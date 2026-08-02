@@ -8,17 +8,22 @@
 //! index management.
 
 pub mod branched;
+pub mod branching;
 pub mod capabilities;
+pub mod eval;
 #[cfg(feature = "lance-backend")]
 pub mod fts_analyzer;
 #[cfg(feature = "lance-backend")]
 pub mod lance;
 #[cfg(feature = "lance-backend")]
 pub mod lance_branch;
+#[cfg(feature = "lance-backend")]
+pub mod lance_directory;
 pub mod table_names;
 pub mod traits;
 pub mod types;
 
+pub use branching::ForkBranching;
 pub use capabilities::{FullTextSearchCapability, ScalarIndexCapability, VectorSearchCapability};
 pub use traits::StorageBackend;
 pub use types::*;

@@ -57,7 +57,12 @@ impl IdAllocator {
                 let manifest: CounterManifest = serde_json::from_slice(&bytes)?;
                 (manifest, version)
             }
-            Err(e) if e.to_string().contains("not found") => (CounterManifest::default(), None),
+            // Typed, not substring: a transient failure whose message merely
+            // reads like a missing object (proxy 404, wrapped S3 "bucket not
+            // found") would otherwise start the allocator from a defaulted
+            // manifest against a populated database and re-issue live VIDs.
+            // Same rationale as `fork/registry.rs` and `snapshot/manager.rs`.
+            Err(e) if crate::store_utils::is_not_found(&e) => (CounterManifest::default(), None),
             Err(e) => return Err(e),
         };
 
@@ -221,6 +226,28 @@ impl IdAllocator {
     pub async fn current_hwm(&self) -> (u64, u64) {
         let state = self.state.lock().await;
         (state.current_vid, state.current_eid)
+    }
+
+    /// Creates a throwaway in-memory `IdAllocator` that allocates ids *above*
+    /// `(vid_hwm, eid_hwm)`, backed by an `InMemory` object store discarded with
+    /// the allocator.
+    ///
+    /// This is the id source for an ephemeral / scratch transaction
+    /// (`Session::scratch`): it hands out vids/eids that cannot collide with the
+    /// primary's live rows (all `< hwm`, pinned in the scratch's read base), and
+    /// it never touches the primary's durable `id_allocator.json` — so thousands
+    /// of open-write-discard rollouts advance no global counter and do no catalog
+    /// I/O (G8/E2).
+    pub async fn in_memory_seeded(vid_hwm: u64, eid_hwm: u64, batch_size: u64) -> Result<Self> {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let path = Path::from("scratch_id_allocator.json");
+        let manifest = CounterManifest {
+            next_vid_batch: vid_hwm,
+            next_eid_batch: eid_hwm,
+        };
+        let bytes = Bytes::from(serde_json::to_vec(&manifest)?);
+        put_with_timeout(&store, &path, bytes, DEFAULT_TIMEOUT).await?;
+        Self::new(store, path, batch_size).await
     }
 
     /// Force a checkpoint of the in-memory state to the underlying

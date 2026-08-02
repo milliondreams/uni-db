@@ -50,6 +50,7 @@ use uni_common::Properties;
 use uni_common::Value;
 use uni_common::core::id::Vid;
 use uni_common::core::schema::Schema as UniSchema;
+use uni_store::backend::types::{FilterExpr, Scalar};
 
 /// Graph scan execution plan.
 ///
@@ -109,9 +110,6 @@ pub struct GraphScanExec {
     /// can't reach uncommitted/unflushed rows). See issue #57.
     extra_runtime_filter: Option<Arc<dyn PhysicalExpr>>,
 
-    /// Whether this is an edge scan (vs vertex scan).
-    is_edge_scan: bool,
-
     /// Whether this is a schemaless scan (uses main table instead of per-label table).
     is_schemaless: bool,
 
@@ -135,7 +133,6 @@ impl fmt::Debug for GraphScanExec {
                 "vid_list_filter_len",
                 &self.vid_list_filter.as_ref().map(Vec::len),
             )
-            .field("is_edge_scan", &self.is_edge_scan)
             .finish()
     }
 }
@@ -182,11 +179,6 @@ impl GraphScanExec {
     /// have a different shape and aren't currently a join target for this
     /// optimization.
     pub(crate) async fn execute_with_vid_filter(&self, vids: &[u64]) -> DFResult<RecordBatch> {
-        if self.is_edge_scan {
-            return Err(datafusion::error::DataFusionError::Plan(
-                "execute_with_vid_filter not supported for edge scans".into(),
-            ));
-        }
         if self.is_schemaless {
             columnar_scan_schemaless_vertex_batch_static(
                 &self.graph_ctx,
@@ -248,7 +240,6 @@ impl GraphScanExec {
             vid_list_filter: None,
             extra_lance_filter: None,
             extra_runtime_filter: None,
-            is_edge_scan: false,
             is_schemaless: false,
             schema,
             properties,
@@ -294,7 +285,6 @@ impl GraphScanExec {
             vid_list_filter: None,
             extra_lance_filter: None,
             extra_runtime_filter: None,
-            is_edge_scan: false,
             is_schemaless: true,
             schema,
             properties,
@@ -335,7 +325,6 @@ impl GraphScanExec {
             vid_list_filter: None,
             extra_lance_filter: None,
             extra_runtime_filter: None,
-            is_edge_scan: false,
             is_schemaless: true,
             schema,
             properties,
@@ -374,7 +363,6 @@ impl GraphScanExec {
             vid_list_filter: None,
             extra_lance_filter: None,
             extra_runtime_filter: None,
-            is_edge_scan: false,
             is_schemaless: true,
             schema,
             properties,
@@ -418,43 +406,6 @@ impl GraphScanExec {
         Arc::new(Schema::new(fields))
     }
 
-    /// Create a new graph scan for edges.
-    ///
-    /// Scans all edges of the given type from storage and L0 buffers,
-    /// then materializes the requested properties.
-    pub fn new_edge_scan(
-        graph_ctx: Arc<GraphExecutionContext>,
-        edge_type: impl Into<String>,
-        variable: impl Into<String>,
-        projected_properties: Vec<String>,
-        filter: Option<Arc<dyn PhysicalExpr>>,
-    ) -> Self {
-        let label = edge_type.into();
-        let variable = variable.into();
-
-        // Build output schema with proper types from Uni schema
-        let uni_schema = graph_ctx.storage().schema_manager().schema();
-        let schema = Self::build_edge_schema(&variable, &label, &projected_properties, &uni_schema);
-
-        let properties = compute_plan_properties(schema.clone());
-
-        Self {
-            graph_ctx,
-            label,
-            variable,
-            projected_properties,
-            filter,
-            vid_list_filter: None,
-            extra_lance_filter: None,
-            extra_runtime_filter: None,
-            is_edge_scan: true,
-            is_schemaless: false,
-            schema,
-            properties,
-            metrics: ExecutionPlanMetricsSet::new(),
-        }
-    }
-
     /// Build output schema for vertex scan with proper Arrow types.
     fn build_vertex_schema(
         variable: &str,
@@ -477,35 +428,12 @@ impl GraphScanExec {
         }
         Arc::new(Schema::new(fields))
     }
-
-    /// Build output schema for edge scan with proper Arrow types.
-    fn build_edge_schema(
-        variable: &str,
-        edge_type: &str,
-        properties: &[String],
-        uni_schema: &UniSchema,
-    ) -> SchemaRef {
-        let mut fields = vec![
-            Field::new(format!("{}._eid", variable), DataType::UInt64, false),
-            Field::new(format!("{}._src_vid", variable), DataType::UInt64, false),
-            Field::new(format!("{}._dst_vid", variable), DataType::UInt64, false),
-        ];
-        let edge_props = uni_schema.properties.get(edge_type);
-        for prop in properties {
-            let col_name = format!("{}.{}", variable, prop);
-            let arrow_type = resolve_property_type(prop, edge_props);
-            let uni_type = edge_props
-                .and_then(|props| props.get(prop))
-                .map(|m| &m.r#type);
-            fields.push(property_field(&col_name, arrow_type, uni_type));
-        }
-        Arc::new(Schema::new(fields))
-    }
 }
 
 impl DisplayAs for GraphScanExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let scan_type = if self.is_edge_scan { "Edge" } else { "Vertex" };
+        // Only vertex scans exist; the edge-scan path was removed as dead code.
+        let scan_type = "Vertex";
         write!(
             f,
             "GraphScanExec: {}={}, properties={:?}",
@@ -564,7 +492,6 @@ impl ExecutionPlan for GraphScanExec {
             self.label.clone(),
             self.variable.clone(),
             self.projected_properties.clone(),
-            self.is_edge_scan,
             self.is_schemaless,
             self.filter.clone(),
             self.vid_list_filter.clone(),
@@ -608,9 +535,6 @@ struct GraphScanStream {
     /// Properties to materialize.
     properties: Vec<String>,
 
-    /// Whether this is an edge scan.
-    is_edge_scan: bool,
-
     /// Whether this is a schemaless scan.
     is_schemaless: bool,
 
@@ -645,7 +569,6 @@ impl GraphScanStream {
         label: String,
         variable: String,
         properties: Vec<String>,
-        is_edge_scan: bool,
         is_schemaless: bool,
         filter: Option<Arc<dyn PhysicalExpr>>,
         vid_list_filter: Option<Vec<u64>>,
@@ -659,7 +582,6 @@ impl GraphScanStream {
             label,
             variable,
             properties,
-            is_edge_scan,
             is_schemaless,
             filter,
             vid_list_filter,
@@ -825,7 +747,7 @@ async fn drop_superseded_pushdown_rows(
     const VERIFY_CHUNK: usize = 1000;
     let mut max_ver: HashMap<u64, u64> = HashMap::with_capacity(candidates.len());
     for chunk in candidates.chunks(VERIFY_CHUNK) {
-        let filter = format_vid_in_list(chunk);
+        let filter = FilterExpr::one_of("_vid", chunk.iter().map(|v| Scalar::UInt(*v)));
         let scanned = match label_table {
             Some(label) => {
                 storage
@@ -1154,23 +1076,6 @@ fn mvcc_dedup_batch_by(batch: &RecordBatch, id_column: &str) -> DFResult<RecordB
     arrow::compute::filter_record_batch(&sorted, &mask).map_err(arrow_err)
 }
 
-/// Filter out edge rows where `op != 0` (non-INSERT) after MVCC dedup.
-fn filter_deleted_edge_ops(batch: &RecordBatch) -> DFResult<RecordBatch> {
-    if batch.num_rows() == 0 {
-        return Ok(batch.clone());
-    }
-    let op_col = match batch.column_by_name("op") {
-        Some(col) => col
-            .as_any()
-            .downcast_ref::<arrow_array::UInt8Array>()
-            .unwrap(),
-        None => return Ok(batch.clone()),
-    };
-    let keep: Vec<bool> = (0..op_col.len()).map(|i| op_col.value(i) == 0).collect();
-    let mask = arrow_array::BooleanArray::from(keep);
-    arrow::compute::filter_record_batch(batch, &mask).map_err(arrow_err)
-}
-
 /// Filter out rows where `_deleted = true` after MVCC dedup.
 fn filter_deleted_rows(batch: &RecordBatch) -> DFResult<RecordBatch> {
     if batch.num_rows() == 0 {
@@ -1291,43 +1196,6 @@ fn filter_l0_label_overwrites(
     arrow::compute::filter_record_batch(batch, &mask).map_err(arrow_err)
 }
 
-/// Filter out rows whose `eid` appears in L0 edge tombstones.
-fn filter_l0_edge_tombstones(
-    batch: &RecordBatch,
-    l0_ctx: &crate::query::df_graph::L0Context,
-) -> DFResult<RecordBatch> {
-    if batch.num_rows() == 0 {
-        return Ok(batch.clone());
-    }
-
-    let mut tombstones: HashSet<u64> = HashSet::new();
-    for l0 in l0_ctx.iter_l0_buffers() {
-        let guard = l0.read();
-        for eid in guard.tombstones.keys() {
-            tombstones.insert(eid.as_u64());
-        }
-    }
-
-    if tombstones.is_empty() {
-        return Ok(batch.clone());
-    }
-
-    let eid_col = batch
-        .column_by_name("eid")
-        .ok_or_else(|| {
-            datafusion::error::DataFusionError::Internal("Missing eid column".to_string())
-        })?
-        .as_any()
-        .downcast_ref::<UInt64Array>()
-        .unwrap();
-
-    let keep: Vec<bool> = (0..eid_col.len())
-        .map(|i| !tombstones.contains(&eid_col.value(i)))
-        .collect();
-    let mask = arrow_array::BooleanArray::from(keep);
-    arrow::compute::filter_record_batch(batch, &mask).map_err(arrow_err)
-}
-
 /// Extract a target VID from a DataFusion physical filter expression.
 ///
 /// Looks for patterns like `_vid = <uint64_literal>` or `<uint64_literal> = _vid`
@@ -1390,34 +1258,6 @@ fn try_extract_vid_eq(
     }
 
     None
-}
-
-/// AND-combine an optional VID filter clause with an optional indexed-property
-/// filter clause. Either, both, or neither may be present. See issues #55, #57.
-fn combine_lance_filters(vid_filter: Option<&str>, extra: Option<&str>) -> Option<String> {
-    match (vid_filter, extra) {
-        (Some(a), Some(b)) => Some(format!("({a}) AND ({b})")),
-        (Some(a), None) => Some(a.to_string()),
-        (None, Some(b)) => Some(b.to_string()),
-        (None, None) => None,
-    }
-}
-
-/// Format a slice of VIDs as a Lance `_vid IN (v1, v2, ...)` filter clause.
-/// Used by the scan-side IN-list pushdown introduced in issue #55 PR #4.
-fn format_vid_in_list(vids: &[u64]) -> String {
-    use std::fmt::Write;
-    debug_assert!(!vids.is_empty());
-    let mut s = String::with_capacity(vids.len() * 8 + 12);
-    s.push_str("_vid IN (");
-    for (i, v) in vids.iter().enumerate() {
-        if i > 0 {
-            s.push(',');
-        }
-        let _ = write!(s, "{v}");
-    }
-    s.push(')');
-    s
 }
 
 /// Convert a `ScalarValue` to `u64` if it is a non-negative integer type.
@@ -1644,204 +1484,6 @@ fn build_l0_property_column(
     build_property_column_static(&vid_keys, &props_map, prop_name, data_type)
 }
 
-/// Build a RecordBatch from L0 buffer data for a given edge type, matching
-/// the DeltaDataset Lance table's column set.
-///
-/// Merges L0 buffers in visibility order (pending_flush → current → transaction),
-/// with later buffers overwriting earlier ones for the same EID.
-fn build_l0_edge_batch(
-    l0_ctx: &crate::query::df_graph::L0Context,
-    edge_type: &str,
-    internal_schema: &SchemaRef,
-    type_props: Option<&HashMap<String, uni_common::core::schema::PropertyMeta>>,
-) -> DFResult<RecordBatch> {
-    // Collect all L0 edge data, merging in visibility order
-    // eid -> (src_vid, dst_vid, properties, version)
-    let mut eid_data: HashMap<u64, (u64, u64, Properties, u64)> = HashMap::new();
-    let mut tombstones: HashSet<u64> = HashSet::new();
-    // System-managed timestamps: earliest creation, latest update.
-    // See `build_l0_vertex_batch` for the rationale.
-    let mut eid_created_at: HashMap<u64, i64> = HashMap::new();
-    let mut eid_updated_at: HashMap<u64, i64> = HashMap::new();
-
-    for l0 in l0_ctx.iter_l0_buffers() {
-        let guard = l0.read();
-        // Collect tombstones
-        for eid in guard.tombstones.keys() {
-            tombstones.insert(eid.as_u64());
-        }
-        // Collect edges for this type
-        for eid in guard.eids_for_type(edge_type) {
-            let eid_u64 = eid.as_u64();
-            if tombstones.contains(&eid_u64) {
-                continue;
-            }
-            let (src_vid, dst_vid) = match guard.get_edge_endpoints(eid) {
-                Some(endpoints) => (endpoints.0.as_u64(), endpoints.1.as_u64()),
-                None => continue,
-            };
-            let version = guard.edge_versions.get(&eid).copied().unwrap_or(0);
-            let entry = eid_data
-                .entry(eid_u64)
-                .or_insert_with(|| (src_vid, dst_vid, Properties::new(), 0));
-            // Merge properties (later L0 overwrites)
-            if let Some(props) = guard.edge_properties.get(&eid) {
-                for (k, v) in props {
-                    entry.2.insert(k.clone(), v.clone());
-                }
-            }
-            // Update endpoints from latest L0 layer
-            entry.0 = src_vid;
-            entry.1 = dst_vid;
-            // Take the highest version
-            if version > entry.3 {
-                entry.3 = version;
-            }
-            // Merge system timestamps
-            if let Some(&ts) = guard.edge_created_at.get(&eid) {
-                eid_created_at
-                    .entry(eid_u64)
-                    .and_modify(|cur| {
-                        if ts < *cur {
-                            *cur = ts;
-                        }
-                    })
-                    .or_insert(ts);
-            }
-            if let Some(&ts) = guard.edge_updated_at.get(&eid) {
-                eid_updated_at
-                    .entry(eid_u64)
-                    .and_modify(|cur| {
-                        if ts > *cur {
-                            *cur = ts;
-                        }
-                    })
-                    .or_insert(ts);
-            }
-        }
-    }
-
-    // Remove tombstoned EIDs
-    for t in &tombstones {
-        eid_data.remove(t);
-    }
-
-    if eid_data.is_empty() {
-        return Ok(RecordBatch::new_empty(internal_schema.clone()));
-    }
-
-    // Sort EIDs for deterministic output
-    let mut eids: Vec<u64> = eid_data.keys().copied().collect();
-    eids.sort_unstable();
-
-    let num_rows = eids.len();
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(internal_schema.fields().len());
-
-    // Determine which schema property names exist
-    let schema_prop_names: HashSet<&str> = type_props
-        .map(|tp| tp.keys().map(|k| k.as_str()).collect())
-        .unwrap_or_default();
-
-    for field in internal_schema.fields() {
-        let col_name = field.name().as_str();
-        match col_name {
-            "eid" => {
-                columns.push(Arc::new(UInt64Array::from(eids.clone())));
-            }
-            "src_vid" => {
-                let vals: Vec<u64> = eids.iter().map(|e| eid_data[e].0).collect();
-                columns.push(Arc::new(UInt64Array::from(vals)));
-            }
-            "dst_vid" => {
-                let vals: Vec<u64> = eids.iter().map(|e| eid_data[e].1).collect();
-                columns.push(Arc::new(UInt64Array::from(vals)));
-            }
-            "op" => {
-                // L0 edges are always live (tombstoned ones already excluded)
-                let vals = vec![0u8; num_rows];
-                columns.push(Arc::new(arrow_array::UInt8Array::from(vals)));
-            }
-            "_version" => {
-                let vals: Vec<u64> = eids.iter().map(|e| eid_data[e].3).collect();
-                columns.push(Arc::new(UInt64Array::from(vals)));
-            }
-            "_created_at" => {
-                let mut builder =
-                    arrow_array::builder::TimestampNanosecondBuilder::new().with_timezone("UTC");
-                for e in &eids {
-                    match eid_created_at.get(e) {
-                        Some(&ts) => builder.append_value(ts),
-                        None => builder.append_null(),
-                    }
-                }
-                columns.push(Arc::new(builder.finish()));
-            }
-            "_updated_at" => {
-                let mut builder =
-                    arrow_array::builder::TimestampNanosecondBuilder::new().with_timezone("UTC");
-                for e in &eids {
-                    match eid_updated_at.get(e) {
-                        Some(&ts) => builder.append_value(ts),
-                        None => builder.append_null(),
-                    }
-                }
-                columns.push(Arc::new(builder.finish()));
-            }
-            "overflow_json" => {
-                // Collect non-schema properties as CypherValue
-                let mut builder = arrow_array::builder::LargeBinaryBuilder::new();
-                for eid_u64 in &eids {
-                    let (_, _, props, _) = &eid_data[eid_u64];
-                    let mut overflow: HashMap<String, Value> = HashMap::new();
-                    for (k, v) in props {
-                        if k.starts_with('_') {
-                            continue;
-                        }
-                        if !schema_prop_names.contains(k.as_str()) {
-                            overflow.insert(k.clone(), v.clone());
-                        }
-                    }
-                    if overflow.is_empty() {
-                        builder.append_null();
-                    } else {
-                        builder.append_value(uni_common::cypher_value_codec::encode(&Value::Map(
-                            overflow,
-                        )));
-                    }
-                }
-                columns.push(Arc::new(builder.finish()));
-            }
-            _ => {
-                // Schema property column: convert L0 Value → Arrow typed value
-                let col =
-                    build_l0_edge_property_column(&eids, &eid_data, col_name, field.data_type())?;
-                columns.push(col);
-            }
-        }
-    }
-
-    RecordBatch::try_new(internal_schema.clone(), columns).map_err(arrow_err)
-}
-
-/// Build a single Arrow column from L0 edge property values.
-///
-/// Operates on the `eid_data` map produced by `build_l0_edge_batch`.
-fn build_l0_edge_property_column(
-    eids: &[u64],
-    eid_data: &HashMap<u64, (u64, u64, Properties, u64)>,
-    prop_name: &str,
-    data_type: &DataType,
-) -> DFResult<ArrayRef> {
-    // Convert to Vid keys for reuse of existing build_property_column_static
-    let vid_keys: Vec<Vid> = eids.iter().map(|e| Vid::from(*e)).collect();
-    let props_map: HashMap<Vid, Properties> = eid_data
-        .iter()
-        .map(|(k, (_, _, props, _))| (Vid::from(*k), props.clone()))
-        .collect();
-
-    build_property_column_static(&vid_keys, &props_map, prop_name, data_type)
-}
-
 /// Build the `_labels` column for known-label vertices.
 ///
 /// Reads `_labels` from the stored Lance batch if available. Falls back to
@@ -2026,112 +1668,6 @@ fn map_to_output_schema(
     RecordBatch::try_new(output_schema.clone(), columns).map_err(arrow_err)
 }
 
-/// Map an internal DeltaDataset-schema edge batch to the DataFusion output schema.
-///
-/// The internal batch has `eid`, `src_vid`, `dst_vid`, `op`, `_version`, and property
-/// columns. The output schema has `{variable}._eid`, `{variable}._src_vid`,
-/// `{variable}._dst_vid`, and per-property columns. Internal columns `op` and
-/// `_version` are dropped.
-fn map_edge_to_output_schema(
-    batch: &RecordBatch,
-    variable: &str,
-    projected_properties: &[String],
-    output_schema: &SchemaRef,
-) -> DFResult<RecordBatch> {
-    if batch.num_rows() == 0 {
-        return Ok(RecordBatch::new_empty(output_schema.clone()));
-    }
-
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(output_schema.fields().len());
-
-    // 1. {var}._eid
-    let eid_col = batch
-        .column_by_name("eid")
-        .ok_or_else(|| {
-            datafusion::error::DataFusionError::Internal("Missing eid column".to_string())
-        })?
-        .clone();
-    columns.push(eid_col);
-
-    // 2. {var}._src_vid
-    let src_col = batch
-        .column_by_name("src_vid")
-        .ok_or_else(|| {
-            datafusion::error::DataFusionError::Internal("Missing src_vid column".to_string())
-        })?
-        .clone();
-    columns.push(src_col);
-
-    // 3. {var}._dst_vid
-    let dst_col = batch
-        .column_by_name("dst_vid")
-        .ok_or_else(|| {
-            datafusion::error::DataFusionError::Internal("Missing dst_vid column".to_string())
-        })?
-        .clone();
-    columns.push(dst_col);
-
-    // 4. Projected properties
-    for prop in projected_properties {
-        if prop == "overflow_json" {
-            match batch.column_by_name("overflow_json") {
-                Some(col) => columns.push(col.clone()),
-                None => {
-                    columns.push(arrow_array::new_null_array(
-                        &DataType::LargeBinary,
-                        batch.num_rows(),
-                    ));
-                }
-            }
-        } else {
-            match batch.column_by_name(prop) {
-                Some(col) => columns.push(col.clone()),
-                None => {
-                    // Column missing in Lance — extract from overflow_json CypherValue blob
-                    // (mirrors the vertex path in map_to_output_schema)
-                    let overflow_arr = batch
-                        .column_by_name("overflow_json")
-                        .and_then(|c| c.as_any().downcast_ref::<arrow_array::LargeBinaryArray>());
-
-                    if let Some(arr) = overflow_arr {
-                        let mut builder = arrow_array::builder::LargeBinaryBuilder::new();
-                        for i in 0..batch.num_rows() {
-                            if !arr.is_null(i) {
-                                let blob = arr.value(i);
-                                // Fast path: extract map entry without decoding entire map
-                                if let Some(sub_bytes) =
-                                    uni_common::cypher_value_codec::extract_map_entry_raw(
-                                        blob, prop,
-                                    )
-                                {
-                                    builder.append_value(&sub_bytes);
-                                } else {
-                                    builder.append_null();
-                                }
-                            } else {
-                                builder.append_null();
-                            }
-                        }
-                        columns.push(Arc::new(builder.finish()));
-                    } else {
-                        // No overflow_json column either — return null column
-                        let target_field = output_schema
-                            .fields()
-                            .iter()
-                            .find(|f| f.name() == &format!("{}.{}", variable, prop));
-                        let dt = target_field
-                            .map(|f| f.data_type().clone())
-                            .unwrap_or(DataType::LargeBinary);
-                        columns.push(arrow_array::new_null_array(&dt, batch.num_rows()));
-                    }
-                }
-            }
-        }
-    }
-
-    RecordBatch::try_new(output_schema.clone(), columns).map_err(arrow_err)
-}
-
 /// Columnar-first vertex scan: single Lance query with MVCC dedup and L0 overlay.
 ///
 /// Replaces the two-phase `scan_vertex_vids_static()` + `materialize_vertex_batch_static()`
@@ -2198,11 +1734,21 @@ async fn columnar_scan_vertex_batch_static(
     // single-VID `_vid = N` from the WHERE-clause path. AND-combined with
     // any indexed-property pushdown (issue #57).
     let vid_part = match (vid_list_filter, target_vid) {
-        (Some(vs), _) if !vs.is_empty() => Some(format_vid_in_list(vs)),
-        (_, Some(v)) => Some(format!("_vid = {v}")),
+        (Some(vs), _) if !vs.is_empty() => Some(FilterExpr::one_of(
+            "_vid",
+            vs.iter().map(|v| Scalar::UInt(*v)),
+        )),
+        (_, Some(v)) => Some(FilterExpr::equals("_vid", Scalar::UInt(v))),
         _ => None,
     };
-    let combined_filter = combine_lance_filters(vid_part.as_deref(), extra_lance_filter);
+    // `extra_lance_filter` arrives as rendered SQL from the planner's
+    // hash-index pushdown, so it stays `Raw` — nothing in the engine parses it.
+    let combined_filter = match (vid_part, extra_lance_filter) {
+        (Some(v), Some(e)) => Some(FilterExpr::all([v, FilterExpr::Raw(e.to_string())])),
+        (Some(v), None) => Some(v),
+        (None, Some(e)) => Some(FilterExpr::Raw(e.to_string())),
+        (None, None) => None,
+    };
     let lance_columns_refs: Vec<&str> = lance_columns.iter().map(|s| s.as_str()).collect();
 
     // M5h.2: route through plugin Storage if one is registered for
@@ -2255,7 +1801,7 @@ async fn columnar_scan_vertex_batch_static(
         Some(b) => (Some(b), false),
         None => (
             storage
-                .scan_vertex_table(label, &lance_columns_refs, combined_filter.as_deref())
+                .scan_vertex_table(label, &lance_columns_refs, combined_filter.as_ref())
                 .await
                 .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?,
             extra_lance_filter.is_some(),
@@ -2391,131 +1937,6 @@ fn apply_runtime_filter(
     arrow::compute::filter_record_batch(&batch, bools).map_err(arrow_err)
 }
 
-/// Columnar-first edge scan: single Lance query with MVCC dedup and L0 overlay.
-///
-/// Replaces the two-phase `scan_edge_eids_static()` + `materialize_edge_batch_static()`
-/// for edge scans. Reads all needed columns in a single DeltaDataset query, performs
-/// MVCC dedup via Arrow compute, merges L0 buffer data, filters tombstones, and maps
-/// to the output schema.
-async fn columnar_scan_edge_batch_static(
-    graph_ctx: &GraphExecutionContext,
-    edge_type: &str,
-    variable: &str,
-    projected_properties: &[String],
-    output_schema: &SchemaRef,
-) -> DFResult<RecordBatch> {
-    let storage = graph_ctx.storage();
-    let l0_ctx = graph_ctx.l0_context();
-    let uni_schema = storage.schema_manager().schema();
-    let type_props = uni_schema.properties.get(edge_type);
-
-    // Build the list of columns to request from DeltaDataset Lance table
-    let mut lance_columns: Vec<String> = vec![
-        "eid".to_string(),
-        "src_vid".to_string(),
-        "dst_vid".to_string(),
-        "op".to_string(),
-        "_version".to_string(),
-    ];
-    for prop in projected_properties {
-        if prop == "overflow_json" {
-            push_column_if_absent(&mut lance_columns, "overflow_json");
-        } else if prop == "_created_at" || prop == "_updated_at" {
-            // System-managed timestamps live on every edge table.
-            push_column_if_absent(&mut lance_columns, prop);
-        } else {
-            let exists_in_schema = type_props.is_some_and(|tp| tp.contains_key(prop));
-            if exists_in_schema {
-                push_column_if_absent(&mut lance_columns, prop);
-            }
-        }
-    }
-
-    // Ensure overflow_json is present when any projected property is not in the schema
-    // (excluding system-managed columns like `_created_at` / `_updated_at`).
-    let needs_overflow = projected_properties.iter().any(|p| {
-        p == "overflow_json"
-            || (!matches!(p.as_str(), "_created_at" | "_updated_at")
-                && !type_props.is_some_and(|tp| tp.contains_key(p)))
-    });
-    if needs_overflow {
-        push_column_if_absent(&mut lance_columns, "overflow_json");
-    }
-
-    // Try to query DeltaDataset (forward direction) via StorageManager domain method
-    let lance_columns_refs: Vec<&str> = lance_columns.iter().map(|s| s.as_str()).collect();
-    let lance_batch = storage
-        .scan_delta_table(edge_type, "fwd", &lance_columns_refs, None)
-        .await
-        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
-
-    // MVCC dedup the Lance batch (by eid)
-    let lance_deduped = mvcc_dedup_to_option(lance_batch, "eid")?;
-
-    // Build the internal schema for L0 batch construction.
-    // Use the Lance batch schema if available, otherwise build from scratch.
-    let internal_schema = match &lance_deduped {
-        Some(batch) => batch.schema(),
-        None => {
-            let mut fields = vec![
-                Field::new("eid", DataType::UInt64, false),
-                Field::new("src_vid", DataType::UInt64, false),
-                Field::new("dst_vid", DataType::UInt64, false),
-                Field::new("op", DataType::UInt8, false),
-                Field::new("_version", DataType::UInt64, false),
-            ];
-            for col in &lance_columns {
-                if matches!(
-                    col.as_str(),
-                    "eid" | "src_vid" | "dst_vid" | "op" | "_version"
-                ) {
-                    continue;
-                }
-                if col == "overflow_json" {
-                    fields.push(Field::new("overflow_json", DataType::LargeBinary, true));
-                } else if col == "_created_at" || col == "_updated_at" {
-                    fields.push(Field::new(
-                        col,
-                        DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
-                        true,
-                    ));
-                } else {
-                    let arrow_type = type_props
-                        .and_then(|tp| tp.get(col.as_str()))
-                        .map(|meta| meta.r#type.to_arrow())
-                        .unwrap_or(DataType::LargeBinary);
-                    fields.push(Field::new(col, arrow_type, true));
-                }
-            }
-            Arc::new(Schema::new(fields))
-        }
-    };
-
-    // Build L0 batch
-    let l0_batch = build_l0_edge_batch(l0_ctx, edge_type, &internal_schema, type_props)?;
-
-    // Merge Lance + L0
-    let Some(merged) = merge_lance_and_l0(lance_deduped, l0_batch, &internal_schema, "eid")? else {
-        return Ok(RecordBatch::new_empty(output_schema.clone()));
-    };
-
-    // Filter out MVCC deletion ops (op != 0) after dedup
-    let merged = filter_deleted_edge_ops(&merged)?;
-    if merged.num_rows() == 0 {
-        return Ok(RecordBatch::new_empty(output_schema.clone()));
-    }
-
-    // Filter L0 edge tombstones
-    let filtered = filter_l0_edge_tombstones(&merged, l0_ctx)?;
-
-    if filtered.num_rows() == 0 {
-        return Ok(RecordBatch::new_empty(output_schema.clone()));
-    }
-
-    // Map to output schema
-    map_edge_to_output_schema(&filtered, variable, projected_properties, output_schema)
-}
-
 /// Columnar-first schemaless vertex scan: single Lance query with MVCC dedup and L0 overlay.
 ///
 /// Replaces the two-phase `scan_*_vids_*()` + `materialize_schemaless_vertex_batch_static()`
@@ -2545,37 +1966,41 @@ async fn columnar_scan_schemaless_vertex_batch_static(
     // Build the Lance filter expression — do NOT filter _deleted here;
     // MVCC dedup must see deletion tombstones to pick the highest version.
     let filter = {
-        let mut parts = Vec::new();
+        let mut parts: Vec<FilterExpr> = Vec::new();
 
         // VID point-lookup filter — uses BTree index on _vid. Prefer the
         // multi-VID list (formats as `_vid IN (...)`); fall back to single-VID.
         match (vid_list_filter, target_vid) {
-            (Some(vs), _) if !vs.is_empty() => parts.push(format_vid_in_list(vs)),
-            (_, Some(vid)) => parts.push(format!("_vid = {vid}")),
+            (Some(vs), _) if !vs.is_empty() => parts.push(FilterExpr::one_of(
+                "_vid",
+                vs.iter().map(|v| Scalar::UInt(*v)),
+            )),
+            (_, Some(vid)) => parts.push(FilterExpr::equals("_vid", Scalar::UInt(vid))),
             _ => {}
         }
 
         // Label filter
         if !label.is_empty() {
-            if label.contains(':') {
-                // Multi-label: each label must be present
-                for lbl in label.split(':') {
-                    parts.push(format!("array_contains(labels, '{}')", lbl));
-                }
-            } else {
-                parts.push(format!("array_contains(labels, '{}')", label));
+            // Multi-label: each label must be present. The label travels as a
+            // `Scalar`, so `to_sql` escapes it — the previous `format!` did not.
+            for lbl in label.split(':') {
+                parts.push(FilterExpr::array_contains(
+                    "labels",
+                    Scalar::Str(lbl.to_string()),
+                ));
             }
         }
 
-        // Indexed-property pushdown — issue #57.
+        // Indexed-property pushdown — issue #57. Already-rendered SQL from the
+        // planner, so it stays `Raw`.
         if let Some(extra) = extra_lance_filter {
-            parts.push(extra.to_string());
+            parts.push(FilterExpr::Raw(extra.to_string()));
         }
 
         if parts.is_empty() {
             None
         } else {
-            Some(parts.join(" AND "))
+            Some(FilterExpr::all(parts))
         }
     };
 
@@ -2583,7 +2008,7 @@ async fn columnar_scan_schemaless_vertex_batch_static(
     let lance_batch = storage
         .scan_main_vertex_table(
             &["_vid", "_deleted", "labels", "props_json", "_version"],
-            filter.as_deref(),
+            filter.as_ref(),
         )
         .await
         .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
@@ -3975,7 +3400,6 @@ impl Stream for GraphScanStream {
                     let label = self.label.clone();
                     let variable = self.variable.clone();
                     let properties = self.properties.clone();
-                    let is_edge_scan = self.is_edge_scan;
                     let is_schemaless = self.is_schemaless;
                     let filter = self.filter.clone();
                     let vid_list_filter = self.vid_list_filter.clone();
@@ -3988,16 +3412,7 @@ impl Stream for GraphScanStream {
                             datafusion::error::DataFusionError::Execution(e.to_string())
                         })?;
 
-                        let batch = if is_edge_scan {
-                            columnar_scan_edge_batch_static(
-                                &graph_ctx,
-                                &label,
-                                &variable,
-                                &properties,
-                                &schema,
-                            )
-                            .await?
-                        } else if is_schemaless {
+                        let batch = if is_schemaless {
                             columnar_scan_schemaless_vertex_batch_static(
                                 &graph_ctx,
                                 &label,
@@ -4079,19 +3494,6 @@ mod tests {
         assert_eq!(schema.field(1).name(), "n._labels");
         assert_eq!(schema.field(2).name(), "n.name");
         assert_eq!(schema.field(3).name(), "n.age");
-    }
-
-    #[test]
-    fn test_build_edge_schema() {
-        let uni_schema = UniSchema::default();
-        let schema =
-            GraphScanExec::build_edge_schema("r", "KNOWS", &["weight".to_string()], &uni_schema);
-
-        assert_eq!(schema.fields().len(), 4);
-        assert_eq!(schema.field(0).name(), "r._eid");
-        assert_eq!(schema.field(1).name(), "r._src_vid");
-        assert_eq!(schema.field(2).name(), "r._dst_vid");
-        assert_eq!(schema.field(3).name(), "r.weight");
     }
 
     #[test]

@@ -28,6 +28,8 @@ use wasmtime::component::{ComponentType, Lift, Linker, Lower};
 
 use crate::error::WasmError;
 use crate::host_state::HostState;
+use uni_plugin_builtin::algorithms::graph_compute::handle::Handle;
+use uni_plugin_builtin::algorithms::graph_compute::session::{AlgoSession, GraphArenaCompute};
 
 /// Default per-call HTTP timeout ceiling when the grant carries no
 /// `WallClockMillisPerCall`. The guest may request *less* via `timeout-ms`.
@@ -115,6 +117,7 @@ pub fn build_scalar_linker_v1(
         .any(|c| matches!(c, Capability::GraphCompute))
     {
         add_host_graph(&mut linker)?;
+        add_host_arena(&mut linker)?;
     }
     Ok(linker)
 }
@@ -142,6 +145,7 @@ pub fn build_algorithm_linker_v1(
         .any(|c| matches!(c, Capability::GraphCompute))
     {
         add_host_graph(&mut linker)?;
+        add_host_arena(&mut linker)?;
     }
     Ok(linker)
 }
@@ -287,6 +291,89 @@ fn add_host_graph(linker: &mut Linker<HostState>) -> Result<(), WasmError> {
             },
         )
         .map_err(|e| WasmError::Instantiate(format!("link host-graph graph-call: {e}")))?;
+    Ok(())
+}
+
+/// Add the capability-gated typed `uni:plugin/host-arena` interface.
+///
+/// The typed counterpart to [`add_host_graph`]. Same registry, same sessions,
+/// same panic isolation — the only difference is that operands cross as raw
+/// `u64` handles and scalars instead of a JSON string, which is worth ~32x at
+/// batch granularity (proposal §12 / §5.3).
+///
+/// Additive: a guest that does not import this interface is unaffected by its
+/// presence, so adding it does not break already-built components (§10.4).
+fn add_host_arena(linker: &mut Linker<HostState>) -> Result<(), WasmError> {
+    let mut instance = linker
+        .instance("uni:plugin/host-arena@0.1.0")
+        .map_err(|e| WasmError::Instantiate(format!("link host-arena instance: {e}")))?;
+
+    /// Resolves the registry or reports the missing grant, then runs `f`.
+    macro_rules! arena_fn {
+        ($name:literal, ($($arg:ident : $ty:ty),*), $out:ty, $call:expr) => {
+            instance
+                .func_wrap(
+                    $name,
+                    |store: wasmtime::StoreContextMut<'_, HostState>,
+                     (session, $($arg,)*): (u64, $($ty,)*)|
+                     -> wasmtime::Result<(Result<$out, WasmFnError>,)> {
+                        let Some(registry) = store.data().graph.clone() else {
+                            return Ok((Err(fn_err(
+                                0x86C,
+                                "host-arena: no GraphCompute registry configured",
+                            )),));
+                        };
+                        #[allow(clippy::redundant_closure_call)]
+                        let r = registry
+                            .with_session(session, |s| ($call)(s, $($arg,)*))
+                            .map_err(|e| fn_err(e.code, e.message));
+                        Ok((r,))
+                    },
+                )
+                .map_err(|e| WasmError::Instantiate(format!("link host-arena {}: {e}", $name)))?;
+        };
+    }
+
+    arena_fn!("arena-new", (capacity: u32, branching: u32), u64, |s: &mut AlgoSession, c, b| {
+        s.arena_new(c, b).map(Handle::as_u64)
+    });
+    arena_fn!("arena-alloc", (arena: u64, count: u32), u64, |s: &mut AlgoSession, a, c| {
+        s.arena_alloc(Handle::from_u64(a), c).map(Handle::as_u64)
+    });
+    arena_fn!("arena-link", (arena: u64, parents: u64, kids: u64), (), |s: &mut AlgoSession, a, p, k| {
+        s.arena_link(Handle::from_u64(a), Handle::from_u64(p), Handle::from_u64(k))
+    });
+    arena_fn!("arena-column", (arena: u64), u32, |s: &mut AlgoSession, a| {
+        s.arena_column(Handle::from_u64(a))
+            .map(|i| u32::try_from(i).unwrap_or(u32::MAX))
+    });
+    arena_fn!("arena-candidates", (arena: u64, roots: u64), u64, |s: &mut AlgoSession, a, r| {
+        s.arena_candidates(Handle::from_u64(a), Handle::from_u64(r)).map(Handle::as_u64)
+    });
+    arena_fn!("arena-gather", (arena: u64, column: u32, slots: u64), u64, |s: &mut AlgoSession, a, c, sl| {
+        s.arena_gather(Handle::from_u64(a), c, Handle::from_u64(sl)).map(Handle::as_u64)
+    });
+    arena_fn!("arena-scatter", (arena: u64, column: u32, slots: u64, values: u64), (), |s: &mut AlgoSession, a, c, sl, v| {
+        s.arena_scatter(Handle::from_u64(a), c, Handle::from_u64(sl), Handle::from_u64(v))
+    });
+    arena_fn!("arena-backup", (arena: u64, value_col: u32, leaves: u64, deltas: u64), (), |s: &mut AlgoSession, a, vc, l, d| {
+        s.arena_backup(Handle::from_u64(a), vc, Handle::from_u64(l), Handle::from_u64(d))
+    });
+    arena_fn!("arena-descend",
+    (arena: u64, roots: u64, score: u32, visit: u32, maximize: bool, vloss: f64), u64,
+    |s: &mut AlgoSession, a, r, sc, vi, mx, vl| {
+        s.arena_descend(Handle::from_u64(a), Handle::from_u64(r), sc, vi, mx, vl)
+            .map(Handle::as_u64)
+    });
+
+    arena_fn!("arena-expand", (arena: u64, parents: u64, fanout: u32), u64,
+    |s: &mut AlgoSession, a, p, f| {
+        s.arena_expand(Handle::from_u64(a), Handle::from_u64(p), f).map(Handle::as_u64)
+    });
+    arena_fn!("arena-freeze", (arena: u64), u64, |s: &mut AlgoSession, a| {
+        s.arena_freeze(Handle::from_u64(a)).map(Handle::as_u64)
+    });
+
     Ok(())
 }
 

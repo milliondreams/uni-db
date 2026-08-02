@@ -51,6 +51,7 @@ rhai-runtime = ["dep:rhai"]
 otel = ["uni-plugin/otel"]
 
 [dev-dependencies]
+criterion = { workspace = true }
 tokio = { workspace = true }
 tempfile = { workspace = true }
 # For the `otel`-gated positive injection test: a real (no-exporter) tracer
@@ -60,3 +61,9 @@ opentelemetry = { workspace = true }
 opentelemetry_sdk = "0.32"
 tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+# Batched-descent MCTS in Rhai — the #152 question: is an interpreted body viable
+# at batch granularity, where `require_compiled_body` disqualified it per-step?
+[[bench]]
+name = "mcts_batched_rhai"
+harness = false

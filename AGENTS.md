@@ -35,6 +35,14 @@
 ## Testing Guidelines
 - Unit tests live next to code in `crates/*/src/**` with `#[cfg(test)] mod tests`.
 - Integration tests live in `crates/*/tests/` (mostly `crates/uni/tests/common/`) and often use `#[tokio::test]`.
+- **Consolidate integration-test binaries — hard cap of 3 per crate.** Cargo builds
+  one binary per `.rs` file directly under `tests/`, each statically linking the full
+  dep set (datafusion/lance/candle), so loose files explode build/link time. When
+  adding a repro or integration test, add a `mod <name>;` to the crate's existing
+  `tests/integration.rs` — do **not** create a new top-level `tests/<name>.rs`. A 2nd/3rd
+  binary is allowed only for a documented reason (mutually-exclusive feature set, a
+  loom/model-check target, or a registry test needing process isolation). Full rationale,
+  mechanism, and migration recipe: `docs/test_layout.md`.
 - Benchmarks go in `crates/uni/benches/` using Criterion.
 - If a test is flaky or sensitive to parallelism, document the constraint in a comment at the test site.
 - For TCK compliance runs, use `scripts/run_tck_with_report.sh`.

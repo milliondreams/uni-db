@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
 
+use crate::backend::types::{FilterExpr, Scalar};
 use anyhow::{Result, anyhow};
 use arrow_array::builder::{ListBuilder, StringBuilder, UInt64Builder};
 use arrow_array::{Array, ListArray, RecordBatch, RecordBatchIterator, UInt64Array};
@@ -77,12 +78,11 @@ impl JsonPathIndex {
             Err(_) => return Ok(vec![]),
         };
 
-        // Scan and filter (MVP)
-        let mut stream = ds
-            .scan()
-            .filter(&format!("value = '{}'", value))?
-            .try_into_stream()
-            .await?;
+        // Scan and filter (MVP). Quoting and escaping are `FilterExpr::to_sql`'s
+        // job — a value containing `'` would otherwise close the literal early
+        // and produce a malformed predicate.
+        let predicate = FilterExpr::equals("value", Scalar::Str(value.to_string())).to_sql()?;
+        let mut stream = ds.scan().filter(&predicate)?.try_into_stream().await?;
 
         let mut result = Vec::new();
 

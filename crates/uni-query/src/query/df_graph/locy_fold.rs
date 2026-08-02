@@ -64,6 +64,31 @@ pub fn is_monotonic_aggregate(registry: &uni_plugin::PluginRegistry, name: &str)
     resolve_locy_aggregate(registry, name).map(|e| e.aggregate.semilattice().monotone_join)
 }
 
+/// The registry's verdict, falling back to the built-in `M*` contract.
+///
+/// This is the composition every consumer should use, and it exists because
+/// registry-alone is wrong in both directions.
+///
+/// A bare `PluginRegistry::new()` — a plugin-less embedding, or a host that has
+/// removed a plugin — answers `None` for `MSUM`, `MMAX` and the rest, so a
+/// registry-only oracle would start rejecting recursive programs that use the
+/// built-in lattice folds. Falling back to
+/// [`uni_locy::default_monotonicity_oracle`] keeps that user-asserted contract
+/// working regardless of registry state.
+///
+/// The compile-time oracle and the planner's guard must both go through this
+/// function. When they disagree — as they did while the compiler consulted the
+/// default and the planner consulted the registry — a program can compile
+/// cleanly and then fail at plan time with an unstructured error, or the
+/// reverse.
+#[must_use]
+pub fn locy_monotonicity_verdict(
+    registry: &uni_plugin::PluginRegistry,
+    name: &str,
+) -> Option<bool> {
+    is_monotonic_aggregate(registry, name).or_else(|| uni_locy::default_monotonicity_oracle(name))
+}
+
 #[must_use]
 pub fn resolve_locy_aggregate(
     registry: &uni_plugin::PluginRegistry,
@@ -818,7 +843,7 @@ mod tests {
     use super::*;
     use arrow_array::{Float64Array, Int64Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
-    use datafusion::physical_plan::memory::MemoryStream;
+    use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::prelude::SessionContext;
 
     /// Direct construction of a built-in `LocyAggregate` trait object for use
@@ -858,59 +883,7 @@ mod tests {
 
     fn make_memory_exec(batch: RecordBatch) -> Arc<dyn ExecutionPlan> {
         let schema = batch.schema();
-        Arc::new(TestMemoryExec {
-            batches: vec![batch],
-            schema: schema.clone(),
-            properties: compute_plan_properties(schema),
-        })
-    }
-
-    #[derive(Debug)]
-    struct TestMemoryExec {
-        batches: Vec<RecordBatch>,
-        schema: SchemaRef,
-        properties: Arc<PlanProperties>,
-    }
-
-    impl DisplayAs for TestMemoryExec {
-        fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "TestMemoryExec")
-        }
-    }
-
-    impl ExecutionPlan for TestMemoryExec {
-        fn name(&self) -> &str {
-            "TestMemoryExec"
-        }
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-        fn schema(&self) -> SchemaRef {
-            Arc::clone(&self.schema)
-        }
-        fn properties(&self) -> &Arc<PlanProperties> {
-            &self.properties
-        }
-        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-            vec![]
-        }
-        fn with_new_children(
-            self: Arc<Self>,
-            _children: Vec<Arc<dyn ExecutionPlan>>,
-        ) -> DFResult<Arc<dyn ExecutionPlan>> {
-            Ok(self)
-        }
-        fn execute(
-            &self,
-            _partition: usize,
-            _context: Arc<TaskContext>,
-        ) -> DFResult<SendableRecordBatchStream> {
-            Ok(Box::pin(MemoryStream::try_new(
-                self.batches.clone(),
-                Arc::clone(&self.schema),
-                None,
-            )?))
-        }
+        MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).unwrap()
     }
 
     async fn execute_fold(

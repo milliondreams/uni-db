@@ -6,6 +6,7 @@
 from datetime import date, datetime
 
 import pytest
+from pydantic import field_validator
 
 from uni_pydantic import (
     Field,
@@ -501,3 +502,242 @@ class TestTypedMapProperty:
         assert found is not None
         assert found.scores == {"x": 1.5, "y": 2.25}
         assert found.nested == {"k": [1, 2, 3], "m": [4]}
+
+
+# ---------------------------------------------------------------------------
+# Hydration must not silently drop rows
+# ---------------------------------------------------------------------------
+
+
+class FalsyThing(UniNode):
+    """A model that is legitimately falsy when empty.
+
+    Defining ``__bool__`` is ordinary Python, and nothing documents that a
+    model may not. Every hydration path gated on ``if instance:`` drops such a
+    row on the floor, so ``.all()`` silently returns fewer rows than matched.
+    """
+
+    __label__ = "FalsyThing"
+
+    name: str
+    count: int = 0
+
+    def __bool__(self) -> bool:
+        return self.count > 0
+
+
+class PickyThing(UniNode):
+    """A model whose validator legitimately rejects some stored data."""
+
+    __label__ = "PickyThing"
+
+    name: str
+
+    @field_validator("name")
+    @classmethod
+    def _reject_bad(cls, v: str) -> str:
+        if v == "bad":
+            raise ValueError("name must not be 'bad'")
+        return v
+
+
+class BuggyThing(UniNode):
+    """A model whose validator raises a *non*-validation error.
+
+    Stands in for any defect inside hydration -- a broken type coercion, a
+    typo'd attribute in ``_convert_db_values``, a raising ``@field_validator``.
+    ``except Exception: return None`` cannot tell this apart from data that
+    genuinely failed validation, so the bug is invisible and the row vanishes.
+    """
+
+    __label__ = "BuggyThing"
+
+    name: str
+
+    @field_validator("name")
+    @classmethod
+    def _boom(cls, v: str) -> str:
+        if v == "boom":
+            raise RuntimeError("hydration bug, not a validation failure")
+        return v
+
+
+def _raw_create(session, cypher: str) -> None:
+    """Insert nodes bypassing the ORM, so model validation runs only on load."""
+    tx = session._db_session.tx()
+    tx.execute(cypher)
+    tx.commit()
+
+
+class TestHydrationDoesNotDropRows:
+    def test_falsy_instance_is_not_dropped(self, session):
+        session.register(FalsyThing)
+        session.sync_schema()
+
+        _raw_create(
+            session,
+            "CREATE (:FalsyThing {name: 'empty', count: 0}) "
+            "CREATE (:FalsyThing {name: 'full', count: 3})",
+        )
+
+        found = session.query(FalsyThing).all()
+        names = sorted(f.name for f in found)
+        assert names == ["empty", "full"], (
+            f"a validly hydrated but falsy model was dropped; got {names}"
+        )
+
+    def test_hydration_bug_is_not_swallowed(self, session):
+        session.register(BuggyThing)
+        session.sync_schema()
+
+        _raw_create(
+            session,
+            "CREATE (:BuggyThing {name: 'ok'}) CREATE (:BuggyThing {name: 'boom'})",
+        )
+
+        # A RuntimeError from inside hydration is a defect, not a data problem.
+        # Silently returning one row instead of two hides it completely.
+        with pytest.raises(RuntimeError, match="hydration bug"):
+            session.query(BuggyThing).all()
+
+    def test_validation_failure_warns_instead_of_vanishing(self, session):
+        session.register(PickyThing)
+        session.sync_schema()
+
+        _raw_create(
+            session,
+            "CREATE (:PickyThing {name: 'good'}) CREATE (:PickyThing {name: 'bad'})",
+        )
+
+        # Genuinely invalid stored data is still skipped -- but it must say so,
+        # naming the label and vid, rather than shrinking the result set in
+        # silence.
+        with pytest.warns(UserWarning, match="PickyThing"):
+            found = session.query(PickyThing).all()
+
+        assert [p.name for p in found] == ["good"]
+
+    def test_valid_rows_are_unaffected(self, session):
+        """Inverse guard: narrowing the except must not break ordinary loads."""
+        session.register(Person)
+        session.sync_schema()
+
+        session.add_all(
+            [
+                Person(name="Alice", email="alice@drop.test"),
+                Person(name="Bob", email="bob@drop.test"),
+            ]
+        )
+        session.commit()
+
+        found = session.query(Person).all()
+        assert sorted(p.name for p in found) == ["Alice", "Bob"]
+
+
+# ---------------------------------------------------------------------------
+# eager_load() must hydrate models, exactly as lazy loading does
+# ---------------------------------------------------------------------------
+
+
+class Author(UniNode):
+    """Owner of both a to-many and a to-one relationship."""
+
+    __label__ = "Author"
+
+    name: str
+
+    books: list["Book"] = Relationship("WROTE")
+    bio: "Bio | None" = Relationship("HAS_BIO")
+
+
+class Book(UniNode):
+    __label__ = "Book"
+
+    title: str
+
+
+class Bio(UniNode):
+    __label__ = "Bio"
+
+    summary: str
+
+
+class TestEagerLoadHydratesModels:
+    """`_eager_load_relationships` cached raw result dicts.
+
+    The lazy path (`_load_relationship`) routes rows through
+    `_result_to_model` and honours `descriptor.is_list`; the eager path did
+    neither. `RelationshipDescriptor.__get__` returns whatever is cached
+    verbatim, so eager loading handed back `list[dict]` where lazy loading
+    hands back `list[Model]` — and a to-one relationship came back as a list.
+
+    This is worse on the async session, where `_load_relationship` *raises*
+    and tells the caller to use `eager_load()`. There, the broken path is the
+    only relationship path there is.
+    """
+
+    def _seed(self, session):
+        session.register(Author, Book, Bio)
+        session.sync_schema()
+
+        author = Author(name="Ursula")
+        book = Book(title="A Wizard of Earthsea")
+        bio = Bio(summary="Wrote about wizards.")
+        session.add_all([author, book, bio])
+        session.commit()
+
+        session.create_edge(author, "WROTE", book, {})
+        session.create_edge(author, "HAS_BIO", bio, {})
+        session._db.flush()
+        return author
+
+    def test_to_many_yields_models_not_dicts(self, session):
+        self._seed(session)
+
+        found = session.query(Author).eager_load("books").all()
+        assert len(found) == 1
+        books = found[0].books
+
+        assert len(books) == 1
+        assert isinstance(books[0], Book), (
+            f"eager_load cached a raw {type(books[0]).__name__}; "
+            "attribute access on it fails where lazy loading works"
+        )
+        # The symptom a user actually hits.
+        assert books[0].title == "A Wizard of Earthsea"
+
+    def test_to_one_yields_a_model_not_a_list(self, session):
+        self._seed(session)
+
+        found = session.query(Author).eager_load("bio").all()
+        bio = found[0].bio
+
+        assert not isinstance(bio, list), (
+            "a to-one relationship must not come back as a list; "
+            "`descriptor.is_list` was ignored"
+        )
+        assert isinstance(bio, Bio)
+        assert bio.summary == "Wrote about wizards."
+
+    def test_eager_and_lazy_agree(self, session):
+        """The two paths must produce the same thing for the same data."""
+        self._seed(session)
+
+        eager = session.query(Author).eager_load("books").all()[0].books
+        lazy = session.query(Author).all()[0].books
+
+        assert [type(b) for b in eager] == [type(b) for b in lazy]
+        assert [b.title for b in eager] == [b.title for b in lazy]
+
+    def test_no_related_rows_is_still_well_typed(self, session):
+        """Inverse guard: an author with nothing attached."""
+        session.register(Author, Book, Bio)
+        session.sync_schema()
+
+        session.add(Author(name="Nobody"))
+        session.commit()
+        session._db.flush()
+
+        found = session.query(Author).eager_load("books", "bio").all()
+        assert found[0].books == []
+        assert found[0].bio is None

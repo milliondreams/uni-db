@@ -376,9 +376,12 @@ async def test_get_label_info(async_empty_db):
     info = await async_empty_db.get_label_info("Movie")
 
     assert info.name == "Movie"
-    # count may be 0 if get_label_info doesn't reflect recent inserts
-    # just check the attribute exists
-    assert hasattr(info, "count")
+    # This used to be `assert hasattr(info, "count")`, weakened with the comment
+    # "count may be 0 if get_label_info doesn't reflect recent inserts". That was
+    # a real bug, not a tolerance: get_label_info counted flushed storage only
+    # and could not see the L0 buffers. It now counts via Cypher, like
+    # get_edge_type_info, so the value is assertable.
+    assert info.count == 2
 
     # Check properties
     assert len(info.properties) == 3

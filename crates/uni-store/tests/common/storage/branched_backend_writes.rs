@@ -24,7 +24,7 @@ use uni_store::backend::branched::BranchedBackend;
 use uni_store::backend::lance::LanceDbBackend;
 use uni_store::backend::lance_branch;
 use uni_store::backend::traits::StorageBackend;
-use uni_store::backend::types::{ScanRequest, WriteMode};
+use uni_store::backend::types::{FilterExpr, ScanRequest, WriteMode};
 use uni_store::fork::{ForkRegistryHandle, ForkScope};
 
 fn arrow_schema() -> Arc<ArrowSchema> {
@@ -157,7 +157,13 @@ async fn write_overwrite_replaces_branch_tip_only() {
 async fn delete_rows_removes_only_on_branch() {
     let (_dir, inner, branched, _branch) = fixture().await;
 
-    branched.delete_rows("rows", "id = 2").await.unwrap();
+    branched
+        .delete_rows(
+            "rows",
+            &FilterExpr::equals("id", uni_store::backend::types::Scalar::Int(2)),
+        )
+        .await
+        .unwrap();
 
     // Branch missing id=2.
     assert_eq!(count_via_scan(&branched, "rows").await, 2);

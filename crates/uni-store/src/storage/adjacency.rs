@@ -3,14 +3,10 @@
 
 use crate::backend::StorageBackend;
 use crate::backend::table_names;
-use crate::backend::types::{ScanRequest, WriteMode};
+use crate::backend::types::{FilterExpr, Scalar, ScanRequest, WriteMode};
 use anyhow::{Result, anyhow};
 use arrow_array::{ListArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
-#[cfg(feature = "lance-backend")]
-use futures::TryStreamExt;
-#[cfg(feature = "lance-backend")]
-use lance::dataset::Dataset;
 use std::collections::HashMap;
 use std::sync::Arc;
 use uni_common::core::id::{Eid, Vid};
@@ -119,8 +115,6 @@ fn extract_adjacency_from_batch_grouped(batch: &RecordBatch) -> Result<GroupedAd
 }
 
 pub struct AdjacencyDataset {
-    #[cfg_attr(not(feature = "lance-backend"), allow(dead_code))]
-    uri: String,
     edge_type: String,
     direction: String,
     /// Lance branch for branched reads. `None` = primary.
@@ -133,17 +127,8 @@ impl AdjacencyDataset {
     ///
     /// The on-disk dataset is per-`(edge_type, direction)` — the `label`
     /// argument is vestigial (adjacency is not per-label) and kept only for
-    /// call-site stability. The `uri` mirrors the backend's canonical
-    /// `{base}/{table_name}.lance` so the direct-open path (`open`/`open_at`,
-    /// `lance-backend` only) targets the same dataset the live backend reads.
-    pub fn new(base_uri: &str, edge_type: &str, _label: &str, direction: &str) -> Self {
-        let uri = format!(
-            "{}/{}.lance",
-            base_uri,
-            table_names::adjacency_table_name(edge_type, direction)
-        );
+    pub fn new(_base_uri: &str, edge_type: &str, _label: &str, direction: &str) -> Self {
         Self {
-            uri,
             edge_type: edge_type.to_string(),
             direction: direction.to_string(),
             branch: None,
@@ -161,23 +146,6 @@ impl AdjacencyDataset {
         let mut ds = Self::new(base_uri, edge_type, label, direction);
         ds.branch = Some(branch.into());
         ds
-    }
-
-    #[cfg(feature = "lance-backend")]
-    pub async fn open(&self) -> Result<Arc<Dataset>> {
-        self.open_at(None).await
-    }
-
-    #[cfg(feature = "lance-backend")]
-    pub async fn open_at(&self, version: Option<u64>) -> Result<Arc<Dataset>> {
-        let mut ds = match &self.branch {
-            Some(branch) => crate::backend::lance_branch::open_branch(&self.uri, branch).await?,
-            None => Dataset::open(&self.uri).await?,
-        };
-        if let Some(v) = version {
-            ds = ds.checkout_version(v).await?;
-        }
-        Ok(Arc::new(ds))
     }
 
     pub fn get_arrow_schema(&self) -> Arc<ArrowSchema> {
@@ -200,35 +168,6 @@ impl AdjacencyDataset {
         Arc::new(ArrowSchema::new(fields))
     }
 
-    #[cfg(feature = "lance-backend")]
-    pub async fn read_adjacency(&self, vid: Vid) -> Result<Option<(Vec<Vid>, Vec<Eid>)>> {
-        self.read_adjacency_at(vid, None).await
-    }
-
-    #[cfg(feature = "lance-backend")]
-    pub async fn read_adjacency_at(
-        &self,
-        vid: Vid,
-        version: Option<u64>,
-    ) -> Result<Option<(Vec<Vid>, Vec<Eid>)>> {
-        let ds = match self.open_at(version).await {
-            Ok(ds) => ds,
-            Err(_) => return Ok(None),
-        };
-
-        let mut stream = ds
-            .scan()
-            .filter(&format!("src_vid = {}", vid.as_u64()))?
-            .try_into_stream()
-            .await?;
-
-        if let Some(batch) = stream.try_next().await? {
-            return extract_adjacency_from_batch(&batch);
-        }
-
-        Ok(None)
-    }
-
     // ========================================================================
     // Backend-agnostic Methods
     // ========================================================================
@@ -247,7 +186,7 @@ impl AdjacencyDataset {
             return Ok(None);
         }
 
-        let filter = format!("src_vid = {}", vid.as_u64());
+        let filter = FilterExpr::equals("src_vid", Scalar::UInt(vid.as_u64()));
         let batches = backend
             .scan(ScanRequest::all(&table_name).with_filter(filter))
             .await?;
@@ -280,13 +219,7 @@ impl AdjacencyDataset {
             return Ok(HashMap::new());
         }
 
-        // Build IN filter for batch query
-        let vid_list = vids
-            .iter()
-            .map(|v| v.as_u64().to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let filter = format!("src_vid IN ({})", vid_list);
+        let filter = FilterExpr::one_of("src_vid", vids.iter().map(|v| Scalar::UInt(v.as_u64())));
         let batches = backend
             .scan(ScanRequest::all(&table_name).with_filter(filter))
             .await?;

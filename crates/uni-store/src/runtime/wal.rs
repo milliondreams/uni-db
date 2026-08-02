@@ -510,7 +510,39 @@ impl WriteAheadLog {
         let mut segments_replayed = 0;
 
         for (idx, path) in paths.iter().enumerate() {
-            let get_result = get_with_timeout(&self.store, path, DEFAULT_TIMEOUT).await?;
+            // A segment can disappear between the listing above and this read.
+            // Two benign, unavoidable causes:
+            //   * a flush finalizer's `truncate_before` (writer.rs step K) is
+            //     deleting segments concurrently. `Drop for Uni` only *signals*
+            //     shutdown (`ShutdownHandle::shutdown_blocking` sends on a
+            //     channel and returns without joining), so a spawned finalizer
+            //     outlives the handle and can still be truncating while the next
+            //     open replays.
+            //   * an eventually-consistent object store returns an
+            //     already-deleted key in a listing.
+            //
+            // Skipping costs no durability: `truncate_before` only deletes
+            // segments whose mutations are already in L1, so a vanished segment
+            // carries nothing that is not recovered anyway — and a listing taken
+            // microseconds later would simply not have included it. Propagating
+            // instead turns the race into a failed database open.
+            //
+            // ONLY `NotFound` is skipped. Any other read error still fails
+            // recovery: treating a transient blip as "skip" would silently drop
+            // committed mutations. Pinned by
+            // `replay_still_fails_on_non_notfound_read_error`.
+            let get_result = match get_with_timeout(&self.store, path, DEFAULT_TIMEOUT).await {
+                Ok(result) => result,
+                Err(e) if crate::store_utils::is_not_found(&e) => {
+                    warn!(
+                        path = %path,
+                        "WAL segment vanished between listing and read (concurrent \
+                         truncation); skipping — its mutations are already durable in L1"
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             let bytes = get_result.bytes().await?;
 
             // Empty files and decode failures share one corruption policy.
@@ -564,6 +596,39 @@ impl WriteAheadLog {
         self.replay_since(0).await
     }
 
+    /// Delete one WAL segment, treating "already absent" as success.
+    ///
+    /// `truncate_before` and `truncate` list segments and then delete them one
+    /// at a time. Between the listing and any given delete, another truncation
+    /// can remove the same segment: the flush finalizer runs `truncate_before`
+    /// on a spawned task (`writer.rs` step K) which outlives the `Uni` handle,
+    /// because `Drop for Uni` only *signals* shutdown
+    /// (`ShutdownHandle::shutdown_blocking` sends on a channel and returns
+    /// without joining). Reopening the same directory therefore gives two live
+    /// truncators, and the loser of the race previously failed its whole flush
+    /// with `Object at location ... not found`.
+    ///
+    /// A delete whose object is already gone has achieved its postcondition, so
+    /// treating it as an error is wrong. Only `NotFound` is tolerated — every
+    /// other delete error still propagates, so a permissions or I/O fault is
+    /// never mistaken for "already truncated".
+    ///
+    /// Returns `true` when this call is the one that removed the object, so
+    /// `deleted_count` stays an honest count rather than a count of attempts.
+    async fn delete_segment_if_present(&self, path: &Path) -> Result<bool> {
+        match delete_with_timeout(&self.store, path, DEFAULT_TIMEOUT).await {
+            Ok(()) => Ok(true),
+            Err(e) if crate::store_utils::is_not_found(&e) => {
+                debug!(
+                    path = %path,
+                    "WAL segment already removed by a concurrent truncation; nothing to do"
+                );
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Deletes WAL segments with LSN <= high_water_mark by parsing filenames.
     /// Only downloads segments if filename parsing fails (fallback).
     #[instrument(skip(self), level = "info")]
@@ -603,8 +668,7 @@ impl WriteAheadLog {
                 }
             };
 
-            if should_delete {
-                delete_with_timeout(&self.store, &meta.location, DEFAULT_TIMEOUT).await?;
+            if should_delete && self.delete_segment_if_present(&meta.location).await? {
                 deleted_count += 1;
             }
         }
@@ -624,8 +688,9 @@ impl WriteAheadLog {
 
         let mut deleted_count = 0;
         for meta in metas {
-            delete_with_timeout(&self.store, &meta.location, DEFAULT_TIMEOUT).await?;
-            deleted_count += 1;
+            if self.delete_segment_if_present(&meta.location).await? {
+                deleted_count += 1;
+            }
         }
         info!(deleted_count, "Full WAL truncation completed");
         Ok(())
@@ -1226,5 +1291,369 @@ mod tests {
             serde_json::to_vec(&owned).unwrap(),
             serde_json::to_vec(&borrowed).unwrap()
         );
+    }
+
+    /// An `ObjectStore` that lists a chosen path but returns `NotFound` when it
+    /// is read — modelling the window between `replay_since`'s listing and its
+    /// per-segment `get`.
+    ///
+    /// Two real situations produce exactly this, and neither is a fault:
+    ///   * a flush finalizer's `truncate_before` (`writer.rs` step K) deleting a
+    ///     segment concurrently — `Drop for Uni` only *signals* shutdown
+    ///     (`ShutdownHandle::shutdown_blocking` sends on a channel and returns),
+    ///     so a spawned finalizer outlives the handle and can still be deleting
+    ///     while the next open replays;
+    ///   * an eventually-consistent object store returning a already-deleted key
+    ///     in a listing.
+    #[derive(Debug)]
+    struct VanishingStore {
+        inner: Arc<dyn ObjectStore>,
+        vanish: Path,
+    }
+
+    impl std::fmt::Display for VanishingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "VanishingStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for VanishingStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            if location == &self.vanish {
+                return Err(object_store::Error::NotFound {
+                    path: location.to_string(),
+                    source: Box::new(std::io::Error::from(std::io::ErrorKind::NotFound)),
+                });
+            }
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// Build a WAL with `n` single-mutation segments and return their paths in
+    /// LSN order.
+    async fn seed_segments(store: &Arc<dyn ObjectStore>, prefix: &Path, n: u64) -> Vec<Path> {
+        let wal = WriteAheadLog::new(store.clone(), prefix.clone());
+        for i in 1..=n {
+            wal.append(Mutation::InsertVertex {
+                vid: Vid::new(i),
+                properties: HashMap::new(),
+                labels: vec![],
+            })
+            .unwrap();
+            wal.flush().await.unwrap();
+        }
+        let mut paths: Vec<Path> = list_with_timeout(store, Some(prefix), DEFAULT_TIMEOUT)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.location)
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    /// A WAL segment that disappears between the listing and its read must not
+    /// fail recovery.
+    ///
+    /// `replay_since` lists segments and then `get`s each one. A concurrent
+    /// `truncate_before` deletes segments whose mutations are already durable in
+    /// L1, so a segment vanishing in that window carries nothing that is not
+    /// already recovered — and a listing taken microseconds later would simply
+    /// not have included it. Propagating the `NotFound` turns that benign,
+    /// unavoidable race into a hard open failure.
+    ///
+    /// Observed in the wild as a load-dependent flake in
+    /// `recovery_index_no_rebuild::scalar_recovered_delta_queryable_without_rebuild`:
+    /// `Object at location .../wal/00000000000000000002_<uuid>.wal not found`.
+    #[tokio::test]
+    async fn replay_skips_segment_truncated_between_list_and_read() -> Result<()> {
+        let dir = tempdir()?;
+        let prefix = Path::from("wal");
+        let base: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new_with_prefix(dir.path())?);
+        let paths = seed_segments(&base, &prefix, 3).await;
+
+        // Vanish a NON-tail segment: the tail has its own corrupt-tail policy,
+        // so using the tail would pass for the wrong reason.
+        let store: Arc<dyn ObjectStore> = Arc::new(VanishingStore {
+            inner: base,
+            vanish: paths[0].clone(),
+        });
+        let wal = WriteAheadLog::new(store, prefix);
+
+        let mutations = wal.replay().await?;
+
+        // The two readable segments still replay; only the vanished one is skipped.
+        assert_eq!(
+            mutations.len(),
+            2,
+            "a concurrently-truncated segment must be skipped, not fail the replay"
+        );
+        Ok(())
+    }
+
+    /// A store whose `list` hands back entries that it has *already* removed —
+    /// the other truncator winning the race in the window between our listing
+    /// and our deletes. The `NotFound` the truncation then sees is a real one
+    /// raised by `LocalFileSystem`, not a synthesised error.
+    #[derive(Debug)]
+    struct DeletedAfterListStore {
+        inner: Arc<dyn ObjectStore>,
+    }
+
+    impl std::fmt::Display for DeletedAfterListStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "DeletedAfterListStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for DeletedAfterListStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            use futures::{StreamExt, TryStreamExt};
+            let inner = self.inner.clone();
+            let prefix = prefix.cloned();
+            Box::pin(
+                futures::stream::once(async move {
+                    let metas: Vec<object_store::ObjectMeta> = inner
+                        .list(prefix.as_ref())
+                        .try_collect()
+                        .await
+                        .unwrap_or_default();
+                    // The competing truncation completes here.
+                    for m in &metas {
+                        let _ = inner.delete(&m.location).await;
+                    }
+                    futures::stream::iter(metas.into_iter().map(Ok))
+                })
+                .flatten(),
+            )
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// Truncation must not fail when a segment it listed was already deleted by
+    /// a concurrent truncation.
+    ///
+    /// Two truncators exist whenever a spawned flush finalizer (`writer.rs`
+    /// step K) outlives its `Uni` — `Drop for Uni` only signals shutdown — and
+    /// the directory is reopened. The loser used to fail the enclosing flush
+    /// with `Object at location .../wal/...wal not found`, which is how this
+    /// surfaced as a load-dependent flake across the
+    /// `recovery_index_no_rebuild` tests.
+    ///
+    /// Deleting an object that is already absent has achieved its
+    /// postcondition, so it is success, not failure.
+    #[tokio::test]
+    async fn truncate_tolerates_segment_deleted_by_concurrent_truncation() -> Result<()> {
+        let dir = tempdir()?;
+        let prefix = Path::from("wal");
+        let base: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new_with_prefix(dir.path())?);
+        seed_segments(&base, &prefix, 3).await;
+
+        let store: Arc<dyn ObjectStore> = Arc::new(DeletedAfterListStore { inner: base });
+        let wal = WriteAheadLog::new(store, prefix);
+
+        // Every segment this lists has already been removed by the time the
+        // delete runs.
+        wal.truncate_before(u64::MAX)
+            .await
+            .expect("truncate_before must tolerate an already-deleted segment");
+        wal.truncate()
+            .await
+            .expect("truncate must tolerate an already-deleted segment");
+        Ok(())
+    }
+
+    /// Inverse guard: a `NotFound` is the *only* read error that may be skipped.
+    /// A transient read failure must still fail recovery loudly, or a blip
+    /// silently drops committed mutations.
+    #[tokio::test]
+    async fn replay_still_fails_on_non_notfound_read_error() -> Result<()> {
+        struct FailingStore(Arc<dyn ObjectStore>);
+
+        impl std::fmt::Debug for FailingStore {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "FailingStore")
+            }
+        }
+        impl std::fmt::Display for FailingStore {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "FailingStore")
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl ObjectStore for FailingStore {
+            async fn put_opts(
+                &self,
+                location: &Path,
+                payload: object_store::PutPayload,
+                opts: object_store::PutOptions,
+            ) -> object_store::Result<object_store::PutResult> {
+                self.0.put_opts(location, payload, opts).await
+            }
+            async fn put_multipart_opts(
+                &self,
+                location: &Path,
+                opts: object_store::PutMultipartOptions,
+            ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+                self.0.put_multipart_opts(location, opts).await
+            }
+            async fn get_opts(
+                &self,
+                _location: &Path,
+                _options: object_store::GetOptions,
+            ) -> object_store::Result<object_store::GetResult> {
+                Err(object_store::Error::Generic {
+                    store: "FailingStore",
+                    source: Box::new(std::io::Error::other("injected transient read failure")),
+                })
+            }
+            fn delete_stream(
+                &self,
+                locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+            ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+                self.0.delete_stream(locations)
+            }
+            fn list(
+                &self,
+                prefix: Option<&Path>,
+            ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+            {
+                self.0.list(prefix)
+            }
+            async fn list_with_delimiter(
+                &self,
+                prefix: Option<&Path>,
+            ) -> object_store::Result<object_store::ListResult> {
+                self.0.list_with_delimiter(prefix).await
+            }
+            async fn copy_opts(
+                &self,
+                from: &Path,
+                to: &Path,
+                options: object_store::CopyOptions,
+            ) -> object_store::Result<()> {
+                self.0.copy_opts(from, to, options).await
+            }
+        }
+
+        let dir = tempdir()?;
+        let prefix = Path::from("wal");
+        let base: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new_with_prefix(dir.path())?);
+        seed_segments(&base, &prefix, 2).await;
+
+        let store: Arc<dyn ObjectStore> = Arc::new(FailingStore(base));
+        let wal = WriteAheadLog::new(store, prefix);
+
+        assert!(
+            wal.replay().await.is_err(),
+            "a non-NotFound read error must still fail recovery"
+        );
+        Ok(())
     }
 }

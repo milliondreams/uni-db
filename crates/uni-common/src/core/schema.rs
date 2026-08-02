@@ -1177,55 +1177,48 @@ pub enum IndexDefinition {
     Sparse(SparseVectorIndexConfig),
 }
 
-impl IndexDefinition {
-    /// Returns the index name for any variant.
-    pub fn name(&self) -> &str {
-        match self {
-            IndexDefinition::Vector(c) => &c.name,
-            IndexDefinition::FullText(c) => &c.name,
-            IndexDefinition::Scalar(c) => &c.name,
-            IndexDefinition::Inverted(c) => &c.name,
-            IndexDefinition::JsonFullText(c) => &c.name,
-            IndexDefinition::Sparse(c) => &c.name,
-        }
-    }
-
-    /// Returns the label this index is defined on.
-    pub fn label(&self) -> &str {
-        match self {
-            IndexDefinition::Vector(c) => &c.label,
-            IndexDefinition::FullText(c) => &c.label,
-            IndexDefinition::Scalar(c) => &c.label,
-            IndexDefinition::Inverted(c) => &c.label,
-            IndexDefinition::JsonFullText(c) => &c.label,
-            IndexDefinition::Sparse(c) => &c.label,
-        }
-    }
-
-    /// Returns a reference to the index lifecycle metadata.
-    pub fn metadata(&self) -> &IndexMetadata {
-        match self {
-            IndexDefinition::Vector(c) => &c.metadata,
-            IndexDefinition::FullText(c) => &c.metadata,
-            IndexDefinition::Scalar(c) => &c.metadata,
-            IndexDefinition::Inverted(c) => &c.metadata,
-            IndexDefinition::JsonFullText(c) => &c.metadata,
-            IndexDefinition::Sparse(c) => &c.metadata,
-        }
-    }
-
-    /// Returns a mutable reference to the index lifecycle metadata.
-    pub fn metadata_mut(&mut self) -> &mut IndexMetadata {
-        match self {
-            IndexDefinition::Vector(c) => &mut c.metadata,
-            IndexDefinition::FullText(c) => &mut c.metadata,
-            IndexDefinition::Scalar(c) => &mut c.metadata,
-            IndexDefinition::Inverted(c) => &mut c.metadata,
-            IndexDefinition::JsonFullText(c) => &mut c.metadata,
-            IndexDefinition::Sparse(c) => &mut c.metadata,
-        }
-    }
+/// Single source of truth for the `IndexDefinition` variant table.
+///
+/// Every accessor below (`name`, `label`, `metadata`, `metadata_mut`) drives
+/// off this list, so adding an index kind means editing exactly one place.
+/// Mirrors the `for_each_crdt_variant!` idiom in `uni-crdt`.
+macro_rules! for_each_index_variant {
+    ($mac:ident) => {
+        $mac! { Vector, FullText, Scalar, Inverted, JsonFullText, Sparse }
+    };
 }
+
+/// Generate a `&self -> &T` accessor that forwards to the same field on
+/// whichever config the variant carries.
+macro_rules! index_field_accessor {
+    ($($variant:ident),*) => {
+        impl IndexDefinition {
+            /// Returns the index name for any variant.
+            pub fn name(&self) -> &str {
+                match self { $(IndexDefinition::$variant(c) => &c.name,)* }
+            }
+
+            /// Returns the label this index is defined on.
+            pub fn label(&self) -> &str {
+                match self { $(IndexDefinition::$variant(c) => &c.label,)* }
+            }
+
+            /// Returns a reference to the index lifecycle metadata.
+            pub fn metadata(&self) -> &IndexMetadata {
+                match self { $(IndexDefinition::$variant(c) => &c.metadata,)* }
+            }
+
+            /// Returns a mutable reference to the index lifecycle metadata.
+            pub fn metadata_mut(&mut self) -> &mut IndexMetadata {
+                match self { $(IndexDefinition::$variant(c) => &mut c.metadata,)* }
+            }
+        }
+    };
+}
+
+for_each_index_variant!(index_field_accessor);
+
+impl IndexDefinition {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InvertedIndexConfig {

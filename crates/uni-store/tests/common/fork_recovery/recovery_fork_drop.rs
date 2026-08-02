@@ -21,7 +21,8 @@ use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 use uni_common::core::fork::{ForkId, ForkInfo};
 use uni_store::backend::lance_branch;
-use uni_store::fork::recovery::{join_uri_with, recover_forks};
+use uni_store::backend::lance_branch::LanceBranching;
+use uni_store::fork::recovery::recover_forks;
 use uni_store::fork::registry::ForkRegistryHandle;
 
 #[tokio::test]
@@ -64,7 +65,7 @@ async fn tombstoned_drop_completes_on_recovery() {
     // Restart and recover.
     let h2 = ForkRegistryHandle::load(store.clone()).await.unwrap();
     let base = format!("{}/", dir.path().display());
-    let reconciled = recover_forks(&h2, &store, &[], join_uri_with(base))
+    let reconciled = recover_forks(&h2, &store, &[], Some(&LanceBranching::new(base)))
         .await
         .unwrap();
     assert_eq!(reconciled, 1);
@@ -115,7 +116,7 @@ async fn orphan_tombstone_with_no_registry_entry_is_swept() {
     // tombstoned-recovery path. This still validates the recovery
     // contract: tombstone present → recovery completes the drop.
     let base = format!("{}/", dir.path().display());
-    let reconciled = recover_forks(&h2, &store, &[], join_uri_with(base))
+    let reconciled = recover_forks(&h2, &store, &[], Some(&LanceBranching::new(base)))
         .await
         .unwrap();
     assert!(
@@ -157,13 +158,13 @@ async fn recover_forks_is_idempotent() {
 
     let base = format!("{}/", dir.path().display());
     let h2 = ForkRegistryHandle::load(store.clone()).await.unwrap();
-    let first = recover_forks(&h2, &store, &[], join_uri_with(base.clone()))
+    let first = recover_forks(&h2, &store, &[], Some(&LanceBranching::new(base.clone())))
         .await
         .unwrap();
     assert_eq!(first, 1);
 
     // Second invocation should be a no-op.
-    let second = recover_forks(&h2, &store, &[], join_uri_with(base))
+    let second = recover_forks(&h2, &store, &[], Some(&LanceBranching::new(base)))
         .await
         .unwrap();
     assert_eq!(second, 0);

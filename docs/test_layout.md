@@ -10,6 +10,33 @@ cycles, each statically linking the full transitive dep set
 This document codifies the convention so new crates and new test files
 follow it without per-author discovery.
 
+## The rule (hard cap)
+
+**A crate must not exceed 3 integration-test binaries.** Aim for 1.
+The unit-test binary Cargo builds from the crate's own `src/` (the one
+nextest lists as the bare crate name) does not count against the cap —
+only binaries produced from files under `tests/`.
+
+Concretely, when you add a test:
+
+- **Adding a repro or an integration test?** Add a `mod <name>;` line to
+  the crate's existing `tests/integration.rs` and drop your file next to
+  it. Do **not** create a new top-level `tests/<name>.rs` — that silently
+  mints a whole new binary (full relink of datafusion/lance/candle/...),
+  which is the exact drift this convention exists to prevent.
+- **Crate has no `integration.rs` yet?** If it already has more than ~3
+  loose `tests/*.rs` files, consolidate them first (see the migration
+  recipe below), then add yours as a `mod`.
+- **Need a 2nd or 3rd binary?** Only for a genuine, documented reason —
+  a mutually-exclusive feature set (e.g. `provider-onnx-dynamic`), a
+  loom/model-check target built under a different feature, or a
+  registry/linker-section test that needs process isolation. Record the
+  reason in a comment on the `[[test]]` entry. "It's a separate topic" is
+  **not** a reason — that's what modules are for.
+
+The three legitimate exception classes are the only ones observed in this
+workspace; see "Edge cases" for each.
+
 ## The pattern
 
 For any crate with more than ~3 integration test files, configure
@@ -139,13 +166,21 @@ To convert an unconverted crate:
 
 ## Crates currently following this convention
 
-| Crate | Layout | Notes |
+| Crate | Integration binaries | Notes |
 |---|---|---|
 | `uni` | 9 categorical shims + 5 feature-gated standalones | Original; 280 files behind 14 binaries |
-| `uni-store` | Single `integration` binary | 40 files behind 1 binary; 9 are lance-gated in-file |
-| `uni-query` | Single `integration` binary | 27 files behind 1 binary |
+| `uni-store` | 2 (`integration` + `occ_model`) | `occ_model` is the loom/shuttle model-check target (`#![cfg(any(feature = "loom", feature = "shuttle"))]`) and must stay standalone — merging it drags real-`Writer` tests into the loom build, which panics |
+| `uni-query` | 1 (`integration`) | 27+ files behind 1 binary |
+| `uni-cypher` | 1 (`integration`) | 9 files consolidated |
+| `uni-plugin-host` | 1 (`integration`) | 6 `bug_*` repros consolidated |
+| `uni-locy` | 1 (`integration`) | 5 repros consolidated |
+| `uni-query-functions` | 1 (`integration`) | 4 repros consolidated |
 
-Smaller crates (≤4 integration test files) have not been converted —
-the per-file binary count is already small enough that the convention's
-overhead would outweigh its benefit. New crates should still adopt the
-pattern proactively if test file count is expected to grow.
+Every crate above is at or under the 3-binary cap. When adding a test to any
+of them, add a `mod` to its `tests/integration.rs` — do not create a new
+top-level `tests/*.rs` file (`autotests = false` is set, so a stray file would
+not even be built until it is explicitly `mod`-ed or given its own `[[test]]`).
+
+Crates with ≤3 integration test files are already within the cap and need no
+`integration.rs` yet — but the moment a 4th would be added, consolidate first
+(migration recipe above) rather than minting a 4th binary.

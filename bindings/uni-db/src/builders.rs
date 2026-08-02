@@ -13,42 +13,21 @@ use std::sync::Arc;
 use uni_common::core::schema::{DataType, IndexDefinition};
 
 /// M8 F2 helper: convert a list of grant strings into a
-/// [`uni_plugin::CapabilitySet`]. Empty / `None` → empty set.
+/// [`uni_plugin::CapabilitySet`]. Empty / `None` → default decorator set.
 ///
-/// Recognised grants mirror the rhai loader's surface (sync_api.rs
-/// `load_rhai_plugin` accepts the same set): `ScalarFn` /
-/// `AggregateFn` / `Procedure` / `Filesystem` / `Network` /
-/// `HostQuery` / `Kms` / `Secret`. Unknown grants are silently
-/// dropped (decorators don't fail on best-effort grant strings;
-/// stricter validation lives in the Python source-load path).
+/// Grant strings are parsed by [`uni_plugin::Capability::parse_grant`] — the
+/// single source of truth shared with the strict loader path and the CLI. On this
+/// best-effort decorator surface, unrecognized / non-grantable strings are
+/// silently dropped (stricter validation lives in the Python source-load path).
 pub(crate) fn build_capability_set(grants: Option<Vec<String>>) -> uni_plugin::CapabilitySet {
     use uni_plugin::Capability;
     let mut cap_set = uni_plugin::CapabilitySet::new();
     if let Some(list) = grants {
         for g in list {
-            match g.as_str() {
-                "ScalarFn" => cap_set.insert(Capability::ScalarFn),
-                "AggregateFn" => cap_set.insert(Capability::AggregateFn),
-                "Procedure" => cap_set.insert(Capability::Procedure),
-                "Filesystem" => cap_set.insert(Capability::Filesystem {
-                    read: vec!["**".into()],
-                    write: vec!["**".into()],
-                }),
-                "Network" => cap_set.insert(Capability::Network {
-                    allow: vec!["**".into()],
-                }),
-                "HostQuery" => cap_set.insert(Capability::HostQuery {
-                    read_only: true,
-                    scopes: vec!["**".into()],
-                }),
-                "Kms" => cap_set.insert(Capability::Kms {
-                    key_ids: vec!["*".into()],
-                }),
-                "Secret" => cap_set.insert(Capability::Secret {
-                    ids: vec!["*".into()],
-                }),
-                _ => true, // ignore unknown for now
-            };
+            // Best-effort: ignore anything not grantable from a bare string.
+            if let Ok(cap) = Capability::parse_grant(&g) {
+                cap_set.insert(cap);
+            }
         }
     } else {
         // Default for decorator surface: enable scalar / aggregate /
@@ -65,16 +44,19 @@ pub(crate) fn build_capability_set(grants: Option<Vec<String>>) -> uni_plugin::C
 ///
 /// Used by the Rhai loader (sync and async), which validates grants strictly.
 /// Grants default to `ScalarFn` / `AggregateFn` / `Procedure` when `None`.
+/// Grant strings are parsed by [`uni_plugin::Capability::parse_grant`] — the
+/// single source of truth shared with the lenient path and the CLI — so any
+/// grantable capability (buckets A + B), including `Algorithm` / `GraphCompute`,
+/// is accepted with its broadest attenuation; tightening is host-side work.
 ///
 /// # Errors
-/// Returns a `ValueError` if `grants` contains an unrecognized capability name.
+/// Returns a `ValueError` if `grants` contains a name that is unknown, a resource
+/// quota (needs a value in the manifest), or an internal / first-party capability.
 pub(crate) fn build_capability_set_strict(
     grants: Option<Vec<String>>,
 ) -> PyResult<uni_plugin::CapabilitySet> {
     use uni_plugin::Capability;
     let mut cap_set = uni_plugin::CapabilitySet::new();
-    // Any grant adds the capability with the broadest attenuation
-    // (e.g. Filesystem {read: ["**"]}); tightening is host-side work.
     let grants = grants.unwrap_or_else(|| {
         vec![
             "ScalarFn".to_owned(),
@@ -83,49 +65,9 @@ pub(crate) fn build_capability_set_strict(
         ]
     });
     for g in &grants {
-        match g.as_str() {
-            "ScalarFn" => {
-                cap_set.insert(Capability::ScalarFn);
-            }
-            "AggregateFn" => {
-                cap_set.insert(Capability::AggregateFn);
-            }
-            "Procedure" => {
-                cap_set.insert(Capability::Procedure);
-            }
-            "Filesystem" => {
-                cap_set.insert(Capability::Filesystem {
-                    read: vec!["**".into()],
-                    write: vec!["**".into()],
-                });
-            }
-            "Network" => {
-                cap_set.insert(Capability::Network {
-                    allow: vec!["**".into()],
-                });
-            }
-            "HostQuery" => {
-                cap_set.insert(Capability::HostQuery {
-                    read_only: true,
-                    scopes: vec!["**".into()],
-                });
-            }
-            "Kms" => {
-                cap_set.insert(Capability::Kms {
-                    key_ids: vec!["*".into()],
-                });
-            }
-            "Secret" => {
-                cap_set.insert(Capability::Secret {
-                    ids: vec!["*".into()],
-                });
-            }
-            other => {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "unknown grant `{other}`; supported: ScalarFn / AggregateFn / Procedure / Filesystem / Network / HostQuery / Kms / Secret"
-                )));
-            }
-        }
+        let cap = Capability::parse_grant(g)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        cap_set.insert(cap);
     }
     Ok(cap_set)
 }
@@ -148,6 +90,10 @@ pub(crate) fn load_outcome_to_pydict(
     dict.set_item(
         "procedures_registered",
         outcome.procedures_registered.clone(),
+    )?;
+    dict.set_item(
+        "algorithms_registered",
+        outcome.algorithms_registered.clone(),
     )?;
     let denied: Vec<String> = outcome
         .denied_capabilities
@@ -1693,6 +1639,10 @@ pub struct PyTxQueryBuilder {
     pub(crate) cypher: String,
     pub(crate) params: HashMap<String, Py<PyAny>>,
     pub(crate) timeout_secs: Option<f64>,
+    /// Mirrors `SessionQueryBuilder`. Its absence made the whole transaction
+    /// surface uncancellable from Python even though the Rust builder this
+    /// wraps has carried the field all along.
+    pub(crate) cancellation_token: Option<crate::types::PyCancellationToken>,
 }
 
 #[pymethods]
@@ -1709,6 +1659,15 @@ impl PyTxQueryBuilder {
         slf
     }
 
+    /// Attach a cancellation token for cooperative query cancellation.
+    fn cancellation_token(
+        mut slf: PyRefMut<'_, Self>,
+        token: crate::types::PyCancellationToken,
+    ) -> PyRefMut<'_, Self> {
+        slf.cancellation_token = Some(token);
+        slf
+    }
+
     /// Fetch all results as a `QueryResult`.
     fn fetch_all(&self, py: Python) -> PyResult<crate::types::PyQueryResult> {
         let tx_ref = self.tx.borrow(py);
@@ -1722,6 +1681,9 @@ impl PyTxQueryBuilder {
         }
         if let Some(t) = self.timeout_secs {
             builder = builder.timeout(std::time::Duration::from_secs_f64(t));
+        }
+        if let Some(ref ct) = self.cancellation_token {
+            builder = builder.cancellation_token(ct.inner.clone());
         }
         let result = py
             .detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(builder.fetch_all()))
@@ -1746,6 +1708,9 @@ impl PyTxQueryBuilder {
             let val = convert::py_object_to_value(py, v)?;
             builder = builder.param(k, val);
         }
+        if let Some(ref ct) = self.cancellation_token {
+            builder = builder.cancellation_token(ct.inner.clone());
+        }
         let result = py
             .detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(builder.run()))
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
@@ -1765,6 +1730,9 @@ impl PyTxQueryBuilder {
         }
         if let Some(t) = self.timeout_secs {
             builder = builder.timeout(std::time::Duration::from_secs_f64(t));
+        }
+        if let Some(ref ct) = self.cancellation_token {
+            builder = builder.cancellation_token(ct.inner.clone());
         }
         let cursor = py
             .detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(builder.cursor()))

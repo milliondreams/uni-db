@@ -550,3 +550,248 @@ YIELD nodeId, order
 RETURN nodeId, order
 ORDER BY order ASC
 ```
+
+---
+
+## 12. Guest-Authorable Graph Algorithms (GraphCompute)
+
+Beyond the built-in `uni.algo.*` catalog, third-party algorithms can be authored in a guest language (Rhai, Python/PyO3, WASM, Extism) and run inside the engine as a *conductor* that issues coarse **native kernels** over opaque graph handles. The guest never touches raw storage; it orchestrates O(V+E) native primitives (projection, SpMV, expand, arena / tree-search ops) and reads back only small result tensors. First-party guest algorithms ship under `uni.algo.gc*` (e.g. `uni.algo.gcpagerank`).
+
+### Kernel catalog highlights
+
+Element-wise / map kernels make composite scoring formulas expressible without a bespoke native op — e.g. the UCT exploration term `c * sqrt(ln N / n)` is now composable:
+
+| Kernel | Effect |
+|---|---|
+| `map_apply(m, "sqrt")` | Element-wise sqrt over a map handle |
+| `map_apply(m, "exp")` | Element-wise exp |
+| `ewise(a, b, "div")` | Element-wise `a / b`, with `x / 0 = 0` |
+| `compare(a, b, "gt")` | Element-wise comparison (`gt`/`ge`/`lt`/`le`/`eq`/`ne`) to a 1.0/0.0 mask; shape-preserving, so an `[E]` comparison yields an `[E]` mask |
+| `work_budget()` / `work_spent()` / `work_remaining()` | The native-work meter; reading costs nothing |
+
+### When `node_property` / `edge_property` return NaN
+
+The consumer-facing rule has two halves, and they behave differently:
+
+- A property you **did not request** in the projection spec is an **error**:
+  `edge_property: \`w\` was not projected (add it to edgeProperties)`. The
+  `nodeProperties` / `edgeProperties` config keys are what make a column exist at
+  all — a kernel cannot read a column the projection never materialized.
+- A property you **did** request but which has no value for a given element is
+  `NaN`, per element, silently. That is deliberate: `NaN` is an honest "no value
+  here", distinct from a real `0.0`, and it propagates visibly into `reduce_sum`.
+
+A requested name that is declared on **none** of the projected labels/edge types
+*and* resolves for **no** projected element is rejected outright — that is a typo,
+not data. A name declared on at least one projected label is accepted across a
+heterogeneous projection; the labels that do not carry it yield `NaN`. The same
+check covers `weightProperty`, where the old failure mode was worse: an unknown
+weight name silently defaulted every edge weight to `1.0`, which is
+indistinguishable from real data.
+
+So, after that check, the remaining ways to see `NaN` are:
+
+| Cause | Detail |
+| --- | --- |
+| Heterogeneous projection | The element's label does not declare the property. |
+| Non-numeric value | Only `Float` and `Int` convert; `Bool`, `String`, `Null` and `Bytes` all read `NaN`. |
+| Deleted element | A tombstone in a newer L0 generation removes the entry. |
+| Time-travel pin | A pinned snapshot drops entries above its version high-water mark. |
+
+Two related contracts worth knowing:
+
+- **Cypher / Named projections carry no property columns at all**, so
+  `node_property` / `edge_property` against one always *error* — they never return
+  `NaN`. Use a label/edge-type-scoped projection when you need property tensors.
+- **Edge weight is not an edge property.** A missing weight falls back to `1.0`
+  (the traversal default), never `NaN`.
+
+### Composing operations the catalog does not name
+
+The kernel set is deliberately coarse and the op vocabularies are closed, so `ewise` has no
+`gt` and `map_apply` has no `step`. That does **not** mean thresholds and conditionals are out
+of reach: `map_to_set` carries a closed predicate enum and `set_to_map` lifts the resulting
+bitset back to a `[V]` map, which composes with `ewise mul` into an ordinary masked blend.
+
+Ask for an op that is not in a vocabulary and the engine answers with the remedy:
+
+```
+bad ewise op `gt` — elementwise comparison is composable: compare(a, b, "gt");
+valid ewise ops: add, mul, min, max, axpy, div
+```
+
+| You wanted | Compose it as |
+| --- | --- |
+| `a > b` (also `ge`/`lt`/`le`/`eq`/`ne`) | `compare(a, b, "gt")` — a kernel since 3.0; the older `set_to_map(map_to_set(...))` composition still works but costs three passes of the work meter |
+| `step(a, theta)` / `heaviside` | `set_to_map(map_to_set(a, "gt", theta), 1.0)` |
+| `select(m, a, b)` | `ewise(b, ewise(m, ewise(a, b, "axpy", -1.0), "mul"), "add")` |
+| `a - b` | `ewise(a, b, "axpy", -1.0)` |
+| `a - c` (constant) | `map_apply(a, "affine", 1.0, -c)` |
+| `relu(a)` | `ewise(a, set_to_map(map_to_set(a, "gt", 0.0), 1.0), "mul")` |
+| `abs(a)` | `ewise(a, map_apply(a, "scale", -1.0), "max")` |
+| `clip(a, lo, hi)` | `ewise(ewise(a, lo, "max"), hi, "min")` |
+| `a ** 2`, integer powers | `repeat ewise(x, x, "mul"); x squared is ewise(a, a, "mul")` |
+| `-a` | `map_apply(a, "scale", -1.0)` |
+| `normalize(m)` | `map_apply(m, "normalize_l1") or map_apply(m, "normalize_l2")` |
+| an exact edge mask (edge-type / class selector) | `edge_mask_window(edge_property(g, prop), 0.5, 1.5)` — deterministic, no RNG. `sample_edges(sel, seed, iter)` yields the same mask because `prob = 0.0` never fires and `prob = 1.0` always does, **for every seed** — that endpoint behaviour is a guarantee, not an accident. Prefer the window: it says what it means. |
+
+Two caveats worth knowing before you rely on them:
+
+- **The `select` blend poisons on NaN.** `0.0 * NaN = NaN`, so a NaN in the *unselected* branch
+  propagates. Where either branch may be NaN, `scatter` over the `VertexSet` instead of
+  multiplying by its lowered mask.
+- **A composed comparison charges the native-work meter three times** (`ewise` + `map_to_set` +
+  `set_to_map`, each `|V|`), where a primitive comparison would charge once.
+
+These identities are executed against an independent scalar oracle on every CI run
+(`composition_recipes.rs`), so a recipe that stops being true breaks the build rather than
+quietly misleading you.
+
+Arena — the tree-search substrate, now **11 kernels**:
+
+| Kernel | Effect |
+|---|---|
+| `arena_backup(arena, value_col, leaves, deltas)` | Value backprop along each leaf's **full root path** (general-depth UCT, not just depth-1). |
+| `arena_descend(...)` | Selection descent. The virtual-loss (`vloss`) term is a flat linear score offset applied in the descent loop — **not** a per-visit UCB recompute. Run at `vloss = 0` for parity with a Python-engine reference. |
+
+Reachability and sampled expansion:
+
+| Kernel | Effect |
+|---|---|
+| `reach_fixpoint(g, seeds, dir)` | BFS-to-fixpoint reachable set in one native O(V+E) call. |
+| `expand_sampled(g, frontier, dir, exclude, prob, seed, iter)` | Fused frontier-scoped lazy sampled expansion — draws only the frontier's out-edges (out-only), applying the per-edge Bernoulli `prob` inline. |
+| `sample_edges_undirected(g, prob, seed, iter)` | Both half-edges of an undirected pair share one Bernoulli draw (canonical `(min, max)` key). Simple undirected graphs only. |
+
+Direction `"both"` — `expand`, `degrees`, and `spmv` accept `dir: "both"` (union of out + in edges). This **requires `includeReverse: true` in the projection config, or it errors** (fail-loud). `spmv` with `"both"` is unweighted.
+
+### Argument typing
+
+A guest algorithm's declared manifest `args` are now type- and arity-checked before the provider runs (previously the declaration was ignored). Tokens:
+
+| Token | Accepts |
+|---|---|
+| `value` / `cypherValue` | A scalar **or** an array — e.g. a variable-length seed set |
+| `list` / `array` | An array/list argument |
+| `int`, `float`, `string`, `bool`, ... | The corresponding primitive |
+
+A guest declaring `args: ["value"]` can be called with a Cypher list directly — no per-arity codegen:
+
+```cypher
+CALL p.spread([1, 2, 3], {nodeLabels: ['N'], edgeTypes: ['E']})
+```
+
+The trailing projection-config object (`{nodeLabels, edgeTypes, includeReverse, projectAll, ...}`) is an implicit optional last argument on every guest algorithm — it need not be declared in `args`.
+
+### Projection scoping is fail-loud (breaking change)
+
+An **unscoped** projection — no `nodeLabels` and no `edgeTypes` — now **errors** instead of silently projecting the whole graph. To project the entire graph, name the labels/types or set `projectAll: true` explicitly. First-party `uni.algo.gc*` procedures opt into whole-graph projection automatically.
+
+Additional fail-loud guarantees:
+- `emit` names the fault at the guest's call: a column from the wrong projection is rejected by identity, and a wrong-length column by length.
+- A whole-graph projection errors on undeclared (schemaless) labels.
+- Stored property values now read correctly from **unflushed in-memory L0** — previously a projection built before a flush saw `NaN` values / default edge weight `1.0`.
+
+### Value identity: shape and index space
+
+Every value carries the **shape** it was built with (`[V]` or `[E]`) and the **index space** its
+slots belong to — the projection or arena it came from. Both are enforced, so a `[V]` map cannot
+combine with an `[E]` tensor of equal length, and values from two projections cannot combine at
+all (slot `i` names a different vertex in each). `ewise`, `map_apply`, `compare` and
+`segmented_reduce` preserve both, so an `[E]` pipeline stays `[E]` through to `sample_edges`.
+
+Sets, walk matrices and pair lists are tagged too, so a foreign operand is rejected wherever one
+meets a graph or another set: the set algebra, `expand` / `expand_masked` / `expand_sampled`
+(frontier, `exclude` **and** edge mask), `spmv` / `spmv_masked`, `scatter`, a masked `reduce`,
+`walk_visit_counts`, and `sample_edges_undirected`. The `exclude` case matters most:
+`reach_fixpoint` passes the visited-set as `exclude` every iteration, so a foreign one silently
+under-expands the traversal instead of failing.
+
+`set_to_map` therefore **inherits** its set's space. *Unknown* survives only as the permissive
+element of unification — nothing a guest can build lands there. `map_to_set` is shape-polymorphic:
+an `[E]` tensor lowers to an `EdgeSet` that `spmv_masked` accepts.
+
+A guest can pre-declare extra projections at the CALL site with a `scopes` map
+(`{nodeLabels: [...], scopes: {agg: {nodeLabels: [...], edgeTypes: [...]}}}`) and reach them with
+`gc.graph_named("agg")`. Scopes are built by the host before the guest runs — `graph_named` is a
+lookup, so a guest cannot project in a loop and escape the work meter — and the size-derived work
+budget is summed across every bound projection. Each scope takes the full config vocabulary
+independently, Native or Cypher/Named. Slot correspondence between projections is a **Native-only**
+guarantee: `ProjectionBuilder` sorts and dedups vids, `GraphProjection::from_rows` does not.
+
+To combine values across scopes, use `rekey(value, g)`. It is a *verified* move, not a cast: it
+walks both slot→Vid maps and fails naming the first divergent slot unless the projections describe
+the same vertices. `[V]` tensors and vertex sets only — `[E]` values have no cross-projection
+meaning.
+
+Egress is keyed to the value: `topk`, `arg_extreme`, `emit_walks` and `emit_pairs` return the vids
+of *their own* value's projection, not the first graph bound; an arena-keyed value is rejected.
+`emit` checks identity before length, so a wrong-projection column is named as such.
+
+### The native-work budget
+
+Every invocation gets a finite budget of *native-work units*, and each kernel
+charges roughly the work it does. Exceeding it aborts the CALL with `0x865`
+(`GraphComputeIncomplete`, reason `Exhausted`) — never a silently truncated result.
+
+**The default is `min(10_000 x (|V| + |E| + 1), 1_000_000_000)`.** Both `|V|` and
+`|E|` appear because the meter charges the `O(V)` kernels as well as the `O(E)`
+ones. The absolute ceiling binds above roughly 100k projected elements, so the
+linear term alone is not the whole rule.
+
+A `GraphComputeWork` capability grant **replaces** that default rather than
+raising it — an explicit grant is authoritative in both directions.
+
+**What each kernel charges:**
+
+| Kernel family | Charge |
+| --- | --- |
+| `spmv`, `spmv_masked`, `edge_weights`, `edges_all` | `|E|` |
+| `expand`, `expand_masked`, `expand_sampled` | the frontier's total degree |
+| `sample_edges`, `sample_edges_undirected` | `|E|`, checked in chunks |
+| `degrees`, `vertex_ids`, `ewise`, `compare`, `map_apply`, `reduce_sum`, `reduce_sum_masked`, `zero_map`, `scatter`, `set_to_map`, `map_to_set`, `l1_diff`, `arg_extreme`, `topk`, `next_bucket`, `node_property`, `edge_property`, `segmented_reduce`, `edge_mask_window` | one unit per element |
+| `frontier` | one unit per seed |
+| `rekey` | `|V|` — it walks both projections' slot→Vid maps to verify the correspondence |
+| `set_union` / `set_diff` / `set_intersect` | one unit per 64-bit *word*, not per element |
+| `emit` | `rows x columns` |
+| `random_walks`, `walk_visit_counts`, `emit_walks` | total steps |
+| `neighborhood_overlap`, `all_pairs_overlap` | work done, at least `|V|` |
+| arena kernels | their own footprint (capacity, path length, or neighbours touched) |
+| `work_budget` / `work_spent` / `work_remaining`, `set_len`, `is_empty`, `free`, `vertex_count`, `edge_count` | nothing |
+
+Expensive kernels re-check mid-loop, so a single celebrity-vertex `expand` cannot
+blow past the cap. Batching amortizes the boundary crossing but never the meter:
+a batched kernel charges the same as the calls it replaces.
+
+**Reading the meter from a guest:**
+
+```rhai
+let left = gc.work_remaining();   // free; so are work_budget and work_spent
+```
+
+Sizing work ahead of a run is better done from the formula than from the meter:
+branching on `work_remaining()` makes a kernel's *result* depend on the capability
+grant, so the same program under two grants can return different answers. That
+does not violate the determinism contract, which is per-configuration, but it does
+forfeit cross-grant reproducibility — and a differential oracle would see it as
+drift. Discovering the ceiling by deliberately triggering aborted CALLs is never
+necessary: it is a pure function of `|V|` and `|E|`.
+
+### Tracing handle resolutions
+
+Setting `UNI_GC_TRACE` makes a session remember its recent handle resolutions, and
+attaches them to any handle error it raises:
+
+```
+GraphComputeError: stale handle [gc-trace, oldest first, epoch:kind:gen:slot —
+0007:1:000:0 0007:2:000:1 0007:1:001:0]
+```
+
+The trace is bounded (the tail leading up to a failure, not the whole history) and
+rides the error rather than a separate log, so it reaches whoever ran the query
+without any extra plumbing. It is recorded at the point every loader shares, so a
+Rhai guest is covered as well as the sandboxed ones.
+
+It is always compiled and inert unless the variable is set — with it unset,
+nothing is recorded and error messages are byte-identical. That is deliberate:
+diagnostics you cannot switch on in an already-shipped build are no help against a
+problem that only appears in production.

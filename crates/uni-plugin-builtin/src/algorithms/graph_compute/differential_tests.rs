@@ -22,8 +22,11 @@ use super::first_party::{
     bellman_ford, eigenvector_centrality, k_core, personalized_pagerank, reachable_set, wcc_labels,
 };
 use super::handle::{Handle, HandleKind};
-use super::session::{AlgoSession, Direction, GraphCompute, MapOp, Semiring};
-use super::value::{DType, Scalar};
+use super::session::{
+    AlgoSession, Direction, EndpointOp, EwiseOp, GraphArenaCompute, GraphCompute, MapOp,
+    OverlapMetric, PairSpec, Predicate, Semiring, rem_floor,
+};
+use super::value::{DType, Scalar, Tensor};
 use super::{Arena, WorkBudget};
 
 // ---- test fixtures -------------------------------------------------------
@@ -622,9 +625,7 @@ fn next_bucket_selects_the_distance_band() {
         let relaxed = s
             .spmv(g, dist, Semiring::ShortestPath, Direction::Out, None)
             .unwrap();
-        let next = s
-            .ewise(dist, relaxed, super::session::EwiseOp::Min)
-            .unwrap();
+        let next = s.ewise(dist, relaxed, EwiseOp::Min).unwrap();
         s.free(relaxed).unwrap();
         s.free(dist).unwrap();
         dist = next;
@@ -765,18 +766,93 @@ fn emit_validates_against_declared_columns() {
     let (mut s, m) = mk_session(vec!["score".to_string()]);
     s.emit(&[("score", m)]).expect("declared column emits");
 
-    // Omitting a declared column -> 0x869.
+    // Omitting a declared column is still 0x869 — but at session close, not at
+    // the emit call. Every guest shim emits one column per call, so a partial
+    // emit is a legal intermediate state; only the closed session can know the
+    // set is short.
     let (mut s, m) = mk_session(vec!["a".to_string(), "b".to_string()]);
+    s.emit(&[("a", m)])
+        .expect("a partial emit is legal; the set is checked at close");
     assert_eq!(
-        s.emit(&[("a", m)]).unwrap_err().code,
-        super::error::EMIT_SCHEMA_MISMATCH
+        s.finish_emitted().unwrap_err().code,
+        super::error::EMIT_SCHEMA_MISMATCH,
+        "a declared column the guest never emitted must fail at close"
     );
 
-    // Repeating a column -> 0x869.
+    // Repeating a column within one call -> 0x869.
     let (mut s, m) = mk_session(vec!["score".to_string()]);
     assert_eq!(
         s.emit(&[("score", m), ("score", m)]).unwrap_err().code,
         super::error::EMIT_SCHEMA_MISMATCH
+    );
+
+    // Repeating a column ACROSS calls -> 0x869. Accumulation makes this newly
+    // reachable, and it must not be silent: `build_batch` resolves each declared
+    // field by the first matching entry, so an appended duplicate would quietly
+    // discard the second value.
+    let (mut s, m) = mk_session(vec!["score".to_string()]);
+    s.emit(&[("score", m)]).expect("first emit lands");
+    assert_eq!(
+        s.emit(&[("score", m)]).unwrap_err().code,
+        super::error::EMIT_SCHEMA_MISMATCH,
+        "re-emitting a column must be rejected, not silently dropped"
+    );
+}
+
+/// A guest emitting one column per call assembles the full declared set — the
+/// shape every loader shim actually produces.
+#[test]
+fn emit_accumulates_across_calls() {
+    let nodes = vec![0, 1, 2];
+    let edges = vec![(0, 1, 1.0), (1, 2, 1.0)];
+    let arena = Arena::new(
+        super::DEFAULT_ARENA_MAX_BYTES,
+        super::DEFAULT_ARENA_MAX_HANDLES,
+    );
+    let mut s = AlgoSession::new(1, WorkBudget::from_edge_count(1_000), arena)
+        .with_expected_columns(vec!["a".to_string(), "b".to_string()]);
+    let g = s.bind_graph(Arc::new(build_projection(&nodes, &edges, false, false)));
+    let deg = s.degrees(g, Direction::Out).expect("degrees");
+    let ids = s.vertex_ids(g).expect("vertex_ids");
+
+    s.emit(&[("a", deg)]).expect("first column");
+    s.emit(&[("b", ids)]).expect("second column");
+
+    let emitted = s.finish_emitted().expect("the declared set is complete");
+    let names: Vec<&str> = emitted.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, vec!["a", "b"], "both columns survive, in emit order");
+    assert!(
+        emitted.iter().all(|(_, vals)| vals.len() == 3),
+        "columns stay keyed to the projected vertex space"
+    );
+}
+
+/// Columns must stay rectangular across calls, not merely within one.
+#[test]
+fn emit_rejects_a_ragged_column_from_a_later_call() {
+    let arena = Arena::new(
+        super::DEFAULT_ARENA_MAX_BYTES,
+        super::DEFAULT_ARENA_MAX_HANDLES,
+    );
+    let mut s = AlgoSession::new(1, WorkBudget::from_edge_count(1_000), arena);
+    // No expected-columns contract and NO bound graph, so the
+    // `primary_graph.vertex_count()` anchor is unavailable and the seeded
+    // cross-call length is the only thing standing between a guest and a ragged
+    // batch. Arena columns give differently-sized tensors without a projection.
+    use super::session::GraphArenaCompute as _;
+    let arena = s.arena_new(8, 2).expect("arena");
+    // `arena_alloc` yields a tensor of the requested slot count — the only
+    // tensor source that needs no projection.
+    // Lengths are the requested slot counts by construction. (These are
+    // i64-backed; `emit` widens them, so they exercise the length guard fine.)
+    let three = s.arena_alloc(arena, 3).expect("three slots");
+    let two = s.arena_alloc(arena, 2).expect("two slots");
+    s.emit(&[("a", three)])
+        .expect("first column sets the width");
+    assert_eq!(
+        s.emit(&[("b", two)]).unwrap_err().code,
+        super::error::EMIT_SCHEMA_MISMATCH,
+        "a later call must not widen or narrow the emitted batch"
     );
 }
 
@@ -1088,9 +1164,7 @@ fn m4_spmv_mask_fuses_with_filter() {
         .spmv(g, src, Semiring::LinearAlgebra, Direction::Out, None)
         .unwrap();
     let indicator = s.set_to_map(mask, Scalar::F64(1.0)).unwrap();
-    let filtered = s
-        .ewise(full, indicator, super::session::EwiseOp::Mul)
-        .unwrap();
+    let filtered = s.ewise(full, indicator, EwiseOp::Mul).unwrap();
 
     let a = read_tensor(&s, fused);
     let b = read_tensor(&s, filtered);
@@ -1180,9 +1254,9 @@ fn p0_8_kernels_charge_their_exact_work() {
     let e = edges.len() as u64;
     let (mut s, g) = session_with(build_projection(&nodes, &edges, false, false));
 
-    let mut last = s.work_spent();
+    let mut last = s.work_spent_units();
     let charged = |s: &AlgoSession, last: &mut u64| -> u64 {
-        let now = s.work_spent();
+        let now = s.work_spent_units();
         let delta = now - *last;
         *last = now;
         delta
@@ -1194,7 +1268,7 @@ fn p0_8_kernels_charge_their_exact_work() {
     let inv = s.map_apply(deg, MapOp::Scale(2.0)).unwrap();
     assert_eq!(charged(&s, &mut last), v, "map_apply charges |V|");
 
-    let sum = s.ewise(deg, inv, super::session::EwiseOp::Add).unwrap();
+    let sum = s.ewise(deg, inv, EwiseOp::Add).unwrap();
     assert_eq!(charged(&s, &mut last), v, "ewise charges |V|");
 
     let _ = s.reduce(sum, ReduceOp::Sum, None).unwrap();
@@ -1514,9 +1588,9 @@ fn s5_sample_charges_one_work_unit_per_element() {
     // work spent across the call so the tensor-build charges are excluded.
     let n = 5000;
     let (mut s, _g, prob) = constant_prob_fixture(n, 0.5);
-    let before = s.work_spent();
+    let before = s.work_spent_units();
     let _mask = s.sample(prob, 3, 0).expect("sample runs");
-    let charged = s.work_spent() - before;
+    let charged = s.work_spent_units() - before;
     assert_eq!(
         charged, n as u64,
         "sample must charge exactly |V| work units"
@@ -2367,4 +2441,2235 @@ impl std::ops::Deref for TensorView {
     fn deref(&self) -> &[f64] {
         &self.0
     }
+}
+
+// ---------------------------------------------------------------------------
+// AT-FLOW (issue #152 gap 2): edge-mutating workloads on the scratch substrate
+// ---------------------------------------------------------------------------
+
+/// A deterministic capacitated DAG-ish graph: `(u, v, capacity)` triples.
+///
+/// Fixed LCG so the oracle and the kernel see byte-identical input.
+fn random_flow_edges(nodes: usize, edges: usize, seed: u64) -> Vec<(usize, usize, f64)> {
+    let mut state = seed | 1;
+    let mut next = || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        (state >> 33) as usize
+    };
+    let mut out = Vec::with_capacity(edges);
+    while out.len() < edges {
+        let u = next() % nodes;
+        let v = next() % nodes;
+        if u == v {
+            continue;
+        }
+        // Orient low->high so the graph stays acyclic and the max-flow is
+        // non-trivial but well-defined.
+        let (a, b) = if u < v { (u, v) } else { (v, u) };
+        let cap = ((next() % 20) + 1) as f64;
+        out.push((a, b, cap));
+    }
+    out
+}
+
+/// Independent max-flow oracle: matrix-based Edmonds-Karp.
+///
+/// Deliberately a *different* algorithm and a *different* data structure from
+/// the adjacency-list Dinic under test, so agreement is real evidence rather
+/// than a shared-bug artifact (the AT-ABM discipline).
+fn native_max_flow(nodes: usize, edges: &[(usize, usize, f64)], s: usize, t: usize) -> f64 {
+    let mut cap = vec![vec![0.0f64; nodes]; nodes];
+    for &(u, v, c) in edges {
+        cap[u][v] += c;
+    }
+    let mut flow = 0.0;
+    loop {
+        let mut parent = vec![usize::MAX; nodes];
+        parent[s] = s;
+        let mut q = VecDeque::new();
+        q.push_back(s);
+        while let Some(u) = q.pop_front() {
+            for v in 0..nodes {
+                if parent[v] == usize::MAX && cap[u][v] > 1e-12 {
+                    parent[v] = u;
+                    q.push_back(v);
+                }
+            }
+        }
+        if parent[t] == usize::MAX {
+            break;
+        }
+        let mut bottleneck = f64::INFINITY;
+        let mut v = t;
+        while v != s {
+            let u = parent[v];
+            bottleneck = bottleneck.min(cap[u][v]);
+            v = u;
+        }
+        let mut v = t;
+        while v != s {
+            let u = parent[v];
+            cap[u][v] -= bottleneck;
+            cap[v][u] += bottleneck;
+            v = u;
+        }
+        flow += bottleneck;
+    }
+    flow
+}
+
+#[test]
+fn at_flow_batched_max_flow_matches_a_native_oracle() {
+    // AT-FLOW: a guest conducting `while augment_batch(..) > 0` over the scratch
+    // substrate computes the true max flow, proving the batched/handle design
+    // serves *edge-mutating* algorithms and not only node-growing search
+    // (issue #152 gap 2). Agreement is against an independent matrix-based
+    // Edmonds-Karp, so a shared bug cannot produce a false pass.
+    // AT-FLOW still exercises the retiring scratch path until its arena
+    // rewrite lands; the deprecation is a staged removal, not a bug here.
+    #[allow(deprecated)]
+    use super::scratch::ScratchGraph;
+    use super::{Arena, WorkBudget};
+
+    const NODES: usize = 40;
+    const EDGES: usize = 160;
+
+    for (seed, k) in [(0xF10Au64, 1usize), (0xF10A, 8), (0xBEEF, 32)] {
+        let edges = random_flow_edges(NODES, EDGES, seed);
+        let (s, t) = (0usize, NODES - 1);
+
+        #[allow(deprecated)]
+        let mut g = ScratchGraph::new(
+            WorkBudget::new(u64::MAX / 4),
+            Arena::new(1 << 24, 1 << 20),
+            seed,
+        );
+        for _ in 0..NODES {
+            g.add_node(0.0).unwrap();
+        }
+        for &(u, v, c) in &edges {
+            g.add_flow_edge(u as u32, v as u32, c).unwrap();
+        }
+
+        // The guest program: conduct phases until no augmenting path remains.
+        let mut total = 0.0;
+        let mut crossings = 0u32;
+        loop {
+            let pushed = g.augment_batch(s as u32, t as u32, k).unwrap();
+            crossings += 1;
+            if pushed <= 0.0 {
+                break;
+            }
+            total += pushed;
+        }
+
+        let expected = native_max_flow(NODES, &edges, s, t);
+        assert!(
+            (total - expected).abs() < 1e-9,
+            "seed {seed:x} k={k}: batched max-flow {total} != oracle {expected} \
+             (after {crossings} crossings)"
+        );
+
+        // Conservation, readable from residuals alone. Edges are oriented
+        // low->high, so node `s` (0) is never a destination — every one of its
+        // arcs is a forward arc, in insertion order — and node `t` is never a
+        // source, so every one of its arcs is a *reverse* arc whose residual is
+        // exactly the flow that arrived along its pair.
+        let src_caps: Vec<f64> = edges
+            .iter()
+            .filter(|&&(u, _, _)| u == s)
+            .map(|&(_, _, c)| c)
+            .collect();
+        let out_of_s: f64 = src_caps
+            .iter()
+            .enumerate()
+            .map(|(k, cap)| cap - g.edge_field(s as u32, k).unwrap())
+            .sum();
+        let deg_t = g.neighbors(t as u32).unwrap().len();
+        let into_t: f64 = (0..deg_t).map(|k| g.edge_field(t as u32, k).unwrap()).sum();
+
+        assert!(
+            (out_of_s - total).abs() < 1e-9,
+            "seed {seed:x} k={k}: flow leaving source {out_of_s} != {total}"
+        );
+        assert!(
+            (into_t - total).abs() < 1e-9,
+            "seed {seed:x} k={k}: flow entering sink {into_t} != {total}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AT-ARENA — batched arena search vs an independent oracle
+//
+// Replaces AT-MCTS (proposal §6), which proved determinism over the retired
+// scratch ABI on a structure that could not represent an MCTS node. This runs
+// the *kernel path* — handles, tensors, columns-by-index, work charging — and
+// compares against a plain-Rust tree walk that shares none of it.
+// ---------------------------------------------------------------------------
+
+/// A complete binary tree laid out as an adjacency list, the oracle's structure.
+fn oracle_tree(depth: u32) -> Vec<Vec<u32>> {
+    let n = (1usize << (depth + 1)) - 1;
+    let mut kids = vec![Vec::new(); n];
+    for (i, slot) in kids.iter_mut().enumerate() {
+        let (l, r) = (2 * i + 1, 2 * i + 2);
+        if r < n {
+            #[expect(clippy::cast_possible_truncation, reason = "tree is small in test")]
+            slot.extend_from_slice(&[l as u32, r as u32]);
+        }
+    }
+    kids
+}
+
+/// The oracle: descend from the root, greedily by score, applying one visit and
+/// the virtual loss at every step — the same *semantics* as the kernel, written
+/// independently and without handles, columns, or a work meter.
+fn oracle_descend(
+    kids: &[Vec<u32>],
+    score: &mut [f64],
+    visit: &mut [f64],
+    rollouts: usize,
+    vloss: f64,
+) -> Vec<u32> {
+    let mut leaves = Vec::with_capacity(rollouts);
+    for _ in 0..rollouts {
+        let mut cur = 0u32;
+        loop {
+            visit[cur as usize] += 1.0;
+            score[cur as usize] -= vloss;
+            let ks = &kids[cur as usize];
+            if ks.is_empty() {
+                break;
+            }
+            let mut best = ks[0];
+            for &k in &ks[1..] {
+                if score[k as usize] > score[best as usize] {
+                    best = k;
+                }
+            }
+            cur = best;
+        }
+        leaves.push(cur);
+    }
+    leaves
+}
+
+/// The kernel path and an independent oracle must agree exactly — on the leaves
+/// reached *and* on the resulting visit distribution.
+///
+/// Agreeing on the root visit count alone would be far too weak: a descent that
+/// silently ignored the score column would still visit the root every time.
+#[test]
+fn at_arena_batched_descent_matches_an_independent_oracle() {
+    use super::session::GraphArenaCompute;
+
+    const DEPTH: u32 = 6;
+    const ROLLOUTS: usize = 256;
+    const VLOSS: f64 = 0.35;
+
+    let kids = oracle_tree(DEPTH);
+    let n = kids.len();
+
+    let mut session = AlgoSession::new(11, WorkBudget::new(50_000_000), Arena::new(8 << 20, 4096));
+
+    // Build the same tree through the kernels.
+    #[expect(clippy::cast_possible_truncation, reason = "tree is small in test")]
+    let cap = n as u32;
+    let arena = session.arena_new(cap, 2).expect("arena");
+    let slots = session.arena_alloc(arena, cap).expect("alloc");
+    let mut parents: Vec<i64> = Vec::new();
+    let mut children: Vec<i64> = Vec::new();
+    for (i, ks) in kids.iter().enumerate() {
+        for &k in ks {
+            parents.push(i as i64);
+            children.push(i64::from(k));
+        }
+    }
+    let ph = session
+        .alloc_tensor_for_test(Tensor::from_i64(parents))
+        .expect("parents tensor");
+    let ch = session
+        .alloc_tensor_for_test(Tensor::from_i64(children))
+        .expect("children tensor");
+    session.arena_link(arena, ph, ch).expect("link");
+
+    let score_col = session.arena_column(arena).expect("score column");
+    let visit_col = session.arena_column(arena).expect("visit column");
+    assert_ne!(score_col, visit_col, "columns must be distinct");
+
+    // Seed the score column with a deterministic, non-uniform prior so the
+    // descent has something real to discriminate on.
+    let prior: Vec<f64> = (0..n).map(|i| ((i * 37) % 101) as f64 / 101.0).collect();
+    let all_slots = slots;
+    let prior_h = session
+        .alloc_tensor_for_test(Tensor::from_f64(prior.clone()))
+        .expect("prior tensor");
+    #[expect(clippy::cast_possible_truncation, reason = "column index is small")]
+    let sc = score_col as u32;
+    #[expect(clippy::cast_possible_truncation, reason = "column index is small")]
+    let vi = visit_col as u32;
+    session
+        .arena_scatter(arena, sc, all_slots, prior_h)
+        .expect("seed scores");
+
+    // One rollout per descend call, matching the oracle's sequential semantics.
+    let root_h = session
+        .alloc_tensor_for_test(Tensor::from_i64(vec![0]))
+        .expect("root tensor");
+    let mut kernel_leaves = Vec::with_capacity(ROLLOUTS);
+    for _ in 0..ROLLOUTS {
+        let out = session
+            .arena_descend(arena, root_h, sc, vi, true, VLOSS)
+            .expect("descend");
+        let t = session.tensor_for_test(out).expect("leaf tensor");
+        kernel_leaves
+            .push(u32::try_from(t.values_i64().expect("i64 leaves")[0]).expect("leaf fits u32"));
+    }
+
+    let mut o_score = prior;
+    let mut o_visit = vec![0.0; n];
+    let oracle_leaves = oracle_descend(&kids, &mut o_score, &mut o_visit, ROLLOUTS, VLOSS);
+
+    assert_eq!(
+        kernel_leaves, oracle_leaves,
+        "kernel and oracle must reach the same leaf on every rollout"
+    );
+
+    let kernel_visits = session.arena_column_for_test(arena, vi).expect("visits");
+    assert_eq!(
+        kernel_visits, o_visit,
+        "the whole visit distribution must match, not merely the root count"
+    );
+    assert!(
+        (kernel_visits[0] - ROLLOUTS as f64).abs() < f64::EPSILON,
+        "every rollout must pass through the root"
+    );
+
+    // Virtual loss must actually spread the search: a descent without it would
+    // take the same path every time (proposal §12.2 measured 16 of 1024 leaves).
+    let distinct: HashSet<u32> = kernel_leaves.iter().copied().collect();
+    assert!(
+        distinct.len() > 1,
+        "virtual loss must diversify the batch; got {} distinct leaves",
+        distinct.len()
+    );
+}
+
+/// Design P5: batching amortizes the crossing, never the meter.
+///
+/// One `arena_descend` over B roots must charge exactly what B single-root
+/// descents charge. If batching bought a discount, a guest could evade the
+/// native-work budget simply by batching harder — the budget is the only thing
+/// bounding a runaway guest that never returns to the host.
+#[test]
+fn arena_batching_gives_no_budget_discount() {
+    use super::session::GraphArenaCompute;
+
+    const DEPTH: u32 = 5;
+    const ROOTS: usize = 16;
+
+    // Building the identical arena twice keeps the comparison honest: the only
+    // difference between the two runs is batched vs sequential descent.
+    let build = || {
+        let kids = oracle_tree(DEPTH);
+        #[expect(clippy::cast_possible_truncation, reason = "tree is small in test")]
+        let cap = kids.len() as u32;
+        let mut s = AlgoSession::new(12, WorkBudget::new(50_000_000), Arena::new(8 << 20, 4096));
+        let arena = s.arena_new(cap, 2).expect("arena");
+        let _ = s.arena_alloc(arena, cap).expect("alloc");
+        let mut ps = Vec::new();
+        let mut cs = Vec::new();
+        for (i, ks) in kids.iter().enumerate() {
+            for &k in ks {
+                ps.push(i as i64);
+                cs.push(i64::from(k));
+            }
+        }
+        let ph = s.alloc_tensor_for_test(Tensor::from_i64(ps)).expect("p");
+        let ch = s.alloc_tensor_for_test(Tensor::from_i64(cs)).expect("c");
+        s.arena_link(arena, ph, ch).expect("link");
+        let sc = u32::try_from(s.arena_column(arena).expect("score")).expect("fits");
+        let vi = u32::try_from(s.arena_column(arena).expect("visit")).expect("fits");
+        (s, arena, sc, vi)
+    };
+
+    let (mut batched, a1, sc1, vi1) = build();
+    let roots = batched
+        .alloc_tensor_for_test(Tensor::from_i64(vec![0; ROOTS]))
+        .expect("roots");
+    let before = batched.spent_for_test();
+    batched
+        .arena_descend(a1, roots, sc1, vi1, true, 0.25)
+        .expect("batched descend");
+    let batched_cost = batched.spent_for_test() - before;
+
+    let (mut seq, a2, sc2, vi2) = build();
+    let one = seq
+        .alloc_tensor_for_test(Tensor::from_i64(vec![0]))
+        .expect("root");
+    let before = seq.spent_for_test();
+    for _ in 0..ROOTS {
+        seq.arena_descend(a2, one, sc2, vi2, true, 0.25)
+            .expect("single descend");
+    }
+    let sequential_cost = seq.spent_for_test() - before;
+
+    assert_eq!(
+        batched_cost, sequential_cost,
+        "a batched descent must charge exactly what the same descents charge one at a time"
+    );
+    assert!(batched_cost > 0, "descent must charge something");
+}
+
+/// The typed host ABI must reach the same kernels as the JSON one, and fail the
+/// same way (proposal §13.7).
+///
+/// `with_session` is what the WASM `host-arena` functions call instead of
+/// encoding a JSON string. If it diverged from `call_json` in either result or
+/// error behaviour, the two loader classes would silently disagree — the exact
+/// class of split-surface defect the reachability contract exists to prevent.
+#[test]
+fn typed_session_access_matches_the_json_path_and_isolates_panics() {
+    use super::dispatch::GraphComputeRegistry;
+    use super::session::GraphArenaCompute;
+
+    let registry = GraphComputeRegistry::new();
+    let sid = registry.open(AlgoSession::new(
+        21,
+        WorkBudget::new(1_000_000),
+        Arena::new(1 << 20, 256),
+    ));
+
+    // The typed path drives a real kernel and returns a real handle.
+    let arena = registry
+        .with_session(sid, |s| s.arena_new(16, 2))
+        .expect("typed arena_new");
+    let slots = registry
+        .with_session(sid, |s| s.arena_alloc(arena, 4))
+        .expect("typed arena_alloc");
+
+    // The same session is visible through the JSON path — one substrate, two
+    // ABIs, not two stacks.
+    let json = serde_json::json!({
+        "session": sid, "op": "arena_column", "g": to_i64_for_test(arena)
+    })
+    .to_string();
+    let resp: super::dispatch::KernelResponse =
+        serde_json::from_str(&registry.call_json(&json)).expect("decodes");
+    assert!(
+        matches!(resp, super::dispatch::KernelResponse::Float(f) if f == 0.0),
+        "the JSON path must see the arena the typed path created, got {resp:?}"
+    );
+
+    // A stale/forged handle fails typed, not by panic or silent success.
+    let bogus = Handle::from_u64(0xDEAD_BEEF);
+    let err = registry
+        .with_session(sid, |s| s.arena_alloc(bogus, 1))
+        .expect_err("a forged handle must be rejected");
+    assert!(
+        err.code == 0x863 || err.code == 0x860 || err.code == 0x861,
+        "expected a handle-validation code, got 0x{:x}",
+        err.code
+    );
+
+    // An unknown session is a typed error, never a lookup panic.
+    assert_eq!(
+        registry
+            .with_session(sid.wrapping_add(1), |s| s.arena_new(4, 2))
+            .expect_err("unknown session")
+            .code,
+        0x86E
+    );
+
+    // A panicking kernel body is isolated exactly as on the JSON path.
+    let err = registry
+        .with_session(sid, |_| -> Result<Handle, uni_plugin::errors::FnError> {
+            panic!("simulated kernel panic")
+        })
+        .expect_err("panic must be caught");
+    assert_eq!(err.code, 0x86D, "a panic must surface as an isolated 0x86D");
+
+    // The session survives the panic and still works.
+    registry
+        .with_session(sid, |s| s.arena_alloc(arena, 1))
+        .expect("session is usable after an isolated panic");
+    let _ = slots;
+}
+
+/// Packs a handle the way a loader does, for the test above.
+fn to_i64_for_test(h: Handle) -> i64 {
+    #[expect(clippy::cast_possible_wrap, reason = "handle round-trips bit-exact")]
+    let v = h.as_u64() as i64;
+    v
+}
+
+/// Phase 4's north star: the whole `graph-compute@1` kernel library applies to
+/// structure a *guest grew*, not only to a projection read from the store.
+///
+/// Builds a tree through the arena kernels, freezes it, and then runs ordinary
+/// Mode-A kernels — `vertex_count`, `degrees`, `expand`, `spmv` — against the
+/// resulting handle. The oracle is the same tree walked in plain Rust.
+#[test]
+fn frozen_arena_is_an_ordinary_graph_to_every_mode_a_kernel() {
+    use super::session::GraphArenaCompute;
+
+    const DEPTH: u32 = 4;
+    let kids = oracle_tree(DEPTH);
+    let n = kids.len();
+
+    let mut s = AlgoSession::new(31, WorkBudget::new(10_000_000), Arena::new(8 << 20, 4096));
+    #[expect(clippy::cast_possible_truncation, reason = "tree is small in test")]
+    let cap = n as u32;
+    let arena = s.arena_new(cap, 2).expect("arena");
+    let _ = s.arena_alloc(arena, cap).expect("alloc");
+
+    let mut ps = Vec::new();
+    let mut cs = Vec::new();
+    for (i, ks) in kids.iter().enumerate() {
+        for &k in ks {
+            ps.push(i as i64);
+            cs.push(i64::from(k));
+        }
+    }
+    let edge_total = ps.len();
+    let ph = s.alloc_tensor_for_test(Tensor::from_i64(ps)).expect("p");
+    let ch = s.alloc_tensor_for_test(Tensor::from_i64(cs)).expect("c");
+    s.arena_link(arena, ph, ch).expect("link");
+
+    // The freeze is what unifies the two worlds.
+    let g = s.arena_freeze(arena).expect("freeze");
+
+    assert_eq!(
+        s.vertex_count(g).expect("vertex_count on a frozen arena") as usize,
+        n,
+        "a frozen arena must report its slots as vertices"
+    );
+    assert_eq!(
+        s.edge_count(g).expect("edge_count on a frozen arena") as usize,
+        edge_total,
+        "freezing must drop the CSR slack, leaving exactly the linked edges"
+    );
+
+    // `degrees` is a real Mode-A kernel with no arena awareness whatsoever.
+    let deg = s.degrees(g, Direction::Out).expect("degrees");
+    let got = s.tensor_for_test(deg).expect("degree tensor").as_f64_vec();
+    let want: Vec<f64> = kids.iter().map(|k| k.len() as f64).collect();
+    assert_eq!(got, want, "out-degrees must match the tree that was grown");
+
+    // And a traversal kernel: expanding the root reaches exactly its children.
+    let root = s
+        .frontier(g, &[Vid::new(0)])
+        .expect("frontier over the frozen arena");
+    let nbrs = s.expand(g, root, Direction::Out, None).expect("expand");
+    let reached = s.set_len(nbrs).expect("set_len");
+    assert_eq!(
+        reached as usize,
+        kids[0].len(),
+        "expanding the root must reach exactly its linked children"
+    );
+
+    // The snapshot is stable: growing the arena afterwards must not mutate a
+    // graph handle already frozen.
+    let more = s.arena_alloc(arena, 0);
+    assert!(more.is_ok(), "arena remains usable after freezing");
+    assert_eq!(
+        s.vertex_count(g).expect("vertex_count again") as usize,
+        n,
+        "a frozen handle is a snapshot, not a live view"
+    );
+}
+
+// ---- REQ-D1 probe: comparison + select are composable from shipped kernels --
+
+/// Loads an explicit `[V]` map by scattering each value onto a zero map.
+fn load_map(s: &mut AlgoSession, g: Handle, vals: &[f64]) -> Handle {
+    let mut m = s.zero_map(g, DType::F64).expect("zero_map");
+    for (i, &v) in vals.iter().enumerate() {
+        let f = s
+            .frontier(g, &[Vid::new(i as u64)])
+            .expect("frontier for slot");
+        m = s.scatter(m, f, Scalar::F64(v)).expect("scatter");
+    }
+    m
+}
+
+#[test]
+fn reqd1_compare_and_select_are_composable_from_shipped_kernels() {
+    // The uniscape stepped-dynamics track reports "no comparison -> mask op"
+    // as a milestone blocker. It is already expressible: `map_to_set` carries
+    // the closed `Predicate` enum and `set_to_map` lifts the resulting bitset
+    // back to a 0/1 `[V]` map. Tensor-vs-tensor compare reduces to a
+    // scalar-vs-zero compare on the difference, which `axpy(a, b, -1.0)`
+    // supplies exactly.
+    let nodes: Vec<u64> = (0..5).collect();
+    let (mut s, g) = session_with(build_projection(&nodes, &[(0, 1, 1.0)], false, false));
+
+    let a_vals = [1.0, 5.0, 3.0, 9.0, 2.0];
+    let b_vals = [4.0, 4.0, 4.0, 4.0, 4.0];
+    let a = load_map(&mut s, g, &a_vals);
+    let b = load_map(&mut s, g, &b_vals);
+
+    // compare(a, b, "gt")  ==  set_to_map(map_to_set(axpy(a, b, -1), "gt", 0), 1)
+    let diff = s.ewise(a, b, EwiseOp::Axpy(-1.0)).expect("axpy");
+    let hits = s.map_to_set(diff, Predicate::Gt(0.0)).expect("map_to_set");
+    let mask = s.set_to_map(hits, Scalar::F64(1.0)).expect("set_to_map");
+
+    let got = read_tensor(&s, mask).to_vec();
+    let want: Vec<f64> = a_vals
+        .iter()
+        .zip(&b_vals)
+        .map(|(x, y)| if x > y { 1.0 } else { 0.0 })
+        .collect();
+    assert_eq!(
+        got, want,
+        "compare(a,b,\"gt\") must match the scalar oracle"
+    );
+
+    // select(mask, a, b) == b + mask * (a - b), using only shipped ewise ops.
+    let scaled = s.ewise(mask, diff, EwiseOp::Mul).expect("mul");
+    let sel = s.ewise(b, scaled, EwiseOp::Add).expect("add");
+    let got_sel = read_tensor(&s, sel).to_vec();
+    let want_sel: Vec<f64> = a_vals
+        .iter()
+        .zip(&b_vals)
+        .map(|(x, y)| if x > y { *x } else { *y })
+        .collect();
+    assert_eq!(got_sel, want_sel, "select must blend on the mask");
+
+    // A scalar threshold needs no difference at all: one map_to_set + set_to_map.
+    let thr = s
+        .map_to_set(a, Predicate::Gt(2.5))
+        .expect("map_to_set scalar");
+    let thr_map = s.set_to_map(thr, Scalar::F64(1.0)).expect("set_to_map");
+    assert_eq!(
+        read_tensor(&s, thr_map).to_vec(),
+        vec![0.0, 1.0, 1.0, 1.0, 0.0],
+        "step(a, 2.5) must match"
+    );
+}
+
+#[test]
+fn reqd4_edge_mask_window_is_an_exact_selector_without_sampling() {
+    // The same track builds edge-type masks with `sample_edges(sel, 1, 0)`,
+    // relying on p in {0,1} being degenerate. `edge_mask_window` states the
+    // same intent directly and is not a sampler at all.
+    let nodes: Vec<u64> = (0..4).collect();
+    let edges = [(0, 1, 1.0), (1, 2, 0.0), (2, 3, 1.0)];
+    let (mut s, g) = session_with(build_projection(&nodes, &edges, true, false));
+
+    let sel = s
+        .edge_weights(g)
+        .expect("edge_weights doubles as the selector");
+    let win = s.edge_mask_window(sel, 0.5, 1.5).expect("edge_mask_window");
+    assert_eq!(
+        s.edge_set_len(win).expect("len"),
+        2,
+        "exactly the 1.0 edges"
+    );
+
+    let drawn = s.sample_edges(sel, 1, 0).expect("sample_edges");
+    assert_eq!(
+        s.edge_set_len(drawn).expect("len"),
+        s.edge_set_len(win).expect("len"),
+        "the sampler at degenerate p agrees with the explicit window"
+    );
+}
+
+// ---- REQ-D13 probe: floor and mod -----------------------------------------
+
+/// True when two `f64`s are indistinguishable, NaN and the zero sign included.
+///
+/// `assert_eq!` cannot express either half of what these tests check: `NaN` is
+/// never equal to itself, and `-0.0 == 0.0` hides exactly the divergence the
+/// zero-remainder sign rule exists to fix.
+fn identical(a: f64, b: f64) -> bool {
+    (a.is_nan() && b.is_nan()) || a.to_bits() == b.to_bits()
+}
+
+fn assert_identical(got: &[f64], want: &[f64], what: &str) {
+    assert_eq!(got.len(), want.len(), "{what}: length");
+    for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+        assert!(
+            identical(g, w),
+            "{what}: slot {i} is {g:?} (bits {:#x}), want {w:?} (bits {:#x})",
+            g.to_bits(),
+            w.to_bits()
+        );
+    }
+}
+
+#[test]
+fn reqd13_floor_matches_the_ieee_oracle() {
+    // The ask's acceptance criterion: `map_apply(x, "floor")` matches `np.floor`
+    // on the f64 path "including negatives (floor(-1.5) = -2, i.e. floor and
+    // not truncation) and the +-0 / +-inf / NaN edges". `f64::floor` is IEEE
+    // `roundToIntegralTowardNegative`, which is that function; the oracle here
+    // is the scalar loop, sharing no code with the kernel.
+    let vals = [
+        -1.5,
+        -0.5,
+        -0.0,
+        0.0,
+        0.5,
+        1.5,
+        2.999,
+        4.25,
+        // At and above 2^53 every f64 is already integral, so floor is identity.
+        9_007_199_254_740_992.0,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+        1e308,
+        -1e308,
+    ];
+    let nodes: Vec<u64> = (0..vals.len() as u64).collect();
+    let (mut s, g) = session_with(build_projection(&nodes, &[(0, 1, 1.0)], false, false));
+    let m = load_map(&mut s, g, &vals);
+
+    let out = s.map_apply(m, MapOp::Floor).expect("floor");
+    let want: Vec<f64> = vals.iter().map(|x| x.floor()).collect();
+    assert_identical(&read_tensor(&s, out), &want, "floor");
+
+    // Spelled out, because "floor, not truncation" is the whole distinction and
+    // a `trunc` implementation would pass every other case above.
+    assert!(
+        identical(want[0], -2.0),
+        "floor(-1.5) must be -2, not -1: got {:?}",
+        want[0]
+    );
+
+    // The requester's own published acceptance vector, verbatim from
+    // UNIDB_ASK_FLOOR_MOD.md section 0.3, where it was checked against
+    // `np.floor` by their `scratchpad/mod_floor_probe/probe.py`. Pinning it here
+    // means their probe and this suite cannot drift into disagreeing.
+    let ask = [0.0, 0.5, 1.0, 1.7, 2.0, 2.999, 3.5, 4.25];
+    let ask_nodes: Vec<u64> = (0..ask.len() as u64).collect();
+    let (mut s2, g2) = session_with(build_projection(&ask_nodes, &[(0, 1, 1.0)], false, false));
+    let m2 = load_map(&mut s2, g2, &ask);
+    let out2 = s2.map_apply(m2, MapOp::Floor).expect("floor");
+    assert_identical(
+        &read_tensor(&s2, out2),
+        &[0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 4.0],
+        "the ask's published acceptance vector",
+    );
+}
+
+#[test]
+fn reqd13_rem_floor_matches_numpy_on_every_edge() {
+    // `rem_floor` is the normative definition of the `mod` convention shared by
+    // `MapOp::Mod` and `EwiseOp::Mod`, so its edges are pinned directly rather
+    // than through a kernel. Every expectation below is `np.mod`'s answer.
+    let cases: &[(f64, f64, f64)] = &[
+        // The four sign quadrants: the result follows the *divisor*.
+        (5.0, 3.0, 2.0),
+        (5.0, -3.0, -1.0),
+        (-5.0, 3.0, 1.0),
+        (-5.0, -3.0, -2.0),
+        // A zero remainder also takes the divisor's sign. Without the
+        // `copysign`, four of these seven disagree with `np.mod` -- and
+        // `assert_eq!` on the value could not see it, since -0.0 == 0.0.
+        (-0.0, 3.0, 0.0),
+        (0.0, -3.0, -0.0),
+        (-0.0, -3.0, -0.0),
+        (6.0, 3.0, 0.0),
+        (-6.0, 3.0, 0.0),
+        (6.0, -3.0, -0.0),
+        (-6.0, -3.0, -0.0),
+        // A zero divisor is NaN -- deliberately NOT the `x / 0 = 0` convention
+        // that `EwiseOp::Div` and `MapOp::Recip` follow. See `rem_floor`.
+        (1.0, 0.0, f64::NAN),
+        (1.0, -0.0, f64::NAN),
+        // Infinities and NaN, per IEEE.
+        (3.0, f64::INFINITY, 3.0),
+        (3.0, f64::NEG_INFINITY, f64::NEG_INFINITY),
+        (f64::INFINITY, 3.0, f64::NAN),
+        (f64::NAN, 3.0, f64::NAN),
+    ];
+    for &(x, y, want) in cases {
+        let got = rem_floor(x, y);
+        assert!(
+            identical(got, want),
+            "rem_floor({x:?}, {y:?}) = {got:?} (bits {:#x}), want {want:?} (bits {:#x})",
+            got.to_bits(),
+            want.to_bits()
+        );
+    }
+}
+
+#[test]
+fn reqd13_native_mod_survives_where_the_floor_composition_collapses() {
+    // THE reason `mod` is its own op rather than a published composition.
+    //
+    // The ask (UNIDB_ASK_FLOOR_MOD.md, 2026-07-28) states that `mod` follows
+    // from `floor` as `a - b*floor(a/b)` and asks us NOT to ship it. That
+    // identity holds in R but not in binary64: once `a/b` exceeds 2^53 the
+    // quotient carries no fractional bits, `floor` becomes the identity,
+    // `b*(a/b)` reconstructs `a`, and the subtraction collapses to 0.0.
+    //
+    // It is silent, and the wrong answer still lies inside [0, b), so a range
+    // assertion on a seasonality index cannot catch it. Any unbounded
+    // accumulator reaches that regime; a small divisor reaches it early.
+    //
+    // If this test ever fails because the two routes now agree, do NOT delete
+    // the op -- check whether `floor` or `div` changed.
+    let a_vals = [2e17, 1e12];
+    let b_vals = [12.0, 0.001];
+    let nodes: Vec<u64> = (0..2).collect();
+    let (mut s, g) = session_with(build_projection(&nodes, &[(0, 1, 1.0)], false, false));
+    let a = load_map(&mut s, g, &a_vals);
+    let b = load_map(&mut s, g, &b_vals);
+
+    // The composition the ask proposed, built from real kernels.
+    let q = s.ewise(a, b, EwiseOp::Div).expect("div");
+    let fq = s.map_apply(q, MapOp::Floor).expect("floor");
+    let bq = s.ewise(b, fq, EwiseOp::Mul).expect("mul");
+    let composed = s.ewise(a, bq, EwiseOp::Axpy(-1.0)).expect("axpy");
+    assert_identical(
+        &read_tensor(&s, composed),
+        &[0.0, 0.0],
+        "the floor composition is expected to collapse here -- that is the bug",
+    );
+
+    // The native op, against `f64::%` (raw fmod) as an independent oracle: both
+    // operands are positive, so no sign adjust is exercised and the oracle
+    // shares no logic with `rem_floor`.
+    let native = s.ewise(a, b, EwiseOp::Mod).expect("mod");
+    let got = read_tensor(&s, native).to_vec();
+    assert_identical(&got, &[2e17 % 12.0, 1e12 % 0.001], "native mod");
+    assert!(identical(got[0], 8.0), "2e17 mod 12 is 8, not {:?}", got[0]);
+    assert!(got[1] > 0.0, "1e12 mod 0.001 is nonzero, got {:?}", got[1]);
+}
+
+#[test]
+fn reqd13_scalar_mod_is_one_op_and_agrees_with_the_tensor_form() {
+    // `time % <literal>` is the driving spelling, and the scalar form exists so
+    // it does not have to materialize a constant `[V]` map first. The two forms
+    // must not drift.
+    let vals = [0.0, 1.0, 5.0, 11.0, 12.0, 13.0, 59.0, -1.0];
+    let period = 12.0;
+    let nodes: Vec<u64> = (0..vals.len() as u64).collect();
+    let (mut s, g) = session_with(build_projection(&nodes, &[(0, 1, 1.0)], false, false));
+    let t = load_map(&mut s, g, &vals);
+
+    let before = s.work_spent_units();
+    let scalar = s.map_apply(t, MapOp::Mod(period)).expect("scalar mod");
+    let charged = s.work_spent_units() - before;
+    assert_eq!(
+        charged,
+        vals.len() as u64,
+        "the scalar form charges one unit per element, once"
+    );
+
+    let divisor = load_map(&mut s, g, &[period; 8]);
+    let tensor = s.ewise(t, divisor, EwiseOp::Mod).expect("tensor mod");
+
+    let want: Vec<f64> = vals.iter().map(|x| rem_floor(*x, period)).collect();
+    assert_identical(&read_tensor(&s, scalar), &want, "scalar mod");
+    assert_identical(&read_tensor(&s, tensor), &want, "tensor mod");
+    // -1 % 12 == 11, not -1: the sign follows the divisor.
+    assert!(
+        identical(want[7], 11.0),
+        "-1 mod 12 is 11, got {:?}",
+        want[7]
+    );
+}
+
+// ---- Phase 0 reproductions ------------------------------------------------
+//
+// Every test below the PIN marker asserts the *desired* contract, not the
+// current one, and is expected to FAIL on baseline `254b4c26c`. They are the
+// red-first evidence that each gap is real; a fix is only credible once the
+// matching test here flips. See
+// `docs/proposals/graphcompute_dynamics_requirements_response_2026-07-25.md` §12.
+
+/// PIN-D4b: `sample_edges` is bitwise reproducible across independent sessions.
+///
+/// `sample` has S-1/S-2 (`s1_…`, `s2_…` above); `sample_edges` had neither, and
+/// was covered only transitively through the SIR end-to-end test. The `[E]`
+/// sampler is what fork/hybrid coupling masks are built from, so it earns the
+/// same direct guarantee.
+#[test]
+fn pin_d4b_sample_edges_is_bitwise_reproducible_across_sessions() {
+    let fixture = || {
+        let nodes: Vec<u64> = (0..201).collect();
+        let edges: Vec<(u64, u64, f64)> = (0..200).map(|i| (i, i + 1, i as f64 / 200.0)).collect();
+        let (mut s, g) = session_with(build_projection(&nodes, &edges, true, false));
+        let prob = s.edge_weights(g).expect("edge_weights runs");
+        (s, prob)
+    };
+
+    let (mut a, pa) = fixture();
+    let (mut b, pb) = fixture();
+    let ma = a.sample_edges(pa, 0xC0FF_EE01, 3).expect("sample_edges a");
+    let mb = b.sample_edges(pb, 0xC0FF_EE01, 3).expect("sample_edges b");
+    assert_eq!(
+        a.edge_set_members_for_test(ma),
+        b.edge_set_members_for_test(mb),
+        "two independent sessions must draw the identical edge mask"
+    );
+}
+
+/// PIN-D4b (cont.): each edge's inclusion is exactly `sample_bernoulli` keyed on
+/// its CSR out-edge index — order- and partition-independent by construction.
+#[test]
+fn pin_d4b_sample_edges_matches_the_per_edge_counter_hash_oracle() {
+    use uni_algo::algo::rng::sample_bernoulli;
+
+    let nodes: Vec<u64> = (0..201).collect();
+    let edges: Vec<(u64, u64, f64)> = (0..200).map(|i| (i, i + 1, i as f64 / 200.0)).collect();
+    let (mut s, g) = session_with(build_projection(&nodes, &edges, true, false));
+    let prob = s.edge_weights(g).expect("edge_weights runs");
+
+    // Read the probabilities the kernel actually saw, so the oracle does not
+    // have to assume the projection's edge ordering.
+    let probs = s.tensor_values_for_test(prob);
+    let (seed, iter) = (0x1234_5678, 11);
+    let mask = s.sample_edges(prob, seed, iter).expect("sample_edges runs");
+    let got: std::collections::HashSet<u32> =
+        s.edge_set_members_for_test(mask).into_iter().collect();
+
+    for (edge, &p) in probs.iter().enumerate() {
+        assert_eq!(
+            got.contains(&(edge as u32)),
+            sample_bernoulli(p, seed, iter, edge as u64),
+            "edge {edge} (p={p}) disagreed with the counter-hash oracle"
+        );
+    }
+}
+
+/// REPRO-D1E: `map_to_set` ignores `Shape`, so thresholding an `[E]` tensor
+/// yields a `VertexSet` that every edge-mask consumer rejects.
+///
+/// This is the one genuinely composition-blocked case behind REQ-D1: a guest can
+/// build a `[V]` mask from a predicate today (`set_to_map(map_to_set(…))`), but
+/// the `[E]` equivalent dead-ends, because `map_to_set` calls `alloc_set`
+/// unconditionally. Asserts the desired behaviour: an `[E]` input produces an
+/// edge mask usable by `spmv_masked`.
+#[test]
+fn repro_d1e_map_to_set_on_an_edge_tensor_must_yield_an_edge_mask() {
+    let nodes: Vec<u64> = (0..4).collect();
+    let edges = [(0, 1, 1.0), (1, 2, 0.0), (2, 3, 1.0)];
+    let (mut s, g) = session_with(build_projection(&nodes, &edges, true, false));
+
+    let sel = s.edge_weights(g).expect("edge_weights gives an [E] tensor");
+    let mask = s
+        .map_to_set(sel, Predicate::Gt(0.5))
+        .expect("map_to_set accepts the [E] tensor");
+
+    let vec = s.zero_map(g, DType::F64).expect("zero_map runs");
+    let out = s.spmv_masked(g, vec, Semiring::LinearAlgebra, mask);
+    assert!(
+        out.is_ok(),
+        "an [E] tensor thresholded by map_to_set must produce an EdgeSet that \
+         spmv_masked accepts; got {:?}",
+        out.err()
+    );
+}
+
+/// REPRO-EW: `ewise` validates operand *length* but not *shape*, so a `[V]` map
+/// and an `[E]` tensor that happen to be the same length compute silently.
+///
+/// A silent wrong answer, independent of any consumer ask, and materially more
+/// likely once a session carries more than one projection.
+#[test]
+fn repro_ew_ewise_must_reject_mixed_vertex_and_edge_shapes() {
+    // A 4-cycle: |V| == |E| == 4, so the length check cannot separate them.
+    let nodes: Vec<u64> = (0..4).collect();
+    let edges = [(0, 1, 1.0), (1, 2, 1.0), (2, 3, 1.0), (3, 0, 1.0)];
+    let (mut s, g) = session_with(build_projection(&nodes, &edges, true, false));
+
+    let vmap = s.zero_map(g, DType::F64).expect("[V] map");
+    let emap = s.edge_weights(g).expect("[E] tensor");
+    assert_eq!(
+        s.tensor_values_for_test(vmap).len(),
+        s.tensor_values_for_test(emap).len(),
+        "fixture must make the two shapes indistinguishable by length alone"
+    );
+
+    let out = s.ewise(vmap, emap, EwiseOp::Add);
+    assert!(
+        out.is_err(),
+        "ewise must reject a [V] map combined with an [E] tensor even when the \
+         lengths coincide; it silently computed instead"
+    );
+}
+
+/// REPRO-PROV: a tensor carries no record of the projection it came from, so a
+/// value derived from graph A can be combined with one from graph B whenever the
+/// vertex counts coincide — slot `i` means a different vertex in each.
+///
+/// The session layer already supports many projections (`bind_graph` is public
+/// and re-callable), so this is reachable today; it becomes the default hazard
+/// once guests can ask for a second projection.
+#[test]
+fn repro_prov_tensors_must_not_cross_projections() {
+    let a = build_projection(&[0, 1, 2, 3], &[(0, 1, 1.0)], false, false);
+    // Same vertex count, disjoint vertex ids: slot 0 is vid 0 in `a` and vid 10
+    // in `b`, so combining them elementwise is meaningless.
+    let b = build_projection(&[10, 11, 12, 13], &[(10, 11, 1.0)], false, false);
+
+    let (mut s, ga) = session_with(a);
+    let gb = s.bind_graph(Arc::new(b));
+
+    let da = s.degrees(ga, Direction::Out).expect("degrees on a");
+    let db = s.degrees(gb, Direction::Out).expect("degrees on b");
+
+    let out = s.ewise(da, db, EwiseOp::Add);
+    assert!(
+        out.is_err(),
+        "a tensor from one projection must not combine with a tensor from \
+         another; it silently computed instead"
+    );
+}
+
+/// REPRO-NAN: a NaN probability silently never fires.
+///
+/// `sample_bernoulli` early-returns on `p <= 0.0` and `p >= 1.0`; NaN satisfies
+/// neither guard and then fails the `unit < prob` comparison, so a NaN-poisoned
+/// probability tensor yields a mask that is quietly missing those edges. Every
+/// other numeric fault in this surface is loud — this one should be too.
+#[test]
+fn repro_nan_sample_edges_must_reject_a_nan_probability() {
+    // log(-1.0) = NaN, giving a genuinely NaN-valued [E] tensor.
+    let nodes: Vec<u64> = (0..4).collect();
+    let edges = [(0, 1, 1.0), (1, 2, -1.0), (2, 3, 1.0)];
+    let (mut s, g) = session_with(build_projection(&nodes, &edges, true, false));
+
+    let w = s.edge_weights(g).expect("edge_weights runs");
+    let probs = s.map_apply(w, MapOp::Log).expect("map_apply log runs");
+    assert!(
+        s.tensor_values_for_test(probs).iter().any(|v| v.is_nan()),
+        "fixture must actually contain a NaN probability"
+    );
+
+    let out = s.sample_edges(probs, 7, 1);
+    assert!(
+        out.is_err(),
+        "a NaN probability must be rejected, not silently treated as never-fire"
+    );
+}
+
+/// `ewise` must preserve `[E]` all the way to an edge consumer.
+///
+/// The input check and the output tag are one change, not two. Validating shape
+/// on the way in while collapsing it to `[V]` on the way out would accept
+/// `ewise([E], [E])` and hand back a tensor that `sample_edges`,
+/// `edge_mask_window`, `expand_sampled` and `sample_edges_undirected` all
+/// reject — a kernel that type-checks its inputs and then lies about its result.
+#[test]
+fn ewise_preserves_edge_shape_through_to_a_consumer() {
+    let nodes: Vec<u64> = (0..4).collect();
+    let edges = [(0, 1, 1.0), (1, 2, 0.0), (2, 3, 1.0)];
+    let (mut s, g) = session_with(build_projection(&nodes, &edges, true, false));
+
+    let w = s.edge_weights(g).expect("[E] tensor");
+    // An [E] op with an [E] operand stays [E]...
+    let doubled = s
+        .ewise(w, w, EwiseOp::Add)
+        .expect("ewise over two [E] tensors");
+    // ...which only an edge consumer will accept.
+    let mask = s
+        .edge_mask_window(doubled, 1.5, 2.5)
+        .expect("the [E] tag must survive ewise");
+    assert_eq!(
+        s.edge_set_len(mask).expect("len"),
+        2,
+        "the two weight-1.0 edges double to 2.0 and fall inside the window"
+    );
+}
+
+/// A guest must not be able to abort the host with ordinary input.
+///
+/// Three kernels combined values from two differently-sized graphs and reached a
+/// `panic!` rather than a typed error. `bind_graph` is public and re-callable and
+/// `arena_freeze` mints a second graph mid-session, so all three were reachable.
+/// `VertexSet::zip_with`'s own doc comment asserted the invariant that made it
+/// safe — "sets from the same session always share the projection vertex count" —
+/// which is exactly why nobody noticed it had stopped being true.
+#[test]
+fn cross_graph_operands_error_instead_of_panicking() {
+    let small = build_projection(&[0, 1], &[(0, 1, 1.0)], false, false);
+    let large = build_projection(&[0, 1, 2, 3, 4], &[(0, 1, 1.0)], false, false);
+    let (mut s, gs) = session_with(small);
+    let gl = s.bind_graph(Arc::new(large));
+
+    // Set algebra over two capacities used to hit an assert! inside zip_with.
+    let fs = s.frontier(gs, &[Vid::new(0)]).expect("frontier on small");
+    let fl = s.frontier(gl, &[Vid::new(0)]).expect("frontier on large");
+    for (name, res) in [
+        ("set_union", s.set_union(fs, fl)),
+        ("set_diff", s.set_diff(fs, fl)),
+        ("set_intersect", s.set_intersect(fs, fl)),
+    ] {
+        assert!(
+            res.is_err(),
+            "{name} over mismatched capacities must error, not abort the host"
+        );
+    }
+
+    // `walk_visit_counts` sized its counter from `g` and indexed it with slots
+    // from `walks`, so walks over the larger graph ran off the end.
+    let walks = s
+        .random_walks(gl, 3, 1, &[Vid::new(4)], 1.0, 1.0, 7)
+        .expect("walks over the large graph");
+    assert!(
+        s.walk_visit_counts(walks, gs).is_err(),
+        "walks from a larger graph must be rejected, not indexed out of bounds"
+    );
+}
+
+/// `expand_sampled` indexes its probability tensor by global CSR edge index, so
+/// a tensor shorter than the edge count would read past its end.
+#[test]
+fn expand_sampled_rejects_a_short_probability_tensor() {
+    let nodes: Vec<u64> = (0..4).collect();
+    let wide = [(0, 1, 1.0), (1, 2, 1.0), (2, 3, 1.0)];
+    let (mut s, g) = session_with(build_projection(&nodes, &wide, true, false));
+    // A [E] tensor from a *different*, smaller projection.
+    let narrow = s.bind_graph(Arc::new(build_projection(
+        &nodes,
+        &[(0, 1, 1.0)],
+        true,
+        false,
+    )));
+    let short = s.edge_weights(narrow).expect("[E] over one edge");
+    let front = s.frontier(g, &[Vid::new(0)]).expect("frontier");
+
+    assert!(
+        s.expand_sampled(g, front, Direction::Out, None, short, 1, 0)
+            .is_err(),
+        "a probability tensor shorter than the edge count must be rejected"
+    );
+}
+
+/// Arena-derived tensors must not combine with graph-derived ones.
+///
+/// The arena family tags its slot-keyed tensors `Shape::V` — the tag is already
+/// lying, because arena slots are not vertex slots — so a strict shape check
+/// cannot catch this. Provenance can: `Origin::Arena` is deliberately distinct
+/// from `Origin::Graph` rather than collapsing to `Untracked`.
+#[test]
+fn arena_tensors_do_not_combine_with_graph_tensors() {
+    use super::session::GraphArenaCompute as _;
+    let nodes: Vec<u64> = (0..3).collect();
+    let (mut s, g) = session_with(build_projection(&nodes, &[(0, 1, 1.0)], false, false));
+
+    let deg = s.degrees(g, Direction::Out).expect("[V] over the graph");
+    let arena = s.arena_new(8, 2).expect("arena");
+    let slots = s.arena_alloc(arena, 3).expect("3 arena slots");
+    assert_eq!(
+        s.tensor_values_for_test(deg).len(),
+        3,
+        "same length, so only provenance separates them"
+    );
+
+    assert!(
+        s.ewise(deg, slots, EwiseOp::Add).is_err(),
+        "an arena slot list must not combine with a vertex map"
+    );
+}
+
+/// `Untracked` means unknown, not a third space: it unifies with anything.
+///
+/// Set-derived tensors carry no provenance, and PageRank's teleport vector is
+/// exactly that (`set_to_map` over a frontier). Treating `Untracked` as distinct
+/// would reject every `ewise` against it and break ordinary compositions.
+#[test]
+fn untracked_provenance_unifies_rather_than_conflicting() {
+    let nodes: Vec<u64> = (0..3).collect();
+    let (mut s, g) = session_with(build_projection(&nodes, &[(0, 1, 1.0)], false, false));
+
+    let deg = s.degrees(g, Direction::Out).expect("graph-derived");
+    let front = s.frontier(g, &[Vid::new(0)]).expect("frontier");
+    let from_set = s
+        .set_to_map(front, Scalar::F64(1.0))
+        .expect("set-derived, so untracked");
+
+    let mixed = s
+        .ewise(deg, from_set, EwiseOp::Add)
+        .expect("an untracked operand must not block the composition");
+    // ...and the result adopts the known space, so provenance survives the hop.
+    let again = s.ewise(mixed, deg, EwiseOp::Add);
+    assert!(
+        again.is_ok(),
+        "the unified result must still be usable with its own graph's tensors"
+    );
+}
+
+/// `compare` matches a scalar oracle across every operator.
+#[test]
+fn compare_matches_the_scalar_oracle() {
+    use super::session::CmpOp;
+    let a_vals = [1.0, 5.0, 3.0, 4.0, f64::NAN];
+    let b_vals = [4.0, 4.0, 3.0, 4.0, 4.0];
+    let nodes: Vec<u64> = (0..5).collect();
+
+    for (op, oracle) in [
+        (CmpOp::Gt, (|x: f64, y: f64| x > y) as fn(f64, f64) -> bool),
+        (CmpOp::Ge, |x, y| x >= y),
+        (CmpOp::Lt, |x, y| x < y),
+        (CmpOp::Le, |x, y| x <= y),
+        (CmpOp::Eq, |x, y| x == y),
+        (CmpOp::Ne, |x, y| x != y),
+    ] {
+        let (mut s, g) = session_with(build_projection(&nodes, &[(0, 1, 1.0)], false, false));
+        let a = load_vals(&mut s, g, &a_vals);
+        let b = load_vals(&mut s, g, &b_vals);
+        let m = s.compare(a, b, op).expect("compare runs");
+        let want: Vec<f64> = a_vals
+            .iter()
+            .zip(&b_vals)
+            .map(|(&x, &y)| f64::from(u8::from(oracle(x, y))))
+            .collect();
+        assert_eq!(
+            s.tensor_values_for_test(m),
+            want,
+            "{op:?} disagreed with the scalar oracle (NaN included)"
+        );
+    }
+}
+
+/// `compare` is exactly the composition it replaces — the proof that the
+/// ergonomic shortcut did not change semantics.
+#[test]
+fn compare_agrees_with_the_composition_it_replaces() {
+    let a_vals = [1.0, 5.0, 3.0, 9.0, 2.0];
+    let b_vals = [4.0; 5];
+    let nodes: Vec<u64> = (0..5).collect();
+    let (mut s, g) = session_with(build_projection(&nodes, &[(0, 1, 1.0)], false, false));
+    let a = load_vals(&mut s, g, &a_vals);
+    let b = load_vals(&mut s, g, &b_vals);
+
+    let direct = s
+        .compare(a, b, super::session::CmpOp::Gt)
+        .expect("the kernel");
+    let diff = s.ewise(a, b, EwiseOp::Axpy(-1.0)).expect("axpy");
+    let hits = s.map_to_set(diff, Predicate::Gt(0.0)).expect("map_to_set");
+    let composed = s.set_to_map(hits, Scalar::F64(1.0)).expect("set_to_map");
+
+    assert_eq!(
+        s.tensor_values_for_test(direct),
+        s.tensor_values_for_test(composed),
+        "the kernel and the published composition must agree bit for bit"
+    );
+}
+
+/// An `[E]` comparison lowers to an `EdgeSet` and drives `spmv_masked`.
+///
+/// This is the case that was genuinely composition-blocked: `map_to_set` used to
+/// hand back a `VertexSet` for an `[E]` input, so an edge threshold could not
+/// reach an edge consumer at all.
+#[test]
+fn compare_on_edges_feeds_spmv_masked() {
+    let nodes: Vec<u64> = (0..4).collect();
+    let edges = [(0, 1, 5.0), (1, 2, 1.0), (2, 3, 5.0)];
+    let (mut s, g) = session_with(build_projection(&nodes, &edges, true, false));
+
+    let w = s.edge_weights(g).expect("[E] weights");
+    let threshold = s
+        .map_apply(w, MapOp::AxPlusB(0.0, 3.0))
+        .expect("[E] of 3.0");
+    let mask = s
+        .compare(w, threshold, super::session::CmpOp::Gt)
+        .expect("[E] comparison");
+    let edge_set = s
+        .map_to_set(mask, Predicate::Gt(0.5))
+        .expect("an [E] mask lowers to an EdgeSet");
+    assert_eq!(
+        s.edge_set_len(edge_set).expect("len"),
+        2,
+        "the two weight-5.0 edges exceed the threshold"
+    );
+
+    let vec = s.zero_map(g, DType::F64).expect("zero_map");
+    s.spmv_masked(g, vec, Semiring::LinearAlgebra, edge_set)
+        .expect("the EdgeSet must be accepted by spmv_masked");
+}
+
+/// Loads an explicit `[V]` map by scattering each value onto a zero map.
+fn load_vals(s: &mut AlgoSession, g: Handle, vals: &[f64]) -> Handle {
+    let mut m = s.zero_map(g, DType::F64).expect("zero_map");
+    for (i, &v) in vals.iter().enumerate() {
+        let f = s.frontier(g, &[Vid::new(i as u64)]).expect("frontier");
+        m = s.scatter(m, f, Scalar::F64(v)).expect("scatter");
+    }
+    m
+}
+
+/// The budget accessors report the real meter and cost nothing to read.
+///
+/// Free is the load-bearing part: a guest sizing its own work must be able to
+/// poll without the polling itself consuming what it is measuring.
+#[test]
+fn budget_accessors_are_free_and_track_the_meter() {
+    let nodes: Vec<u64> = (0..8).collect();
+    let (mut s, g) = session_with(build_projection(&nodes, &[(0, 1, 1.0)], false, false));
+
+    let total = s.work_budget().expect("budget");
+    assert!(total > 0.0, "a session starts with a budget");
+    assert_eq!(s.work_spent().expect("spent"), 0.0, "nothing charged yet");
+    assert_eq!(
+        s.work_remaining().expect("remaining"),
+        total,
+        "remaining starts at the total"
+    );
+
+    // Reading is free.
+    for _ in 0..5 {
+        let _ = s.work_budget().expect("budget");
+        let _ = s.work_spent().expect("spent");
+        let _ = s.work_remaining().expect("remaining");
+    }
+    assert_eq!(
+        s.work_spent().expect("spent"),
+        0.0,
+        "the accessors must not charge the meter they report"
+    );
+
+    // A real kernel moves it, and the three stay consistent.
+    s.degrees(g, Direction::Out).expect("degrees charges |V|");
+    let spent = s.work_spent().expect("spent");
+    assert_eq!(spent, 8.0, "degrees charges one unit per vertex");
+    assert_eq!(
+        s.work_budget().expect("budget"),
+        total,
+        "the total is fixed"
+    );
+    assert_eq!(
+        s.work_remaining().expect("remaining"),
+        total - spent,
+        "remaining is total minus spent"
+    );
+}
+
+/// The published budget formula must match the code.
+///
+/// The consumer reverse-engineered `10_000 * (V + E + 1)` from aborted CALLs,
+/// which is right below the ceiling and wrong above it. Now that the formula is
+/// documented, this keeps the doc honest.
+#[test]
+fn the_documented_budget_formula_matches_the_code() {
+    use super::{DEFAULT_WORK_ABS_CEILING, DEFAULT_WORK_EDGE_MULTIPLIER, WorkBudget};
+    for (v, e) in [(0, 0), (1, 1), (10, 40), (1_000, 5_000), (100_000, 500_000)] {
+        let want = (DEFAULT_WORK_EDGE_MULTIPLIER * (v + e + 1)).min(DEFAULT_WORK_ABS_CEILING);
+        assert_eq!(
+            WorkBudget::from_graph_size(v, e).total(),
+            want,
+            "min(10_000 * (V + E + 1), 1e9) is the documented rule"
+        );
+    }
+    // Above ~100k elements the ceiling binds, which is the half the consumer's
+    // empirical rule missed.
+    assert_eq!(
+        WorkBudget::from_graph_size(10_000_000, 10_000_000).total(),
+        DEFAULT_WORK_ABS_CEILING,
+        "the absolute ceiling clamps large projections"
+    );
+}
+
+/// Sets carry their index space, so cross-graph combinations are rejected.
+///
+/// Before this, `VertexSet` / `EdgeSet` carried no graph, so `set_to_map` yielded
+/// `Untracked` and every set-derived value was provenance-blind. Two projections
+/// of the *same size* — where the capacity guard cannot help — combined silently.
+#[test]
+fn sets_carry_provenance_across_equal_sized_graphs() {
+    // Same vertex count, disjoint vids: capacity checks cannot separate these.
+    let a = build_projection(&[0, 1, 2, 3], &[(0, 1, 1.0)], false, false);
+    let b = build_projection(&[10, 11, 12, 13], &[(10, 11, 1.0)], false, false);
+    let (mut s, ga) = session_with(a);
+    let gb = s.bind_graph(Arc::new(b));
+
+    let fa = s.frontier(ga, &[Vid::new(0)]).expect("frontier on a");
+    let fb = s.frontier(gb, &[Vid::new(10)]).expect("frontier on b");
+
+    for (name, res) in [
+        ("set_union", s.set_union(fa, fb)),
+        ("set_diff", s.set_diff(fa, fb)),
+        ("set_intersect", s.set_intersect(fa, fb)),
+    ] {
+        assert!(
+            res.is_err(),
+            "{name} across two projections must be rejected even at equal capacity"
+        );
+    }
+
+    // A frontier from another graph cannot drive a traversal.
+    assert!(
+        s.expand(ga, fb, Direction::Out, None).is_err(),
+        "expand must reject a frontier from a different projection"
+    );
+
+    // Nor mask a reduction — the case that used to read zero silently.
+    let deg = s.degrees(ga, Direction::Out).expect("degrees on a");
+    assert!(
+        s.reduce(deg, super::session::ReduceOp::Sum, Some(fb))
+            .is_err(),
+        "a masked reduce must reject a foreign mask rather than reading zero"
+    );
+}
+
+/// Every kernel that mixes a value with a graph checks the index space.
+///
+/// The test above covers the set algebra, the `expand` *frontier* and the masked
+/// `reduce`. These are the rest — sites where a foreign operand reached the
+/// kernel body with no identity check at all. The fixtures share a vertex count
+/// **and** an edge count, so no length or capacity guard can separate them; only
+/// provenance can.
+#[test]
+fn every_graph_taking_kernel_rejects_a_foreign_operand() {
+    let a = build_projection(&[0, 1, 2, 3], &[(0, 1, 1.0), (1, 2, 1.0)], false, false);
+    let b = build_projection(
+        &[10, 11, 12, 13],
+        &[(10, 11, 1.0), (11, 12, 1.0)],
+        false,
+        false,
+    );
+    let (mut s, ga) = session_with(a);
+    let gb = s.bind_graph(Arc::new(b));
+
+    let fa = s.frontier(ga, &[Vid::new(0)]).expect("frontier on a");
+    let fb = s.frontier(gb, &[Vid::new(10)]).expect("frontier on b");
+    let va = s.degrees(ga, Direction::Out).expect("degrees on a");
+    let vb = s.degrees(gb, Direction::Out).expect("degrees on b");
+    let ea = s.edge_weights(ga).expect("edge weights on a");
+    let eb = s.edge_weights(gb).expect("edge weights on b");
+    let ma = s.edges_all(ga).expect("edges_all on a");
+    let mb = s.edges_all(gb).expect("edges_all on b");
+
+    let sr = Semiring::LinearAlgebra;
+    let out = Direction::Out;
+    for (name, res) in [
+        // `spmv` — the [V] operand, then the optional vertex mask.
+        ("spmv vec", s.spmv(ga, vb, sr, out, None).map(|_| ())),
+        ("spmv mask", s.spmv(ga, va, sr, out, Some(fb)).map(|_| ())),
+        // `spmv_masked` — both operands.
+        ("spmv_masked vec", s.spmv_masked(ga, vb, sr, ma).map(|_| ())),
+        (
+            "spmv_masked mask",
+            s.spmv_masked(ga, va, sr, mb).map(|_| ()),
+        ),
+        // `scatter` writes the frontier's slots into the map.
+        ("scatter", s.scatter(va, fb, Scalar::F64(1.0)).map(|_| ())),
+        // The `expand` family's `exclude` — the operand `reach_fixpoint` feeds on
+        // every iteration, so a foreign set silently under-expands the traversal
+        // rather than failing once.
+        (
+            "expand exclude",
+            s.expand(ga, fa, out, Some(fb)).map(|_| ()),
+        ),
+        (
+            "expand_masked exclude",
+            s.expand_masked(ga, fa, out, Some(fb), ma).map(|_| ()),
+        ),
+        (
+            "expand_masked edge mask",
+            s.expand_masked(ga, fa, out, None, mb).map(|_| ()),
+        ),
+        (
+            "expand_sampled exclude",
+            s.expand_sampled(ga, fa, out, Some(fb), ea, 1, 0)
+                .map(|_| ()),
+        ),
+        (
+            "expand_sampled prob",
+            s.expand_sampled(ga, fa, out, None, eb, 1, 0).map(|_| ()),
+        ),
+        // The undirected sampler reaches the CSR, so its [E] tensor must match.
+        (
+            "sample_edges_undirected",
+            s.sample_edges_undirected(ga, eb, 1, 0).map(|_| ()),
+        ),
+        // Edge-set algebra at *equal* capacity, where the capacity guard added in
+        // Phase 4 cannot fire.
+        ("edge_intersect", s.edge_intersect(ma, mb).map(|_| ())),
+        ("edge_union", s.edge_union(ma, mb).map(|_| ())),
+    ] {
+        assert!(
+            res.is_err(),
+            "{name}: a foreign operand must be rejected even when every length matches"
+        );
+    }
+
+    // Walks carry their graph too. The slot-range check in `walk_visit_counts`
+    // structurally cannot see this: equal vertex counts mean equal valid ranges.
+    let wb = s
+        .random_walks(gb, 2, 1, &[Vid::new(10)], 1.0, 1.0, 7)
+        .expect("walks on b");
+    assert!(
+        s.walk_visit_counts(wb, ga).is_err(),
+        "walk_visit_counts must reject walks produced over a different projection"
+    );
+}
+
+/// The ragged egress kernels label rows with their *own* projection's vids.
+///
+/// `emit_walks` and `emit_pairs` translated slots through the first-bound graph
+/// unconditionally, so a value derived from a second projection came back with
+/// right-looking, wrong vertices — and no error. Both now resolve through the
+/// value's own `Origin`, which is what `PairList`/`WalkMatrix` provenance is for.
+#[test]
+fn ragged_egress_labels_rows_with_the_values_own_projection() {
+    let a = build_projection(&[0, 1, 2, 3], &[(0, 1, 1.0), (1, 2, 1.0)], false, false);
+    let b = build_projection(
+        &[10, 11, 12, 13],
+        &[(10, 11, 1.0), (11, 12, 1.0)],
+        false,
+        false,
+    );
+    let (mut s, _ga) = session_with(a);
+    let gb = s.bind_graph(Arc::new(b));
+
+    let walks = s
+        .random_walks(gb, 3, 1, &[Vid::new(10)], 1.0, 1.0, 7)
+        .expect("walks on b");
+    s.emit_walks(walks).expect("emit walks from b");
+    let rows = s.take_emitted_walks();
+    assert!(
+        !rows.is_empty(),
+        "the fixture must produce at least one step"
+    );
+    for (_, _, vid) in &rows {
+        assert!(
+            *vid >= 10,
+            "emit_walks must label b's slots with b's vids, got {vid} \
+             (a's vids are 0..=3, so a leak is unambiguous)"
+        );
+    }
+
+    let pairs = s
+        .all_pairs_overlap(gb, PairSpec::AdjacentPairs, OverlapMetric::Count)
+        .expect("overlap on b");
+    s.emit_pairs(pairs).expect("emit pairs from b");
+    let out = s.take_emitted_pairs();
+    for (src, dst, _) in &out {
+        assert!(
+            *src >= 10 && *dst >= 10,
+            "emit_pairs must label b's slots with b's vids, got ({src}, {dst})"
+        );
+    }
+}
+
+/// The arena→graph composition still works after tensors gained provenance.
+///
+/// `arena_freeze` turns grown structure into an ordinary graph handle, which is
+/// what makes neighbour aggregation over arena links expressible without a
+/// bespoke `arena_spmv`: freeze, then `spmv`. Tensor provenance could plausibly
+/// have broken exactly this — an arena-gathered column carries `Origin::Arena`
+/// while the frozen graph is an `Origin::Graph`, and the two do not unify.
+#[test]
+fn an_arena_can_be_frozen_and_aggregated_over() {
+    let (mut s, _g) = session_with(build_projection(
+        &[0, 1, 2, 3],
+        &[(0, 1, 1.0)],
+        false,
+        false,
+    ));
+
+    let arena = s.arena_new(8, 2).expect("arena");
+    // `arena_alloc` yields a tensor of the allocated slot ids, keyed to the
+    // arena — the natural thing to aggregate over grown structure.
+    let slots = s.arena_alloc(arena, 3).expect("alloc 3 slots");
+
+    let frozen = s.arena_freeze(arena).expect("freeze");
+    assert_eq!(
+        s.vertex_count(frozen).expect("frozen vertex count"),
+        3,
+        "the frozen graph spans the arena's live slots"
+    );
+
+    // The value is `Origin::Arena`; the graph it is aggregated over is
+    // `Origin::Graph(frozen)`. If provenance rejected this pairing, freezing an
+    // arena and aggregating over it — the composition that makes a bespoke
+    // `arena_spmv` unnecessary — would be unreachable.
+    let out = s.spmv(frozen, slots, Semiring::LinearAlgebra, Direction::Out, None);
+    assert!(
+        out.is_ok(),
+        "an arena-keyed value must be aggregable over the graph frozen FROM that \
+         arena: {:?}",
+        out.err()
+    );
+
+    // The relaxation is bounded to *that* arena's own frozen graph. An arena
+    // value must still be refused against an unrelated projection, and against a
+    // graph frozen from a different arena, or the check would be decorative.
+    let other = s.bind_graph(Arc::new(build_projection(&[0, 1, 2], &[], false, false)));
+    assert!(
+        s.spmv(other, slots, Semiring::LinearAlgebra, Direction::Out, None)
+            .is_err(),
+        "an arena value must not aggregate over an unrelated projection"
+    );
+    let arena2 = s.arena_new(8, 2).expect("second arena");
+    let _ = s.arena_alloc(arena2, 3).expect("alloc in the second arena");
+    let frozen2 = s.arena_freeze(arena2).expect("freeze the second arena");
+    assert!(
+        s.spmv(
+            frozen2,
+            slots,
+            Semiring::LinearAlgebra,
+            Direction::Out,
+            None
+        )
+        .is_err(),
+        "an arena value must not aggregate over a graph frozen from a DIFFERENT arena"
+    );
+}
+
+/// Degenerate sampling probabilities are exact, and seed-independent.
+///
+/// `sample_edges(p, ..)` at `p` of exactly 0.0 or 1.0 is deterministic: the draw
+/// is `unit < prob` with `unit ∈ [0,1)`, plus explicit endpoint short-circuits in
+/// `sample_bernoulli`. Downstream users build **edge-type masks** on this — a
+/// stored 1.0/0.0 selector column sampled at those endpoints — so it is a
+/// contract, not an implementation detail, and this test is what stops it being
+/// optimised away.
+///
+/// It also pins the better spelling: `edge_mask_window` selects the same edges
+/// deterministically by construction, with no RNG in the path at all.
+#[test]
+fn degenerate_sampling_probabilities_are_exact_and_seed_independent() {
+    // Edge weights double as a 1.0/0.0 selector column, exactly as a caller's
+    // stored `sel_*` edge property would.
+    let (mut s, g) = session_with(build_projection(
+        &[0, 1, 2, 3],
+        &[(0, 1, 1.0), (1, 2, 0.0), (2, 3, 1.0)],
+        true, // the weights ARE the selector column
+        false,
+    ));
+    let sel = s.edge_weights(g).expect("selector column");
+
+    // The endpoints hold for every seed and every iteration counter.
+    for seed in [0u64, 1, 7, 42, u64::MAX] {
+        for iter in [0u64, 3] {
+            let picked = s.sample_edges(sel, seed, iter).expect("sample");
+            assert_eq!(
+                s.edge_set_len(picked).expect("len"),
+                2,
+                "p∈{{0,1}} must select exactly the 1.0 edges (seed {seed}, iter {iter})"
+            );
+        }
+    }
+
+    // The deterministic spelling selects the same set — so a caller needing an
+    // edge-type mask never has to route through the sampler at all.
+    let windowed = s.edge_mask_window(sel, 0.5, 1.5).expect("window");
+    let sampled = s.sample_edges(sel, 9, 0).expect("sample");
+    let both = s.edge_intersect(windowed, sampled).expect("intersect");
+    assert_eq!(
+        s.edge_set_len(both).expect("len"),
+        2,
+        "edge_mask_window and endpoint-sampling must agree edge for edge"
+    );
+
+    // An all-zero column selects nothing, again for any seed.
+    let zeros = s
+        .map_apply(sel, MapOp::Scale(0.0))
+        .expect("zero the column");
+    let none = s.sample_edges(zeros, 3, 0).expect("sample");
+    assert_eq!(
+        s.edge_set_len(none).expect("len"),
+        0,
+        "p = 0.0 must never fire"
+    );
+}
+
+/// Freezing an arena repeatedly must not leak the arena budget.
+///
+/// `free` deliberately does not return bytes for a graph handle, because
+/// `bind_graph` never reserves any — it shares an `Arc`. But `arena_freeze`
+/// *does* reserve the projection it builds, so under that rule every freeze
+/// permanently consumed a handle slot and its bytes for the life of the CALL.
+/// A grow/freeze loop — the natural shape for a per-tick simulation — would hit
+/// the cap and abort with `0x864` for no reason the guest could see.
+#[test]
+fn repeated_arena_freezing_reclaims_its_budget() {
+    // A deliberately tiny handle cap, so a leak shows up in a few iterations
+    // rather than after four thousand.
+    let mut s = AlgoSession::new(
+        11,
+        WorkBudget::from_edge_count(1_000_000),
+        Arena::new(1 << 20, 16),
+    );
+    let arena = s.arena_new(8, 2).expect("arena");
+    let _slots = s.arena_alloc(arena, 4).expect("slots");
+
+    for round in 0..64 {
+        let frozen = s
+            .arena_freeze(arena)
+            .unwrap_or_else(|e| panic!("freeze {round} must not exhaust the budget: {e:?}"));
+        s.free(frozen)
+            .unwrap_or_else(|e| panic!("free {round}: {e:?}"));
+    }
+}
+
+/// Freeing a *bound* graph must not hand back budget it never took.
+///
+/// The sibling of the freeze-leak test, and the invariant the blanket
+/// graph carve-out in `free` existed to protect. `bind_graph` shares an `Arc`
+/// and reserves nothing, so a bind/free loop that credited the arena each time
+/// would mint handle budget from nothing and let a guest walk past the cap.
+#[test]
+fn freeing_a_bound_graph_does_not_mint_budget() {
+    let mut s = AlgoSession::new(
+        11,
+        WorkBudget::from_edge_count(1_000_000),
+        Arena::new(1 << 20, 8),
+    );
+    let g = s.bind_graph(Arc::new(build_projection(&[0, 1], &[], false, false)));
+    for _ in 0..32 {
+        let extra = s.bind_graph(Arc::new(build_projection(&[0, 1], &[], false, false)));
+        s.free(extra).expect("free a bound graph");
+    }
+    // The cap must still bite after all that binding and freeing: eight handles,
+    // so a ninth live allocation fails. If the loop had credited the arena, this
+    // would succeed and the cap would be decorative.
+    let mut allocated = 0;
+    let err = loop {
+        match s.frontier(g, &[Vid::new(0)]) {
+            Ok(_) => allocated += 1,
+            Err(e) => break e,
+        }
+        assert!(allocated <= 8, "the handle cap must still be enforced");
+    };
+    assert_eq!(
+        err.code,
+        super::error::ARENA_CAP_EXCEEDED,
+        "exhaustion must report as an arena cap, got: {}",
+        err.message
+    );
+}
+
+/// Seeding an arena from a projection gives newborns real neighbours.
+///
+/// The completion of dynamic populations: import an existing network, grow into
+/// it, freeze, aggregate. Before this a guest could grow structure or read the
+/// store, never both — an agent created during a CALL could hold state but had
+/// no way to acquire graph neighbours.
+#[test]
+fn an_arena_seeded_from_a_projection_grows_into_it() {
+    // 0→1, 1→2: a path. Max out-degree 1.
+    let (mut s, g) = session_with(build_projection(
+        &[10, 11, 12],
+        &[(10, 11, 1.0), (11, 12, 1.0)],
+        false,
+        false,
+    ));
+    let arena = s.arena_new(8, 2).expect("arena");
+    let seeded = s.arena_seed(arena, g).expect("seed from the projection");
+
+    // The frozen arena reproduces the imported topology...
+    let frozen = s.arena_freeze(arena).expect("freeze");
+    assert_eq!(s.vertex_count(frozen).expect("V"), 3, "one slot per vertex");
+    assert_eq!(s.edge_count(frozen).expect("E"), 2, "the links came across");
+
+    // ...and a newborn linked into it extends the graph rather than colliding.
+    let newborn = s.arena_alloc(arena, 1).expect("newborn");
+    s.arena_link(arena, seeded, newborn).ok();
+    let grown = s.arena_freeze(arena).expect("freeze again");
+    assert_eq!(
+        s.vertex_count(grown).expect("V"),
+        4,
+        "the newborn extends the vertex set, it does not overwrite a slot"
+    );
+
+    // A second seed into a used arena would silently break slot correspondence.
+    let err = s
+        .arena_seed(arena, g)
+        .expect_err("seeding a non-empty arena must be refused");
+    assert_eq!(err.code, super::error::ARG_VALIDATION);
+
+    // And a projection whose fan-out exceeds `branching` is named up front,
+    // rather than failing partway through the import.
+    let (mut s2, hub) = session_with(build_projection(
+        &[0, 1, 2, 3, 4],
+        &[(0, 1, 1.0), (0, 2, 1.0), (0, 3, 1.0), (0, 4, 1.0)],
+        false,
+        false,
+    ));
+    let narrow = s2.arena_new(8, 2).expect("arena");
+    let err = s2
+        .arena_seed(narrow, hub)
+        .expect_err("out-degree 4 must not fit branching 2");
+    assert!(
+        err.message.contains("arena_new(capacity, 4)"),
+        "the error must name the branching needed, got: {}",
+        err.message
+    );
+}
+
+/// REQ-D9 repro: an arena-computed column must be able to leave the CALL.
+///
+/// An arena-native algorithm (MCTS is the reported case) grows structure, scores
+/// it, and reports a per-vertex result whose slots correspond positionally to the
+/// input projection. Tightening `emit` to check `Origin` made that impossible:
+/// the column is `Origin::Arena`, `emit` demands the primary graph, and there is
+/// no kernel that rebases one onto the other. The arena could compute but not
+/// report — a regression against the previous release with no workaround.
+#[test]
+fn an_arena_column_can_be_emitted_against_a_matching_projection() {
+    let nodes: Vec<u64> = (0..4).collect();
+    let (mut s, g) = session_with(build_projection(&nodes, &[(0, 1, 1.0)], false, false));
+    s = s.with_expected_columns(vec!["visit".to_string()]);
+
+    let arena = s.arena_new(8, 2).expect("arena");
+    let slots = s.arena_alloc(arena, 4).expect("four slots, one per vertex");
+    let c = s.arena_column(arena).expect("a state column");
+    #[expect(clippy::cast_sign_loss, reason = "column index is non-negative")]
+    let col = s
+        .arena_gather(arena, c as u32, slots)
+        .expect("a scored column");
+
+    // `emit` stays strict — but the refusal must name the way out, since an
+    // arena-native algorithm reporting results is a legitimate thing to want.
+    let err = s
+        .emit(&[("visit", col)])
+        .expect_err("emit is keyed to the projection");
+    assert!(
+        err.message.contains("rekey"),
+        "the refusal must name the primitive that fixes it, got: {}",
+        err.message
+    );
+
+    // One explicit call, and the column reports. The guest states the
+    // correspondence; the host checks the counts agree.
+    let moved = s.rekey(col, g).expect("arena slots match the projection");
+    assert!(
+        s.emit(&[("visit", moved)]).is_ok(),
+        "a rebased arena column must be emittable"
+    );
+
+    // The length check is real: a value of the wrong length cannot be rebased.
+    let small = s.arena_new(8, 2).expect("second arena");
+    let two = s.arena_alloc(small, 2).expect("two slots");
+    let c2 = s.arena_column(small).expect("column");
+    #[expect(clippy::cast_sign_loss, reason = "column index is non-negative")]
+    let wrong = s.arena_gather(small, c2 as u32, two).expect("gather");
+    assert!(
+        s.rekey(wrong, g).is_err(),
+        "a 2-element value cannot be rebased onto a 4-vertex projection"
+    );
+
+    // A *subset* of a larger arena rebases fine, because the check is on the
+    // value's length rather than the arena's total live slots. This is the
+    // bandit shape: an arena holding root + K arms, gathering the K arms against
+    // a projection sized to K. Checking the arena's total refused it and forced
+    // the caller to reshape the projection around an arena implementation detail.
+    let big = s.arena_new(16, 2).expect("big arena");
+    let _root = s.arena_alloc(big, 1).expect("root slot");
+    let arms_slots = s.arena_alloc(big, 4).expect("four arms");
+    let cb = s.arena_column(big).expect("column");
+    #[expect(clippy::cast_sign_loss, reason = "column index is non-negative")]
+    let arms = s
+        .arena_gather(big, cb as u32, arms_slots)
+        .expect("gather the arms only");
+    assert!(
+        s.rekey(arms, g).is_ok(),
+        "a 4-element subset of a 5-slot arena must rebase onto a 4-vertex projection"
+    );
+}
+
+/// REQ-D8's published hint must actually work.
+///
+/// The `arena_spmv` hint tells a guest to freeze the arena and `spmv` over it.
+/// Publishing a composition that fails is worse than publishing nothing, so this
+/// runs the hint verbatim.
+#[test]
+fn the_arena_spmv_hint_composition_actually_runs() {
+    let (mut s, _g) = session_with(build_projection(
+        &[0, 1, 2, 3],
+        &[(0, 1, 1.0)],
+        false,
+        false,
+    ));
+    let arena = s.arena_new(8, 2).expect("arena");
+    let slots = s.arena_alloc(arena, 3).expect("slots");
+    let c = s.arena_column(arena).expect("a state column");
+    #[expect(clippy::cast_sign_loss, reason = "column index is non-negative")]
+    let col = s.arena_gather(arena, c as u32, slots).expect("column");
+
+    // Verbatim: spmv(arena_freeze(a), col, "linear_algebra", "out")
+    let frozen = s.arena_freeze(arena).expect("freeze");
+    let out = s.spmv(frozen, col, Semiring::LinearAlgebra, Direction::Out, None);
+    assert!(
+        out.is_ok(),
+        "the published arena_spmv composition must run: {:?}",
+        out.err()
+    );
+}
+
+/// `interp` is the SD table function, checked against a hand oracle.
+///
+/// Breakpoints (0,0), (1,2), (3,3): slope 2 then 0.5, clamped outside. The
+/// composition this replaces was proven correct first — a per-segment ramp gated
+/// on `compare` — and measured at ~14 passes over `[V]` per segment, which is why
+/// this exists as a kernel rather than only as a published recipe.
+#[test]
+fn interp_evaluates_a_table_function_with_clamped_ends() {
+    let (mut s, g) = session_with(build_projection(&[0, 1, 2, 3, 4, 5], &[], false, false));
+    let xs = [0.0_f64, 1.0, 3.0];
+    let ys = [0.0_f64, 2.0, 3.0];
+
+    // below range | exact knot | mid-segment | exact knot | mid-segment | above
+    let x = s
+        .alloc_tensor_for_test(Tensor::from_f64(vec![-1.0, 0.0, 0.5, 1.0, 2.0, 9.0]))
+        .expect("x");
+    let out = s.interp(x, &xs, &ys).expect("interp");
+    let got = s.tensor_values_for_test(out);
+    for (i, want) in [0.0_f64, 0.0, 1.0, 2.0, 2.5, 3.0].iter().enumerate() {
+        assert!(
+            (got[i] - want).abs() < 1e-12,
+            "slot {i}: got {}, want {want}",
+            got[i]
+        );
+    }
+
+    // One pass, not one per segment.
+    let before = s.spent_for_test();
+    let _ = s.interp(x, &xs, &ys).expect("second interp");
+    assert_eq!(
+        s.spent_for_test() - before,
+        6,
+        "interp must charge one pass over [V], independent of breakpoint count"
+    );
+
+    // Shape and provenance survive, so an [E] curve stays [E].
+    let e = s.edge_weights(g).expect("edge weights");
+    let ei = s.interp(e, &xs, &ys).expect("interp on [E]");
+    assert!(
+        s.tensor_for_test(ei).expect("tensor").is_edge_shaped(),
+        "an [E] input must yield an [E] result"
+    );
+}
+
+/// Malformed breakpoints are named, not silently reinterpreted.
+#[test]
+fn interp_rejects_a_curve_it_cannot_evaluate() {
+    let (mut s, _g) = session_with(build_projection(&[0, 1], &[], false, false));
+    let x = s
+        .alloc_tensor_for_test(Tensor::from_f64(vec![0.5, 0.5]))
+        .expect("x");
+
+    for (xs, ys, needle) in [
+        (vec![1.0], vec![1.0], "at least two"),
+        (vec![0.0, 1.0], vec![1.0], "y-breakpoints"),
+        // Not merely unsorted — a repeated x makes the segment slope infinite.
+        (
+            vec![0.0, 1.0, 1.0],
+            vec![0.0, 1.0, 2.0],
+            "strictly increase",
+        ),
+        (
+            vec![0.0, 2.0, 1.0],
+            vec![0.0, 1.0, 2.0],
+            "strictly increase",
+        ),
+        (vec![0.0, f64::NAN], vec![0.0, 1.0], "NaN"),
+    ] {
+        let err = s
+            .interp(x, &xs, &ys)
+            .expect_err("a malformed curve must be rejected");
+        assert!(
+            err.message.contains(needle),
+            "error must mention `{needle}`, got: {}",
+            err.message
+        );
+    }
+}
+
+/// `edge_from_nodes` bridges node values onto edges — and unblocks the rule
+/// that motivated it.
+///
+/// Comparing edge *properties* was always possible; nothing brought node values
+/// onto edges, so a predicate over an edge's two endpoints — which is what an
+/// interaction rule is made of — could not be expressed at all.
+#[test]
+fn edge_from_nodes_gathers_endpoint_values_onto_edges() {
+    // 0->1, 1->2, 0->2 in CSR out-edge order.
+    let (mut s, g) = session_with(build_projection(
+        &[0, 1, 2],
+        &[(0, 1, 1.0), (1, 2, 1.0), (0, 2, 1.0)],
+        false,
+        false,
+    ));
+    // opinions: node0 = 0.0, node1 = 0.1, node2 = 0.9
+    let x = s
+        .alloc_tensor_for_test(Tensor::from_f64(vec![0.0, 0.1, 0.9]))
+        .expect("opinions");
+
+    // CSR order is node 0's edges first (0->1, 0->2), then node 1's (1->2).
+    for (op, want) in [
+        (EndpointOp::Src, vec![0.0, 0.0, 0.1]),
+        (EndpointOp::Dst, vec![0.1, 0.9, 0.9]),
+        (EndpointOp::Sub, vec![0.1, 0.9, 0.8]),
+        (EndpointOp::AbsDiff, vec![0.1, 0.9, 0.8]),
+        (EndpointOp::Max, vec![0.1, 0.9, 0.9]),
+    ] {
+        let out = s.edge_from_nodes(g, x, op).expect("gather");
+        let got = s.tensor_values_for_test(out);
+        for (i, w) in want.iter().enumerate() {
+            assert!(
+                (got[i] - w).abs() < 1e-12,
+                "{op:?} edge {i}: got {}, want {w}",
+                got[i]
+            );
+        }
+        assert!(
+            s.tensor_for_test(out).expect("t").is_edge_shaped(),
+            "{op:?} must yield an [E] tensor"
+        );
+    }
+
+    // The whole point: bounded confidence. Keep only edges whose endpoints
+    // differ by less than epsilon = 0.5, then traverse only those.
+    let diff = s.edge_from_nodes(g, x, EndpointOp::AbsDiff).expect("diff");
+    let close = s
+        .map_to_set(diff, Predicate::Lt(0.5))
+        .expect("an [E] mask lowers to an EdgeSet");
+    let ones = s
+        .alloc_tensor_for_test(Tensor::from_f64(vec![1.0, 1.0, 1.0]))
+        .expect("ones");
+    let agg = s
+        .spmv_masked(g, ones, Semiring::LinearAlgebra, close)
+        .expect("masked traversal over the surviving edges");
+    let got = s.tensor_values_for_test(agg);
+    // Only 0->1 survives (|0.1-0.0| = 0.1 < 0.5), so node 1 receives 1.0.
+    assert!(
+        (got[1] - 1.0).abs() < 1e-12 && got[2].abs() < 1e-12,
+        "only the within-epsilon edge may contribute, got {got:?}"
+    );
+}
+
+/// A node map from another projection, or an `[E]` input, is refused.
+#[test]
+fn edge_from_nodes_rejects_a_value_it_cannot_gather() {
+    let (mut s, g) = session_with(build_projection(&[0, 1], &[(0, 1, 1.0)], false, false));
+    let e = s.edge_weights(g).expect("an [E] tensor");
+    assert!(
+        s.edge_from_nodes(g, e, EndpointOp::Src).is_err(),
+        "an [E] input is already edge-shaped and cannot be gathered onto edges"
+    );
+
+    let other = s.bind_graph(Arc::new(build_projection(
+        &[10, 11],
+        &[(10, 11, 1.0)],
+        false,
+        false,
+    )));
+    let foreign = s.degrees(other, Direction::Out).expect("degrees elsewhere");
+    assert!(
+        s.edge_from_nodes(g, foreign, EndpointOp::Src).is_err(),
+        "a [V] map from another projection must not be gathered onto these edges"
+    );
+}
+
+/// `rekey` is a verified move between projections, not a cast.
+///
+/// It is the escape hatch that makes named scopes useful: two edge layers over
+/// the same vertices are a real thing to want to combine. What keeps it honest is
+/// that it *checks* the correspondence rather than trusting the caller — so the
+/// failure mode is a named error, not a plausible wrong number.
+#[test]
+fn rekey_moves_a_value_between_projections_only_when_they_correspond() {
+    // Same vids, different topology — the case named scopes exist for.
+    let layer_a = build_projection(&[0, 1, 2, 3], &[(0, 1, 1.0)], false, false);
+    let layer_b = build_projection(&[0, 1, 2, 3], &[(2, 3, 1.0)], false, false);
+    let (mut s, ga) = session_with(layer_a);
+    let gb = s.bind_graph(Arc::new(layer_b));
+
+    let deg_b = s.degrees(gb, Direction::Out).expect("degrees on b");
+    // Without rekey the layers cannot be combined at all.
+    let deg_a = s.degrees(ga, Direction::Out).expect("degrees on a");
+    assert!(
+        s.ewise(deg_a, deg_b, EwiseOp::Add).is_err(),
+        "combining across projections must require an explicit rekey"
+    );
+
+    let moved = s.rekey(deg_b, ga).expect("same vid set, so rekey succeeds");
+    let sum = s
+        .ewise(deg_a, moved, EwiseOp::Add)
+        .expect("after rekey the layers combine");
+    let total: f64 = s.tensor_values_for_test(sum).iter().sum();
+    assert!(
+        (total - 2.0).abs() < 1e-9,
+        "both layers must contribute one edge each, got {total}"
+    );
+
+    // A different vid set is refused, naming where they diverge.
+    let other = s.bind_graph(Arc::new(build_projection(
+        &[0, 1, 2, 9],
+        &[(0, 1, 1.0)],
+        false,
+        false,
+    )));
+    let err = s
+        .rekey(deg_a, other)
+        .expect_err("differing vid sets must not be re-keyed");
+    assert!(
+        err.message.contains("slot 3"),
+        "the error must name the first divergent slot, got: {}",
+        err.message
+    );
+
+    // Differing sizes are refused before the walk.
+    let smaller = s.bind_graph(Arc::new(build_projection(&[0, 1], &[], false, false)));
+    assert!(
+        s.rekey(deg_a, smaller).is_err(),
+        "projections of different sizes cannot describe the same vertex set"
+    );
+
+    // [E] values have no cross-projection meaning even when the vertices match.
+    let edge_vals = s.edge_weights(ga).expect("edge weights");
+    let err = s
+        .rekey(edge_vals, gb)
+        .expect_err("an [E] value must not be re-keyed");
+    assert!(
+        err.message.contains("[V]") || err.message.contains("edge order"),
+        "the error must explain why [E] cannot carry across, got: {}",
+        err.message
+    );
+
+    // Re-keying to the value's own projection is a caller mistake, not a no-op,
+    // and reports as an argument fault rather than a shape one.
+    let err = s
+        .rekey(deg_a, ga)
+        .expect_err("rekey to the same projection must be reported");
+    assert_eq!(
+        err.code,
+        super::error::ARG_VALIDATION,
+        "a same-projection rekey is an argument fault (0x86E), not a shape one"
+    );
+
+    // A value that could never be re-keyed must not debit the work meter for the
+    // O(V) correspondence walk it was never going to reach.
+    let walks = s
+        .random_walks(ga, 2, 1, &[Vid::new(0)], 1.0, 1.0, 3)
+        .expect("walks on a");
+    let before = s.work_spent_units();
+    assert!(
+        s.rekey(walks, gb).is_err(),
+        "a walk matrix has no [V] keying to move"
+    );
+    assert_eq!(
+        s.work_spent_units(),
+        before,
+        "a rejected rekey must not charge the correspondence walk"
+    );
+}
+
+/// Provenance survives the set→map hop, so a real composition still works.
+///
+/// `set_to_map` used to return `Untracked`. Now it inherits, which is what makes
+/// `Untracked` unreachable from guest code — while the unification rule keeps
+/// ordinary pipelines (PageRank's teleport vector) working.
+#[test]
+fn set_to_map_carries_the_sets_provenance() {
+    let nodes: Vec<u64> = (0..4).collect();
+    let (mut s, g) = session_with(build_projection(&nodes, &[(0, 1, 1.0)], false, false));
+    let other = s.bind_graph(Arc::new(build_projection(
+        &[10, 11, 12, 13],
+        &[(10, 11, 1.0)],
+        false,
+        false,
+    )));
+
+    let f = s.frontier(g, &[Vid::new(0)]).expect("frontier");
+    let m = s.set_to_map(f, Scalar::F64(1.0)).expect("set_to_map");
+    let deg = s.degrees(g, Direction::Out).expect("degrees");
+    // Same graph: still composes.
+    s.ewise(m, deg, EwiseOp::Add)
+        .expect("a set-derived map must still combine with its own graph");
+
+    // Different graph: now caught, where it previously slipped through as Untracked.
+    let foreign = s.degrees(other, Direction::Out).expect("degrees on other");
+    assert!(
+        s.ewise(m, foreign, EwiseOp::Add).is_err(),
+        "a set-derived map must not combine with another projection"
+    );
+}
+
+/// Edge-set algebra must not abort the host on mismatched capacities.
+///
+/// The vertex-set trio got this guard when multi-graph sessions made `zip_with`'s
+/// assert reachable; the edge-set pair sitting beside them was missed.
+#[test]
+fn edge_set_algebra_errors_instead_of_panicking() {
+    let a = build_projection(&[0, 1, 2], &[(0, 1, 1.0), (1, 2, 1.0)], true, false);
+    let b = build_projection(&[0, 1, 2, 3], &[(0, 1, 1.0)], true, false);
+    let (mut s, ga) = session_with(a);
+    let gb = s.bind_graph(Arc::new(b));
+
+    let ea = s.edges_all(ga).expect("all edges of a");
+    let eb = s.edges_all(gb).expect("all edges of b");
+    assert!(
+        s.edge_union(ea, eb).is_err(),
+        "edge_union across differing edge counts must error, not abort"
+    );
+    assert!(
+        s.edge_intersect(ea, eb).is_err(),
+        "edge_intersect across differing edge counts must error, not abort"
+    );
+}
+
+/// Output kernels must key their vertex ids to the value's own projection.
+///
+/// `emit` tied output to a graph by *length*, and `topk` / `arg_extreme`
+/// translated slots through the first-bound projection unconditionally. So with
+/// two projections of the same vertex count, a value from the second was
+/// labelled with the first's Vids — plausible ids, wrong vertices, no error.
+#[test]
+fn output_kernels_reject_or_relabel_by_the_values_own_graph() {
+    // Same vertex count, disjoint vids: length can never separate these.
+    let a = build_projection(&[0, 1, 2, 3], &[(0, 1, 1.0)], false, false);
+    let b = build_projection(&[10, 11, 12, 13], &[(10, 11, 1.0)], false, false);
+    let (mut s, ga) = session_with(a);
+    let gb = s.bind_graph(Arc::new(b));
+    assert_eq!(
+        s.table_vertex_count_for_test(ga),
+        s.table_vertex_count_for_test(gb),
+        "the fixture must make the two graphs indistinguishable by length"
+    );
+
+    // `topk` and `arg_extreme` label ids from the tensor's own graph, so a
+    // second-projection tensor yields *that* graph's vids, not the primary's.
+    let deg_b = s.degrees(gb, Direction::Out).expect("degrees on b");
+    let (vid, _) = s.arg_extreme(deg_b, true).expect("arg_extreme");
+    assert!(
+        vid.as_u64() >= 10,
+        "arg_extreme must return graph b's vids, got {vid:?}"
+    );
+    let top = s.topk(deg_b, 1).expect("topk");
+    assert!(
+        top[0].0.as_u64() >= 10,
+        "topk must return graph b's vids, got {:?}",
+        top[0].0
+    );
+
+    // `emit` keys its rows to the primary projection, so a column from the
+    // second graph is rejected outright rather than mislabelled.
+    let mut s2 = {
+        let a2 = build_projection(&[0, 1, 2, 3], &[(0, 1, 1.0)], false, false);
+        let (mut inner, _) = session_with(a2);
+        inner = inner.with_expected_columns(vec!["score".to_string()]);
+        inner
+    };
+    let g2 = s2.bind_graph(Arc::new(build_projection(
+        &[20, 21, 22, 23],
+        &[(20, 21, 1.0)],
+        false,
+        false,
+    )));
+    let foreign = s2
+        .degrees(g2, Direction::Out)
+        .expect("degrees on the second");
+    let err = s2
+        .emit(&[("score", foreign)])
+        .expect_err("emitting a foreign column must be rejected");
+    assert!(
+        err.message.contains("different projection"),
+        "the error must name the mismatch, got: {}",
+        err.message
+    );
 }

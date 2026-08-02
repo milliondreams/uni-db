@@ -241,8 +241,33 @@ pub fn value_to_py(py: Python, value: &Value) -> PyResult<Py<PyAny>> {
             let lanes: Vec<i64> = bytes.iter().map(|&b| i64::from(b)).collect();
             Ok(lanes.into_py_any(py)?)
         }
-        _ => Ok(py.None()),
+        // `uni_common::Value` is `#[non_exhaustive]` and this is a different
+        // crate, so the wildcard is mandatory — rustc can never warn here. It
+        // used to return `py.None()`, which is how the `SparseVector` and
+        // `BinaryVector` arms above came to exist: each was added only after a
+        // release had already shipped silently dropping that property. Failing
+        // loudly converts the next such variant from lost data into a visible
+        // error at the boundary.
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "uni_db: no Python conversion for Value variant {}; this is a \
+             uni-db bug — the binding needs an arm for it",
+            truncated_variant_debug(other)
+        ))),
     }
+}
+
+/// Render a `Value` for an error message without pasting a whole vector into it.
+fn truncated_variant_debug(value: &Value) -> String {
+    const MAX: usize = 120;
+    let rendered = format!("{value:?}");
+    if rendered.len() <= MAX {
+        return rendered;
+    }
+    let mut cut = MAX;
+    while cut > 0 && !rendered.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}… ({} bytes total)", &rendered[..cut], rendered.len())
 }
 
 /// Convert a Python object to a serde_json::Value.
@@ -1824,4 +1849,36 @@ pub fn py_timedelta_to_duration(obj: &Bound<'_, PyAny>) -> PyResult<std::time::D
         ));
     }
     Ok(std::time::Duration::from_secs_f64(total_secs))
+}
+
+#[cfg(test)]
+mod value_to_py_coverage {
+    use super::*;
+
+    /// A Rust-side exhaustiveness test is not possible here: the crate builds
+    /// with pyo3's `extension-module`, so libpython is not linked and
+    /// `Python::initialize()` is unavailable in a unit test. Coverage of the
+    /// conversion itself lives in `tests/test_value_conversion.py`, which runs
+    /// under a real interpreter.
+    ///
+    /// What is testable without Python is that the new error path stays bounded
+    /// — a vector-shaped variant would otherwise paste kilobytes into the
+    /// exception message.
+    #[test]
+    fn variant_debug_is_truncated() {
+        let big = Value::Vector(vec![1.234_567; 4096]);
+        let rendered = truncated_variant_debug(&big);
+        assert!(
+            rendered.len() < 200,
+            "error text must stay bounded, got {} bytes",
+            rendered.len()
+        );
+        assert!(rendered.contains("bytes total"));
+    }
+
+    #[test]
+    fn short_variant_debug_is_left_alone() {
+        let small = Value::Int(7);
+        assert_eq!(truncated_variant_debug(&small), "Int(7)");
+    }
 }

@@ -58,6 +58,8 @@ pub struct LoadOutcome {
     pub aggregates_registered: Vec<String>,
     /// Procedure qnames registered (M8.7).
     pub procedures_registered: Vec<String>,
+    /// Algorithm qnames registered (gated on `Capability::Algorithm`).
+    pub algorithms_registered: Vec<String>,
     /// Strong reference to the per-plugin runtime. Adapters hold inner
     /// `Arc` clones; the host can drop this on unload to release the
     /// captured callables.
@@ -237,14 +239,16 @@ impl PyPluginLoader {
         } else {
             Vec::new()
         };
-        if effective.contains(&Capability::Algorithm) {
+        let algorithms_registered = if effective.contains(&Capability::Algorithm) {
             register_algorithms(
                 registrar,
                 Arc::clone(&runtime),
                 &resolved_id,
                 &manifest.algorithms,
-            )?;
-        }
+            )?
+        } else {
+            Vec::new()
+        };
 
         Ok(LoadOutcome {
             plugin_id: resolved_id,
@@ -254,6 +258,7 @@ impl PyPluginLoader {
             scalars_registered,
             aggregates_registered,
             procedures_registered,
+            algorithms_registered,
             runtime,
         })
     }
@@ -495,10 +500,40 @@ fn register_algorithms(
     entries: &[crate::manifest::PyAlgorithmEntry],
 ) -> Result<Vec<String>, PyPluginError> {
     use arrow_schema::Field;
+    use uni_plugin::adapter_common::arrow_types::arg_type_from_token;
     use uni_plugin::traits::algorithm::AlgorithmSignature;
+    use uni_plugin::traits::procedure::NamedArgType;
 
     let mut registered = Vec::with_capacity(entries.len());
     for entry in entries {
+        // Declared algorithm args are now typed and validated (G4) — they were
+        // parsed then silently ignored, leaving `signature.args` empty so
+        // `coerce_config_json` was a no-op. The shared token vocabulary also lets
+        // a guest declare a `value`/`list` argument (a variable-length seed set)
+        // instead of generating the plugin per-arity.
+        let mut args: Vec<NamedArgType> = entry
+            .args
+            .iter()
+            .enumerate()
+            .map(|(i, tok)| {
+                let ty = arg_type_from_token(tok.as_str()).ok_or_else(|| {
+                    PyPluginError::ManifestInvalid(format!(
+                        "unknown arg type `{tok}` for algorithm `{}`; supported: \
+                         float/int/string/bool/null/value/list",
+                        entry.name
+                    ))
+                })?;
+                Ok(NamedArgType {
+                    name: SmolStr::from(format!("arg{i}")),
+                    ty,
+                    default: None,
+                    doc: String::new(),
+                })
+            })
+            .collect::<Result<_, PyPluginError>>()?;
+        // Accept the optional trailing projection-config object the CALL
+        // convention appends after the guest args (stripped by the adapter).
+        args.push(NamedArgType::projection_config());
         // Yields are declared `"name:type"` (e.g. `"score:float"`) so the
         // emitted column and the special `nodeId` column bind by name.
         let output_fields: Vec<Field> = entry
@@ -510,12 +545,26 @@ fn register_algorithms(
                     Some((n, t)) => (n.trim().to_string(), t.trim()),
                     None => (format!("col{i}"), spec.as_str()),
                 };
-                let dt = type_name_to_datatype(type_name)?;
+                // Algorithm yields are narrower than the general type map:
+                // the emit channel is `Vec<f64>` and `build_batch` can only
+                // assemble Int64/Float64, so accepting `string`/`bool` here
+                // registered an algorithm that failed on every CALL.
+                let dt = uni_plugin_builtin::algorithms::graph_compute::algorithm_yield_datatype(
+                    type_name,
+                )
+                .ok_or_else(|| {
+                    PyPluginError::ManifestInvalid(format!(
+                        "algorithm `{}` declares yield type `{type_name}`, which the emit \
+                         path cannot build; algorithm yields must be int or float",
+                        entry.name
+                    ))
+                })?;
                 Ok(Field::new(name, dt, false))
             })
             .collect::<Result<_, PyPluginError>>()?;
         let sig = AlgorithmSignature {
             output_fields,
+            args,
             docs: String::new(),
             ..Default::default()
         };
@@ -539,11 +588,10 @@ fn intersect_caps(
     granted: &CapabilitySet,
 ) -> (CapabilitySet, Vec<Capability>) {
     let effective = declared.intersect(granted);
-    let denied: Vec<Capability> = declared
-        .iter()
-        .filter(|c| !granted.contains(c))
-        .cloned()
-        .collect();
+    // Denied = declared minus effective, tested by variant so an
+    // attenuated-but-granted payload cap (e.g. a narrowed HostQuery) is not
+    // misreported as denied. See `CapabilitySet::denied_against`.
+    let denied = declared.denied_against(&effective);
     (effective, denied)
 }
 

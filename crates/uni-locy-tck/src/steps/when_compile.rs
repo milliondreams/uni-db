@@ -20,7 +20,22 @@ async fn when_compiling_locy_program(world: &mut LocyWorld, step: &cucumber::ghe
             }));
         }
         Ok(ast) => {
-            let compile_result = uni_locy::compile(&ast).map_err(|e| UniError::Query {
+            // Compile through the registry-backed oracle, matching every host
+            // path. A bare `uni_locy::compile` uses the six-name default, so
+            // the TCK could not exercise the registry at all — which is how
+            // this feature's prose came to describe behaviour the suite never
+            // checked.
+            let plugins = uni_query::query::df_graph::locy_fold::default_locy_plugin_registry();
+            let oracle = |name: &str| {
+                uni_query::query::df_graph::locy_fold::locy_monotonicity_verdict(&plugins, name)
+            };
+            let compile_result = uni_locy::compile_with_oracle(
+                &ast,
+                &std::collections::HashMap::new(),
+                &[],
+                &oracle,
+            )
+            .map_err(|e| UniError::Query {
                 message: format!("LocyCompileError: {e}"),
                 query: None,
             });

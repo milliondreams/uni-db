@@ -3,6 +3,7 @@
 
 #[cfg(feature = "lance-backend")]
 use crate::backend::table_names;
+use crate::backend::types::{CmpOp, FilterExpr, Scalar};
 use crate::runtime::context::QueryContext;
 use crate::runtime::embed_caps::is_multivector_property;
 use crate::runtime::flush_coordinator::{
@@ -306,6 +307,7 @@ fn refresh_touched_embed_targets(
 }
 
 #[derive(Clone, Debug)]
+
 pub struct WriterConfig {
     pub max_mutations: usize,
     /// Enable the partial-column MergeInsert path for SET-only flushes.
@@ -408,31 +410,6 @@ fn props_subset(props: &Properties, keys: &HashSet<String>) -> Properties {
         }
     }
     out
-}
-
-/// Join a storage base URI and a dataset name into a `.lance` URI.
-///
-/// Mirrors the fork branch loop's `join_uri` so the versions captured
-/// by [`Writer::flush_and_capture_fork_point`] key the exact same
-/// datasets the fork later branches.
-fn join_lance_uri(base: &str, dataset: &str) -> String {
-    if base.ends_with('/') {
-        format!("{base}{dataset}.lance")
-    } else {
-        format!("{base}/{dataset}.lance")
-    }
-}
-
-/// Cheap on-disk existence check for a dataset `.lance` directory.
-///
-/// Local-fs heuristic: a URI with a `://` scheme is assumed remote and
-/// reported present, deferring the real check to `current_version`.
-/// Mirrors the fork branch loop's `path_exists`.
-fn lance_path_exists(uri: &str) -> bool {
-    if uri.contains("://") {
-        return true;
-    }
-    std::path::Path::new(uri).exists()
 }
 
 /// Output of [`Writer::flush_stream_l1`]: the built (but not yet
@@ -1888,7 +1865,7 @@ impl Writer {
                         }
                     }
                     ConstraintType::Check { expression } => {
-                        if !self.evaluate_check_constraint(expression, properties)? {
+                        if !uni_common::core::check_constraint::evaluate(expression, properties)? {
                             return Err(anyhow!(
                                 "CHECK constraint '{}' violated: expression '{}' evaluated to false",
                                 constraint.name,
@@ -2246,7 +2223,9 @@ impl Writer {
                         ));
                     }
                     ConstraintType::Check { expression }
-                        if !self.evaluate_check_constraint(expression, properties)? =>
+                        if !uni_common::core::check_constraint::evaluate(
+                            expression, properties,
+                        )? =>
                     {
                         return Err(anyhow!(
                             "Constraint violation at index {}: CHECK constraint '{}' violated",
@@ -2326,36 +2305,31 @@ impl Writer {
                     let mut all_present = true;
                     for prop in unique_props {
                         if let Some(val) = properties.get(prop) {
-                            let val_str = match val {
-                                Value::String(s) => format!("'{}'", s.replace('\'', "''")),
-                                Value::Int(n) => n.to_string(),
-                                Value::Float(f) => f.to_string(),
-                                Value::Bool(b) => b.to_string(),
-                                _ => {
-                                    all_present = false;
-                                    break;
-                                }
+                            let Some(scalar) = constraint_scalar(val) else {
+                                all_present = false;
+                                break;
                             };
-                            and_parts.push(format!("{} = {}", prop, val_str));
+                            and_parts.push(FilterExpr::equals(prop.as_str(), scalar));
                         } else {
                             all_present = false;
                             break;
                         }
                     }
                     if all_present {
-                        or_filters.push(format!("({})", and_parts.join(" AND ")));
+                        or_filters.push(FilterExpr::all(and_parts));
                     }
                 }
 
                 #[cfg(feature = "lance-backend")]
                 if !or_filters.is_empty() {
-                    let vid_list: Vec<String> =
-                        vids.iter().map(|v| v.as_u64().to_string()).collect();
-                    let filter = format!(
-                        "({}) AND _deleted = false AND _vid NOT IN ({})",
-                        or_filters.join(" OR "),
-                        vid_list.join(", ")
-                    );
+                    let filter = FilterExpr::all([
+                        FilterExpr::any_of(or_filters),
+                        FilterExpr::not_deleted(),
+                        FilterExpr::negate(FilterExpr::one_of(
+                            "_vid",
+                            vids.iter().map(|v| Scalar::UInt(v.as_u64())),
+                        )),
+                    ]);
 
                     // Count flushed duplicates through the `StorageBackend`
                     // (branch-aware, correct `.lance` path). A missing table
@@ -2366,7 +2340,7 @@ impl Writer {
                     let backend = self.storage.backend();
                     let table = table_names::vertex_table_name(label);
                     if backend.table_exists(&table).await? {
-                        let count = backend.count_rows(&table, Some(filter.as_str())).await?;
+                        let count = backend.count_rows(&table, Some(&filter)).await?;
                         if count > 0 {
                             return Err(anyhow!(
                                 "Constraint violation: Duplicate composite key for label '{}' in storage (constraint '{}')",
@@ -2526,116 +2500,6 @@ impl Writer {
         self.resolve_l0(tx_l0).write().set_edge_type(eid, type_name);
     }
 
-    /// Evaluate a simple CHECK constraint expression.
-    /// Supports: "property op value" (e.g., "age > 18", "status = 'active'")
-    fn evaluate_check_constraint(&self, expression: &str, properties: &Properties) -> Result<bool> {
-        let parts: Vec<&str> = expression.split_whitespace().collect();
-        if parts.len() != 3 {
-            // For now, only support "prop op val"
-            // Fallback to true if too complex to avoid breaking, but warn
-            log::warn!(
-                "Complex CHECK constraint expression '{}' not fully supported yet; allowing write.",
-                expression
-            );
-            return Ok(true);
-        }
-
-        let prop_part = parts[0].trim_start_matches('(');
-        // Handle "variable.property" format - take the part after the dot
-        let prop_name = if let Some(idx) = prop_part.find('.') {
-            &prop_part[idx + 1..]
-        } else {
-            prop_part
-        };
-
-        let op = parts[1];
-        let val_str = parts[2].trim_end_matches(')');
-
-        let prop_val = match properties.get(prop_name) {
-            Some(v) => v,
-            None => return Ok(true), // If property missing, CHECK usually passes (unless NOT NULL)
-        };
-
-        // Parse value string (handle quotes for strings)
-        let target_val = if (val_str.starts_with('\'') && val_str.ends_with('\''))
-            || (val_str.starts_with('"') && val_str.ends_with('"'))
-        {
-            Value::String(val_str[1..val_str.len() - 1].to_string())
-        } else if let Ok(n) = val_str.parse::<i64>() {
-            Value::Int(n)
-        } else if let Ok(n) = val_str.parse::<f64>() {
-            Value::Float(n)
-        } else if let Ok(b) = val_str.parse::<bool>() {
-            Value::Bool(b)
-        } else {
-            // Check for internal format wrappers if they somehow leaked through
-            if val_str.starts_with("Number(") && val_str.ends_with(')') {
-                let n_str = &val_str[7..val_str.len() - 1];
-                if let Ok(n) = n_str.parse::<i64>() {
-                    Value::Int(n)
-                } else if let Ok(n) = n_str.parse::<f64>() {
-                    Value::Float(n)
-                } else {
-                    Value::String(val_str.to_string())
-                }
-            } else {
-                Value::String(val_str.to_string())
-            }
-        };
-
-        match op {
-            "=" | "==" => Ok(prop_val == &target_val),
-            "!=" | "<>" => Ok(prop_val != &target_val),
-            ">" => self
-                .compare_values(prop_val, &target_val)
-                .map(|o| o.is_gt()),
-            "<" => self
-                .compare_values(prop_val, &target_val)
-                .map(|o| o.is_lt()),
-            ">=" => self
-                .compare_values(prop_val, &target_val)
-                .map(|o| o.is_ge()),
-            "<=" => self
-                .compare_values(prop_val, &target_val)
-                .map(|o| o.is_le()),
-            _ => {
-                log::warn!("Unsupported operator '{}' in CHECK constraint", op);
-                Ok(true)
-            }
-        }
-    }
-
-    fn compare_values(&self, a: &Value, b: &Value) -> Result<std::cmp::Ordering> {
-        use std::cmp::Ordering;
-
-        fn cmp_f64(x: f64, y: f64) -> Ordering {
-            x.partial_cmp(&y).unwrap_or(Ordering::Equal)
-        }
-
-        match (a, b) {
-            (Value::Int(n1), Value::Int(n2)) => Ok(n1.cmp(n2)),
-            (Value::Float(f1), Value::Float(f2)) => Ok(cmp_f64(*f1, *f2)),
-            // Exact i64-vs-f64 order (no lossy `as f64` cast above 2^53);
-            // preserve `cmp_f64`'s NaN-as-Equal behavior for the degenerate case.
-            (Value::Int(n), Value::Float(f)) => Ok(if f.is_nan() {
-                Ordering::Equal
-            } else {
-                uni_common::cmp_i64_f64(*n, *f)
-            }),
-            (Value::Float(f), Value::Int(n)) => Ok(if f.is_nan() {
-                Ordering::Equal
-            } else {
-                uni_common::cmp_i64_f64(*n, *f).reverse()
-            }),
-            (Value::String(s1), Value::String(s2)) => Ok(s1.cmp(s2)),
-            _ => Err(anyhow!(
-                "Cannot compare incompatible types: {:?} vs {:?}",
-                a,
-                b
-            )),
-        }
-    }
-
     async fn check_unique_constraint_multi(
         &self,
         label: &str,
@@ -2716,28 +2580,27 @@ impl Writer {
         }
 
         // 2. Check Storage (L1/L2)
-        let filters: Vec<String> = key_values
+        let mut parts: Vec<FilterExpr> = key_values
             .iter()
             .map(|(prop, val)| {
-                let val_str = match val {
-                    Value::String(s) => format!("'{}'", s.replace('\'', "''")),
-                    Value::Int(n) => n.to_string(),
-                    Value::Float(f) => f.to_string(),
-                    Value::Bool(b) => b.to_string(),
-                    _ => "NULL".to_string(),
-                };
-                format!("{} = {}", prop, val_str)
+                FilterExpr::equals(
+                    prop.as_str(),
+                    constraint_scalar(val).unwrap_or(Scalar::Null),
+                )
             })
             .collect();
-
-        let mut filter = filters.join(" AND ");
-        filter.push_str(" AND _deleted = false");
+        parts.push(FilterExpr::not_deleted());
         // Exclude the vertex's own row only when it has a VID; a brand-new insert
         // (bulk) has none, and emitting `_vid != u64::MAX` would overflow the
         // filter's i64 literal parsing.
         if let Some(vid) = exclude_vid {
-            filter.push_str(&format!(" AND _vid != {}", vid.as_u64()));
+            parts.push(FilterExpr::compare(
+                "_vid",
+                CmpOp::NotEq,
+                Scalar::UInt(vid.as_u64()),
+            ));
         }
+        let filter = FilterExpr::all(parts);
 
         // 2. Check Storage (L1/L2) through the `StorageBackend` (branch-aware,
         // correct `.lance` path). Skip cleanly when the table is not yet
@@ -2747,7 +2610,7 @@ impl Writer {
             let backend = self.storage.backend();
             let table = table_names::vertex_table_name(label);
             if backend.table_exists(&table).await? {
-                let count = backend.count_rows(&table, Some(filter.as_str())).await?;
+                let count = backend.count_rows(&table, Some(&filter)).await?;
                 if count > 0 {
                     return Ok(true);
                 }
@@ -3862,7 +3725,7 @@ impl Writer {
         }
 
         // Query for this specific vid (don't filter by _deleted yet - we need to find the latest version first)
-        let filter = format!("_vid = {}", vid.as_u64());
+        let filter = FilterExpr::equals("_vid", Scalar::UInt(vid.as_u64()));
         let batches = backend
             .scan(
                 ScanRequest::all(table_name)
@@ -4689,15 +4552,19 @@ impl Writer {
         // rows. Cheap read lock; no buffer clone.
         let version_hwm = self.l0_manager.get_current().read().current_version;
 
-        let base = self.storage.base_uri();
+        let branching = self.storage.backend().branching().ok_or_else(|| {
+            anyhow::anyhow!(
+                "storage backend does not support fork branching; \
+                 cannot capture a fork point"
+            )
+        })?;
         let mut dataset_versions = BTreeMap::new();
         let mut parent_branch_versions = BTreeMap::new();
         for name in candidate_dataset_names {
-            let uri = join_lance_uri(base, name);
-            if !lance_path_exists(&uri) {
+            if !branching.table_exists(name).await? {
                 continue;
             }
-            let version = crate::backend::lance_branch::current_version(&uri).await?;
+            let version = branching.current_version(name).await?;
             dataset_versions.insert(name.clone(), version);
 
             // For a nested fork, also capture the parent branch's tip under the
@@ -4707,9 +4574,9 @@ impl Writer {
             // nested fork's branch point atomic w.r.t. a concurrent parent
             // commit+flush (the D2 fix).
             if let Some(parent_branch) = parent_branches.get(name) {
-                let branch_version =
-                    crate::backend::lance_branch::current_version_on_branch(&uri, parent_branch)
-                        .await?;
+                let branch_version = branching
+                    .current_version_on_branch(name, parent_branch)
+                    .await?;
                 parent_branch_versions.insert(name.clone(), branch_version);
             }
         }
@@ -5999,8 +5866,18 @@ impl Writer {
             if previous_still_running {
                 info!("Skipping compaction: previous compaction still in progress");
             } else {
+                // Reclaim shadow-CSR entries no in-flight reader can reach.
+                // The floor is the minimum version pinned by a live
+                // `pinned_at_version` view, or the current version when none is
+                // pinned — a reader starting now pins at the current version,
+                // so anything deleted at or below it is already unreachable.
+                let gc_version = shared
+                    .storage
+                    .version_high_water_mark()
+                    .unwrap_or_else(|| shared.l0_manager.get_current().read().current_version);
                 let handle = tokio::spawn(async move {
                     am.compact();
+                    am.gc_shadow(gc_version);
                 });
                 *shared.compaction_handle.write() = Some(handle);
             }
@@ -6200,6 +6077,22 @@ impl FinalizeFn for WriterFinalizer {
             drop(rotated.permit);
             err
         })
+    }
+}
+
+/// Map a constraint key's [`Value`] onto a [`Scalar`] literal.
+///
+/// `None` for anything with no scalar equivalent (list, map, vector, null).
+/// The two constraint probes differ in what they do with that: the batch check
+/// abandons the row entirely, while the full-horizon check probes with SQL
+/// NULL — preserving each site's prior behavior exactly.
+fn constraint_scalar(value: &Value) -> Option<Scalar> {
+    match value {
+        Value::String(s) => Some(Scalar::Str(s.clone())),
+        Value::Int(n) => Some(Scalar::Int(*n)),
+        Value::Float(f) => Some(Scalar::Float(*f)),
+        Value::Bool(b) => Some(Scalar::Bool(*b)),
+        _ => None,
     }
 }
 

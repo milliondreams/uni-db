@@ -46,14 +46,45 @@ impl ShadowCsr {
         }
     }
 
-    /// Records a deleted edge with its version lifecycle.
+    /// Record a deleted edge with its version lifecycle, ignoring a repeat of
+    /// one already recorded.
+    ///
+    /// The dedup is load-bearing, not tidiness. `AdjacencyManager::warm` pushes
+    /// a shadow entry for every `op == 1` row it scans out of the L1 delta, and
+    /// unlike `warm_coalesced` it has no `has_csr` short-circuit — so each warm
+    /// of the same `(edge_type, direction)` re-pushed the *entire* delete
+    /// history. Growth was therefore unbounded in the number of warms rather
+    /// than in the number of deletes, and invisible to the cache budget.
+    ///
+    /// `Eid` identifies the edge, and a given edge has one deletion, so a
+    /// same-eid repeat carries no information. Reads dedupe by `Eid` downstream
+    /// already, which is why this only ever showed up as memory rather than as
+    /// wrong answers.
     pub fn add_deleted_edge(&self, src_vid: Vid, edge: ShadowEdge, direction: Direction) {
+        let mut bucket = self.entries.entry((edge.edge_type, direction)).or_default();
+        let edges = bucket.entry(src_vid).or_default();
+        if edges.iter().any(|e| e.eid == edge.eid) {
+            return;
+        }
+        edges.push(edge);
+    }
+
+    /// Total shadow entries retained, across every key.
+    ///
+    /// Exposed so retention is observable directly. `current_bytes` in
+    /// `AdjacencyManager` tracks only the main CSR, so `memory_usage` folds in
+    /// [`Self::approx_bytes`] rather than counting shadow entries
+    /// incrementally.
+    pub fn entry_count(&self) -> usize {
         self.entries
-            .entry((edge.edge_type, direction))
-            .or_default()
-            .entry(src_vid)
-            .or_default()
-            .push(edge);
+            .iter()
+            .map(|kv| kv.value().values().map(Vec::len).sum::<usize>())
+            .sum()
+    }
+
+    /// Approximate retained bytes, for the same observability reason.
+    pub fn approx_bytes(&self) -> usize {
+        self.entry_count() * std::mem::size_of::<ShadowEdge>()
     }
 
     /// Returns edges that were alive at the given `version`.
@@ -96,6 +127,27 @@ impl ShadowCsr {
     ///
     /// Removes entries where `deleted_version <= oldest_active_snapshot_version`,
     /// since no active snapshot can reference those edges.
+    ///
+    /// # Choosing the bound
+    ///
+    /// Callers must pass the floor computed by
+    /// [`AdjacencyManager::gc_shadow`](crate::storage::adjacency_manager::AdjacencyManager::gc_shadow),
+    /// never a raw version. The bound is narrower than "the oldest snapshot",
+    /// and getting it wrong drops entries a live reader still resolves through
+    /// [`Self::get_entries_at_version`]:
+    ///
+    /// * `StorageManager::pinned()` and `at_fork` each build a **fresh**
+    ///   `AdjacencyManager` with its own empty `ShadowCsr`, so those readers
+    ///   never consult this instance.
+    /// * `StorageManager::pinned_at_version` **shares** the live
+    ///   `AdjacencyManager`, and is the path every read-write transaction
+    ///   takes.
+    ///
+    /// So the floor is the minimum version among in-flight `pinned_at_version`
+    /// views — tracked by `PinnedVersions`, refcounted so it cannot rise while
+    /// another reader holds the same version — falling back to the current
+    /// version when nothing is pinned. `SnapshotManager` cannot supply this: it
+    /// is a manifest reader-writer and tracks no live readers.
     pub fn gc(&self, oldest_active_snapshot_version: u64) {
         for mut entry in self.entries.iter_mut() {
             let map = entry.value_mut();

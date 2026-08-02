@@ -138,6 +138,15 @@ with uni_db.Uni.open("./my_graph") as db:
 | `db.restore_snapshot(snapshot_id)` | `None` | Restore database to a snapshot |
 | `db.write_lease()` | `WriteLease \| None` | Current write lease configuration |
 
+The `count` returned by `db.get_label_info()` / `db.get_edge_type_info()` is
+obtained with a Cypher `count(...)`, so it includes rows still buffered in L0
+and excludes tombstoned
+or superseded versions. The element name is backtick-quoted, so names containing
+punctuation (such as `.`), leading digits, or non-ASCII characters count
+correctly; a name containing a backtick cannot be quoted and raises
+`UniQueryError`. Counting failures raise rather than being reported as
+`count == 0`.
+
 ---
 
 ### UniBuilder
@@ -431,6 +440,11 @@ Returned by `session.locy_with(program)`. Supports chaining.
 | `.run()` | `LocyResult` | Execute the evaluation |
 | `.explain()` | `LocyExplainOutput` | Explain without executing |
 
+Cancellation is enforced against the whole evaluation, not just the Cypher
+statements the program dispatches, so a long-running fixpoint is interruptible.
+A cancelled evaluation raises `UniCancelledError`. `session.cancel()` applies in
+addition to any token passed to `.cancellation_token(token)`.
+
 #### TransactionBuilder
 
 Returned by `session.tx_with()`.
@@ -491,6 +505,10 @@ Returned by `tx.locy_with(program)`.
 | `.with_config(config)` | self | Apply a `LocyConfig` or config dict |
 | `.cancellation_token(token)` | self | Attach cancellation token |
 | `.run()` | `LocyResult` | Execute the evaluation |
+
+As with `SessionLocyBuilder`, cancellation races the whole evaluation and raises
+`UniCancelledError`. `tx.cancel()` applies in addition to any token passed to
+`.cancellation_token(token)`, and also reaches `tx.apply(...)`.
 
 #### ApplyBuilder
 

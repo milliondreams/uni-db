@@ -150,21 +150,23 @@ fn parse_config(config_json: &str) -> Result<(Vec<Vid>, f64, GraphProjectionSpec
         _ => DEFAULT_ALPHA,
     };
 
-    let mut spec = GraphProjectionSpec::default();
-    if let Some(serde_json::Value::Object(cfg)) = args.get(2) {
-        if let Some(labels) = cfg.get("nodeLabels").and_then(serde_json::Value::as_array) {
-            spec.node_labels = labels
-                .iter()
-                .filter_map(|v| v.as_str().map(str::to_owned))
-                .collect();
+    // Native-mode projection knobs (nodeLabels / edgeTypes / weightProperty)
+    // parsed by the shared source-of-truth parser so the knob names cannot
+    // drift from the guest loaders. gcpagerank only traverses Direction::Out
+    // (see `personalized_pagerank`), so it never needs inbound adjacency —
+    // force no-reverse regardless of the includeReverse hint to avoid building
+    // an unused in-CSR.
+    let mut spec = match args.get(2) {
+        Some(serde_json::Value::Object(cfg)) => {
+            GraphProjectionSpec::reject_scopes(cfg, "uni.algo.gcpagerank")?;
+            GraphProjectionSpec::from_config_object(cfg)
         }
-        if let Some(types) = cfg.get("edgeTypes").and_then(serde_json::Value::as_array) {
-            spec.edge_types = types
-                .iter()
-                .filter_map(|v| v.as_str().map(str::to_owned))
-                .collect();
-        }
-    }
+        _ => GraphProjectionSpec::default(),
+    };
+    spec.include_reverse = false;
+    // First-party provider: keep the ergonomic whole-graph default (G9 opt-in).
+    // A named nodeLabels/edgeTypes still scopes the projection.
+    spec.project_all = true;
     Ok((seeds, alpha, spec))
 }
 
@@ -212,9 +214,14 @@ impl AlgorithmProvider for GraphComputePageRankProvider {
             // with Timeout (0x867) once this instant passes, checked in `charge`.
             let deadline_at = deadline_ms
                 .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
-            let mut session = AlgoSession::new(super::next_session_epoch(), budget, arena)
-                .with_deadline(deadline_at)
-                .with_expected_columns(expected_cols);
+            let mut session = AlgoSession::new(
+                super::next_session_epoch()
+                    .map_err(|e| DataFusionError::Execution(format!("gcpagerank: {e}")))?,
+                budget,
+                arena,
+            )
+            .with_deadline(deadline_at)
+            .with_expected_columns(expected_cols);
             let g = session.bind_graph(Arc::clone(&graph));
 
             // Flagship returns the last iterate (allow_partial = true), matching
@@ -238,8 +245,9 @@ impl AlgorithmProvider for GraphComputePageRankProvider {
                     "uni.algo.gcpagerank",
                     started.elapsed().as_millis() as u64,
                     0,
-                    session.work_spent(),
-                    session.work_budget(),
+                    session.work_spent_units(),
+                    session.work_budget_units(),
+                    &session.trace_breadcrumbs(),
                 )
                 .map_or_else(
                     || DataFusionError::Execution(format!("gcpagerank: {e}")),
@@ -249,7 +257,9 @@ impl AlgorithmProvider for GraphComputePageRankProvider {
             session
                 .emit(&[("score", rank)])
                 .map_err(|e| DataFusionError::Execution(format!("gcpagerank emit: {e}")))?;
-            let emitted = session.take_emitted();
+            let emitted = session
+                .finish_emitted()
+                .map_err(|e| DataFusionError::Execution(format!("gcpagerank emit: {e}")))?;
             let scores = emitted
                 .into_iter()
                 .next()

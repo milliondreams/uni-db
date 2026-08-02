@@ -48,6 +48,16 @@ pub fn register(_: ()) -> FnResult<String> {
             "qname": "ai.example.extismgc.ppr",
             "args": [{"kind": "primitive", "arrow": "int64"}],
             "yields": ["nodeId:int", "score:float"]
+        }, {
+            "kind": "algorithm",
+            "qname": "ai.example.extismgc.twocol",
+            "args": [],
+            "yields": ["nodeId:int", "a:float", "b:float"]
+        }, {
+            "kind": "algorithm",
+            "qname": "ai.example.extismgc.layers",
+            "args": [],
+            "yields": ["nodeId:int", "both:float"]
         }]
     })
     .to_string())
@@ -119,7 +129,70 @@ fn ppr(session: u64, g: i64, source: i64) -> Result<(), String> {
     Ok(())
 }
 
-/// The algorithm invoke export. Input JSON `{session, graph, args}`.
+/// Emits two declared columns in a single `emit`, exercising the batch wire
+/// form (`names` + `handles`) that pairs positionally.
+fn twocol(session: u64, g: i64) -> Result<(), String> {
+    let deg = h(session, serde_json::json!({"op": "degrees", "g": g, "s": "out"}))?;
+    let ids = h(session, serde_json::json!({"op": "vertex_ids", "g": g}))?;
+    kernel(
+        session,
+        serde_json::json!({"op": "emit", "names": ["a", "b"], "handles": [deg, ids]}),
+    )?;
+    Ok(())
+}
+
+/// Reads a pre-declared named scope and combines it with the primary.
+///
+/// Sandboxed guests do not call `graph_named`: the host hands them the scope
+/// handles in the invocation JSON's `graphs` map. Crossing index spaces still
+/// needs an explicit `rekey`, which verifies the two projections describe the
+/// same vertices before re-tagging the value.
+fn layers(session: u64, g: i64, agg: i64) -> Result<(), String> {
+    let a = h(session, serde_json::json!({"op": "degrees", "g": g, "s": "out"}))?;
+    let b = h(session, serde_json::json!({"op": "degrees", "g": agg, "s": "out"}))?;
+    let moved = h(session, serde_json::json!({"op": "rekey", "a": b, "g": g}))?;
+    let sum = h(
+        session,
+        serde_json::json!({"op": "ewise", "a": a, "b": moved, "s": "add"}),
+    )?;
+    kernel(session, serde_json::json!({"op": "emit", "g": sum, "name": "both"}))?;
+    Ok(())
+}
+
+/// The named-scope algorithm's invoke export.
+/// Input JSON `{session, graph, args, graphs}`.
+#[plugin_fn]
+pub fn algo_ai_example_extismgc_layers_invoke(input: Vec<u8>) -> FnResult<Vec<u8>> {
+    let req: serde_json::Value = serde_json::from_slice(&input)
+        .map_err(|e| WithReturnCode::new(Error::msg(format!("input json: {e}")), 2))?;
+    let session = req.get("session").and_then(serde_json::Value::as_u64).unwrap_or(0);
+    let g = req.get("graph").and_then(serde_json::Value::as_i64).unwrap_or(0);
+    let agg = req
+        .get("graphs")
+        .and_then(|m| m.get("agg"))
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| {
+            WithReturnCode::new(
+                Error::msg("layers: no `agg` scope in the invocation `graphs` map"),
+                2,
+            )
+        })?;
+    layers(session, g, agg).map_err(|e| WithReturnCode::new(Error::msg(e), 2))?;
+    Ok(Vec::new())
+}
+
+/// The two-column algorithm's invoke export.
+#[plugin_fn]
+pub fn algo_ai_example_extismgc_twocol_invoke(input: Vec<u8>) -> FnResult<Vec<u8>> {
+    let req: serde_json::Value = serde_json::from_slice(&input)
+        .map_err(|e| WithReturnCode::new(Error::msg(format!("input json: {e}")), 2))?;
+    let session = req.get("session").and_then(serde_json::Value::as_u64).unwrap_or(0);
+    let g = req.get("graph").and_then(serde_json::Value::as_i64).unwrap_or(0);
+    twocol(session, g).map_err(|e| WithReturnCode::new(Error::msg(e), 2))?;
+    Ok(Vec::new())
+}
+
+/// The algorithm invoke export. Input JSON `{session, graph, args, graphs}`.
 #[plugin_fn]
 pub fn algo_ai_example_extismgc_ppr_invoke(input: Vec<u8>) -> FnResult<Vec<u8>> {
     let req: serde_json::Value = serde_json::from_slice(&input)

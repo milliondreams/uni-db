@@ -101,6 +101,58 @@ pub fn arrow_name_to_datatype(name: &str) -> Option<DataType> {
     })
 }
 
+/// Map a wire-level argument *type token* (as a plugin writes it in its manifest
+/// `args`) to an [`ArgType`]. This is the single vocabulary every loader uses to
+/// *declare* algorithm / procedure argument types, so a guest can declare a
+/// variable-length set argument — not just fixed scalars — and get the same
+/// arity/type validation the first-party providers already enjoy (closes the
+/// G4 dead-metadata gap: declared `args` were parsed but never validated).
+///
+/// Accepted tokens (case-insensitive, friendly aliases):
+/// - primitives: `float`/`float64`/`double`/`f64` → `Float64`, `float32`/`f32`
+///   → `Float32`, `int`/`int64`/`long`/`i64` → `Int64`, `int32`/`i32` → `Int32`,
+///   `string`/`utf8`/`str` → `Utf8`, `bool`/`boolean` → `Boolean`,
+///   `null`/`void`/`()` → `Null`;
+/// - `value`/`cypher`/`cyphervalue`/`cypher_value`/`any` → [`ArgType::CypherValue`]
+///   (accepts a scalar *or* an array — the right choice for a "single vid or a
+///   list of vids" seed argument, matching first-party `gcpagerank`'s `sourceVid`);
+/// - `list`/`array`/`set`/`vertexset`/`vertex_set` → an array-shape-enforcing
+///   [`ArgType::Vector`] (`json_matches_argtype` requires an array).
+///
+/// Returns `None` for any unrecognized token; callers wrap that in their
+/// loader-specific error.
+///
+/// # Examples
+///
+/// ```
+/// use uni_plugin::adapter_common::arrow_types::arg_type_from_token;
+/// use uni_plugin::traits::scalar::ArgType;
+///
+/// assert!(matches!(arg_type_from_token("int"), Some(ArgType::Primitive(_))));
+/// assert!(matches!(arg_type_from_token("value"), Some(ArgType::CypherValue)));
+/// assert!(matches!(arg_type_from_token("list"), Some(ArgType::Vector { .. })));
+/// assert!(arg_type_from_token("uuid").is_none());
+/// ```
+#[must_use]
+pub fn arg_type_from_token(name: &str) -> Option<ArgType> {
+    let n = name.trim().to_ascii_lowercase();
+    Some(match n.as_str() {
+        "float" | "float64" | "double" | "f64" => ArgType::Primitive(DataType::Float64),
+        "float32" | "f32" => ArgType::Primitive(DataType::Float32),
+        "int" | "int64" | "long" | "i64" => ArgType::Primitive(DataType::Int64),
+        "int32" | "i32" => ArgType::Primitive(DataType::Int32),
+        "string" | "utf8" | "str" => ArgType::Primitive(DataType::Utf8),
+        "bool" | "boolean" => ArgType::Primitive(DataType::Boolean),
+        "null" | "void" | "()" => ArgType::Primitive(DataType::Null),
+        "value" | "cypher" | "cyphervalue" | "cypher_value" | "any" => ArgType::CypherValue,
+        "list" | "array" | "set" | "vertexset" | "vertex_set" => ArgType::Vector {
+            len: 0,
+            element: DataType::Null,
+        },
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,5 +221,54 @@ mod tests {
     fn arrow_name_unknown_returns_none() {
         assert_eq!(arrow_name_to_datatype("super_int"), None);
         assert_eq!(arrow_name_to_datatype(""), None);
+    }
+
+    #[test]
+    fn arg_token_primitive_aliases_map() {
+        for (tok, dt) in [
+            ("int", DataType::Int64),
+            ("i64", DataType::Int64),
+            ("long", DataType::Int64),
+            ("float", DataType::Float64),
+            ("f64", DataType::Float64),
+            ("double", DataType::Float64),
+            ("string", DataType::Utf8),
+            ("str", DataType::Utf8),
+            ("bool", DataType::Boolean),
+        ] {
+            assert!(
+                matches!(arg_type_from_token(tok), Some(ArgType::Primitive(ref d)) if *d == dt),
+                "token `{tok}` should map to {dt:?}"
+            );
+        }
+        // Case-insensitive + trimmed.
+        assert!(matches!(
+            arg_type_from_token("  INT  "),
+            Some(ArgType::Primitive(DataType::Int64))
+        ));
+    }
+
+    #[test]
+    fn arg_token_set_and_list_map() {
+        // `value`/`cypherValue` accept a scalar OR an array (the seed-set arg).
+        for tok in ["value", "cypherValue", "cypher_value", "any"] {
+            assert!(
+                matches!(arg_type_from_token(tok), Some(ArgType::CypherValue)),
+                "token `{tok}` should be CypherValue"
+            );
+        }
+        // `list`/`array` enforce an array shape.
+        for tok in ["list", "array", "set", "vertexSet"] {
+            assert!(
+                matches!(arg_type_from_token(tok), Some(ArgType::Vector { .. })),
+                "token `{tok}` should be a Vector"
+            );
+        }
+    }
+
+    #[test]
+    fn arg_token_unknown_returns_none() {
+        assert!(arg_type_from_token("uuid").is_none());
+        assert!(arg_type_from_token("").is_none());
     }
 }

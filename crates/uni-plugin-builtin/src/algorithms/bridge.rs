@@ -28,7 +28,7 @@ use uni_algo::algo::projection::{GraphProjection, ProjectionBuilder};
 use uni_common::core::id::Vid;
 use uni_plugin::traits::algorithm::{
     AlgorithmContext, AlgorithmHost, AlgorithmProvider, AlgorithmSignature, GraphProjectionSpec,
-    GraphView,
+    GraphScopeSpec, GraphView,
 };
 use uni_plugin::{Capability, CapabilitySet, FnError};
 
@@ -98,12 +98,33 @@ pub struct AlgorithmHostBridge {
     pub algo_ctx: AlgoContext,
     /// Effective capabilities of the plugin owning the running algorithm.
     pub effective_caps: CapabilitySet,
+    /// Cypher/Named `graphRef` + its resolver (issue #151 P3). When both are set,
+    /// `project_for_graph_compute` resolves the projection through the injected
+    /// resolver instead of scanning storage from the (empty) Native spec.
+    resolver: Option<Arc<dyn GraphProjectionResolver>>,
+    graph_ref: Option<serde_json::Value>,
+}
+
+/// Resolves a Cypher/Named `graphRef` into a materialized [`GraphProjection`].
+///
+/// Defined here (uni-plugin-builtin) so a uni-query type can implement it and be
+/// injected into the bridge (issue #151 P3): the bridge cannot reach query
+/// execution or the projection store across the `uni-query → uni-plugin-builtin`
+/// dependency edge, so the query-side machinery is supplied by inversion.
+pub trait GraphProjectionResolver: Send + Sync {
+    /// Materialize the projection named by `graph_ref` (a Cypher or Named
+    /// graphRef object). Runs in the bridge's async context.
+    fn resolve(
+        &self,
+        graph_ref: serde_json::Value,
+    ) -> BoxFuture<'static, Result<Arc<GraphProjection>, FnError>>;
 }
 
 impl std::fmt::Debug for AlgorithmHostBridge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AlgorithmHostBridge")
             .field("effective_caps", &self.effective_caps)
+            .field("has_graph_ref", &self.graph_ref.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -115,7 +136,51 @@ impl AlgorithmHostBridge {
         Self {
             algo_ctx,
             effective_caps,
+            resolver: None,
+            graph_ref: None,
         }
+    }
+
+    /// Attach a Cypher/Named `graphRef` and the resolver that materializes it
+    /// (issue #151 P3). When set, `project_for_graph_compute` resolves through
+    /// `resolver` rather than scanning storage.
+    #[must_use]
+    pub fn with_graph_resolver(
+        mut self,
+        resolver: Arc<dyn GraphProjectionResolver>,
+        graph_ref: serde_json::Value,
+    ) -> Self {
+        self.resolver = Some(resolver);
+        self.graph_ref = Some(graph_ref);
+        self
+    }
+
+    /// Attach the resolver without a primary `graphRef`.
+    ///
+    /// Needed when the primary projection is Native but a **named scope** is
+    /// Cypher/Named: the resolver must be present for the scope, while the
+    /// primary still takes the storage-scan path. Without this the scope would
+    /// silently fall through to a Native scan of an empty spec.
+    #[must_use]
+    pub fn with_resolver(mut self, resolver: Arc<dyn GraphProjectionResolver>) -> Self {
+        self.resolver = Some(resolver);
+        self
+    }
+
+    /// Whether the effective `HostQuery` grant names a restricting scope (a
+    /// non-empty prefix list that is not the universal `**`/`*` wildcard).
+    fn host_query_scope_restricted(&self) -> bool {
+        let scopes: Vec<String> = self
+            .effective_caps
+            .iter()
+            .find_map(|c| match c {
+                Capability::HostQuery { scopes, .. } => {
+                    Some(scopes.iter().map(ToString::to_string).collect())
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
+        !scopes.is_empty() && !scopes.iter().any(|p| p == "**" || p == "*")
     }
 
     /// Builds a concrete projection for GraphCompute kernels, gated on caps.
@@ -133,6 +198,28 @@ impl AlgorithmHostBridge {
     pub fn project_for_graph_compute(
         &self,
         spec: &GraphProjectionSpec,
+    ) -> BoxFuture<'static, Result<Arc<GraphProjection>, FnError>> {
+        self.project_scope(spec, self.graph_ref.clone())
+    }
+
+    /// Projects one scope, taking its Cypher/Named `graphRef` per call.
+    ///
+    /// [`Self::project_for_graph_compute`] reads the bridge's single stored
+    /// `graph_ref`, which is right for the primary projection but cannot express
+    /// a `scopes` map where each entry may be Native or Cypher independently.
+    /// This takes the ref as an argument instead; passing `None` forces the
+    /// Native storage scan even when the bridge holds a ref for the primary.
+    ///
+    /// Returns a `'static` future that clones everything it needs, so N scopes
+    /// can be built by collecting N futures before entering the result stream —
+    /// which is what the loader adapters do, so no borrow of the host escapes.
+    ///
+    /// # Errors
+    /// As [`Self::project_for_graph_compute`].
+    pub fn project_scope(
+        &self,
+        spec: &GraphProjectionSpec,
+        graph_ref: Option<serde_json::Value>,
     ) -> BoxFuture<'static, Result<Arc<GraphProjection>, FnError>> {
         if !self
             .effective_caps
@@ -159,6 +246,26 @@ impl AlgorithmHostBridge {
                 ))
             });
         }
+
+        // Cypher/Named graphRef (issue #151 P3): resolved by the injected
+        // uni-query resolver in this async context, since the bridge cannot reach
+        // query execution or the projection store. A restricting HostQuery scope
+        // cannot be checked against a query-defined subgraph, so reject
+        // fail-closed and require an unscoped grant.
+        if let (Some(resolver), Some(graph_ref)) = (self.resolver.clone(), graph_ref) {
+            let restricted = self.host_query_scope_restricted();
+            return Box::pin(async move {
+                if restricted {
+                    return Err(FnError::new(
+                        0x804,
+                        "GraphCompute: a Cypher/Named projection requires an unscoped HostQuery \
+                         grant (a restricting scope cannot gate a query-defined subgraph)",
+                    ));
+                }
+                resolver.resolve(graph_ref).await
+            });
+        }
+
         // Enforce the HostQuery scope restriction (E5): when the grant names
         // scopes (label / edge-type prefixes), every projected label and edge
         // type must match one — a plugin scoped to `Person` cannot project the
@@ -173,7 +280,50 @@ impl AlgorithmHostBridge {
                 _ => None,
             })
             .unwrap_or_default();
-        if !scope_prefixes.is_empty() {
+        // A `**`/`*` scope (the default `HostQuery` grant, and what the Python
+        // `"HostQuery"` grant string parses to) is unrestricted; only a narrower
+        // prefix list actually gates which labels a guest may project.
+        let scope_restricted =
+            !scope_prefixes.is_empty() && !scope_prefixes.iter().any(|p| p == "**" || p == "*");
+
+        // Fail-loud (G9): projecting the whole graph must be a deliberate choice,
+        // not the silent default. Regardless of grant width, an unscoped
+        // projection (empty node_labels AND edge_types) requires either explicit
+        // nodeLabels/edgeTypes or an explicit `projectAll: true`. The #151 guard
+        // below only fired under a *restricted* scope, so under the default `**`
+        // grant an unscoped projection used to silently pull in every declared
+        // label — corrupting index-keyed kernels when unrelated data (e.g. a
+        // coexisting MCTS search tree) shares the store. First-party providers
+        // opt into the whole graph by setting `project_all`; guests must pass
+        // `projectAll: true` in their config on purpose.
+        if spec.node_labels.is_empty() && spec.edge_types.is_empty() && !spec.project_all {
+            return Box::pin(async {
+                Err(FnError::new(
+                    0x804,
+                    "GraphCompute: an unscoped projection is not allowed; name \
+                     nodeLabels/edgeTypes explicitly, or set projectAll:true to \
+                     deliberately project the whole graph",
+                ))
+            });
+        }
+        if scope_restricted {
+            // Fail-closed (issue #151): a whole-graph projection under a restricted
+            // HostQuery grant defeats the scope, so it is rejected even when the
+            // caller opted in via `projectAll` — the opt-in cannot override a
+            // restricting scope. The guest must name in-scope labels / edge types.
+            if spec.node_labels.is_empty() && spec.edge_types.is_empty() {
+                let scopes = scope_prefixes.join(", ");
+                return Box::pin(async move {
+                    Err(FnError::new(
+                        0x804,
+                        format!(
+                            "GraphCompute: an unscoped projection is not allowed under restricted \
+                             HostQuery scopes [{scopes}]; name nodeLabels/edgeTypes explicitly \
+                             (projectAll does not override a restricting scope)"
+                        ),
+                    ))
+                });
+            }
             let in_scope = |name: &str| scope_prefixes.iter().any(|p| name.starts_with(p.as_str()));
             let denied = spec
                 .node_labels
@@ -193,17 +343,66 @@ impl AlgorithmHostBridge {
                 });
             }
         }
+        // G11: a whole-graph projection (no nodeLabels/edgeTypes named) must not
+        // silently omit vertices whose label is present in storage/L0 but absent
+        // from the schema — uni-db permits schemaless labels via `CREATE (:X)`
+        // without a prior `schema().label("X")`, and the projection enumerates
+        // only *declared* labels. Detect the drift and fail loud so "the whole
+        // graph" cannot quietly drop them. A *scoped* projection is exempt: it
+        // names exactly what it wants, and a named-but-undeclared label already
+        // errors in ProjectionBuilder::resolve_ids.
+        if spec.node_labels.is_empty() && spec.edge_types.is_empty() {
+            let schema = self.algo_ctx.storage.schema_manager().schema();
+            let declared: std::collections::HashSet<String> =
+                schema.labels.keys().cloned().collect();
+            // Sorted, deduped union of physically-present vertex labels: flushed
+            // (storage index) + unflushed (every live L0 generation).
+            let mut present: std::collections::BTreeSet<String> = self
+                .algo_ctx
+                .storage
+                .physical_vertex_label_names()
+                .into_iter()
+                .collect();
+            if let Some(l0) = &self.algo_ctx.l0_manager {
+                let mut bufs = l0.get_pending_flush();
+                bufs.push(l0.get_current());
+                for buf in bufs {
+                    present.extend(buf.read().label_to_vids.keys().cloned());
+                }
+            }
+            let undeclared: Vec<String> = present
+                .into_iter()
+                .filter(|n| !declared.contains(n))
+                .collect();
+            if !undeclared.is_empty() {
+                let names = undeclared.join(", ");
+                return Box::pin(async move {
+                    Err(FnError::new(
+                        0x804,
+                        format!(
+                            "GraphCompute: a whole-graph projection would silently omit vertices \
+                             with undeclared (schemaless) label(s) [{names}]; declare them via \
+                             schema().label(...) or name nodeLabels explicitly"
+                        ),
+                    ))
+                });
+            }
+        }
         let storage = Arc::clone(&self.algo_ctx.storage);
         let l0 = self.algo_ctx.l0_manager.as_ref().map(Arc::clone);
         let spec = spec.clone();
         Box::pin(async move {
             let node_labels: Vec<&str> = spec.node_labels.iter().map(String::as_str).collect();
             let edge_types: Vec<&str> = spec.edge_types.iter().map(String::as_str).collect();
+            let node_props: Vec<&str> = spec.node_properties.iter().map(String::as_str).collect();
+            let edge_props: Vec<&str> = spec.edge_properties.iter().map(String::as_str).collect();
             let mut builder = ProjectionBuilder::new(storage)
                 .l0_manager(l0)
                 .node_labels(&node_labels)
                 .edge_types(&edge_types)
-                .include_reverse(spec.include_reverse);
+                .include_reverse(spec.include_reverse)
+                .node_properties(&node_props)
+                .edge_properties(&edge_props);
             if let Some(prop) = spec.weight_property.as_deref() {
                 builder = builder.weight_property(prop);
             }
@@ -290,11 +489,15 @@ impl AlgorithmHost for AlgorithmHostBridge {
         Box::pin(async move {
             let node_labels: Vec<&str> = spec.node_labels.iter().map(String::as_str).collect();
             let edge_types: Vec<&str> = spec.edge_types.iter().map(String::as_str).collect();
+            let node_props: Vec<&str> = spec.node_properties.iter().map(String::as_str).collect();
+            let edge_props: Vec<&str> = spec.edge_properties.iter().map(String::as_str).collect();
             let mut builder = ProjectionBuilder::new(storage)
                 .l0_manager(l0)
                 .node_labels(&node_labels)
                 .edge_types(&edge_types)
-                .include_reverse(spec.include_reverse);
+                .include_reverse(spec.include_reverse)
+                .node_properties(&node_props)
+                .edge_properties(&edge_props);
             if let Some(prop) = spec.weight_property.as_deref() {
                 builder = builder.weight_property(prop);
             }
@@ -509,4 +712,159 @@ pub fn host_bridge_from_storage(
     effective_caps: CapabilitySet,
 ) -> AlgorithmHostBridge {
     AlgorithmHostBridge::new(AlgoContext::new(storage, l0), effective_caps)
+}
+
+/// The primary projection plus every pre-declared named scope for one CALL.
+///
+/// Parsed once from the trailing config object and consumed identically by all
+/// four loader adapters. Sharing this rather than hand-writing the same steps per
+/// loader is deliberate: the guest shims drifting from the host contract is the
+/// defect class this subsystem has hit most, and four copies of "parse config,
+/// build futures, bind primary first" is exactly how it happens.
+#[derive(Debug)]
+pub struct ProjectionPlan {
+    /// Knobs for the primary projection — the one `emit` keys its `nodeId` to.
+    pub primary: GraphProjectionSpec,
+    /// Cypher/Named `graphRef` for the primary, if it named one.
+    pub primary_graph_ref: Option<serde_json::Value>,
+    /// Named scopes, in declaration order.
+    pub scopes: Vec<GraphScopeSpec>,
+}
+
+impl ProjectionPlan {
+    /// Strips the trailing projection-config object from `args` and parses it.
+    ///
+    /// With no config object, yields the loader default (`include_reverse: true`,
+    /// so the In-direction kernels work) and no scopes.
+    ///
+    /// # Errors
+    /// Returns `0x86E` when a `scopes` map is malformed — an unnamed scope, a
+    /// non-object scope value, or a scope called `graph`.
+    pub fn take_from_args(args: &mut Vec<serde_json::Value>) -> Result<Self, FnError> {
+        let Some(cfg) = GraphProjectionSpec::take_config_from_args(args) else {
+            return Ok(Self {
+                primary: GraphProjectionSpec {
+                    include_reverse: true,
+                    ..GraphProjectionSpec::default()
+                },
+                primary_graph_ref: None,
+                scopes: Vec::new(),
+            });
+        };
+        let scopes = GraphProjectionSpec::scopes_from_config_object(&cfg).map_err(|e| {
+            FnError::new(crate::algorithms::graph_compute::error::ARG_VALIDATION, e)
+        })?;
+        let primary_graph_ref = GraphProjectionSpec::is_query_graph_ref(&cfg)
+            .then(|| serde_json::Value::Object(cfg.clone()));
+        Ok(Self {
+            primary: GraphProjectionSpec::from_config_object(&cfg),
+            primary_graph_ref,
+            scopes,
+        })
+    }
+}
+
+impl std::fmt::Debug for BoundProjections {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BoundProjections")
+            .field("vertices", &self.primary.vertex_count())
+            .field(
+                "scopes",
+                &self.named.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+/// Every projection a CALL needs, built and bound.
+///
+/// Returned by [`build_projections`] after all the futures resolve.
+pub struct BoundProjections {
+    /// The primary projection.
+    pub primary: Arc<GraphProjection>,
+    /// Named scopes in declaration order, paired with their projections.
+    pub named: Vec<(String, Arc<GraphProjection>)>,
+}
+
+impl BoundProjections {
+    /// Total vertices across every projection, for sizing the work budget.
+    #[must_use]
+    pub fn total_vertices(&self) -> u64 {
+        self.named
+            .iter()
+            .map(|(_, g)| g.vertex_count() as u64)
+            .sum::<u64>()
+            + self.primary.vertex_count() as u64
+    }
+
+    /// Total edges across every projection, for sizing the work budget.
+    #[must_use]
+    pub fn total_edges(&self) -> u64 {
+        self.named
+            .iter()
+            .map(|(_, g)| g.edge_count() as u64)
+            .sum::<u64>()
+            + self.primary.edge_count() as u64
+    }
+}
+
+/// Builds the futures for every projection in `plan`, ready to be awaited.
+///
+/// Called **before** the adapter enters its result stream, so no borrow of the
+/// host escapes into the `'static` future — the same reason the single-projection
+/// path built its future early. Awaiting is sequential inside
+/// [`await_projections`]: `ProjectionBuilder::build` scans storage, and running N
+/// of those concurrently buys little while making the work accounting racy.
+#[must_use]
+pub fn build_projections(bridge: &AlgorithmHostBridge, plan: &ProjectionPlan) -> ProjectionFutures {
+    ProjectionFutures {
+        primary: bridge.project_scope(&plan.primary, plan.primary_graph_ref.clone()),
+        named: plan
+            .scopes
+            .iter()
+            .map(|s| {
+                (
+                    s.name.clone(),
+                    bridge.project_scope(&s.spec, s.graph_ref.clone()),
+                )
+            })
+            .collect(),
+    }
+}
+
+impl std::fmt::Debug for ProjectionFutures {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProjectionFutures")
+            .field(
+                "scopes",
+                &self.named.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+/// A projection being built.
+type PendingProjection = BoxFuture<'static, Result<Arc<GraphProjection>, FnError>>;
+
+/// Pending projections for one CALL, awaited by [`await_projections`].
+pub struct ProjectionFutures {
+    primary: PendingProjection,
+    named: Vec<(String, PendingProjection)>,
+}
+
+/// Awaits every projection, naming the scope that failed.
+///
+/// # Errors
+/// Propagates the first projection failure, prefixed with the scope name so a
+/// broken scope is not reported as if the primary projection failed.
+pub async fn await_projections(futures: ProjectionFutures) -> Result<BoundProjections, FnError> {
+    let primary = futures.primary.await?;
+    let mut named = Vec::with_capacity(futures.named.len());
+    for (name, fut) in futures.named {
+        let g = fut
+            .await
+            .map_err(|e| FnError::new(e.code, format!("graph scope `{name}`: {}", e.message)))?;
+        named.push((name, g));
+    }
+    Ok(BoundProjections { primary, named })
 }

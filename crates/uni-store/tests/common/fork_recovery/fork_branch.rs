@@ -19,7 +19,7 @@ use tempfile::TempDir;
 use uni_store::backend::lance::LanceDbBackend;
 use uni_store::backend::lance_branch;
 use uni_store::backend::traits::StorageBackend;
-use uni_store::backend::types::{ScanRequest, WriteMode};
+use uni_store::backend::types::{CmpOp, FilterExpr, Scalar, ScanRequest, WriteMode};
 
 fn arrow_schema() -> Arc<ArrowSchema> {
     Arc::new(ArrowSchema::new(vec![
@@ -125,7 +125,7 @@ async fn branch_scan_respects_filter_and_projection() {
 
     let request = ScanRequest::all("rows")
         .with_branch("filter-fork")
-        .with_filter("id > 1")
+        .with_filter(FilterExpr::compare("id", CmpOp::Gt, Scalar::Int(1)))
         .with_columns(vec!["id".to_string()]);
     let batches = backend.scan(request).await.unwrap();
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();

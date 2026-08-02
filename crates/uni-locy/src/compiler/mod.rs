@@ -104,6 +104,33 @@ pub fn compile_with_config(
 /// that resolves aggregate names through the registry and reads
 /// `Semilattice.monotone_join`, so user-registered aggregates participate
 /// in the recursive-stratum FOLD check.
+/// Compile with both a host-supplied monotonicity oracle and a [`LocyConfig`].
+///
+/// The combination every `uni` host entry point needs: hosts hold a
+/// `PluginRegistry` *and* a config carrying the neural-predicate preview gate,
+/// and neither [`compile_with_oracle`] nor [`compile_with_config`] offers both.
+///
+/// Deliberately a seventh shim rather than a `CompileOptions` struct.
+/// [`MonotonicityOracle`] carries a lifetime parameter, so such a struct cannot
+/// derive `Default` and would need a hand-written impl plus a borrowed empty
+/// module map — real work for no call-site benefit while exactly one new
+/// combination is required.
+pub fn compile_with_oracle_and_config(
+    program: &LocyProgram,
+    available_modules: &HashMap<String, Vec<String>>,
+    external_rules: &[String],
+    config: &LocyConfig,
+    is_monotonic: MonotonicityOracle<'_>,
+) -> Result<CompiledProgram, LocyCompileError> {
+    compile_with_context(
+        program,
+        available_modules,
+        external_rules,
+        config.neural_predicates_preview,
+        is_monotonic,
+    )
+}
+
 pub fn compile_with_oracle(
     program: &LocyProgram,
     available_modules: &HashMap<String, Vec<String>>,
@@ -146,6 +173,7 @@ fn compile_with_context(
             &empty_rule_catalog,
             neural_predicates_preview,
             &mut extra_warnings,
+            is_monotonic,
         )?;
         model_warnings.extend(extra_warnings);
         return Ok(CompiledProgram {
@@ -208,6 +236,7 @@ fn compile_with_context(
         &compiled_rules,
         neural_predicates_preview,
         &mut extra_command_warnings,
+        is_monotonic,
     )?;
     warnings.extend(extra_command_warnings);
 
@@ -223,6 +252,10 @@ fn compile_with_context(
 /// Extract non-rule statements as compiled commands, validating rule references.
 /// Returns the commands and any extra warnings emitted by command
 /// compilation (e.g., Phase C C4 `EceBinningBias`).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Threads the compile context (rules, modules, catalogs, preview gate, warning sink) plus the caller's monotonicity oracle into command extraction; grouping into a struct would just move the argument list."
+)]
 fn extract_commands(
     program: &LocyProgram,
     defined_rules: &[String],
@@ -231,6 +264,9 @@ fn extract_commands(
     rule_catalog: &HashMap<String, crate::types::CompiledRule>,
     neural_predicates_preview_flag: bool,
     extra_warnings: &mut Vec<crate::types::CompilerWarning>,
+    // Threaded so an ASSUME body inherits the caller's oracle rather than
+    // silently re-defaulting at the boundary.
+    is_monotonic: MonotonicityOracle<'_>,
 ) -> Result<Vec<CompiledCommand>, LocyCompileError> {
     let validate_rule = |raw_name: &str| -> Result<(), LocyCompileError> {
         let resolved = modules::resolve_rule_name(module_ctx, raw_name);
@@ -269,7 +305,30 @@ fn extract_commands(
                 };
                 let body_module_ctx = modules::ModuleContext::default();
                 let body_rule_groups = group_rules(&body_program_ast);
-                let all_rule_names: Vec<String> = defined_rules
+
+                // The body compiles with no module of its own, so a reference
+                // to an outer rule resolves bare (`adult`) while the enclosing
+                // `MODULE m` catalogued that rule qualified (`m.adult`) -- and
+                // the reference failed with `UndefinedRule`. Offer every outer
+                // rule under both spellings: inside `MODULE m`, writing `adult`
+                // *is* how you name `m.adult`.
+                //
+                // Deliberately NOT fixed by handing the body the outer module
+                // context. That would also qualify the body's *own* rules
+                // (`m.eligible`), while the runtime looks those up unqualified
+                // straight from the AST -- `locy_assume.rs` and `locy_query.rs`
+                // both do `program.rule_catalog.get(&rule_name)` -- so
+                // `QUERY eligible` would compile and then fail at run time with
+                // "rule not found". Aliasing leaves every catalog key and every
+                // lookup exactly as it was.
+                let outer_visible: Vec<String> = defined_rules
+                    .iter()
+                    .flat_map(|qualified| {
+                        let bare = qualified.rsplit_once('.').map(|(_, bare)| bare.to_string());
+                        std::iter::once(qualified.clone()).chain(bare)
+                    })
+                    .collect();
+                let all_rule_names: Vec<String> = outer_visible
                     .iter()
                     .chain(body_rule_groups.keys())
                     .cloned()
@@ -283,6 +342,7 @@ fn extract_commands(
                     rule_catalog,
                     neural_predicates_preview_flag,
                     &mut body_extra_warnings,
+                    is_monotonic,
                 )?;
                 extra_warnings.extend(body_extra_warnings);
 
@@ -294,9 +354,13 @@ fn extract_commands(
                     compile_with_context(
                         &body_program_ast,
                         &HashMap::new(),
-                        defined_rules,
+                        &outer_visible,
                         neural_predicates_preview_flag,
-                        &default_monotonicity_oracle,
+                        // Inherit the caller's oracle. Re-defaulting here would
+                        // silently stop a host-supplied oracle at the ASSUME
+                        // boundary, so a plugin aggregate legal in the outer
+                        // program would be rejected inside an ASSUME body.
+                        is_monotonic,
                     )?
                 } else {
                     CompiledProgram {
@@ -710,6 +774,77 @@ mod tests {
             LocyCompileError::BestByWithMonotonicFold { rule, fold } => {
                 assert_eq!(rule, "r");
                 assert_eq!(fold.to_uppercase(), "MNOR");
+            }
+            e => panic!("expected BestByWithMonotonicFold, got {e:?}"),
+        }
+    }
+
+    // ── BEST BY is decided syntactically, not by the oracle ─────────
+
+    /// Tripwire for the registry-backed oracle.
+    ///
+    /// `check_best_by_monotonic_fold` consumes its predicate **inverted** —
+    /// "monotone" means *reject*. It also runs for every rule, not only
+    /// recursive ones. So the moment the injected `MonotonicityOracle` is
+    /// pointed at a plugin registry, any rule combining `BEST BY` with a fold
+    /// the registry calls monotone starts failing to compile — and the builtin
+    /// registry marks `MAX`, `MIN`, `COUNT`, `COUNTALL` and `COLLECT` as
+    /// `monotone_join: true`.
+    ///
+    /// `BEST BY score DESC … FOLD peak = MAX(a.cost)` is an ordinary,
+    /// runtime-correct program. This test compiles one under an oracle that
+    /// answers `Some(true)` for `MAX` — exactly what a registry-backed oracle
+    /// does — and asserts it is accepted. If someone re-unifies the BEST BY
+    /// guard with the oracle, this goes red.
+    #[test]
+    fn best_by_with_registry_monotone_fold_still_compiles() {
+        let prog = parse_locy(
+            "CREATE RULE r AS MATCH (a)-[:E]->(b) \
+             FOLD peak = MAX(a.cost) BEST BY peak ASC YIELD KEY a, KEY b, peak",
+        )
+        .unwrap();
+
+        // Stands in for the registry: MAX/MIN/COUNT/COLLECT are monotone joins.
+        let registry_like = |name: &str| match name.to_uppercase().as_str() {
+            "MAX" | "MIN" | "COUNT" | "COUNTALL" | "COLLECT" => Some(true),
+            "SUM" | "AVG" => Some(false),
+            _ => None,
+        };
+
+        let result = compile_with_oracle(&prog, &HashMap::new(), &[], &registry_like);
+        assert!(
+            result.is_ok(),
+            "BEST BY with a registry-monotone fold must still compile; got {:?}",
+            result.err()
+        );
+    }
+
+    /// Inverse guard: the six declared `M*` lattice folds are still refused,
+    /// even when the oracle claims to know nothing about them.
+    ///
+    /// The rule is deliberately **non-recursive**. A recursive one would trip
+    /// `check_non_monotonic_in_recursion` first (that check *does* consult the
+    /// oracle, and correctly so), and the BEST BY guard would never be reached —
+    /// the test would pass for the wrong reason.
+    #[test]
+    fn best_by_with_declared_lattice_fold_still_rejected_under_registry_oracle() {
+        let prog = parse_locy(
+            "CREATE RULE r AS MATCH (a)-[:E]->(b) \
+             FOLD total = MSUM(a.cost) BEST BY total ASC YIELD KEY a, KEY b, total",
+        )
+        .unwrap();
+
+        // Answers `None` for MSUM — if the guard consulted the oracle, this
+        // program would now be accepted.
+        let registry_like = |name: &str| match name.to_uppercase().as_str() {
+            "MAX" | "MIN" => Some(true),
+            _ => None,
+        };
+
+        match compile_with_oracle(&prog, &HashMap::new(), &[], &registry_like).unwrap_err() {
+            LocyCompileError::BestByWithMonotonicFold { rule, fold } => {
+                assert_eq!(rule, "r");
+                assert_eq!(fold.to_uppercase(), "MSUM");
             }
             e => panic!("expected BestByWithMonotonicFold, got {e:?}"),
         }

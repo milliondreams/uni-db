@@ -13,6 +13,7 @@ pub mod value;
 pub mod vector_index_opts;
 
 pub mod core {
+    pub mod check_constraint;
     pub mod edge_type;
     pub mod fork;
     pub mod id;

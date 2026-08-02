@@ -21,7 +21,8 @@ use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 use uni_common::core::fork::{ForkId, ForkInfo};
 use uni_store::backend::lance_branch;
-use uni_store::fork::recovery::{join_uri_with, recover_forks};
+use uni_store::backend::lance_branch::LanceBranching;
+use uni_store::fork::recovery::recover_forks;
 use uni_store::fork::registry::ForkRegistryHandle;
 
 #[tokio::test]
@@ -39,7 +40,7 @@ async fn pending_entry_with_no_branches_is_rolled_back() {
     // Reload from disk to simulate restart.
     let h2 = ForkRegistryHandle::load(store.clone()).await.unwrap();
     let base = format!("{}/", dir.path().display());
-    let reconciled = recover_forks(&h2, &store, &[], join_uri_with(base))
+    let reconciled = recover_forks(&h2, &store, &[], Some(&LanceBranching::new(base)))
         .await
         .unwrap();
 
@@ -78,7 +79,7 @@ async fn pending_entry_with_partial_branches_force_deletes_them() {
     // Restart-equivalent recovery.
     let h2 = ForkRegistryHandle::load(store.clone()).await.unwrap();
     let base = format!("{}/", dir.path().display());
-    recover_forks(&h2, &store, &[], join_uri_with(base))
+    recover_forks(&h2, &store, &[], Some(&LanceBranching::new(base)))
         .await
         .unwrap();
 

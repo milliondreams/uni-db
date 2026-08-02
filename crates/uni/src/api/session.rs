@@ -713,6 +713,7 @@ impl Session {
     /// Access the session-scoped rule registry.
     pub fn rules(&self) -> super::rule_registry::RuleRegistry<'_> {
         super::rule_registry::RuleRegistry::new(&self.rule_registry)
+            .with_plugin_registry(&self.db.plugin_registry)
     }
 
     /// Compile a Locy program without executing it, using this session's rule registry.
@@ -726,22 +727,32 @@ impl Session {
             context: None,
         })?;
         let registry = self.rule_registry.read().unwrap();
-        if registry.rules.is_empty() {
-            drop(registry);
-            uni_locy::compile(&ast).map_err(|e| UniError::Query {
+        let external_names: Vec<String> = registry.rules.keys().cloned().collect();
+        drop(registry);
+
+        // Consult the session registry before the instance one, so a
+        // session-scoped plugin aggregate is visible. This is also why the
+        // oracle is passed explicitly rather than read from the task-local:
+        // `LocyBuilder::run` wraps itself in `scoped_with_session_context` but
+        // `explain()` and `profile()` do not, so a task-local would make
+        // `explain()` reject a program `run()` accepts.
+        let session_reg = &self.session_plugin_registry;
+        let instance_reg = self.instance_plugin_registry();
+        let oracle = |name: &str| {
+            uni_query::query::df_graph::locy_fold::locy_monotonicity_verdict(session_reg, name)
+                .or_else(|| {
+                    uni_query::query::df_graph::locy_fold::locy_monotonicity_verdict(
+                        instance_reg,
+                        name,
+                    )
+                })
+        };
+        uni_locy::compile_with_oracle(&ast, &HashMap::new(), &external_names, &oracle).map_err(
+            |e| UniError::Query {
                 message: format!("LocyCompileError: {e}"),
                 query: None,
-            })
-        } else {
-            let external_names: Vec<String> = registry.rules.keys().cloned().collect();
-            drop(registry);
-            uni_locy::compile_with_external_rules(&ast, &external_names).map_err(|e| {
-                UniError::Query {
-                    message: format!("LocyCompileError: {e}"),
-                    query: None,
-                }
-            })
-        }
+            },
+        )
     }
 
     // ── Transaction & Writer Factories ────────────────────────────────
@@ -763,6 +774,29 @@ impl Session {
             });
         }
         Transaction::new(self).await
+    }
+
+    /// Begin a **scratch** (ephemeral, write-isolated) transaction — the cheap
+    /// per-rollout fork (G8/E2).
+    ///
+    /// A scratch transaction behaves like [`tx`](Self::tx) — `execute`, `query`
+    /// (read-your-writes), `rollback`, and drop all work — with two differences:
+    /// its writes go to a private L0 over a *pinned* read base with an in-memory
+    /// id allocator, and **`commit()` is refused**, so the writes are always
+    /// discarded on drop. It costs a pinned-snapshot (~1ms), not a Lance-branch
+    /// fork (~10ms): no branch, no registry 2PC, no per-fork WAL, and the global
+    /// `id_allocator.json` is never advanced — so thousands of speculative
+    /// open-write-discard rollouts (e.g. an MCTS that *mutates* per rollout) are
+    /// affordable. For a read-only rollout, prefer
+    /// [`pin_to_version`](Self::pin_to_version) instead.
+    #[instrument(skip(self), fields(session_id = %self.id))]
+    pub async fn scratch(&self) -> Result<Transaction> {
+        if self.is_pinned() {
+            return Err(UniError::ReadOnly {
+                operation: "start_scratch_transaction".to_string(),
+            });
+        }
+        Transaction::new_scratch(self).await
     }
 
     /// Runs `f` in a transaction, retrying on retriable conflicts.
@@ -951,9 +985,18 @@ impl Session {
             let writer: &uni_store::Writer = writer_lock.as_ref();
             writer.flush_to_l1(None).await.map_err(UniError::Internal)?;
         }
+        let branching =
+            self.db
+                .storage
+                .backend()
+                .branching()
+                .ok_or_else(|| UniError::InvalidArgument {
+                    arg: "self".into(),
+                    message: "storage backend does not support fork branching".into(),
+                })?;
         uni_store::fork::index_builder::build_fork_local_index(
             &scope,
-            self.db.storage.base_uri(),
+            branching.as_ref(),
             label,
             column,
             kind,
@@ -976,6 +1019,17 @@ impl Session {
     /// Pin this session to a specific snapshot version.
     ///
     /// All subsequent reads see data as of that version. Writes are rejected.
+    ///
+    /// **This is the fork-free read snapshot for read-only rollouts (G8).** A
+    /// repeated read-only workload — e.g. an MCTS `graph_readonly` rollout that
+    /// only *reads* the graph thousands of times — should pin a version here
+    /// rather than create-and-drop a Lance-branch fork per iteration. Pinning is
+    /// an in-memory `StorageManager` clone (`StorageManager::pinned`) — no
+    /// branch, no registry 2PC, no per-fork WAL — so it costs ~1ms against a
+    /// fork's ~10ms. A plain read session already gets MVCC snapshot isolation
+    /// without any fork; use this when you additionally need a *stable, durable*
+    /// version across many queries. Write-isolated speculative rollouts (mutate
+    /// then discard) still need a fork.
     #[instrument(skip(self), fields(session_id = %self.id))]
     pub async fn pin_to_version(&mut self, snapshot_id: &str) -> Result<()> {
         let pinned = self.live_db().at_snapshot(snapshot_id).await?;
@@ -1039,6 +1093,20 @@ impl Session {
         self.cancellation_token.read().unwrap().clone()
     }
 
+    /// The cancellation scope statements issued on this session run under.
+    ///
+    /// Every execution path takes one of these, so `cancel()` reaches work that
+    /// is already in flight. Previously only `QueryBuilder` with an explicit
+    /// token carried anything down, and the plain `query()` path passed `None`
+    /// at each of its three call sites — which made `Session::cancel()` inert
+    /// for the most common way of running a query.
+    pub(crate) fn cancel_scope(
+        &self,
+        caller: Option<CancellationToken>,
+    ) -> crate::api::impl_query::CancelScope {
+        crate::api::impl_query::CancelScope::new(Some(self.cancellation_token()), caller)
+    }
+
     // ── Prepared Statements ──────────────────────────────────────────
 
     /// Prepare a Cypher query for repeated execution.
@@ -1052,7 +1120,13 @@ impl Session {
             self.hooks.values().cloned().collect(),
             self.id.clone(),
         );
-        crate::api::prepared::PreparedQuery::new(self.db.clone(), cypher, guards).await
+        crate::api::prepared::PreparedQuery::new(
+            self.db.clone(),
+            cypher,
+            guards,
+            self.cancel_scope(None),
+        )
+        .await
     }
 
     /// Prepare a Locy program for repeated evaluation.
@@ -1269,8 +1343,13 @@ impl Session {
             return uni_query::scoped_with_session_context(
                 session_pr,
                 session_principal,
-                self.db
-                    .execute_plan_internal(plan, cypher, params, self.db.config.clone(), None),
+                self.db.execute_plan_internal(
+                    plan,
+                    cypher,
+                    params,
+                    self.db.config.clone(),
+                    self.cancel_scope(None),
+                ),
             )
             .await;
         }
@@ -1295,8 +1374,12 @@ impl Session {
             return uni_query::scoped_with_session_context(
                 Arc::clone(&session_pr),
                 session_principal.clone(),
-                self.db
-                    .execute_internal_with_config(cypher, params, self.db.config.clone()),
+                self.db.execute_internal_with_config(
+                    cypher,
+                    params,
+                    self.db.config.clone(),
+                    self.cancel_scope(None),
+                ),
             )
             .await;
         }
@@ -1338,7 +1421,7 @@ impl Session {
                 cypher,
                 params,
                 self.db.config.clone(),
-                None,
+                self.cancel_scope(None),
             ),
         )
         .await
@@ -1502,7 +1585,7 @@ impl<'a> QueryBuilder<'a> {
                     &self.cypher,
                     params,
                     db_config,
-                    self.cancellation_token,
+                    self.session.cancel_scope(self.cancellation_token),
                 ),
             )
             .await
@@ -1538,9 +1621,12 @@ impl<'a> QueryBuilder<'a> {
         uni_query::scoped_with_session_context(
             session_pr,
             session_principal,
-            self.session
-                .db
-                .execute_cursor_internal_with_config(&self.cypher, params, db_config),
+            self.session.db.execute_cursor_internal_with_config(
+                &self.cypher,
+                params,
+                db_config,
+                self.session.cancel_scope(self.cancellation_token),
+            ),
         )
         .await
     }
@@ -1603,7 +1689,7 @@ impl<'a> TransactionBuilder<'a> {
                 operation: "start_transaction".to_string(),
             });
         }
-        Transaction::new_with_options(self.session, self.timeout, self.isolation).await
+        Transaction::new_with_options(self.session, self.timeout, self.isolation, false).await
     }
 }
 

@@ -530,7 +530,7 @@ When the SKILL.md overview is insufficient for the user's task, load the appropr
 | Schema design, data types, indexes, identity (ext_id/VID) | `references/schema-indexing.md` |
 | BTIC temporal intervals, Allen algebra, certainty/granularity | `references/btic.md` |
 | Xervo ML runtime, providers, model catalog, auto-embedding | `references/xervo.md` |
-| Graph algorithms (PageRank, WCC, shortest path, etc.) | `references/graph-algorithms.md` |
+| Graph algorithms (PageRank, WCC, shortest path, etc.); guest-authorable GraphCompute kernels | `references/graph-algorithms.md` |
 
 Load **multiple references** when a task spans domains. Examples:
 - RAG pipeline: `references/vector-hybrid-search.md` + `references/python-api.md`

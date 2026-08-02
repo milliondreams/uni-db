@@ -285,7 +285,7 @@ session.refresh().await?;
 | `id()` | `&str` | Session ID (UUID). |
 | `metrics()` | `SessionMetrics` | Snapshot session-level metrics. |
 | `capabilities()` | `SessionCapabilities` | Query what the session can do in its current mode. |
-| `cancel()` | `()` | Cancel all in-flight queries. Session remains usable after. |
+| `cancel()` | `()` | Cancel all in-flight queries and Locy evaluations. Session remains usable after. |
 | `cancellation_token()` | `CancellationToken` | Get a clone of the session's cancellation token. |
 
 ---
@@ -477,7 +477,7 @@ DERIVE commands auto-apply to the transaction's private L0.
 | `is_dirty()` | `bool` | Whether the transaction has uncommitted changes. |
 | `id()` | `&str` | Transaction ID (UUID). |
 | `started_at_version()` | `u64` | Database version when the transaction was created. |
-| `cancel()` | `()` | Cancel all in-flight queries in this transaction. |
+| `cancel()` | `()` | Cancel all in-flight queries, Locy evaluations, and `apply()` calls in this transaction. |
 
 ### Drop Behavior
 
@@ -657,6 +657,7 @@ pub enum VectorMetric {
 | `properties` | `Vec<PropertyInfo>` |
 | `indexes` | `Vec<IndexInfo>` |
 | `constraints` | `Vec<ConstraintInfo>` |
+| `description` | `Option<String>` |
 
 **`EdgeTypeInfo`:**
 
@@ -669,8 +670,17 @@ pub enum VectorMetric {
 | `properties` | `Vec<PropertyInfo>` |
 | `indexes` | `Vec<IndexInfo>` |
 | `constraints` | `Vec<ConstraintInfo>` |
+| `description` | `Option<String>` |
 
-**`PropertyInfo`:** `name: String`, `data_type: String`, `nullable: bool`, `is_indexed: bool`
+On both `LabelInfo` and `EdgeTypeInfo`, `count` is obtained with a Cypher
+`count(...)` over the element, so it includes rows still buffered in L0 and
+excludes tombstoned or superseded versions. The
+element name is backtick-quoted, so names containing punctuation (such as `.`),
+leading digits, or non-ASCII characters count correctly; a name containing a
+backtick cannot be quoted and is refused with `UniError::Query`. Counting
+failures propagate as an `Err` rather than being reported as `count: 0`.
+
+**`PropertyInfo`:** `name: String`, `data_type: String`, `nullable: bool`, `is_indexed: bool`, `description: Option<String>`
 
 **`IndexInfo`:** `name: String`, `index_type: String`, `properties: Vec<String>`, `status: String`
 
@@ -828,6 +838,12 @@ for row in result.rows() {
 | `with_config(config)` | `Self` | Apply a full `LocyConfig`. |
 | `run()` | `Result<LocyResult>` | Evaluate and return results. |
 | `explain()` | `Result<LocyExplainOutput>` | Explain without executing. |
+
+Cancellation is enforced against the whole evaluation, not just the Cypher
+statements the program dispatches, so a long-running fixpoint is interruptible.
+A cancelled evaluation returns `UniError::Cancelled`. The session's own token
+(`Session::cancel()`) applies in addition to any token passed to
+`cancellation_token(...)`.
 
 ### TxLocyBuilder (Transaction-level)
 
@@ -1481,6 +1497,11 @@ Database-level rules are durable: their source is persisted to
 `catalog/locy_rules.json` and recompiled on open, so they survive restarts.
 Session-, transaction-, and fork-scoped rules are ephemeral. Mutating methods
 are `async` because the database-level variants persist.
+
+Registered rules are compiled against the database's plugin aggregate registry,
+so an aggregate supplied by a plugin and declared monotone is accepted in a
+recursive stratum. Database-level rules are recompiled against the same
+registry when the database is reopened.
 
 ```rust
 // Database-level (global, durable across restarts)

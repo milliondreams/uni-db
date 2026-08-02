@@ -12,3 +12,11 @@ mod integration;
 mod parser;
 #[path = "common/planner/mod.rs"]
 mod planner;
+
+// --- consolidated from former standalone binaries (see docs/test_layout.md) ---
+#[path = "correctness_repros.rs"]
+mod correctness_repros;
+#[path = "dispatch.rs"]
+mod dispatch;
+#[path = "vector_agg_return_type_repro.rs"]
+mod vector_agg_return_type_repro;

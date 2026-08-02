@@ -29,7 +29,7 @@ use std::hint::black_box;
 
 use uni_common::core::id::{Eid, Vid};
 use uni_common::{Properties, Value};
-use uni_store::runtime::l0_visibility::{lookup_vertex_prop, overlay_vertex_batch};
+use uni_store::runtime::l0_visibility::lookup_vertex_prop;
 use uni_store::runtime::{L0Buffer, QueryContext};
 
 // ----------------------------------------------------------------------------
@@ -240,32 +240,6 @@ fn bench_read_path(c: &mut Criterion) {
                 black_box(lookup_vertex_prop(vid, "name", Some(&ctx)))
             });
         });
-
-        let batch: Vec<Vid> = (0..1000)
-            .map(|k| Vid::from(scatter(k * 3 + 1, n) as u64))
-            .collect();
-        let mut vid_to_idx: HashMap<Vid, usize> = HashMap::with_capacity(batch.len());
-        for (idx, vid) in batch.iter().enumerate() {
-            vid_to_idx.insert(*vid, idx);
-        }
-        group.bench_function(
-            BenchmarkId::new("overlay_vertex_batch_1k", shape.label()),
-            |b| {
-                b.iter_batched(
-                    || {
-                        (
-                            vec![Properties::new(); batch.len()],
-                            vec![false; batch.len()],
-                        )
-                    },
-                    |(mut result, mut deleted)| {
-                        overlay_vertex_batch(&vid_to_idx, &mut result, &mut deleted, Some(&ctx));
-                        black_box((result, deleted));
-                    },
-                    BatchSize::SmallInput,
-                );
-            },
-        );
     }
     group.finish();
 }

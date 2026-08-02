@@ -72,7 +72,7 @@ Builder methods:
 | `.timeout(seconds)` | Set evaluation timeout |
 | `.max_iterations(n)` | Set recursion iteration cap |
 | `.with_config(dict)` | Set full `LocyConfig` options |
-| `.cancellation_token(token)` | Attach a cancellation token |
+| `.cancellation_token(token)` | Attach a cancellation token; cancelling it aborts the evaluation with `UniCancelledError` |
 | `.run()` | Execute and return `LocyResult` |
 
 ## Compile-Only Check

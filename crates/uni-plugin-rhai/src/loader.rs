@@ -22,6 +22,7 @@ use uni_plugin::{
 
 use arrow_schema::Field;
 
+use uni_plugin::adapter_common::arrow_types::arg_type_from_token;
 use uni_plugin::capability::SideEffects;
 use uni_plugin::secrets::SecretStore;
 use uni_plugin::traits::procedure::{NamedArgType, ProcedureMode, ProcedureSignature};
@@ -57,6 +58,8 @@ pub struct LoadOutcome {
     pub aggregates_registered: Vec<String>,
     /// Procedure qnames registered.
     pub procedures_registered: Vec<String>,
+    /// Algorithm qnames registered (gated on `Capability::Algorithm`).
+    pub algorithms_registered: Vec<String>,
     /// Strong reference to the per-plugin runtime. Adapters hold inner
     /// `Arc` clones; the host can drop this on unload to release the
     /// engine.
@@ -259,12 +262,14 @@ impl RhaiLoader {
             }
         }
 
+        let mut algorithms_registered = Vec::new();
         if effective.contains(&Capability::Algorithm) {
             for entry in &manifest.algorithms {
                 let sig = build_algorithm_signature(entry)?;
                 let qname = QName::new(plugin_id.as_str(), entry.name.clone());
                 let adapter =
                     RhaiAlgorithm::new(Arc::clone(&runtime), entry.name.clone(), sig.clone());
+                algorithms_registered.push(qname.to_string());
                 registrar
                     .algorithm(qname, Arc::new(adapter))
                     .map_err(plugin_to_rhai_err)?;
@@ -279,6 +284,7 @@ impl RhaiLoader {
             scalars_registered,
             aggregates_registered,
             procedures_registered,
+            algorithms_registered,
             runtime,
         })
     }
@@ -339,18 +345,59 @@ fn build_procedure_signature(entry: &ProcedureEntry) -> Result<ProcedureSignatur
 }
 
 fn build_algorithm_signature(entry: &AlgorithmEntry) -> Result<AlgorithmSignature, RhaiError> {
+    // Declared algorithm args are now typed and validated (G4). Previously
+    // `entry.args` was parsed then silently ignored — `signature.args` was left
+    // empty, so `coerce_config_json` was a no-op and a guest got no arity/type
+    // checking. The shared token vocabulary also lets a guest declare a
+    // `value`/`list` argument (not just fixed scalars), so a variable-length seed
+    // set can be passed without generating the plugin per-arity.
+    let mut args: Vec<NamedArgType> = entry
+        .args
+        .iter()
+        .enumerate()
+        .map(|(i, tok)| {
+            let ty = arg_type_from_token(tok).ok_or_else(|| {
+                RhaiError::ManifestInvalid(format!(
+                    "unknown arg type `{tok}` for algorithm `{}`; supported: \
+                     float/int/string/bool/null/value/list",
+                    entry.name
+                ))
+            })?;
+            Ok(NamedArgType {
+                name: format!("arg{i}").into(),
+                ty,
+                default: None,
+                doc: String::new(),
+            })
+        })
+        .collect::<Result<_, RhaiError>>()?;
+    // Accept the optional trailing projection-config object the CALL convention
+    // appends after the guest args (the adapter strips it before the guest runs).
+    args.push(NamedArgType::projection_config());
     let output_fields: Vec<Field> = entry
         .yields
         .iter()
         .enumerate()
         .map(|(i, y)| {
-            let dt = type_name_to_datatype(&y.type_name)?;
+            // See the pyo3 loader: algorithm yields are narrower than the
+            // general type map, because the emit channel is `Vec<f64>`.
+            let dt = uni_plugin_builtin::algorithms::graph_compute::algorithm_yield_datatype(
+                &y.type_name,
+            )
+            .ok_or_else(|| {
+                RhaiError::ManifestInvalid(format!(
+                    "algorithm `{}` declares yield type `{}`, which the emit path cannot \
+                     build; algorithm yields must be int or float",
+                    entry.name, y.type_name
+                ))
+            })?;
             let name = y.name.clone().unwrap_or_else(|| format!("col{i}"));
             Ok(Field::new(name, dt, false))
         })
         .collect::<Result<_, RhaiError>>()?;
     Ok(AlgorithmSignature {
         output_fields,
+        args,
         docs: String::new(),
         ..Default::default()
     })
@@ -389,11 +436,10 @@ fn intersect_caps(
     granted: &CapabilitySet,
 ) -> (CapabilitySet, Vec<Capability>) {
     let effective = declared.intersect(granted);
-    let denied: Vec<Capability> = declared
-        .iter()
-        .filter(|c| !granted.contains(c))
-        .cloned()
-        .collect();
+    // Denied = declared minus effective, tested by variant so an
+    // attenuated-but-granted payload cap (e.g. a narrowed HostQuery) is not
+    // misreported as denied. See `CapabilitySet::denied_against`.
+    let denied = declared.denied_against(&effective);
     (effective, denied)
 }
 

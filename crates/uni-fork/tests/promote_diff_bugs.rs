@@ -28,7 +28,7 @@ use uni_common::{Node, Properties, Result, Value};
 use uni_query::{QueryMetrics, QueryResult, Row};
 use uni_store::backend::table_names::main_vertex_table_name;
 use uni_store::backend::traits::{RecordBatchStream, TableWriteGuard};
-use uni_store::backend::types::{ScanRequest, WriteMode};
+use uni_store::backend::types::{FilterExpr, ScanRequest, WriteMode};
 use uni_store::storage::manager::StorageManager;
 use uni_store::storage::vertex::VertexDataset;
 use uni_store::{LanceDbBackend, StorageBackend};
@@ -155,7 +155,7 @@ impl StorageBackend for FaultBackend {
     async fn get_table_schema(&self, name: &str) -> AnyResult<Option<Arc<ArrowSchema>>> {
         self.inner.get_table_schema(name).await
     }
-    async fn count_rows(&self, table_name: &str, filter: Option<&str>) -> AnyResult<usize> {
+    async fn count_rows(&self, table_name: &str, filter: Option<&FilterExpr>) -> AnyResult<usize> {
         self.inner.count_rows(table_name, filter).await
     }
     async fn write(
@@ -166,7 +166,7 @@ impl StorageBackend for FaultBackend {
     ) -> AnyResult<()> {
         self.inner.write(table_name, batches, mode).await
     }
-    async fn delete_rows(&self, table_name: &str, filter: &str) -> AnyResult<()> {
+    async fn delete_rows(&self, table_name: &str, filter: &FilterExpr) -> AnyResult<()> {
         self.inner.delete_rows(table_name, filter).await
     }
     async fn replace_table_atomic(

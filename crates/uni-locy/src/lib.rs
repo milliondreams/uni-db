@@ -23,6 +23,7 @@ pub use compiler::compile_with_external_rules;
 pub use compiler::compile_with_external_rules_and_config;
 pub use compiler::compile_with_modules;
 pub use compiler::compile_with_oracle;
+pub use compiler::compile_with_oracle_and_config;
 pub use compiler::errors::LocyCompileError;
 pub use compiler::modules::ModuleContext;
 pub use compiler::{MonotonicityOracle, default_monotonicity_oracle};

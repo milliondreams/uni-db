@@ -20,7 +20,6 @@ use std::time::Duration;
 use tracing::{debug, instrument};
 use uni_common::api::error::{Result, UniError};
 use uni_common::core::fork::{ForkId, ForkInfo, ForkStatus};
-use uni_store::backend::lance_branch;
 use uni_store::fork::{ForkRegistryHandle, ForkScope};
 
 use super::session::Session;
@@ -411,8 +410,9 @@ pub(crate) fn fork_candidate_dataset_names(
     names
 }
 
-/// Walk the schema's labels and edge types, calling `lance_branch::create_branch`
-/// for each existing dataset. Returns the dataset → branch map.
+/// Walk the schema's labels and edge types, calling
+/// [`uni_store::backend::ForkBranching::create_branch`] for each existing
+/// dataset. Returns the dataset → branch map.
 ///
 /// Branches every dataset that exists on disk at fork-point, including:
 /// - the main `vertices` and `edges` tables (label-agnostic; written by
@@ -434,7 +434,21 @@ async fn build_datasets_for_fork(
     parent_branch_versions: &BTreeMap<String, u64>,
 ) -> Result<BTreeMap<String, String>> {
     let schema = parent.db.schema.schema();
-    let storage_uri = parent.db.storage.base_uri().to_string();
+    let branching =
+        parent
+            .db
+            .storage
+            .backend()
+            .branching()
+            .ok_or_else(|| UniError::ForkLifecycle {
+                name: format!("<fork:{fork_id}>"),
+                stage: "branching",
+                source: anyhow::anyhow!(
+                    "storage backend does not support fork branching; forks require a \
+                 backend implementing ForkBranching"
+                )
+                .into(),
+            })?;
 
     let mut branches: BTreeMap<String, String> = BTreeMap::new();
     let candidate_names = fork_candidate_dataset_names(&schema);
@@ -453,8 +467,13 @@ async fn build_datasets_for_fork(
     let mut attempted: Vec<(String, String)> = Vec::new();
     let build_result: Result<()> = async {
         for dataset_name in candidate_names {
-            let dataset_uri = join_uri(&storage_uri, &dataset_name);
-            if !path_exists(&dataset_uri) {
+            if !branching.table_exists(&dataset_name).await.map_err(|e| {
+                UniError::ForkLifecycle {
+                    name: format!("<fork:{fork_id}>"),
+                    stage: "table_exists",
+                    source: e.into(),
+                }
+            })? {
                 continue;
             }
 
@@ -474,28 +493,23 @@ async fn build_datasets_for_fork(
                     fail::fail_point!("nested_fork_before_branch");
                     let parent_v = match parent_branch_versions.get(&dataset_name) {
                         Some(v) => *v,
-                        None => {
-                            lance_branch::current_version_on_branch(&dataset_uri, &parent_branch)
-                                .await
-                                .map_err(|e| UniError::ForkLifecycle {
-                                    name: format!("<fork:{fork_id}>"),
-                                    stage: "current_version_on_branch",
-                                    source: e.into(),
-                                })?
-                        }
+                        None => branching
+                            .current_version_on_branch(&dataset_name, &parent_branch)
+                            .await
+                            .map_err(|e| UniError::ForkLifecycle {
+                                name: format!("<fork:{fork_id}>"),
+                                stage: "current_version_on_branch",
+                                source: e.into(),
+                            })?,
                     };
-                    lance_branch::create_branch_from(
-                        &dataset_uri,
-                        &branch_name,
-                        &parent_branch,
-                        parent_v,
-                    )
-                    .await
-                    .map_err(|e| UniError::ForkLifecycle {
-                        name: format!("<fork:{fork_id}>"),
-                        stage: "create_branch_from",
-                        source: e.into(),
-                    })?;
+                    branching
+                        .create_branch_from(&dataset_name, &branch_name, &parent_branch, parent_v)
+                        .await
+                        .map_err(|e| UniError::ForkLifecycle {
+                            name: format!("<fork:{fork_id}>"),
+                            stage: "create_branch_from",
+                            source: e.into(),
+                        })?;
                 }
                 None => {
                     // Either parent is primary (no scope), or parent is a
@@ -524,7 +538,8 @@ async fn build_datasets_for_fork(
                     // but keep it for robustness.
                     let parent_v = match captured_versions.get(&dataset_name) {
                         Some(v) => *v,
-                        None => lance_branch::current_version(&dataset_uri)
+                        None => branching
+                            .current_version(&dataset_name)
                             .await
                             .map_err(|e| UniError::ForkLifecycle {
                                 name: format!("<fork:{fork_id}>"),
@@ -532,7 +547,8 @@ async fn build_datasets_for_fork(
                                 source: e.into(),
                             })?,
                     };
-                    lance_branch::create_branch(&dataset_uri, &branch_name, parent_v)
+                    branching
+                        .create_branch(&dataset_name, &branch_name, parent_v)
                         .await
                         .map_err(|e| UniError::ForkLifecycle {
                             name: format!("<fork:{fork_id}>"),
@@ -553,10 +569,9 @@ async fn build_datasets_for_fork(
         // zombie branches while the process keeps running; recovery provides
         // the same guarantee across a crash (see `recovery::rollback_branches`).
         for (dataset_name, branch_name) in &attempted {
-            let dataset_uri = join_uri(&storage_uri, dataset_name);
-            if let Err(rb) = lance_branch::delete_branch(&dataset_uri, branch_name).await {
+            if let Err(rb) = branching.delete_branch(dataset_name, branch_name).await {
                 tracing::warn!(
-                    "fork-create cleanup: delete_branch '{branch_name}' on '{dataset_uri}' failed: {rb}"
+                    "fork-create cleanup: delete_branch '{branch_name}' on '{dataset_name}' failed: {rb}"
                 );
             }
         }
@@ -564,26 +579,4 @@ async fn build_datasets_for_fork(
     }
 
     Ok(branches)
-}
-
-fn join_uri(base: &str, dataset: &str) -> String {
-    if base.ends_with('/') {
-        format!("{base}{dataset}.lance")
-    } else {
-        format!("{base}/{dataset}.lance")
-    }
-}
-
-/// Cheap on-disk existence check. Used to skip branching for labels
-/// that have no rows yet (no `.lance` directory). For non-local
-/// stores this conservatively returns `true`, deferring the existence
-/// check to `lance_branch::current_version` which surfaces the right
-/// error.
-fn path_exists(uri: &str) -> bool {
-    // Local-fs heuristic: if it parses as a URL with a scheme, assume
-    // remote. Otherwise check the path on disk.
-    if uri.contains("://") {
-        return true;
-    }
-    std::path::Path::new(uri).exists()
 }

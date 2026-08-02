@@ -9,11 +9,61 @@
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 3 }
 
+# The three heavy issue #55 get_edges probes need BOTH a concurrency bound and a
+# raised ceiling. Each alone was measured and found insufficient.
+#
+# Each builds successively larger graphs; under the debug profile nextest builds,
+# that construction dominates. Uncontended on a 22-core box: instrumented 165s,
+# probe_layer 109s, repro_scaling 107s. Every other `issue_55_*` test is under
+# 2s, so only these three matter. 165s against the 180s default is 8.6%
+# headroom, which any concurrent load erases — the heaviest timed out in 3 of 4
+# full-suite runs and passed at 168s in the fourth.
+#
+# Measured, full suite, so these are not retried blindly:
+#   * Raise the ceiling for the heaviest test ONLY -> failure just moves. With it
+#     killed at 180s the other two finished in ~107s/~109s; once it ran to
+#     completion those two timed out instead. Same contention, new loser.
+#   * Raise the ceiling to 360s for all three, no grouping -> STILL RED:
+#     instrumented blew even the 360s ceiling, and the separate marginal test
+#     `guest_authored_mcts_meets_the_absolute_throughput_floor` (uni-plugin-rhai)
+#     failed too, because the three ran concurrently and saturated the box.
+#     Suite 367s, 1 failed + 1 timed out.
+#   * Group with `max-threads = 1` AND the 360s ceiling -> GREEN, 6126/6126.
+#     instrumented 245s, repro 210s, probe_layer 56s. Suite 520s.
+#
+# So both parts are load-bearing: the group keeps the three from starving each
+# other (and from starving the rhai throughput-floor test), and the ceiling
+# covers the 245s they still take, since serialising them within the group does
+# NOT give them an idle box — the other ~6000 tests keep running alongside.
+# The ~150s of extra wall-clock buys a suite that is green deterministically.
+#
+# If one of these approaches 360s under the group, that is a real regression to
+# investigate, not a number to bump again.
+#
+# Note: these tests' timing assertions are `#[cfg(not(debug_assertions))]`, so
+# under the debug profile they assert correctness only — the wall-clock here is
+# graph-construction cost, not a measurement being taken. Neither the ceiling
+# nor the grouping weakens any assertion.
+[test-groups.issue-55-get-edges]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'test(instrumented_get_edges_scaling) or test(probe_get_edges_layer_attribution) or test(repro_get_edges_scales_with_graph_size)'
+test-group = 'issue-55-get-edges'
+slow-timeout = { period = "60s", terminate-after = 6 }
+
 # CI profile: keep running after failures so one broken test surfaces the
 # full failure set in a single pipeline run. Select with `--profile ci`.
 [profile.ci]
 fail-fast = false
 slow-timeout = { period = "60s", terminate-after = 3 }
+
+# Mirrored explicitly rather than relying on override inheritance from
+# `default`; see the rationale on the default-profile override above.
+[[profile.ci.overrides]]
+filter = 'test(instrumented_get_edges_scaling) or test(probe_get_edges_layer_attribution) or test(repro_get_edges_scales_with_graph_size)'
+test-group = 'issue-55-get-edges'
+slow-timeout = { period = "60s", terminate-after = 6 }
 
 # Soak profile: the nightly "Soak & Stress" job opts the long-running
 # `#[ignore]`'d soak/stress tests in via `--run-ignored`. They legitimately run

@@ -1,6 +1,9 @@
 pub mod algo_registry_dispatch;
 pub mod algorithm_graph_ref_native;
+pub mod graph_compute_l0_ladder;
 pub mod graph_compute_pagerank;
 pub mod named_projection;
 pub mod pregel_algos;
+pub mod projection_contract;
 pub mod reachability_provider;
+pub mod read_only_l0_recovery;

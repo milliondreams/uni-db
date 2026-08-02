@@ -8,6 +8,7 @@
 //! maintaining a term-to-VID mapping. Supports both full rebuilds and
 //! incremental updates for optimal performance during mutations.
 
+use crate::backend::types::{FilterExpr, Scalar};
 use anyhow::{Result, anyhow};
 use arrow_array::types::UInt64Type;
 use arrow_array::{Array, ListArray, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
@@ -275,11 +276,12 @@ impl InvertedIndex {
             return Ok(Vec::new());
         }
 
-        let filter = normalized
-            .iter()
-            .map(|t| format!("term = '{}'", t.replace("'", "''")))
-            .collect::<Vec<_>>()
-            .join(" OR ");
+        let filter = FilterExpr::any_of(
+            normalized
+                .iter()
+                .map(|t| FilterExpr::equals("term", Scalar::Str(t.clone()))),
+        )
+        .to_sql()?;
 
         debug!(filter = %filter, "Querying inverted index");
 

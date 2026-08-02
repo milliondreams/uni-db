@@ -252,21 +252,45 @@ ALONG distance = prev.distance + e.length,
 
 Aggregates values across rows sharing the same KEY group.
 
-### Standard Aggregates (Non-Recursive Only)
+### Standard Aggregates
 
-| Aggregate | Description | Output Type |
-|-----------|-------------|-------------|
-| `SUM(expr)` | Sum of values | Float64 |
-| `COUNT(expr)` | Count of non-null values | Int64 |
-| `COUNT(*)` | Count of all rows | Int64 |
-| `AVG(expr)` | Arithmetic mean | Float64 |
-| `MIN(expr)` | Minimum value | Same as input |
-| `MAX(expr)` | Maximum value | Same as input |
-| `COLLECT(expr)` | Collect into a list | List |
+| Aggregate | Description | Output Type | In recursion |
+|-----------|-------------|-------------|--------------|
+| `SUM(expr)` | Sum of values | Float64 | Rejected |
+| `AVG(expr)` | Arithmetic mean | Float64 | Rejected |
+| `COUNT(expr)` | Count of non-null values | Int64 | Allowed (unbounded) |
+| `COUNT(*)` | Count of all rows | Int64 | Allowed (unbounded) |
+| `MIN(expr)` | Minimum value | Same as input | Allowed |
+| `MAX(expr)` | Maximum value | Same as input | Allowed |
+| `COLLECT(expr)` | Collect into a list | List | Allowed (unbounded) |
 
-These are not monotonic and cannot be used in recursive strata (error: `NonMonotonicInRecursion`).
+Recursive use is decided by the monotonicity oracle, which reads each aggregate's
+`Semilattice.monotone_join` flag from the plugin registry (falling back to the six
+`M*` names below on a registry miss). `SUM` and `AVG` declare `monotone_join: false`
+and are rejected in a recursive stratum with `NonMonotonicInRecursion`; the others
+are monotone and compile.
 
-### Monotonic Aggregates (Safe in Recursion)
+`COUNT`, `COUNT(*)` and `COLLECT` are monotone but **unbounded** (`has_top: false`);
+`MIN` and `MAX` are bounded (`has_top: true`). Unboundedness only bites for the
+aggregates the fixpoint loop actually tracks: `COUNT` / `COUNT(*)` carry a row-level
+accumulator, so a recursive rule folding over them may never reach a fixpoint and
+instead runs out at `max_iterations` -- which surfaces as `UniError::LocyIncomplete`
+with reason `IterationLimit` unless `allow_partial` is set. `COLLECT` (like `AVG`)
+has no row-level accumulator; the fixpoint loop skips it and it is evaluated after
+convergence, so it does not itself keep the loop iterating. The iteration cap is the
+backstop, not a convergence guarantee.
+
+Because the oracle is registry-backed, a plugin-registered aggregate declaring
+`monotone_join: true` is likewise accepted in a recursive stratum -- via
+`session.locy()` and via `db.rules().register(...)`. This does **not** survive a
+reopen: persisted rules in `catalog/locy_rules.json` are recompiled during open,
+before any plugin can be added (`add_plugin` only exists on an already-open `Uni`),
+so a stored rule folding over a plugin aggregate fails the open naming that rule --
+unless you open with `skip_invalid_locy_rules(true)`, which drops it with a warning
+so you can re-register it after `add_plugin`. Rules folding over built-in
+aggregates reload normally.
+
+### Monotonic Aggregates (Declared Lattice Folds)
 
 | Aggregate | Formula | Direction | Identity | Domain |
 |-----------|---------|-----------|----------|--------|
@@ -277,7 +301,7 @@ These are not monotonic and cannot be used in recursive strata (error: `NonMonot
 | `MNOR(expr)` | `1 - (1-acc)(1-val)` | Non-decreasing | 0.0 | [0, 1] |
 | `MPROD(expr)` | `acc * val` | Non-increasing | 1.0 | [0, 1] |
 
-Fixpoint converges when: (1) no new KEY tuples produced, AND (2) all monotonic accumulators stable (change < `f64::EPSILON`).
+Fixpoint converges when: (1) no new KEY tuples produced, AND (2) all monotonic accumulators stable (change < `f64::EPSILON`). An unbounded monotone fold that the loop tracks (`COUNT`, `MSUM`, `MCOUNT`) can fail condition (2) indefinitely; such a rule terminates at `max_iterations` instead. `COLLECT` and `AVG` have no row-level accumulator and are not part of condition (2) at all -- they are computed after the fixpoint.
 
 ### Post-FOLD WHERE (HAVING semantics)
 
@@ -299,7 +323,9 @@ CREATE RULE heavy_spender AS
 
 ### FOLD + BEST BY Restriction
 
-BEST BY cannot be combined with monotonic FOLD in the same clause -- semantically contradictory. Error: `BestByWithMonotonicFold`.
+BEST BY cannot be combined with a *declared lattice fold* in the same clause -- semantically contradictory (BEST BY keeps one witness row; a lattice fold aggregates across all of them). Error: `BestByWithMonotonicFold`.
+
+The check is syntactic over the six `M`-prefixed spellings -- `MSUM`, `MMAX`, `MMIN`, `MCOUNT`, `MNOR`, `MPROD` -- and is deliberately decoupled from the monotonicity oracle. So `BEST BY ... FOLD MAX(x)` / `MIN` / `COUNT` / `COLLECT` are legal even though those are monotone in the registry. The guard runs on every rule, not only recursive ones.
 
 ---
 
@@ -596,6 +622,10 @@ session.rules().count();
 session.rules().clear();
 ```
 
+### Cancellation
+
+`.cancellation_token(token)` on `LocyBuilder` / `TxLocyBuilder` / `SessionLocyBuilder` races the token against the **whole** evaluation, so a long-running fixpoint is cancellable -- not merely at statement boundaries. Cancelling returns `UniError::Cancelled` (`UniCancelledError` in Python). The enclosing session's or transaction's own scope applies too: `Transaction::cancel()` reaches `tx.locy()` / `tx.locy_with()` and `tx.apply()` as well as its Cypher statements.
+
 ### LocyResult Fields
 
 | Field | Type | Description |
@@ -673,6 +703,7 @@ a.b.c.my_rule                -- Deep nesting
 |-------|------|---------|-------------|
 | `max_iterations` | `usize` | `1000` | Max fixpoint iterations per recursive stratum |
 | `timeout` | `Duration` | `300s` | Overall evaluation timeout |
+| `allow_partial` | `bool` | `false` | Return the partial `LocyResult` (with `incomplete` populated) instead of `UniError::LocyIncomplete` when `timeout` or `max_iterations` is exhausted |
 | `max_explain_depth` | `usize` | `100` | Max recursion depth for EXPLAIN trees |
 | `max_slg_depth` | `usize` | `1000` | Max recursion depth for SLG resolution (QUERY) |
 | `max_abduce_candidates` | `usize` | `20` | Max candidates generated during ABDUCE |
@@ -813,11 +844,12 @@ RETURN modifications
 
 | Anti-Pattern | Symptom | Fix |
 |-------------|---------|-----|
-| Missing KEY columns in recursive rules | Exponential growth, `MaxIterationsExceeded` | Add KEY columns for fact identity |
-| SUM/COUNT/AVG in recursion | `NonMonotonicInRecursion` | Use MSUM/MCOUNT or restructure |
+| Missing KEY columns in recursive rules | Exponential growth, then `LocyIncomplete` (reason `IterationLimit`) | Add KEY columns for fact identity |
+| SUM/AVG in recursion | `NonMonotonicInRecursion` | Use MSUM or restructure |
+| COUNT in recursion over a cyclic/unbounded fact set | Monotone but unbounded and loop-tracked: can run to `max_iterations`, then `LocyIncomplete` | Bound the recursion, or accept the cap via `allow_partial` |
 | `prev.field` in base case | `PrevInBaseCase` | Use literal values in base case ALONG |
 | Cyclic negation (A IS NOT B, B IS NOT A) | `CyclicNegation` | Ensure negation flows in one direction |
-| BEST BY + monotonic FOLD | `BestByWithMonotonicFold` | Use BEST BY with ALONG, or FOLD without BEST BY |
+| BEST BY + `M*` lattice fold (MSUM/MMAX/MMIN/MCOUNT/MNOR/MPROD) | `BestByWithMonotonicFold` | Use BEST BY with ALONG, or FOLD without BEST BY |
 | Ignoring `SharedProbabilisticDependency` warning | Silently wrong probabilities | Enable `exact_probability` or review rule logic |
 | ALONG without BEST BY in recursive rules | All path variants retained (exponential) | Add BEST BY to prune dominated paths |
 | Command WHERE using DataFusion-only functions | Silent eval failure or limited behavior | Move complex filters into rule MATCH/WHERE |

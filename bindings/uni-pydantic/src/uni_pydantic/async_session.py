@@ -15,6 +15,8 @@ from typing import (
 )
 from weakref import WeakValueDictionary
 
+from pydantic import ValidationError
+
 from .async_query import AsyncQueryBuilder
 from .base import UniEdge, UniNode
 from .exceptions import (
@@ -36,7 +38,12 @@ from .hooks import (
     run_class_hooks,
     run_hooks,
 )
-from .query import _edge_pattern, _row_to_node_dict, _validate_property
+from .query import (
+    _edge_pattern,
+    _row_to_node_dict,
+    _validate_property,
+    _warn_unhydratable,
+)
 from .schema import SchemaGenerator
 from .session import _NODE_RETURN, UniSession
 from .types import db_to_python_value, python_to_db_value
@@ -336,7 +343,7 @@ class AsyncUniSession:
                 if isinstance(value, dict):
                     if "_id" in value and "_label" in value:
                         instance = self._result_to_model(value, result_type)
-                        if instance:
+                        if instance is not None:
                             mapped.append(instance)
                             break
                     elif "_label" in value:
@@ -344,14 +351,14 @@ class AsyncUniSession:
                         if label in self._schema_gen._node_models:
                             model = self._schema_gen._node_models[label]
                             instance = self._result_to_model(value, model)
-                            if instance:
+                            if instance is not None:
                                 mapped.append(instance)
                                 break
             else:
                 first_value = next(iter(row.values()), None)
                 if isinstance(first_value, dict):
                     instance = self._result_to_model(first_value, result_type)
-                    if instance:
+                    if instance is not None:
                         mapped.append(instance)
 
         return mapped
@@ -563,7 +570,8 @@ class AsyncUniSession:
                 NodeT,
                 model.from_properties(data, vid=vid, session=self),
             )
-        except Exception:
+        except ValidationError as exc:
+            _warn_unhydratable(model, vid, exc)
             return None
 
         if vid is not None:
@@ -617,6 +625,13 @@ class AsyncUniSession:
             )
             results = await self._db_session.query(cypher, {"vids": vids})
 
+            # Hydrate, mirroring the sync session. This matters more here:
+            # `_load_relationship` raises on an async session and tells the
+            # caller to use `eager_load()`, so this is the *only* relationship
+            # path async has -- and it was the broken one.
+            descriptor = getattr(model, rel_name, None)
+            is_list = getattr(descriptor, "is_list", True)
+
             by_source: dict[int, list[Any]] = {}
             for raw_row in results:
                 row = raw_row.to_dict()
@@ -624,12 +639,19 @@ class AsyncUniSession:
                 node_data = _row_to_node_dict(row)
                 if node_data is None:
                     continue
-                if src_vid not in by_source:
-                    by_source[src_vid] = []
-                by_source[src_vid].append(node_data)
+                node_label = node_data.get("_label")
+                if not node_label or node_label not in self._schema_gen._node_models:
+                    continue
+                target_model = self._schema_gen._node_models[node_label]
+                instance = self._result_to_model(node_data, target_model)
+                if instance is None:
+                    continue
+                by_source.setdefault(src_vid, []).append(instance)
 
+            cache_attr = f"_rel_cache_{rel_name}"
             for entity in entities:
-                if entity._vid in by_source:
-                    related = by_source[entity._vid]
-                    cache_attr = f"_rel_cache_{rel_name}"
+                related = by_source.get(entity._vid, [])
+                if is_list:
                     setattr(entity, cache_attr, related)
+                else:
+                    setattr(entity, cache_attr, related[0] if related else None)

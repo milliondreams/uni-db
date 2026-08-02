@@ -9,6 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 use uni_cypher::ast::{BinaryOp, CypherLiteral, Expr, UnaryOp};
+use uni_store::backend::types::{CmpOp, FilterExpr, Scalar, StringMatchKind};
 
 use uni_common::Value;
 use uni_common::core::id::UniId;
@@ -730,38 +731,51 @@ fn flatten_ands(expr: &Expr) -> Vec<&Expr> {
 pub struct LanceFilterGenerator;
 
 impl LanceFilterGenerator {
-    /// Checks if a string contains SQL LIKE wildcard characters.
+    /// Convert pushable predicates into a structured [`FilterExpr`].
     ///
-    /// # Security
+    /// Conjuncts with no structured representation — parameters, unsupported
+    /// operators, a non-property left-hand side — are **silently dropped**. The
+    /// result therefore matches a *superset* of the intended rows, and is only
+    /// sound where the caller re-applies the original predicates above the scan
+    /// (`apply_scan_filter` / `verify_and_filter_candidates` both do).
     ///
-    /// **CWE-89 (SQL Injection)**: Predicates containing wildcards are NOT pushed
-    /// to storage because Lance DataFusion doesn't support the ESCAPE clause.
-    /// Instead, they're evaluated at the application layer where we have full
-    /// control over string matching semantics.
-    fn contains_sql_wildcards(s: &str) -> bool {
-        s.contains('%') || s.contains('_')
-    }
-
-    /// Escapes special characters in LIKE patterns.
+    /// Returns [`FilterExpr::Literal`]`(true)` when nothing is pushable.
     ///
-    /// **Note**: This function is kept for documentation and potential future use,
-    /// but currently we do not push down LIKE patterns containing wildcards
-    /// because Lance DataFusion doesn't support the ESCAPE clause.
-    #[expect(
-        dead_code,
-        reason = "Reserved for future use when Lance supports ESCAPE"
-    )]
-    fn escape_like_pattern(s: &str) -> String {
-        s.replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_")
-            .replace('\'', "''")
+    /// The predicate may contain a [`FilterExpr::StringMatch`] whose pattern
+    /// holds a SQL wildcard, which [`FilterExpr::to_sql`] declines. Callers
+    /// feeding a SQL backend must project through
+    /// [`FilterExpr::sql_pushable`] first; [`Self::generate`] does exactly that.
+    pub fn generate_expr(
+        predicates: &[Expr],
+        variable: &str,
+        schema_props: Option<&HashMap<String, PropertyMeta>>,
+    ) -> FilterExpr {
+        // Flattening nested ANDs keeps `all()` a single flat conjunction, which
+        // is what the range-aware planners downstream expect to see.
+        //
+        // There used to be a "range fusion" pass here that recognized a
+        // `col >= L` / `col <= U` pair and emitted one combined clause. It is
+        // gone: structured output makes it a no-op — the generic path below
+        // produces the same two `Compare` nodes — and its bespoke string form
+        // (`"col" >= L`) was a live defect, because Lance parses a
+        // double-quoted name as a string literal, so the whole clause collapsed
+        // to a data-independent constant that matched every row.
+        FilterExpr::all(
+            predicates
+                .iter()
+                .flat_map(flatten_ands)
+                .filter_map(|e| Self::expr_to_filter(e, variable, schema_props)),
+        )
     }
 
     /// Converts pushable predicates to Lance SQL filter string.
     ///
     /// When `schema_props` is provided, properties not in the schema (overflow properties)
     /// are skipped since they don't exist as physical columns in Lance.
+    ///
+    /// `None` means "nothing to push" — the caller should not build a filtered
+    /// scan path at all. It does not distinguish "no input" from "nothing was
+    /// pushable"; both leave the residual filter to do all the work.
     pub fn generate(
         predicates: &[Expr],
         variable: &str,
@@ -770,175 +784,69 @@ impl LanceFilterGenerator {
         if predicates.is_empty() {
             return None;
         }
-
-        // Flatten nested ANDs first
-        let flattened: Vec<&Expr> = predicates.iter().flat_map(|p| flatten_ands(p)).collect();
-
-        // Optimize Ranges: Group predicates by column and combine into >= AND <= if possible
-        let mut by_column: HashMap<String, Vec<&Expr>> = HashMap::new();
-        let mut optimized_filters: Vec<String> = Vec::new();
-        let mut used_expressions: HashSet<*const Expr> = HashSet::new();
-
-        for expr in &flattened {
-            if let Some(col) = Self::extract_column_from_range(expr, variable, schema_props) {
-                by_column.entry(col).or_default().push(expr);
-            }
+        let expr = Self::generate_expr(predicates, variable, schema_props).sql_pushable();
+        if expr.is_trivially_true() {
+            return None;
         }
-
-        for (col, exprs) in &by_column {
-            if exprs.len() < 2 {
-                continue;
-            }
-
-            // Try to find pairs of >/>= and </<=
-            // Very naive: find ONE pair and emit range expression.
-            // Complex ranges (e.g. >10 AND >20) are not merged but valid.
-            // We look for: (col > L OR col >= L) AND (col < R OR col <= R)
-
-            let mut lower: Option<(bool, &Expr, &Expr)> = None; // (inclusive, val_expr, original_expr)
-            let mut upper: Option<(bool, &Expr, &Expr)> = None;
-
-            for expr in exprs {
-                if let Expr::BinaryOp { op, right, .. } = expr {
-                    match op {
-                        BinaryOp::Gt => {
-                            // If we have multiple lower bounds, pick the last one (arbitrary for now, intersection handles logic)
-                            lower = Some((false, right, expr));
-                        }
-                        BinaryOp::GtEq => {
-                            lower = Some((true, right, expr));
-                        }
-                        BinaryOp::Lt => {
-                            upper = Some((false, right, expr));
-                        }
-                        BinaryOp::LtEq => {
-                            upper = Some((true, right, expr));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            if let (Some((true, l_val, l_expr)), Some((true, u_val, u_expr))) = (lower, upper) {
-                // Both inclusive -> use >= AND <= (Lance doesn't support BETWEEN)
-                if let (Some(l_str), Some(u_str)) =
-                    (Self::value_to_lance(l_val), Self::value_to_lance(u_val))
-                {
-                    optimized_filters.push(format!(
-                        "\"{}\" >= {} AND \"{}\" <= {}",
-                        col, l_str, col, u_str
-                    ));
-                    used_expressions.insert(l_expr as *const Expr);
-                    used_expressions.insert(u_expr as *const Expr);
-                }
-            }
-        }
-
-        let mut filters = optimized_filters;
-
-        for expr in flattened {
-            if used_expressions.contains(&(expr as *const Expr)) {
-                continue;
-            }
-            if let Some(s) = Self::expr_to_lance(expr, variable, schema_props) {
-                filters.push(s);
-            }
-        }
-
-        if filters.is_empty() {
-            None
-        } else {
-            Some(filters.join(" AND "))
-        }
+        expr.to_sql().ok()
     }
 
-    fn extract_column_from_range(
+    fn expr_to_filter(
         expr: &Expr,
         variable: &str,
         schema_props: Option<&HashMap<String, PropertyMeta>>,
-    ) -> Option<String> {
-        match expr {
-            Expr::BinaryOp { left, op, .. } => {
-                if matches!(
-                    op,
-                    BinaryOp::Gt | BinaryOp::GtEq | BinaryOp::Lt | BinaryOp::LtEq
-                ) {
-                    return Self::extract_column(left, variable, schema_props);
-                }
-                None
-            }
-            _ => None,
-        }
-    }
-
-    fn expr_to_lance(
-        expr: &Expr,
-        variable: &str,
-        schema_props: Option<&HashMap<String, PropertyMeta>>,
-    ) -> Option<String> {
+    ) -> Option<FilterExpr> {
         match expr {
             Expr::In {
                 expr: left,
                 list: right,
             } => {
                 let column = Self::extract_column(left, variable, schema_props)?;
-                let value = Self::value_to_lance(right)?;
-                Some(format!("{} IN {}", column, value))
+                Some(FilterExpr::one_of(column, Self::list_to_scalars(right)?))
             }
             Expr::BinaryOp { left, op, right } => {
                 let column = Self::extract_column(left, variable, schema_props)?;
-
-                // Special handling for string operators
-                // Security: CWE-89 - Prevent SQL wildcard injection
-                //
-                // Lance DataFusion doesn't support the ESCAPE clause, so we cannot
-                // safely push down LIKE predicates containing SQL wildcards (% or _).
-                // If the input contains these characters, we return None to keep
-                // the predicate as a residual for application-level evaluation.
-                match op {
-                    BinaryOp::Contains | BinaryOp::StartsWith | BinaryOp::EndsWith => {
-                        let raw_value = Self::get_string_value(right)?;
-
-                        // If the value contains SQL wildcards, don't push down
-                        // to prevent wildcard injection attacks
-                        if Self::contains_sql_wildcards(&raw_value) {
-                            return None;
-                        }
-
-                        // Escape single quotes for the SQL string
-                        let escaped = raw_value.replace('\'', "''");
-
-                        match op {
-                            BinaryOp::Contains => Some(format!("{} LIKE '%{}%'", column, escaped)),
-                            BinaryOp::StartsWith => Some(format!("{} LIKE '{}%'", column, escaped)),
-                            BinaryOp::EndsWith => Some(format!("{} LIKE '%{}'", column, escaped)),
-                            _ => unreachable!(),
-                        }
-                    }
-                    _ => {
-                        let op_str = Self::op_to_lance(op)?;
-                        let value = Self::value_to_lance(right)?;
-                        // Use unquoted column name for DataFusion compatibility
-                        // DataFusion treats unquoted identifiers case-insensitively
-                        Some(format!("{} {} {}", column, op_str, value))
-                    }
+                let kind = match op {
+                    BinaryOp::Contains => Some(StringMatchKind::Contains),
+                    BinaryOp::StartsWith => Some(StringMatchKind::StartsWith),
+                    BinaryOp::EndsWith => Some(StringMatchKind::EndsWith),
+                    _ => None,
+                };
+                match kind {
+                    // The pattern travels as data. Whether a `%`/`_` inside it
+                    // can be honored is the backend's call: `to_sql` refuses
+                    // (no ESCAPE clause — CWE-89), a native evaluator matches
+                    // the substring exactly.
+                    Some(kind) => Some(FilterExpr::StringMatch {
+                        column,
+                        kind,
+                        pattern: Self::get_string_value(right)?,
+                    }),
+                    None => Some(FilterExpr::compare(
+                        column,
+                        Self::op_to_cmp(op)?,
+                        Self::value_to_scalar(right)?,
+                    )),
                 }
             }
             Expr::UnaryOp {
                 op: UnaryOp::Not,
                 expr,
-            } => {
-                let inner = Self::expr_to_lance(expr, variable, schema_props)?;
-                Some(format!("NOT ({})", inner))
-            }
-            Expr::IsNull(inner) => {
-                let column = Self::extract_column(inner, variable, schema_props)?;
-                Some(format!("{} IS NULL", column))
-            }
-            Expr::IsNotNull(inner) => {
-                let column = Self::extract_column(inner, variable, schema_props)?;
-                Some(format!("{} IS NOT NULL", column))
-            }
+            } => Some(FilterExpr::negate(Self::expr_to_filter(
+                expr,
+                variable,
+                schema_props,
+            )?)),
+            Expr::IsNull(inner) => Some(FilterExpr::IsNull(Self::extract_column(
+                inner,
+                variable,
+                schema_props,
+            )?)),
+            Expr::IsNotNull(inner) => Some(FilterExpr::IsNotNull(Self::extract_column(
+                inner,
+                variable,
+                schema_props,
+            )?)),
             _ => None,
         }
     }
@@ -977,35 +885,32 @@ impl LanceFilterGenerator {
         }
     }
 
-    fn op_to_lance(op: &BinaryOp) -> Option<&'static str> {
+    fn op_to_cmp(op: &BinaryOp) -> Option<CmpOp> {
         match op {
-            BinaryOp::Eq => Some("="),
-            BinaryOp::NotEq => Some("!="),
-            BinaryOp::Lt => Some("<"),
-            BinaryOp::LtEq => Some("<="),
-            BinaryOp::Gt => Some(">"),
-            BinaryOp::GtEq => Some(">="),
+            BinaryOp::Eq => Some(CmpOp::Eq),
+            BinaryOp::NotEq => Some(CmpOp::NotEq),
+            BinaryOp::Lt => Some(CmpOp::Lt),
+            BinaryOp::LtEq => Some(CmpOp::LtEq),
+            BinaryOp::Gt => Some(CmpOp::Gt),
+            BinaryOp::GtEq => Some(CmpOp::GtEq),
             _ => None,
         }
     }
 
-    fn value_to_lance(expr: &Expr) -> Option<String> {
+    fn value_to_scalar(expr: &Expr) -> Option<Scalar> {
         match expr {
             Expr::Literal(CypherLiteral::String(s)) => {
                 // Normalize datetime strings to include seconds for Arrow timestamp parsing.
                 // Our Cypher datetime formatting omits `:00` seconds (e.g. `2021-06-01T00:00Z`)
                 // but Arrow/Lance requires full `HH:MM:SS` for timestamp parsing.
-                let s = super::df_expr::normalize_datetime_str(s).unwrap_or_else(|| s.clone());
-                Some(format!("'{}'", s.replace("'", "''")))
+                Some(Scalar::Str(
+                    super::df_expr::normalize_datetime_str(s).unwrap_or_else(|| s.clone()),
+                ))
             }
-            Expr::Literal(CypherLiteral::Integer(i)) => Some(i.to_string()),
-            Expr::Literal(CypherLiteral::Float(f)) => Some(f.to_string()),
-            Expr::Literal(CypherLiteral::Bool(b)) => Some(b.to_string()),
-            Expr::Literal(CypherLiteral::Null) => Some("NULL".to_string()),
-            Expr::List(items) => {
-                let values: Option<Vec<String>> = items.iter().map(Self::value_to_lance).collect();
-                values.map(|v| format!("({})", v.join(", ")))
-            }
+            Expr::Literal(CypherLiteral::Integer(i)) => Some(Scalar::Int(*i)),
+            Expr::Literal(CypherLiteral::Float(f)) => Some(Scalar::Float(*f)),
+            Expr::Literal(CypherLiteral::Bool(b)) => Some(Scalar::Bool(*b)),
+            Expr::Literal(CypherLiteral::Null) => Some(Scalar::Null),
             // Security: CWE-89 - Parameters are NOT pushed to storage layer.
             // Parameterized predicates stay in the application layer where the
             // query executor can safely substitute values with proper type handling.
@@ -1015,10 +920,18 @@ impl LanceFilterGenerator {
         }
     }
 
-    /// Extracts raw string value from expression for LIKE pattern use.
+    /// The right-hand side of an `IN`, which must be a literal list.
     ///
-    /// Returns the raw string without escaping - escaping is handled by
-    /// `escape_like_pattern` for LIKE clauses.
+    /// One unrenderable element rejects the whole list — a partial `IN` would
+    /// silently narrow the predicate.
+    fn list_to_scalars(expr: &Expr) -> Option<Vec<Scalar>> {
+        match expr {
+            Expr::List(items) => items.iter().map(Self::value_to_scalar).collect(),
+            _ => None,
+        }
+    }
+
+    /// Extracts raw string value from expression for pattern-match use.
     fn get_string_value(expr: &Expr) -> Option<String> {
         match expr {
             Expr::Literal(CypherLiteral::String(s)) => Some(s.clone()),
@@ -1115,27 +1028,41 @@ mod security_tests {
     mod wildcard_protection {
         use super::*;
 
-        #[test]
-        fn test_contains_sql_wildcards_detects_percent() {
-            assert!(LanceFilterGenerator::contains_sql_wildcards("admin%"));
-            assert!(LanceFilterGenerator::contains_sql_wildcards("%admin"));
-            assert!(LanceFilterGenerator::contains_sql_wildcards("ad%min"));
+        /// The wildcard check moved from generation time into the renderer:
+        /// `StringMatch` carries the pattern as data, and `to_sql` is what
+        /// declines it (no ESCAPE clause in the dialect). These assert the
+        /// refusal directly, where the old tests asserted the private helper.
+        fn like_sql(pattern: &str) -> Result<String, uni_store::backend::types::ToSqlError> {
+            FilterExpr::StringMatch {
+                column: "name".to_string(),
+                kind: StringMatchKind::Contains,
+                pattern: pattern.to_string(),
+            }
+            .to_sql()
         }
 
         #[test]
-        fn test_contains_sql_wildcards_detects_underscore() {
-            assert!(LanceFilterGenerator::contains_sql_wildcards("a_min"));
-            assert!(LanceFilterGenerator::contains_sql_wildcards("_admin"));
-            assert!(LanceFilterGenerator::contains_sql_wildcards("admin_"));
+        fn test_percent_wildcard_refused_by_renderer() {
+            for p in ["admin%", "%admin", "ad%min"] {
+                assert!(like_sql(p).is_err(), "pattern {p:?} must not render");
+            }
         }
 
         #[test]
-        fn test_contains_sql_wildcards_safe_strings() {
-            assert!(!LanceFilterGenerator::contains_sql_wildcards("admin"));
-            assert!(!LanceFilterGenerator::contains_sql_wildcards("John Smith"));
-            assert!(!LanceFilterGenerator::contains_sql_wildcards(
-                "test@example.com"
-            ));
+        fn test_underscore_wildcard_refused_by_renderer() {
+            for p in ["a_min", "_admin", "admin_"] {
+                assert!(like_sql(p).is_err(), "pattern {p:?} must not render");
+            }
+        }
+
+        #[test]
+        fn test_safe_strings_render() {
+            assert_eq!(like_sql("admin").unwrap(), "name LIKE '%admin%'");
+            assert_eq!(like_sql("John Smith").unwrap(), "name LIKE '%John Smith%'");
+            assert_eq!(
+                like_sql("test@example.com").unwrap(),
+                "name LIKE '%test@example.com%'"
+            );
         }
 
         #[test]

@@ -76,6 +76,36 @@ fn ppr(session: u64, g: i64, source: i64) -> Result<(), String> {
     Ok(())
 }
 
+/// Emits two declared columns in a single `emit`, exercising the batch wire
+/// form (`names` + `handles`) that pairs positionally.
+fn twocol(session: u64, g: i64) -> Result<(), String> {
+    let deg = h(session, serde_json::json!({"op": "degrees", "g": g, "s": "out"}))?;
+    let ids = h(session, serde_json::json!({"op": "vertex_ids", "g": g}))?;
+    kernel(
+        session,
+        serde_json::json!({"op": "emit", "names": ["a", "b"], "handles": [deg, ids]}),
+    )?;
+    Ok(())
+}
+
+/// Reads a pre-declared named scope and combines it with the primary.
+///
+/// Sandboxed guests do not call `graph_named`: the host hands them the scope
+/// handles in the invocation JSON's `graphs` map. Crossing index spaces still
+/// needs an explicit `rekey`, which verifies the two projections describe the
+/// same vertices before re-tagging the value.
+fn layers(session: u64, g: i64, agg: i64) -> Result<(), String> {
+    let a = h(session, serde_json::json!({"op": "degrees", "g": g, "s": "out"}))?;
+    let b = h(session, serde_json::json!({"op": "degrees", "g": agg, "s": "out"}))?;
+    let moved = h(session, serde_json::json!({"op": "rekey", "a": b, "g": g}))?;
+    let sum = h(
+        session,
+        serde_json::json!({"op": "ewise", "a": a, "b": moved, "s": "add"}),
+    )?;
+    kernel(session, serde_json::json!({"op": "emit", "g": sum, "name": "both"}))?;
+    Ok(())
+}
+
 impl Guest for GraphPlugin {
     fn manifest() -> String {
         r#"{
@@ -98,6 +128,16 @@ impl Guest for GraphPlugin {
                 "qname": "ai.example.wasmgc.ppr",
                 "args": [{"kind": "primitive", "arrow": "int64"}],
                 "yields": ["nodeId:int", "score:float"]
+            }, {
+                "kind": "algorithm",
+                "qname": "ai.example.wasmgc.twocol",
+                "args": [],
+                "yields": ["nodeId:int", "a:float", "b:float"]
+            }, {
+                "kind": "algorithm",
+                "qname": "ai.example.wasmgc.layers",
+                "args": [],
+                "yields": ["nodeId:int", "both:float"]
             }]
         }"#
         .to_owned()
@@ -112,7 +152,7 @@ impl Guest for GraphPlugin {
         })
     }
 
-    fn invoke_algorithm(_qname: String, args_ipc: Vec<u8>) -> Result<Vec<u8>, FnError> {
+    fn invoke_algorithm(qname: String, args_ipc: Vec<u8>) -> Result<Vec<u8>, FnError> {
         let req: serde_json::Value = serde_json::from_slice(&args_ipc).map_err(|e| FnError {
             code: 0x802,
             message: format!("input json: {e}"),
@@ -125,7 +165,24 @@ impl Guest for GraphPlugin {
             .and_then(|a| a.get(0))
             .and_then(serde_json::Value::as_i64)
             .unwrap_or(0);
-        ppr(session, g, source).map_err(|e| FnError {
+        let result = if qname.ends_with(".twocol") {
+            twocol(session, g)
+        } else if qname.ends_with(".layers") {
+            // Named scopes arrive beside `graph`, keyed by their CALL-site name.
+            let agg = req
+                .get("graphs")
+                .and_then(|m| m.get("agg"))
+                .and_then(serde_json::Value::as_i64)
+                .ok_or_else(|| FnError {
+                    code: 0x86E,
+                    message: "layers: no `agg` scope in the invocation `graphs` map".to_owned(),
+                    retryable: false,
+                })?;
+            layers(session, g, agg)
+        } else {
+            ppr(session, g, source)
+        };
+        result.map_err(|e| FnError {
             code: 0x86D,
             message: e,
             retryable: false,

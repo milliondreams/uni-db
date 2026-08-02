@@ -32,31 +32,7 @@ pub fn is_vertex_deleted(vid: Vid, ctx: Option<&QueryContext>) -> bool {
     // antidependency check (write-skew). No-op outside a write-tx. (review H1)
     record_vertex_read(ctx, vid);
 
-    // Check transaction L0 first (newest)
-    if let Some(tx_l0_arc) = &ctx.transaction_l0 {
-        let tx_l0 = tx_l0_arc.read();
-        if tx_l0.vertex_tombstones.contains(&vid) {
-            return true;
-        }
-    }
-
-    // Check main L0
-    {
-        let l0 = ctx.l0.read();
-        if l0.vertex_tombstones.contains(&vid) {
-            return true;
-        }
-    }
-
-    // Check pending flush L0s (newest first for early exit)
-    for pending_l0_arc in ctx.pending_flush_l0s.iter().rev() {
-        let pending_l0 = pending_l0_arc.read();
-        if pending_l0.vertex_tombstones.contains(&vid) {
-            return true;
-        }
-    }
-
-    false
+    visit_l0_buffers(Some(ctx), |buf| buf.vertex_tombstones.contains(&vid))
 }
 
 /// Check if an edge is deleted in the L0 chain.
@@ -70,31 +46,7 @@ pub fn is_edge_deleted(eid: Eid, ctx: Option<&QueryContext>) -> bool {
     // the SSI read-set. No-op outside a write-tx. (review H1)
     record_edge_read(ctx, eid);
 
-    // Check transaction L0 first (newest)
-    if let Some(tx_l0_arc) = &ctx.transaction_l0 {
-        let tx_l0 = tx_l0_arc.read();
-        if tx_l0.tombstones.contains_key(&eid) {
-            return true;
-        }
-    }
-
-    // Check main L0
-    {
-        let l0 = ctx.l0.read();
-        if l0.tombstones.contains_key(&eid) {
-            return true;
-        }
-    }
-
-    // Check pending flush L0s (newest first for early exit)
-    for pending_l0_arc in ctx.pending_flush_l0s.iter().rev() {
-        let pending_l0 = pending_l0_arc.read();
-        if pending_l0.tombstones.contains_key(&eid) {
-            return true;
-        }
-    }
-
-    false
+    visit_l0_buffers(Some(ctx), |buf| buf.tombstones.contains_key(&eid))
 }
 
 /// Records a vertex read into the transaction's SSI read-set, when tracking.
@@ -131,37 +83,12 @@ pub fn lookup_vertex_prop(vid: Vid, prop: &str, ctx: Option<&QueryContext>) -> O
     let ctx = ctx?;
     record_vertex_read(ctx, vid);
 
-    // Check transaction L0 first (newest)
-    if let Some(tx_l0_arc) = &ctx.transaction_l0 {
-        let tx_l0 = tx_l0_arc.read();
-        if let Some(props) = tx_l0.vertex_properties.get(&vid)
-            && let Some(val) = props.get(prop)
-        {
-            return Some(val.clone());
-        }
-    }
-
-    // Check main L0
-    {
-        let l0 = ctx.l0.read();
-        if let Some(props) = l0.vertex_properties.get(&vid)
-            && let Some(val) = props.get(prop)
-        {
-            return Some(val.clone());
-        }
-    }
-
-    // Check pending flush L0s (newest first)
-    for pending_l0_arc in ctx.pending_flush_l0s.iter().rev() {
-        let pending_l0 = pending_l0_arc.read();
-        if let Some(props) = pending_l0.vertex_properties.get(&vid)
-            && let Some(val) = props.get(prop)
-        {
-            return Some(val.clone());
-        }
-    }
-
-    None
+    find_in_l0_buffers(ctx, |buf| {
+        buf.vertex_properties
+            .get(&vid)
+            .and_then(|props| props.get(prop))
+            .cloned()
+    })
 }
 
 /// Look up an edge property in the L0 chain.
@@ -171,37 +98,12 @@ pub fn lookup_edge_prop(eid: Eid, prop: &str, ctx: Option<&QueryContext>) -> Opt
     let ctx = ctx?;
     record_edge_read(ctx, eid);
 
-    // Check transaction L0 first (newest)
-    if let Some(tx_l0_arc) = &ctx.transaction_l0 {
-        let tx_l0 = tx_l0_arc.read();
-        if let Some(props) = tx_l0.edge_properties.get(&eid)
-            && let Some(val) = props.get(prop)
-        {
-            return Some(val.clone());
-        }
-    }
-
-    // Check main L0
-    {
-        let l0 = ctx.l0.read();
-        if let Some(props) = l0.edge_properties.get(&eid)
-            && let Some(val) = props.get(prop)
-        {
-            return Some(val.clone());
-        }
-    }
-
-    // Check pending flush L0s (newest first)
-    for pending_l0_arc in ctx.pending_flush_l0s.iter().rev() {
-        let pending_l0 = pending_l0_arc.read();
-        if let Some(props) = pending_l0.edge_properties.get(&eid)
-            && let Some(val) = props.get(prop)
-        {
-            return Some(val.clone());
-        }
-    }
-
-    None
+    find_in_l0_buffers(ctx, |buf| {
+        buf.edge_properties
+            .get(&eid)
+            .and_then(|props| props.get(prop))
+            .cloned()
+    })
 }
 
 /// Accumulate all vertex properties from the L0 chain.
@@ -333,91 +235,40 @@ where
     false
 }
 
-/// Overlay L0 properties onto a batch result.
-/// This applies L0 modifications to a set of vertices loaded from storage.
-pub fn overlay_vertex_batch(
-    vid_to_idx: &HashMap<Vid, usize>,
-    result: &mut [Properties],
-    deleted: &mut [bool],
-    ctx: Option<&QueryContext>,
-) {
-    let ctx = match ctx {
-        Some(c) => c,
-        None => return,
-    };
-
-    // Apply pending flush L0s (oldest first)
-    for pending_l0_arc in ctx.pending_flush_l0s.iter() {
-        let pending_l0 = pending_l0_arc.read();
-        overlay_vertex_from_l0(&pending_l0, vid_to_idx, result, deleted);
-    }
-
-    // Apply main L0
-    {
-        let l0 = ctx.l0.read();
-        overlay_vertex_from_l0(&l0, vid_to_idx, result, deleted);
-    }
-
-    // Apply transaction L0 (newest, highest priority)
+/// Visit L0 buffers newest-to-oldest, returning the first `Some` a visitor yields.
+///
+/// The value-returning sibling of [`visit_l0_buffers`]: same
+/// transaction-L0 → main-L0 → pending-flush (newest first) order and the same
+/// early exit. The visitor runs while that layer's read guard is held, so it
+/// must clone anything it returns.
+///
+/// Callers MUST record their SSI read *before* calling this. The
+/// antidependency contract requires the observation to be registered whether or
+/// not any layer yields a hit, so read-recording cannot move inside the walk.
+/// (review H1)
+fn find_in_l0_buffers<T, F>(ctx: &QueryContext, mut visitor: F) -> Option<T>
+where
+    F: FnMut(&L0Buffer) -> Option<T>,
+{
     if let Some(tx_l0_arc) = &ctx.transaction_l0 {
         let tx_l0 = tx_l0_arc.read();
-        overlay_vertex_from_l0(&tx_l0, vid_to_idx, result, deleted);
-    }
-}
-
-/// Helper to overlay a single L0 buffer onto the batch result.
-fn overlay_vertex_from_l0(
-    l0: &L0Buffer,
-    vid_to_idx: &HashMap<Vid, usize>,
-    result: &mut [Properties],
-    deleted: &mut [bool],
-) {
-    // Apply tombstones
-    for vid in &l0.vertex_tombstones {
-        if let Some(&idx) = vid_to_idx.get(vid) {
-            deleted[idx] = true;
+        if let Some(v) = visitor(&tx_l0) {
+            return Some(v);
         }
     }
-
-    // Apply property updates
-    for (vid, props) in &l0.vertex_properties {
-        if let Some(&idx) = vid_to_idx.get(vid) {
-            for (k, v) in props {
-                result[idx].insert(k.clone(), v.clone());
-            }
-        }
-    }
-}
-
-/// Overlay L0 edge properties onto a batch result.
-pub fn overlay_edge_batch(
-    eid_to_idx: &HashMap<Eid, usize>,
-    result: &mut [Properties],
-    deleted: &mut [bool],
-    ctx: Option<&QueryContext>,
-) {
-    let ctx = match ctx {
-        Some(c) => c,
-        None => return,
-    };
-
-    // Apply pending flush L0s (oldest first)
-    for pending_l0_arc in ctx.pending_flush_l0s.iter() {
-        let pending_l0 = pending_l0_arc.read();
-        overlay_edge_from_l0(&pending_l0, eid_to_idx, result, deleted);
-    }
-
-    // Apply main L0
     {
         let l0 = ctx.l0.read();
-        overlay_edge_from_l0(&l0, eid_to_idx, result, deleted);
+        if let Some(v) = visitor(&l0) {
+            return Some(v);
+        }
     }
-
-    // Apply transaction L0 (newest, highest priority)
-    if let Some(tx_l0_arc) = &ctx.transaction_l0 {
-        let tx_l0 = tx_l0_arc.read();
-        overlay_edge_from_l0(&tx_l0, eid_to_idx, result, deleted);
+    for pending_l0_arc in ctx.pending_flush_l0s.iter().rev() {
+        let pending_l0 = pending_l0_arc.read();
+        if let Some(v) = visitor(&pending_l0) {
+            return Some(v);
+        }
     }
+    None
 }
 
 /// Check if a vertex exists in any L0 buffer (has topology entry).
@@ -430,31 +281,9 @@ pub fn vertex_exists_in_l0(vid: Vid, ctx: Option<&QueryContext>) -> bool {
     // Existence is an SSI-relevant observation under a write-tx. (review H1)
     record_vertex_read(ctx, vid);
 
-    // Check transaction L0 first
-    if let Some(tx_l0_arc) = &ctx.transaction_l0 {
-        let tx_l0 = tx_l0_arc.read();
-        if tx_l0.vertex_properties.contains_key(&vid) {
-            return true;
-        }
-    }
-
-    // Check main L0
-    {
-        let l0 = ctx.l0.read();
-        if l0.vertex_properties.contains_key(&vid) {
-            return true;
-        }
-    }
-
-    // Check pending flush L0s
-    for pending_l0_arc in ctx.pending_flush_l0s.iter() {
-        let pending_l0 = pending_l0_arc.read();
-        if pending_l0.vertex_properties.contains_key(&vid) {
-            return true;
-        }
-    }
-
-    false
+    // Existence is order-independent — any layer holding the key means "exists" —
+    // so the walk's newest-first pending order only affects early exit.
+    visit_l0_buffers(Some(ctx), |buf| buf.vertex_properties.contains_key(&vid))
 }
 
 /// Get the labels for a vertex from the L0 chain.
@@ -605,6 +434,35 @@ pub fn get_edge_endpoints(eid: Eid, ctx: &QueryContext) -> Option<(Vid, Vid)> {
 /// Get the properties for a vertex from the L0 chain.
 /// Returns properties from the most recent L0 buffer that has the vertex.
 /// Returns None if the vertex is not in any L0 buffer.
+///
+/// # Why this does not record an SSI read
+///
+/// Eleven sibling accessors in this module call `record_vertex_read` /
+/// `record_edge_read`; this one, [`get_edge_properties`] and
+/// [`edge_exists_in_l0`] deliberately do not. That asymmetry is safe, not an
+/// oversight, and it was checked rather than assumed:
+///
+/// * **The read set is item-granular**, not field-granular — `HashSet<Vid>` /
+///   `HashSet<Eid>` in `runtime/l0.rs`. Recording an id once therefore covers
+///   *every* read of that item, its properties included. A second record of the
+///   same vid adds no conflict coverage.
+/// * **Every caller has already recorded the id.** Node materialisation calls
+///   `get_vertex_labels` (which records) immediately before this, in
+///   `df_graph/common.rs`. On the edge side the eid is recorded by
+///   `get_edge_type` or, where the type came from a batch column, by
+///   `resolve_stored_edge_endpoints` → `get_edge_endpoints`. The traverse paths
+///   inherit it from `get_neighbors`' `record_neighbor_reads`, or from
+///   `record_edge_adjacency` on the schemaless path.
+/// * **The cost is not free.** `record_vertex_read` takes an unconditional
+///   `RwLock::read` plus a `Mutex::lock` with no membership pre-check, and this
+///   function sits on the per-row materialisation path. Adding it would double
+///   the read-set lock acquisitions for a `RETURN n` over N rows and buy nothing
+///   — while the surrounding code deliberately optimises the other way
+///   (`get_neighbors_batch` passes `record_reads = false` precisely to collapse
+///   per-vertex locking into one batch acquisition).
+///
+/// If a future caller reaches this without a preceding sibling record, the fix
+/// is to record at *that* call site, not here.
 pub fn get_vertex_properties(vid: Vid, ctx: &QueryContext) -> Option<uni_common::Properties> {
     // Check transaction L0 first (newest)
     if let Some(tx_l0_arc) = &ctx.transaction_l0 {
@@ -636,6 +494,10 @@ pub fn get_vertex_properties(vid: Vid, ctx: &QueryContext) -> Option<uni_common:
 /// Get the properties for an edge from the L0 chain.
 /// Returns properties from the most recent L0 buffer that has the edge.
 /// Returns None if the edge is not in any L0 buffer.
+///
+/// Records no SSI read, for the reasons given on [`get_vertex_properties`] —
+/// the read set is item-granular and every caller has already recorded the eid
+/// via `get_edge_type`, `get_edge_endpoints` or `record_edge_adjacency`.
 pub fn get_edge_properties(eid: Eid, ctx: &QueryContext) -> Option<uni_common::Properties> {
     // Check transaction L0 first (newest)
     if let Some(tx_l0_arc) = &ctx.transaction_l0 {
@@ -672,55 +534,14 @@ pub fn edge_exists_in_l0(eid: Eid, ctx: Option<&QueryContext>) -> bool {
         None => return false,
     };
 
-    // Check transaction L0 first
-    if let Some(tx_l0_arc) = &ctx.transaction_l0 {
-        let tx_l0 = tx_l0_arc.read();
-        if tx_l0.edge_endpoints.contains_key(&eid) {
-            return true;
-        }
-    }
-
-    // Check main L0
-    {
-        let l0 = ctx.l0.read();
-        if l0.edge_endpoints.contains_key(&eid) {
-            return true;
-        }
-    }
-
-    // Check pending flush L0s
-    for pending_l0_arc in ctx.pending_flush_l0s.iter() {
-        let pending_l0 = pending_l0_arc.read();
-        if pending_l0.edge_endpoints.contains_key(&eid) {
-            return true;
-        }
-    }
-
-    false
-}
-
-/// Helper to overlay a single L0 buffer's edge data onto the batch result.
-fn overlay_edge_from_l0(
-    l0: &L0Buffer,
-    eid_to_idx: &HashMap<Eid, usize>,
-    result: &mut [Properties],
-    deleted: &mut [bool],
-) {
-    // Apply tombstones
-    for eid in l0.tombstones.keys() {
-        if let Some(&idx) = eid_to_idx.get(eid) {
-            deleted[idx] = true;
-        }
-    }
-
-    // Apply property updates
-    for (eid, props) in &l0.edge_properties {
-        if let Some(&idx) = eid_to_idx.get(eid) {
-            for (k, v) in props {
-                result[idx].insert(k.clone(), v.clone());
-            }
-        }
-    }
+    // NB: unlike `vertex_exists_in_l0` this deliberately does not record an SSI
+    // read. The reason — which the previous "preserved as-is" comment did not
+    // give — is that its sole caller, the edge-property fetch in
+    // `property_manager.rs`, calls `is_edge_deleted(eid, ctx)` a few lines
+    // earlier, and that *does* record. This function only disambiguates
+    // "absent" from "present but propertyless" for an eid already in the read
+    // set, and the set is item-granular (see `get_vertex_properties`).
+    visit_l0_buffers(Some(ctx), |buf| buf.edge_endpoints.contains_key(&eid))
 }
 
 #[cfg(test)]
@@ -815,6 +636,15 @@ mod tests {
     /// H1: label / existence / liveness / edge-endpoint reads consulted under a
     /// write-tx must land in the SSI read-set — otherwise a concurrent mutation
     /// to the observed item escapes the antidependency check (write-skew).
+    ///
+    /// This covers the seven *keyed* accessors. Three siblings are deliberately
+    /// absent and must stay absent: `get_vertex_properties`,
+    /// `get_edge_properties` and `edge_exists_in_l0`. The read set is
+    /// item-granular, so an id recorded by the accessor that necessarily runs
+    /// first already covers the property read; adding it here would double the
+    /// lock traffic on the per-row materialisation path for zero extra
+    /// coverage. See `get_vertex_properties`' doc comment for the call-site
+    /// evidence. Do not "complete" this list.
     #[test]
     fn test_keyed_reads_recorded_in_ssi_read_set() {
         use crate::runtime::l0::OccReadSet;

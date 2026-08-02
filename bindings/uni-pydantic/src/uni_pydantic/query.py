@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import copy
 import re
+import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
@@ -18,6 +19,8 @@ from typing import (
     TypeVar,
     cast,
 )
+
+from pydantic import ValidationError
 
 from .base import SearchScores, UniNode
 from .exceptions import CypherInjectionError, QueryError
@@ -56,6 +59,32 @@ def _node_return_clause(var: str, *, distinct: bool = False) -> str:
 def _opt_float(value: Any) -> float | None:
     """Coerce an optional numeric column to ``float | None``."""
     return float(value) if value is not None else None
+
+
+def _warn_unhydratable(
+    model: type[Any],
+    vid: int | None,
+    exc: ValidationError,
+) -> None:
+    """Report a stored row that does not satisfy its model, then skip it.
+
+    Skipping is the right behaviour -- one unmappable row should not fail a
+    whole query -- but it used to happen in complete silence, so a result set
+    that quietly lost rows was indistinguishable from one that matched fewer.
+    Naming the label and vid makes the offending row findable.
+
+    Only a genuine :class:`ValidationError` reaches here. Anything else raised
+    during hydration is a defect in the mapping layer, not a property of the
+    data, and is deliberately left to propagate.
+    """
+    label = getattr(model, "__label__", model.__name__)
+    where = f"vid={vid}" if vid is not None else "no vid"
+    warnings.warn(
+        f"skipping {label} row ({where}): stored properties do not satisfy "
+        f"{model.__name__}: {exc}",
+        UserWarning,
+        stacklevel=3,
+    )
 
 
 def _row_to_node_dict(row: dict[str, Any]) -> dict[str, Any] | None:
@@ -935,7 +964,7 @@ class _QueryBuilderBase(Generic[NodeT]):
             if node_data is None:
                 continue
             instance = self._session._result_to_model(node_data, self._model)
-            if instance:
+            if instance is not None:
                 instances.append(instance)
         return instances
 
@@ -953,7 +982,7 @@ class _QueryBuilderBase(Generic[NodeT]):
             if node_data is None:
                 continue
             instance = self._session._result_to_model(node_data, self._model)
-            if not instance:
+            if instance is None:
                 continue
             primary = row.get("score")
             if primary is None:

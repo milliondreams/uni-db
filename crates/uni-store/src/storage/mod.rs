@@ -32,6 +32,28 @@ pub mod value_codec;
 pub mod vertex;
 pub mod vid_labels;
 
+use crate::backend::types::FilterExpr;
+
+/// Conjoin the snapshot-isolation version bound onto a scan `filter`.
+///
+/// When `version` is `Some(hwm)`, restricts the scan to rows at or below the
+/// high water mark; `None` leaves the filter unchanged (global visibility).
+/// This bound is SSI/OCC-critical and must be applied identically across all
+/// snapshot reads — conjoining structured nodes is what guarantees that, where
+/// the previous `push_str(" AND …")` would have mis-bound against any body
+/// carrying a top-level `OR`.
+///
+/// Shared by the vertex- and edge-side main-table readers. It lived in
+/// `main_vertex` alone while the edge side had no bound at all, which is how
+/// the two drifted: L0 and the delta tier gated edge reads by version, the L1
+/// main-table fallback did not.
+pub(crate) fn with_version_bound(filter: FilterExpr, version: Option<u64>) -> FilterExpr {
+    match version {
+        Some(hwm) => FilterExpr::all([filter, FilterExpr::version_at_most(hwm)]),
+        None => filter,
+    }
+}
+
 pub use adjacency::AdjacencyDataset;
 pub use adjacency_manager::AdjacencyManager;
 pub use csr::CompressedSparseRow;

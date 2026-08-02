@@ -33,10 +33,10 @@ use rhai::{Dynamic, Scope};
 use smol_str::SmolStr;
 
 use uni_plugin::errors::FnError;
-use uni_plugin::traits::algorithm::{
-    AlgorithmContext, AlgorithmProvider, AlgorithmSignature, GraphProjectionSpec,
+use uni_plugin::traits::algorithm::{AlgorithmContext, AlgorithmProvider, AlgorithmSignature};
+use uni_plugin_builtin::algorithms::bridge::{
+    AlgorithmHostBridge, ProjectionPlan, await_projections, build_projections,
 };
-use uni_plugin_builtin::algorithms::bridge::AlgorithmHostBridge;
 use uni_plugin_builtin::algorithms::graph_compute::{
     AlgoSession, Arena, DEFAULT_ARENA_MAX_HANDLES, WorkBudget, next_session_epoch,
 };
@@ -68,6 +68,15 @@ impl RhaiAlgorithm {
     }
 }
 
+fn to_i64(h: uni_plugin_builtin::algorithms::graph_compute::handle::Handle) -> i64 {
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "opaque handle round-trips bit-exact"
+    )]
+    let v = h.as_u64() as i64;
+    v
+}
+
 impl AlgorithmProvider for RhaiAlgorithm {
     fn signature(&self) -> &AlgorithmSignature {
         &self.signature
@@ -86,8 +95,12 @@ impl AlgorithmProvider for RhaiAlgorithm {
 
         // Convert the positional-JSON CALL args to Rhai Dynamic values; they are
         // passed to the guest after the injected `GcSession`.
-        let json_args: Vec<serde_json::Value> = serde_json::from_str(ctx.config_json)
+        let mut json_args: Vec<serde_json::Value> = serde_json::from_str(ctx.config_json)
             .map_err(|e| FnError::new(0x802, format!("rhai algorithm: bad config json: {e}")))?;
+        // A trailing projection-config object scopes/weights the graph the guest
+        // sees (issue #151) and may pre-declare named `scopes`; strip it before
+        // the remaining args reach the guest.
+        let plan = ProjectionPlan::take_from_args(&mut json_args)?;
         let guest_args: Vec<Dynamic> = json_args
             .into_iter()
             .map(|v| {
@@ -96,13 +109,9 @@ impl AlgorithmProvider for RhaiAlgorithm {
             })
             .collect::<Result<_, _>>()?;
 
-        // v1: project the whole graph. Build the 'static projection future and
-        // read the caps BEFORE the stream so no borrow of `ctx.host` escapes.
-        let spec = GraphProjectionSpec {
-            include_reverse: true, // enable In-direction kernels (WCC/k-core/HITS)
-            ..GraphProjectionSpec::default()
-        };
-        let projection = bridge.project_for_graph_compute(&spec);
+        // Build the 'static projection futures and read the caps BEFORE the
+        // stream so no borrow of `ctx.host` escapes.
+        let projections = build_projections(bridge, &plan);
         let (work_cap, arena_bytes) = bridge.graph_compute_caps();
 
         let out_schema: SchemaRef = Arc::new(Schema::new(self.signature.output_fields.clone()));
@@ -114,27 +123,38 @@ impl AlgorithmProvider for RhaiAlgorithm {
         );
 
         let stream = futures::stream::once(async move {
-            let graph = projection
+            let bound = await_projections(projections)
                 .await
                 .map_err(|e| DataFusionError::Execution(format!("rhai algorithm: {e}")))?;
+            let graph = Arc::clone(&bound.primary);
 
             // An explicit grant is authoritative and may raise the ceiling;
-            // otherwise the size-derived default (proposal §9).
-            let budget = WorkBudget::resolve(
-                work_cap,
-                graph.vertex_count() as u64,
-                graph.edge_count() as u64,
-            );
+            // otherwise the size-derived default (proposal §9), sized across
+            // *every* bound projection — a guest with named scopes can do O(V+E)
+            // work on each, so sizing from the primary alone under-budgets it.
+            let budget = WorkBudget::resolve(work_cap, bound.total_vertices(), bound.total_edges());
             let session = Arc::new(parking_lot::Mutex::new(
                 AlgoSession::new(
-                    next_session_epoch(),
+                    next_session_epoch()
+                        .map_err(|e| DataFusionError::Execution(format!("rhai algorithm: {e}")))?,
                     budget,
                     Arena::new(arena_bytes, DEFAULT_ARENA_MAX_HANDLES),
                 )
                 .with_expected_columns(expected_cols),
             ));
-            let g = session.lock().bind_graph(Arc::clone(&graph));
-            let gc = new_session(Arc::clone(&session), g);
+            // The primary binds FIRST: `bind_graph` treats the first bind as the
+            // primary projection, which is what `emit` keys its `nodeId` column to.
+            let (g, scopes) = {
+                let mut s = session.lock();
+                let g = s.bind_graph(Arc::clone(&graph));
+                let scopes: Vec<(String, i64)> = bound
+                    .named
+                    .iter()
+                    .map(|(name, proj)| (name.clone(), to_i64(s.bind_graph(Arc::clone(proj)))))
+                    .collect();
+                (g, scopes)
+            };
+            let gc = new_session(Arc::clone(&session), g, Arc::new(scopes));
 
             // Drive the guest: `fn name(gc, ...args)`. All O(V+E) work happens in
             // the native kernels the guest calls; the interpreter only loops.
@@ -159,9 +179,13 @@ impl AlgorithmProvider for RhaiAlgorithm {
                     // A drained native-work budget is a typed Exhausted outcome
                     // (§5.2); a Rhai guest has no host wall-clock deadline, so a
                     // Timeout is never inferred here. Other faults report verbatim.
-                    let (spent, budget) = {
+                    let (spent, budget, crumbs) = {
                         let s = session.lock();
-                        (s.work_spent(), s.work_budget())
+                        (
+                            s.work_spent_units(),
+                            s.work_budget_units(),
+                            s.trace_breadcrumbs(),
+                        )
                     };
                     return Err(
                         uni_plugin_builtin::algorithms::graph_compute::error::incomplete_tag_after_guest(
@@ -170,6 +194,7 @@ impl AlgorithmProvider for RhaiAlgorithm {
                             spent,
                             budget,
                             started.elapsed().as_millis() as u64,
+                            &crumbs,
                         )
                         .map_or_else(
                             || DataFusionError::Execution(format!("rhai algorithm `{name}`: {e}")),
@@ -185,7 +210,10 @@ impl AlgorithmProvider for RhaiAlgorithm {
             }
 
             // Read the guest's emitted columns and assemble the output batch.
-            let emitted = session.lock().take_emitted();
+            let emitted = session
+                .lock()
+                .finish_emitted()
+                .map_err(|e| DataFusionError::Execution(format!("rhai algorithm emit: {e}")))?;
             build_batch(&schema_for_batch, &graph, &emitted)
                 .map_err(|e| DataFusionError::Execution(format!("rhai algorithm emit: {e}")))
         });

@@ -104,6 +104,10 @@ impl<'a> InnerLocyBuilder<'a> {
             locy_l0: None,
             collect_derive: true,
             read_snapshot: None,
+            // `InnerLocyBuilder` is the internal `&UniInner` entry point; it has
+            // no session or transaction to inherit a scope from and exposes no
+            // token setter.
+            cancel: crate::api::impl_query::CancelScope::default(),
         };
         engine
             .evaluate_with_config(&self.program, &self.config)
@@ -211,6 +215,7 @@ impl<'a> LocyBuilder<'a> {
                 &self.program,
                 &self.config,
                 self.session.rule_registry(),
+                self.session.cancel_scope(self.cancellation_token.clone()),
             ),
         )
         .await
@@ -241,6 +246,7 @@ impl<'a> LocyBuilder<'a> {
             &self.config,
             self.session.rule_registry(),
             Some(&capture),
+            self.session.cancel_scope(self.cancellation_token.clone()),
         )
         .await?;
         let profile = capture
@@ -344,6 +350,7 @@ impl<'a> TxLocyBuilder<'a> {
             locy_l0: Some(self.tx.tx_l0.clone()),
             collect_derive: false,
             read_snapshot: self.tx.read_snapshot(),
+            cancel: self.tx.cancel_scope(self.cancellation_token.clone()),
         };
         engine
             .evaluate_with_config(&self.program, &self.config)
@@ -359,6 +366,7 @@ impl<'a> TxLocyBuilder<'a> {
             locy_l0: Some(self.tx.tx_l0.clone()),
             collect_derive: false,
             read_snapshot: self.tx.read_snapshot(),
+            cancel: self.tx.cancel_scope(self.cancellation_token.clone()),
         };
         let explain = crate::api::locy_result::LocyExplainOutput::from_compiled(
             &engine.compile_only(&self.program)?,

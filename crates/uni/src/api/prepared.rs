@@ -114,6 +114,10 @@ pub struct PreparedQuery {
     /// `Some` for a transaction-bound query (writes allowed, routed to the
     /// tx's L0); `None` for a session-prepared query (validated read-only).
     tx: Option<PreparedTxBinding>,
+    /// The scope this statement executes under, captured from the session or
+    /// transaction that prepared it. Without it a prepared query would be the
+    /// one execution path `cancel()` could not reach.
+    cancel: crate::api::impl_query::CancelScope,
     /// Authorization + before-query-hook context, replayed on every execution.
     guards: PreparedGuards,
     inner: std::sync::RwLock<PreparedQueryInner>,
@@ -139,6 +143,7 @@ impl PreparedQuery {
         db: Arc<UniInner>,
         cypher: &str,
         guards: PreparedGuards,
+        cancel: crate::api::impl_query::CancelScope,
     ) -> Result<Self> {
         let ast = parse_cypher(cypher)?;
         // Session-prepared queries must be read-only, mirroring `Session::query`.
@@ -148,7 +153,7 @@ impl PreparedQuery {
                 .to_string(),
             query: Some(cypher.to_string()),
         })?;
-        Self::build(db, cypher, ast, None, guards)
+        Self::build(db, cypher, ast, None, guards, cancel)
     }
 
     /// Create a transaction-bound prepared query (mutations allowed, routed to
@@ -158,9 +163,10 @@ impl PreparedQuery {
         cypher: &str,
         binding: PreparedTxBinding,
         guards: PreparedGuards,
+        cancel: crate::api::impl_query::CancelScope,
     ) -> Result<Self> {
         let ast = parse_cypher(cypher)?;
-        Self::build(db, cypher, ast, Some(binding), guards)
+        Self::build(db, cypher, ast, Some(binding), guards, cancel)
     }
 
     /// Plan `ast` and assemble the prepared query.
@@ -170,6 +176,7 @@ impl PreparedQuery {
         ast: uni_query::CypherQuery,
         tx: Option<PreparedTxBinding>,
         guards: PreparedGuards,
+        cancel: crate::api::impl_query::CancelScope,
     ) -> Result<Self> {
         let schema_version = db.schema.schema().schema_version;
         let planner = uni_query::QueryPlanner::new(db.schema.schema().clone());
@@ -183,6 +190,7 @@ impl PreparedQuery {
             query_text: cypher.to_string(),
             tx,
             guards,
+            cancel,
             inner: std::sync::RwLock::new(PreparedQueryInner {
                 ast,
                 plan,
@@ -226,6 +234,7 @@ impl PreparedQuery {
                     tx.tx_l0.clone(),
                     Some(tx.id_reservoir.clone()),
                     snapshot,
+                    self.cancel.clone(),
                 )
                 .await;
         }
@@ -237,7 +246,13 @@ impl PreparedQuery {
         };
 
         self.db
-            .execute_plan_internal(plan, &self.query_text, params, self.db.config.clone(), None)
+            .execute_plan_internal(
+                plan,
+                &self.query_text,
+                params,
+                self.db.config.clone(),
+                self.cancel.clone(),
+            )
             .await
     }
 
@@ -426,6 +441,10 @@ impl PreparedLocy {
             locy_l0: None,
             collect_derive: true,
             read_snapshot: None,
+            // `PreparedLocy` is owned by the instance, not a session, so it
+            // has no enclosing scope to inherit; `PreparedLocyBinder` is where
+            // a per-execution token would attach.
+            cancel: crate::api::impl_query::CancelScope::default(),
         };
         engine
             .evaluate_compiled_with_config(compiled, &config)

@@ -722,90 +722,19 @@ fn extract_inner_aggregates(expr: &Expr) -> Vec<Expr> {
 
 fn extract_inner_aggregates_rec(expr: &Expr, out: &mut Vec<Expr>) {
     match expr {
+        // A bare aggregate is what we are looking for — collect it and stop;
+        // its own arguments cannot contain another top-level aggregate.
         Expr::FunctionCall {
             name, window_spec, ..
         } if window_spec.is_none() && is_aggregate_function_name(name) => {
-            // Found a bare aggregate — collect it and stop recursing
             out.push(expr.clone());
         }
-        Expr::CountSubquery(_) | Expr::CollectSubquery(_) => {
-            out.push(expr.clone());
-        }
-        // For list comprehension, only search the `list` source for aggregates
-        Expr::ListComprehension { list, .. } => {
-            extract_inner_aggregates_rec(list, out);
-        }
-        // For quantifier, only search the `list` source
-        Expr::Quantifier { list, .. } => {
-            extract_inner_aggregates_rec(list, out);
-        }
-        // For reduce, search `init` and `list` (not the body `expr`)
-        Expr::Reduce { init, list, .. } => {
-            extract_inner_aggregates_rec(init, out);
-            extract_inner_aggregates_rec(list, out);
-        }
-        // Standard recursive cases
-        Expr::FunctionCall { args, .. } => {
-            for arg in args {
-                extract_inner_aggregates_rec(arg, out);
-            }
-        }
-        Expr::BinaryOp { left, right, .. } => {
-            extract_inner_aggregates_rec(left, out);
-            extract_inner_aggregates_rec(right, out);
-        }
-        Expr::UnaryOp { expr: e, .. }
-        | Expr::IsNull(e)
-        | Expr::IsNotNull(e)
-        | Expr::IsUnique(e) => extract_inner_aggregates_rec(e, out),
-        Expr::Property(base, _) => extract_inner_aggregates_rec(base, out),
-        Expr::List(items) => {
-            for item in items {
-                extract_inner_aggregates_rec(item, out);
-            }
-        }
-        Expr::Case {
-            expr: case_expr,
-            when_then,
-            else_expr,
-        } => {
-            if let Some(e) = case_expr {
-                extract_inner_aggregates_rec(e, out);
-            }
-            for (w, t) in when_then {
-                extract_inner_aggregates_rec(w, out);
-                extract_inner_aggregates_rec(t, out);
-            }
-            if let Some(e) = else_expr {
-                extract_inner_aggregates_rec(e, out);
-            }
-        }
-        Expr::In {
-            expr: in_expr,
-            list,
-        } => {
-            extract_inner_aggregates_rec(in_expr, out);
-            extract_inner_aggregates_rec(list, out);
-        }
-        Expr::ArrayIndex { array, index } => {
-            extract_inner_aggregates_rec(array, out);
-            extract_inner_aggregates_rec(index, out);
-        }
-        Expr::ArraySlice { array, start, end } => {
-            extract_inner_aggregates_rec(array, out);
-            if let Some(s) = start {
-                extract_inner_aggregates_rec(s, out);
-            }
-            if let Some(e) = end {
-                extract_inner_aggregates_rec(e, out);
-            }
-        }
-        Expr::Map(entries) => {
-            for (_, v) in entries {
-                extract_inner_aggregates_rec(v, out);
-            }
-        }
-        _ => {}
+        // Subquery aggregates count as aggregates at this node. `for_each_child`
+        // never descends into them, so they must be collected here or not at all.
+        Expr::CountSubquery(_) | Expr::CollectSubquery(_) => out.push(expr.clone()),
+        other => other.for_each_child_in_scope(&mut |child| {
+            extract_inner_aggregates_rec(child, out);
+        }),
     }
 }
 
@@ -816,182 +745,45 @@ fn extract_inner_aggregates_rec(expr: &Expr, out: &mut Vec<Expr>) {
 /// rewritten (the body references the loop variable, not outer-scope columns).
 fn replace_aggregates_with_columns(expr: &Expr) -> Expr {
     match expr {
+        // A bare aggregate becomes a reference to the column the aggregation
+        // stage will produce; its arguments are consumed by that stage.
         Expr::FunctionCall {
             name, window_spec, ..
         } if window_spec.is_none() && is_aggregate_function_name(name) => {
-            // Replace bare aggregate with column reference
             Expr::Variable(aggregate_column_name(expr))
         }
+        // Subquery aggregates likewise. `map_children` never descends into
+        // them, so they must be rewritten here or not at all.
         Expr::CountSubquery(_) | Expr::CollectSubquery(_) => {
             Expr::Variable(aggregate_column_name(expr))
         }
-        Expr::ListComprehension {
-            variable,
-            list,
-            where_clause,
-            map_expr,
-        } => Expr::ListComprehension {
-            variable: variable.clone(),
-            list: Box::new(replace_aggregates_with_columns(list)),
-            where_clause: where_clause.clone(), // don't touch — references loop var
-            map_expr: map_expr.clone(),         // don't touch — references loop var
-        },
-        Expr::Quantifier {
-            quantifier,
-            variable,
-            list,
-            predicate,
-        } => Expr::Quantifier {
-            quantifier: *quantifier,
-            variable: variable.clone(),
-            list: Box::new(replace_aggregates_with_columns(list)),
-            predicate: predicate.clone(), // don't touch — references loop var
-        },
-        Expr::Reduce {
-            accumulator,
-            init,
-            variable,
-            list,
-            expr: body,
-        } => Expr::Reduce {
-            accumulator: accumulator.clone(),
-            init: Box::new(replace_aggregates_with_columns(init)),
-            variable: variable.clone(),
-            list: Box::new(replace_aggregates_with_columns(list)),
-            expr: body.clone(), // don't touch — references loop var
-        },
-        Expr::FunctionCall {
-            name,
-            args,
-            distinct,
-            window_spec,
-        } => Expr::FunctionCall {
-            name: name.clone(),
-            args: args.iter().map(replace_aggregates_with_columns).collect(),
-            distinct: *distinct,
-            window_spec: window_spec.clone(),
-        },
-        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
-            left: Box::new(replace_aggregates_with_columns(left)),
-            op: *op,
-            right: Box::new(replace_aggregates_with_columns(right)),
-        },
-        Expr::UnaryOp { op, expr: e } => Expr::UnaryOp {
-            op: *op,
-            expr: Box::new(replace_aggregates_with_columns(e)),
-        },
-        Expr::IsNull(e) => Expr::IsNull(Box::new(replace_aggregates_with_columns(e))),
-        Expr::IsNotNull(e) => Expr::IsNotNull(Box::new(replace_aggregates_with_columns(e))),
-        Expr::IsUnique(e) => Expr::IsUnique(Box::new(replace_aggregates_with_columns(e))),
-        Expr::Property(base, prop) => Expr::Property(
-            Box::new(replace_aggregates_with_columns(base)),
-            prop.clone(),
-        ),
-        Expr::List(items) => {
-            Expr::List(items.iter().map(replace_aggregates_with_columns).collect())
-        }
-        Expr::Case {
-            expr: case_expr,
-            when_then,
-            else_expr,
-        } => Expr::Case {
-            expr: case_expr
-                .as_ref()
-                .map(|e| Box::new(replace_aggregates_with_columns(e))),
-            when_then: when_then
-                .iter()
-                .map(|(w, t)| {
-                    (
-                        replace_aggregates_with_columns(w),
-                        replace_aggregates_with_columns(t),
-                    )
-                })
-                .collect(),
-            else_expr: else_expr
-                .as_ref()
-                .map(|e| Box::new(replace_aggregates_with_columns(e))),
-        },
-        Expr::In {
-            expr: in_expr,
-            list,
-        } => Expr::In {
-            expr: Box::new(replace_aggregates_with_columns(in_expr)),
-            list: Box::new(replace_aggregates_with_columns(list)),
-        },
-        Expr::ArrayIndex { array, index } => Expr::ArrayIndex {
-            array: Box::new(replace_aggregates_with_columns(array)),
-            index: Box::new(replace_aggregates_with_columns(index)),
-        },
-        Expr::ArraySlice { array, start, end } => Expr::ArraySlice {
-            array: Box::new(replace_aggregates_with_columns(array)),
-            start: start
-                .as_ref()
-                .map(|e| Box::new(replace_aggregates_with_columns(e))),
-            end: end
-                .as_ref()
-                .map(|e| Box::new(replace_aggregates_with_columns(e))),
-        },
-        Expr::Map(entries) => Expr::Map(
-            entries
-                .iter()
-                .map(|(k, v)| (k.clone(), replace_aggregates_with_columns(v)))
-                .collect(),
-        ),
-        // Leaf expressions — return as-is
-        other => other.clone(),
+        // Everything else rewrites its in-scope children. The scoped map leaves
+        // comprehension bodies alone — they reference the loop variable, not a
+        // column the aggregation stage emits.
+        other => other
+            .clone()
+            .map_children_in_scope(&mut |child| replace_aggregates_with_columns(&child)),
     }
 }
 
 /// Check if an expression contains any aggregate function (recursively).
 fn contains_aggregate_recursive(expr: &Expr) -> bool {
-    match expr {
-        Expr::FunctionCall { name, args, .. } => {
-            is_aggregate_function_name(name) || args.iter().any(contains_aggregate_recursive)
-        }
-        Expr::BinaryOp { left, right, .. } => {
-            contains_aggregate_recursive(left) || contains_aggregate_recursive(right)
-        }
-        Expr::UnaryOp { expr: e, .. }
-        | Expr::IsNull(e)
-        | Expr::IsNotNull(e)
-        | Expr::IsUnique(e) => contains_aggregate_recursive(e),
-        Expr::List(items) => items.iter().any(contains_aggregate_recursive),
-        Expr::Case {
-            expr,
-            when_then,
-            else_expr,
-        } => {
-            expr.as_deref().is_some_and(contains_aggregate_recursive)
-                || when_then.iter().any(|(w, t)| {
-                    contains_aggregate_recursive(w) || contains_aggregate_recursive(t)
-                })
-                || else_expr
-                    .as_deref()
-                    .is_some_and(contains_aggregate_recursive)
-        }
-        Expr::In { expr, list } => {
-            contains_aggregate_recursive(expr) || contains_aggregate_recursive(list)
-        }
-        Expr::Property(base, _) => contains_aggregate_recursive(base),
-        Expr::ListComprehension { list, .. } => {
-            // Only check the list source — where_clause/map_expr reference the loop variable
-            contains_aggregate_recursive(list)
-        }
-        Expr::Quantifier { list, .. } => contains_aggregate_recursive(list),
-        Expr::Reduce { init, list, .. } => {
-            contains_aggregate_recursive(init) || contains_aggregate_recursive(list)
-        }
-        Expr::ArrayIndex { array, index } => {
-            contains_aggregate_recursive(array) || contains_aggregate_recursive(index)
-        }
-        Expr::ArraySlice { array, start, end } => {
-            contains_aggregate_recursive(array)
-                || start.as_deref().is_some_and(contains_aggregate_recursive)
-                || end.as_deref().is_some_and(contains_aggregate_recursive)
-        }
-        Expr::Map(entries) => entries.iter().any(|(_, v)| contains_aggregate_recursive(v)),
-        _ => false,
+    if matches!(expr, Expr::FunctionCall { name, .. } if is_aggregate_function_name(name)) {
+        return true;
     }
+    // `for_each_child_in_scope`, not `for_each_child`: an aggregate inside a
+    // comprehension's body belongs to the comprehension, not to the query
+    // containing it. Using the scoped walk keeps that narrowing while picking
+    // up the variants the old hand-rolled match silently missed through its
+    // `_ => false` arm — `MapProjection`, `ValidAt` and `LabelCheck`. Missing
+    // `MapProjection` made `RETURN n{.name, c: count(*)}` fail to plan.
+    let mut found = false;
+    expr.for_each_child_in_scope(&mut |child| {
+        if !found {
+            found = contains_aggregate_recursive(child);
+        }
+    });
+    found
 }
 
 /// Check if an expression contains a non-deterministic function (e.g. rand()).
@@ -1010,73 +802,13 @@ fn contains_non_deterministic(expr: &Expr) -> bool {
 
 fn collect_aggregate_reprs(expr: &Expr, out: &mut HashSet<String>) {
     match expr {
-        Expr::FunctionCall { name, args, .. } => {
-            if is_aggregate_function_name(name) {
-                out.insert(expr.to_string_repr());
-                return;
-            }
-            for arg in args {
-                collect_aggregate_reprs(arg, out);
-            }
+        // An aggregate contributes its own repr; its arguments are grouped over.
+        Expr::FunctionCall { name, .. } if is_aggregate_function_name(name) => {
+            out.insert(expr.to_string_repr());
         }
-        Expr::BinaryOp { left, right, .. } => {
-            collect_aggregate_reprs(left, out);
-            collect_aggregate_reprs(right, out);
-        }
-        Expr::UnaryOp { expr, .. }
-        | Expr::IsNull(expr)
-        | Expr::IsNotNull(expr)
-        | Expr::IsUnique(expr) => collect_aggregate_reprs(expr, out),
-        Expr::List(items) => {
-            for item in items {
-                collect_aggregate_reprs(item, out);
-            }
-        }
-        Expr::Case {
-            expr,
-            when_then,
-            else_expr,
-        } => {
-            if let Some(e) = expr {
-                collect_aggregate_reprs(e, out);
-            }
-            for (w, t) in when_then {
-                collect_aggregate_reprs(w, out);
-                collect_aggregate_reprs(t, out);
-            }
-            if let Some(e) = else_expr {
-                collect_aggregate_reprs(e, out);
-            }
-        }
-        Expr::In { expr, list } => {
-            collect_aggregate_reprs(expr, out);
-            collect_aggregate_reprs(list, out);
-        }
-        Expr::Property(base, _) => collect_aggregate_reprs(base, out),
-        Expr::ListComprehension { list, .. } => {
-            collect_aggregate_reprs(list, out);
-        }
-        Expr::Quantifier { list, .. } => {
-            collect_aggregate_reprs(list, out);
-        }
-        Expr::Reduce { init, list, .. } => {
-            collect_aggregate_reprs(init, out);
-            collect_aggregate_reprs(list, out);
-        }
-        Expr::ArrayIndex { array, index } => {
-            collect_aggregate_reprs(array, out);
-            collect_aggregate_reprs(index, out);
-        }
-        Expr::ArraySlice { array, start, end } => {
-            collect_aggregate_reprs(array, out);
-            if let Some(s) = start {
-                collect_aggregate_reprs(s, out);
-            }
-            if let Some(e) = end {
-                collect_aggregate_reprs(e, out);
-            }
-        }
-        _ => {}
+        other => other.for_each_child_in_scope(&mut |child| {
+            collect_aggregate_reprs(child, out);
+        }),
     }
 }
 
@@ -1089,74 +821,30 @@ enum NonAggregateRef {
     },
 }
 
-fn collect_non_aggregate_refs(expr: &Expr, inside_agg: bool, out: &mut Vec<NonAggregateRef>) {
+fn collect_non_aggregate_refs(expr: &Expr, out: &mut Vec<NonAggregateRef>) {
     match expr {
-        Expr::FunctionCall { name, args, .. } => {
-            if is_aggregate_function_name(name) {
-                return;
-            }
-            for arg in args {
-                collect_non_aggregate_refs(arg, inside_agg, out);
-            }
-        }
-        Expr::Variable(v) if !inside_agg => out.push(NonAggregateRef::Var(v.clone())),
-        Expr::Property(base, _) if !inside_agg => {
-            let base_var = if let Expr::Variable(v) = base.as_ref() {
-                Some(v.clone())
-            } else {
-                None
+        // An aggregate's arguments are grouped over — they are not group keys.
+        Expr::FunctionCall { name, .. } if is_aggregate_function_name(name) => {}
+        Expr::Variable(v) => out.push(NonAggregateRef::Var(v.clone())),
+        // A property reference is itself a key; do not descend into its base.
+        Expr::Property(base, _) => {
+            let base_var = match base.as_ref() {
+                Expr::Variable(v) => Some(v.clone()),
+                _ => None,
             };
             out.push(NonAggregateRef::Property {
                 repr: expr.to_string_repr(),
                 base_var,
             });
         }
-        Expr::BinaryOp { left, right, .. } => {
-            collect_non_aggregate_refs(left, inside_agg, out);
-            collect_non_aggregate_refs(right, inside_agg, out);
-        }
-        Expr::UnaryOp { expr, .. }
-        | Expr::IsNull(expr)
-        | Expr::IsNotNull(expr)
-        | Expr::IsUnique(expr) => collect_non_aggregate_refs(expr, inside_agg, out),
-        Expr::List(items) => {
-            for item in items {
-                collect_non_aggregate_refs(item, inside_agg, out);
-            }
-        }
-        Expr::Case {
-            expr,
-            when_then,
-            else_expr,
-        } => {
-            if let Some(e) = expr {
-                collect_non_aggregate_refs(e, inside_agg, out);
-            }
-            for (w, t) in when_then {
-                collect_non_aggregate_refs(w, inside_agg, out);
-                collect_non_aggregate_refs(t, inside_agg, out);
-            }
-            if let Some(e) = else_expr {
-                collect_non_aggregate_refs(e, inside_agg, out);
-            }
-        }
-        Expr::In { expr, list } => {
-            collect_non_aggregate_refs(expr, inside_agg, out);
-            collect_non_aggregate_refs(list, inside_agg, out);
-        }
-        // For ListComprehension/Quantifier/Reduce, only recurse into the `list`
-        // source. The body references the loop variable, not outer-scope vars.
-        Expr::ListComprehension { list, .. } => {
-            collect_non_aggregate_refs(list, inside_agg, out);
-        }
-        Expr::Quantifier { list, .. } => {
-            collect_non_aggregate_refs(list, inside_agg, out);
-        }
-        Expr::Reduce { init, list, .. } => {
-            collect_non_aggregate_refs(init, inside_agg, out);
-            collect_non_aggregate_refs(list, inside_agg, out);
-        }
-        _ => {}
+        // Everything else contributes whatever its in-scope children do. The
+        // old hand-rolled match ended in `_ => {}`, so `MapProjection`,
+        // `ValidAt`, `LabelCheck`, `Map`, `ArrayIndex` and `ArraySlice` never
+        // yielded group keys — which is why `RETURN n{.name, c: count(*)}`
+        // planned without `n.name` in the grouping and failed on its schema.
+        other => other.for_each_child_in_scope(&mut |child| {
+            collect_non_aggregate_refs(child, out);
+        }),
     }
 }
 
@@ -1178,7 +866,7 @@ fn validate_with_order_by_aggregate_item(
     }
 
     let mut refs = Vec::new();
-    collect_non_aggregate_refs(expr, false, &mut refs);
+    collect_non_aggregate_refs(expr, &mut refs);
     refs.retain(|r| match r {
         NonAggregateRef::Var(v) => !projected_aliases.contains(v),
         NonAggregateRef::Property { repr, .. } => !projected_simple_reprs.contains(repr),
@@ -2315,6 +2003,67 @@ pub enum LogicalPlan {
     },
 }
 
+impl LogicalPlan {
+    /// Mutable access to this node's single child input, when it has one.
+    ///
+    /// `..` works in a *pattern* even though enum struct-variants have no
+    /// functional-update syntax for *construction* — which is what makes this
+    /// one line per variant while rebuilding a node by hand is not.
+    fn input_mut(&mut self) -> Option<&mut LogicalPlan> {
+        match self {
+            LogicalPlan::Unwind { input, .. }
+            | LogicalPlan::Traverse { input, .. }
+            | LogicalPlan::TraverseMainByType { input, .. }
+            | LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Create { input, .. }
+            | LogicalPlan::CreateBatch { input, .. }
+            | LogicalPlan::Merge { input, .. }
+            | LogicalPlan::Set { input, .. }
+            | LogicalPlan::Remove { input, .. }
+            | LogicalPlan::Delete { input, .. }
+            | LogicalPlan::Foreach { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Limit { input, .. }
+            | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::Distinct { input, .. }
+            | LogicalPlan::Window { input, .. }
+            | LogicalPlan::Project { input, .. }
+            | LogicalPlan::Apply { input, .. }
+            | LogicalPlan::SubqueryCall { input, .. }
+            | LogicalPlan::ShortestPath { input, .. }
+            | LogicalPlan::AllShortestPaths { input, .. }
+            | LogicalPlan::QuantifiedPattern { input, .. }
+            | LogicalPlan::BindZeroLengthPath { input, .. }
+            | LogicalPlan::BindPath { input, .. }
+            | LogicalPlan::LocyFold { input, .. }
+            | LogicalPlan::LocyBestBy { input, .. }
+            | LogicalPlan::LocyPriority { input, .. }
+            | LogicalPlan::LocyProject { input, .. }
+            | LogicalPlan::LocyModelInvoke { input, .. } => Some(input),
+            _ => None,
+        }
+    }
+
+    /// Replace this node's single child input, leaving every other field intact.
+    ///
+    /// Rust has no functional update (`..rest`) for enum struct-variants, so
+    /// swapping one field of a 19-field variant like `Traverse` otherwise means
+    /// destructuring and rebuilding all nineteen at the call site — and
+    /// silently dropping whichever one you forget. The plan rewriters carried
+    /// that 38-line dance once each.
+    ///
+    /// Nodes with no single input are returned unchanged, matching the
+    /// `other => other` arm those rewriters already had.
+    #[must_use]
+    pub fn map_input(mut self, f: impl FnOnce(LogicalPlan) -> LogicalPlan) -> Self {
+        if let Some(input) = self.input_mut() {
+            let taken = std::mem::replace(input, LogicalPlan::Empty);
+            *input = f(taken);
+        }
+        self
+    }
+}
+
 /// Extracted vector similarity predicate info for optimization
 struct VectorSimilarityPredicate {
     variable: String,
@@ -3072,7 +2821,7 @@ impl QueryPlanner {
                 group_by.iter().map(|e| e.to_string_repr()).collect();
             for expr in &compound_agg_exprs {
                 let mut refs = Vec::new();
-                collect_non_aggregate_refs(expr, false, &mut refs);
+                collect_non_aggregate_refs(expr, &mut refs);
                 for r in &refs {
                     let is_covered = match r {
                         NonAggregateRef::Var(v) => group_by_reprs.contains(v),
@@ -6702,49 +6451,9 @@ impl QueryPlanner {
                     }
                 }
             }
-            LogicalPlan::Traverse {
-                input,
-                edge_type_ids,
-                direction,
-                source_variable,
-                target_variable,
-                target_label_id,
-                step_variable,
-                min_hops,
-                max_hops,
-                optional: trav_optional,
-                target_filter,
-                path_variable,
-                edge_properties,
-                is_variable_length,
-                optional_pattern_vars,
-                scope_match_variables,
-                edge_filter_expr,
-                path_mode,
-                qpp_steps,
-            } => LogicalPlan::Traverse {
-                input: Box::new(
-                    self.replace_scan_all_with_label_union(*input, variable, labels, optional),
-                ),
-                edge_type_ids,
-                direction,
-                source_variable,
-                target_variable,
-                target_label_id,
-                step_variable,
-                min_hops,
-                max_hops,
-                optional: trav_optional,
-                target_filter,
-                path_variable,
-                edge_properties,
-                is_variable_length,
-                optional_pattern_vars,
-                scope_match_variables,
-                edge_filter_expr,
-                path_mode,
-                qpp_steps,
-            },
+            other @ LogicalPlan::Traverse { .. } => other.map_input(|child| {
+                self.replace_scan_all_with_label_union(child, variable, labels, optional)
+            }),
             other => other,
         }
     }
@@ -7173,7 +6882,7 @@ impl QueryPlanner {
                 group_by.iter().map(|e| e.to_string_repr()).collect();
             for expr in &compound_agg_exprs {
                 let mut refs = Vec::new();
-                collect_non_aggregate_refs(expr, false, &mut refs);
+                collect_non_aggregate_refs(expr, &mut refs);
                 for r in &refs {
                     let is_covered = match r {
                         NonAggregateRef::Var(v) => group_by_reprs.contains(v),
@@ -7845,47 +7554,9 @@ impl QueryPlanner {
                     }
                 }
             }
-            LogicalPlan::Traverse {
-                input,
-                edge_type_ids,
-                direction,
-                source_variable,
-                target_variable,
-                target_label_id,
-                step_variable,
-                min_hops,
-                max_hops,
-                optional,
-                target_filter,
-                path_variable,
-                edge_properties,
-                is_variable_length,
-                optional_pattern_vars,
-                scope_match_variables,
-                edge_filter_expr,
-                path_mode,
-                qpp_steps,
-            } => LogicalPlan::Traverse {
-                input: Box::new(Self::push_predicate_to_scan(*input, variable, predicate)),
-                edge_type_ids,
-                direction,
-                source_variable,
-                target_variable,
-                target_label_id,
-                step_variable,
-                min_hops,
-                max_hops,
-                optional,
-                target_filter,
-                path_variable,
-                edge_properties,
-                is_variable_length,
-                optional_pattern_vars,
-                scope_match_variables,
-                edge_filter_expr,
-                path_mode,
-                qpp_steps,
-            },
+            other @ LogicalPlan::Traverse { .. } => {
+                other.map_input(|child| Self::push_predicate_to_scan(child, variable, predicate))
+            }
             other => other,
         }
     }
@@ -8409,47 +8080,9 @@ impl QueryPlanner {
                 left: Box::new(Self::push_predicates_to_apply(*left, current_predicate)),
                 right: Box::new(Self::push_predicates_to_apply(*right, current_predicate)),
             },
-            LogicalPlan::Traverse {
-                input,
-                edge_type_ids,
-                direction,
-                source_variable,
-                target_variable,
-                target_label_id,
-                step_variable,
-                min_hops,
-                max_hops,
-                optional,
-                target_filter,
-                path_variable,
-                edge_properties,
-                is_variable_length,
-                optional_pattern_vars,
-                scope_match_variables,
-                edge_filter_expr,
-                path_mode,
-                qpp_steps,
-            } => LogicalPlan::Traverse {
-                input: Box::new(Self::push_predicates_to_apply(*input, current_predicate)),
-                edge_type_ids,
-                direction,
-                source_variable,
-                target_variable,
-                target_label_id,
-                step_variable,
-                min_hops,
-                max_hops,
-                optional,
-                target_filter,
-                path_variable,
-                edge_properties,
-                is_variable_length,
-                optional_pattern_vars,
-                scope_match_variables,
-                edge_filter_expr,
-                path_mode,
-                qpp_steps,
-            },
+            other @ LogicalPlan::Traverse { .. } => {
+                other.map_input(|child| Self::push_predicates_to_apply(child, current_predicate))
+            }
             other => other,
         }
     }

@@ -18,7 +18,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
 use async_trait::async_trait;
 use uni_store::backend::traits::{RecordBatchStream, StorageBackend, TableWriteGuard};
-use uni_store::backend::types::{ScanRequest, WriteMode};
+use uni_store::backend::types::{FilterExpr, ScanRequest, WriteMode};
 
 pub struct FaultBackend {
     inner: Arc<dyn StorageBackend>,
@@ -79,7 +79,7 @@ impl StorageBackend for FaultBackend {
         self.inner.get_table_schema(name).await
     }
 
-    async fn count_rows(&self, table_name: &str, filter: Option<&str>) -> Result<usize> {
+    async fn count_rows(&self, table_name: &str, filter: Option<&FilterExpr>) -> Result<usize> {
         self.inner.count_rows(table_name, filter).await
     }
 
@@ -92,7 +92,7 @@ impl StorageBackend for FaultBackend {
         self.inner.write(table_name, batches, mode).await
     }
 
-    async fn delete_rows(&self, table_name: &str, filter: &str) -> Result<()> {
+    async fn delete_rows(&self, table_name: &str, filter: &FilterExpr) -> Result<()> {
         self.inner.delete_rows(table_name, filter).await
     }
 

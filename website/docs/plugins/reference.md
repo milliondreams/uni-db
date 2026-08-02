@@ -209,7 +209,11 @@ Rust; as plain grant strings they request the variant.
 | `Secret` | `ids` | Acquiring named secret handles. |
 | `Lock` | `granularity` (`Nodes`/`Edges`/`Both`/`Global`) | Explicit node / edge lock primitives. **Reserved** — the capability is declared and intersected, but the host functions are not yet callable. |
 | `Config` | `keys` patterns | Scoped configuration K/V access. |
-| `PluginStorage` | — | Per-plugin scoped K/V store. **Reserved** — declared and intersected, host functions not yet callable. |
+
+Grant strings accept either the PascalCase variant name (`HostQuery`) or the
+serde kebab-case tag (`host-query`); both fold to the same capability. Bucket-B
+names build with a permissive default payload (e.g. `HostQuery` → `read_only`,
+`scopes: ["**"]`), which the host then attenuates against its own grant.
 
 ### Extension surfaces
 
@@ -227,29 +231,91 @@ register.
 | `ProcedureDbms` | Administrative procedures. |
 | `LocyAggregate` | Locy aggregate functions. |
 | `LocyPredicate` | Locy predicates (including neural). |
+| `LocyGenerator` | Locy value generators. |
 | `Operator` | Physical operators / optimizer rules. |
 | `Index` | Index kinds. |
 | `Storage` | Storage backends by URI scheme. |
 | `Algorithm` | Graph algorithms. |
+| `GraphCompute` | GraphCompute coarse kernels (the handle-table runtime that guest-authored graph algorithms drive) — see [Graph Algorithms](graph-algorithms.md). |
 | `Crdt` | CRDT kinds. |
 | `Hook` | Session / query lifecycle hooks. |
 | `Trigger` | Fine-grained mutation triggers. |
-| `BackgroundJob` | Background / scheduled jobs (carries `max_concurrent`). |
 | `Type` | Logical (Arrow extension) types. |
+| `Collation` | Collations (sort orders). |
+| `PluginStorage` | Per-plugin scoped K/V store. **Reserved** — declared and intersected, host functions not yet callable. |
+
+The Python load methods default to `ScalarFn`, `AggregateFn`, `Procedure` when
+`grants` is omitted. A guest-authored graph algorithm needs the triple
+`Algorithm` (register the algorithm), `GraphCompute` (drive the kernels), and
+`HostQuery` (project the graph) — see
+[Graph Algorithms](graph-algorithms.md) for the kernel catalogue and a worked example.
+
+### Capability slices
+
+Separately from grants, an algorithm declares the **kernel slices** it needs, and
+the host checks them at registration. A slice is a versioned kernel family, so a
+guest written against a newer host fails to load with a clear typed error
+(`0x86A`) instead of trapping later on an unknown kernel.
+
+| Slice | Provides |
+| --- | --- |
+| `graph-compute@1` | The read-only coarse kernels over a projected graph: traversal, SpMV, set and edge-mask operations, sampling, similarity, emit. |
+| `graph-arena@1` | Mutable session-local structure a guest **grows** during a call — search trees, residual networks, agent populations — plus `arena_freeze` to turn one into an ordinary graph. |
+
+Declare them on your `AlgorithmSignature`:
+
+```rust
+slices: vec![
+    SliceReq { slice: "graph-compute".into(), version: 1 },
+    SliceReq { slice: "graph-arena".into(),   version: 1 },
+],
+```
+
+Omitting a slice you use is not an error today — the kernels are gated by the
+`GraphCompute` grant, not by the declaration. Declaring them is what buys you the
+load-time compatibility check, so declare what you use.
+
+### Algorithm argument typing
+
+`AlgorithmSignature.args` declares the arguments the algorithm expects. The
+declared list is **type- and arity-checked at call time** (previously it was
+inert metadata). The arg-type token vocabulary:
+
+| Token | Accepts |
+| --- | --- |
+| `int` / `float` / `string` / `bool` | The corresponding primitive scalar. |
+| `value` / `cypherValue` | A scalar **or** an array — e.g. a variable-length seed set through one declared parameter. |
+| `list` / `array` | An array (required). |
+
+The trailing projection-config object (`{nodeLabels, edgeTypes, projectAll}`) is
+an implicit optional last argument and does **not** count against the declared
+arity. Note that an unscoped GraphCompute projection now errors — pass
+`projectAll: true` for the whole graph, or name `nodeLabels` / `edgeTypes`. See
+[Graph Algorithms → Arguments and projecting the graph](graph-algorithms.md#arguments-and-projecting-the-graph)
+for the full contract and the worked `CALL` examples.
+
+### Not guest-grantable (internal / first-party)
+
+These capabilities exist but are **never** grantable from a bare grant string —
+`Capability::parse_grant` rejects them, and only first-party host code may
+construct them directly. Requesting one from Python or the CLI is an error
+(strict paths) or is dropped (lenient paths).
+
+| Name | Purpose |
+| --- | --- |
 | `Auth` | Authentication providers. |
 | `Authz` | Authorization policies. |
-| `Connector` | Wire / connector protocols. |
-| `Collation` | Collations (sort orders). |
 | `Cdc` | CDC output sinks. |
 | `Catalog` | Catalogs / virtual schemas. |
 | `PluginDeclare` | Authority to call `uni.plugin.declare*` meta-procedures. |
 
-The Python load methods default to `ScalarFn`, `AggregateFn`, `Procedure` when
-`grants` is omitted.
-
 ### Resource quotas
 
 Quota variants carry a numeric bound.
+
+Quotas are **manifest-only** — they carry a value and cannot be requested as a
+bare grant string; `Capability::parse_grant` rejects a quota name with guidance
+to declare it in the plugin manifest's `capabilities:` list instead.
 
 | Name | Bound | Limits |
 | --- | --- | --- |
@@ -259,10 +325,20 @@ Quota variants carry a numeric bound.
 | `ConcurrentInstances` | `u32` | Max concurrent instances in the wasm pool. |
 | `TotalMemoryBytes` | `u64` | Max total memory across all instances. |
 | `MaxResultRows` | `u64` | Cap on rows yielded by a procedure. |
+| `GraphComputeWork` | `u64` | Max GraphCompute work budget (kernel operations) per algorithm call. |
+| `GraphComputeArenaBytes` | `u64` | Max GraphCompute handle-arena bytes per algorithm call. |
+| `BackgroundJob` | `max_concurrent: u32` | Background / scheduled jobs; a registration gate that carries a concurrency quota. |
 
 Today `FuelPerCall` and `MemoryBytes` are enforced (Rhai from the granted
 capability; the WASM Component Model and Extism loaders from their manifest
 fields). The remaining quota variants are recognized but not yet enforced.
+
+> **Contract for adding a capability.** `Capability::grant_name` is an exhaustive
+> match with no wildcard arm, and the `every_variant_classified_exactly_once`
+> test in `uni-plugin` asserts every variant is classified as grantable, quota,
+> or internal. A new `Capability` variant therefore fails to compile / fails the
+> test until it is classified here — this is what keeps the grant surface (and
+> this table) from drifting.
 
 ## See also
 

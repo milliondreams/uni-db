@@ -488,6 +488,22 @@ impl Executor {
         self.writer = Some(writer);
     }
 
+    /// Attach a standalone `L0Manager` for a view that has no `Writer`.
+    ///
+    /// A read-only open still replays the WAL suffix above the snapshot
+    /// manifest's high-water mark into an `L0Manager` — those are *committed*
+    /// mutations — and only then drops the writer. Without this the recovered
+    /// tier is unreachable, `get_context` returns `None`, and every read
+    /// on the session silently sees flushed L1 only.
+    ///
+    /// Leaving it `None` is the *deliberately L0-free* case: a pinned
+    /// time-travel snapshot, whose rows are entirely in L1 because
+    /// `create_snapshot` flushes first, and whose live L0 holds only
+    /// post-snapshot writes that must stay invisible.
+    pub fn set_l0_manager(&mut self, manager: Arc<L0Manager>) {
+        self.l0_manager = Some(manager);
+    }
+
     /// Take all collected warnings from the last execution, leaving the collector empty.
     pub fn take_warnings(&self) -> Vec<QueryWarning> {
         self.warnings
@@ -580,7 +596,17 @@ impl Executor {
             Some(ctx)
         } else {
             self.l0_manager.as_ref().map(|m| {
-                let mut ctx = QueryContext::new(m.get_current());
+                // `new_with_pending`, not `new`: a background rotation moves the
+                // active generation into the pending-flush list, so reading only
+                // `get_current()` would silently drop rows that are still in L0.
+                // The writer branch above has always done this; this branch had
+                // not, which mattered the moment a writer-less view became one
+                // that carries real data (a read-only open after WAL replay).
+                let mut ctx = QueryContext::new_with_pending(
+                    m.get_current(),
+                    self.transaction_l0_override.clone(),
+                    m.get_pending_flush(),
+                );
                 ctx.set_deadline(Instant::now() + self.config.query_timeout);
                 if let Some(ref token) = self.cancellation_token {
                     ctx.set_cancellation_token(token.clone());

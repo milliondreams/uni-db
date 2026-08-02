@@ -8,8 +8,8 @@
 
 use crate::query::df_graph::GraphExecutionContext;
 use crate::query::df_graph::common::{
-    ScalarKey, arrow_err, collect_all_partitions, compute_plan_properties, execute_subplan,
-    execute_subplan_collecting, extract_scalar_key,
+    ScalarKey, arrow_err, collect_all_partitions, compute_plan_properties,
+    execute_locy_clause_body, extract_scalar_key,
 };
 use crate::query::df_graph::locy_best_by::{BestByExec, SortCriterion};
 use crate::query::df_graph::locy_errors::LocyRuntimeError;
@@ -27,6 +27,7 @@ use arrow_row::{RowConverter, SortField};
 use arrow_schema::SchemaRef;
 use datafusion::common::JoinType;
 use datafusion::common::Result as DFResult;
+use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion::physical_plan::memory::MemoryStream;
@@ -1034,9 +1035,10 @@ async fn arrow_left_anti_dedup(
         return dedup_batches_all_columns(candidates, schema);
     }
 
-    let left: Arc<dyn ExecutionPlan> = Arc::new(InMemoryExec::new(candidates, Arc::clone(schema)));
+    let left: Arc<dyn ExecutionPlan> =
+        MemorySourceConfig::try_new_exec(&[candidates], Arc::clone(schema), None)?;
     let right: Arc<dyn ExecutionPlan> =
-        Arc::new(InMemoryExec::new(existing.to_vec(), Arc::clone(schema)));
+        MemorySourceConfig::try_new_exec(&[existing.to_vec()], Arc::clone(schema), None)?;
 
     let on: Vec<(
         Arc<dyn datafusion::physical_plan::PhysicalExpr>,
@@ -1307,33 +1309,17 @@ async fn run_fixpoint_loop(
                 // `LocyProject` when this clause has neural-model
                 // invocations, so `execute_subplan` runs the invocation
                 // inline as part of the body plan tree.
-                let mut batches = if profile_collector.is_some() {
-                    let (b, ops) = execute_subplan_collecting(
-                        &clause.body_logical,
-                        &params,
-                        &HashMap::new(),
-                        &graph_ctx,
-                        &session_ctx,
-                        &storage,
-                        &schema_info,
-                        None, // Locy fixpoint clause body is read-only
-                    )
-                    .await?;
-                    iter_ops.extend(ops);
-                    b
-                } else {
-                    execute_subplan(
-                        &clause.body_logical,
-                        &params,
-                        &HashMap::new(),
-                        &graph_ctx,
-                        &session_ctx,
-                        &storage,
-                        &schema_info,
-                        None, // Locy fixpoint clause body is read-only
-                    )
-                    .await?
-                };
+                let mut batches = execute_locy_clause_body(
+                    &clause.body_logical,
+                    &params,
+                    &graph_ctx,
+                    &session_ctx,
+                    &storage,
+                    &schema_info,
+                    profile_collector.is_some(),
+                    &mut iter_ops,
+                )
+                .await?;
                 // Apply negated IS-ref semantics: probabilistic complement or anti-join.
                 for binding in &clause.is_ref_bindings {
                     if binding.negated
@@ -2809,64 +2795,6 @@ fn batch_row_to_value_map(
         .collect()
 }
 
-/// Filter `batches` to exclude rows where `left_col` VID appears in `neg_facts[right_col]`.
-///
-/// Implements anti-join semantics for negated IS-refs (`n IS NOT rule`): keeps only
-/// rows whose subject VID is NOT present in the negated rule's fully-converged facts.
-pub fn apply_anti_join(
-    batches: Vec<RecordBatch>,
-    neg_facts: &[RecordBatch],
-    left_col: &str,
-    right_col: &str,
-) -> datafusion::error::Result<Vec<RecordBatch>> {
-    use arrow::compute::filter_record_batch;
-    use arrow_array::{Array as _, BooleanArray, UInt64Array};
-
-    // Collect right-side VIDs from the negated rule's derived facts.
-    let mut banned: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    for batch in neg_facts {
-        let Ok(idx) = batch.schema().index_of(right_col) else {
-            continue;
-        };
-        let arr = batch.column(idx);
-        let Some(vids) = arr.as_any().downcast_ref::<UInt64Array>() else {
-            continue;
-        };
-        for i in 0..vids.len() {
-            if !vids.is_null(i) {
-                banned.insert(vids.value(i));
-            }
-        }
-    }
-
-    if banned.is_empty() {
-        return Ok(batches);
-    }
-
-    // Filter body batches: keep rows where left_col NOT IN banned.
-    let mut result = Vec::new();
-    for batch in batches {
-        let Ok(idx) = batch.schema().index_of(left_col) else {
-            result.push(batch);
-            continue;
-        };
-        let arr = batch.column(idx);
-        let Some(vids) = arr.as_any().downcast_ref::<UInt64Array>() else {
-            result.push(batch);
-            continue;
-        };
-        let keep: Vec<bool> = (0..vids.len())
-            .map(|i| vids.is_null(i) || !banned.contains(&vids.value(i)))
-            .collect();
-        let keep_arr = BooleanArray::from(keep);
-        let filtered = filter_record_batch(&batch, &keep_arr).map_err(arrow_err)?;
-        if filtered.num_rows() > 0 {
-            result.push(filtered);
-        }
-    }
-    Ok(result)
-}
-
 // ─── Phase B Slice 3: neural-model invocation pass ───────────────────────
 //
 // `apply_model_invocations` runs every `ModelInvocation` lifted from a
@@ -4260,104 +4188,6 @@ fn extract_feature_value(col: &dyn arrow_array::Array, row_idx: usize) -> uni_lo
     uni_locy::FeatureValue::Null
 }
 
-/// Probabilistic complement for negated IS-refs targeting PROB rules.
-///
-/// Instead of filtering out matching VIDs (anti-join), this adds a complement
-/// column `__prob_complement_{rule_name}` with value `1 - p` for each matching
-/// VID, and `1.0` for VIDs not present in the negated rule's facts. Implements
-/// `IS NOT risk` on a PROB rule: the probability that the entity is NOT risky.
-pub fn apply_prob_complement(
-    batches: Vec<RecordBatch>,
-    neg_facts: &[RecordBatch],
-    left_col: &str,
-    right_col: &str,
-    prob_col: &str,
-    complement_col_name: &str,
-) -> datafusion::error::Result<Vec<RecordBatch>> {
-    use arrow_array::{Array as _, Float64Array, UInt64Array};
-
-    // Build VID → probability lookup from negative facts
-    let mut prob_map: std::collections::HashMap<u64, f64> = std::collections::HashMap::new();
-    for batch in neg_facts {
-        let Ok(vid_idx) = batch.schema().index_of(right_col) else {
-            continue;
-        };
-        let Ok(prob_idx) = batch.schema().index_of(prob_col) else {
-            continue;
-        };
-        let Some(vids) = batch.column(vid_idx).as_any().downcast_ref::<UInt64Array>() else {
-            continue;
-        };
-        let prob_arr = batch.column(prob_idx);
-        let probs = prob_arr.as_any().downcast_ref::<Float64Array>();
-        for i in 0..vids.len() {
-            if !vids.is_null(i) {
-                let p = probs
-                    .and_then(|arr| {
-                        if arr.is_null(i) {
-                            None
-                        } else {
-                            Some(arr.value(i))
-                        }
-                    })
-                    .unwrap_or(0.0);
-                // If multiple facts for same VID, use noisy-OR combination:
-                // combined = 1 - (1 - existing) * (1 - new)
-                prob_map
-                    .entry(vids.value(i))
-                    .and_modify(|existing| {
-                        *existing = 1.0 - (1.0 - *existing) * (1.0 - p);
-                    })
-                    .or_insert(p);
-            }
-        }
-    }
-
-    // Add complement column to each batch
-    let mut result = Vec::new();
-    for batch in batches {
-        let Ok(idx) = batch.schema().index_of(left_col) else {
-            result.push(batch);
-            continue;
-        };
-        let Some(vids) = batch.column(idx).as_any().downcast_ref::<UInt64Array>() else {
-            result.push(batch);
-            continue;
-        };
-
-        // Compute complement values: 1 - p for matched VIDs, 1.0 for absent
-        let complements: Vec<f64> = (0..vids.len())
-            .map(|i| {
-                if vids.is_null(i) {
-                    1.0
-                } else {
-                    let p = prob_map.get(&vids.value(i)).copied().unwrap_or(0.0);
-                    1.0 - p
-                }
-            })
-            .collect();
-
-        let complement_arr = Float64Array::from(complements);
-
-        // Add the complement column to the batch
-        let mut columns: Vec<arrow_array::ArrayRef> = batch.columns().to_vec();
-        columns.push(std::sync::Arc::new(complement_arr));
-
-        let mut fields: Vec<std::sync::Arc<arrow_schema::Field>> =
-            batch.schema().fields().iter().cloned().collect();
-        fields.push(std::sync::Arc::new(arrow_schema::Field::new(
-            complement_col_name,
-            arrow_schema::DataType::Float64,
-            true,
-        )));
-
-        let new_schema = std::sync::Arc::new(arrow_schema::Schema::new(fields));
-        let new_batch = RecordBatch::try_new(new_schema, columns).map_err(arrow_err)?;
-        result.push(new_batch);
-    }
-    Ok(result)
-}
-
 /// Probabilistic complement for composite (multi-column) join keys.
 ///
 /// Builds a composite key from all `join_cols` right-side columns in
@@ -4845,81 +4675,6 @@ impl ExecutionPlan for DerivedScanExec {
 }
 
 // ---------------------------------------------------------------------------
-// InMemoryExec — wrapper to feed Vec<RecordBatch> into operator chains
-// ---------------------------------------------------------------------------
-
-/// Simple in-memory execution plan that serves pre-computed batches.
-///
-/// Used internally to feed fixpoint results into post-fixpoint operator chains
-/// (FOLD, BEST BY). Not exported — only used within this module.
-struct InMemoryExec {
-    batches: Vec<RecordBatch>,
-    schema: SchemaRef,
-    properties: Arc<PlanProperties>,
-}
-
-impl InMemoryExec {
-    fn new(batches: Vec<RecordBatch>, schema: SchemaRef) -> Self {
-        let properties = compute_plan_properties(Arc::clone(&schema));
-        Self {
-            batches,
-            schema,
-            properties,
-        }
-    }
-}
-
-impl fmt::Debug for InMemoryExec {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("InMemoryExec")
-            .field("num_batches", &self.batches.len())
-            .field("schema", &self.schema)
-            .finish()
-    }
-}
-
-impl DisplayAs for InMemoryExec {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "InMemoryExec: batches={}", self.batches.len())
-    }
-}
-
-impl ExecutionPlan for InMemoryExec {
-    fn name(&self) -> &str {
-        "InMemoryExec"
-    }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
-    }
-    fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
-    }
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![]
-    }
-    fn with_new_children(
-        self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        Ok(self)
-    }
-    fn execute(
-        &self,
-        _partition: usize,
-        _context: Arc<TaskContext>,
-    ) -> DFResult<SendableRecordBatchStream> {
-        Ok(Box::pin(MemoryStream::try_new(
-            self.batches.clone(),
-            Arc::clone(&self.schema),
-            None,
-        )?))
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Post-fixpoint chain — FOLD and BEST BY on converged facts
 // ---------------------------------------------------------------------------
 
@@ -5141,7 +4896,7 @@ pub(crate) async fn apply_post_fixpoint_chain(
         return Ok(facts);
     }
 
-    // Wrap facts in InMemoryExec.
+    // Wrap facts in an in-memory data source.
     // Prefer the actual batch schema (from physical execution) over the
     // pre-computed yield_schema, which may have wrong inferred types
     // (e.g. Float64 for a string property).
@@ -5153,7 +4908,7 @@ pub(crate) async fn apply_post_fixpoint_chain(
 
     // Phase D D-C0: pre-compute body-row → IS-ref support map for
     // TopKProofs MNOR's DNF inclusion-exclusion math. Must be built
-    // here because `facts` is moved into `InMemoryExec` on the next
+    // here because `facts` is moved into the memory source on the next
     // line. The map is keyed by a full-column row hash — only
     // meaningful when no downstream plan node strips/adds columns
     // between this batch view and the FoldExec input. PRIORITY drops
@@ -5193,7 +4948,8 @@ pub(crate) async fn apply_post_fixpoint_chain(
         None
     };
 
-    let input: Arc<dyn ExecutionPlan> = Arc::new(InMemoryExec::new(facts, schema.clone()));
+    let input: Arc<dyn ExecutionPlan> =
+        MemorySourceConfig::try_new_exec(&[facts], schema.clone(), None)?;
 
     // Reconcile key indices: rule's indices are yield-schema positions but
     // the actual batch may have different column ordering after schema
@@ -5251,7 +5007,7 @@ pub(crate) async fn apply_post_fixpoint_chain(
         if filtered.is_empty() {
             return Ok(filtered);
         }
-        Arc::new(InMemoryExec::new(filtered, Arc::clone(&current.schema())))
+        MemorySourceConfig::try_new_exec(&[filtered], Arc::clone(&current.schema()), None)?
     } else {
         current
     };

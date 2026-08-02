@@ -39,8 +39,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use parking_lot::Mutex;
-
 /// Per-pool configuration.
 #[derive(Clone, Debug)]
 pub struct PoolConfig {
@@ -114,7 +112,10 @@ where
     E: PoolResourceLimit + Send + Sync + 'static,
 {
     cfg: PoolConfig,
-    factory: Mutex<Box<dyn Fn() -> Result<T, E> + Send + Sync>>,
+    /// Not behind a lock: the closure is `Fn + Send + Sync`, so a `Mutex`
+    /// added no safety and its guard — held across the whole call — serialized
+    /// exactly the instantiation `max_instances` exists to run concurrently.
+    factory: Box<dyn Fn() -> Result<T, E> + Send + Sync>,
     metrics: Arc<PoolMetrics>,
 }
 
@@ -153,7 +154,7 @@ where
         cfg: PoolConfig,
         factory: impl Fn() -> Result<T, E> + Send + Sync + 'static,
     ) -> Result<Self, E> {
-        let factory = Mutex::new(Box::new(factory) as Box<dyn Fn() -> Result<T, E> + Send + Sync>);
+        let factory = Box::new(factory) as Box<dyn Fn() -> Result<T, E> + Send + Sync>;
         Ok(Self {
             cfg,
             factory,
@@ -196,7 +197,7 @@ where
         }
         // The slot is reserved; construct a fresh instance. If
         // construction fails, give the slot back.
-        let inst = (self.factory.lock())().inspect_err(|_| {
+        let inst = (self.factory)().inspect_err(|_| {
             self.metrics.live.fetch_sub(1, Ordering::SeqCst);
         })?;
         self.metrics.misses.fetch_add(1, Ordering::SeqCst);
@@ -333,6 +334,59 @@ mod tests {
     struct Dummy(u32);
 
     type TestPool = InstancePool<Dummy, TestErr>;
+
+    /// The factory is `Fn + Send + Sync`, so wrapping it in a `Mutex` bought
+    /// nothing — but `(self.factory.lock())()` held the guard across the whole
+    /// call, serializing every concurrent construction. `max_instances = 4`
+    /// advertised 4-way concurrency and delivered 1-way.
+    ///
+    /// Two threads acquire at once against a factory that waits on a shared
+    /// `Barrier`. Under the `Mutex` the first holds the lock while waiting for
+    /// the second, which cannot enter — a deadlock, caught here as a timeout.
+    #[test]
+    fn concurrent_acquire_does_not_serialize_construction() {
+        use std::sync::Barrier;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let barrier = Arc::new(Barrier::new(2));
+        let bf = Arc::clone(&barrier);
+        let pool: Arc<TestPool> = Arc::new(
+            InstancePool::new(
+                PoolConfig {
+                    max_instances: 4,
+                    ..PoolConfig::default()
+                },
+                move || {
+                    // Only completes if a second construction can run
+                    // concurrently with this one.
+                    bf.wait();
+                    Ok(Dummy(0))
+                },
+            )
+            .unwrap(),
+        );
+
+        let (tx, rx) = mpsc::channel();
+        for _ in 0..2 {
+            let p = Arc::clone(&pool);
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(p.acquire().is_ok());
+            });
+        }
+        drop(tx);
+
+        for i in 0..2 {
+            match rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(ok) => assert!(ok, "acquire {i} failed"),
+                Err(_) => panic!(
+                    "acquire {i} did not complete within 10s — construction is \
+                     serialized, so the two factory calls can never rendezvous"
+                ),
+            }
+        }
+    }
 
     #[test]
     fn acquire_constructs_fresh_each_time() {

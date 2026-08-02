@@ -1086,12 +1086,12 @@ impl PreExistingProbe {
             let col_refs: Vec<&str> = column_names.iter().map(|s| s.as_str()).collect();
 
             for chunk in vids.chunks(CHUNK_SIZE) {
-                let in_list = chunk
-                    .iter()
-                    .map(|v| v.as_u64().to_string())
-                    .collect::<Vec<_>>()
-                    .join(",");
-                let filter = format!("_vid IN ({in_list})");
+                let filter = uni_store::backend::types::FilterExpr::one_of(
+                    "_vid",
+                    chunk
+                        .iter()
+                        .map(|v| uni_store::backend::types::Scalar::UInt(v.as_u64())),
+                );
                 let batch = match storage
                     .scan_vertex_table(&label, &col_refs, Some(&filter))
                     .await

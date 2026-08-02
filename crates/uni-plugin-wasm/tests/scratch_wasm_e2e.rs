@@ -15,7 +15,10 @@
 //! The fixture is built by `scripts/build-wasm-fixtures.sh`; a missing artifact
 //! panics with a build hint (no silent skip — the `e9e3784a1` freshness lesson).
 #![cfg(feature = "wasmtime-runtime")]
-
+// These measure the retiring `ScratchGraph` path on purpose: they are the
+// evidence the arena replaces it (proposal §12). They move to the arena
+// kernels when `scratch` is deleted at the next major (§13.4).
+#![allow(deprecated)]
 use std::sync::Arc;
 
 use uni_plugin_builtin::algorithms::graph_compute::scratch::{ScratchGraph, ScratchRegistry};
@@ -44,6 +47,8 @@ wasmtime::component::bindgen!({
         interface host-graph {
             use types.{fn-error};
             graph-call: func(req: string) -> result<string, fn-error>;
+            descend-batch: func(session: u64, active: list<u32>) -> result<list<u32>, fn-error>;
+            visit-batch: func(session: u64, nodes: list<u32>, delta: f64) -> result<_, fn-error>;
         }
         world scratch-guest {
             import host-graph;
@@ -95,10 +100,11 @@ fn wasm_guest_drives_the_scratch_graph_abi() {
     // Linker: WASI plus the manually-wired `host-graph` import → scratch registry.
     let mut linker: Linker<HarnessState> = Linker::new(&engine);
     wasmtime_wasi::p2::add_to_linker_sync(&mut linker).expect("wasi linked");
-    linker
-        .instance("uni:scratch/host-graph@0.1.0")
-        .expect("host-graph instance")
-        .func_wrap(
+    {
+        let mut hg = linker
+            .instance("uni:scratch/host-graph@0.1.0")
+            .expect("host-graph instance");
+        hg.func_wrap(
             "graph-call",
             |store: wasmtime::StoreContextMut<'_, HarnessState>,
              (req,): (String,)|
@@ -109,6 +115,60 @@ fn wasm_guest_drives_the_scratch_graph_abi() {
             },
         )
         .expect("host-graph graph-call linked");
+        // The typed batched ops the guest also imports (issue #152). This test
+        // drives only `run`, but every declared import must be satisfied for the
+        // component to instantiate.
+        hg.func_wrap(
+            "descend-batch",
+            |store: wasmtime::StoreContextMut<'_, HarnessState>,
+             (session, active): (u64, Vec<u32>)|
+             -> wasmtime::Result<(Result<Vec<u32>, WasmFnError>,)> {
+                let out = store
+                    .data()
+                    .registry
+                    .with_session(session, |g| g.descend_batch(&active));
+                Ok((match out {
+                    Some(Ok(v)) => Ok(v),
+                    Some(Err(e)) => Err(WasmFnError {
+                        code: e.code,
+                        message: e.to_string(),
+                        retryable: false,
+                    }),
+                    None => Err(WasmFnError {
+                        code: 0x860,
+                        message: format!("no scratch session {session}"),
+                        retryable: false,
+                    }),
+                },))
+            },
+        )
+        .expect("host-graph descend-batch linked");
+        hg.func_wrap(
+            "visit-batch",
+            |store: wasmtime::StoreContextMut<'_, HarnessState>,
+             (session, nodes, delta): (u64, Vec<u32>, f64)|
+             -> wasmtime::Result<(Result<(), WasmFnError>,)> {
+                let out = store
+                    .data()
+                    .registry
+                    .with_session(session, |g| g.visit_batch(&nodes, delta));
+                Ok((match out {
+                    Some(Ok(())) => Ok(()),
+                    Some(Err(e)) => Err(WasmFnError {
+                        code: e.code,
+                        message: e.to_string(),
+                        retryable: false,
+                    }),
+                    None => Err(WasmFnError {
+                        code: 0x860,
+                        message: format!("no scratch session {session}"),
+                        retryable: false,
+                    }),
+                },))
+            },
+        )
+        .expect("host-graph visit-batch linked");
+    }
 
     let mut store = Store::new(
         &engine,

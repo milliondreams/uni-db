@@ -41,8 +41,41 @@ incremental = true
 
 # Release tuning: ThinLTO + 16 codegen units gives near-fat-LTO performance
 # without the wall-clock cost of fat-LTO + codegen-units=1 (which should be
-# reserved for publishable wheels via a separate `--profile publish`).
+# reserved for publishable wheels via a separate `--profile dist`).
+#
+# `strip` matters more here than it looks: release builds carry little debug
+# info (~30 MiB) but a ~132 MiB symbol table, a consequence of monomorphizing
+# across 500+ dependency crates. `strip = "debuginfo"` reclaims almost none of
+# it; only "symbols" does. Measured on lib_uni_db.so: 536 MiB -> 375 MiB.
+# The cost is unsymbolicated panic backtraces — panic *messages* still reach
+# Python through PyO3, only frame names are lost. Build without this profile
+# (or with `strip = "none"`) when you need a symbolicated backtrace.
 [profile.release]
 lto = "thin"
 codegen-units = 16
+strip = "symbols"
+
+# Publishable-wheel profile — the `--profile dist` the note above refers to.
+# NB: named `dist`, not `publish` — Cargo reserves `publish` as a profile name
+# and errors out on it, which is likely why this profile never got written.
+# Fat LTO across a single codegen unit lets LLVM inline and dead-strip across
+# crate boundaries, which matters here because ~94% of .text comes from
+# dependencies rather than our own code. Inherits `strip = "symbols"` from
+# release. `codegen-units` is the real size lever here, not the LTO mode.
+# Measured on `-p uni-python` (WASM off), lib_uni_db.so / peak rustc RSS / wall:
+#   thin cgu=16 (= release)  ~368 MiB   --        15m40s
+#   thin cgu=4                289.0 MiB  11.0 GiB  12m37s
+#   thin cgu=1                238.4 MiB  11.7 GiB  19m26s   <- chosen
+#   fat  cgu=1                219.6 MiB  15.8+ GiB 36m48s   <- rejected, see below
+# `lto = "fat"` buys only 18.8 MiB over thin but pushes peak RSS past 15.8 GiB,
+# which OOMs the 14 GB macos-latest-xlarge metal job. cgu=4 saves just 0.7 GiB
+# over cgu=1 while giving back 50 MiB — peak RSS floors around 11 GiB for the
+# ThinLTO link regardless of codegen-units, so cgu=1 is strictly the better
+# trade. 11.7 GiB is ~84% of the 14 GB metal runner: if that job ever OOMs,
+# move it to `--release` rather than raising codegen-units.
+# Used by .github/workflows/release-wheels.yml; keep the two in sync.
+[profile.dist]
+inherits = "release"
+lto = "thin"
+codegen-units = 1
 

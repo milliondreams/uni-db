@@ -44,7 +44,70 @@ use uni_common::Value;
 use uni_cypher::ast::BinaryOp;
 use uni_store::storage::arrow_convert::values_to_array;
 
-use super::expr_eval::cypher_eq;
+use super::expr_eval::{
+    cypher_eq, cypher_type_name, eval_substring, eval_toboolean, eval_tointeger, eval_tostring,
+    to_datafusion_err,
+};
+
+/// Generate a Cypher scalar UDF whose shell is entirely mechanical.
+///
+/// Most UDFs in this module differ in only four things: the constructor and
+/// struct names, the registered `name()` string, the `Signature`, and the
+/// declared `return_type`. Everything else — the unit struct holding a single
+/// `Signature`, `new`, `impl_udf_eq_hash!`, `as_any`, `name`, `signature` —
+/// used to be hand-copied ~30 lines at a time per UDF. This macro emits that
+/// shell so only `invoke_with_args` is written by hand.
+///
+/// The `name:` string is matched by `df_expr.rs` at planning time, so it must
+/// stay byte-identical to what the planner emits.
+macro_rules! cypher_scalar_udf {
+    (
+        $(#[$ctor_meta:meta])*
+        $ctor:ident => $struct:ident,
+        name: $name:literal,
+        signature: $sig:expr,
+        return_type: $ret:expr,
+        invoke($args:ident) $body:block
+    ) => {
+        $(#[$ctor_meta])*
+        pub fn $ctor() -> ScalarUDF {
+            ScalarUDF::new_from_impl($struct::new())
+        }
+
+        #[derive(Debug)]
+        struct $struct {
+            signature: Signature,
+        }
+
+        impl $struct {
+            fn new() -> Self {
+                Self { signature: $sig }
+            }
+        }
+
+        impl_udf_eq_hash!($struct);
+
+        impl ScalarUDFImpl for $struct {
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+
+            fn name(&self) -> &str {
+                $name
+            }
+
+            fn signature(&self) -> &Signature {
+                &self.signature
+            }
+
+            fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+                Ok($ret)
+            }
+
+            fn invoke_with_args(&self, $args: ScalarFunctionArgs) -> DFResult<ColumnarValue> $body
+        }
+    };
+}
 
 /// Macro to implement common UDF trait boilerplate.
 ///
@@ -956,59 +1019,28 @@ impl ScalarUDFImpl for LabelsUdf {
 // nodes(path) -> List<Node>
 // ============================================================================
 
-pub fn create_nodes_udf() -> ScalarUDF {
-    ScalarUDF::new_from_impl(NodesUdf::new())
-}
-
-#[derive(Debug)]
-struct NodesUdf {
-    signature: Signature,
-}
-
-impl NodesUdf {
-    fn new() -> Self {
-        Self {
-            signature: Signature::any(1, Volatility::Immutable),
+cypher_scalar_udf! {
+    create_nodes_udf => NodesUdf,
+    name: "nodes",
+    signature: Signature::any(1, Volatility::Immutable),
+    return_type: DataType::LargeBinary,
+    invoke(args) {
+    let output_type = DataType::LargeBinary;
+    invoke_cypher_udf(args, &output_type, |val_args| {
+        if val_args.is_empty() {
+            return Err(datafusion::error::DataFusionError::Execution(
+                "nodes(): requires 1 argument".to_string(),
+            ));
         }
-    }
-}
 
-impl_udf_eq_hash!(NodesUdf);
+        let path = &val_args[0];
+        let nodes = match path {
+            Value::Map(map) => map.get("nodes").cloned().unwrap_or(Value::Null),
+            _ => Value::Null,
+        };
 
-impl ScalarUDFImpl for NodesUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "nodes"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::LargeBinary)
-    }
-
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        let output_type = self.return_type(&[])?;
-        invoke_cypher_udf(args, &output_type, |val_args| {
-            if val_args.is_empty() {
-                return Err(datafusion::error::DataFusionError::Execution(
-                    "nodes(): requires 1 argument".to_string(),
-                ));
-            }
-
-            let path = &val_args[0];
-            let nodes = match path {
-                Value::Map(map) => map.get("nodes").cloned().unwrap_or(Value::Null),
-                _ => Value::Null,
-            };
-
-            Ok(nodes)
-        })
+        Ok(nodes)
+    })
     }
 }
 
@@ -1016,59 +1048,28 @@ impl ScalarUDFImpl for NodesUdf {
 // relationships(path) -> List<Relationship>
 // ============================================================================
 
-pub fn create_relationships_udf() -> ScalarUDF {
-    ScalarUDF::new_from_impl(RelationshipsUdf::new())
-}
-
-#[derive(Debug)]
-struct RelationshipsUdf {
-    signature: Signature,
-}
-
-impl RelationshipsUdf {
-    fn new() -> Self {
-        Self {
-            signature: Signature::any(1, Volatility::Immutable),
+cypher_scalar_udf! {
+    create_relationships_udf => RelationshipsUdf,
+    name: "relationships",
+    signature: Signature::any(1, Volatility::Immutable),
+    return_type: DataType::LargeBinary,
+    invoke(args) {
+    let output_type = DataType::LargeBinary;
+    invoke_cypher_udf(args, &output_type, |val_args| {
+        if val_args.is_empty() {
+            return Err(datafusion::error::DataFusionError::Execution(
+                "relationships(): requires 1 argument".to_string(),
+            ));
         }
-    }
-}
 
-impl_udf_eq_hash!(RelationshipsUdf);
+        let path = &val_args[0];
+        let rels = match path {
+            Value::Map(map) => map.get("relationships").cloned().unwrap_or(Value::Null),
+            _ => Value::Null,
+        };
 
-impl ScalarUDFImpl for RelationshipsUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "relationships"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::LargeBinary)
-    }
-
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        let output_type = self.return_type(&[])?;
-        invoke_cypher_udf(args, &output_type, |val_args| {
-            if val_args.is_empty() {
-                return Err(datafusion::error::DataFusionError::Execution(
-                    "relationships(): requires 1 argument".to_string(),
-                ));
-            }
-
-            let path = &val_args[0];
-            let rels = match path {
-                Value::Map(map) => map.get("relationships").cloned().unwrap_or(Value::Null),
-                _ => Value::Null,
-            };
-
-            Ok(rels)
-        })
+        Ok(rels)
+    })
     }
 }
 
@@ -1076,51 +1077,20 @@ impl ScalarUDFImpl for RelationshipsUdf {
 // startNode(relationship) -> Node
 // ============================================================================
 
-/// Create the `startnode` UDF for getting the start node of a relationship.
-///
-/// At translation time, all known node variable columns are appended as extra arguments
-/// so the UDF can find the matching node by VID at runtime.
-pub fn create_startnode_udf() -> ScalarUDF {
-    ScalarUDF::new_from_impl(StartNodeUdf::new())
-}
-
-#[derive(Debug)]
-struct StartNodeUdf {
-    signature: Signature,
-}
-
-impl StartNodeUdf {
-    fn new() -> Self {
-        Self {
-            signature: Signature::new(TypeSignature::VariadicAny, Volatility::Immutable),
-        }
-    }
-}
-
-impl_udf_eq_hash!(StartNodeUdf);
-
-impl ScalarUDFImpl for StartNodeUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "startnode"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::LargeBinary)
-    }
-
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        let output_type = DataType::LargeBinary;
-        invoke_cypher_udf(args, &output_type, |val_args| {
-            startnode_endnode_impl(val_args, true)
-        })
+cypher_scalar_udf! {
+    /// Create the `startnode` UDF for getting the start node of a relationship.
+    ///
+    /// At translation time, all known node variable columns are appended as extra arguments
+    /// so the UDF can find the matching node by VID at runtime.
+    create_startnode_udf => StartNodeUdf,
+    name: "startnode",
+    signature: Signature::new(TypeSignature::VariadicAny, Volatility::Immutable),
+    return_type: DataType::LargeBinary,
+    invoke(args) {
+    let output_type = DataType::LargeBinary;
+    invoke_cypher_udf(args, &output_type, |val_args| {
+        startnode_endnode_impl(val_args, true)
+    })
     }
 }
 
@@ -1128,48 +1098,17 @@ impl ScalarUDFImpl for StartNodeUdf {
 // endNode(relationship) -> Node
 // ============================================================================
 
-/// Create the `endnode` UDF for getting the end node of a relationship.
-pub fn create_endnode_udf() -> ScalarUDF {
-    ScalarUDF::new_from_impl(EndNodeUdf::new())
-}
-
-#[derive(Debug)]
-struct EndNodeUdf {
-    signature: Signature,
-}
-
-impl EndNodeUdf {
-    fn new() -> Self {
-        Self {
-            signature: Signature::new(TypeSignature::VariadicAny, Volatility::Immutable),
-        }
-    }
-}
-
-impl_udf_eq_hash!(EndNodeUdf);
-
-impl ScalarUDFImpl for EndNodeUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "endnode"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::LargeBinary)
-    }
-
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        let output_type = DataType::LargeBinary;
-        invoke_cypher_udf(args, &output_type, |val_args| {
-            startnode_endnode_impl(val_args, false)
-        })
+cypher_scalar_udf! {
+    /// Create the `endnode` UDF for getting the end node of a relationship.
+    create_endnode_udf => EndNodeUdf,
+    name: "endnode",
+    signature: Signature::new(TypeSignature::VariadicAny, Volatility::Immutable),
+    return_type: DataType::LargeBinary,
+    invoke(args) {
+    let output_type = DataType::LargeBinary;
+    invoke_cypher_udf(args, &output_type, |val_args| {
+        startnode_endnode_impl(val_args, false)
+    })
     }
 }
 
@@ -2089,28 +2028,7 @@ impl ScalarUDFImpl for ToStringUdf {
                     "toString(): requires 1 argument".to_string(),
                 ));
             }
-            match &val_args[0] {
-                Value::Null => Ok(Value::Null),
-                Value::String(s) => Ok(Value::String(s.clone())),
-                Value::Int(i) => Ok(Value::String(i.to_string())),
-                Value::Float(f) => Ok(Value::String(f.to_string())),
-                Value::Bool(b) => Ok(Value::String(b.to_string())),
-                Value::Temporal(t) => Ok(Value::String(t.to_string())),
-                other => {
-                    let type_name = match other {
-                        Value::List(_) => "List",
-                        Value::Map(_) => "Map",
-                        Value::Node { .. } => "Node",
-                        Value::Edge { .. } => "Relationship",
-                        Value::Path { .. } => "Path",
-                        _ => "Unknown",
-                    };
-                    Err(datafusion::error::DataFusionError::Execution(format!(
-                        "TypeError: InvalidArgumentValue - toString() does not accept {} values",
-                        type_name
-                    )))
-                }
-            }
+            eval_tostring(&val_args[0]).map_err(to_datafusion_err)
         })
     }
 }
@@ -2195,26 +2113,6 @@ macro_rules! downcast_arr {
             ))
         })?
     };
-}
-
-/// Return the Cypher type name for a `Value`, used in error messages.
-fn cypher_type_name(val: &Value) -> &'static str {
-    match val {
-        Value::Null => "Null",
-        Value::Bool(_) => "Boolean",
-        Value::Int(_) => "Integer",
-        Value::Float(_) => "Float",
-        Value::String(_) => "String",
-        Value::Bytes(_) => "Bytes",
-        Value::List(_) => "List",
-        Value::Map(_) => "Map",
-        Value::Node(_) => "Node",
-        Value::Edge(_) => "Relationship",
-        Value::Path(_) => "Path",
-        Value::Vector(_) => "Vector",
-        Value::Temporal(_) => "Temporal",
-        _ => "Unknown",
-    }
 }
 
 /// Convert a string slice to `Value`, attempting JSON parse for object/array/quoted-string prefixes.
@@ -2638,109 +2536,78 @@ fn value_to_columnar(val: &Value) -> DFResult<ColumnarValue> {
 // Internal UDF to check if a list contains any nulls
 // ============================================================================
 
-pub fn create_has_null_udf() -> ScalarUDF {
-    ScalarUDF::new_from_impl(HasNullUdf::new())
-}
+cypher_scalar_udf! {
+    create_has_null_udf => HasNullUdf,
+    name: "_has_null",
+    signature: Signature::any(1, Volatility::Immutable),
+    return_type: DataType::Boolean,
+    invoke(args) {
+    if args.args.len() != 1 {
+        return Err(datafusion::error::DataFusionError::Execution(
+            "_has_null(): requires 1 argument".to_string(),
+        ));
+    }
 
-#[derive(Debug)]
-struct HasNullUdf {
-    signature: Signature,
-}
-
-impl HasNullUdf {
-    fn new() -> Self {
-        Self {
-            signature: Signature::any(1, Volatility::Immutable),
+    /// Check if a list array element at index has any nulls
+    fn check_list_nulls<T: arrow_array::OffsetSizeTrait>(
+        arr: &arrow_array::GenericListArray<T>,
+        idx: usize,
+    ) -> bool {
+        if arr.is_null(idx) || arr.is_empty() {
+            false
+        } else {
+            arr.value(idx).null_count() > 0
         }
     }
-}
 
-impl_udf_eq_hash!(HasNullUdf);
-
-impl ScalarUDFImpl for HasNullUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "_has_null"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Boolean)
-    }
-
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        if args.args.len() != 1 {
-            return Err(datafusion::error::DataFusionError::Execution(
-                "_has_null(): requires 1 argument".to_string(),
-            ));
+    match &args.args[0] {
+        ColumnarValue::Scalar(scalar) => {
+            let has_null = match scalar {
+                ScalarValue::List(arr) => arr
+                    .as_any()
+                    .downcast_ref::<arrow::array::ListArray>()
+                    .map(|a| !a.is_empty() && a.value(0).null_count() > 0)
+                    .unwrap_or(arr.null_count() > 0),
+                ScalarValue::LargeList(arr) => arr.len() > 0 && arr.value(0).null_count() > 0,
+                ScalarValue::FixedSizeList(arr) => {
+                    arr.len() > 0 && arr.value(0).null_count() > 0
+                }
+                _ => false,
+            };
+            Ok(ColumnarValue::Scalar(ScalarValue::Boolean(Some(has_null))))
         }
+        ColumnarValue::Array(arr) => {
+            use arrow_array::{LargeListArray, ListArray};
 
-        /// Check if a list array element at index has any nulls
-        fn check_list_nulls<T: arrow_array::OffsetSizeTrait>(
-            arr: &arrow_array::GenericListArray<T>,
-            idx: usize,
-        ) -> bool {
-            if arr.is_null(idx) || arr.is_empty() {
-                false
-            } else {
-                arr.value(idx).null_count() > 0
-            }
-        }
-
-        match &args.args[0] {
-            ColumnarValue::Scalar(scalar) => {
-                let has_null = match scalar {
-                    ScalarValue::List(arr) => arr
-                        .as_any()
-                        .downcast_ref::<arrow::array::ListArray>()
-                        .map(|a| !a.is_empty() && a.value(0).null_count() > 0)
-                        .unwrap_or(arr.null_count() > 0),
-                    ScalarValue::LargeList(arr) => arr.len() > 0 && arr.value(0).null_count() > 0,
-                    ScalarValue::FixedSizeList(arr) => {
-                        arr.len() > 0 && arr.value(0).null_count() > 0
-                    }
-                    _ => false,
+            let results: arrow::array::BooleanArray =
+                if let Some(list_arr) = arr.as_any().downcast_ref::<ListArray>() {
+                    (0..list_arr.len())
+                        .map(|i| {
+                            if list_arr.is_null(i) {
+                                None
+                            } else {
+                                Some(check_list_nulls(list_arr, i))
+                            }
+                        })
+                        .collect()
+                } else if let Some(large) = arr.as_any().downcast_ref::<LargeListArray>() {
+                    (0..large.len())
+                        .map(|i| {
+                            if large.is_null(i) {
+                                None
+                            } else {
+                                Some(check_list_nulls(large, i))
+                            }
+                        })
+                        .collect()
+                } else {
+                    return Err(datafusion::error::DataFusionError::Execution(
+                        "_has_null(): requires list array".to_string(),
+                    ));
                 };
-                Ok(ColumnarValue::Scalar(ScalarValue::Boolean(Some(has_null))))
-            }
-            ColumnarValue::Array(arr) => {
-                use arrow_array::{LargeListArray, ListArray};
-
-                let results: arrow::array::BooleanArray =
-                    if let Some(list_arr) = arr.as_any().downcast_ref::<ListArray>() {
-                        (0..list_arr.len())
-                            .map(|i| {
-                                if list_arr.is_null(i) {
-                                    None
-                                } else {
-                                    Some(check_list_nulls(list_arr, i))
-                                }
-                            })
-                            .collect()
-                    } else if let Some(large) = arr.as_any().downcast_ref::<LargeListArray>() {
-                        (0..large.len())
-                            .map(|i| {
-                                if large.is_null(i) {
-                                    None
-                                } else {
-                                    Some(check_list_nulls(large, i))
-                                }
-                            })
-                            .collect()
-                    } else {
-                        return Err(datafusion::error::DataFusionError::Execution(
-                            "_has_null(): requires list array".to_string(),
-                        ));
-                    };
-                Ok(ColumnarValue::Array(Arc::new(results)))
-            }
+            Ok(ColumnarValue::Array(Arc::new(results)))
         }
+    }
     }
 }
 
@@ -2748,71 +2615,22 @@ impl ScalarUDFImpl for HasNullUdf {
 // toInteger(x) -> Int64
 // ============================================================================
 
-pub fn create_to_integer_udf() -> ScalarUDF {
-    ScalarUDF::new_from_impl(ToIntegerUdf::new())
-}
-
-#[derive(Debug)]
-struct ToIntegerUdf {
-    signature: Signature,
-}
-
-impl ToIntegerUdf {
-    fn new() -> Self {
-        Self {
-            signature: Signature::any(1, Volatility::Immutable),
+cypher_scalar_udf! {
+    create_to_integer_udf => ToIntegerUdf,
+    name: "tointeger",
+    signature: Signature::any(1, Volatility::Immutable),
+    return_type: DataType::Int64,
+    invoke(args) {
+    let output_type = DataType::Int64;
+    invoke_cypher_udf(args, &output_type, |val_args| {
+        if val_args.is_empty() {
+            return Err(datafusion::error::DataFusionError::Execution(
+                "tointeger(): requires 1 argument".to_string(),
+            ));
         }
-    }
-}
 
-impl_udf_eq_hash!(ToIntegerUdf);
-
-impl ScalarUDFImpl for ToIntegerUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "tointeger"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Int64)
-    }
-
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        let output_type = self.return_type(&[])?;
-        invoke_cypher_udf(args, &output_type, |val_args| {
-            if val_args.is_empty() {
-                return Err(datafusion::error::DataFusionError::Execution(
-                    "tointeger(): requires 1 argument".to_string(),
-                ));
-            }
-
-            let val = &val_args[0];
-            match val {
-                Value::Int(i) => Ok(Value::Int(*i)),
-                Value::Float(f) => Ok(Value::Int(*f as i64)),
-                Value::String(s) => {
-                    if let Ok(i) = s.parse::<i64>() {
-                        Ok(Value::Int(i))
-                    } else if let Ok(f) = s.parse::<f64>() {
-                        Ok(Value::Int(f as i64))
-                    } else {
-                        Ok(Value::Null)
-                    }
-                }
-                Value::Null => Ok(Value::Null),
-                other => Err(datafusion::error::DataFusionError::Execution(format!(
-                    "InvalidArgumentValue: tointeger(): cannot convert {} to integer",
-                    cypher_type_name(other)
-                ))),
-            }
-        })
+        eval_tointeger(&val_args[0]).map_err(to_datafusion_err)
+    })
     }
 }
 
@@ -2820,69 +2638,38 @@ impl ScalarUDFImpl for ToIntegerUdf {
 // toFloat(x) -> Float64
 // ============================================================================
 
-pub fn create_to_float_udf() -> ScalarUDF {
-    ScalarUDF::new_from_impl(ToFloatUdf::new())
-}
-
-#[derive(Debug)]
-struct ToFloatUdf {
-    signature: Signature,
-}
-
-impl ToFloatUdf {
-    fn new() -> Self {
-        Self {
-            signature: Signature::any(1, Volatility::Immutable),
+cypher_scalar_udf! {
+    create_to_float_udf => ToFloatUdf,
+    name: "tofloat",
+    signature: Signature::any(1, Volatility::Immutable),
+    return_type: DataType::Float64,
+    invoke(args) {
+    let output_type = DataType::Float64;
+    invoke_cypher_udf(args, &output_type, |val_args| {
+        if val_args.is_empty() {
+            return Err(datafusion::error::DataFusionError::Execution(
+                "tofloat(): requires 1 argument".to_string(),
+            ));
         }
-    }
-}
 
-impl_udf_eq_hash!(ToFloatUdf);
-
-impl ScalarUDFImpl for ToFloatUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "tofloat"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Float64)
-    }
-
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        let output_type = self.return_type(&[])?;
-        invoke_cypher_udf(args, &output_type, |val_args| {
-            if val_args.is_empty() {
-                return Err(datafusion::error::DataFusionError::Execution(
-                    "tofloat(): requires 1 argument".to_string(),
-                ));
-            }
-
-            let val = &val_args[0];
-            match val {
-                Value::Int(i) => Ok(Value::Float(*i as f64)),
-                Value::Float(f) => Ok(Value::Float(*f)),
-                Value::String(s) => {
-                    if let Ok(f) = s.parse::<f64>() {
-                        Ok(Value::Float(f))
-                    } else {
-                        Ok(Value::Null)
-                    }
+        let val = &val_args[0];
+        match val {
+            Value::Int(i) => Ok(Value::Float(*i as f64)),
+            Value::Float(f) => Ok(Value::Float(*f)),
+            Value::String(s) => {
+                if let Ok(f) = s.parse::<f64>() {
+                    Ok(Value::Float(f))
+                } else {
+                    Ok(Value::Null)
                 }
-                Value::Null => Ok(Value::Null),
-                other => Err(datafusion::error::DataFusionError::Execution(format!(
-                    "InvalidArgumentValue: tofloat(): cannot convert {} to float",
-                    cypher_type_name(other)
-                ))),
             }
-        })
+            Value::Null => Ok(Value::Null),
+            other => Err(datafusion::error::DataFusionError::Execution(format!(
+                "InvalidArgumentValue: tofloat(): cannot convert {} to float",
+                cypher_type_name(other)
+            ))),
+        }
+    })
     }
 }
 
@@ -2890,72 +2677,22 @@ impl ScalarUDFImpl for ToFloatUdf {
 // toBoolean(x) -> Boolean
 // ============================================================================
 
-pub fn create_to_boolean_udf() -> ScalarUDF {
-    ScalarUDF::new_from_impl(ToBooleanUdf::new())
-}
-
-#[derive(Debug)]
-struct ToBooleanUdf {
-    signature: Signature,
-}
-
-impl ToBooleanUdf {
-    fn new() -> Self {
-        Self {
-            signature: Signature::any(1, Volatility::Immutable),
+cypher_scalar_udf! {
+    create_to_boolean_udf => ToBooleanUdf,
+    name: "toboolean",
+    signature: Signature::any(1, Volatility::Immutable),
+    return_type: DataType::Boolean,
+    invoke(args) {
+    let output_type = DataType::Boolean;
+    invoke_cypher_udf(args, &output_type, |val_args| {
+        if val_args.is_empty() {
+            return Err(datafusion::error::DataFusionError::Execution(
+                "toboolean(): requires 1 argument".to_string(),
+            ));
         }
-    }
-}
 
-impl_udf_eq_hash!(ToBooleanUdf);
-
-impl ScalarUDFImpl for ToBooleanUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "toboolean"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Boolean)
-    }
-
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        let output_type = self.return_type(&[])?;
-        invoke_cypher_udf(args, &output_type, |val_args| {
-            if val_args.is_empty() {
-                return Err(datafusion::error::DataFusionError::Execution(
-                    "toboolean(): requires 1 argument".to_string(),
-                ));
-            }
-
-            let val = &val_args[0];
-            match val {
-                Value::Bool(b) => Ok(Value::Bool(*b)),
-                Value::String(s) => {
-                    let s_lower = s.to_lowercase();
-                    if s_lower == "true" {
-                        Ok(Value::Bool(true))
-                    } else if s_lower == "false" {
-                        Ok(Value::Bool(false))
-                    } else {
-                        Ok(Value::Null)
-                    }
-                }
-                Value::Null => Ok(Value::Null),
-                Value::Int(i) => Ok(Value::Bool(*i != 0)),
-                other => Err(datafusion::error::DataFusionError::Execution(format!(
-                    "InvalidArgumentValue: toboolean(): cannot convert {} to boolean",
-                    cypher_type_name(other)
-                ))),
-            }
-        })
+        eval_toboolean(&val_args[0]).map_err(to_datafusion_err)
+    })
     }
 }
 
@@ -2965,79 +2702,48 @@ impl ScalarUDFImpl for ToBooleanUdf {
 // Produces byte sequences where memcmp matches Cypher's orderability rules.
 // ============================================================================
 
-pub fn create_cypher_sort_key_udf() -> ScalarUDF {
-    ScalarUDF::new_from_impl(CypherSortKeyUdf::new())
-}
+cypher_scalar_udf! {
+    create_cypher_sort_key_udf => CypherSortKeyUdf,
+    name: "_cypher_sort_key",
+    signature: Signature::any(1, Volatility::Immutable),
+    return_type: DataType::LargeBinary,
+    invoke(args) {
+    if args.args.len() != 1 {
+        return Err(datafusion::error::DataFusionError::Execution(
+            "_cypher_sort_key(): requires 1 argument".to_string(),
+        ));
+    }
 
-#[derive(Debug)]
-struct CypherSortKeyUdf {
-    signature: Signature,
-}
-
-impl CypherSortKeyUdf {
-    fn new() -> Self {
-        Self {
-            signature: Signature::any(1, Volatility::Immutable),
+    let arg = &args.args[0];
+    match arg {
+        ColumnarValue::Scalar(s) => {
+            let val = if s.is_null() {
+                Value::Null
+            } else {
+                scalar_to_value(s)?
+            };
+            let key = encode_cypher_sort_key(&val);
+            Ok(ColumnarValue::Scalar(ScalarValue::LargeBinary(Some(key))))
         }
-    }
-}
-
-impl_udf_eq_hash!(CypherSortKeyUdf);
-
-impl ScalarUDFImpl for CypherSortKeyUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "_cypher_sort_key"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::LargeBinary)
-    }
-
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        if args.args.len() != 1 {
-            return Err(datafusion::error::DataFusionError::Execution(
-                "_cypher_sort_key(): requires 1 argument".to_string(),
-            ));
-        }
-
-        let arg = &args.args[0];
-        match arg {
-            ColumnarValue::Scalar(s) => {
-                let val = if s.is_null() {
+        ColumnarValue::Array(arr) => {
+            let field = args.arg_fields.first().map(|f| f.as_ref());
+            let mut keys: Vec<Option<Vec<u8>>> = Vec::with_capacity(arr.len());
+            for i in 0..arr.len() {
+                let val = if arr.is_null(i) {
                     Value::Null
                 } else {
-                    scalar_to_value(s)?
+                    get_value_from_array(arr, i, field)?
                 };
-                let key = encode_cypher_sort_key(&val);
-                Ok(ColumnarValue::Scalar(ScalarValue::LargeBinary(Some(key))))
+                keys.push(Some(encode_cypher_sort_key(&val)));
             }
-            ColumnarValue::Array(arr) => {
-                let field = args.arg_fields.first().map(|f| f.as_ref());
-                let mut keys: Vec<Option<Vec<u8>>> = Vec::with_capacity(arr.len());
-                for i in 0..arr.len() {
-                    let val = if arr.is_null(i) {
-                        Value::Null
-                    } else {
-                        get_value_from_array(arr, i, field)?
-                    };
-                    keys.push(Some(encode_cypher_sort_key(&val)));
-                }
-                let array = LargeBinaryArray::from(
-                    keys.iter()
-                        .map(|k| k.as_deref())
-                        .collect::<Vec<Option<&[u8]>>>(),
-                );
-                Ok(ColumnarValue::Array(Arc::new(array)))
-            }
+            let array = LargeBinaryArray::from(
+                keys.iter()
+                    .map(|k| k.as_deref())
+                    .collect::<Vec<Option<&[u8]>>>(),
+            );
+            Ok(ColumnarValue::Array(Arc::new(array)))
         }
+    }
     }
 }
 
@@ -5239,71 +4945,40 @@ impl ScalarUDFImpl for CvToBoolUdf {
 // Polymorphic SIZE/LENGTH: dispatches on runtime type
 // ============================================================================
 
-pub fn create_cypher_size_udf() -> ScalarUDF {
-    ScalarUDF::new_from_impl(CypherSizeUdf::new())
-}
+cypher_scalar_udf! {
+    create_cypher_size_udf => CypherSizeUdf,
+    name: "_cypher_size",
+    signature: Signature::any(1, Volatility::Immutable),
+    return_type: DataType::Int64,
+    invoke(args) {
+    if args.args.len() != 1 {
+        return Err(datafusion::error::DataFusionError::Execution(
+            "_cypher_size() requires exactly 1 argument".to_string(),
+        ));
+    }
 
-#[derive(Debug)]
-struct CypherSizeUdf {
-    signature: Signature,
-}
-
-impl CypherSizeUdf {
-    fn new() -> Self {
-        Self {
-            signature: Signature::any(1, Volatility::Immutable),
+    match &args.args[0] {
+        ColumnarValue::Scalar(scalar) => {
+            let result = cypher_size_scalar(scalar)?;
+            Ok(ColumnarValue::Scalar(result))
         }
-    }
-}
-
-impl_udf_eq_hash!(CypherSizeUdf);
-
-impl ScalarUDFImpl for CypherSizeUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "_cypher_size"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Int64)
-    }
-
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        if args.args.len() != 1 {
-            return Err(datafusion::error::DataFusionError::Execution(
-                "_cypher_size() requires exactly 1 argument".to_string(),
-            ));
-        }
-
-        match &args.args[0] {
-            ColumnarValue::Scalar(scalar) => {
-                let result = cypher_size_scalar(scalar)?;
-                Ok(ColumnarValue::Scalar(result))
-            }
-            ColumnarValue::Array(arr) => {
-                let mut results: Vec<Option<i64>> = Vec::with_capacity(arr.len());
-                for i in 0..arr.len() {
-                    if arr.is_null(i) {
-                        results.push(None);
-                    } else {
-                        let scalar = ScalarValue::try_from_array(arr, i)?;
-                        match cypher_size_scalar(&scalar)? {
-                            ScalarValue::Int64(v) => results.push(v),
-                            _ => results.push(None),
-                        }
+        ColumnarValue::Array(arr) => {
+            let mut results: Vec<Option<i64>> = Vec::with_capacity(arr.len());
+            for i in 0..arr.len() {
+                if arr.is_null(i) {
+                    results.push(None);
+                } else {
+                    let scalar = ScalarValue::try_from_array(arr, i)?;
+                    match cypher_size_scalar(&scalar)? {
+                        ScalarValue::Int64(v) => results.push(v),
+                        _ => results.push(None),
                     }
                 }
-                let arr: ArrayRef = Arc::new(arrow_array::Int64Array::from(results));
-                Ok(ColumnarValue::Array(arr))
             }
+            let arr: ArrayRef = Arc::new(arrow_array::Int64Array::from(results));
+            Ok(ColumnarValue::Array(arr))
         }
+    }
     }
 }
 
@@ -5429,91 +5104,60 @@ fn cypher_size_scalar(scalar: &ScalarValue) -> DFResult<ScalarValue> {
 // Lexicographic list ordering for Cypher comparison semantics
 // ============================================================================
 
-pub fn create_cypher_list_compare_udf() -> ScalarUDF {
-    ScalarUDF::new_from_impl(CypherListCompareUdf::new())
-}
-
-#[derive(Debug)]
-struct CypherListCompareUdf {
-    signature: Signature,
-}
-
-impl CypherListCompareUdf {
-    fn new() -> Self {
-        Self {
-            signature: Signature::any(3, Volatility::Immutable),
+cypher_scalar_udf! {
+    create_cypher_list_compare_udf => CypherListCompareUdf,
+    name: "_cypher_list_compare",
+    signature: Signature::any(3, Volatility::Immutable),
+    return_type: DataType::Boolean,
+    invoke(args) {
+    let output_type = DataType::Boolean;
+    invoke_cypher_udf(args, &output_type, |val_args| {
+        if val_args.len() != 3 {
+            return Err(datafusion::error::DataFusionError::Execution(
+                "_cypher_list_compare(): requires 3 arguments (left, right, op)".to_string(),
+            ));
         }
-    }
-}
 
-impl_udf_eq_hash!(CypherListCompareUdf);
-
-impl ScalarUDFImpl for CypherListCompareUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "_cypher_list_compare"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Boolean)
-    }
-
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        let output_type = DataType::Boolean;
-        invoke_cypher_udf(args, &output_type, |val_args| {
-            if val_args.len() != 3 {
+        let left = &val_args[0];
+        let right = &val_args[1];
+        let op_str = match &val_args[2] {
+            Value::String(s) => s.as_str(),
+            _ => {
                 return Err(datafusion::error::DataFusionError::Execution(
-                    "_cypher_list_compare(): requires 3 arguments (left, right, op)".to_string(),
+                    "_cypher_list_compare(): op must be a string".to_string(),
                 ));
             }
+        };
 
-            let left = &val_args[0];
-            let right = &val_args[1];
-            let op_str = match &val_args[2] {
-                Value::String(s) => s.as_str(),
-                _ => {
-                    return Err(datafusion::error::DataFusionError::Execution(
-                        "_cypher_list_compare(): op must be a string".to_string(),
-                    ));
-                }
-            };
+        let (left_items, right_items) = match (left, right) {
+            (Value::List(l), Value::List(r)) => (l, r),
+            (Value::Null, _) | (_, Value::Null) => return Ok(Value::Null),
+            _ => {
+                return Err(datafusion::error::DataFusionError::Execution(
+                    "_cypher_list_compare(): both arguments must be lists".to_string(),
+                ));
+            }
+        };
 
-            let (left_items, right_items) = match (left, right) {
-                (Value::List(l), Value::List(r)) => (l, r),
-                (Value::Null, _) | (_, Value::Null) => return Ok(Value::Null),
-                _ => {
-                    return Err(datafusion::error::DataFusionError::Execution(
-                        "_cypher_list_compare(): both arguments must be lists".to_string(),
-                    ));
-                }
-            };
+        // Element-wise comparison using Cypher ordering semantics
+        let cmp = cypher_list_cmp(left_items, right_items);
 
-            // Element-wise comparison using Cypher ordering semantics
-            let cmp = cypher_list_cmp(left_items, right_items);
+        let result = match (op_str, cmp) {
+            (_, None) => Value::Null,
+            ("lt", Some(ord)) => Value::Bool(ord == std::cmp::Ordering::Less),
+            ("lteq", Some(ord)) => Value::Bool(ord != std::cmp::Ordering::Greater),
+            ("gt", Some(ord)) => Value::Bool(ord == std::cmp::Ordering::Greater),
+            ("gteq", Some(ord)) => Value::Bool(ord != std::cmp::Ordering::Less),
+            _ => {
+                return Err(datafusion::error::DataFusionError::Execution(format!(
+                    "_cypher_list_compare(): unknown op '{}'",
+                    op_str
+                )));
+            }
+        };
 
-            let result = match (op_str, cmp) {
-                (_, None) => Value::Null,
-                ("lt", Some(ord)) => Value::Bool(ord == std::cmp::Ordering::Less),
-                ("lteq", Some(ord)) => Value::Bool(ord != std::cmp::Ordering::Greater),
-                ("gt", Some(ord)) => Value::Bool(ord == std::cmp::Ordering::Greater),
-                ("gteq", Some(ord)) => Value::Bool(ord != std::cmp::Ordering::Less),
-                _ => {
-                    return Err(datafusion::error::DataFusionError::Execution(format!(
-                        "_cypher_list_compare(): unknown op '{}'",
-                        op_str
-                    )));
-                }
-            };
-
-            Ok(result)
-        })
+        Ok(result)
+    })
     }
 }
 
@@ -5521,91 +5165,60 @@ impl ScalarUDFImpl for CypherListCompareUdf {
 // _map_project(key1, val1, key2, val2, ...) -> LargeBinary (CypherValue)
 // ============================================================================
 
-pub fn create_map_project_udf() -> ScalarUDF {
-    ScalarUDF::new_from_impl(MapProjectUdf::new())
-}
-
-#[derive(Debug)]
-struct MapProjectUdf {
-    signature: Signature,
-}
-
-impl MapProjectUdf {
-    fn new() -> Self {
-        Self {
-            signature: Signature::new(TypeSignature::VariadicAny, Volatility::Immutable),
-        }
-    }
-}
-
-impl_udf_eq_hash!(MapProjectUdf);
-
-impl ScalarUDFImpl for MapProjectUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "_map_project"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::LargeBinary)
-    }
-
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        let output_type = self.return_type(&[])?;
-        invoke_cypher_udf(args, &output_type, |val_args| {
-            let mut result_map = std::collections::HashMap::new();
-            let mut i = 0;
-            while i + 1 < val_args.len() {
-                let key = &val_args[i];
-                let value = &val_args[i + 1];
-                if let Some(k) = key.as_str() {
-                    if k == "__all__" {
-                        // AllProperties: expand entity map, skip _-prefixed keys
-                        match value {
-                            Value::Map(map) => {
-                                // Prefer `_all_props` (the CypherValue-encoded
-                                // property map, which round-trips raw `Bytes`
-                                // losslessly) over the top-level struct columns,
-                                // where a raw `Bytes` property decodes to Null
-                                // because `named_struct` drops the `uni_raw_bytes`
-                                // marker. Mirrors `properties()` for consistency.
-                                let source = match map.get("_all_props") {
-                                    Some(Value::Map(all)) => all,
-                                    _ => map,
-                                };
-                                for (mk, mv) in source {
-                                    if !mk.starts_with('_') {
-                                        result_map.insert(mk.clone(), mv.clone());
-                                    }
+cypher_scalar_udf! {
+    create_map_project_udf => MapProjectUdf,
+    name: "_map_project",
+    signature: Signature::new(TypeSignature::VariadicAny, Volatility::Immutable),
+    return_type: DataType::LargeBinary,
+    invoke(args) {
+    let output_type = DataType::LargeBinary;
+    invoke_cypher_udf(args, &output_type, |val_args| {
+        let mut result_map = std::collections::HashMap::new();
+        let mut i = 0;
+        while i + 1 < val_args.len() {
+            let key = &val_args[i];
+            let value = &val_args[i + 1];
+            if let Some(k) = key.as_str() {
+                if k == "__all__" {
+                    // AllProperties: expand entity map, skip _-prefixed keys
+                    match value {
+                        Value::Map(map) => {
+                            // Prefer `_all_props` (the CypherValue-encoded
+                            // property map, which round-trips raw `Bytes`
+                            // losslessly) over the top-level struct columns,
+                            // where a raw `Bytes` property decodes to Null
+                            // because `named_struct` drops the `uni_raw_bytes`
+                            // marker. Mirrors `properties()` for consistency.
+                            let source = match map.get("_all_props") {
+                                Some(Value::Map(all)) => all,
+                                _ => map,
+                            };
+                            for (mk, mv) in source {
+                                if !mk.starts_with('_') {
+                                    result_map.insert(mk.clone(), mv.clone());
                                 }
                             }
-                            Value::Node(node) => {
-                                for (pk, pv) in &node.properties {
-                                    result_map.insert(pk.clone(), pv.clone());
-                                }
-                            }
-                            Value::Edge(edge) => {
-                                for (pk, pv) in &edge.properties {
-                                    result_map.insert(pk.clone(), pv.clone());
-                                }
-                            }
-                            _ => {}
                         }
-                    } else {
-                        result_map.insert(k.to_string(), value.clone());
+                        Value::Node(node) => {
+                            for (pk, pv) in &node.properties {
+                                result_map.insert(pk.clone(), pv.clone());
+                            }
+                        }
+                        Value::Edge(edge) => {
+                            for (pk, pv) in &edge.properties {
+                                result_map.insert(pk.clone(), pv.clone());
+                            }
+                        }
+                        _ => {}
                     }
+                } else {
+                    result_map.insert(k.to_string(), value.clone());
                 }
-                i += 2;
             }
-            Ok(Value::Map(result_map))
-        })
+            i += 2;
+        }
+        Ok(Value::Map(result_map))
+    })
     }
 }
 
@@ -5613,47 +5226,16 @@ impl ScalarUDFImpl for MapProjectUdf {
 // _make_cypher_list(arg0, arg1, ...) -> LargeBinary (CypherValue array)
 // ============================================================================
 
-pub fn create_make_cypher_list_udf() -> ScalarUDF {
-    ScalarUDF::new_from_impl(MakeCypherListUdf::new())
-}
-
-#[derive(Debug)]
-struct MakeCypherListUdf {
-    signature: Signature,
-}
-
-impl MakeCypherListUdf {
-    fn new() -> Self {
-        Self {
-            signature: Signature::new(TypeSignature::VariadicAny, Volatility::Immutable),
-        }
-    }
-}
-
-impl_udf_eq_hash!(MakeCypherListUdf);
-
-impl ScalarUDFImpl for MakeCypherListUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "_make_cypher_list"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::LargeBinary)
-    }
-
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        let output_type = self.return_type(&[])?;
-        invoke_cypher_udf(args, &output_type, |val_args| {
-            Ok(Value::List(val_args.to_vec()))
-        })
+cypher_scalar_udf! {
+    create_make_cypher_list_udf => MakeCypherListUdf,
+    name: "_make_cypher_list",
+    signature: Signature::new(TypeSignature::VariadicAny, Volatility::Immutable),
+    return_type: DataType::LargeBinary,
+    invoke(args) {
+    let output_type = DataType::LargeBinary;
+    invoke_cypher_udf(args, &output_type, |val_args| {
+        Ok(Value::List(val_args.to_vec()))
+    })
     }
 }
 
@@ -5661,105 +5243,74 @@ impl ScalarUDFImpl for MakeCypherListUdf {
 // _cypher_in(element, list) -> Boolean (nullable)
 // ============================================================================
 
-/// Create the `_cypher_in` UDF for Cypher's `x IN list` semantics.
-///
-/// Handles all list representations (native List, Utf8 json-encoded, LargeBinary CypherValue)
-/// via `invoke_cypher_udf` which converts everything to `Value` first.
-///
-/// Cypher IN semantics (3-valued logic):
-/// - list is null → null
-/// - x found in list → true
-/// - x not found, list contains null → null
-/// - x not found, no nulls → false
-/// - x is null, list empty → false
-/// - x is null, list non-empty → null
-pub fn create_cypher_in_udf() -> ScalarUDF {
-    ScalarUDF::new_from_impl(CypherInUdf::new())
-}
-
-#[derive(Debug)]
-struct CypherInUdf {
-    signature: Signature,
-}
-
-impl CypherInUdf {
-    fn new() -> Self {
-        Self {
-            signature: Signature::any(2, Volatility::Immutable),
+cypher_scalar_udf! {
+    /// Create the `_cypher_in` UDF for Cypher's `x IN list` semantics.
+    ///
+    /// Handles all list representations (native List, Utf8 json-encoded, LargeBinary CypherValue)
+    /// via `invoke_cypher_udf` which converts everything to `Value` first.
+    ///
+    /// Cypher IN semantics (3-valued logic):
+    /// - list is null → null
+    /// - x found in list → true
+    /// - x not found, list contains null → null
+    /// - x not found, no nulls → false
+    /// - x is null, list empty → false
+    /// - x is null, list non-empty → null
+    create_cypher_in_udf => CypherInUdf,
+    name: "_cypher_in",
+    signature: Signature::any(2, Volatility::Immutable),
+    return_type: DataType::Boolean,
+    invoke(args) {
+    invoke_cypher_udf(args, &DataType::Boolean, |vals| {
+        if vals.len() != 2 {
+            return Err(datafusion::error::DataFusionError::Execution(
+                "_cypher_in(): requires 2 arguments".to_string(),
+            ));
         }
-    }
-}
+        let element = &vals[0];
+        let list_val = &vals[1];
 
-impl_udf_eq_hash!(CypherInUdf);
+        // If list is null, result is null
+        if list_val.is_null() {
+            return Ok(Value::Null);
+        }
 
-impl ScalarUDFImpl for CypherInUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "_cypher_in"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Boolean)
-    }
-
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        invoke_cypher_udf(args, &DataType::Boolean, |vals| {
-            if vals.len() != 2 {
-                return Err(datafusion::error::DataFusionError::Execution(
-                    "_cypher_in(): requires 2 arguments".to_string(),
-                ));
+        // Extract list items
+        let items = match list_val {
+            Value::List(items) => items.as_slice(),
+            _ => {
+                return Err(datafusion::error::DataFusionError::Execution(format!(
+                    "_cypher_in(): second argument must be a list, got {:?}",
+                    list_val
+                )));
             }
-            let element = &vals[0];
-            let list_val = &vals[1];
+        };
 
-            // If list is null, result is null
-            if list_val.is_null() {
-                return Ok(Value::Null);
-            }
-
-            // Extract list items
-            let items = match list_val {
-                Value::List(items) => items.as_slice(),
-                _ => {
-                    return Err(datafusion::error::DataFusionError::Execution(format!(
-                        "_cypher_in(): second argument must be a list, got {:?}",
-                        list_val
-                    )));
-                }
-            };
-
-            // If element is null
-            if element.is_null() {
-                return if items.is_empty() {
-                    Ok(Value::Bool(false))
-                } else {
-                    Ok(Value::Null) // null IN non-empty list → null
-                };
-            }
-
-            // 3-valued comparison: cypher_eq returns Some(true/false) or None (indeterminate)
-            let mut has_null = false;
-            for item in items {
-                match cypher_eq(element, item) {
-                    Some(true) => return Ok(Value::Bool(true)),
-                    None => has_null = true,
-                    Some(false) => {}
-                }
-            }
-
-            if has_null {
-                Ok(Value::Null) // not found but comparison was indeterminate → null
-            } else {
+        // If element is null
+        if element.is_null() {
+            return if items.is_empty() {
                 Ok(Value::Bool(false))
+            } else {
+                Ok(Value::Null) // null IN non-empty list → null
+            };
+        }
+
+        // 3-valued comparison: cypher_eq returns Some(true/false) or None (indeterminate)
+        let mut has_null = false;
+        for item in items {
+            match cypher_eq(element, item) {
+                Some(true) => return Ok(Value::Bool(true)),
+                None => has_null = true,
+                Some(false) => {}
             }
-        })
+        }
+
+        if has_null {
+            Ok(Value::Null) // not found but comparison was indeterminate → null
+        } else {
+            Ok(Value::Bool(false))
+        }
+    })
     }
 }
 
@@ -5767,84 +5318,53 @@ impl ScalarUDFImpl for CypherInUdf {
 // _cypher_list_concat(left, right) -> LargeBinary (CypherValue)
 // ============================================================================
 
-/// Create the `_cypher_list_concat` UDF for Cypher `list + list` concatenation.
-pub fn create_cypher_list_concat_udf() -> ScalarUDF {
-    ScalarUDF::new_from_impl(CypherListConcatUdf::new())
-}
-
-#[derive(Debug)]
-struct CypherListConcatUdf {
-    signature: Signature,
-}
-
-impl CypherListConcatUdf {
-    fn new() -> Self {
-        Self {
-            signature: Signature::any(2, Volatility::Immutable),
+cypher_scalar_udf! {
+    /// Create the `_cypher_list_concat` UDF for Cypher `list + list` concatenation.
+    create_cypher_list_concat_udf => CypherListConcatUdf,
+    name: "_cypher_list_concat",
+    signature: Signature::any(2, Volatility::Immutable),
+    return_type: DataType::LargeBinary,
+    invoke(args) {
+    invoke_cypher_udf(args, &DataType::LargeBinary, |vals| {
+        if vals.len() != 2 {
+            return Err(datafusion::error::DataFusionError::Execution(
+                "_cypher_list_concat(): requires 2 arguments".to_string(),
+            ));
         }
-    }
-}
-
-impl_udf_eq_hash!(CypherListConcatUdf);
-
-impl ScalarUDFImpl for CypherListConcatUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "_cypher_list_concat"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::LargeBinary)
-    }
-
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        invoke_cypher_udf(args, &DataType::LargeBinary, |vals| {
-            if vals.len() != 2 {
-                return Err(datafusion::error::DataFusionError::Execution(
-                    "_cypher_list_concat(): requires 2 arguments".to_string(),
-                ));
+        // If either is null, result is null
+        if vals[0].is_null() || vals[1].is_null() {
+            return Ok(Value::Null);
+        }
+        match (&vals[0], &vals[1]) {
+            (Value::List(left), Value::List(right)) => {
+                let mut result = left.clone();
+                result.extend(right.iter().cloned());
+                Ok(Value::List(result))
             }
-            // If either is null, result is null
-            if vals[0].is_null() || vals[1].is_null() {
-                return Ok(Value::Null);
+            // When both sides are CypherValue we can't distinguish list+scalar
+            // from list+list at compile time; handle append/prepend here too
+            (Value::List(list), elem) => {
+                let mut result = list.clone();
+                result.push(elem.clone());
+                Ok(Value::List(result))
             }
-            match (&vals[0], &vals[1]) {
-                (Value::List(left), Value::List(right)) => {
-                    let mut result = left.clone();
-                    result.extend(right.iter().cloned());
-                    Ok(Value::List(result))
-                }
-                // When both sides are CypherValue we can't distinguish list+scalar
-                // from list+list at compile time; handle append/prepend here too
-                (Value::List(list), elem) => {
-                    let mut result = list.clone();
-                    result.push(elem.clone());
-                    Ok(Value::List(result))
-                }
-                (elem, Value::List(list)) => {
-                    let mut result = vec![elem.clone()];
-                    result.extend(list.iter().cloned());
-                    Ok(Value::List(result))
-                }
-                _ => {
-                    // Neither is a list — fall back to regular addition
-                    // (dispatch routes all CypherValue Plus here because LargeBinary matches)
-                    crate::expr_eval::eval_binary_op(
-                        &vals[0],
-                        &uni_cypher::ast::BinaryOp::Add,
-                        &vals[1],
-                    )
-                    .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))
-                }
+            (elem, Value::List(list)) => {
+                let mut result = vec![elem.clone()];
+                result.extend(list.iter().cloned());
+                Ok(Value::List(result))
             }
-        })
+            _ => {
+                // Neither is a list — fall back to regular addition
+                // (dispatch routes all CypherValue Plus here because LargeBinary matches)
+                crate::expr_eval::eval_binary_op(
+                    &vals[0],
+                    &uni_cypher::ast::BinaryOp::Add,
+                    &vals[1],
+                )
+                .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))
+            }
+        }
+    })
     }
 }
 
@@ -5852,77 +5372,46 @@ impl ScalarUDFImpl for CypherListConcatUdf {
 // _cypher_list_append(left, right) -> LargeBinary (CypherValue)
 // ============================================================================
 
-/// Create the `_cypher_list_append` UDF for Cypher `list + element` or `element + list`.
-pub fn create_cypher_list_append_udf() -> ScalarUDF {
-    ScalarUDF::new_from_impl(CypherListAppendUdf::new())
-}
-
-#[derive(Debug)]
-struct CypherListAppendUdf {
-    signature: Signature,
-}
-
-impl CypherListAppendUdf {
-    fn new() -> Self {
-        Self {
-            signature: Signature::any(2, Volatility::Immutable),
+cypher_scalar_udf! {
+    /// Create the `_cypher_list_append` UDF for Cypher `list + element` or `element + list`.
+    create_cypher_list_append_udf => CypherListAppendUdf,
+    name: "_cypher_list_append",
+    signature: Signature::any(2, Volatility::Immutable),
+    return_type: DataType::LargeBinary,
+    invoke(args) {
+    invoke_cypher_udf(args, &DataType::LargeBinary, |vals| {
+        if vals.len() != 2 {
+            return Err(datafusion::error::DataFusionError::Execution(
+                "_cypher_list_append(): requires 2 arguments".to_string(),
+            ));
         }
-    }
-}
+        let left = &vals[0];
+        let right = &vals[1];
 
-impl_udf_eq_hash!(CypherListAppendUdf);
+        // If either is null, result is null
+        if left.is_null() || right.is_null() {
+            return Ok(Value::Null);
+        }
 
-impl ScalarUDFImpl for CypherListAppendUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "_cypher_list_append"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::LargeBinary)
-    }
-
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        invoke_cypher_udf(args, &DataType::LargeBinary, |vals| {
-            if vals.len() != 2 {
-                return Err(datafusion::error::DataFusionError::Execution(
-                    "_cypher_list_append(): requires 2 arguments".to_string(),
-                ));
+        match (left, right) {
+            // list + scalar → append
+            (Value::List(list), elem) => {
+                let mut result = list.clone();
+                result.push(elem.clone());
+                Ok(Value::List(result))
             }
-            let left = &vals[0];
-            let right = &vals[1];
-
-            // If either is null, result is null
-            if left.is_null() || right.is_null() {
-                return Ok(Value::Null);
+            // scalar + list → prepend
+            (elem, Value::List(list)) => {
+                let mut result = vec![elem.clone()];
+                result.extend(list.iter().cloned());
+                Ok(Value::List(result))
             }
-
-            match (left, right) {
-                // list + scalar → append
-                (Value::List(list), elem) => {
-                    let mut result = list.clone();
-                    result.push(elem.clone());
-                    Ok(Value::List(result))
-                }
-                // scalar + list → prepend
-                (elem, Value::List(list)) => {
-                    let mut result = vec![elem.clone()];
-                    result.extend(list.iter().cloned());
-                    Ok(Value::List(result))
-                }
-                _ => Err(datafusion::error::DataFusionError::Execution(format!(
-                    "_cypher_list_append(): at least one argument must be a list, got {:?} and {:?}",
-                    left, right
-                ))),
-            }
-        })
+            _ => Err(datafusion::error::DataFusionError::Execution(format!(
+                "_cypher_list_append(): at least one argument must be a list, got {:?} and {:?}",
+                left, right
+            ))),
+        }
+    })
     }
 }
 
@@ -5930,97 +5419,66 @@ impl ScalarUDFImpl for CypherListAppendUdf {
 // _cypher_list_slice(list, start, end) -> LargeBinary (CypherValue)
 // ============================================================================
 
-/// Create the `_cypher_list_slice` UDF for Cypher list slicing on CypherValue-encoded lists.
-pub fn create_cypher_list_slice_udf() -> ScalarUDF {
-    ScalarUDF::new_from_impl(CypherListSliceUdf::new())
-}
-
-#[derive(Debug)]
-struct CypherListSliceUdf {
-    signature: Signature,
-}
-
-impl CypherListSliceUdf {
-    fn new() -> Self {
-        Self {
-            signature: Signature::any(3, Volatility::Immutable),
+cypher_scalar_udf! {
+    /// Create the `_cypher_list_slice` UDF for Cypher list slicing on CypherValue-encoded lists.
+    create_cypher_list_slice_udf => CypherListSliceUdf,
+    name: "_cypher_list_slice",
+    signature: Signature::any(3, Volatility::Immutable),
+    return_type: DataType::LargeBinary,
+    invoke(args) {
+    invoke_cypher_udf(args, &DataType::LargeBinary, |vals| {
+        if vals.len() != 3 {
+            return Err(datafusion::error::DataFusionError::Execution(
+                "_cypher_list_slice(): requires 3 arguments (list, start, end)".to_string(),
+            ));
         }
-    }
-}
-
-impl_udf_eq_hash!(CypherListSliceUdf);
-
-impl ScalarUDFImpl for CypherListSliceUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "_cypher_list_slice"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::LargeBinary)
-    }
-
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        invoke_cypher_udf(args, &DataType::LargeBinary, |vals| {
-            if vals.len() != 3 {
-                return Err(datafusion::error::DataFusionError::Execution(
-                    "_cypher_list_slice(): requires 3 arguments (list, start, end)".to_string(),
-                ));
+        // Null list → null
+        if vals[0].is_null() {
+            return Ok(Value::Null);
+        }
+        let list = match &vals[0] {
+            Value::List(l) => l,
+            _ => {
+                return Err(datafusion::error::DataFusionError::Execution(format!(
+                    "_cypher_list_slice(): first argument must be a list, got {:?}",
+                    vals[0]
+                )));
             }
-            // Null list → null
-            if vals[0].is_null() {
-                return Ok(Value::Null);
-            }
-            let list = match &vals[0] {
-                Value::List(l) => l,
-                _ => {
-                    return Err(datafusion::error::DataFusionError::Execution(format!(
-                        "_cypher_list_slice(): first argument must be a list, got {:?}",
-                        vals[0]
-                    )));
-                }
-            };
-            // Null bounds → null result
-            if vals[1].is_null() || vals[2].is_null() {
-                return Ok(Value::Null);
-            }
+        };
+        // Null bounds → null result
+        if vals[1].is_null() || vals[2].is_null() {
+            return Ok(Value::Null);
+        }
 
-            let len = list.len() as i64;
-            let raw_start = match &vals[1] {
-                Value::Int(i) => *i,
-                _ => 0,
-            };
-            let raw_end = match &vals[2] {
-                Value::Int(i) => *i,
-                _ => len,
-            };
+        let len = list.len() as i64;
+        let raw_start = match &vals[1] {
+            Value::Int(i) => *i,
+            _ => 0,
+        };
+        let raw_end = match &vals[2] {
+            Value::Int(i) => *i,
+            _ => len,
+        };
 
-            // Resolve negative indices: if idx < 0 → len + idx (clamp to 0)
-            let start = if raw_start < 0 {
-                (len + raw_start).max(0) as usize
-            } else {
-                (raw_start).min(len) as usize
-            };
-            let end = if raw_end == i64::MAX {
-                len as usize
-            } else if raw_end < 0 {
-                (len + raw_end).max(0) as usize
-            } else {
-                (raw_end).min(len) as usize
-            };
+        // Resolve negative indices: if idx < 0 → len + idx (clamp to 0)
+        let start = if raw_start < 0 {
+            (len + raw_start).max(0) as usize
+        } else {
+            (raw_start).min(len) as usize
+        };
+        let end = if raw_end == i64::MAX {
+            len as usize
+        } else if raw_end < 0 {
+            (len + raw_end).max(0) as usize
+        } else {
+            (raw_end).min(len) as usize
+        };
 
-            if start >= end {
-                return Ok(Value::List(vec![]));
-            }
-            Ok(Value::List(list[start..end.min(list.len())].to_vec()))
-        })
+        if start >= end {
+            return Ok(Value::List(vec![]));
+        }
+        Ok(Value::List(list[start..end.min(list.len())].to_vec()))
+    })
     }
 }
 
@@ -6028,69 +5486,38 @@ impl ScalarUDFImpl for CypherListSliceUdf {
 // _cypher_reverse(val) -> LargeBinary (CypherValue)
 // ============================================================================
 
-/// Create the `_cypher_reverse` UDF for Cypher `reverse()`.
-///
-/// Handles both strings and lists:
-/// - `reverse("abc")` → `"cba"`
-/// - `reverse([1,2,3])` → `[3,2,1]`
-/// - `reverse(null)` → `null`
-pub fn create_cypher_reverse_udf() -> ScalarUDF {
-    ScalarUDF::new_from_impl(CypherReverseUdf::new())
-}
-
-#[derive(Debug)]
-struct CypherReverseUdf {
-    signature: Signature,
-}
-
-impl CypherReverseUdf {
-    fn new() -> Self {
-        Self {
-            signature: Signature::any(1, Volatility::Immutable),
+cypher_scalar_udf! {
+    /// Create the `_cypher_reverse` UDF for Cypher `reverse()`.
+    ///
+    /// Handles both strings and lists:
+    /// - `reverse("abc")` → `"cba"`
+    /// - `reverse([1,2,3])` → `[3,2,1]`
+    /// - `reverse(null)` → `null`
+    create_cypher_reverse_udf => CypherReverseUdf,
+    name: "_cypher_reverse",
+    signature: Signature::any(1, Volatility::Immutable),
+    return_type: DataType::LargeBinary,
+    invoke(args) {
+    invoke_cypher_udf(args, &DataType::LargeBinary, |vals| {
+        if vals.len() != 1 {
+            return Err(datafusion::error::DataFusionError::Execution(
+                "_cypher_reverse(): requires exactly 1 argument".to_string(),
+            ));
         }
-    }
-}
-
-impl_udf_eq_hash!(CypherReverseUdf);
-
-impl ScalarUDFImpl for CypherReverseUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "_cypher_reverse"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::LargeBinary)
-    }
-
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        invoke_cypher_udf(args, &DataType::LargeBinary, |vals| {
-            if vals.len() != 1 {
-                return Err(datafusion::error::DataFusionError::Execution(
-                    "_cypher_reverse(): requires exactly 1 argument".to_string(),
-                ));
+        match &vals[0] {
+            Value::Null => Ok(Value::Null),
+            Value::String(s) => Ok(Value::String(s.chars().rev().collect())),
+            Value::List(l) => {
+                let mut reversed = l.clone();
+                reversed.reverse();
+                Ok(Value::List(reversed))
             }
-            match &vals[0] {
-                Value::Null => Ok(Value::Null),
-                Value::String(s) => Ok(Value::String(s.chars().rev().collect())),
-                Value::List(l) => {
-                    let mut reversed = l.clone();
-                    reversed.reverse();
-                    Ok(Value::List(reversed))
-                }
-                other => Err(datafusion::error::DataFusionError::Execution(format!(
-                    "_cypher_reverse(): expected string or list, got {:?}",
-                    other
-                ))),
-            }
-        })
+            other => Err(datafusion::error::DataFusionError::Execution(format!(
+                "_cypher_reverse(): expected string or list, got {:?}",
+                other
+            ))),
+        }
+    })
     }
 }
 
@@ -6098,107 +5525,21 @@ impl ScalarUDFImpl for CypherReverseUdf {
 // _cypher_substring(str, start [, length]) -> Utf8
 // ============================================================================
 
-/// Create the `_cypher_substring` UDF for Cypher `substring()`.
-///
-/// Uses 0-based indexing (Cypher convention):
-/// - `substring("hello", 1)` → `"ello"`
-/// - `substring("hello", 1, 3)` → `"ell"`
-/// - Any null argument → `null`
-pub fn create_cypher_substring_udf() -> ScalarUDF {
-    ScalarUDF::new_from_impl(CypherSubstringUdf::new())
-}
-
-#[derive(Debug)]
-struct CypherSubstringUdf {
-    signature: Signature,
-}
-
-impl CypherSubstringUdf {
-    fn new() -> Self {
-        Self {
-            signature: Signature::variadic_any(Volatility::Immutable),
-        }
-    }
-}
-
-impl_udf_eq_hash!(CypherSubstringUdf);
-
-impl ScalarUDFImpl for CypherSubstringUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "_cypher_substring"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Utf8)
-    }
-
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        invoke_cypher_udf(args, &DataType::Utf8, |vals| {
-            if vals.len() < 2 || vals.len() > 3 {
-                return Err(datafusion::error::DataFusionError::Execution(
-                    "_cypher_substring(): requires 2 or 3 arguments".to_string(),
-                ));
-            }
-            // Null propagation
-            if vals.iter().any(|v| v.is_null()) {
-                return Ok(Value::Null);
-            }
-            let s = match &vals[0] {
-                Value::String(s) => s.as_str(),
-                other => {
-                    return Err(datafusion::error::DataFusionError::Execution(format!(
-                        "_cypher_substring(): first argument must be a string, got {:?}",
-                        other
-                    )));
-                }
-            };
-            let start = match &vals[1] {
-                Value::Int(i) => *i,
-                other => {
-                    return Err(datafusion::error::DataFusionError::Execution(format!(
-                        "_cypher_substring(): second argument must be an integer, got {:?}",
-                        other
-                    )));
-                }
-            };
-
-            // Cypher substring is 0-based, operates on characters (not bytes)
-            let chars: Vec<char> = s.chars().collect();
-            let len = chars.len() as i64;
-
-            // Clamp start to valid range
-            let start_idx = start.max(0).min(len) as usize;
-
-            let end_idx = if vals.len() == 3 {
-                let length = match &vals[2] {
-                    Value::Int(i) => *i,
-                    other => {
-                        return Err(datafusion::error::DataFusionError::Execution(format!(
-                            "_cypher_substring(): third argument must be an integer, got {:?}",
-                            other
-                        )));
-                    }
-                };
-                if length < 0 {
-                    return Err(datafusion::error::DataFusionError::Execution(
-                        "ArgumentError: NegativeIntegerArgument - substring length must be non-negative".to_string(),
-                    ));
-                }
-                (start_idx as i64 + length).min(len) as usize
-            } else {
-                len as usize
-            };
-
-            Ok(Value::String(chars[start_idx..end_idx].iter().collect()))
-        })
+cypher_scalar_udf! {
+    /// Create the `_cypher_substring` UDF for Cypher `substring()`.
+    ///
+    /// Uses 0-based indexing (Cypher convention):
+    /// - `substring("hello", 1)` → `"ello"`
+    /// - `substring("hello", 1, 3)` → `"ell"`
+    /// - Any null argument → `null`
+    create_cypher_substring_udf => CypherSubstringUdf,
+    name: "_cypher_substring",
+    signature: Signature::variadic_any(Volatility::Immutable),
+    return_type: DataType::Utf8,
+    invoke(args) {
+    invoke_cypher_udf(args, &DataType::Utf8, |vals| {
+        eval_substring(vals).map_err(to_datafusion_err)
+    })
     }
 }
 
@@ -6206,81 +5547,19 @@ impl ScalarUDFImpl for CypherSubstringUdf {
 // _cypher_split(str, delimiter) -> LargeBinary (CypherValue list of strings)
 // ============================================================================
 
-/// Create the `_cypher_split` UDF for Cypher `split()`.
-///
-/// - `split("one,two", ",")` → `["one", "two"]`
-/// - `split(null, ",")` → `null`
-pub fn create_cypher_split_udf() -> ScalarUDF {
-    ScalarUDF::new_from_impl(CypherSplitUdf::new())
-}
-
-#[derive(Debug)]
-struct CypherSplitUdf {
-    signature: Signature,
-}
-
-impl CypherSplitUdf {
-    fn new() -> Self {
-        Self {
-            signature: Signature::any(2, Volatility::Immutable),
-        }
-    }
-}
-
-impl_udf_eq_hash!(CypherSplitUdf);
-
-impl ScalarUDFImpl for CypherSplitUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "_cypher_split"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::LargeBinary)
-    }
-
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        invoke_cypher_udf(args, &DataType::LargeBinary, |vals| {
-            if vals.len() != 2 {
-                return Err(datafusion::error::DataFusionError::Execution(
-                    "_cypher_split(): requires exactly 2 arguments".to_string(),
-                ));
-            }
-            // Null propagation
-            if vals.iter().any(|v| v.is_null()) {
-                return Ok(Value::Null);
-            }
-            let s = match &vals[0] {
-                Value::String(s) => s.clone(),
-                other => {
-                    return Err(datafusion::error::DataFusionError::Execution(format!(
-                        "_cypher_split(): first argument must be a string, got {:?}",
-                        other
-                    )));
-                }
-            };
-            let delimiter = match &vals[1] {
-                Value::String(d) => d.clone(),
-                other => {
-                    return Err(datafusion::error::DataFusionError::Execution(format!(
-                        "_cypher_split(): second argument must be a string, got {:?}",
-                        other
-                    )));
-                }
-            };
-            let parts: Vec<Value> = s
-                .split(&delimiter)
-                .map(|p| Value::String(p.to_string()))
-                .collect();
-            Ok(Value::List(parts))
-        })
+cypher_scalar_udf! {
+    /// Create the `_cypher_split` UDF for Cypher `split()`.
+    ///
+    /// - `split("one,two", ",")` → `["one", "two"]`
+    /// - `split(null, ",")` → `null`
+    create_cypher_split_udf => CypherSplitUdf,
+    name: "_cypher_split",
+    signature: Signature::any(2, Volatility::Immutable),
+    return_type: DataType::LargeBinary,
+    invoke(args) {
+    invoke_cypher_udf(args, &DataType::LargeBinary, |vals| {
+        crate::expr_eval::eval_split(vals).map_err(to_datafusion_err)
+    })
     }
 }
 
@@ -6288,57 +5567,26 @@ impl ScalarUDFImpl for CypherSplitUdf {
 // _cypher_list_to_cv(list) -> LargeBinary (CypherValue)
 // ============================================================================
 
-/// Create the `_cypher_list_to_cv` UDF.
-///
-/// Wraps a native Arrow `List<T>` or `LargeList<T>` column as a `LargeBinary`
-/// CypherValue. Used by CASE/coalesce type coercion when branches have mixed
-/// `LargeList<T>` and `LargeBinary` types — since Arrow cannot cast between
-/// those types natively, we route through this UDF instead.
-pub fn create_cypher_list_to_cv_udf() -> ScalarUDF {
-    ScalarUDF::new_from_impl(CypherListToCvUdf::new())
-}
-
-#[derive(Debug)]
-struct CypherListToCvUdf {
-    signature: Signature,
-}
-
-impl CypherListToCvUdf {
-    fn new() -> Self {
-        Self {
-            signature: Signature::any(1, Volatility::Immutable),
+cypher_scalar_udf! {
+    /// Create the `_cypher_list_to_cv` UDF.
+    ///
+    /// Wraps a native Arrow `List<T>` or `LargeList<T>` column as a `LargeBinary`
+    /// CypherValue. Used by CASE/coalesce type coercion when branches have mixed
+    /// `LargeList<T>` and `LargeBinary` types — since Arrow cannot cast between
+    /// those types natively, we route through this UDF instead.
+    create_cypher_list_to_cv_udf => CypherListToCvUdf,
+    name: "_cypher_list_to_cv",
+    signature: Signature::any(1, Volatility::Immutable),
+    return_type: DataType::LargeBinary,
+    invoke(args) {
+    invoke_cypher_udf(args, &DataType::LargeBinary, |vals| {
+        if vals.len() != 1 {
+            return Err(datafusion::error::DataFusionError::Execution(
+                "_cypher_list_to_cv(): requires exactly 1 argument".to_string(),
+            ));
         }
-    }
-}
-
-impl_udf_eq_hash!(CypherListToCvUdf);
-
-impl ScalarUDFImpl for CypherListToCvUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "_cypher_list_to_cv"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::LargeBinary)
-    }
-
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        invoke_cypher_udf(args, &DataType::LargeBinary, |vals| {
-            if vals.len() != 1 {
-                return Err(datafusion::error::DataFusionError::Execution(
-                    "_cypher_list_to_cv(): requires exactly 1 argument".to_string(),
-                ));
-            }
-            Ok(vals[0].clone())
-        })
+        Ok(vals[0].clone())
+    })
     }
 }
 
@@ -6346,57 +5594,26 @@ impl ScalarUDFImpl for CypherListToCvUdf {
 // _cypher_scalar_to_cv(scalar) -> LargeBinary (CypherValue)
 // ============================================================================
 
-/// Create the `_cypher_scalar_to_cv` UDF.
-///
-/// Converts a native scalar column (Int64, Float64, Utf8, Boolean, etc.) to
-/// CypherValue-encoded LargeBinary. Used when coalesce has mixed native +
-/// LargeBinary args so all branches can be normalized to LargeBinary.
-/// SQL NULLs are preserved as SQL NULLs (not encoded as CypherValue::Null).
-pub fn create_cypher_scalar_to_cv_udf() -> ScalarUDF {
-    ScalarUDF::new_from_impl(CypherScalarToCvUdf::new())
-}
-
-#[derive(Debug)]
-struct CypherScalarToCvUdf {
-    signature: Signature,
-}
-
-impl CypherScalarToCvUdf {
-    fn new() -> Self {
-        Self {
-            signature: Signature::any(1, Volatility::Immutable),
+cypher_scalar_udf! {
+    /// Create the `_cypher_scalar_to_cv` UDF.
+    ///
+    /// Converts a native scalar column (Int64, Float64, Utf8, Boolean, etc.) to
+    /// CypherValue-encoded LargeBinary. Used when coalesce has mixed native +
+    /// LargeBinary args so all branches can be normalized to LargeBinary.
+    /// SQL NULLs are preserved as SQL NULLs (not encoded as CypherValue::Null).
+    create_cypher_scalar_to_cv_udf => CypherScalarToCvUdf,
+    name: "_cypher_scalar_to_cv",
+    signature: Signature::any(1, Volatility::Immutable),
+    return_type: DataType::LargeBinary,
+    invoke(args) {
+    invoke_cypher_udf(args, &DataType::LargeBinary, |vals| {
+        if vals.len() != 1 {
+            return Err(datafusion::error::DataFusionError::Execution(
+                "_cypher_scalar_to_cv(): requires exactly 1 argument".to_string(),
+            ));
         }
-    }
-}
-
-impl_udf_eq_hash!(CypherScalarToCvUdf);
-
-impl ScalarUDFImpl for CypherScalarToCvUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "_cypher_scalar_to_cv"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::LargeBinary)
-    }
-
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        invoke_cypher_udf(args, &DataType::LargeBinary, |vals| {
-            if vals.len() != 1 {
-                return Err(datafusion::error::DataFusionError::Execution(
-                    "_cypher_scalar_to_cv(): requires exactly 1 argument".to_string(),
-                ));
-            }
-            Ok(vals[0].clone())
-        })
+        Ok(vals[0].clone())
+    })
     }
 }
 
@@ -6404,71 +5621,40 @@ impl ScalarUDFImpl for CypherScalarToCvUdf {
 // _cypher_tail(list) -> LargeBinary (CypherValue)
 // ============================================================================
 
-/// Create the `_cypher_tail` UDF for Cypher `tail()`.
-///
-/// Returns all elements except the first element of a list.
-/// - `tail([1,2,3])` → `[2,3]`
-/// - `tail([1])` → `[]`
-/// - `tail([])` → `[]`
-/// - `tail(null)` → `null`
-pub fn create_cypher_tail_udf() -> ScalarUDF {
-    ScalarUDF::new_from_impl(CypherTailUdf::new())
-}
-
-#[derive(Debug)]
-struct CypherTailUdf {
-    signature: Signature,
-}
-
-impl CypherTailUdf {
-    fn new() -> Self {
-        Self {
-            signature: Signature::any(1, Volatility::Immutable),
+cypher_scalar_udf! {
+    /// Create the `_cypher_tail` UDF for Cypher `tail()`.
+    ///
+    /// Returns all elements except the first element of a list.
+    /// - `tail([1,2,3])` → `[2,3]`
+    /// - `tail([1])` → `[]`
+    /// - `tail([])` → `[]`
+    /// - `tail(null)` → `null`
+    create_cypher_tail_udf => CypherTailUdf,
+    name: "_cypher_tail",
+    signature: Signature::any(1, Volatility::Immutable),
+    return_type: DataType::LargeBinary,
+    invoke(args) {
+    invoke_cypher_udf(args, &DataType::LargeBinary, |vals| {
+        if vals.len() != 1 {
+            return Err(datafusion::error::DataFusionError::Execution(
+                "_cypher_tail(): requires exactly 1 argument".to_string(),
+            ));
         }
-    }
-}
-
-impl_udf_eq_hash!(CypherTailUdf);
-
-impl ScalarUDFImpl for CypherTailUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "_cypher_tail"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::LargeBinary)
-    }
-
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        invoke_cypher_udf(args, &DataType::LargeBinary, |vals| {
-            if vals.len() != 1 {
-                return Err(datafusion::error::DataFusionError::Execution(
-                    "_cypher_tail(): requires exactly 1 argument".to_string(),
-                ));
-            }
-            match &vals[0] {
-                Value::Null => Ok(Value::Null),
-                Value::List(l) => {
-                    if l.is_empty() {
-                        Ok(Value::List(vec![]))
-                    } else {
-                        Ok(Value::List(l[1..].to_vec()))
-                    }
+        match &vals[0] {
+            Value::Null => Ok(Value::Null),
+            Value::List(l) => {
+                if l.is_empty() {
+                    Ok(Value::List(vec![]))
+                } else {
+                    Ok(Value::List(l[1..].to_vec()))
                 }
-                other => Err(datafusion::error::DataFusionError::Execution(format!(
-                    "_cypher_tail(): expected list, got {:?}",
-                    other
-                ))),
             }
-        })
+            other => Err(datafusion::error::DataFusionError::Execution(format!(
+                "_cypher_tail(): expected list, got {:?}",
+                other
+            ))),
+        }
+    })
     }
 }
 
@@ -6476,64 +5662,33 @@ impl ScalarUDFImpl for CypherTailUdf {
 // _cypher_head(list) -> LargeBinary (CypherValue)
 // ============================================================================
 
-/// Create the `_cypher_head` UDF for Cypher `head()`.
-///
-/// Returns the first element of a list. Handles LargeBinary-encoded lists.
-/// - `head([1,2,3])` → `1`
-/// - `head([])` → `null`
-/// - `head(null)` → `null`
-pub fn create_cypher_head_udf() -> ScalarUDF {
-    ScalarUDF::new_from_impl(CypherHeadUdf::new())
-}
-
-#[derive(Debug)]
-struct CypherHeadUdf {
-    signature: Signature,
-}
-
-impl CypherHeadUdf {
-    fn new() -> Self {
-        Self {
-            signature: Signature::any(1, Volatility::Immutable),
+cypher_scalar_udf! {
+    /// Create the `_cypher_head` UDF for Cypher `head()`.
+    ///
+    /// Returns the first element of a list. Handles LargeBinary-encoded lists.
+    /// - `head([1,2,3])` → `1`
+    /// - `head([])` → `null`
+    /// - `head(null)` → `null`
+    create_cypher_head_udf => CypherHeadUdf,
+    name: "head",
+    signature: Signature::any(1, Volatility::Immutable),
+    return_type: DataType::LargeBinary,
+    invoke(args) {
+    invoke_cypher_udf(args, &DataType::LargeBinary, |vals| {
+        if vals.len() != 1 {
+            return Err(datafusion::error::DataFusionError::Execution(
+                "head(): requires exactly 1 argument".to_string(),
+            ));
         }
-    }
-}
-
-impl_udf_eq_hash!(CypherHeadUdf);
-
-impl ScalarUDFImpl for CypherHeadUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "head"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::LargeBinary)
-    }
-
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        invoke_cypher_udf(args, &DataType::LargeBinary, |vals| {
-            if vals.len() != 1 {
-                return Err(datafusion::error::DataFusionError::Execution(
-                    "head(): requires exactly 1 argument".to_string(),
-                ));
-            }
-            match &vals[0] {
-                Value::Null => Ok(Value::Null),
-                Value::List(l) => Ok(l.first().cloned().unwrap_or(Value::Null)),
-                other => Err(datafusion::error::DataFusionError::Execution(format!(
-                    "head(): expected list, got {:?}",
-                    other
-                ))),
-            }
-        })
+        match &vals[0] {
+            Value::Null => Ok(Value::Null),
+            Value::List(l) => Ok(l.first().cloned().unwrap_or(Value::Null)),
+            other => Err(datafusion::error::DataFusionError::Execution(format!(
+                "head(): expected list, got {:?}",
+                other
+            ))),
+        }
+    })
     }
 }
 
@@ -6541,64 +5696,33 @@ impl ScalarUDFImpl for CypherHeadUdf {
 // _cypher_last(list) -> LargeBinary (CypherValue)
 // ============================================================================
 
-/// Create the `_cypher_last` UDF for Cypher `last()`.
-///
-/// Returns the last element of a list. Handles LargeBinary-encoded lists.
-/// - `last([1,2,3])` → `3`
-/// - `last([])` → `null`
-/// - `last(null)` → `null`
-pub fn create_cypher_last_udf() -> ScalarUDF {
-    ScalarUDF::new_from_impl(CypherLastUdf::new())
-}
-
-#[derive(Debug)]
-struct CypherLastUdf {
-    signature: Signature,
-}
-
-impl CypherLastUdf {
-    fn new() -> Self {
-        Self {
-            signature: Signature::any(1, Volatility::Immutable),
+cypher_scalar_udf! {
+    /// Create the `_cypher_last` UDF for Cypher `last()`.
+    ///
+    /// Returns the last element of a list. Handles LargeBinary-encoded lists.
+    /// - `last([1,2,3])` → `3`
+    /// - `last([])` → `null`
+    /// - `last(null)` → `null`
+    create_cypher_last_udf => CypherLastUdf,
+    name: "last",
+    signature: Signature::any(1, Volatility::Immutable),
+    return_type: DataType::LargeBinary,
+    invoke(args) {
+    invoke_cypher_udf(args, &DataType::LargeBinary, |vals| {
+        if vals.len() != 1 {
+            return Err(datafusion::error::DataFusionError::Execution(
+                "last(): requires exactly 1 argument".to_string(),
+            ));
         }
-    }
-}
-
-impl_udf_eq_hash!(CypherLastUdf);
-
-impl ScalarUDFImpl for CypherLastUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "last"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::LargeBinary)
-    }
-
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        invoke_cypher_udf(args, &DataType::LargeBinary, |vals| {
-            if vals.len() != 1 {
-                return Err(datafusion::error::DataFusionError::Execution(
-                    "last(): requires exactly 1 argument".to_string(),
-                ));
-            }
-            match &vals[0] {
-                Value::Null => Ok(Value::Null),
-                Value::List(l) => Ok(l.last().cloned().unwrap_or(Value::Null)),
-                other => Err(datafusion::error::DataFusionError::Execution(format!(
-                    "last(): expected list, got {:?}",
-                    other
-                ))),
-            }
-        })
+        match &vals[0] {
+            Value::Null => Ok(Value::Null),
+            Value::List(l) => Ok(l.last().cloned().unwrap_or(Value::Null)),
+            other => Err(datafusion::error::DataFusionError::Execution(format!(
+                "last(): expected list, got {:?}",
+                other
+            ))),
+        }
+    })
     }
 }
 
@@ -6629,6 +5753,11 @@ fn cypher_value_cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
         (Value::String(l), Value::String(r)) => Some(l.cmp(r)),
         (Value::Bool(l), Value::Bool(r)) => Some(l.cmp(r)),
         (Value::List(l), Value::List(r)) => cypher_list_cmp(l, r),
+        // Temporals compare by their numeric representation, matching
+        // `expr_eval::cypher_partial_cmp`. Without this arm they fell through to
+        // `_ => None`, so a list of dates was incomparable on the UDF path only.
+        // Mismatched temporal types and Durations still yield `None`.
+        (Value::Temporal(l), Value::Temporal(r)) => crate::expr_eval::temporal_partial_cmp(l, r),
         _ => None, // Incomparable types
     }
 }
@@ -7916,87 +7045,25 @@ fn invoke_similarity_udf(
     })
 }
 
-/// Create the `similar_to` UDF for unified similarity scoring.
-pub fn create_similar_to_udf() -> ScalarUDF {
-    ScalarUDF::new_from_impl(SimilarToUdf::new())
-}
-
-#[derive(Debug)]
-struct SimilarToUdf {
-    signature: Signature,
-}
-
-impl SimilarToUdf {
-    fn new() -> Self {
-        Self {
-            signature: Signature::new(TypeSignature::VariadicAny, Volatility::Immutable),
-        }
+cypher_scalar_udf! {
+    /// Create the `similar_to` UDF for unified similarity scoring.
+    create_similar_to_udf => SimilarToUdf,
+    name: "similar_to",
+    signature: Signature::new(TypeSignature::VariadicAny, Volatility::Immutable),
+    return_type: DataType::Float64,
+    invoke(args) {
+    invoke_similarity_udf("similar_to", 2, args)
     }
 }
 
-impl_udf_eq_hash!(SimilarToUdf);
-
-impl ScalarUDFImpl for SimilarToUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "similar_to"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Float64)
-    }
-
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        invoke_similarity_udf("similar_to", 2, args)
-    }
-}
-
-/// Create the `vector_similarity` UDF (alias for similar_to with two vector args).
-pub fn create_vector_similarity_udf() -> ScalarUDF {
-    ScalarUDF::new_from_impl(VectorSimilarityUdf::new())
-}
-
-#[derive(Debug)]
-struct VectorSimilarityUdf {
-    signature: Signature,
-}
-
-impl VectorSimilarityUdf {
-    fn new() -> Self {
-        Self {
-            signature: Signature::new(TypeSignature::Any(2), Volatility::Immutable),
-        }
-    }
-}
-
-impl_udf_eq_hash!(VectorSimilarityUdf);
-
-impl ScalarUDFImpl for VectorSimilarityUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "vector_similarity"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Float64)
-    }
-
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        invoke_similarity_udf("vector_similarity", 2, args)
+cypher_scalar_udf! {
+    /// Create the `vector_similarity` UDF (alias for similar_to with two vector args).
+    create_vector_similarity_udf => VectorSimilarityUdf,
+    name: "vector_similarity",
+    signature: Signature::new(TypeSignature::Any(2), Volatility::Immutable),
+    return_type: DataType::Float64,
+    invoke(args) {
+    invoke_similarity_udf("vector_similarity", 2, args)
     }
 }
 
@@ -8017,45 +7084,14 @@ fn invoke_sparse_similarity_udf(args: ScalarFunctionArgs) -> DFResult<ColumnarVa
     })
 }
 
-/// Create the `sparse_similar_to` UDF for learned-sparse dot-product scoring.
-pub fn create_sparse_similar_to_udf() -> ScalarUDF {
-    ScalarUDF::new_from_impl(SparseSimilarToUdf::new())
-}
-
-#[derive(Debug)]
-struct SparseSimilarToUdf {
-    signature: Signature,
-}
-
-impl SparseSimilarToUdf {
-    fn new() -> Self {
-        Self {
-            signature: Signature::new(TypeSignature::Any(2), Volatility::Immutable),
-        }
-    }
-}
-
-impl_udf_eq_hash!(SparseSimilarToUdf);
-
-impl ScalarUDFImpl for SparseSimilarToUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "sparse_similar_to"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Float64)
-    }
-
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        invoke_sparse_similarity_udf(args)
+cypher_scalar_udf! {
+    /// Create the `sparse_similar_to` UDF for learned-sparse dot-product scoring.
+    create_sparse_similar_to_udf => SparseSimilarToUdf,
+    name: "sparse_similar_to",
+    signature: Signature::new(TypeSignature::Any(2), Volatility::Immutable),
+    return_type: DataType::Float64,
+    invoke(args) {
+    invoke_sparse_similarity_udf(args)
     }
 }
 

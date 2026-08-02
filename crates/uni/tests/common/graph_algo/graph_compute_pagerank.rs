@@ -438,13 +438,13 @@ async fn l3_project_needs_hostquery_too() -> anyhow::Result<()> {
 /// [`GraphComputePageRankProvider`] but publishes a **chosen** `df_composable`
 /// flag — so a test can register the *same* algorithm on the DataFusion path
 /// and the row-based fallback and compare (DF-2 / DF-3).
-struct DfFlagProvider {
+pub(crate) struct DfFlagProvider {
     inner: uni_plugin_builtin::algorithms::graph_compute::provider::GraphComputePageRankProvider,
     sig: uni_plugin::traits::algorithm::AlgorithmSignature,
 }
 
 impl DfFlagProvider {
-    fn new(df_composable: bool) -> Self {
+    pub(crate) fn new(df_composable: bool) -> Self {
         use uni_plugin::traits::algorithm::AlgorithmProvider as _;
         let inner =
             uni_plugin_builtin::algorithms::graph_compute::provider::GraphComputePageRankProvider::new();
@@ -468,7 +468,7 @@ impl uni_plugin::traits::algorithm::AlgorithmProvider for DfFlagProvider {
 
 /// A third-party plugin registering [`DfFlagProvider`] under an arbitrary
 /// namespaced name with a chosen `df_composable` flag.
-struct DfFlagPlugin {
+pub(crate) struct DfFlagPlugin {
     manifest: OnceLock<PluginManifest>,
     ns: &'static str,
     local: &'static str,
@@ -476,7 +476,7 @@ struct DfFlagPlugin {
 }
 
 impl DfFlagPlugin {
-    fn new(ns: &'static str, local: &'static str, df_composable: bool) -> Self {
+    pub(crate) fn new(ns: &'static str, local: &'static str, df_composable: bool) -> Self {
         Self {
             manifest: OnceLock::new(),
             ns,
@@ -683,6 +683,10 @@ async fn df4_multi_batch_provider_streams_every_batch() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Exercises the retiring scratch path on purpose: the isolation property it
+/// proves is inherited by the arena, and the test moves to `arena_*` when
+/// `scratch` is deleted at the next major (proposal §13.4).
+#[allow(deprecated)]
 #[tokio::test]
 async fn q3_scratch_graph_is_never_observable_by_the_store() -> anyhow::Result<()> {
     // Q-3 (proposal §7b / §15.5, live-store): a Mode B-seq scratch graph is
@@ -759,9 +763,15 @@ async fn q3_projected_reads_are_pinned_across_concurrent_commits() -> anyhow::Re
 
     let db = Uni::in_memory().build().await?;
     let _ = build_graph(&db).await?; // 4 nodes, 4 edges at T0
-    db.flush().await?; // land the seed in storage so the None-L0 projection sees it
+    db.flush().await?;
 
     // Project a read-only graph snapshot at T0 through the host bridge.
+    //
+    // The bridge carries a real L0 tier: a live storage view with none is the
+    // silent-stale-read shape and is now rejected. That is incidental to what
+    // this test asserts — the pinning below is a property of the *materialized*
+    // projection, so an L0-aware bridge exercises it identically (and the seed
+    // was flushed above, so L0 is empty at T0 either way).
     let storage = db.storage();
     let caps = CapabilitySet::from_iter_of([
         Capability::GraphCompute,
@@ -770,12 +780,18 @@ async fn q3_projected_reads_are_pinned_across_concurrent_commits() -> anyhow::Re
             scopes: Vec::new(),
         },
     ]);
-    let bridge = host_bridge_from_storage(storage, None, caps);
+    let writer = db.writer().expect("in-memory db has a writer");
+    let l0 = std::sync::Arc::new(uni_db::runtime::l0_manager::L0Manager::from_snapshot(
+        writer.l0_manager.get_current(),
+        writer.l0_manager.get_pending_flush(),
+    ));
+    let bridge = host_bridge_from_storage(storage, Some(l0), caps);
     let spec = GraphProjectionSpec {
         node_labels: vec!["Node".into()],
         edge_types: vec!["LINKS".into()],
         include_reverse: false,
         weight_property: None,
+        ..GraphProjectionSpec::default()
     };
     let proj0 = bridge.project_for_graph_compute(&spec).await?;
     let v0 = proj0.vertex_count();
@@ -804,5 +820,115 @@ async fn q3_projected_reads_are_pinned_across_concurrent_commits() -> anyhow::Re
         e0,
         "projection stays pinned to T0 edges"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn fail_closed_unscoped_projection_under_restricted_scope() -> anyhow::Result<()> {
+    // Issue #151 (WS-2): a guest granted a *narrow* HostQuery scope must not be
+    // able to project the whole graph by leaving node_labels/edge_types empty.
+    // The bridge rejects an unscoped projection under a restricted scope (0x804)
+    // instead of silently handing over every label. A `**`/`*` scope (the
+    // default grant) stays unrestricted, exercised by every other test here.
+    use uni_plugin::traits::algorithm::GraphProjectionSpec;
+    use uni_plugin_builtin::algorithms::bridge::host_bridge_from_storage;
+
+    let db = Uni::in_memory().build().await?;
+    let _ = build_graph(&db).await?; // labels are ":Node", edges ":LINKS"
+    db.flush().await?;
+
+    let storage = db.storage();
+    // A genuinely narrow scope: only labels/edge-types starting with "Person".
+    // The seeded graph has none, so the whole graph is out of scope.
+    let caps = CapabilitySet::from_iter_of([
+        Capability::GraphCompute,
+        Capability::HostQuery {
+            read_only: true,
+            scopes: vec!["Person".into()],
+        },
+    ]);
+    let bridge = host_bridge_from_storage(storage, None, caps);
+
+    // Unscoped spec (empty labels/edge_types = "all") is rejected fail-closed.
+    let unscoped = GraphProjectionSpec {
+        include_reverse: false,
+        ..GraphProjectionSpec::default()
+    };
+    let err = bridge
+        .project_for_graph_compute(&unscoped)
+        .await
+        .expect_err("unscoped projection under a restricted HostQuery scope must be rejected");
+    assert_eq!(err.code, 0x804, "fail-closed reject uses 0x804");
+
+    // A named label outside the granted scope is also rejected (pre-existing).
+    let out_of_scope = GraphProjectionSpec {
+        node_labels: vec!["Node".into()],
+        include_reverse: false,
+        ..GraphProjectionSpec::default()
+    };
+    let err2 = bridge
+        .project_for_graph_compute(&out_of_scope)
+        .await
+        .expect_err("a label outside the granted scope must be rejected");
+    assert_eq!(err2.code, 0x804);
+
+    Ok(())
+}
+
+/// A first-party provider rejects a `scopes` map instead of ignoring it.
+///
+/// `scopes` had to join `CONFIG_KEYS` so a scopes-only object is stripped from a
+/// guest's positional arguments — but that stripping applies to *every*
+/// algorithm, while only the guest loader adapters build the declared
+/// projections. Without this, `uni.algo.gc*` would accept a `scopes` map, project
+/// nothing, and run as though it had never been asked: the same silent-ignore
+/// the unscoped-projection change made loud.
+///
+/// Covering all three first-party providers here is the anti-drift device — a
+/// fourth one that forgets the check fails this test rather than shipping the
+/// silent behaviour.
+#[tokio::test]
+async fn first_party_providers_reject_named_scopes() -> anyhow::Result<()> {
+    let db = Uni::in_memory().build().await?;
+    let vid_a = build_graph(&db).await?;
+    let session = db.session();
+    let scopes = "scopes: {agg: {nodeLabels: ['Node'], edgeTypes: ['LINKS']}}";
+
+    for (label, query) in [
+        (
+            "uni.algo.gcpagerank",
+            format!(
+                "CALL uni.algo.gcpagerank({vid_a}, 0.85, \
+                 {{nodeLabels: ['Node'], edgeTypes: ['LINKS'], {scopes}}}) \
+                 YIELD nodeId, score RETURN nodeId"
+            ),
+        ),
+        (
+            "uni.algo.gcwalks",
+            format!(
+                "CALL uni.algo.gcwalks([{vid_a}], 2, 1, 1.0, 1.0, 7, \
+                 {{nodeLabels: ['Node'], edgeTypes: ['LINKS'], {scopes}}}) \
+                 YIELD walkId RETURN walkId"
+            ),
+        ),
+        (
+            "uni.algo.gcoverlap",
+            format!(
+                "CALL uni.algo.gcoverlap('count', 'adjacent', 0, \
+                 {{nodeLabels: ['Node'], edgeTypes: ['LINKS'], {scopes}}}) \
+                 YIELD sourceNodeId RETURN sourceNodeId"
+            ),
+        ),
+    ] {
+        let err = session
+            .query(&query)
+            .await
+            .expect_err("a fixed-algorithm provider must refuse named scopes");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not take named `scopes`"),
+            "{label} must name the reason it refuses, got: {msg}"
+        );
+    }
     Ok(())
 }

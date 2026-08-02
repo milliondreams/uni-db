@@ -159,8 +159,14 @@ fn parse_config(config_json: &str) -> Result<OverlapArgs, FnError> {
         PairSpec::AdjacentPairs
     };
 
-    let mut projection = GraphProjectionSpec::default();
+    // First-party provider: keep the ergonomic whole-graph default (G9 opt-in);
+    // a named nodeLabels/edgeTypes below still scopes it.
+    let mut projection = GraphProjectionSpec {
+        project_all: true,
+        ..GraphProjectionSpec::default()
+    };
     if let Some(serde_json::Value::Object(cfg)) = args.get(3) {
+        GraphProjectionSpec::reject_scopes(cfg, "uni.algo.gcoverlap")?;
         if let Some(labels) = cfg.get("nodeLabels").and_then(serde_json::Value::as_array) {
             projection.node_labels = labels
                 .iter()
@@ -218,8 +224,13 @@ impl AlgorithmProvider for GraphComputeOverlapProvider {
             let deadline_at = deadline_ms
                 .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
             // srcId/dstId are real data columns, so no expected-columns contract.
-            let mut session = AlgoSession::new(super::next_session_epoch(), budget, arena)
-                .with_deadline(deadline_at);
+            let mut session = AlgoSession::new(
+                super::next_session_epoch()
+                    .map_err(|e| DataFusionError::Execution(format!("gcoverlap: {e}")))?,
+                budget,
+                arena,
+            )
+            .with_deadline(deadline_at);
             let g = session.bind_graph(Arc::clone(&graph));
 
             let started = std::time::Instant::now();
@@ -229,8 +240,9 @@ impl AlgorithmProvider for GraphComputeOverlapProvider {
                     "uni.algo.gcoverlap",
                     started.elapsed().as_millis() as u64,
                     0,
-                    session.work_spent(),
-                    session.work_budget(),
+                    session.work_spent_units(),
+                    session.work_budget_units(),
+                    &session.trace_breadcrumbs(),
                 )
                 .map_or_else(
                     || DataFusionError::Execution(format!("gcoverlap: {e}")),

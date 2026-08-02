@@ -43,8 +43,8 @@ where
         match tokio::time::timeout(timeout, op()).await {
             Ok(Ok(res)) => return Ok(res),
             Ok(Err(e)) => {
-                // NotFound is permanent — the object won't appear after backoff.
-                if matches!(e, object_store::Error::NotFound { .. }) {
+                // Terminal errors describe a state backoff cannot change.
+                if is_terminal(&e) {
                     return Err(anyhow::Error::from(e));
                 }
                 last_err = anyhow!(e);
@@ -72,6 +72,44 @@ pub async fn get_with_timeout(
     retry_with_timeout(timeout, &msg, || store.get(path)).await
 }
 
+/// Returns `true` when retrying an object-store operation cannot help.
+///
+/// A terminal error describes a state the store will keep reporting: the object
+/// is absent, already present, fails a precondition, or the caller is not
+/// permitted. Retrying spends the whole backoff budget to arrive at the same
+/// answer — and in `ResilientObjectStore` it also charges a *system* failure
+/// against the circuit breaker for what is an application-level outcome.
+///
+/// Matching is on the **variant**, never on the rendered message. A store can
+/// wrap a transient failure in `Generic` with text that reads "not found" — a
+/// proxy returning a 404 HTML body, or an S3-compatible endpoint reporting a
+/// missing bucket. Substring matching calls those terminal and abandons a blip
+/// that would have healed; `tests/common/bugs/repro_id_allocator_substring_notfound.rs`
+/// pins the same defect one layer up.
+///
+/// `object_store::Error` is `#[non_exhaustive]`, so the wildcard is mandatory —
+/// this can never become a compile-time exhaustiveness check. It answers
+/// **retryable** deliberately: a bounded backoff before failing is the safe
+/// response to an unrecognised error, where declaring it terminal would abandon
+/// a recoverable operation immediately.
+#[must_use]
+pub fn is_terminal(err: &object_store::Error) -> bool {
+    use object_store::Error as E;
+    matches!(
+        err,
+        E::NotFound { .. }
+            | E::AlreadyExists { .. }
+            | E::Precondition { .. }
+            | E::NotModified { .. }
+            | E::PermissionDenied { .. }
+            | E::Unauthenticated { .. }
+            | E::NotSupported { .. }
+            | E::NotImplemented { .. }
+            | E::InvalidPath { .. }
+            | E::UnknownConfigurationKey { .. }
+    )
+}
+
 /// Returns `true` when an object-store read error is a permanent `NotFound`.
 ///
 /// Distinguishes "the object was never created" (empty result is correct) from
@@ -79,6 +117,13 @@ pub async fn get_with_timeout(
 /// `object_store::Error::NotFound` through `anyhow` (see `retry_with_timeout`),
 /// so a downcast that also matches the variant is reliable — transient errors
 /// are wrapped generically and never match.
+///
+/// Deliberately **narrower** than [`is_terminal`], and not implemented in terms
+/// of it. `is_terminal` answers "will a retry help?"; this answers "is the
+/// object absent?". Widening it to the whole terminal set would make a
+/// `PermissionDenied` or `Precondition` read as "absent", so every caller that
+/// substitutes a default on `is_not_found` would silently swallow a real
+/// failure — the fail-open shape this module exists to avoid.
 ///
 /// # Examples
 ///

@@ -55,6 +55,7 @@ SSI is on by default (`UniConfig.ssi_enabled = true`). Under SSI, concurrent rea
 - **Retry helpers.** `Session::transact_with_retry` re-runs a transaction closure when the commit fails with a retriable error, and `Session::execute_with_retry` is the single-statement convenience over it. The `is_retriable` classifier decides which errors trigger a retry — `SerializationConflict` is retriable, plain timeouts are not.
 - **`ssi_enabled` toggle.** Setting `UniConfig.ssi_enabled = false` reverts to the legacy single-writer last-write-wins (LWW) behavior, where concurrent writers silently overwrite each other rather than aborting. Leave it on unless you specifically need the old semantics.
 - **`commit_timeout`.** `UniConfig.commit_timeout` (default 5s) bounds how long a commit waits before failing, guarding against a likely deadlock or long-held lock.
+- **Cancellation.** `Transaction::cancel()` cancels work already in flight in the transaction — `execute`, `query`, `apply`, and Locy evaluated against the transaction — which fails with `UniError::Cancelled` (`UniCancelledError` in Python). The transaction's token is a child of the session's token at the time the transaction was opened, so `Session::cancel()` cascades to the transactions already open on it. `Transaction::cancellation_token()` hands out a clone for an external timeout task. Unlike `Session::cancel()`, which cancels its token and installs a fresh one, `Transaction::cancel()` cancels the transaction's token in place and never replaces it, so a clone taken after the fact still reads cancelled.
 
 ```rust
 use uni_db::{RetryOptions, Uni};
@@ -81,3 +82,22 @@ session
 # Ok(())
 # }
 ```
+
+## Scratch transactions — throwaway write isolation
+
+`Session::scratch()` opens a **write-isolated, transient** transaction for speculation you intend to throw away — a "what if I applied these writes?" that never touches durable state. It is the cheap sibling of a [fork](forks.md): a private L0 buffer layered over a pinned base with an in-memory id allocator, so it gives full **read-your-writes** (including edge traversal over what you just wrote) while its writes stay invisible to every other session.
+
+Two properties make it disposable by design:
+
+- **`commit()` is refused.** A scratch transaction cannot be committed — all of its writes are discarded when it drops. There is no way to accidentally persist speculation.
+- **It never advances the global id allocator.** Because it allocates ids in-memory over a pinned snapshot, opening thousands of scratch transactions in a loop leaves the durable database — its versions, its id high-water mark — completely unmoved.
+
+It costs about **~1 ms** (a pinned snapshot) versus roughly ~10 ms for a full Lance-branch fork, and does no branch / registry / WAL work. That makes thousands of speculative *open → write → read → discard* rollouts affordable — the intended use is per-iteration speculation in search, planning, and simulation loops.
+
+Choose by what the rollout needs:
+
+| Need | Use |
+|---|---|
+| Speculate with **writes**, then discard | `Session::scratch()` |
+| **Read-only** snapshot rollout | `Session::pin_to_version(snapshot_id)` (in-memory pin, ~1 ms — no branch) |
+| **Keep / promote** the result | A real [fork](forks.md) |

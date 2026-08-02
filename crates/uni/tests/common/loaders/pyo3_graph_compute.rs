@@ -106,8 +106,12 @@ async fn python_guest_ppr_via_call() -> anyhow::Result<()> {
     assert_eq!(outcome.plugin_id.as_str(), "ai.example.pygc");
 
     let session = db.session();
-    let query =
-        format!("CALL ai.example.pygc.ppr({vid_a}) YIELD nodeId, score RETURN nodeId, score");
+    // A guest projection must be scoped explicitly (G9): an unscoped guest CALL
+    // now fails loud instead of silently projecting the whole graph.
+    let query = format!(
+        "CALL ai.example.pygc.ppr({vid_a}, {{nodeLabels: ['Node'], edgeTypes: ['LINKS']}}) \
+         YIELD nodeId, score RETURN nodeId, score"
+    );
     let res = session.query(&query).await?;
     let rows = res.rows();
     assert_eq!(rows.len(), 4, "one score row per vertex");
@@ -197,7 +201,8 @@ async fn pyo3_deadline_honored() -> anyhow::Result<()> {
     let start = std::time::Instant::now();
     let err = session
         .query(&format!(
-            "CALL ai.example.pyspin.spin({vid_a}) YIELD nodeId, score RETURN nodeId"
+            "CALL ai.example.pyspin.spin({vid_a}, {{nodeLabels: ['Node'], edgeTypes: ['LINKS']}}) \
+             YIELD nodeId, score RETURN nodeId"
         ))
         .await
         .expect_err("a runaway spin guest must be interrupted, not hang");
@@ -221,9 +226,233 @@ async fn pyo3_deadline_honored() -> anyhow::Result<()> {
     // Worker survived: a normal CALL on the same plugin still works.
     let ok = session
         .query(&format!(
-            "CALL ai.example.pyspin.noop({vid_a}) YIELD nodeId, score RETURN nodeId, score"
+            "CALL ai.example.pyspin.noop({vid_a}, {{nodeLabels: ['Node'], edgeTypes: ['LINKS']}}) \
+             YIELD nodeId, score RETURN nodeId, score"
         ))
         .await?;
     assert_eq!(ok.rows().len(), 4, "worker must survive the interrupt");
+    Ok(())
+}
+
+/// A Python guest declaring two value columns, delivered both ways: one column
+/// per call, then the whole set in a single dict.
+const TWO_COLUMN_MODULE: &str = r#"
+db.set_plugin_id("ai.example.pymulti")
+db.set_version("0.1.0")
+
+@db.algorithm("percall", args=[], yields=["nodeId:int", "a:float", "b:float"])
+def percall(gc):
+    g = gc.graph()
+    gc.emit("a", gc.degrees(g, "out"))
+    gc.emit("b", gc.vertex_ids(g))
+
+@db.algorithm("batch", args=[], yields=["nodeId:int", "a:float", "b:float"])
+def batch(gc):
+    g = gc.graph()
+    gc.emit({"a": gc.degrees(g, "out"), "b": gc.vertex_ids(g)})
+"#;
+
+/// Both multi-column emit forms work from Python.
+///
+/// The per-call form is what every guest shim has always offered and was
+/// unsatisfiable for a two-column declaration; the dict form is the batch shim.
+#[tokio::test]
+async fn python_guest_emits_two_declared_columns() -> anyhow::Result<()> {
+    Python::initialize();
+    let db = Uni::in_memory().build().await?;
+    build_graph(&db).await?;
+
+    let loader = uni_plugin_pyo3::PythonPluginLoader::with_default_plugin_id("ai.example.pymulti");
+    let caps = CapabilitySet::from_iter_of([
+        Capability::Algorithm,
+        Capability::GraphCompute,
+        Capability::HostQuery {
+            read_only: true,
+            scopes: Vec::new(),
+        },
+    ]);
+    Python::attach(|py| {
+        db.load_python_plugin(py, &loader, TWO_COLUMN_MODULE, "ai.example.pymulti", &caps)
+            .expect("load_python_plugin succeeds")
+    });
+
+    let session = db.session();
+    for algo in ["percall", "batch"] {
+        let res = session
+            .query(&format!(
+                "CALL ai.example.pymulti.{algo}({{nodeLabels: ['Node'], edgeTypes: ['LINKS']}}) \
+                 YIELD nodeId, a, b RETURN nodeId, a, b"
+            ))
+            .await?;
+        assert_eq!(res.rows().len(), 4, "{algo}: one row per projected vertex");
+        for row in res.rows() {
+            let a: f64 = row.get("a")?;
+            let b: f64 = row.get("b")?;
+            assert!(
+                a.is_finite() && b.is_finite(),
+                "{algo}: both columns carry values"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A Python guest reading a pre-declared named scope, and crossing index spaces.
+///
+/// The PyO3 `graph_named` shipped with no end-to-end coverage, and its
+/// reachability tripwire filtered on `all_loaders()` — which excludes the
+/// host-supplied bucket — so deleting the method broke nothing in CI. That
+/// tripwire now covers the in-process bucket; this proves the method works.
+const SCOPES_MODULE: &str = r#"
+db.set_plugin_id("ai.example.pyscopes")
+db.set_version("0.1.0")
+
+@db.algorithm("layers", args=[], yields=["nodeId:int", "both:float"])
+def layers(gc):
+    g = gc.graph()
+    agg = gc.graph_named("agg")
+    a = gc.degrees(g, "out")
+    b = gc.degrees(agg, "out")
+    # `b` is keyed to `agg`; crossing index spaces needs a verified rekey.
+    moved = gc.rekey(b, g)
+    total = gc.ewise(a, moved, "add")
+    gc.free(a)
+    gc.free(b)
+    gc.free(moved)
+    gc.emit("both", total)
+"#;
+
+async fn build_two_layer_graph(db: &Uni) -> anyhow::Result<()> {
+    db.schema()
+        .label("Node")
+        .property("name", DataType::String)
+        .done()
+        .edge_type("LINKS", &["Node"], &["Node"])
+        .done()
+        .edge_type("SECOND", &["Node"], &["Node"])
+        .done()
+        .apply()
+        .await?;
+    let session = db.session();
+    let tx = session.tx().await?;
+    for name in ["A", "B", "C", "D"] {
+        tx.execute(&format!("CREATE (:Node {{name: '{name}'}})"))
+            .await?;
+    }
+    for (a, b) in [("A", "B"), ("B", "C"), ("C", "A"), ("A", "D")] {
+        tx.execute(&format!(
+            "MATCH (a:Node {{name: '{a}'}}), (b:Node {{name: '{b}'}}) CREATE (a)-[:LINKS]->(b)"
+        ))
+        .await?;
+    }
+    for (a, b) in [("A", "C"), ("C", "D")] {
+        tx.execute(&format!(
+            "MATCH (a:Node {{name: '{a}'}}), (b:Node {{name: '{b}'}}) CREATE (a)-[:SECOND]->(b)"
+        ))
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pyo3_guest_reads_a_named_scope() -> anyhow::Result<()> {
+    let db = Uni::in_memory().build().await?;
+    build_two_layer_graph(&db).await?;
+
+    let loader = uni_plugin_pyo3::PythonPluginLoader::with_default_plugin_id("ai.example.pyscopes");
+    let caps = CapabilitySet::from_iter_of([
+        Capability::Algorithm,
+        Capability::GraphCompute,
+        Capability::HostQuery {
+            read_only: true,
+            scopes: Vec::new(),
+        },
+    ]);
+    Python::attach(|py| {
+        db.load_python_plugin(py, &loader, SCOPES_MODULE, "ai.example.pyscopes", &caps)
+            .expect("load_python_plugin succeeds")
+    });
+
+    let res = db
+        .session()
+        .query(
+            "CALL ai.example.pyscopes.layers({\
+               nodeLabels: ['Node'], edgeTypes: ['LINKS'], \
+               scopes: {agg: {nodeLabels: ['Node'], edgeTypes: ['SECOND']}}\
+             }) YIELD nodeId, both RETURN nodeId, both",
+        )
+        .await?;
+    assert_eq!(res.rows().len(), 4, "one row per projected vertex");
+    let total: f64 = res
+        .rows()
+        .iter()
+        .map(|r| r.get::<f64>("both").unwrap_or(f64::NAN))
+        .sum();
+    assert!(
+        (total - 6.0).abs() < 1e-9,
+        "the scope must contribute its 2 SECOND edges on top of the primary's 4 \
+         LINKS edges, got {total}"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Yield types the emit path cannot assemble must be rejected at load
+// ---------------------------------------------------------------------------
+//
+// Companion to the rhai fixture's pair. The PyO3 loader mapped `yields` tokens
+// through the general type map, which also serves scalar UDFs and procedures
+// and so accepts `string`/`bool`. The algorithm emit channel is `Vec<f64>` per
+// column and `build_batch` handles exactly Int64/Float64, so such a declaration
+// registered cleanly and failed on every CALL with `0x862 unsupported emit
+// column type` — permanently broken, reported at the call site rather than at
+// the manifest.
+
+const BAD_YIELD_MODULE: &str = r#"
+db.set_plugin_id("ai.example.pybadyield")
+db.set_version("0.1.0")
+
+@db.algorithm("labelled", args=["int"], yields=["nodeId:int", "label:string"])
+def labelled(gc, source):
+    g = gc.graph()
+    d = gc.degrees(g, "out")
+    gc.emit("label", d)
+"#;
+
+#[tokio::test]
+async fn pyo3_string_yield_is_rejected_at_load() -> anyhow::Result<()> {
+    Python::initialize();
+    let db = Uni::in_memory().build().await?;
+    build_graph(&db).await?;
+
+    let loader =
+        uni_plugin_pyo3::PythonPluginLoader::with_default_plugin_id("ai.example.pybadyield");
+    let caps = CapabilitySet::from_iter_of([
+        Capability::Algorithm,
+        Capability::GraphCompute,
+        Capability::HostQuery {
+            read_only: true,
+            scopes: Vec::new(),
+        },
+    ]);
+
+    let msg = Python::attach(|py| {
+        db.load_python_plugin(
+            py,
+            &loader,
+            BAD_YIELD_MODULE,
+            "ai.example.pybadyield",
+            &caps,
+        )
+        .expect_err("a yield type the emit path cannot build must fail to load")
+        .to_string()
+    });
+
+    assert!(
+        msg.contains("string") && msg.contains("int or float"),
+        "the error must name the offending token and the buildable set, got: {msg}"
+    );
+
     Ok(())
 }

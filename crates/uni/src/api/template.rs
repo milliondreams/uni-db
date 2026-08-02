@@ -102,7 +102,7 @@ impl SessionTemplateBuilder {
     /// Rules are compiled eagerly so that `create()` only needs a cheap clone.
     pub fn rules(mut self, program: &str) -> Result<Self> {
         let temp_registry = Arc::new(std::sync::RwLock::new(self.rule_registry.clone()));
-        impl_locy::register_rules_on_registry(&temp_registry, program)?;
+        impl_locy::register_rules_on_registry(&temp_registry, program, &self.db.plugin_registry)?;
         self.rule_registry = temp_registry.read().unwrap().clone();
         Ok(self)
     }

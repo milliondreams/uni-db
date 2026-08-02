@@ -28,6 +28,7 @@ pub mod repro_11_compact_adjacency_empty_resurrect;
 pub mod repro_17_merge_l0_vector_tombstone_resurrect;
 pub mod repro_17_overlay_tombstone_ungated;
 pub mod repro_18_merge_l0_fts_tombstone_resurrect;
+pub mod repro_edge_props_lost_after_compaction;
 pub mod test_repro_compaction_empty_resurrect;
 
 // Correctness-scan Wave 1 repros (R4 MVCC batch version-ranking).
@@ -46,3 +47,15 @@ pub mod repro_05_06_temporal_missing_not_null;
 pub mod repro_04_adjacency_incoming_shadow;
 pub mod repro_10_id_allocator_persist_fail;
 pub mod repro_16_compact_vertices_concurrent_flush;
+pub mod repro_id_allocator_substring_notfound;
+
+// Tier 1.10a — object-store error classification (typed vs. substring), and the
+// classifier/attempt-budget ordering bug in ResilientObjectStore::retry.
+pub mod repro_resilient_stringly_classifier;
+
+// Tier 1.1 — the L1 main-edge property fallback read at HEAD while L0 and the
+// delta tier were bounded by the snapshot.
+pub mod repro_schemaless_edge_props_escape_pin;
+
+// Tier 1.2 — shadow-CSR retention grew unbounded in the number of warms.
+pub mod repro_shadow_csr_warm_retention;

@@ -276,7 +276,12 @@ fn run_program_to_stream<P: VertexProgram + 'static>(
 /// Parse the leading projection config shared by Pregel providers from a
 /// positional-JSON object at `args[obj_index]`.
 fn parse_spec(obj: Option<&serde_json::Map<String, serde_json::Value>>) -> GraphProjectionSpec {
-    let mut spec = GraphProjectionSpec::default();
+    // First-party providers keep the ergonomic whole-graph default (G9 opt-in);
+    // a named nodeLabels/edgeTypes below still scopes it.
+    let mut spec = GraphProjectionSpec {
+        project_all: true,
+        ..GraphProjectionSpec::default()
+    };
     let Some(cfg) = obj else {
         return spec;
     };

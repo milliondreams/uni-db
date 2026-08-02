@@ -21,6 +21,11 @@
 //! cargo bench --bench mode_b_seq_random_access
 //! ```
 
+// Measures the retiring `ScratchGraph` path on purpose: it is the evidence the
+// arena replaces it (proposal §12). Moves to the arena kernels when `scratch`
+// is deleted at the next major (§13.4).
+#![allow(deprecated)]
+
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 use uni_plugin_builtin::algorithms::graph_compute::scratch::ScratchGraph;
@@ -112,8 +117,13 @@ fn bench(c: &mut Criterion) {
     });
     group.finish();
     // The `json_abi_crossing / direct_host_baseline` time ratio is the per-op
-    // host-boundary overhead a compiled guest pays; Q-5's ≤ 10× bound is applied
-    // to the JIT'd-WASM-vs-host ratio once the WASM fixture arm is wired in.
+    // host-boundary overhead a compiled guest pays. The JIT'd-WASM arm that Q-5's
+    // ≤ 10× bound is actually applied to now lives in
+    // `crates/uni-plugin-wasm/benches/mode_b_seq_wasm.rs` — it drives the real
+    // `example-wasm-scratch` guest over this same walk, alongside this same host
+    // baseline in one process, and prints the gate verdict. It lives there rather
+    // than here because it needs wasmtime, whose compile cost uni-db deliberately
+    // keeps behind an opt-in feature.
 }
 
 criterion_group!(benches, bench);

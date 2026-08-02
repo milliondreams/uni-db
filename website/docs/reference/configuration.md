@@ -398,6 +398,12 @@ pub struct LocyConfig {
 | `deterministic_best_by` | bool | true | Deterministic tie-breaking for BEST BY |
 | `params` | map | empty | Named parameters bound to `$name` references |
 
+`max_iterations` is also the backstop for a recursive `FOLD` over an aggregate
+that is monotone but unbounded — `COUNT`, `MSUM` and `MCOUNT`, for example, are
+accepted in a recursive stratum but have no top element, so such a rule can run
+to the iteration cap instead of converging. (`COLLECT` is likewise unbounded but
+is assembled after the fixpoint, so it does not itself keep the loop iterating.)
+
 ---
 
 ## Query and Index Tuning

@@ -75,10 +75,25 @@ pub mod repro_config_path_plugin_registry;
 // Correctness-scan Wave 2 repros (L7 commit-timeout after durable point).
 pub mod repro_commit_timeout_after_durable;
 // Correctness-scan Wave 4 repro (fork-local index-kind collision).
+pub mod hash_index_range_quoting;
+pub mod map_projection_aggregate;
 pub mod repro_fork_index_kind_collision;
+pub mod shutdown_reaps_scratch_dir;
 pub mod test_issue_72_version_recovery;
 pub mod test_overflow_fix;
 pub mod test_python_repro;
 pub mod traverse_labels_after_flush;
 pub mod unwind_correlated_hash_index_pushdown;
 pub mod vlp_label_filter_after_flush;
+// `VERSION AS OF` reaching the planner un-unwrapped (explain/profile/cursor).
+pub mod repro_time_travel_explain_profile_cursor;
+// Tier 0 item 0.15: properties() empty for an unlabelled multi-label endpoint.
+pub mod repro_multi_label_endpoint_properties;
+// Tier 1.6: get_edge_type_info interpolated the type name into Cypher unquoted
+// and swallowed the resulting parse error as a count of 0.
+pub mod repro_edge_type_info_count;
+// Tier 1.4: the CHECK evaluator existed as two copies whose equality operators
+// had drifted, so bulk and tx disagreed on the same row.
+pub mod repro_tx_check_int_float;
+// Tier 1.5: the compile-time monotonicity oracle never consulted the registry.
+pub mod repro_registry_monotonicity_oracle;

@@ -49,6 +49,7 @@ default = ["wasmtime-runtime"]
 wasmtime-runtime = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:datafusion"]
 
 [dev-dependencies]
+criterion = { workspace = true }
 tokio = { workspace = true }
 # `wat` assembles minimal valid component-model WASM from text for
 # instantiation tests without committing binary fixtures.
@@ -60,3 +61,16 @@ datafusion = { workspace = true }
 # `load_as_plugin` bridge (tests/conformance_wasm.rs). No cycle: the conformance
 # crate depends on uni-plugin, not on this loader.
 uni-plugin-conformance = { workspace = true }
+
+# Mode B-seq perf gate — the JIT'd-WASM arm (plugin-compute proposal §14 Q1 / Q-5).
+# Lives here, not in uni-db's bench set, because it needs wasmtime and uni-db
+# deliberately gates the wasmtime compile cost behind an opt-in feature.
+[[bench]]
+name = "mode_b_seq_wasm"
+harness = false
+
+# Batched-descent MCTS through a real JIT'd guest — the #152 follow-up to the
+# Q-5 gate, measuring whether coarsened granularity brings a WASM guest in budget.
+[[bench]]
+name = "mcts_batched_wasm"
+harness = false

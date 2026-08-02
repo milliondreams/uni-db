@@ -15,7 +15,7 @@ use uni_cypher::locy_ast::RuleOutput;
 use uni_locy::types::CompiledCommand;
 use uni_locy::{
     CommandResult, CompiledProgram, DerivedFactSet, FactRow, LocyCompileError, LocyConfig,
-    LocyError, LocyStats, RuntimeWarning, compile,
+    LocyError, LocyStats, RuntimeWarning,
 };
 use uni_query::{QueryMetrics, QueryPlanner};
 
@@ -57,17 +57,16 @@ pub struct LocyRuleRegistry {
 /// that no longer parses or compiles.
 pub(crate) fn rebuild_registry_from_sources(
     sources: &[crate::api::locy_rule_catalog::RegisteredSource],
+    plugin_registry: &uni_plugin::PluginRegistry,
 ) -> Result<LocyRuleRegistry> {
+    let oracle = plugin_monotonicity_oracle(plugin_registry);
     let mut registry = LocyRuleRegistry::default();
     for src in sources {
         let ast = uni_cypher::parse_locy(&src.source).map_err(map_parse_error)?;
-        let compiled = if registry.rules.is_empty() {
-            compile(&ast).map_err(map_compile_error)?
-        } else {
-            let external_names: Vec<String> = registry.rules.keys().cloned().collect();
-            uni_locy::compile_with_external_rules(&ast, &external_names)
-                .map_err(map_compile_error)?
-        };
+        let external_names: Vec<String> = registry.rules.keys().cloned().collect();
+        let compiled =
+            uni_locy::compile_with_oracle(&ast, &HashMap::new(), &external_names, &oracle)
+                .map_err(map_compile_error)?;
         let base_id = registry.strata.len();
         let mut this_names: Vec<String> = Vec::with_capacity(compiled.rule_catalog.len());
         for (name, rule) in compiled.rule_catalog {
@@ -104,9 +103,10 @@ pub(crate) fn rebuild_registry_from_sources(
 pub(crate) fn build_locy_registry_from_persisted(
     sources: &[crate::api::locy_rule_catalog::RegisteredSource],
     skip_invalid: bool,
+    plugin_registry: &uni_plugin::PluginRegistry,
 ) -> Result<LocyRuleRegistry> {
     if !skip_invalid {
-        return rebuild_registry_from_sources(sources).map_err(|e| {
+        return rebuild_registry_from_sources(sources, plugin_registry).map_err(|e| {
             UniError::Internal(anyhow::anyhow!(
                 "a persisted Locy rule in catalog/locy_rules.json no longer compiles: {e}. \
                  Re-register the rule, or open with skip_invalid_locy_rules(true) to skip it."
@@ -121,7 +121,7 @@ pub(crate) fn build_locy_registry_from_persisted(
     for src in sources {
         let mut trial = good.clone();
         trial.push(src.clone());
-        match rebuild_registry_from_sources(&trial) {
+        match rebuild_registry_from_sources(&trial, plugin_registry) {
             Ok(_) => good.push(src.clone()),
             Err(e) => {
                 tracing::warn!(
@@ -133,7 +133,7 @@ pub(crate) fn build_locy_registry_from_persisted(
             }
         }
     }
-    rebuild_registry_from_sources(&good)
+    rebuild_registry_from_sources(&good, plugin_registry)
 }
 
 /// Registers a Locy program into a registry, rebuilding from sources.
@@ -152,6 +152,7 @@ pub(crate) fn build_locy_registry_from_persisted(
 pub(crate) fn register_rules_on_registry(
     registry_lock: &std::sync::RwLock<LocyRuleRegistry>,
     program: &str,
+    plugin_registry: &uni_plugin::PluginRegistry,
 ) -> Result<bool> {
     // Hold the WRITE lock across the whole read → compile → rebuild → assign so
     // concurrent register/remove calls serialize and cannot clobber each other's
@@ -168,7 +169,7 @@ pub(crate) fn register_rules_on_registry(
     // Discover the rule names this program defines so that any prior source
     // defining them is superseded — the last registration of a name wins, and
     // each name is owned by exactly one source (keeping `remove` unambiguous).
-    let new_names = compile_defined_names(program, &existing)?;
+    let new_names = compile_defined_names(program, &existing, plugin_registry)?;
 
     let mut kept: Vec<crate::api::locy_rule_catalog::RegisteredSource> =
         Vec::with_capacity(existing.len() + 1);
@@ -204,7 +205,7 @@ pub(crate) fn register_rules_on_registry(
         rule_names: new_names,
     });
 
-    let rebuilt = rebuild_registry_from_sources(&kept)?;
+    let rebuilt = rebuild_registry_from_sources(&kept, plugin_registry)?;
     *registry = rebuilt;
     Ok(true)
 }
@@ -221,17 +222,16 @@ pub(crate) fn register_rules_on_registry(
 fn compile_defined_names(
     program: &str,
     existing: &[crate::api::locy_rule_catalog::RegisteredSource],
+    plugin_registry: &uni_plugin::PluginRegistry,
 ) -> Result<Vec<String>> {
     let ast = uni_cypher::parse_locy(program).map_err(map_parse_error)?;
     let external: Vec<String> = existing
         .iter()
         .flat_map(|s| s.rule_names.iter().cloned())
         .collect();
-    let compiled = if external.is_empty() {
-        compile(&ast).map_err(map_compile_error)?
-    } else {
-        uni_locy::compile_with_external_rules(&ast, &external).map_err(map_compile_error)?
-    };
+    let oracle = plugin_monotonicity_oracle(plugin_registry);
+    let compiled = uni_locy::compile_with_oracle(&ast, &HashMap::new(), &external, &oracle)
+        .map_err(map_compile_error)?;
     let mut names: Vec<String> = compiled.rule_catalog.keys().cloned().collect();
     names.sort();
     Ok(names)
@@ -285,8 +285,9 @@ pub(crate) async fn evaluate_with_db_and_config(
     program: &str,
     config: &LocyConfig,
     rule_registry: &std::sync::RwLock<LocyRuleRegistry>,
+    cancel: crate::api::impl_query::CancelScope,
 ) -> Result<LocyResult> {
-    evaluate_with_db_and_config_capturing(db, program, config, rule_registry, None).await
+    evaluate_with_db_and_config_capturing(db, program, config, rule_registry, None, cancel).await
 }
 
 /// Like [`evaluate_with_db_and_config`], but optionally captures a structured
@@ -297,6 +298,7 @@ pub(crate) async fn evaluate_with_db_and_config_capturing(
     config: &LocyConfig,
     rule_registry: &std::sync::RwLock<LocyRuleRegistry>,
     profile_capture: Option<&Arc<std::sync::Mutex<Option<uni_query::LocyExecProfile>>>>,
+    cancel: crate::api::impl_query::CancelScope,
 ) -> Result<LocyResult> {
     // Compile with the given registry
     let ast = match uni_cypher::parse_locy(program) {
@@ -320,12 +322,15 @@ pub(crate) async fn evaluate_with_db_and_config_capturing(
             Some(registry.rules.keys().cloned().collect())
         }
     };
-    let mut compiled = if let Some(names) = external_names {
-        uni_locy::compile_with_external_rules_and_config(&ast, &names, config)
-            .map_err(map_compile_error)?
-    } else {
-        uni_locy::compile_with_config(&ast, config).map_err(map_compile_error)?
-    };
+    let oracle = plugin_monotonicity_oracle(&db.plugin_registry);
+    let mut compiled = uni_locy::compile_with_oracle_and_config(
+        &ast,
+        &HashMap::new(),
+        external_names.as_deref().unwrap_or(&[]),
+        config,
+        &oracle,
+    )
+    .map_err(map_compile_error)?;
 
     // Merge registered rules
     {
@@ -364,10 +369,25 @@ pub(crate) async fn evaluate_with_db_and_config_capturing(
         locy_l0,
         collect_derive: true,
         read_snapshot: None,
+        cancel,
     };
     engine
         .evaluate_compiled_capturing(compiled, config, profile_capture)
         .await
+}
+
+/// Build a monotonicity oracle backed by `registry`, falling back to the
+/// built-in `M*` contract.
+///
+/// Returned as an `impl Fn` borrowed for the call: `MonotonicityOracle<'a>` is
+/// `&'a dyn Fn(&str) -> Option<bool>`, so no `'static` bound, boxing or `Arc` is
+/// needed — `&oracle` coerces at the call site.
+pub(crate) fn plugin_monotonicity_oracle(
+    registry: &uni_plugin::PluginRegistry,
+) -> impl Fn(&str) -> Option<bool> + '_ {
+    move |name: &str| {
+        uni_query::query::df_graph::locy_fold::locy_monotonicity_verdict(registry, name)
+    }
 }
 
 /// Engine for evaluating Locy programs against a real database.
@@ -390,6 +410,14 @@ pub struct LocyEngine<'a> {
     /// the version-pinned L1 view instead of live state. `None` at session
     /// level or with SSI disabled (live reads — a safe no-op downstream).
     pub(crate) read_snapshot: Option<uni_store::runtime::SnapshotView>,
+    /// Cancellation scope for every Cypher statement this evaluation runs.
+    ///
+    /// Carries the enclosing session/transaction scope plus any per-call token
+    /// set via `LocyBuilder::cancellation_token`. Before this existed the
+    /// builder's setter wrote a field nothing ever read, so a caller that
+    /// cancelled a Locy query — which the Python bindings expose and call —
+    /// observed it run to completion.
+    pub(crate) cancel: crate::api::impl_query::CancelScope,
 }
 
 impl crate::api::Uni {
@@ -404,6 +432,7 @@ impl crate::api::Uni {
             locy_l0: None,
             collect_derive: true,
             read_snapshot: None,
+            cancel: crate::api::impl_query::CancelScope::default(),
         }
     }
 }
@@ -429,15 +458,17 @@ impl<'a> LocyEngine<'a> {
     ) -> Result<CompiledProgram> {
         let ast = uni_cypher::parse_locy(program).map_err(map_parse_error)?;
         let registry = self.db.locy_rule_registry.read().unwrap();
-        if registry.rules.is_empty() {
-            drop(registry);
-            uni_locy::compile_with_config(&ast, config).map_err(map_compile_error)
-        } else {
-            let external_names: Vec<String> = registry.rules.keys().cloned().collect();
-            drop(registry);
-            uni_locy::compile_with_external_rules_and_config(&ast, &external_names, config)
-                .map_err(map_compile_error)
-        }
+        let external_names: Vec<String> = registry.rules.keys().cloned().collect();
+        drop(registry);
+        let oracle = plugin_monotonicity_oracle(&self.db.plugin_registry);
+        uni_locy::compile_with_oracle_and_config(
+            &ast,
+            &HashMap::new(),
+            &external_names,
+            config,
+            &oracle,
+        )
+        .map_err(map_compile_error)
     }
 
     /// Compile and register a Locy program's rules for reuse.
@@ -570,7 +601,31 @@ impl<'a> LocyEngine<'a> {
     /// profiling enabled and the resulting [`uni_query::LocyExecProfile`] is
     /// stored into the slot for the caller (the `profile()` builder path) to
     /// read. `None` → zero profiling overhead.
+    /// Evaluate a compiled program, racing the whole evaluation against the
+    /// cancellation scope.
+    ///
+    /// The guard has to be here rather than deeper: the fixpoint runtime has no
+    /// cooperative cancellation check of its own, and a rule body evaluates
+    /// through the native/DataFusion stratum path without ever reaching
+    /// `execute_ast_internal_with_tx_l0`. Guarding only the Cypher statements
+    /// Locy dispatches therefore left the common case — a long-running
+    /// fixpoint — completely unguarded. This mirrors how the Cypher terminals
+    /// enforce cancellation: race the execution, do not rely on the inner
+    /// layers to poll a token.
     pub(crate) async fn evaluate_compiled_capturing(
+        &self,
+        compiled: CompiledProgram,
+        config: &LocyConfig,
+        profile_capture: Option<&Arc<std::sync::Mutex<Option<uni_query::LocyExecProfile>>>>,
+    ) -> Result<LocyResult> {
+        tokio::select! {
+            biased;
+            () = self.cancel.cancelled() => Err(UniError::Cancelled),
+            res = self.evaluate_compiled_capturing_inner(compiled, config, profile_capture) => res,
+        }
+    }
+
+    async fn evaluate_compiled_capturing_inner(
         &self,
         compiled: CompiledProgram,
         config: &LocyConfig,
@@ -794,6 +849,7 @@ impl<'a> LocyEngine<'a> {
             config.params.clone(),
             self.tx_l0_override.clone(),
             self.read_snapshot.clone(),
+            self.cancel.clone(),
         );
         // Propagate locy_l0 to the adapter for DERIVE/ASSUME/ABDUCE scoping.
         *native_ctx.locy_l0.lock().unwrap() = self.locy_l0.clone();
@@ -1039,6 +1095,9 @@ struct NativeExecutionAdapter<'a> {
     /// Stack of saved L0 states for nested fork/restore (ASSUME inside ASSUME).
     l0_save_stack:
         std::sync::Mutex<Vec<Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>>,
+    /// Cancellation scope, cloned from the `LocyEngine`, for the Cypher
+    /// statements command dispatch runs.
+    cancel: crate::api::impl_query::CancelScope,
 }
 
 impl<'a> NativeExecutionAdapter<'a> {
@@ -1055,6 +1114,7 @@ impl<'a> NativeExecutionAdapter<'a> {
         params: HashMap<String, Value>,
         tx_l0_override: Option<Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
         read_snapshot: Option<uni_store::runtime::SnapshotView>,
+        cancel: crate::api::impl_query::CancelScope,
     ) -> Self {
         Self {
             db,
@@ -1067,6 +1127,7 @@ impl<'a> NativeExecutionAdapter<'a> {
             read_snapshot,
             locy_l0: std::sync::Mutex::new(None),
             l0_save_stack: std::sync::Mutex::new(Vec::new()),
+            cancel,
         }
     }
 
@@ -1372,6 +1433,7 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
                     HashMap::new(),
                     self.db.config.clone(),
                     l0.clone(),
+                    self.cancel.clone(),
                 )
                 .await
         } else if let Some(ref tx_l0) = self.tx_l0_override {
@@ -1382,11 +1444,18 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
                     HashMap::new(),
                     self.db.config.clone(),
                     tx_l0.clone(),
+                    self.cancel.clone(),
                 )
                 .await
         } else {
             self.db
-                .execute_ast_internal(ast, "<locy>", HashMap::new(), self.db.config.clone())
+                .execute_ast_internal(
+                    ast,
+                    "<locy>",
+                    HashMap::new(),
+                    self.db.config.clone(),
+                    crate::api::impl_query::CancelScope::default(),
+                )
                 .await
         }
         .map_err(|e| LocyError::ExecutorError {
@@ -1418,6 +1487,7 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
                     params,
                     self.db.config.clone(),
                     l0.clone(),
+                    self.cancel.clone(),
                 )
                 .await
                 .map_err(|e| LocyError::ExecutorError {
@@ -1435,6 +1505,7 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
                     params,
                     self.db.config.clone(),
                     tx_l0.clone(),
+                    self.cancel.clone(),
                 )
                 .await
                 .map_err(|e| LocyError::ExecutorError {
@@ -1446,7 +1517,13 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
         // Standard path: mutations go through writer's global L0
         let before = self.db.get_mutation_count().await;
         self.db
-            .execute_ast_internal(ast, "<locy>", params, self.db.config.clone())
+            .execute_ast_internal(
+                ast,
+                "<locy>",
+                params,
+                self.db.config.clone(),
+                crate::api::impl_query::CancelScope::default(),
+            )
             .await
             .map_err(|e| LocyError::ExecutorError {
                 message: e.to_string(),
@@ -1502,6 +1579,7 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
             locy_l0,
             collect_derive: false,
             read_snapshot: None,
+            cancel: self.cancel.clone(),
         };
         let native_store = engine
             .run_strata_native(&strata_only, config)

@@ -125,7 +125,7 @@ YIELD KEY v, reliability
 
 **ProbabilityDomainViolation warning.** When MNOR or MPROD is used with non-literal arguments, the compiler emits a warning reminding you that inputs should be valid probabilities in [0, 1]. Literal constants (e.g., `MNOR(0.3)`) are checked at compile time and do not trigger the warning.
 
-**BEST BY rejection.** Monotonic folds (including MNOR and MPROD) are incompatible with `BEST BY` witness selection. The compiler rejects this combination with a `BestByWithMonotonicFold` error.
+**BEST BY rejection.** Declared lattice folds — MNOR and MPROD among them — are incompatible with `BEST BY` witness selection. The compiler rejects this combination with a `BestByWithMonotonicFold` error.
 
 **Input clamping.** At runtime, values outside [0, 1] are clamped before computation. This prevents NaN or negative results from bad data, but you should fix the upstream source rather than relying on clamping.
 

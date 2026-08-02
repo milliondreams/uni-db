@@ -206,8 +206,14 @@ fn parse_config(config_json: &str) -> Result<WalksArgs, FnError> {
         _ => 0,
     };
 
-    let mut spec = GraphProjectionSpec::default();
+    // First-party provider: keep the ergonomic whole-graph default (G9 opt-in);
+    // a named nodeLabels/edgeTypes below still scopes it.
+    let mut spec = GraphProjectionSpec {
+        project_all: true,
+        ..GraphProjectionSpec::default()
+    };
     if let Some(serde_json::Value::Object(cfg)) = args.get(6) {
+        GraphProjectionSpec::reject_scopes(cfg, "uni.algo.gcwalks")?;
         if let Some(labels) = cfg.get("nodeLabels").and_then(serde_json::Value::as_array) {
             spec.node_labels = labels
                 .iter()
@@ -273,8 +279,13 @@ impl AlgorithmProvider for GraphComputeWalksProvider {
             // Walks emit their own `nodeId` data column, so — unlike gcpagerank —
             // the session installs NO expected-columns contract (the host does
             // not prepend a `nodeId` here).
-            let mut session = AlgoSession::new(super::next_session_epoch(), budget, arena)
-                .with_deadline(deadline_at);
+            let mut session = AlgoSession::new(
+                super::next_session_epoch()
+                    .map_err(|e| DataFusionError::Execution(format!("gcwalks: {e}")))?,
+                budget,
+                arena,
+            )
+            .with_deadline(deadline_at);
             let g = session.bind_graph(Arc::clone(&graph));
 
             let started = std::time::Instant::now();
@@ -284,8 +295,9 @@ impl AlgorithmProvider for GraphComputeWalksProvider {
                     "uni.algo.gcwalks",
                     started.elapsed().as_millis() as u64,
                     0,
-                    session.work_spent(),
-                    session.work_budget(),
+                    session.work_spent_units(),
+                    session.work_budget_units(),
+                    &session.trace_breadcrumbs(),
                 )
                 .map_or_else(
                     || DataFusionError::Execution(format!("gcwalks: {e}")),

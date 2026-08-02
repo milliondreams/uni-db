@@ -186,3 +186,71 @@ async def test_async_session_template_builds_async_session():
 
     results = await session.query("MATCH (n:Person) RETURN n.name AS name")
     assert any(r["name"] == "Zoe" for r in results)
+
+
+# ---------------------------------------------------------------------------
+# Functional: cursor error-type parity
+# ---------------------------------------------------------------------------
+
+# A query that plans cleanly but fails during execution. The divisor comes from
+# an UNWIND list so there is no constant for the optimizer to fold away, and
+# `apply_int_arithmetic` raises rather than wrapping on integer div-by-zero.
+#
+# Note the cursor stream is single-shot: the whole plan executes inside the
+# first `next_batch()` poll, so the error arrives on the *first* row rather
+# than after the two successful divisions.
+_FAILING_QUERY = "UNWIND [1, 2, 0] AS d RETURN 10 / d AS r"
+
+
+def _sync_failing_cursor():
+    db = uni_db.UniBuilder.temporary().build()
+    return db.session().query_with(_FAILING_QUERY).cursor()
+
+
+async def _async_failing_cursor():
+    db = await uni_db.AsyncUniBuilder.temporary().build()
+    return await db.session().query_with(_FAILING_QUERY).cursor()
+
+
+def test_sync_cursor_raises_typed_error():
+    """Baseline: the sync cursor surfaces the typed `UniQueryError`."""
+    with pytest.raises(uni_db.UniQueryError):
+        _sync_failing_cursor().fetch_one()
+
+
+@pytest.mark.parametrize("method", ["fetch_one", "fetch_many", "aiter"])
+async def test_async_cursor_raises_same_error_class_as_sync(method):
+    """Async row-at-a-time reads must raise the same class the sync twin does.
+
+    `next_row_async` used to return `Result<_, String>`, which erased the
+    `UniError` variant; all three of its callers then had to invent a class and
+    settled on bare `RuntimeError`. That made `_retry.RETRIABLE_EXCEPTIONS` --
+    which matches by class -- unable to see a conflict raised through
+    `async for`, so a retriable transaction failure became permanent.
+
+    `fetch_all` is deliberately not covered here: it bypasses `next_row_async`
+    for `collect_remaining`, so it was already correct and would mask the bug.
+    """
+    cursor = await _async_failing_cursor()
+
+    with pytest.raises(uni_db.UniQueryError):
+        if method == "fetch_one":
+            await cursor.fetch_one()
+        elif method == "fetch_many":
+            await cursor.fetch_many(5)
+        else:
+            [row async for row in cursor]
+
+
+async def test_async_cursor_still_stops_iteration_when_exhausted():
+    """The `Ok(None)` arm must keep producing `StopAsyncIteration`.
+
+    Widening the error type must not disturb exhaustion signalling, which is
+    how `async for` terminates normally.
+    """
+    db = await uni_db.AsyncUniBuilder.temporary().build()
+    cursor = await db.session().query_with("UNWIND [1, 2] AS d RETURN d AS r").cursor()
+
+    rows = [row async for row in cursor]
+    assert [r["r"] for r in rows] == [1, 2]
+    assert await cursor.fetch_one() is None

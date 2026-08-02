@@ -22,12 +22,12 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use arrow_array::builder::{FixedSizeListBuilder, Float32Builder, ListBuilder};
 use arrow_array::{Array, Float32Array, RecordBatch, UInt64Array};
-use futures::TryStreamExt;
-use lancedb::DistanceType;
-use lancedb::index::Index;
-use lancedb::index::vector::{IvfHnswSqIndexBuilder, IvfPqIndexBuilder};
-use lancedb::query::{ExecutableQuery, QueryBase};
 use uni_common::muvera::{DEFAULT_FDE_SEED, FdeEncoder, FdeParams};
+use uni_store::backend::StorageBackend;
+use uni_store::backend::lance::LanceDbBackend;
+use uni_store::backend::types::{
+    DistanceMetric, FilterExpr, VectorIndexKind, VectorIndexParams, VectorQueryOpts,
+};
 
 /// Top-k for recall.
 const K: usize = 10;
@@ -65,57 +65,78 @@ async fn main() -> Result<()> {
 
     let tmp = tempfile::TempDir::new().context("temp dir")?;
     let uri = tmp.path().to_str().context("non-utf8 path")?;
-    let conn = lancedb::connect(uri).execute().await.context("connect")?;
+    let backend = LanceDbBackend::connect(uri, None)
+        .await
+        .context("connect")?;
 
     // no-index (Flat / brute force) — sanity (≈1.0) AND the latency baseline a
     // first-stage index must beat to be worth building.
-    let flat = build_table(&conn, "flat", &docs, dim).await?;
+    let flat = build_table(&backend, "flat", &docs, dim).await?;
     report(
         "no-index (Flat, exact)",
-        &avg_recall(&flat, &queries, &truth, None, None).await?,
+        &avg_recall(&backend, &flat, &queries, &truth, None, None).await?,
     );
 
     // IVF_PQ: the only config that cleared the recall gate (with refine). Sweep
     // nprobes to find the speed/recall operating point — a first-stage index only
     // earns its keep if recall stays >=0.95 at LOW nprobes (where it is fast).
-    let pq = build_table(&conn, "pq", &docs, dim).await?;
+    let pq = build_table(&backend, "pq", &docs, dim).await?;
     let nsub = pick_num_sub_vectors(dim);
-    pq.create_index(
-        &["vector"],
-        Index::IvfPq(
-            IvfPqIndexBuilder::default()
-                .distance_type(DistanceType::Cosine)
-                .num_partitions(N_PARTITIONS)
-                .num_sub_vectors(nsub),
-        ),
-    )
-    .execute()
-    .await
-    .context("IVF_PQ")?;
+    backend
+        .create_vector_index(
+            &pq,
+            "vector",
+            "pq_ivf",
+            VectorIndexParams {
+                kind: VectorIndexKind::IvfPq {
+                    num_partitions: N_PARTITIONS,
+                    num_sub_vectors: nsub,
+                    num_bits: 8,
+                },
+                metric: DistanceMetric::Cosine,
+            },
+        )
+        .await
+        .context("IVF_PQ")?;
     for np in [8usize, 16, 32, 64, 128, 256] {
         let label = format!("IVF_PQ+refine10 (np={np})");
         report(
             &label,
-            &avg_recall(&pq, &queries, &truth, Some(np), Some(10)).await?,
+            &avg_recall(&backend, &pq, &queries, &truth, Some(np), Some(10)).await?,
         );
     }
 
     // IVF_HNSW_SQ at full probing, for comparison.
-    let hnsw = build_table(&conn, "hnsw", &docs, dim).await?;
-    hnsw.create_index(
-        &["vector"],
-        Index::IvfHnswSq(
-            IvfHnswSqIndexBuilder::default()
-                .distance_type(DistanceType::Cosine)
-                .num_partitions(N_PARTITIONS),
-        ),
-    )
-    .execute()
-    .await
-    .context("IVF_HNSW_SQ")?;
+    let hnsw = build_table(&backend, "hnsw", &docs, dim).await?;
+    backend
+        .create_vector_index(
+            &hnsw,
+            "vector",
+            "hnsw_sq",
+            VectorIndexParams {
+                kind: VectorIndexKind::HnswSq {
+                    // Lance's HnswBuildParams::default(), which is what
+                    // lancedb's builder default resolved to.
+                    m: 20,
+                    ef_construction: 150,
+                    num_partitions: N_PARTITIONS,
+                },
+                metric: DistanceMetric::Cosine,
+            },
+        )
+        .await
+        .context("IVF_HNSW_SQ")?;
     report(
         "IVF_HNSW_SQ (np=256)",
-        &avg_recall(&hnsw, &queries, &truth, Some(N_PARTITIONS as usize), None).await?,
+        &avg_recall(
+            &backend,
+            &hnsw,
+            &queries,
+            &truth,
+            Some(N_PARTITIONS as usize),
+            None,
+        )
+        .await?,
     );
 
     println!(
@@ -146,24 +167,28 @@ async fn main() -> Result<()> {
         let fde_dim = params.fde_dim();
         let encoder = FdeEncoder::new(&params).map_err(|e| anyhow!("FDE encoder: {e}"))?;
         let name = format!("fde_{k_sim}_{reps}_{d_proj}");
-        let fde_table = build_fde_table(&conn, &name, &docs, &encoder, fde_dim).await?;
+        let fde_table = build_fde_table(&backend, &name, &docs, &encoder, fde_dim).await?;
         let nsub = pick_num_sub_vectors(fde_dim);
-        fde_table
-            .create_index(
-                &["fde"],
-                Index::IvfPq(
-                    IvfPqIndexBuilder::default()
-                        .distance_type(DistanceType::Dot)
-                        .num_partitions(N_PARTITIONS)
-                        .num_sub_vectors(nsub),
-                ),
+        backend
+            .create_vector_index(
+                &fde_table,
+                "fde",
+                "fde_ivf",
+                VectorIndexParams {
+                    kind: VectorIndexKind::IvfPq {
+                        num_partitions: N_PARTITIONS,
+                        num_sub_vectors: nsub,
+                        num_bits: 8,
+                    },
+                    metric: DistanceMetric::Dot,
+                },
             )
-            .execute()
             .await
             .context("MUVERA IVF_PQ over FDE")?;
         for &over in &[1usize, 2, 4, 8] {
             let retrieval_k = (K * over).max(K);
             let r = muvera_recall(
+                &backend,
                 &fde_table,
                 &docs,
                 &queries,
@@ -189,12 +214,12 @@ async fn main() -> Result<()> {
 
 /// Build a `{id, fde: FixedSizeList<Float32, fde_dim>}` table of document FDEs.
 async fn build_fde_table(
-    conn: &lancedb::Connection,
+    backend: &LanceDbBackend,
     name: &str,
     docs: &[Item],
     encoder: &FdeEncoder,
     fde_dim: usize,
-) -> Result<lancedb::Table> {
+) -> Result<String> {
     let ids = UInt64Array::from((0..docs.len() as u64).collect::<Vec<_>>());
     let mut fde = FixedSizeListBuilder::new(Float32Builder::new(), fde_dim as i32);
     for doc in docs {
@@ -209,10 +234,11 @@ async fn build_fde_table(
         ("fde", Arc::new(fde.finish()) as Arc<dyn Array>),
     ])
     .context("assemble FDE batch")?;
-    conn.create_table(name, vec![batch])
-        .execute()
+    backend
+        .create_table(name, vec![batch])
         .await
-        .with_context(|| format!("create FDE table {name}"))
+        .with_context(|| format!("create FDE table {name}"))?;
+    Ok(name.to_string())
 }
 
 /// Exact MaxSim of one query against one doc's tokens: `Σ_i max_j cos(q_i, d_j)`.
@@ -228,8 +254,10 @@ fn maxsim_one(query: &[Vec<f32>], doc: &[Vec<f32>]) -> f32 {
 }
 
 /// Mean recall@k and latency for MUVERA: FDE ANN over-fetch then exact MaxSim re-rank.
+#[allow(clippy::too_many_arguments)]
 async fn muvera_recall(
-    fde_table: &lancedb::Table,
+    backend: &LanceDbBackend,
+    fde_table: &str,
     docs: &[Item],
     queries: &[Item],
     truth: &[Vec<u64>],
@@ -243,7 +271,7 @@ async fn muvera_recall(
         let fq = encoder
             .encode_query(&q.tokens)
             .map_err(|e| anyhow!("encode_query: {e}"))?;
-        let cand = fde_ann_topk(fde_table, &fq, retrieval_k, nprobes).await?;
+        let cand = fde_ann_topk(backend, fde_table, &fq, retrieval_k, nprobes).await?;
         let mut scored: Vec<(u64, f32)> = cand
             .iter()
             .map(|&id| (id, maxsim_one(&q.tokens, &docs[id as usize].tokens)))
@@ -260,23 +288,25 @@ async fn muvera_recall(
 
 /// Single-vector ANN over the FDE column (Dot), returning candidate ids best-first.
 async fn fde_ann_topk(
-    table: &lancedb::Table,
+    backend: &LanceDbBackend,
+    table: &str,
     fde_query: &[f32],
     retrieval_k: usize,
     nprobes: Option<usize>,
 ) -> Result<Vec<u64>> {
-    let mut vq = table
-        .vector_search(fde_query.to_vec())?
-        .column("fde")
-        .distance_type(DistanceType::Dot)
-        .limit(retrieval_k);
-    if let Some(n) = nprobes {
-        vq = vq.nprobes(n);
-    }
-    let batches = vq
-        .execute()
-        .await?
-        .try_collect::<Vec<RecordBatch>>()
+    let batches: Vec<RecordBatch> = backend
+        .vector_search(
+            table,
+            "fde",
+            fde_query,
+            retrieval_k,
+            DistanceMetric::Dot,
+            FilterExpr::Literal(true),
+            VectorQueryOpts {
+                nprobes,
+                ..Default::default()
+            },
+        )
         .await?;
     let mut out: Vec<(u64, f32)> = Vec::new();
     for batch in &batches {
@@ -381,11 +411,11 @@ fn top_k_ids(ranked: Vec<(u64, f32)>) -> Vec<u64> {
 /// # Errors
 /// Returns an error if Arrow assembly or table creation fails.
 async fn build_table(
-    conn: &lancedb::Connection,
+    backend: &LanceDbBackend,
     name: &str,
     docs: &[Item],
     dim: usize,
-) -> Result<lancedb::Table> {
+) -> Result<String> {
     let ids = UInt64Array::from((0..docs.len() as u64).collect::<Vec<_>>());
     let mut vectors =
         ListBuilder::new(FixedSizeListBuilder::new(Float32Builder::new(), dim as i32));
@@ -401,10 +431,11 @@ async fn build_table(
         ("vector", Arc::new(vectors.finish()) as Arc<dyn Array>),
     ])
     .context("assemble batch")?;
-    conn.create_table(name, vec![batch])
-        .execute()
+    backend
+        .create_table(name, vec![batch])
         .await
-        .with_context(|| format!("create table {name}"))
+        .with_context(|| format!("create table {name}"))?;
+    Ok(name.to_string())
 }
 
 /// Mean `recall@k` and mean query latency (ms) over all queries for a config.
@@ -412,7 +443,8 @@ async fn build_table(
 /// # Errors
 /// Returns an error if any query fails to execute.
 async fn avg_recall(
-    table: &lancedb::Table,
+    backend: &LanceDbBackend,
+    table: &str,
     queries: &[Item],
     truth: &[Vec<u64>],
     nprobes: Option<usize>,
@@ -421,7 +453,7 @@ async fn avg_recall(
     let mut sum = 0.0;
     let start = std::time::Instant::now();
     for (q, t) in queries.iter().zip(truth) {
-        let got = query_topk(table, &q.tokens, nprobes, refine).await?;
+        let got = query_topk(backend, table, &q.tokens, nprobes, refine).await?;
         let tset: BTreeSet<u64> = t.iter().copied().collect();
         let hit = got.iter().filter(|id| tset.contains(id)).count();
         sum += hit as f64 / t.len() as f64;
@@ -435,30 +467,29 @@ async fn avg_recall(
 /// # Errors
 /// Returns an error if the query fails to build, execute, or decode.
 async fn query_topk(
-    table: &lancedb::Table,
+    backend: &LanceDbBackend,
+    table: &str,
     query: &[Vec<f32>],
     nprobes: Option<usize>,
     refine: Option<u32>,
 ) -> Result<Vec<u64>> {
-    let (first, rest) = query.split_first().ok_or_else(|| anyhow!("empty query"))?;
-    let mut vq = table.vector_search(first.clone())?;
-    for tok in rest {
-        vq = vq.add_query_vector(tok.clone())?;
+    if query.is_empty() {
+        return Err(anyhow!("empty query"));
     }
-    let mut vq = vq
-        .column("vector")
-        .distance_type(DistanceType::Cosine)
-        .limit(K);
-    if let Some(n) = nprobes {
-        vq = vq.nprobes(n);
-    }
-    if let Some(r) = refine {
-        vq = vq.refine_factor(r);
-    }
-    let batches = vq
-        .execute()
-        .await?
-        .try_collect::<Vec<RecordBatch>>()
+    let batches: Vec<RecordBatch> = backend
+        .multivector_search(
+            table,
+            "vector",
+            query,
+            K,
+            DistanceMetric::Cosine,
+            FilterExpr::Literal(true),
+            VectorQueryOpts {
+                nprobes,
+                refine_factor: refine,
+                ..Default::default()
+            },
+        )
         .await?;
 
     let mut out: Vec<(u64, f32)> = Vec::new();

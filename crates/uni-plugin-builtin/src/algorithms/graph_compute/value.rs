@@ -22,6 +22,8 @@
 
 use arrow_array::{Array, Float64Array, Int64Array};
 
+use super::handle::Handle;
+
 /// A logical element type for a [`Tensor`].
 ///
 /// v1 computes in `f64` regardless of tag (see module docs); the tag is retained
@@ -128,10 +130,24 @@ impl Scalar {
 /// assert_eq!(s.len(), 2);
 /// assert_eq!(s.iter().collect::<Vec<_>>(), vec![3, 7]);
 /// ```
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq)]
 pub struct VertexSet {
+    /// Which index space these slots belong to. See [`Origin`].
+    origin: Origin,
     words: Vec<u64>,
     capacity: usize,
+}
+
+impl PartialEq for VertexSet {
+    /// Compares membership only.
+    ///
+    /// Deliberately ignores [`Origin`]: two sets with the same members are the
+    /// same set, and a provenance difference is a fault the kernels report rather
+    /// than a difference in contents. Deriving this would have silently changed
+    /// the meaning of set equality when provenance landed.
+    fn eq(&self, other: &Self) -> bool {
+        self.capacity == other.capacity && self.words == other.words
+    }
 }
 
 impl VertexSet {
@@ -139,9 +155,23 @@ impl VertexSet {
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
+            origin: Origin::Untracked,
             words: vec![0; capacity.div_ceil(64)],
             capacity,
         }
+    }
+
+    /// Stamps the index space these slots belong to.
+    #[must_use]
+    pub fn with_origin(mut self, origin: Origin) -> Self {
+        self.origin = origin;
+        self
+    }
+
+    /// Returns the index space these slots belong to.
+    #[must_use]
+    pub fn origin(&self) -> Origin {
+        self.origin
     }
 
     /// Returns the slot capacity (the projection vertex count).
@@ -218,14 +248,18 @@ impl VertexSet {
     /// Applies `op` word-wise against `other`, producing a new set.
     ///
     /// # Panics
-    /// Panics on a capacity mismatch — sets from the same session always share
-    /// the projection vertex count, so a mismatch is a host programming error.
+    /// Panics on a capacity mismatch. Callers must check first — a session can
+    /// bind several graphs, so operands of different capacities are reachable
+    /// from guest input, and every set-algebra kernel guards this before calling.
     fn zip_with(&self, other: &VertexSet, op: impl Fn(u64, u64) -> u64) -> VertexSet {
         assert_eq!(
             self.capacity, other.capacity,
             "vertex-set capacity mismatch"
         );
         VertexSet {
+            // The result of combining two sets belongs to whichever space is
+            // known; the kernels reject a genuine mismatch before reaching here.
+            origin: self.origin.unify(other.origin),
             words: self
                 .words
                 .iter()
@@ -262,10 +296,30 @@ impl VertexSet {
 /// assert!(m.contains(2) && !m.contains(3));
 /// assert_eq!(m.iter().collect::<Vec<_>>(), vec![2, 5]);
 /// ```
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq)]
 pub struct EdgeSet(VertexSet);
 
+impl PartialEq for EdgeSet {
+    /// Compares membership only, like [`VertexSet`]'s.
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
 impl EdgeSet {
+    /// Stamps the index space these edge slots belong to.
+    #[must_use]
+    pub fn with_origin(mut self, origin: Origin) -> Self {
+        self.0 = self.0.with_origin(origin);
+        self
+    }
+
+    /// Returns the index space these edge slots belong to.
+    #[must_use]
+    pub fn origin(&self) -> Origin {
+        self.0.origin()
+    }
+
     /// Creates an empty edge mask able to hold edge indices `0..capacity`.
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
@@ -346,6 +400,70 @@ enum TensorBuf {
     I64(Int64Array),
 }
 
+/// Which index space a tensor's slots belong to.
+///
+/// Slot `i` of a `[V]` map means "the i-th vertex *of some projection*", and
+/// nothing in the value itself said which one — so two tensors from different
+/// graphs combined silently whenever their lengths coincided, computing correct
+/// arithmetic over two different vertex sets.
+///
+/// The graph [`Handle`] is the identity rather than a new id: it is what
+/// `bind_graph` already returns, and its generation makes recycling fail closed —
+/// free a graph, bind another into the same slot, and older tensors stop matching,
+/// which is right, because slot `i` now means a different vertex.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Origin {
+    /// Keyed to a bound projection's vertex or edge space.
+    Graph(Handle),
+    /// Keyed to a mutable arena's slot space, which is not any graph's.
+    ///
+    /// Distinct from [`Origin::Untracked`] on purpose: arena tensors are tagged
+    /// `Shape::V` while being slot-keyed, so without a separate origin a slot
+    /// list would combine happily with a real `[V]` map.
+    Arena(Handle),
+    /// No index space is known — the constructor default, before `with_origin`
+    /// stamps the real one.
+    ///
+    /// Every value kind now carries provenance, so this is unreachable from
+    /// guest code: it survives only as the pre-stamp default and as the
+    /// permissive element of [`Origin::unify`], which is what keeps a
+    /// mixed-provenance program working rather than failing on a value nothing
+    /// could have tagged.
+    #[default]
+    Untracked,
+}
+
+impl Origin {
+    /// Whether two operands may be combined.
+    ///
+    /// [`Origin::Untracked`] means *unknown*, not "a third space": it unifies
+    /// with anything. Treating it as a distinct value would reject ordinary
+    /// compositions — PageRank's teleport vector comes from `set_to_map`, and
+    /// sets carry no provenance, so every `ewise` against it would fail.
+    ///
+    /// Only two *known* and *different* spaces are incompatible.
+    #[must_use]
+    pub fn compatible_with(self, other: Origin) -> bool {
+        matches!(
+            (self, other),
+            (Origin::Untracked, _) | (_, Origin::Untracked)
+        ) || self == other
+    }
+
+    /// The more specific of two compatible origins.
+    ///
+    /// A result derived from a known space and an unknown one belongs to the
+    /// known space — that is what lets provenance survive a `set_to_map` hop
+    /// instead of decaying to `Untracked` at the first composition.
+    #[must_use]
+    pub fn unify(self, other: Origin) -> Origin {
+        match (self, other) {
+            (Origin::Untracked, o) | (o, Origin::Untracked) => o,
+            (a, _) => a,
+        }
+    }
+}
+
 /// A shaped, Arrow-backed per-vertex value map.
 ///
 /// v1 is [`Shape::V`] backed by a [`Float64Array`] by default; the exact
@@ -367,6 +485,7 @@ pub struct Tensor {
     shape: Shape,
     dtype: DType,
     buf: TensorBuf,
+    origin: Origin,
 }
 
 impl Tensor {
@@ -375,6 +494,7 @@ impl Tensor {
     pub fn from_f64(values: Vec<f64>) -> Self {
         Self {
             shape: Shape::V,
+            origin: Origin::Untracked,
             dtype: DType::F64,
             buf: TensorBuf::F64(Float64Array::from(values)),
         }
@@ -389,6 +509,7 @@ impl Tensor {
     pub fn from_f64_typed(values: Vec<f64>, dtype: DType) -> Self {
         Self {
             shape: Shape::V,
+            origin: Origin::Untracked,
             dtype,
             buf: TensorBuf::F64(Float64Array::from(values)),
         }
@@ -402,6 +523,7 @@ impl Tensor {
     pub fn from_i64(values: Vec<i64>) -> Self {
         Self {
             shape: Shape::V,
+            origin: Origin::Untracked,
             dtype: DType::I64,
             buf: TensorBuf::I64(Int64Array::from(values)),
         }
@@ -418,6 +540,7 @@ impl Tensor {
     pub fn from_f64_edge(values: Vec<f64>) -> Self {
         Self {
             shape: Shape::E,
+            origin: Origin::Untracked,
             dtype: DType::F64,
             buf: TensorBuf::F64(Float64Array::from(values)),
         }
@@ -438,9 +561,23 @@ impl Tensor {
     pub fn from_f64_shaped(values: Vec<f64>, shape: Shape) -> Self {
         Self {
             shape,
+            origin: Origin::Untracked,
             dtype: DType::F64,
             buf: TensorBuf::F64(Float64Array::from(values)),
         }
+    }
+
+    /// Returns the index space this tensor's slots belong to.
+    #[must_use]
+    pub fn origin(&self) -> Origin {
+        self.origin
+    }
+
+    /// Stamps the index space this tensor's slots belong to.
+    #[must_use]
+    pub fn with_origin(mut self, origin: Origin) -> Self {
+        self.origin = origin;
+        self
     }
 
     /// Returns the tensor shape (always [`Shape::V`] in v1).
@@ -550,6 +687,8 @@ impl Tensor {
 /// so a reduction can index per-vertex arrays directly.
 #[derive(Clone, Debug)]
 pub struct WalkMatrix {
+    /// Which index space the recorded slots belong to. See [`Origin`].
+    origin: Origin,
     walks: Vec<Vec<u32>>,
 }
 
@@ -557,7 +696,23 @@ impl WalkMatrix {
     /// Wraps a batch of slot-sequence walks.
     #[must_use]
     pub fn new(walks: Vec<Vec<u32>>) -> Self {
-        Self { walks }
+        Self {
+            origin: Origin::Untracked,
+            walks,
+        }
+    }
+
+    /// Stamps the index space the recorded slots belong to.
+    #[must_use]
+    pub fn with_origin(mut self, origin: Origin) -> Self {
+        self.origin = origin;
+        self
+    }
+
+    /// Returns the index space the recorded slots belong to.
+    #[must_use]
+    pub fn origin(&self) -> Origin {
+        self.origin
     }
 
     /// Returns the walks as slot sequences.
@@ -600,6 +755,7 @@ pub struct PairList {
     src: Vec<u32>,
     dst: Vec<u32>,
     val: Vec<f64>,
+    origin: Origin,
 }
 
 impl PairList {
@@ -613,7 +769,28 @@ impl PairList {
             src.len() == dst.len() && dst.len() == val.len(),
             "PairList columns must be equal length"
         );
-        Self { src, dst, val }
+        Self {
+            src,
+            dst,
+            val,
+            origin: Origin::Untracked,
+        }
+    }
+
+    /// Stamps the index space these `(src, dst)` slots are keyed to.
+    #[must_use]
+    pub fn with_origin(mut self, origin: Origin) -> Self {
+        self.origin = origin;
+        self
+    }
+
+    /// Returns the index space these `(src, dst)` slots are keyed to.
+    ///
+    /// `emit_pairs` translates both endpoint columns to external Vids through
+    /// this, not through the primary projection.
+    #[must_use]
+    pub fn origin(&self) -> Origin {
+        self.origin
     }
 
     /// Returns the source-slot column.

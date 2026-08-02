@@ -114,7 +114,12 @@ fn parse_config(config_json: &str) -> Result<ExpandConfig, FnError> {
             )
         })?;
 
-    let mut spec = GraphProjectionSpec::default();
+    // First-party providers keep the ergonomic whole-graph default (G9 opt-in);
+    // a named nodeLabels/edgeTypes below still scopes it.
+    let mut spec = GraphProjectionSpec {
+        project_all: true,
+        ..GraphProjectionSpec::default()
+    };
     let mut direction = Direction::Out;
     let mut min_level = 0_i64;
     let mut max_level = i64::MAX;

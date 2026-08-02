@@ -159,6 +159,7 @@ pub fn incomplete_tag_for(
     iterations: u64,
     work_charged: u64,
     work_budget: u64,
+    breadcrumbs: &[String],
 ) -> Option<String> {
     let reason = uni_common::GraphComputeIncompleteReason::from_error_code(err.code)?;
     Some(
@@ -171,6 +172,26 @@ pub fn incomplete_tag_for(
             work_budget,
         }
         .to_tagged_message(),
+    )
+    .map(|tagged| append_breadcrumbs(tagged, breadcrumbs))
+}
+
+/// Appends a handle-resolution trail after a tagged diagnostic.
+///
+/// Safe by construction: `GraphComputeIncomplete::from_tagged_message` uses a
+/// streaming deserializer that reads exactly one JSON value and stops, so a
+/// suffix does not disturb the typed round trip.
+///
+/// This is what carries the trace on a `Timeout` / `Exhausted` / `IterationLimit`
+/// abort — the shape where a guest loops on a wrong value until the meter runs
+/// out, which arrives with no handle history otherwise.
+fn append_breadcrumbs(tagged: String, breadcrumbs: &[String]) -> String {
+    if breadcrumbs.is_empty() {
+        return tagged;
+    }
+    format!(
+        "{tagged} [gc-trace, oldest first, epoch:kind:gen:slot — {}]",
+        breadcrumbs.join(" ")
     )
 }
 
@@ -192,6 +213,7 @@ pub fn incomplete_tag_after_guest(
     work_charged: u64,
     work_budget: u64,
     elapsed_ms: u64,
+    breadcrumbs: &[String],
 ) -> Option<String> {
     let reason = if deadline_elapsed {
         uni_common::GraphComputeIncompleteReason::Timeout
@@ -211,6 +233,7 @@ pub fn incomplete_tag_after_guest(
         }
         .to_tagged_message(),
     )
+    .map(|tagged| append_breadcrumbs(tagged, breadcrumbs))
 }
 
 /// Builds a `0x868` seed-not-in-projection error for an unmapped Vid.
@@ -232,4 +255,82 @@ pub fn emit_schema_mismatch(cause: impl Into<String>) -> FnError {
 #[must_use]
 pub fn wrap_fail_closed(cause: impl Into<String>) -> FnError {
     FnError::new(WRAP_FAIL_CLOSED, cause.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uni_common::{GraphComputeIncomplete, GraphComputeIncompleteReason};
+
+    fn crumbs() -> Vec<String> {
+        vec!["7:Tensor:1:0".to_string(), "7:VertexSet:1:3".to_string()]
+    }
+
+    /// The breadcrumb suffix rides an abort **without** breaking the typed round
+    /// trip that the query boundary depends on.
+    ///
+    /// This is the whole premise of appending after the tag rather than adding a
+    /// field: `from_tagged_message` uses a streaming deserializer that reads one
+    /// JSON value and stops. That property was asserted only in a doc comment —
+    /// so nothing would have caught a future switch to `serde_json::from_str`,
+    /// which rejects trailing input and would have silently downgraded every
+    /// traced abort to an untyped execution error.
+    #[test]
+    fn a_traced_abort_still_round_trips_to_a_typed_outcome() {
+        let msg = incomplete_tag_for(
+            &budget_exhausted("meter drained"),
+            "my.algo",
+            42,
+            7,
+            1_000,
+            1_000,
+            &crumbs(),
+        )
+        .expect("0x865 is an incomplete outcome");
+
+        assert!(msg.contains("gc-trace"), "the trail must ride the abort");
+        assert!(
+            msg.contains("7:VertexSet:1:3"),
+            "crumbs must survive: {msg}"
+        );
+
+        let back = GraphComputeIncomplete::from_tagged_message(&msg)
+            .expect("the suffix must not disturb the typed round trip");
+        assert_eq!(back.reason, GraphComputeIncompleteReason::Exhausted);
+        assert_eq!(back.algorithm, "my.algo");
+        assert_eq!(back.iterations, 7);
+        assert_eq!(back.work_charged, 1_000);
+    }
+
+    /// The same for the sandboxed-guest path, which infers the reason host-side.
+    #[test]
+    fn a_traced_guest_abort_round_trips_too() {
+        let msg = incomplete_tag_after_guest("guest.algo", true, 3, 10, 55, &crumbs())
+            .expect("an elapsed deadline is a Timeout");
+        assert!(msg.contains("gc-trace"), "the trail must ride the abort");
+        let back =
+            GraphComputeIncomplete::from_tagged_message(&msg).expect("typed round trip survives");
+        assert_eq!(back.reason, GraphComputeIncompleteReason::Timeout);
+        assert_eq!(back.elapsed_ms, 55);
+    }
+
+    /// No trail, no suffix — the untraced message stays byte-identical.
+    #[test]
+    fn an_untraced_abort_is_unchanged() {
+        let with = incomplete_tag_for(&timeout(), "a", 1, 2, 3, 4, &[]).expect("0x867");
+        assert!(!with.contains("gc-trace"), "no crumbs, no suffix: {with}");
+    }
+
+    /// An ordinary fault is not an incomplete outcome, traced or not.
+    #[test]
+    fn a_handle_fault_is_not_an_incomplete_outcome() {
+        assert!(
+            incomplete_tag_for(&stale_handle(), "a", 1, 2, 3, 4, &crumbs()).is_none(),
+            "0x860 must report verbatim rather than as a §5.2 outcome"
+        );
+        assert!(
+            incomplete_tag_after_guest("a", false, 3, 10, 1, &crumbs()).is_none(),
+            "an un-drained budget with no deadline is an ordinary guest fault"
+        );
+    }
 }

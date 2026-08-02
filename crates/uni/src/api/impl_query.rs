@@ -102,7 +102,15 @@ pub(crate) fn into_query_error(e: impl std::fmt::Display, cypher: &str) -> UniEr
 /// TypeError messages from UDF execution become `UniError::Type` (Runtime phase).
 /// ConstraintVerificationFailed messages become `UniError::Constraint` (Runtime phase).
 /// All other executor errors remain `UniError::Query`.
-fn into_execution_error(e: impl std::fmt::Display, cypher: &str) -> UniError {
+///
+/// `timeout` is the effective `query_timeout` for the statement. The lower
+/// layers signal an elapsed deadline with a bare `anyhow!("Query timed out")`
+/// and cannot know the budget they blew, so it is reattached here.
+fn into_execution_error(
+    e: impl std::fmt::Display,
+    cypher: &str,
+    timeout: std::time::Duration,
+) -> UniError {
     let msg = normalize_error_message(&e.to_string(), cypher);
     if let Some(detail) = uni_common::GraphComputeIncomplete::from_tagged_message(&msg) {
         UniError::GraphComputeIncomplete {
@@ -111,10 +119,7 @@ fn into_execution_error(e: impl std::fmt::Display, cypher: &str) -> UniError {
     } else if msg.contains("Query cancelled") {
         UniError::Cancelled
     } else if msg.contains("Query timed out") {
-        UniError::Query {
-            message: "Query timed out".to_string(),
-            query: Some(cypher.to_string()),
-        }
+        query_timed_out_error(timeout)
     } else if msg.contains("Query exceeded memory limit") {
         UniError::Query {
             message: msg,
@@ -137,9 +142,11 @@ fn into_execution_error(e: impl std::fmt::Display, cypher: &str) -> UniError {
 
 /// Map a streaming-execution error into the appropriate `UniError`.
 ///
-/// The streaming cursor paths cannot encounter cancellation or timeout (those
-/// are enforced around the eager `execute` call), so this is the
-/// [`into_execution_error`] classification minus those two arms.
+/// This is the [`into_execution_error`] classification minus its cancellation
+/// and timeout arms. Those are still not reachable *here* — the cursor's own
+/// guard in [`UniInner::build_guarded_cursor`] raises them around the stream
+/// rather than letting the executor surface them through this function — so
+/// there is nothing for those two arms to match.
 fn into_stream_error(e: impl std::fmt::Display, cypher: &str) -> UniError {
     let msg = normalize_error_message(&e.to_string(), cypher);
     if let Some(detail) = uni_common::GraphComputeIncomplete::from_tagged_message(&msg) {
@@ -158,6 +165,26 @@ fn into_stream_error(e: impl std::fmt::Display, cypher: &str) -> UniError {
             message: msg,
             query: Some(cypher.to_string()),
         }
+    }
+}
+
+/// Peel a `VERSION AS OF` / `TIMESTAMP AS OF` wrapper off a parsed query.
+///
+/// Resolving the spec is the API layer's responsibility: both
+/// `QueryPlanner::plan_with_scope` and the expression rewriter declare a
+/// `Query::TimeTravel` that reaches them `unreachable!`, since neither can
+/// open a snapshot. Every terminal that parses Cypher must therefore split
+/// first and re-dispatch against a pinned instance.
+///
+/// This exists as a named function rather than an inline `match` because it
+/// was inlined at two call sites and simply absent from three others, and the
+/// three that omitted it panicked.
+fn split_time_travel(
+    ast: uni_cypher::ast::Query,
+) -> (uni_cypher::ast::Query, Option<uni_query::TimeTravelSpec>) {
+    match ast {
+        uni_cypher::ast::Query::TimeTravel { query, spec } => (*query, Some(spec)),
+        other => (other, None),
     }
 }
 
@@ -210,10 +237,132 @@ fn rows_for_results(
         .collect()
 }
 
+/// Coarse in-memory size estimate for a result batch: a per-value size plus a
+/// fixed 64-byte overhead.
+///
+/// Shared by the materializing and cursor paths so the two cannot drift — the
+/// cursor previously had no accounting at all, and a second copy of this
+/// formula would have let the same query be accepted by one path and rejected
+/// by the other.
+fn estimate_result_bytes(results: &[HashMap<String, ApiValue>]) -> usize {
+    results
+        .iter()
+        .map(|row| {
+            row.values()
+                .map(|v| std::mem::size_of_val(v) + 64)
+                .sum::<usize>()
+        })
+        .sum()
+}
+
+/// The error both paths raise when `max_query_memory` is exceeded.
+fn memory_limit_error(estimated_bytes: usize, max_mem: usize, cypher: &str) -> UniError {
+    UniError::Query {
+        message: format!(
+            "Query exceeded memory limit ({estimated_bytes} bytes > {max_mem} byte limit)"
+        ),
+        query: Some(cypher.to_string()),
+    }
+}
+
+/// The error every path raises when `query_timeout` elapses.
+///
+/// `UniError::Timeout`, not a `Query` carrying the words "Query timed out":
+/// an elapsed deadline is exactly what the typed variant exists for, it carries
+/// the budget that was exceeded, and the bindings map it to a dedicated
+/// `UniTimeoutError`. The transaction builder's own timeout wrapper has always
+/// produced this variant; the session surface used to disagree, so the same
+/// condition surfaced as two different classes depending on which terminal the
+/// caller reached for.
+fn query_timed_out_error(timeout: std::time::Duration) -> UniError {
+    UniError::Timeout {
+        timeout_ms: timeout.as_millis() as u64,
+    }
+}
+
+/// The error the cursor path raises when its cancellation token fires.
+///
+/// `UniError::Cancelled`, not a generic `Query` — `into_execution_error`
+/// already classifies a cancelled execution that way, and the bindings map it
+/// to a dedicated `UniCancelledError`. Rendering it as `Query` would collapse
+/// it into the same class as every other query failure, which is the exact
+/// defect fixed on the async cursor in the preceding commit.
+fn query_cancelled_error() -> UniError {
+    UniError::Cancelled
+}
+
+/// The cancellation sources a single statement executes under.
+///
+/// uni already scopes cancellation hierarchically — a forked session's token is
+/// a child of its parent's, and a `Transaction`'s is a child of its session's —
+/// so cancelling an outer scope is meant to abort everything running inside it.
+/// A caller may additionally attach a token to one statement through
+/// `.cancellation_token()`.
+///
+/// Those two are independent `CancellationToken`s, and `tokio_util` has no
+/// combinator for "whichever fires first". Merging them would take a spawned
+/// linker task plus a drop guard on every statement, so instead the places that
+/// actually enforce cancellation await both directly.
+///
+/// **The guard is authoritative, the executor's token is an optimisation.**
+/// `Executor::set_cancellation_token` accepts exactly one token and only feeds
+/// `GraphContext::check_timeout`, which fires solely where an operator happens
+/// to call it — no scan/join/traverse plan reaches one. It is worth setting for
+/// the long-running operators that *do* check (traverse, shortest-path,
+/// vector-KNN, procedure calls), but correctness comes from
+/// [`Self::cancelled`], which every terminal races its execution against.
+#[derive(Clone, Default)]
+pub(crate) struct CancelScope {
+    /// The enclosing session or transaction scope.
+    scope: Option<tokio_util::sync::CancellationToken>,
+    /// A token attached to this one statement by the caller.
+    caller: Option<tokio_util::sync::CancellationToken>,
+}
+
+impl CancelScope {
+    pub(crate) fn new(
+        scope: Option<tokio_util::sync::CancellationToken>,
+        caller: Option<tokio_util::sync::CancellationToken>,
+    ) -> Self {
+        Self { scope, caller }
+    }
+
+    /// Resolve as soon as any source is cancelled; pend forever if there are
+    /// none, so callers can `select!` on it unconditionally.
+    pub(crate) async fn cancelled(&self) {
+        match (&self.scope, &self.caller) {
+            (Some(scope), Some(caller)) => {
+                tokio::select! {
+                    _ = scope.cancelled() => {}
+                    _ = caller.cancelled() => {}
+                }
+            }
+            (Some(token), None) | (None, Some(token)) => token.cancelled().await,
+            (None, None) => std::future::pending().await,
+        }
+    }
+
+    /// Best-effort token for the executor's in-operator checks.
+    ///
+    /// Prefers the caller's, which is scoped to this statement; the enclosing
+    /// scope's token outlives it and would leave the executor holding a token
+    /// for work it no longer runs. Only one can be installed — see the type
+    /// docs for why that is an optimisation rather than the enforcement point.
+    fn executor_token(&self) -> Option<tokio_util::sync::CancellationToken> {
+        self.caller.clone().or_else(|| self.scope.clone())
+    }
+
+    /// Install the best-effort token on an executor.
+    pub(crate) fn install(&self, executor: &mut uni_query::Executor) {
+        if let Some(token) = self.executor_token() {
+            executor.set_cancellation_token(token);
+        }
+    }
+}
+
 /// Reject a result set whose estimated in-memory size exceeds `max_mem` bytes.
 ///
-/// A `max_mem` of `0` disables the limit. The estimate is a coarse per-value
-/// size plus a fixed 64-byte overhead, matching the historical accounting.
+/// A `max_mem` of `0` disables the limit.
 fn enforce_memory_limit(
     results: &[HashMap<String, ApiValue>],
     max_mem: usize,
@@ -222,21 +371,9 @@ fn enforce_memory_limit(
     if max_mem == 0 {
         return Ok(());
     }
-    let estimated_bytes: usize = results
-        .iter()
-        .map(|row| {
-            row.values()
-                .map(|v| std::mem::size_of_val(v) + 64)
-                .sum::<usize>()
-        })
-        .sum();
+    let estimated_bytes = estimate_result_bytes(results);
     if estimated_bytes > max_mem {
-        return Err(UniError::Query {
-            message: format!(
-                "Query exceeded memory limit ({estimated_bytes} bytes > {max_mem} byte limit)"
-            ),
-            query: Some(cypher.to_string()),
-        });
+        return Err(memory_limit_error(estimated_bytes, max_mem, cypher));
     }
     Ok(())
 }
@@ -309,20 +446,88 @@ impl crate::api::UniInner {
         if let Some(w) = &self.writer {
             executor.set_writer(w.clone());
         }
+        // A read-only open has no writer but does carry the WAL-replayed L0
+        // (`UniInner::l0_manager`); without this the executor's `get_context`
+        // returns `None` and every read on the session is L0-blind.
+        if let Some(m) = &self.l0_manager {
+            executor.set_l0_manager(Arc::clone(m));
+        }
+    }
+
+    /// Build a planner carrying this session's schema and plugin registry.
+    ///
+    /// The plugin registry is not optional: without it the plugin-catalog
+    /// features (virtual-label resolution, replacement scans, virtual-label
+    /// write rejection) all silently no-op, so a query would drop catalog rows
+    /// the default path returns.
+    fn base_planner(&self) -> uni_query::QueryPlanner {
+        uni_query::QueryPlanner::new(self.schema.schema().clone())
+            .with_plugin_registry(Arc::clone(&self.plugin_registry))
+    }
+
+    /// Plan `ast`, then apply the two rewrites every call site must run.
+    ///
+    /// `rewrite_for_fork_fusion` is load-bearing: per CLAUDE.md's Phase-5a
+    /// invariant, any planner call site that skips it makes fork-local indexes
+    /// silently stop fusing. `fuse_create_set` follows it. Centralised here so
+    /// the pair cannot drift apart across the call sites in this file.
+    fn plan_and_rewrite(
+        &self,
+        planner: &uni_query::QueryPlanner,
+        ast: uni_cypher::ast::Query,
+        cypher: &str,
+    ) -> Result<LogicalPlan> {
+        let logical_plan = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
+        let logical_plan = uni_query::rewrite_for_fork_fusion(logical_plan, &*self.storage);
+        Ok(uni_query::fuse_create_set(logical_plan))
+    }
+
+    /// Resolve a time-travel spec to an instance pinned at that snapshot.
+    ///
+    /// Every terminal that accepts `VERSION AS OF` / `TIMESTAMP AS OF` has to
+    /// do this *before* planning: both the planner and the expression rewriter
+    /// treat a `Query::TimeTravel` that reaches them as `unreachable!`, because
+    /// resolving a snapshot is the API layer's job and neither layer can do it.
+    async fn pinned_at(&self, spec: &uni_query::TimeTravelSpec) -> Result<crate::api::UniInner> {
+        let snapshot_id = self.resolve_time_travel(spec).await?;
+        self.at_snapshot(&snapshot_id).await
     }
 
     /// Explain a Cypher query plan without executing it.
     pub(crate) async fn explain_internal(&self, cypher: &str) -> Result<ExplainOutput> {
         let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
+        let (ast, tt_spec) = split_time_travel(ast);
 
-        let planner = uni_query::QueryPlanner::new(self.schema.schema().clone())
-            .with_plugin_registry(Arc::clone(&self.plugin_registry));
-        let logical_plan = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
-        // Phase 5a-impl: apply fork-aware fusion rewrite so explain
-        // output reflects the operators the executor will actually
-        // pick on a forked session.
-        let logical_plan = uni_query::rewrite_for_fork_fusion(logical_plan, &*self.storage);
-        let logical_plan = uni_query::fuse_create_set(logical_plan);
+        if let Some(spec) = tt_spec {
+            // Plan against the pinned instance, not the live one. Stripping the
+            // spec and explaining the current version would answer a different
+            // question than the caller asked -- quietly, which is worse than
+            // the panic this replaces.
+            //
+            // Read-only validation is deliberately *not* applied, matching the
+            // non-time-travel explain path: EXPLAIN never executes, so
+            // describing a write plan is legitimate introspection.
+            return Box::pin(
+                self.pinned_at(&spec)
+                    .await?
+                    .explain_ast_internal(ast, cypher),
+            )
+            .await;
+        }
+
+        self.explain_ast_internal(ast, cypher).await
+    }
+
+    async fn explain_ast_internal(
+        &self,
+        ast: uni_cypher::ast::Query,
+        cypher: &str,
+    ) -> Result<ExplainOutput> {
+        let planner = self.base_planner();
+        // Phase 5a-impl: `plan_and_rewrite` applies the fork-aware fusion
+        // rewrite so explain output reflects the operators the executor will
+        // actually pick on a forked session.
+        let logical_plan = self.plan_and_rewrite(&planner, ast, cypher)?;
         planner
             .explain_logical_plan(&logical_plan)
             .map_err(|e| into_query_error(e, cypher))
@@ -335,12 +540,32 @@ impl crate::api::UniInner {
         params: HashMap<String, ApiValue>,
     ) -> Result<(QueryResult, ProfileOutput)> {
         let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
+        let (ast, tt_spec) = split_time_travel(ast);
 
-        let planner = uni_query::QueryPlanner::new(self.schema.schema().clone())
-            .with_plugin_registry(Arc::clone(&self.plugin_registry));
-        let logical_plan = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
-        let logical_plan = uni_query::rewrite_for_fork_fusion(logical_plan, &*self.storage);
-        let logical_plan = uni_query::fuse_create_set(logical_plan);
+        if let Some(spec) = tt_spec {
+            // `profile` executes, so pinning is mandatory rather than cosmetic:
+            // profiling the live version would report timings for rows the
+            // caller did not ask about.
+            uni_query::validate_read_only(&ast).map_err(|msg| into_query_error(msg, cypher))?;
+            return Box::pin(
+                self.pinned_at(&spec)
+                    .await?
+                    .profile_ast_internal(ast, cypher, params),
+            )
+            .await;
+        }
+
+        self.profile_ast_internal(ast, cypher, params).await
+    }
+
+    async fn profile_ast_internal(
+        &self,
+        ast: uni_cypher::ast::Query,
+        cypher: &str,
+        params: HashMap<String, ApiValue>,
+    ) -> Result<(QueryResult, ProfileOutput)> {
+        let planner = self.base_planner();
+        let logical_plan = self.plan_and_rewrite(&planner, ast, cypher)?;
 
         let mut executor = uni_query::Executor::new(self.storage.clone());
         executor.set_config(self.config.clone());
@@ -351,7 +576,7 @@ impl crate::api::UniInner {
         let (results, profile_output) = executor
             .profile(logical_plan, &params)
             .await
-            .map_err(|e| into_execution_error(e, cypher))?;
+            .map_err(|e| into_execution_error(e, cypher, self.config.query_timeout))?;
 
         let columns = columns_for_results(&results, projection_order);
         let rows = rows_for_results(results, &columns, true);
@@ -367,31 +592,114 @@ impl crate::api::UniInner {
         cypher: &str,
         params: HashMap<String, ApiValue>,
         config: UniConfig,
+        cancel: CancelScope,
     ) -> Result<QueryCursor> {
         let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
+        let (ast, tt_spec) = split_time_travel(ast);
 
-        let planner = uni_query::QueryPlanner::new(self.schema.schema().clone())
-            .with_params(params.clone())
-            .with_plugin_registry(Arc::clone(&self.plugin_registry));
-        let logical_plan = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
-        let logical_plan = uni_query::rewrite_for_fork_fusion(logical_plan, &*self.storage);
-        let logical_plan = uni_query::fuse_create_set(logical_plan);
+        if let Some(spec) = tt_spec {
+            // Streaming executes too, so the cursor must be built on the pinned
+            // instance -- its storage is what the stream reads from.
+            uni_query::validate_read_only(&ast).map_err(|msg| into_query_error(msg, cypher))?;
+            return Box::pin(
+                self.pinned_at(&spec)
+                    .await?
+                    .cursor_from_ast(ast, cypher, params, config, cancel),
+            )
+            .await;
+        }
+
+        self.cursor_from_ast(ast, cypher, params, config, cancel)
+            .await
+    }
+
+    async fn cursor_from_ast(
+        &self,
+        ast: uni_cypher::ast::Query,
+        cypher: &str,
+        params: HashMap<String, ApiValue>,
+        config: UniConfig,
+        cancel: CancelScope,
+    ) -> Result<QueryCursor> {
+        let planner = self.base_planner().with_params(params.clone());
+        let logical_plan = self.plan_and_rewrite(&planner, ast, cypher)?;
 
         let mut executor = uni_query::Executor::new(self.storage.clone());
         executor.set_config(config.clone());
         self.apply_session_executor_state(&mut executor);
+        cancel.install(&mut executor);
 
+        Ok(self.build_guarded_cursor(executor, logical_plan, params, cypher, &config, cancel))
+    }
+
+    /// Assemble the streaming cursor shared by the session and transaction
+    /// entry points.
+    ///
+    /// The two callers differ only in how they *prepare* — the session one
+    /// takes a per-query config override, the transaction one rejects
+    /// time-travel and installs the tx-private L0. From the configured executor
+    /// onward the work is identical: batches to rows, re-chunk to `batch_size`,
+    /// and guard the stream against the deadline, the memory ceiling and the
+    /// cancellation token.
+    ///
+    /// That tail used to be copy-pasted into both functions, and the copies
+    /// drifted: every limit added to the session cursor was absent from the
+    /// transaction one, so a transaction cursor streamed unbounded while the
+    /// builder happily accepted `.timeout()` and `.cancellation_token()`.
+    /// Keeping one body is what stops that recurring.
+    fn build_guarded_cursor(
+        &self,
+        executor: uni_query::Executor,
+        logical_plan: LogicalPlan,
+        params: HashMap<String, ApiValue>,
+        cypher: &str,
+        config: &UniConfig,
+        cancel: CancelScope,
+    ) -> QueryCursor {
         let projection_order = extract_projection_order(&logical_plan);
         let projection_order_for_rows = projection_order.clone();
         let cypher_for_error = cypher.to_string();
+        let cypher_for_limits = cypher.to_string();
         let batch_size = config.batch_size;
+        let max_mem = config.max_query_memory;
+
+        // Mirrors `execute_plan_internal`, which enforces the deadline twice:
+        // a `tokio::time::timeout` around execution (installed below) plus an
+        // explicit post-execution comparison. The second one is load-bearing —
+        // an in-memory query can finish the whole plan inside a single poll
+        // without ever returning `Pending`, so the timer never gets a chance to
+        // fire and only the elapsed-time comparison catches the overrun.
+        let query_timeout = config.query_timeout;
+        let exec_deadline = Instant::now() + query_timeout;
 
         let stream = executor.execute_stream(logical_plan, self.properties.clone(), params);
+
+        // Running total across batches, mirroring how the materializing path
+        // measures the whole result set at once. `execute_stream` currently
+        // yields a single batch, so the two agree exactly; accumulating keeps
+        // that true if it ever becomes genuinely incremental.
+        let mut streamed_bytes: usize = 0;
 
         // Convert raw hash-map batches to Row batches, chunked by batch_size.
         let row_stream = stream
             .map(move |batch_res| {
                 let results = batch_res.map_err(|e| into_stream_error(e, &cypher_for_error))?;
+                // Applied to the executor's own output, not to the re-chunked
+                // pieces below, so a slow consumer paging an already-computed
+                // result is not charged against the query's execution budget.
+                if Instant::now() > exec_deadline {
+                    return Err(query_timed_out_error(query_timeout));
+                }
+                if max_mem > 0 {
+                    streamed_bytes = streamed_bytes.saturating_add(estimate_result_bytes(&results));
+                    if streamed_bytes > max_mem {
+                        return Err(memory_limit_error(
+                            streamed_bytes,
+                            max_mem,
+                            &cypher_for_limits,
+                        ));
+                    }
+                }
                 if results.is_empty() {
                     return Ok(vec![]);
                 }
@@ -410,10 +718,61 @@ impl crate::api::UniInner {
                 },
             );
 
+        // Wall-clock ceiling and cooperative cancellation.
+        //
+        // The materializing path gets both from `execute_plan_internal`, which
+        // wraps execution in `tokio::time::timeout` and hands the token to the
+        // executor. Neither reached the cursor, so `.timeout()`,
+        // `.max_memory()` and `.cancellation_token()` were all accepted by the
+        // builder and silently ignored once `.cursor()` was the terminal.
+        //
+        // `GraphContext::check_timeout` is not sufficient on its own: it fires
+        // only where an operator happens to call it, and no scan/join/traverse
+        // plan reaches one — which is why the executor token set above needs
+        // this outer guard to have any observable effect.
+        //
+        // The deadline is absolute from cursor creation, matching the
+        // materializing path's ceiling on execution. That is exact while
+        // `execute_stream` yields a single batch (all work happens in the first
+        // poll and later polls resolve immediately from the materialized
+        // vector). If it ever streams incrementally, revisit whether a slow
+        // consumer should be charged against the query's own budget.
+        let deadline = tokio::time::Instant::now() + query_timeout;
+        let guarded = futures::stream::unfold(Some(row_stream.boxed()), move |state| {
+            let cancel = cancel.clone();
+            async move {
+                let stream = state?;
+                let next = stream.into_future();
+                // `biased` so an already-cancelled scope wins deterministically
+                // rather than racing the first poll. An empty scope pends
+                // forever, so the branch is safe to take unconditionally.
+                let outcome = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => None,
+                    res = tokio::time::timeout_at(deadline, next) => Some(res),
+                };
+                match outcome {
+                    // Emit the failure once, then end the stream — re-polling a
+                    // timed-out or cancelled cursor must not yield the same
+                    // error forever.
+                    None => Some((Err(query_cancelled_error()), None)),
+                    Some(Err(_elapsed)) => Some((Err(query_timed_out_error(query_timeout)), None)),
+                    Some(Ok((Some(item), rest))) => Some((item, Some(rest))),
+                    Some(Ok((None, _exhausted))) => None,
+                }
+            }
+        });
+
         // We need columns ahead of time for QueryCursor if possible.
         let columns = projection_order.map_or_else(|| Arc::new(vec![]), Arc::new);
 
-        Ok(QueryCursor::new(columns, Box::pin(row_stream)))
+        // `.fuse()` is required, not cosmetic: `stream::unfold` panics if polled
+        // after it yields `None`, and callers legitimately do that — an empty
+        // result set polls once, and `fetch_one()` on an exhausted cursor polls
+        // again to confirm exhaustion. The previous `map`/`flat_map` chain
+        // tolerated it, so dropping the fuse turns a supported call into a
+        // panic that crosses the pyo3 boundary.
+        QueryCursor::new(columns, Box::pin(guarded.fuse()))
     }
 
     pub(crate) async fn execute_internal(
@@ -421,8 +780,13 @@ impl crate::api::UniInner {
         cypher: &str,
         params: HashMap<String, ApiValue>,
     ) -> Result<QueryResult> {
-        self.execute_internal_with_config(cypher, params, self.config.clone())
-            .await
+        self.execute_internal_with_config(
+            cypher,
+            params,
+            self.config.clone(),
+            CancelScope::default(),
+        )
+        .await
     }
 
     /// Execute a Cypher query with a private transaction L0 buffer.
@@ -435,6 +799,7 @@ impl crate::api::UniInner {
         tx_l0: std::sync::Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>,
         id_reservoir: Option<Arc<uni_store::runtime::TxIdReservoir>>,
         read_snapshot: Option<uni_store::runtime::SnapshotView>,
+        cancel: CancelScope,
     ) -> Result<QueryResult> {
         let total_start = Instant::now();
 
@@ -468,10 +833,7 @@ impl crate::api::UniInner {
                 let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
                 let parse_time = parse_start.elapsed();
 
-                let (ast, tt_spec) = match ast {
-                    uni_cypher::ast::Query::TimeTravel { query, spec } => (*query, Some(spec)),
-                    other => (other, None),
-                };
+                let (ast, tt_spec) = split_time_travel(ast);
                 if tt_spec.is_some() {
                     return Err(UniError::Query {
                         message: "Time-travel queries are not supported within transactions"
@@ -482,9 +844,7 @@ impl crate::api::UniInner {
 
                 let plan_start = Instant::now();
                 let (lp, folded) = {
-                    let planner = uni_query::QueryPlanner::new(self.schema.schema().clone())
-                        .with_params(params.clone())
-                        .with_plugin_registry(Arc::clone(&self.plugin_registry));
+                    let planner = self.base_planner().with_params(params.clone());
                     let lp = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
                     let folded = planner.folded_limit_skip_params();
                     (lp, folded)
@@ -538,15 +898,30 @@ impl crate::api::UniInner {
         if let Some(r) = id_reservoir {
             executor.set_id_reservoir(r);
         }
+        cancel.install(&mut executor);
 
         let projection_order = extract_projection_order(&logical_plan);
 
         let exec_start = Instant::now();
-        let results = executor
-            .execute(logical_plan, &self.properties, &params)
-            .await
-            .map_err(|e| into_execution_error(e, cypher))?;
+        // The transaction's own scope reaches execution here. Without this the
+        // token accepted by `TxQueryBuilder::cancellation_token` was discarded
+        // for want of a parameter to put it in, and `Transaction::cancel()`
+        // cancelled a token nothing was listening to.
+        let results = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(UniError::Cancelled),
+            res = executor.execute(logical_plan, &self.properties, &params) => {
+                res.map_err(|e| into_execution_error(e, cypher, self.config.query_timeout))?
+            }
+        };
         let exec_time = exec_start.elapsed();
+
+        // `max_query_memory` was previously enforced only on the session's
+        // materializing paths, so a transaction query had no ceiling at all.
+        // Adding it to the cursor without adding it here would have handed the
+        // transaction surface a fresh asymmetry — streaming stricter than
+        // materializing — which is the shape of defect this work removes.
+        enforce_memory_limit(&results, self.config.max_query_memory, cypher)?;
 
         let columns = columns_for_results(&results, projection_order);
         let rows = rows_for_results(results, &columns, true);
@@ -587,10 +962,7 @@ impl crate::api::UniInner {
     ) -> Result<(QueryResult, ProfileOutput)> {
         let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
 
-        let (ast, tt_spec) = match ast {
-            uni_cypher::ast::Query::TimeTravel { query, spec } => (*query, Some(spec)),
-            other => (other, None),
-        };
+        let (ast, tt_spec) = split_time_travel(ast);
 
         if tt_spec.is_some() {
             return Err(UniError::Query {
@@ -599,12 +971,8 @@ impl crate::api::UniInner {
             });
         }
 
-        let planner = uni_query::QueryPlanner::new(self.schema.schema().clone())
-            .with_params(params.clone())
-            .with_plugin_registry(Arc::clone(&self.plugin_registry));
-        let logical_plan = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
-        let logical_plan = uni_query::rewrite_for_fork_fusion(logical_plan, &*self.storage);
-        let logical_plan = uni_query::fuse_create_set(logical_plan);
+        let planner = self.base_planner().with_params(params.clone());
+        let logical_plan = self.plan_and_rewrite(&planner, ast, cypher)?;
 
         let mut executor = uni_query::Executor::new(self.storage.clone());
         executor.set_config(self.config.clone());
@@ -620,7 +988,7 @@ impl crate::api::UniInner {
         let (results, profile_output) = executor
             .profile(logical_plan, &params)
             .await
-            .map_err(|e| into_execution_error(e, cypher))?;
+            .map_err(|e| into_execution_error(e, cypher, self.config.query_timeout))?;
 
         let columns = columns_for_results(&results, projection_order);
         let rows = rows_for_results(results, &columns, true);
@@ -640,13 +1008,12 @@ impl crate::api::UniInner {
         cypher: &str,
         params: HashMap<String, ApiValue>,
         tx_l0: std::sync::Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>,
+        config: UniConfig,
+        cancel: CancelScope,
     ) -> Result<QueryCursor> {
         let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
 
-        let (ast, tt_spec) = match ast {
-            uni_cypher::ast::Query::TimeTravel { query, spec } => (*query, Some(spec)),
-            other => (other, None),
-        };
+        let (ast, tt_spec) = split_time_travel(ast);
 
         if tt_spec.is_some() {
             return Err(UniError::Query {
@@ -655,53 +1022,16 @@ impl crate::api::UniInner {
             });
         }
 
-        let planner = uni_query::QueryPlanner::new(self.schema.schema().clone())
-            .with_params(params.clone())
-            // Attach the plugin registry like every other planner construction in
-            // this file — without it plugin-catalog features (virtual-label
-            // resolution, replacement scans, virtual-label write rejection) all
-            // silently no-op, so a config-override query drops catalog rows the
-            // default path returns.
-            .with_plugin_registry(Arc::clone(&self.plugin_registry));
-        let logical_plan = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
-        let logical_plan = uni_query::rewrite_for_fork_fusion(logical_plan, &*self.storage);
-        let logical_plan = uni_query::fuse_create_set(logical_plan);
+        let planner = self.base_planner().with_params(params.clone());
+        let logical_plan = self.plan_and_rewrite(&planner, ast, cypher)?;
 
         let mut executor = uni_query::Executor::new(self.storage.clone());
-        executor.set_config(self.config.clone());
+        executor.set_config(config.clone());
         self.apply_session_executor_state(&mut executor);
         executor.set_transaction_l0(tx_l0);
+        cancel.install(&mut executor);
 
-        let projection_order = extract_projection_order(&logical_plan);
-        let projection_order_for_rows = projection_order.clone();
-        let cypher_for_error = cypher.to_string();
-        let batch_size = self.config.batch_size;
-
-        let stream = executor.execute_stream(logical_plan, self.properties.clone(), params);
-
-        let row_stream = stream
-            .map(move |batch_res| {
-                let results = batch_res.map_err(|e| into_stream_error(e, &cypher_for_error))?;
-                if results.is_empty() {
-                    return Ok(vec![]);
-                }
-                let columns = columns_for_results(&results, projection_order_for_rows.clone());
-                Ok(rows_for_results(results, &columns, false))
-            })
-            .flat_map(
-                move |batch_res: std::result::Result<Vec<Row>, UniError>| match batch_res {
-                    Ok(rows) if batch_size > 0 => {
-                        let chunks: Vec<_> =
-                            rows.chunks(batch_size).map(|c| Ok(c.to_vec())).collect();
-                        futures::stream::iter(chunks).boxed()
-                    }
-                    other => futures::stream::iter(vec![other]).boxed(),
-                },
-            );
-
-        let columns = projection_order.map_or_else(|| Arc::new(vec![]), Arc::new);
-
-        Ok(QueryCursor::new(columns, Box::pin(row_stream)))
+        Ok(self.build_guarded_cursor(executor, logical_plan, params, cypher, &config, cancel))
     }
 
     pub(crate) async fn execute_internal_with_config(
@@ -709,6 +1039,7 @@ impl crate::api::UniInner {
         cypher: &str,
         params: HashMap<String, ApiValue>,
         config: UniConfig,
+        cancel: CancelScope,
     ) -> Result<QueryResult> {
         let total_start = Instant::now();
 
@@ -717,10 +1048,7 @@ impl crate::api::UniInner {
         let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
         let parse_time = parse_start.elapsed();
 
-        let (ast, tt_spec) = match ast {
-            uni_cypher::ast::Query::TimeTravel { query, spec } => (*query, Some(spec)),
-            other => (other, None),
-        };
+        let (ast, tt_spec) = split_time_travel(ast);
 
         if let Some(spec) = tt_spec {
             uni_query::validate_read_only(&ast).map_err(|msg| into_query_error(msg, cypher))?;
@@ -728,12 +1056,12 @@ impl crate::api::UniInner {
             let snapshot_id = self.resolve_time_travel(&spec).await?;
             let pinned = self.at_snapshot(&snapshot_id).await?;
             return pinned
-                .execute_ast_internal(ast, cypher, params, config)
+                .execute_ast_internal(ast, cypher, params, config, cancel)
                 .await;
         }
 
         let mut result = self
-            .execute_ast_internal(ast, cypher, params, config)
+            .execute_ast_internal(ast, cypher, params, config, cancel)
             .await?;
         result.update_parse_timing(parse_time, total_start.elapsed());
         Ok(result)
@@ -745,7 +1073,7 @@ impl crate::api::UniInner {
         cypher: &str,
         params: HashMap<String, ApiValue>,
         config: UniConfig,
-        cancellation_token: Option<tokio_util::sync::CancellationToken>,
+        cancel: CancelScope,
     ) -> Result<QueryResult> {
         let total_start = Instant::now();
 
@@ -753,34 +1081,22 @@ impl crate::api::UniInner {
         let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
         let parse_time = parse_start.elapsed();
 
-        let (ast, tt_spec) = match ast {
-            uni_cypher::ast::Query::TimeTravel { query, spec } => (*query, Some(spec)),
-            other => (other, None),
-        };
+        let (ast, tt_spec) = split_time_travel(ast);
 
         if let Some(spec) = tt_spec {
             uni_query::validate_read_only(&ast).map_err(|msg| into_query_error(msg, cypher))?;
             let snapshot_id = self.resolve_time_travel(&spec).await?;
             let pinned = self.at_snapshot(&snapshot_id).await?;
             return pinned
-                .execute_ast_internal(ast, cypher, params, config)
+                .execute_ast_internal(ast, cypher, params, config, cancel)
                 .await;
         }
 
-        let planner = uni_query::QueryPlanner::new(self.schema.schema().clone())
-            .with_params(params.clone())
-            // Attach the plugin registry like every other planner construction in
-            // this file — without it plugin-catalog features (virtual-label
-            // resolution, replacement scans, virtual-label write rejection) all
-            // silently no-op, so a config-override query drops catalog rows the
-            // default path returns.
-            .with_plugin_registry(Arc::clone(&self.plugin_registry));
-        let logical_plan = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
-        let logical_plan = uni_query::rewrite_for_fork_fusion(logical_plan, &*self.storage);
-        let logical_plan = uni_query::fuse_create_set(logical_plan);
+        let planner = self.base_planner().with_params(params.clone());
+        let logical_plan = self.plan_and_rewrite(&planner, ast, cypher)?;
 
         let mut result = self
-            .execute_plan_internal(logical_plan, cypher, params, config, cancellation_token)
+            .execute_plan_internal(logical_plan, cypher, params, config, cancel)
             .await?;
         result.update_parse_timing(parse_time, total_start.elapsed());
         Ok(result)
@@ -794,30 +1110,35 @@ impl crate::api::UniInner {
         params: HashMap<String, ApiValue>,
         config: UniConfig,
         tx_l0: std::sync::Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>,
+        cancel: CancelScope,
     ) -> Result<QueryResult> {
         let total_start = Instant::now();
 
         let plan_start = Instant::now();
-        let planner = uni_query::QueryPlanner::new(self.schema.schema().clone())
-            .with_params(params.clone())
-            .with_plugin_registry(Arc::clone(&self.plugin_registry));
-        let logical_plan = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
-        let logical_plan = uni_query::rewrite_for_fork_fusion(logical_plan, &*self.storage);
-        let logical_plan = uni_query::fuse_create_set(logical_plan);
+        let planner = self.base_planner().with_params(params.clone());
+        let logical_plan = self.plan_and_rewrite(&planner, ast, cypher)?;
         let plan_time = plan_start.elapsed();
 
         let mut executor = uni_query::Executor::new(self.storage.clone());
         executor.set_config(config.clone());
         self.apply_session_executor_state(&mut executor);
         executor.set_transaction_l0(tx_l0);
+        cancel.install(&mut executor);
 
         let projection_order = extract_projection_order(&logical_plan);
 
         let exec_start = Instant::now();
-        let results = executor
-            .execute(logical_plan, &self.properties, &params)
-            .await
-            .map_err(|e| into_execution_error(e, cypher))?;
+        // Mirrors `execute_ast_internal`: the executor's own token only reaches
+        // operators that happen to call `check_timeout`, so correctness comes
+        // from racing the scope against execution here. This twin was the one
+        // AST path that did neither, which is why `Transaction::cancel()` was
+        // inert for `Transaction::apply` and tx-bound Locy.
+        let results = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(UniError::Cancelled),
+            res = executor.execute(logical_plan, &self.properties, &params) => res
+                .map_err(|e| into_execution_error(e, cypher, config.query_timeout))?,
+        };
         let exec_time = exec_start.elapsed();
 
         let columns = columns_for_results(&results, projection_order);
@@ -850,46 +1171,43 @@ impl crate::api::UniInner {
         cypher: &str,
         params: HashMap<String, ApiValue>,
         config: UniConfig,
+        cancel: CancelScope,
     ) -> Result<QueryResult> {
         let total_start = Instant::now();
         let deadline = total_start + config.query_timeout;
 
         let plan_start = Instant::now();
-        let planner = uni_query::QueryPlanner::new(self.schema.schema().clone())
-            .with_params(params.clone())
-            .with_plugin_registry(Arc::clone(&self.plugin_registry));
-        let logical_plan = planner.plan(ast).map_err(|e| into_query_error(e, cypher))?;
-        let logical_plan = uni_query::rewrite_for_fork_fusion(logical_plan, &*self.storage);
-        let logical_plan = uni_query::fuse_create_set(logical_plan);
+        let planner = self.base_planner().with_params(params.clone());
+        let logical_plan = self.plan_and_rewrite(&planner, ast, cypher)?;
         let plan_time = plan_start.elapsed();
 
         let mut executor = uni_query::Executor::new(self.storage.clone());
         executor.set_config(config.clone());
         self.apply_session_executor_state(&mut executor);
+        cancel.install(&mut executor);
 
         let projection_order = extract_projection_order(&logical_plan);
 
         let exec_start = Instant::now();
         let timeout_duration = config.query_timeout;
-        let results = tokio::time::timeout(
-            timeout_duration,
-            executor.execute(logical_plan, &self.properties, &params),
-        )
-        .await
-        .map_err(|_| UniError::Query {
-            message: "Query timed out".to_string(),
-            query: Some(cypher.to_string()),
-        })?
-        .map_err(|e| into_execution_error(e, cypher))?;
+        // See `execute_plan_internal` for why the scope is raced here rather
+        // than left to the executor's cooperative checks.
+        let results = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(UniError::Cancelled),
+            res = tokio::time::timeout(
+                timeout_duration,
+                executor.execute(logical_plan, &self.properties, &params),
+            ) => res
+                .map_err(|_| query_timed_out_error(timeout_duration))?
+                .map_err(|e| into_execution_error(e, cypher, config.query_timeout))?,
+        };
         let exec_time = exec_start.elapsed();
 
         // Instant-based deadline check for sub-millisecond timeouts that
         // tokio::time::timeout cannot catch due to timer wheel resolution.
         if Instant::now() > deadline {
-            return Err(UniError::Query {
-                message: "Query timed out".to_string(),
-                query: Some(cypher.to_string()),
-            });
+            return Err(query_timed_out_error(timeout_duration));
         }
 
         enforce_memory_limit(&results, config.max_query_memory, cypher)?;
@@ -958,39 +1276,40 @@ impl crate::api::UniInner {
         cypher: &str,
         params: HashMap<String, ApiValue>,
         config: UniConfig,
-        cancellation_token: Option<tokio_util::sync::CancellationToken>,
+        cancel: CancelScope,
     ) -> Result<QueryResult> {
         let total_start = Instant::now();
 
         let mut executor = uni_query::Executor::new(self.storage.clone());
         executor.set_config(config.clone());
         self.apply_session_executor_state(&mut executor);
-        if let Some(token) = cancellation_token {
-            executor.set_cancellation_token(token);
-        }
+        cancel.install(&mut executor);
 
         let projection_order = extract_projection_order(&plan);
 
         let exec_start = Instant::now();
         let deadline = exec_start + config.query_timeout;
         let timeout_duration = config.query_timeout;
-        let results = tokio::time::timeout(
-            timeout_duration,
-            executor.execute(plan, &self.properties, &params),
-        )
-        .await
-        .map_err(|_| UniError::Query {
-            message: "Query timed out".to_string(),
-            query: Some(cypher.to_string()),
-        })?
-        .map_err(|e| into_execution_error(e, cypher))?;
+        // Race execution against the cancellation scope. Handing the token to
+        // the executor is not sufficient on its own: it only reaches
+        // `GraphContext::check_timeout`, which no scan/join/traverse plan
+        // calls, so a cancelled statement previously ran to completion and
+        // returned its rows. `biased` makes an already-cancelled scope win
+        // deterministically instead of racing the first poll.
+        let results = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(UniError::Cancelled),
+            res = tokio::time::timeout(
+                timeout_duration,
+                executor.execute(plan, &self.properties, &params),
+            ) => res
+                .map_err(|_| query_timed_out_error(timeout_duration))?
+                .map_err(|e| into_execution_error(e, cypher, config.query_timeout))?,
+        };
         let exec_time = exec_start.elapsed();
 
         if Instant::now() > deadline {
-            return Err(UniError::Query {
-                message: "Query timed out".to_string(),
-                query: Some(cypher.to_string()),
-            });
+            return Err(query_timed_out_error(timeout_duration));
         }
 
         enforce_memory_limit(&results, config.max_query_memory, cypher)?;

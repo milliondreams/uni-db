@@ -1614,8 +1614,10 @@ FOR (a:Author) REQUIRE a.name IS NOT NULL
 
 // Check constraint (custom validation)
 CREATE CONSTRAINT paper_year_valid
-FOR (p:Paper) REQUIRE p.year >= 1900 AND p.year <= 2100
+FOR (p:Paper) REQUIRE p.year >= 1900
 ```
+
+CHECK enforcement covers a single `property <op> literal` comparison, where `<op>` is one of `=`, `!=`/`<>`, `>`, `<`, `>=`, `<=` and the literal is a single whitespace-free token. An expression that does not reduce to those three tokens — one joined with `AND`/`OR`, for instance — is still accepted and listed by `SHOW CONSTRAINTS`, but it logs a warning and permits the write rather than rejecting it, so do not rely on it to enforce a compound rule. Split it into one constraint per comparison instead. Do not point the right-hand side at a second property either: `REQUIRE p.year >= p.min_year` reduces to three tokens but compares against the *string* `p.min_year`, and the operands cannot be ordered, so the write fails with a comparison error rather than either passing or reporting a constraint violation. Numeric comparisons, including `=` and `!=`, coerce across `Int` and `Float`, so `REQUIRE p.score = 5` holds for a stored `5.0`. A missing property passes; use `IS NOT NULL` to require presence.
 
 ### Show Constraints
 

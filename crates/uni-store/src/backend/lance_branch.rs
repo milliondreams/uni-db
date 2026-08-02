@@ -22,6 +22,7 @@
 
 use std::sync::Arc;
 
+use crate::backend::branching::ForkBranching;
 use crate::backend::types::{FilterExpr, VectorQueryOpts};
 use anyhow::{Context, Result};
 use lance::Dataset;
@@ -307,10 +308,11 @@ pub async fn vector_search_on_branch(
     // + version HWM pin). Prefilter so excluded rows never consume a
     // top-k slot — otherwise a soft-deleted or out-of-version row could
     // shadow a live match and shrink the result below k.
-    if let FilterExpr::Sql(sql) = filter {
+    if !filter.is_trivially_true() {
+        let sql = filter.to_sql()?;
         scanner.prefilter(true);
         scanner
-            .filter(sql)
+            .filter(&sql)
             .map_err(|e| anyhow::anyhow!("vector_search_on_branch filter('{sql}'): {e}"))?;
     }
     let stream = scanner
@@ -360,10 +362,11 @@ pub async fn full_text_search_on_branch(
         .map_err(|e| anyhow::anyhow!("full_text_search_on_branch({column}, k={k}): {e}"))?;
     // M6: honor the caller's filter (user predicate + `_deleted = false`
     // + version HWM pin), prefiltered so excluded rows don't take a slot.
-    if let FilterExpr::Sql(sql) = filter {
+    if !filter.is_trivially_true() {
+        let sql = filter.to_sql()?;
         scanner.prefilter(true);
         scanner
-            .filter(sql)
+            .filter(&sql)
             .map_err(|e| anyhow::anyhow!("full_text_search_on_branch filter('{sql}'): {e}"))?;
     }
     let stream = scanner
@@ -769,6 +772,280 @@ where
         .await
         .with_context(|| format!("branch {branch} off newly-created dataset at {uri}"))?;
     Ok(())
+}
+
+/// [`ForkBranching`] over Lance datasets rooted at a base URI.
+///
+/// A thin adapter: every method resolves the logical table name to
+/// `{base}/{table}.lance` and delegates to this module's free functions, so
+/// behavior is identical to the pre-trait direct calls. The point of the
+/// indirection is that path resolution now lives here instead of being
+/// duplicated in `BranchedBackend` and in `crates/uni/src/api/fork.rs`.
+#[derive(Debug, Clone)]
+pub struct LanceBranching {
+    base_uri: String,
+}
+
+impl LanceBranching {
+    /// Adapter over the Lance datasets under `base_uri`.
+    pub fn new(base_uri: impl Into<String>) -> Self {
+        Self {
+            base_uri: base_uri.into(),
+        }
+    }
+
+    /// Resolve a logical table name to its dataset URI, matching the layout
+    /// `lancedb` uses when it stores tables.
+    fn dataset_uri(&self, table: &str) -> String {
+        if self.base_uri.ends_with('/') {
+            format!("{}{table}.lance", self.base_uri)
+        } else {
+            format!("{}/{table}.lance", self.base_uri)
+        }
+    }
+
+    /// Wrap owned batches as the `RecordBatchReader` the free functions take.
+    ///
+    /// The schema travels separately because an empty `batches` carries none.
+    ///
+    /// An empty `batches` is normalized to a single zero-row batch rather than
+    /// an empty stream. Lance's `Dataset::write` / `append` need at least one
+    /// batch to carry the schema, and every pre-trait call site did this
+    /// normalization itself — centralizing it here keeps that behavior while
+    /// letting the trait express "clear the table" as simply an empty `Vec`.
+    fn reader(
+        mut batches: Vec<arrow_array::RecordBatch>,
+        schema: Arc<arrow_schema::Schema>,
+    ) -> impl arrow_array::RecordBatchReader + Send + 'static {
+        if batches.is_empty() {
+            batches.push(arrow_array::RecordBatch::new_empty(schema.clone()));
+        }
+        arrow_array::RecordBatchIterator::new(batches.into_iter().map(Ok), schema)
+    }
+
+    /// SQL text for a delete predicate, rejecting a match-all filter.
+    ///
+    /// See [`ForkBranching::delete_from_branch`] for why a trivially-true
+    /// filter is an error rather than "match all".
+    fn delete_predicate(filter: &FilterExpr) -> Result<String> {
+        if filter.is_trivially_true() {
+            anyhow::bail!(
+                "delete_from_branch requires an explicit predicate; a \
+                 trivially-true filter would delete every row. Use \
+                 replace_branch_tip with no batches to clear a branch \
+                 deliberately."
+            );
+        }
+        Ok(filter.to_sql()?)
+    }
+}
+
+#[async_trait::async_trait]
+impl ForkBranching for LanceBranching {
+    async fn create_branch(&self, table: &str, branch: &str, parent_version: u64) -> Result<()> {
+        create_branch(&self.dataset_uri(table), branch, parent_version).await
+    }
+
+    async fn create_branch_from(
+        &self,
+        table: &str,
+        new_branch: &str,
+        parent_branch: &str,
+        parent_version: u64,
+    ) -> Result<()> {
+        create_branch_from(
+            &self.dataset_uri(table),
+            new_branch,
+            parent_branch,
+            parent_version,
+        )
+        .await
+    }
+
+    async fn delete_branch(&self, table: &str, branch: &str) -> Result<()> {
+        delete_branch(&self.dataset_uri(table), branch).await
+    }
+
+    async fn list_branches(&self, table: &str) -> Result<Vec<String>> {
+        list_branches(&self.dataset_uri(table)).await
+    }
+
+    async fn current_version(&self, table: &str) -> Result<u64> {
+        current_version(&self.dataset_uri(table)).await
+    }
+
+    async fn current_version_on_branch(&self, table: &str, branch: &str) -> Result<u64> {
+        current_version_on_branch(&self.dataset_uri(table), branch).await
+    }
+
+    async fn table_exists(&self, table: &str) -> Result<bool> {
+        let uri = self.dataset_uri(table);
+        // Local-fs heuristic, matching `BranchedBackend::dataset_path_exists`:
+        // for object stores we answer `true` so the caller proceeds to a real
+        // open, which surfaces the accurate error if the table is missing.
+        if uri.contains("://") {
+            return Ok(true);
+        }
+        Ok(std::path::Path::new(&uri).exists())
+    }
+
+    async fn create_tag(&self, table: &str, tag: &str, branch: &str) -> Result<()> {
+        create_tag(&self.dataset_uri(table), tag, branch).await
+    }
+
+    async fn delete_tag(&self, table: &str, tag: &str) -> Result<()> {
+        delete_tag(&self.dataset_uri(table), tag).await
+    }
+
+    async fn list_tags(&self, table: &str) -> Result<Vec<(String, u64)>> {
+        list_tags(&self.dataset_uri(table)).await
+    }
+
+    async fn write_to_branch(
+        &self,
+        table: &str,
+        branch: &str,
+        batches: Vec<arrow_array::RecordBatch>,
+        schema: Arc<arrow_schema::Schema>,
+    ) -> Result<()> {
+        write_to_branch(
+            &self.dataset_uri(table),
+            branch,
+            Self::reader(batches, schema),
+        )
+        .await
+    }
+
+    async fn delete_from_branch(
+        &self,
+        table: &str,
+        branch: &str,
+        filter: &FilterExpr,
+    ) -> Result<()> {
+        let predicate = Self::delete_predicate(filter)?;
+        delete_from_branch(&self.dataset_uri(table), branch, &predicate).await
+    }
+
+    async fn merge_insert_on_branch(
+        &self,
+        table: &str,
+        branch: &str,
+        on: &[&str],
+        batches: Vec<arrow_array::RecordBatch>,
+        schema: Arc<arrow_schema::Schema>,
+    ) -> Result<()> {
+        merge_insert_on_branch(
+            &self.dataset_uri(table),
+            branch,
+            on,
+            Self::reader(batches, schema),
+        )
+        .await
+    }
+
+    async fn replace_branch_tip(
+        &self,
+        table: &str,
+        branch: &str,
+        batches: Vec<arrow_array::RecordBatch>,
+        schema: Arc<arrow_schema::Schema>,
+    ) -> Result<()> {
+        replace_branch_tip(
+            &self.dataset_uri(table),
+            branch,
+            Self::reader(batches, schema),
+        )
+        .await
+    }
+
+    async fn create_empty_table_then_branch(
+        &self,
+        table: &str,
+        branch: &str,
+        schema: Arc<arrow_schema::Schema>,
+    ) -> Result<()> {
+        // The trunk copy must stay empty — see the trait docs. `reader`
+        // normalizes the empty vec into the one zero-row batch that carries
+        // the schema to `Dataset::write`.
+        create_dataset_then_branch(
+            &self.dataset_uri(table),
+            branch,
+            Self::reader(Vec::new(), schema),
+        )
+        .await
+    }
+
+    async fn create_scalar_index_on_branch(
+        &self,
+        table: &str,
+        branch: &str,
+        column: &str,
+        index_name: &str,
+    ) -> Result<()> {
+        create_scalar_index_on_branch(&self.dataset_uri(table), branch, column, index_name).await
+    }
+
+    async fn create_vector_index_on_branch(
+        &self,
+        table: &str,
+        branch: &str,
+        column: &str,
+        index_name: &str,
+    ) -> Result<()> {
+        create_vector_index_on_branch(&self.dataset_uri(table), branch, column, index_name).await
+    }
+
+    async fn create_fts_index_on_branch(
+        &self,
+        table: &str,
+        branch: &str,
+        column: &str,
+        index_name: &str,
+        tokenizer: &uni_common::core::schema::TokenizerConfig,
+    ) -> Result<()> {
+        create_fts_index_on_branch(
+            &self.dataset_uri(table),
+            branch,
+            column,
+            index_name,
+            tokenizer,
+        )
+        .await
+    }
+
+    async fn vector_search_on_branch(
+        &self,
+        table: &str,
+        branch: &str,
+        column: &str,
+        query: &[f32],
+        k: usize,
+        filter: &FilterExpr,
+        opts: VectorQueryOpts,
+    ) -> Result<Vec<arrow_array::RecordBatch>> {
+        vector_search_on_branch(
+            &self.dataset_uri(table),
+            branch,
+            column,
+            query,
+            k,
+            filter,
+            opts,
+        )
+        .await
+    }
+
+    async fn full_text_search_on_branch(
+        &self,
+        table: &str,
+        branch: &str,
+        column: &str,
+        query: &str,
+        k: usize,
+        filter: &FilterExpr,
+    ) -> Result<Vec<arrow_array::RecordBatch>> {
+        full_text_search_on_branch(&self.dataset_uri(table), branch, column, query, k, filter).await
+    }
 }
 
 #[cfg(test)]

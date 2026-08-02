@@ -18,7 +18,8 @@ use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 use uni_common::core::fork::{ForkId, ForkInfo, ForkStatus};
 use uni_store::backend::lance_branch;
-use uni_store::fork::recovery::{join_uri_with, recover_forks};
+use uni_store::backend::lance_branch::LanceBranching;
+use uni_store::fork::recovery::recover_forks;
 use uni_store::fork::registry::ForkRegistryHandle;
 
 /// Seeds two Lance datasets so a partial fork creation can succeed
@@ -102,7 +103,7 @@ async fn partial_create_branch_rolls_back_on_recovery() {
     }
     let base = format!("{}/", dir.path().display());
     let candidates = vec!["vertices_A".to_string(), "vertices_B".to_string()];
-    let reconciled = recover_forks(&h2, &store, &candidates, join_uri_with(base))
+    let reconciled = recover_forks(&h2, &store, &candidates, Some(&LanceBranching::new(base)))
         .await
         .unwrap();
     assert_eq!(reconciled, 1);

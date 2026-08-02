@@ -72,40 +72,8 @@ pub(crate) struct HostSvcCtx {
     pub graph: Option<uni_plugin_builtin::algorithms::graph_compute::SharedRegistry>,
 }
 
-/// Lowercase hex encoding for the JSON wire boundary.
-pub(crate) fn to_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
-}
-
-/// Decode lowercase/uppercase hex; errors on odd length or non-hex digits.
-///
-/// Operates on raw bytes (`chunks_exact(2)`), NOT `&s[i..i+2]` string slicing:
-/// the guest controls this string, and byte-index slicing panics on a multibyte
-/// UTF-8 codepoint that happens to make the byte length even. A non-ASCII byte
-/// simply fails the hex-digit test and returns `Err`.
-pub(crate) fn from_hex(s: &str) -> Result<Vec<u8>, String> {
-    let bytes = s.as_bytes();
-    if !bytes.len().is_multiple_of(2) {
-        return Err("odd-length hex string".to_owned());
-    }
-    fn nibble(b: u8) -> Result<u8, String> {
-        match b {
-            b'0'..=b'9' => Ok(b - b'0'),
-            b'a'..=b'f' => Ok(b - b'a' + 10),
-            b'A'..=b'F' => Ok(b - b'A' + 10),
-            _ => Err("invalid hex digit".to_owned()),
-        }
-    }
-    bytes
-        .chunks_exact(2)
-        .map(|pair| Ok((nibble(pair[0])? << 4) | nibble(pair[1])?))
-        .collect()
-}
+// Hex codec for the JSON wire boundary — shared with the Rhai loader.
+pub(crate) use uni_plugin::hex::{from_hex, to_hex};
 
 /// Deserialize a JSON request, run `f`, and re-serialize its response as
 /// JSON — the shared `host_fn!`-shell body for every `uni.{kms,secret,http}`

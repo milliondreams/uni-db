@@ -181,7 +181,13 @@ async fn index_builder_tick(weak: &Weak<UniInner>, threshold: u64) -> anyhow::Re
                 );
             }
         }
-        let base_uri = fork_inner.storage.base_uri().to_string();
+        let Some(branching) = fork_inner.storage.backend().branching() else {
+            debug!(
+                fork = %fork_info.name,
+                "storage backend does not support fork branching; skipping index build",
+            );
+            continue;
+        };
         for (label, column, kind) in &index_targets {
             let dataset_name = format!("vertices_{label}");
             let count = scope.fragment_count(&dataset_name);
@@ -196,7 +202,11 @@ async fn index_builder_tick(weak: &Weak<UniInner>, threshold: u64) -> anyhow::Re
                 continue;
             }
             match uni_store::fork::index_builder::build_fork_local_index(
-                &scope, &base_uri, label, column, *kind,
+                &scope,
+                branching.as_ref(),
+                label,
+                column,
+                *kind,
             )
             .await
             {

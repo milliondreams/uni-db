@@ -96,7 +96,12 @@ fn parse_config(config_json: &str) -> Result<(u64, GraphProjectionSpec), FnError
         })?;
 
     // Optional second-arg config object selects the projection subgraph.
-    let mut spec = GraphProjectionSpec::default();
+    // First-party providers keep the ergonomic whole-graph default (G9 opt-in);
+    // a named nodeLabels/edgeTypes below still scopes it.
+    let mut spec = GraphProjectionSpec {
+        project_all: true,
+        ..GraphProjectionSpec::default()
+    };
     if let Some(cfg) = args.get(1).and_then(serde_json::Value::as_object) {
         if let Some(labels) = cfg.get("nodeLabels").and_then(serde_json::Value::as_array) {
             spec.node_labels = labels

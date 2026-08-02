@@ -28,7 +28,6 @@
 
 use anyhow::{Result, anyhow};
 use chrono::Utc;
-use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -650,7 +649,7 @@ impl BulkWriter {
                 }
                 uni_common::core::schema::ConstraintType::Check { expression } => {
                     for (idx, props) in vertices.iter().enumerate() {
-                        if !self.evaluate_check_expression(expression, props)? {
+                        if !uni_common::core::check_constraint::evaluate(expression, props)? {
                             return Err(anyhow!(
                                 "CHECK constraint '{}' violated at row {}: expression '{}' evaluated to false",
                                 constraint.name,
@@ -763,98 +762,6 @@ impl BulkWriter {
         writer
             .unique_key_exists_full_horizon(label, &key_values, None, None)
             .await
-    }
-
-    /// Evaluate a simple CHECK constraint expression.
-    fn evaluate_check_expression(&self, expression: &str, properties: &Properties) -> Result<bool> {
-        let parts: Vec<&str> = expression.split_whitespace().collect();
-        if parts.len() != 3 {
-            // Complex expression - allow for now
-            return Ok(true);
-        }
-
-        let prop_part = parts[0].trim_start_matches('(');
-        let prop_name = if let Some(idx) = prop_part.find('.') {
-            &prop_part[idx + 1..]
-        } else {
-            prop_part
-        };
-
-        let op = parts[1];
-        let val_str = parts[2].trim_end_matches(')');
-
-        let prop_val = match properties.get(prop_name) {
-            Some(v) => v,
-            None => return Ok(true), // Missing property passes CHECK
-        };
-
-        // Parse target value
-        let target_val = if (val_str.starts_with('\'') && val_str.ends_with('\''))
-            || (val_str.starts_with('"') && val_str.ends_with('"'))
-        {
-            Value::String(val_str[1..val_str.len() - 1].to_string())
-        } else if let Ok(n) = val_str.parse::<i64>() {
-            Value::Int(n)
-        } else if let Ok(n) = val_str.parse::<f64>() {
-            Value::Float(n)
-        } else if let Ok(b) = val_str.parse::<bool>() {
-            Value::Bool(b)
-        } else {
-            Value::String(val_str.to_string())
-        };
-
-        match op {
-            // Route numeric equality through `compare_values` so Int/Float coerce
-            // (matching the ordering ops below); Value's `PartialEq` is type-strict
-            // and has no Int/Float arm, so `Float(5.0) == Int(5)` would be false.
-            // Non-numeric operands keep strict structural equality.
-            "=" | "==" => Ok(if prop_val.is_number() && target_val.is_number() {
-                self.compare_values(prop_val, &target_val)?.is_eq()
-            } else {
-                prop_val == &target_val
-            }),
-            "!=" | "<>" => Ok(if prop_val.is_number() && target_val.is_number() {
-                !self.compare_values(prop_val, &target_val)?.is_eq()
-            } else {
-                prop_val != &target_val
-            }),
-            ">" => Ok(self.compare_values(prop_val, &target_val)?.is_gt()),
-            "<" => Ok(self.compare_values(prop_val, &target_val)?.is_lt()),
-            ">=" => Ok(self.compare_values(prop_val, &target_val)?.is_ge()),
-            "<=" => Ok(self.compare_values(prop_val, &target_val)?.is_le()),
-            _ => Ok(true), // Unknown operator - allow
-        }
-    }
-
-    /// Compare two values for ordering.
-    ///
-    /// Incomparable floats (NaN) compare as [`Ordering::Equal`], matching the
-    /// prior branch-based implementation.
-    fn compare_values(&self, a: &Value, b: &Value) -> Result<Ordering> {
-        match (a, b) {
-            (Value::Int(n1), Value::Int(n2)) => Ok(n1.cmp(n2)),
-            (Value::Float(f1), Value::Float(f2)) => {
-                Ok(f1.partial_cmp(f2).unwrap_or(Ordering::Equal))
-            }
-            // Exact i64-vs-f64 order (no lossy `as f64` cast above 2^53);
-            // preserve the prior NaN-as-Equal behavior for the degenerate case.
-            (Value::Int(n), Value::Float(f)) => Ok(if f.is_nan() {
-                Ordering::Equal
-            } else {
-                uni_common::cmp_i64_f64(*n, *f)
-            }),
-            (Value::Float(f), Value::Int(n)) => Ok(if f.is_nan() {
-                Ordering::Equal
-            } else {
-                uni_common::cmp_i64_f64(*n, *f).reverse()
-            }),
-            (Value::String(s1), Value::String(s2)) => Ok(s1.cmp(s2)),
-            _ => Err(anyhow!(
-                "Cannot compare incompatible types: {:?} vs {:?}",
-                a,
-                b
-            )),
-        }
     }
 
     /// Checkpoint: flush all pending data to storage.

@@ -18,6 +18,7 @@ use uni_cypher::ast::{
     SetItem,
 };
 use uni_store::QueryContext;
+use uni_store::backend::types::{FilterExpr, Scalar};
 use uni_store::runtime::l0_visibility;
 use uni_store::runtime::property_manager::PropertyManager;
 use uni_store::runtime::writer::Writer;
@@ -795,7 +796,7 @@ impl Executor {
             return Err(anyhow!("Edge type '{}' not found", edge_type));
         }
 
-        let filter = format!("type = '{}'", edge_type);
+        let filter = FilterExpr::equals("type", Scalar::Str(edge_type.to_string()));
         let stream = self
             .storage
             .scan_main_edge_table_stream(Some(&filter))
@@ -1647,32 +1648,19 @@ impl Executor {
         Some((src_var.clone(), dst_var.clone(), type_id, dir))
     }
 
-    /// Build the persisted-scan filter for a MERGE key, or `None` if any value
-    /// is not a scalar this fast path can represent.
+    /// Whether a MERGE key can take the batched persisted-scan fast path.
     ///
-    /// Returning `None` makes the caller fall back to the general per-row path,
-    /// so unusual key value types (lists, maps, temporals, nulls) are never
-    /// silently mis-matched. The `_deleted = false` clause mirrors the
-    /// persisted-read predicate used elsewhere; the version high-water-mark
-    /// clause is added by [`uni_store::StorageManager::scan_vertex_table`].
-    fn merge_key_filter(key_props: &HashMap<String, Value>) -> Option<String> {
-        if key_props.is_empty() {
-            return None;
-        }
-        let mut parts = Vec::with_capacity(key_props.len() + 1);
-        for (k, v) in key_props {
-            if !Self::is_safe_key_ident(k) {
-                return None;
-            }
-            let lit = Self::render_key_literal(v)?;
-            // Unquoted identifier: the Lance filter parser does not resolve a
-            // double-quoted column name against the table here, so `"k" = v`
-            // silently matches nothing. Keys are validated above to be safe
-            // bare identifiers.
-            parts.push(format!("{k} = {lit}"));
-        }
-        parts.push("_deleted = false".to_string());
-        Some(parts.join(" AND "))
+    /// `false` sends the caller to the general per-row path, so unusual key
+    /// value types (lists, maps, temporals, nulls) are never silently
+    /// mis-matched. This used to build and return the whole filter string; the
+    /// only caller checked `.is_some()` and discarded it, so the predicate is
+    /// all it ever was. The filter itself is built by
+    /// [`Self::merge_batch_filter`].
+    fn merge_key_is_fast_pathable(key_props: &HashMap<String, Value>) -> bool {
+        !key_props.is_empty()
+            && key_props
+                .iter()
+                .all(|(k, v)| Self::is_safe_key_ident(k) && Scalar::from_value(v).is_some())
     }
 
     /// True when a MERGE key name is a safe bare identifier for a Lance
@@ -1682,65 +1670,50 @@ impl Executor {
         !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
     }
 
-    /// Render a scalar MERGE-key value as a Lance filter literal, or `None`
-    /// for value types this fast path cannot represent (lists, maps,
-    /// temporals, nulls) — the caller then falls back to the general path.
-    fn render_key_literal(v: &Value) -> Option<String> {
-        Some(match v {
-            Value::String(s) => format!("'{}'", s.replace('\'', "''")),
-            Value::Int(i) => i.to_string(),
-            Value::Float(f) => f.to_string(),
-            Value::Bool(b) => b.to_string(),
-            _ => return None,
-        })
-    }
-
     /// Build ONE scan filter matching every key tuple in `keys` (all tuples
     /// sorted by `key_names` order, values canonicalized).
     ///
-    /// Single-column keys render as type-grouped `k IN (…)` lists (a filter
-    /// never compares mixed literal types against one column); composite keys
-    /// render as an OR of per-tuple conjunctions. Both forms are wrapped with
-    /// the same `_deleted = false` clause the per-row filter used.
-    fn merge_batch_filter(key_names: &[String], keys: &[&MergeKey]) -> Option<String> {
+    /// Single-column keys render as one `k IN (…)` list, composite keys as an
+    /// OR of per-tuple conjunctions. Both are wrapped with the same
+    /// `_deleted = false` clause the per-row filter used.
+    ///
+    /// `is_safe_key_ident` still gates the column names, and must: `to_sql`
+    /// emits identifiers **bare** and can never quote them, because Lance reads
+    /// a double-quoted name as a string literal rather than an identifier.
+    ///
+    /// Values of mixed types against one column used to be grouped into
+    /// separate same-type `IN` lists. That is gone — it never worked. Lance
+    /// rejects a literal that does not match the *column's* Arrow type at plan
+    /// time, and splitting changes nothing: `(k IN ('a')) OR (k IN (1))` fails
+    /// exactly like `k IN ('a', 1)`. Such a batch errors either way, and a
+    /// write-time type guard makes it unreachable for a schema'd label.
+    fn merge_batch_filter(key_names: &[String], keys: &[&MergeKey]) -> Option<FilterExpr> {
         if keys.is_empty() || key_names.iter().any(|k| !Self::is_safe_key_ident(k)) {
             return None;
         }
         let disjunction = if let [key] = key_names {
-            // Group literals by value variant so each IN list is homogeneous.
-            let mut groups: HashMap<std::mem::Discriminant<Value>, Vec<String>> = HashMap::new();
-            for tuple in keys {
-                let (_, v) = tuple.first()?;
-                groups
-                    .entry(std::mem::discriminant(v))
-                    .or_default()
-                    .push(Self::render_key_literal(v)?);
-            }
-            groups
-                .into_values()
-                .map(|lits| {
-                    if let [lit] = lits.as_slice() {
-                        format!("{key} = {lit}")
-                    } else {
-                        format!("{key} IN ({})", lits.join(", "))
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(" OR ")
+            let values = keys
+                .iter()
+                .map(|tuple| Scalar::from_value(&tuple.first()?.1))
+                .collect::<Option<Vec<_>>>()?;
+            FilterExpr::one_of(key.as_str(), values)
         } else {
-            keys.iter()
-                .map(|tuple| {
-                    let conj = tuple
-                        .iter()
-                        .map(|(k, v)| Some(format!("{k} = {}", Self::render_key_literal(v)?)))
-                        .collect::<Option<Vec<_>>>()?
-                        .join(" AND ");
-                    Some(format!("({conj})"))
-                })
-                .collect::<Option<Vec<_>>>()?
-                .join(" OR ")
+            FilterExpr::any_of(
+                keys.iter()
+                    .map(|tuple| {
+                        Some(FilterExpr::all(
+                            tuple
+                                .iter()
+                                .map(|(k, v)| {
+                                    Some(FilterExpr::equals(k.as_str(), Scalar::from_value(v)?))
+                                })
+                                .collect::<Option<Vec<_>>>()?,
+                        ))
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+            )
         };
-        Some(format!("({disjunction}) AND _deleted = false"))
+        Some(FilterExpr::all([disjunction, FilterExpr::not_deleted()]))
     }
 
     /// Canonicalize a numeric MERGE-key value for *matching only*.
@@ -1928,12 +1901,7 @@ impl Executor {
         let mut verify_columns: Vec<&str> = vec!["_vid", "_deleted", "_version"];
         verify_columns.extend(key_names.iter().map(String::as_str));
         for chunk in candidates.chunks(Self::MERGE_SCAN_CHUNK) {
-            let vid_list = chunk
-                .iter()
-                .map(|v| v.as_u64().to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let filter = format!("_vid IN ({vid_list})");
+            let filter = FilterExpr::one_of("_vid", chunk.iter().map(|v| Scalar::UInt(v.as_u64())));
             let scanned = self
                 .storage
                 .scan_vertex_table(label, &verify_columns, Some(&filter))
@@ -2027,7 +1995,7 @@ impl Executor {
     )> {
         let mut out: HashMap<MergeKey, Vec<Vid>> = HashMap::new();
         let mut props_by_vid: HashMap<Vid, uni_common::Properties> = HashMap::new();
-        let filter = format!("array_contains(labels, '{}')", label.replace('\'', "''"));
+        let filter = FilterExpr::array_contains("labels", Scalar::Str(label.to_string()));
         let Some(batch) = self
             .storage
             .scan_main_vertex_table(
@@ -2428,7 +2396,7 @@ impl Executor {
                 // Only rows whose every key value is a scalar the persisted
                 // scan can express take the fast path (same gate as before,
                 // via the filter builder).
-                if Self::merge_key_filter(&key_props).is_some() {
+                if Self::merge_key_is_fast_pathable(&key_props) {
                     let tuple = Self::merge_key_tuple(&key_props);
                     row_fast.push(Some((key_props, tuple)));
                 } else {

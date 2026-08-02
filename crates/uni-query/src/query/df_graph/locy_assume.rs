@@ -43,17 +43,58 @@ pub async fn evaluate_assume(
         stats.mutations_executed += 1;
     }
 
+    // The body is compiled as its own program, so its plan build saw only the
+    // body's `rule_catalog`. A body rule that IS-references an outer rule --
+    // the ordinary way to reason hypothetically about existing rules -- failed
+    // with `IS-reference to unknown rule`, and the body commands' lookups
+    // consulted the parent's catalog, which lacks the body's own rules. Neither
+    // half worked, with or without a `MODULE`.
+    //
+    // Build one catalog visible to both: the parent's rules, plus the body's
+    // shadowing on collision. Module-qualified parent rules are also exposed
+    // under their bare last segment, mirroring what the compiler does when it
+    // validates the body -- inside `MODULE m`, writing `adult` *is* how you name
+    // `m.adult`, and the body's AST carries the bare spelling.
+    let merged_rule_catalog = {
+        let mut merged = std::collections::HashMap::new();
+        for (name, rule) in &parent_program.rule_catalog {
+            if let Some((_, bare)) = name.rsplit_once('.') {
+                merged.insert(bare.to_string(), rule.clone());
+            }
+            merged.insert(name.clone(), rule.clone());
+        }
+        // Body rules last so a body-local name shadows an outer one.
+        for (name, rule) in &assume.body_program.rule_catalog {
+            merged.insert(name.clone(), rule.clone());
+        }
+        merged
+    };
+
     // 3. Re-evaluate the parent program's strata in the mutated state
     let mut assume_derived_store: RowStore = ctx.re_evaluate_strata(parent_program, config).await?;
     stats.queries_executed += 1; // rough accounting for the re-evaluation
 
     // 4. Also evaluate body program's strata if any (merge into assume_derived_store)
     if !assume.body_program.strata.is_empty() {
-        let body_store = ctx.re_evaluate_strata(&assume.body_program, config).await?;
+        // The body's own strata, planned against the merged catalog.
+        let body_program = CompiledProgram {
+            rule_catalog: merged_rule_catalog.clone(),
+            ..assume.body_program.clone()
+        };
+        let body_store = ctx.re_evaluate_strata(&body_program, config).await?;
         for (name, rel) in body_store {
             assume_derived_store.insert(name, rel);
         }
     }
+
+    // The parent's strata with the merged catalog: body commands must be able
+    // to name the body's own rules, and a nested ASSUME must still see the
+    // parent's strata as its own parent, so the two are combined rather than
+    // one replacing the other.
+    let command_program = CompiledProgram {
+        rule_catalog: merged_rule_catalog,
+        ..parent_program.clone()
+    };
 
     // 5. Execute body commands and collect results
     let mut result_rows = Vec::new();
@@ -61,7 +102,7 @@ pub async fn evaluate_assume(
     for cmd in &assume.body_commands {
         let cmd_result = dispatch_body_command(
             cmd,
-            parent_program,
+            &command_program,
             ctx,
             config,
             &mut assume_derived_store,

@@ -813,7 +813,10 @@ fn cypher_partial_cmp(left: &Value, right: &Value) -> Option<Ordering> {
 }
 
 /// Compare two TemporalValues directly using numeric representation.
-fn temporal_partial_cmp(left: &TemporalValue, right: &TemporalValue) -> Option<Ordering> {
+pub(crate) fn temporal_partial_cmp(
+    left: &TemporalValue,
+    right: &TemporalValue,
+) -> Option<Ordering> {
     match (left, right) {
         (
             TemporalValue::Date {
@@ -1259,14 +1262,50 @@ fn eval_list_function(name: &str, args: &[Value]) -> Result<Value> {
 // Type conversion function helpers
 // ============================================================================
 
-fn eval_tointeger(arg: &Value) -> Result<Value> {
+/// Return the Cypher type name for a `Value`, used in error messages.
+pub(crate) fn cypher_type_name(val: &Value) -> &'static str {
+    match val {
+        Value::Null => "Null",
+        Value::Bool(_) => "Boolean",
+        Value::Int(_) => "Integer",
+        Value::Float(_) => "Float",
+        Value::String(_) => "String",
+        Value::Bytes(_) => "Bytes",
+        Value::List(_) => "List",
+        Value::Map(_) => "Map",
+        Value::Node(_) => "Node",
+        Value::Edge(_) => "Relationship",
+        Value::Path(_) => "Path",
+        Value::Vector(_) => "Vector",
+        Value::Temporal(_) => "Temporal",
+        _ => "Unknown",
+    }
+}
+
+/// Adapt an interpreter error into a DataFusion error, preserving the message.
+///
+/// The messages carry openCypher error-code prefixes (`TypeError:`,
+/// `ArgumentError:`) that TCK scenarios match on, so they must survive verbatim.
+pub(crate) fn to_datafusion_err(e: anyhow::Error) -> datafusion::error::DataFusionError {
+    datafusion::error::DataFusionError::Execution(e.to_string())
+}
+
+pub(crate) fn eval_tointeger(arg: &Value) -> Result<Value> {
     match arg {
         Value::Int(i) => Ok(Value::Int(*i)),
         Value::Float(f) => Ok(Value::Int(*f as i64)),
-        Value::String(s) => Ok(s.parse::<i64>().map(Value::Int).unwrap_or(Value::Null)),
+        // openCypher truncates numeric strings that carry a fractional part:
+        // TCK TypeConversion2 [5] asserts toInteger('2.9') == 2 and [4] that
+        // toInteger('1.7') == 1. Non-numeric strings yield null, not an error.
+        Value::String(s) => Ok(s
+            .parse::<i64>()
+            .map(Value::Int)
+            .or_else(|_| s.parse::<f64>().map(|f| Value::Int(f as i64)))
+            .unwrap_or(Value::Null)),
         Value::Null => Ok(Value::Null),
-        _ => Err(anyhow!(
-            "InvalidArgumentValue: toInteger() cannot convert type"
+        other => Err(anyhow!(
+            "TypeError: InvalidArgumentValue - toInteger() does not accept {} values",
+            cypher_type_name(other)
         )),
     }
 }
@@ -1283,7 +1322,7 @@ fn eval_tofloat(arg: &Value) -> Result<Value> {
     }
 }
 
-fn eval_tostring(arg: &Value) -> Result<Value> {
+pub(crate) fn eval_tostring(arg: &Value) -> Result<Value> {
     match arg {
         Value::String(s) => Ok(Value::String(s.clone())),
         Value::Int(i) => Ok(Value::String(i.to_string())),
@@ -1296,12 +1335,18 @@ fn eval_tostring(arg: &Value) -> Result<Value> {
             }
         }
         Value::Bool(b) => Ok(Value::String(b.to_string())),
+        Value::Temporal(t) => Ok(Value::String(t.to_string())),
         Value::Null => Ok(Value::Null),
-        other => Ok(Value::String(other.to_string())),
+        // TCK TypeConversion4 [10] requires a TypeError for List, Map, Node,
+        // Relationship and Path rather than a stringified rendering.
+        other => Err(anyhow!(
+            "TypeError: InvalidArgumentValue - toString() does not accept {} values",
+            cypher_type_name(other)
+        )),
     }
 }
 
-fn eval_toboolean(arg: &Value) -> Result<Value> {
+pub(crate) fn eval_toboolean(arg: &Value) -> Result<Value> {
     match arg {
         Value::Bool(b) => Ok(Value::Bool(*b)),
         Value::String(s) => {
@@ -1315,8 +1360,13 @@ fn eval_toboolean(arg: &Value) -> Result<Value> {
             }
         }
         Value::Null => Ok(Value::Null),
-        _ => Err(anyhow!(
-            "InvalidArgumentValue: toBoolean() cannot convert type"
+        // Integers coerce (0 == false). TCK TypeConversion1 [5] lists Float,
+        // List, Map, Node, Relationship and Path as invalid but deliberately
+        // omits Integer.
+        Value::Int(i) => Ok(Value::Bool(*i != 0)),
+        other => Err(anyhow!(
+            "TypeError: InvalidArgumentValue - toBoolean() does not accept {} values",
+            cypher_type_name(other)
         )),
     }
 }
@@ -1561,6 +1611,10 @@ pub fn eval_split(args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
         return Err(anyhow!("split() requires 2 arguments"));
     }
+    // Cypher propagates null from *any* argument, not just the first.
+    if args.iter().any(Value::is_null) {
+        return Ok(Value::Null);
+    }
     match (&args[0], &args[1]) {
         (Value::String(s), Value::String(delimiter)) => {
             let parts: Vec<Value> = s
@@ -1569,14 +1623,16 @@ pub fn eval_split(args: &[Value]) -> Result<Value> {
                 .collect();
             Ok(Value::List(parts))
         }
-        (Value::Null, _) => Ok(Value::Null),
         _ => Err(anyhow!("split() expects string arguments")),
     }
 }
 
-fn eval_substring(args: &[Value]) -> Result<Value> {
+pub(crate) fn eval_substring(args: &[Value]) -> Result<Value> {
     if args.len() < 2 || args.len() > 3 {
         return Err(anyhow!("substring() requires 2 or 3 arguments"));
+    }
+    if args.iter().any(Value::is_null) {
+        return Ok(Value::Null);
     }
     match &args[0] {
         Value::String(s) => {
@@ -1586,14 +1642,23 @@ fn eval_substring(args: &[Value]) -> Result<Value> {
             // Cypher requires a non-negative start; reject before the `as usize`
             // cast (which would otherwise turn -1 into a huge index and panic).
             if start_i < 0 {
-                return Err(anyhow!("substring: start must be non-negative"));
+                return Err(anyhow!(
+                    "ArgumentError: NegativeIntegerArgument - substring start must be non-negative"
+                ));
             }
             let start = start_i as usize;
             let len = if args.len() == 3 {
-                args[2]
+                let len_i = args[2]
                     .as_i64()
-                    .ok_or_else(|| anyhow!("substring() length must be an integer"))?
-                    as usize
+                    .ok_or_else(|| anyhow!("substring() length must be an integer"))?;
+                // A negative length used to cast to `usize::MAX` and then clamp,
+                // silently returning the whole tail instead of erroring.
+                if len_i < 0 {
+                    return Err(anyhow!(
+                        "ArgumentError: NegativeIntegerArgument - substring length must be non-negative"
+                    ));
+                }
+                len_i as usize
             } else {
                 s.len().saturating_sub(start)
             };
@@ -1603,7 +1668,6 @@ fn eval_substring(args: &[Value]) -> Result<Value> {
             let result: String = chars[start.min(chars.len())..end].iter().collect();
             Ok(Value::String(result))
         }
-        Value::Null => Ok(Value::Null),
         _ => Err(anyhow!("substring() expects a string")),
     }
 }

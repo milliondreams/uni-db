@@ -415,7 +415,7 @@ async fn batch_resolve_primary_vids<Q: ForkQueryHost + ?Sized>(
     let Ok(uix) = primary_storage.uid_index(label) else {
         return (out, true);
     };
-    let Ok(candidates_per_uid) = resolve_all_candidate_vids(&uix, uids).await else {
+    let Ok(candidates_per_uid) = uix.resolve_all_vids(uids).await else {
         return (out, true);
     };
     if candidates_per_uid.is_empty() {
@@ -524,90 +524,6 @@ async fn batch_resolve_primary_by_ext_id<Q: ForkQueryHost + ?Sized>(
         }
     }
     out
-}
-
-/// Scan `UidIndex`'s underlying dataset with an `_uid_hex IN (...)`
-/// filter and collect **every** VID registered for each UID — unlike
-/// `UidIndex::resolve_uids`, which collapses to one VID per UID via
-/// HashMap overwrite (losing fork-vs-primary disambiguation).
-async fn resolve_all_candidate_vids(
-    uix: &uni_store::storage::index::UidIndex,
-    uids: &[UniId],
-) -> uni_common::Result<HashMap<UniId, Vec<Vid>>> {
-    use arrow_array::Array;
-    use futures::TryStreamExt;
-
-    // Lance/DataFusion errors all wrap uniformly as `Internal`; the
-    // generic bound lets one helper cover the scan-builder and stream
-    // error types alike.
-    fn internal<E>(e: E) -> uni_common::UniError
-    where
-        E: std::error::Error + Send + Sync + 'static,
-    {
-        uni_common::UniError::Internal(anyhow::anyhow!(e))
-    }
-
-    let ds = uix.open().await.map_err(uni_common::UniError::Internal)?;
-    let hex_values: Vec<String> = uids.iter().map(uid_to_hex).collect();
-    let filter = format!(
-        "_uid_hex IN ({})",
-        hex_values
-            .iter()
-            .map(|h| format!("'{}'", h))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    let mut stream = ds
-        .scan()
-        .filter(&filter)
-        .map_err(internal)?
-        .project(&["_uid_hex", "_vid"])
-        .map_err(internal)?
-        .try_into_stream()
-        .await
-        .map_err(internal)?;
-
-    let hex_to_uid: HashMap<String, UniId> =
-        uids.iter().map(|uid| (uid_to_hex(uid), *uid)).collect();
-    let mut out: HashMap<UniId, Vec<Vid>> = HashMap::new();
-    while let Some(batch) = stream.try_next().await.map_err(internal)? {
-        let uid_hex_col = batch
-            .column_by_name("_uid_hex")
-            .and_then(|c| c.as_any().downcast_ref::<arrow_array::StringArray>())
-            .ok_or_else(|| {
-                uni_common::UniError::Internal(anyhow::anyhow!("Missing _uid_hex column"))
-            })?;
-        let vid_col = batch
-            .column_by_name("_vid")
-            .and_then(|c| c.as_any().downcast_ref::<arrow_array::UInt64Array>())
-            .ok_or_else(|| {
-                uni_common::UniError::Internal(anyhow::anyhow!("Missing _vid column"))
-            })?;
-        for i in 0..batch.num_rows() {
-            if uid_hex_col.is_null(i) {
-                continue;
-            }
-            let hex = uid_hex_col.value(i);
-            if let Some(&uid) = hex_to_uid.get(hex) {
-                out.entry(uid)
-                    .or_default()
-                    .push(Vid::from(vid_col.value(i)));
-            }
-        }
-    }
-    Ok(out)
-}
-
-fn uid_to_hex(uid: &UniId) -> String {
-    use std::fmt::Write as _;
-
-    let bytes = uid.as_bytes();
-    let mut hex = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        // Infallible: writing to a `String` never errors.
-        let _ = write!(hex, "{b:02x}");
-    }
-    hex
 }
 
 // ============================================================================

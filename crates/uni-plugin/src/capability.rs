@@ -258,6 +258,38 @@ impl CapabilitySet {
         out
     }
 
+    /// Capabilities this (guest-declared) set requested but the host withheld.
+    ///
+    /// Membership is tested by *variant* against the post-attenuation
+    /// `effective` set: a payload capability that survived
+    /// [`CapabilitySet::intersect`] with a narrowed allow-list (e.g. a
+    /// `HostQuery` whose `scopes` the host tightened) is **granted, not denied**,
+    /// even though its effective payload differs from what was declared. Exact
+    /// equality against the raw grant would misreport such a cap as denied; this
+    /// helper — shared by every loader — is the single correct derivation.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use uni_plugin::{Capability, CapabilitySet};
+    ///
+    /// let declared = CapabilitySet::from_iter_of([
+    ///     Capability::ScalarFn,
+    ///     Capability::Algorithm,
+    /// ]);
+    /// let granted = CapabilitySet::from_iter_of([Capability::ScalarFn]);
+    /// let effective = declared.intersect(&granted);
+    /// assert_eq!(declared.denied_against(&effective), vec![Capability::Algorithm]);
+    /// ```
+    #[must_use]
+    pub fn denied_against(&self, effective: &CapabilitySet) -> Vec<Capability> {
+        self.set
+            .iter()
+            .filter(|c| !effective.contains_variant(c))
+            .cloned()
+            .collect()
+    }
+
     /// Returns an iterator over the contained capabilities.
     pub fn iter(&self) -> impl Iterator<Item = &Capability> {
         self.set.iter()
@@ -461,6 +493,289 @@ impl Capability {
     }
 }
 
+// ---- Grant-string parsing (single source of truth) ----------------------------
+//
+// Host-facing grant APIs (the Python binding, the CLI) express grants as strings.
+// This section is the *one* place that maps a grant string to a `Capability`, so
+// those parsers delegate here instead of each hard-coding a drifting `match`.
+// Rust guideline compliant.
+
+/// Canonical PascalCase names grantable from a bare capability string.
+///
+/// Buckets A (unit registration-gates) and B (allow-list host surfaces). Bucket B
+/// names build with a permissive default payload (see [`Capability::parse_grant`]).
+const GRANTABLE_NAMES: &[&str] = &[
+    // Bucket A — unit registration-gates.
+    "ScalarFn",
+    "AggregateFn",
+    "WindowFn",
+    "Procedure",
+    "ProcedureWrites",
+    "ProcedureSchema",
+    "ProcedureDbms",
+    "LocyAggregate",
+    "LocyPredicate",
+    "LocyGenerator",
+    "Operator",
+    "Index",
+    "Storage",
+    "Algorithm",
+    "GraphCompute",
+    "Crdt",
+    "Hook",
+    "Trigger",
+    "Type",
+    "Collation",
+    "PluginStorage",
+    // Bucket B — allow-list host surfaces.
+    "Network",
+    "Filesystem",
+    "HostQuery",
+    "Kms",
+    "Secret",
+    "Config",
+    "Lock",
+];
+
+/// Names of resource-quota capabilities — grantable only with a numeric value,
+/// via the plugin manifest, never a bare grant string (bucket C).
+const QUOTA_NAMES: &[&str] = &[
+    "BackgroundJob",
+    "MemoryBytes",
+    "FuelPerCall",
+    "WallClockMillisPerCall",
+    "ConcurrentInstances",
+    "TotalMemoryBytes",
+    "MaxResultRows",
+    "GraphComputeWork",
+    "GraphComputeArenaBytes",
+];
+
+/// Names of internal / first-party capabilities — never grantable to a guest
+/// plugin via a grant string (bucket D, plus meta-procedure authority).
+const INTERNAL_NAMES: &[&str] = &["Auth", "Authz", "Cdc", "Catalog", "PluginDeclare"];
+
+/// Fold a grant string to its canonical key: lowercase, with `-` removed.
+///
+/// This makes the parser accept both the PascalCase variant name (`"GraphCompute"`)
+/// and the serde kebab-case tag (`"graph-compute"`).
+fn grant_key(s: &str) -> String {
+    s.chars()
+        .filter(|c| *c != '-')
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// Failure to interpret a capability grant string.
+///
+/// Returned by [`Capability::parse_grant`]; the host-facing parsers map each
+/// variant onto their own reporting policy (hard error, skip, or warn).
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum GrantError {
+    /// The name matches no known capability.
+    #[error("unknown grant `{name}`; grantable capabilities: {supported}")]
+    Unknown {
+        /// The rejected input string.
+        name: String,
+        /// The `/`-joined list of grantable names, for the message.
+        supported: String,
+    },
+    /// The capability is a resource quota needing a numeric value.
+    #[error(
+        "grant `{name}` is a resource quota; declare it with a value in the \
+         plugin manifest `capabilities:` list, not as a bare grant"
+    )]
+    Quota {
+        /// The canonical capability name.
+        name: String,
+    },
+    /// The capability is internal / first-party and not grantable to guests.
+    #[error("grant `{name}` is not grantable to guest plugins")]
+    Internal {
+        /// The canonical capability name.
+        name: String,
+    },
+}
+
+impl Capability {
+    /// The canonical PascalCase grant name for this capability variant.
+    ///
+    /// Exhaustive by construction: adding a `Capability` variant fails to compile
+    /// here until it is named, which keeps the grant-string parsers from silently
+    /// drifting from the enum (see the module's grant-parsing tests).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use uni_plugin::Capability;
+    /// assert_eq!(Capability::GraphCompute.grant_name(), "GraphCompute");
+    /// ```
+    #[must_use]
+    pub fn grant_name(&self) -> &'static str {
+        match self {
+            // Host import surfaces (bucket B).
+            Capability::Network { .. } => "Network",
+            Capability::Filesystem { .. } => "Filesystem",
+            Capability::HostQuery { .. } => "HostQuery",
+            Capability::Kms { .. } => "Kms",
+            Capability::Secret { .. } => "Secret",
+            Capability::Lock { .. } => "Lock",
+            Capability::Config { .. } => "Config",
+            Capability::PluginStorage => "PluginStorage",
+            // Extension surfaces (bucket A) and internal gates (bucket D).
+            Capability::ScalarFn => "ScalarFn",
+            Capability::AggregateFn => "AggregateFn",
+            Capability::WindowFn => "WindowFn",
+            Capability::Procedure => "Procedure",
+            Capability::ProcedureWrites => "ProcedureWrites",
+            Capability::ProcedureSchema => "ProcedureSchema",
+            Capability::ProcedureDbms => "ProcedureDbms",
+            Capability::LocyAggregate => "LocyAggregate",
+            Capability::LocyPredicate => "LocyPredicate",
+            Capability::LocyGenerator => "LocyGenerator",
+            Capability::Operator => "Operator",
+            Capability::Index => "Index",
+            Capability::Storage => "Storage",
+            Capability::Algorithm => "Algorithm",
+            Capability::GraphCompute => "GraphCompute",
+            Capability::Crdt => "Crdt",
+            Capability::Hook => "Hook",
+            Capability::Trigger => "Trigger",
+            Capability::BackgroundJob { .. } => "BackgroundJob",
+            Capability::Type => "Type",
+            Capability::Auth => "Auth",
+            Capability::Authz => "Authz",
+            Capability::Collation => "Collation",
+            Capability::Cdc => "Cdc",
+            Capability::Catalog => "Catalog",
+            Capability::PluginDeclare => "PluginDeclare",
+            // Resource quotas (bucket C).
+            Capability::MemoryBytes(_) => "MemoryBytes",
+            Capability::FuelPerCall(_) => "FuelPerCall",
+            Capability::WallClockMillisPerCall(_) => "WallClockMillisPerCall",
+            Capability::ConcurrentInstances(_) => "ConcurrentInstances",
+            Capability::TotalMemoryBytes(_) => "TotalMemoryBytes",
+            Capability::MaxResultRows(_) => "MaxResultRows",
+            Capability::GraphComputeWork(_) => "GraphComputeWork",
+            Capability::GraphComputeArenaBytes(_) => "GraphComputeArenaBytes",
+        }
+    }
+
+    /// The capability names a host may grant from a bare grant string.
+    ///
+    /// Buckets A + B, in canonical PascalCase. Resource quotas (bucket C) and
+    /// internal capabilities (bucket D) are excluded — see [`Capability::parse_grant`].
+    #[must_use]
+    pub fn grantable_names() -> &'static [&'static str] {
+        GRANTABLE_NAMES
+    }
+
+    /// Parse a host grant string into a `Capability`.
+    ///
+    /// Accepts the canonical PascalCase name (`"GraphCompute"`) or its serde
+    /// kebab-case tag (`"graph-compute"`). Unit registration-gates (bucket A) map
+    /// to their payload-free variant; allow-list host surfaces (bucket B) map to a
+    /// permissive default (`Network { allow: ["**"] }`, `HostQuery { read_only:
+    /// true, scopes: ["**"] }`, …) that the loader then attenuates against the
+    /// guest's declared capability.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use uni_plugin::Capability;
+    /// assert_eq!(Capability::parse_grant("Algorithm").unwrap(), Capability::Algorithm);
+    /// assert_eq!(
+    ///     Capability::parse_grant("graph-compute").unwrap(),
+    ///     Capability::GraphCompute,
+    /// );
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GrantError::Quota`] for a resource-quota name (bucket C, needs a
+    /// value declared in the manifest), [`GrantError::Internal`] for an
+    /// internal / first-party capability (bucket D and `PluginDeclare`), and
+    /// [`GrantError::Unknown`] for an unrecognized name.
+    pub fn parse_grant(s: &str) -> Result<Self, GrantError> {
+        let key = grant_key(s);
+        if let Some(cap) = grant_default_for_key(&key) {
+            return Ok(cap);
+        }
+        if let Some(name) = QUOTA_NAMES.iter().find(|n| grant_key(n) == key) {
+            return Err(GrantError::Quota {
+                name: (*name).to_owned(),
+            });
+        }
+        if let Some(name) = INTERNAL_NAMES.iter().find(|n| grant_key(n) == key) {
+            return Err(GrantError::Internal {
+                name: (*name).to_owned(),
+            });
+        }
+        Err(GrantError::Unknown {
+            name: s.to_owned(),
+            supported: GRANTABLE_NAMES.join(" / "),
+        })
+    }
+}
+
+/// Build the default grant capability for a canonical grant key, or `None`.
+///
+/// The single definition of the permissive default payloads for bucket-B
+/// (allow-list) grants; bucket-A grants are payload-free. Keys are already folded
+/// by [`grant_key`], so both PascalCase and kebab-case inputs land here.
+fn grant_default_for_key(key: &str) -> Option<Capability> {
+    Some(match key {
+        // Bucket A — unit registration-gates.
+        "scalarfn" => Capability::ScalarFn,
+        "aggregatefn" => Capability::AggregateFn,
+        "windowfn" => Capability::WindowFn,
+        "procedure" => Capability::Procedure,
+        "procedurewrites" => Capability::ProcedureWrites,
+        "procedureschema" => Capability::ProcedureSchema,
+        "proceduredbms" => Capability::ProcedureDbms,
+        "locyaggregate" => Capability::LocyAggregate,
+        "locypredicate" => Capability::LocyPredicate,
+        "locygenerator" => Capability::LocyGenerator,
+        "operator" => Capability::Operator,
+        "index" => Capability::Index,
+        "storage" => Capability::Storage,
+        "algorithm" => Capability::Algorithm,
+        "graphcompute" => Capability::GraphCompute,
+        "crdt" => Capability::Crdt,
+        "hook" => Capability::Hook,
+        "trigger" => Capability::Trigger,
+        "type" => Capability::Type,
+        "collation" => Capability::Collation,
+        "pluginstorage" => Capability::PluginStorage,
+        // Bucket B — allow-list host surfaces, permissive default payload.
+        "network" => Capability::Network {
+            allow: vec!["**".into()],
+        },
+        "filesystem" => Capability::Filesystem {
+            read: vec!["**".into()],
+            write: vec!["**".into()],
+        },
+        "hostquery" => Capability::HostQuery {
+            read_only: true,
+            scopes: vec!["**".into()],
+        },
+        "kms" => Capability::Kms {
+            key_ids: vec!["*".into()],
+        },
+        "secret" => Capability::Secret {
+            ids: vec!["*".into()],
+        },
+        "config" => Capability::Config {
+            keys: vec!["**".into()],
+        },
+        "lock" => Capability::Lock {
+            granularity: LockGranularity::Global,
+        },
+        _ => return None,
+    })
+}
+
 /// A capability as it appears in a **guest plugin manifest** (WASM / Extism) —
 /// either a bare capability name (`"network"`, `"scalar-fn"`) or a structured
 /// object carrying attenuation patterns
@@ -590,6 +905,170 @@ pub enum Scope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One representative value per `Capability` variant.
+    ///
+    /// Used by the grant-parsing tests to assert every variant is classified.
+    /// The `grant_name` match is the compile-time guard that forces a new variant
+    /// to be named; the length assertion in `every_variant_classified_exactly_once`
+    /// forces the new variant to be added here too.
+    fn all_capability_variants() -> Vec<Capability> {
+        vec![
+            Capability::Network { allow: vec![] },
+            Capability::Filesystem {
+                read: vec![],
+                write: vec![],
+            },
+            Capability::HostQuery {
+                read_only: true,
+                scopes: vec![],
+            },
+            Capability::Kms { key_ids: vec![] },
+            Capability::Secret { ids: vec![] },
+            Capability::Lock {
+                granularity: LockGranularity::Both,
+            },
+            Capability::Config { keys: vec![] },
+            Capability::PluginStorage,
+            Capability::ScalarFn,
+            Capability::AggregateFn,
+            Capability::WindowFn,
+            Capability::Procedure,
+            Capability::ProcedureWrites,
+            Capability::ProcedureSchema,
+            Capability::ProcedureDbms,
+            Capability::LocyAggregate,
+            Capability::LocyPredicate,
+            Capability::LocyGenerator,
+            Capability::Operator,
+            Capability::Index,
+            Capability::Storage,
+            Capability::Algorithm,
+            Capability::GraphCompute,
+            Capability::Crdt,
+            Capability::Hook,
+            Capability::Trigger,
+            Capability::BackgroundJob { max_concurrent: 1 },
+            Capability::Type,
+            Capability::Auth,
+            Capability::Authz,
+            Capability::Collation,
+            Capability::Cdc,
+            Capability::Catalog,
+            Capability::PluginDeclare,
+            Capability::MemoryBytes(0),
+            Capability::FuelPerCall(0),
+            Capability::WallClockMillisPerCall(0),
+            Capability::ConcurrentInstances(0),
+            Capability::TotalMemoryBytes(0),
+            Capability::MaxResultRows(0),
+            Capability::GraphComputeWork(0),
+            Capability::GraphComputeArenaBytes(0),
+        ]
+    }
+
+    #[test]
+    fn every_variant_classified_exactly_once() {
+        let variants = all_capability_variants();
+        // Guard the representative list against silent omission: if a variant is
+        // added, `grant_name` fails to compile first, and this length check then
+        // fails until the variant is added here too.
+        assert_eq!(
+            variants.len(),
+            GRANTABLE_NAMES.len() + QUOTA_NAMES.len() + INTERNAL_NAMES.len(),
+            "every variant must be represented and classified exactly once",
+        );
+        for cap in variants {
+            let name = cap.grant_name();
+            let grantable = GRANTABLE_NAMES.contains(&name);
+            let quota = QUOTA_NAMES.contains(&name);
+            let internal = INTERNAL_NAMES.contains(&name);
+            assert!(
+                [grantable, quota, internal].iter().filter(|b| **b).count() == 1,
+                "`{name}` must fall in exactly one grant class",
+            );
+        }
+    }
+
+    #[test]
+    fn grantable_names_round_trip() {
+        for name in GRANTABLE_NAMES {
+            let cap = Capability::parse_grant(name)
+                .unwrap_or_else(|e| panic!("`{name}` should be grantable: {e}"));
+            assert_eq!(cap.grant_name(), *name);
+        }
+    }
+
+    #[test]
+    fn parse_grant_accepts_pascal_and_kebab() {
+        assert_eq!(
+            Capability::parse_grant("GraphCompute").unwrap(),
+            Capability::GraphCompute,
+        );
+        assert_eq!(
+            Capability::parse_grant("graph-compute").unwrap(),
+            Capability::GraphCompute,
+        );
+        // The #150 triple all resolve.
+        assert_eq!(
+            Capability::parse_grant("Algorithm").unwrap(),
+            Capability::Algorithm,
+        );
+        assert!(matches!(
+            Capability::parse_grant("HostQuery").unwrap(),
+            Capability::HostQuery { read_only: true, scopes } if scopes == vec![SmolStr::new("**")]
+        ));
+    }
+
+    #[test]
+    fn parse_grant_rejects_quota_internal_unknown() {
+        assert!(matches!(
+            Capability::parse_grant("MemoryBytes"),
+            Err(GrantError::Quota { .. })
+        ));
+        assert!(matches!(
+            Capability::parse_grant("BackgroundJob"),
+            Err(GrantError::Quota { .. })
+        ));
+        assert!(matches!(
+            Capability::parse_grant("Auth"),
+            Err(GrantError::Internal { .. })
+        ));
+        assert!(matches!(
+            Capability::parse_grant("PluginDeclare"),
+            Err(GrantError::Internal { .. })
+        ));
+        assert!(matches!(
+            Capability::parse_grant("NotARealCapability"),
+            Err(GrantError::Unknown { .. })
+        ));
+    }
+
+    #[test]
+    fn denied_against_ignores_attenuated_but_granted_payload() {
+        // Guest asks for a narrow HostQuery scope; host grants a broader one.
+        // After intersect the effective HostQuery survives (with the guest's
+        // narrowed payload), so it must NOT be reported denied — the bug the
+        // exact-`contains` derivation had.
+        let declared = CapabilitySet::from_iter_of([
+            Capability::HostQuery {
+                read_only: true,
+                scopes: vec![SmolStr::new("a")],
+            },
+            Capability::Algorithm,
+        ]);
+        let granted = CapabilitySet::from_iter_of([
+            Capability::HostQuery {
+                read_only: true,
+                scopes: vec![SmolStr::new("a"), SmolStr::new("b")],
+            },
+            // Algorithm withheld.
+        ]);
+        let effective = declared.intersect(&granted);
+        let denied = declared.denied_against(&effective);
+        // HostQuery is granted (attenuated), only the withheld Algorithm is denied.
+        assert_eq!(denied, vec![Capability::Algorithm]);
+    }
 
     #[test]
     fn capability_set_default_empty() {

@@ -10,6 +10,52 @@ v1.4 minor bumps when their ABI grows.
 First phase of the Plugin Compute ABI (`docs/proposals/plugin_compute_abi_2026-07-13.md`),
 which extends GraphCompute additively. No breaking changes.
 
+### Added — `graph-arena@1`: guest-authorable mutable graph structure
+
+Design and measurements: `docs/proposals/guest_stateful_compute_2026-07-20.md`. Closes
+issue #152 — the mutable scratch-graph primitives were unreachable from *every* loader,
+not only Rhai, because they were a parallel stack that no production adapter was wired to.
+
+- **`HandleKind::Arena`** — session-local *mutable* synthetic structure a guest grows
+  (search trees, residual networks, agent populations), in the existing handle table and
+  dispatch table. Flat CSR-with-slack adjacency plus `[capacity]` `f64` state columns, so
+  a node can carry both visits *and* value.
+- **Ten kernels**, reachable from every loader: `arena_new`, `arena_alloc`, `arena_expand`
+  (allocate-and-link; the tree-growth primitive), `arena_link`, `arena_column`,
+  `arena_candidates`, `arena_gather`, `arena_scatter`, `arena_descend`, `arena_freeze`.
+  `arena_candidates` makes guest scoring candidate-scoped — `O(frontier × branching)`
+  rather than whole-column `O(N)`. `arena_descend` applies one visit and the virtual loss
+  *in the descent loop*; omitting that collapses a 1024-rollout batch onto 16 leaves.
+- **`arena_freeze`** compacts an arena into an ordinary `GraphProjection` behind an
+  ordinary `Graph` handle, so the whole `graph-compute@1` library applies to guest-grown
+  structure. It is a snapshot: Mode-A kernels assume a graph that cannot change while they
+  iterate it. New `GraphProjection::from_dense_edges` in `uni-algo` shares `build_csr` with
+  `from_rows`, so a frozen arena gets identical canonical edge ordering.
+- **`HOST_CAPABILITY_SLICES` gains `("graph-arena", 1)`** — declare it via `SliceReq` and
+  a host lacking it refuses at registration with a typed `0x86A`.
+- **New WIT interface `uni:plugin/host-arena@0.1.0`** (WASM), carrying handles as `u64`
+  and scalars directly instead of a JSON string — worth ~32× at batch granularity. It is
+  **additive**: a guest that does not import it is unaffected, verified by the prebuilt
+  component fixtures instantiating unchanged. Extism reaches the arena kernels through the
+  existing JSON path (reachable, not yet typed).
+- **`KernelId` catalog + reachability contract.** Kernel names, `ALL`, `reach` and
+  `from_op_name` are generated from one declaration; `dispatch.rs` matches it with no
+  wildcard, so a catalogued kernel fails to compile until dispatched, and per-loader tests
+  assert every all-loaders kernel is registered on Rhai and PyO3. This found and fixed a
+  live instance: `edge_count` was dispatchable over JSON but invisible to both in-process
+  loaders.
+
+### Deprecated — the scratch-graph stack (removal at the next major)
+
+`ScratchGraph`, `ScratchRegistry`, `ScratchRequest`, `ScratchResponse`, `LoaderClass` and
+`require_compiled_body` are `#[deprecated(since = "3.1.0")]`, superseded by the `arena_*`
+kernels. They are still exported, so this release only warns.
+
+`require_compiled_body` is additionally **refuted by measurement**: an interpreted Rhai
+guest on batched kernels outruns a compiled WASM guest on the per-op JSON ABI, so loader
+class does not predict throughput. The entries under *"Added — iteration driver,
+determinism accumulator, Mode B cores"* below describe this superseded surface.
+
 ### Changed — GraphCompute native-work grant semantics (governance-posture change)
 
 - **`Capability::GraphComputeWork(w)` now *raises* the ceiling, not just lowers it.**

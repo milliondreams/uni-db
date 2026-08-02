@@ -108,19 +108,28 @@ impl ResilientObjectStore {
                     return Ok(val);
                 }
                 Err(e) => {
-                    attempt += 1;
-                    if attempt > self.config.max_retries {
-                        self.cb.report_failure();
+                    // Classify BEFORE spending an attempt. A terminal error is an
+                    // application-level outcome (absent, already present, denied),
+                    // not a system failure, so it must neither retry nor count
+                    // against the breaker.
+                    //
+                    // This check has to precede the attempt-budget check below:
+                    // with the order reversed, a terminal error arriving on the
+                    // final attempt is misreported as a breaker failure and never
+                    // reaches the classifier at all.
+                    //
+                    // Matching is on the variant. The previous
+                    // `to_string().contains("not found")` also caught a *transient*
+                    // `Generic` whose message happened to read that way — a proxy
+                    // 404 body, or a wrapped S3 "bucket not found" — and gave up on
+                    // a blip that would have healed.
+                    if crate::store_utils::is_terminal(&e) {
                         return Err(e);
                     }
 
-                    // Check for non-retryable errors
-                    let msg = e.to_string().to_lowercase();
-                    if msg.contains("not found") || msg.contains("already exists") {
-                        // Don't count 404 as failure for CB?
-                        // Usually 404 is application level logic, not system failure.
-                        // So we report success to CB? Or just ignore?
-                        // Let's ignore it (don't report failure).
+                    attempt += 1;
+                    if attempt > self.config.max_retries {
+                        self.cb.report_failure();
                         return Err(e);
                     }
 
@@ -179,8 +188,17 @@ impl ObjectStore for ResilientObjectStore {
         let res = self
             .timeout(|| self.inner.put_opts(location, payload, opts), timeout)
             .await;
-        match res {
+        match &res {
             Ok(_) => self.cb.report_success(),
+            // A terminal error is an application-level outcome, not a store
+            // failure. `put_opts` is the conditional-write entry point, so a
+            // writer losing an OCC race reports `AlreadyExists` / `Precondition`
+            // here; counting those meant five ordinary write conflicts opened
+            // the breaker and took every path through the store offline for 30s.
+            //
+            // `put_opts` does not route through `retry`, so this is the only
+            // place that classification can happen for it.
+            Err(e) if crate::store_utils::is_terminal(e) => {}
             Err(_) => self.cb.report_failure(),
         }
         res

@@ -265,9 +265,14 @@ use crate::query::df_graph::procedure_call::value_to_columnar;
 /// for shapes it cannot decode. The plugin-output contract instead
 /// requires a hard error on any unexpected Arrow type so the failure
 /// surfaces to the `CALL` site rather than silently producing nulls.
+///
+/// `field` supplies the column's Arrow metadata, which is what distinguishes a
+/// `LargeBinary` carrying an encoded `CypherValue` from one carrying opaque
+/// bytes — see the `LargeBinary` arm.
 fn arrow_scalar_to_value(
     arr: &dyn arrow_array::Array,
     row_idx: usize,
+    field: &arrow_schema::Field,
 ) -> std::result::Result<Value, String> {
     use arrow_array::cast::AsArray;
     use arrow_schema::DataType as Dt;
@@ -304,7 +309,36 @@ fn arrow_scalar_to_value(
             arr.as_string::<i64>().value(row_idx).to_string(),
         )),
         Dt::Binary => Ok(Value::Bytes(arr.as_binary::<i32>().value(row_idx).to_vec())),
-        Dt::LargeBinary => Ok(Value::Bytes(arr.as_binary::<i64>().value(row_idx).to_vec())),
+        // `LargeBinary` is the framework's CypherValue transport:
+        // `argtype_to_arrow` collapses `ArgType::CypherValue` onto it, the
+        // plugin *input* side decodes it (`plugin_adapter.rs`), and so does the
+        // DataFusion CALL path (`read.rs`). This drain did not, so a plugin
+        // yielding a CypherValue handed the caller its wire bytes.
+        //
+        // The default is inverted relative to `read.rs`: decode unless the
+        // column is marked raw. That is deliberate — `uni_raw_bytes` is stamped
+        // only on storage/scan paths and *no* plugin loader stamps it on a yield
+        // field, so gating on the marker being present would fix nothing.
+        //
+        // Decode failure degrades to the bytes rather than erroring. An unmarked
+        // column is currently the only shape a plugin yielding opaque bytes can
+        // produce, so hard-erroring would break every such plugin at the CALL
+        // site. The residual hazard is a raw payload whose first byte happens to
+        // be a valid tag *and* whose remainder is valid msgpack: that decodes
+        // silently and wrongly, and `uni_raw_bytes` on the yield field is the
+        // escape hatch for it.
+        Dt::LargeBinary => {
+            let bytes = arr.as_binary::<i64>().value(row_idx);
+            if field
+                .metadata()
+                .get("uni_raw_bytes")
+                .is_some_and(|v| v == "true")
+            {
+                return Ok(Value::Bytes(bytes.to_vec()));
+            }
+            Ok(uni_common::cypher_value_codec::decode(bytes)
+                .unwrap_or_else(|_| Value::Bytes(bytes.to_vec())))
+        }
         other => Err(format!(
             "unsupported Arrow type in plugin procedure output: {other:?}"
         )),
@@ -720,6 +754,14 @@ impl Executor {
         if let Some(writer) = &self.writer {
             host = host.with_writer(Arc::clone(writer));
         }
+        // Same reasoning as the graphRef resolver below: every row-path plugin
+        // procedure (including `uni.graph.project`'s Cypher mode and every
+        // `CypherProcedureSynthesizer`-declared procedure) runs its inner Cypher
+        // through this host, so it needs the outer query's L0 visibility or it
+        // reads committed storage only.
+        if let Some(qc) = ctx {
+            host = host.with_l0_context(crate::query::df_graph::L0Context::from_query_context(qc));
+        }
         // FU-1: propagate the in-flight principal so capability gates
         // (e.g., `Capability::ProcedureWrites` on
         // `uni.plugin.declareProcedure WRITE`) see the session's
@@ -744,7 +786,7 @@ impl Executor {
                 for col_idx in 0..batch.num_columns() {
                     let field = schema.field(col_idx);
                     let arr = batch.column(col_idx);
-                    let v = arrow_scalar_to_value(arr.as_ref(), row_idx)
+                    let v = arrow_scalar_to_value(arr.as_ref(), row_idx, field)
                         .map_err(|e| anyhow!("Procedure '{name}': output decode: {e}"))?;
                     row.insert(field.name().clone(), v);
                 }
@@ -808,11 +850,33 @@ impl Executor {
             ))
         });
 
+        // Guest Cypher/Named projections (issue #151 P3) resolve through a query
+        // host built from the executor's components (the simple-executor path has
+        // no GraphExecutionContext of its own, so the outer query's L0 snapshot
+        // is threaded in explicitly below).
+        let storage = self.effective_storage();
+        let mut resolver_host =
+            crate::query::executor::procedure_host::QueryProcedureHost::from_components(
+                Arc::clone(&storage),
+                Some(Arc::clone(&self.algo_registry)),
+                self.procedure_registry.clone(),
+            );
+        // The resolver's `nodeQuery` / `edgeQuery` must observe the same L0
+        // snapshot the outer projection does (`l0_manager`, above). Without this
+        // a guest Cypher/Named `graphRef` silently selects from flushed storage
+        // only, while a label-scoped projection on this very call sees L0 — a
+        // wrong answer that depends on which projection mode was used.
+        if let Some(qc) = ctx {
+            resolver_host = resolver_host
+                .with_l0_context(crate::query::df_graph::L0Context::from_query_context(qc));
+        }
+        let resolver = crate::procedures_plugin::algo::guest_graph_resolver(resolver_host);
         let mut stream = crate::procedures_plugin::algo::run_algorithm_provider(
             entry,
-            self.effective_storage(),
+            storage,
             l0_manager,
             &config_json,
+            Some(resolver),
         )
         .map_err(|e| anyhow!("Algorithm '{name}': {e}"))?;
 
@@ -825,7 +889,7 @@ impl Executor {
                 for col_idx in 0..batch.num_columns() {
                     let field = schema.field(col_idx);
                     let arr = batch.column(col_idx);
-                    let v = arrow_scalar_to_value(arr.as_ref(), row_idx)
+                    let v = arrow_scalar_to_value(arr.as_ref(), row_idx, field)
                         .map_err(|e| anyhow!("Algorithm '{name}': output decode: {e}"))?;
                     row.insert(field.name().clone(), v);
                 }
@@ -977,4 +1041,108 @@ fn values_match(row_val: &Value, arg_val: &Value) -> bool {
         return (a - b).abs() < f64::EPSILON;
     }
     row_val == arg_val
+}
+
+#[cfg(test)]
+mod arrow_scalar_to_value_tests {
+    use super::*;
+    use arrow_array::{ArrayRef, Int64Array, LargeBinaryArray};
+    use arrow_schema::{DataType as Dt, Field};
+    use std::collections::HashMap as StdHashMap;
+
+    fn large_binary(bytes: &[u8]) -> ArrayRef {
+        std::sync::Arc::new(LargeBinaryArray::from(vec![Some(bytes)]))
+    }
+
+    fn plain_field(dt: Dt) -> Field {
+        Field::new("col", dt, true)
+    }
+
+    fn raw_bytes_field(dt: Dt) -> Field {
+        let mut md = StdHashMap::new();
+        md.insert("uni_raw_bytes".to_string(), "true".to_string());
+        Field::new("col", dt, true).with_metadata(md)
+    }
+
+    /// `LargeBinary` is how the framework transports a `CypherValue`, so a
+    /// plugin yielding one must get its value back — not the wire bytes.
+    ///
+    /// `argtype_to_arrow` collapses `ArgType::CypherValue` to `LargeBinary`;
+    /// the plugin *input* side already decodes it, and so does the DataFusion
+    /// CALL path. Only this drain treated it as opaque.
+    #[test]
+    fn cypher_value_transport_is_decoded() {
+        let encoded = uni_common::cypher_value_codec::encode(&Value::Int(42));
+        let arr = large_binary(&encoded);
+        let got = arrow_scalar_to_value(arr.as_ref(), 0, &plain_field(Dt::LargeBinary))
+            .expect("decode succeeds");
+        assert_eq!(
+            got,
+            Value::Int(42),
+            "a CypherValue-carrying LargeBinary column must decode, not surface as raw bytes"
+        );
+    }
+
+    /// A string round-trips too — the codec, not a numeric special case.
+    #[test]
+    fn cypher_value_string_is_decoded() {
+        let encoded = uni_common::cypher_value_codec::encode(&Value::String("hi".into()));
+        let arr = large_binary(&encoded);
+        let got =
+            arrow_scalar_to_value(arr.as_ref(), 0, &plain_field(Dt::LargeBinary)).expect("decode");
+        assert_eq!(got, Value::String("hi".into()));
+    }
+
+    /// A column explicitly marked raw stays raw.
+    ///
+    /// `Bytes`, `CypherValue` and `Duration` all map to Arrow `LargeBinary` and
+    /// are otherwise indistinguishable here, which is exactly why
+    /// `uni_raw_bytes` exists (issue #93). This is the escape hatch for a
+    /// plugin that genuinely yields opaque bytes.
+    #[test]
+    fn raw_bytes_marker_suppresses_decoding() {
+        // Deliberately valid CypherValue bytes: only the marker should decide.
+        let encoded = uni_common::cypher_value_codec::encode(&Value::Int(42));
+        let arr = large_binary(&encoded);
+        let got = arrow_scalar_to_value(arr.as_ref(), 0, &raw_bytes_field(Dt::LargeBinary))
+            .expect("raw path succeeds");
+        assert_eq!(
+            got,
+            Value::Bytes(encoded),
+            "`uni_raw_bytes` must win over the codec"
+        );
+    }
+
+    /// Bytes that are not a CypherValue fall back to `Value::Bytes`.
+    ///
+    /// No plugin loader stamps `uni_raw_bytes` on a yield field today, so an
+    /// unmarked column is the *only* shape a plugin yielding opaque bytes can
+    /// produce. Hard-erroring on decode failure would break every such plugin
+    /// at the CALL site; degrading to the bytes is the behaviour that keeps
+    /// both kinds of plugin working.
+    #[test]
+    fn undecodable_bytes_fall_back_instead_of_erroring() {
+        let junk = vec![0xFFu8, 0xFE, 0xFD, 0x00, 0x01];
+        let arr = large_binary(&junk);
+        let got = arrow_scalar_to_value(arr.as_ref(), 0, &plain_field(Dt::LargeBinary))
+            .expect("a non-CypherValue payload must not fail the CALL");
+        assert_eq!(got, Value::Bytes(junk));
+    }
+
+    /// Non-binary columns are untouched by any of this.
+    #[test]
+    fn other_types_are_unchanged() {
+        let arr: ArrayRef = std::sync::Arc::new(Int64Array::from(vec![Some(7i64)]));
+        let got = arrow_scalar_to_value(arr.as_ref(), 0, &plain_field(Dt::Int64)).expect("int");
+        assert_eq!(got, Value::Int(7));
+    }
+
+    /// Nulls stay null regardless of the field's metadata.
+    #[test]
+    fn nulls_are_preserved() {
+        let arr: ArrayRef = std::sync::Arc::new(LargeBinaryArray::from(vec![None::<&[u8]>]));
+        let got =
+            arrow_scalar_to_value(arr.as_ref(), 0, &plain_field(Dt::LargeBinary)).expect("null");
+        assert_eq!(got, Value::Null);
+    }
 }

@@ -61,6 +61,7 @@ pub mod capability;
 pub mod circuit_breaker;
 pub mod errors;
 pub mod fs_guard;
+pub mod hex;
 pub mod host;
 pub mod host_services;
 pub mod lifecycle;
@@ -76,10 +77,11 @@ pub mod secrets;
 pub mod surfaces;
 pub mod traits;
 pub mod verify;
+pub mod wire_manifest;
 
 #[doc(inline)]
 pub use crate::capability::{
-    Capability, CapabilitySet, Determinism, ManifestCapability, Scope, SideEffects,
+    Capability, CapabilitySet, Determinism, GrantError, ManifestCapability, Scope, SideEffects,
 };
 #[doc(inline)]
 pub use crate::errors::{FnError, PluginError, ReloadError};

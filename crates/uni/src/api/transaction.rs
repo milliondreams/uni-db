@@ -146,6 +146,11 @@ pub struct Transaction {
     /// snapshot at execute time (it is pinned lazily on first freeze, so a
     /// value captured at prepare time could be stale).
     snapshot: Arc<parking_lot::Mutex<Option<uni_store::runtime::SnapshotView>>>,
+    /// Ephemeral ("scratch") transaction (G8/E2): writes go to a private L0 over
+    /// a pinned read base with an in-memory id allocator, and `commit()` is
+    /// refused — the writes are always discarded on drop. This is the cheap
+    /// write-isolated per-rollout fork (no Lance branch / registry / WAL).
+    ephemeral: bool,
 }
 
 /// Classify a Cypher payload as `"write"`, `"schema"`, or `"dbms"` for
@@ -167,8 +172,12 @@ pub struct Transaction {
 fn classify_verb(cypher: &str) -> &'static str {
     let s = cypher.trim_start();
     // Take up to 32 chars and uppercase for a cheap prefix match.
-    let prefix_len = s.len().min(32);
-    let prefix = s[..prefix_len].to_uppercase();
+    //
+    // Iterate by `char`, not by byte. `s.len()` is a BYTE length, so slicing
+    // `s[..s.len().min(32)]` panicked whenever byte 32 landed inside a
+    // multi-byte codepoint — i.e. on any query with non-ASCII text near the
+    // start, such as `CREATE (:Thing)-[:\`CONNAÎT\`]->(:Thing)`.
+    let prefix: String = s.chars().take(32).flat_map(char::to_uppercase).collect();
     let p = prefix.as_str();
 
     if p.starts_with("CREATE INDEX")
@@ -195,13 +204,21 @@ fn classify_verb(cypher: &str) -> &'static str {
 
 impl Transaction {
     pub(crate) async fn new(session: &Session) -> Result<Self> {
-        Self::new_with_options(session, None, IsolationLevel::default()).await
+        Self::new_with_options(session, None, IsolationLevel::default(), false).await
+    }
+
+    /// Begin an ephemeral ("scratch") transaction (G8/E2): write-isolated over a
+    /// pinned read base with an in-memory id allocator, `commit()` refused, all
+    /// writes discarded on drop.
+    pub(crate) async fn new_scratch(session: &Session) -> Result<Self> {
+        Self::new_with_options(session, None, IsolationLevel::default(), true).await
     }
 
     pub(crate) async fn new_with_options(
         session: &Session,
         timeout: Option<Duration>,
         _isolation: IsolationLevel,
+        ephemeral: bool,
     ) -> Result<Self> {
         // Ensure no other write context is active on this session
         if session
@@ -239,10 +256,32 @@ impl Transaction {
             let writer: &uni_store::Writer = writer_lock.as_ref();
             let l0 = writer.create_transaction_l0();
             let version = l0.read().current_version;
-            let reservoir = Arc::new(uni_store::runtime::TxIdReservoir::new(
-                writer.allocator.clone(),
-                db.config.tx_id_reservoir_batch,
-            ));
+            let batch = db.config.tx_id_reservoir_batch;
+            // A scratch tx draws ids from a throwaway in-memory allocator seeded
+            // ABOVE the primary's live HWM, so its vids/eids can't collide with
+            // pinned base rows and the global `id_allocator.json` is never
+            // advanced or rewritten (G8/E2). A normal tx uses the global
+            // allocator.
+            let reservoir = if ephemeral {
+                let (vid_hwm, eid_hwm) = writer.allocator.current_hwm().await;
+                let scratch_alloc =
+                    uni_store::runtime::id_allocator::IdAllocator::in_memory_seeded(
+                        vid_hwm,
+                        eid_hwm,
+                        batch as u64,
+                    )
+                    .await
+                    .map_err(UniError::Internal)?;
+                Arc::new(uni_store::runtime::TxIdReservoir::new(
+                    Arc::new(scratch_alloc),
+                    batch,
+                ))
+            } else {
+                Arc::new(uni_store::runtime::TxIdReservoir::new(
+                    writer.allocator.clone(),
+                    batch,
+                ))
+            };
             (version, l0, reservoir)
         };
 
@@ -255,7 +294,11 @@ impl Transaction {
         // scans filter to `_version <= started_at_version`, so a flush
         // completing mid-transaction cannot leak post-snapshot rows. One per
         // transaction (the pinned manager carries a fresh AdjacencyManager).
-        let snapshot = if db.config.ssi_enabled {
+        // A scratch tx always pins (even with SSI off): its read base must be the
+        // version-pinned `pinned_at_version` storage (which SHARES the adjacency
+        // manager, so scratch edges written to tx_l0 are visible to traversal)
+        // rather than live L0, giving stable read-your-writes isolation (G8/E2).
+        let snapshot = if db.config.ssi_enabled || ephemeral {
             let writer: &uni_store::Writer = writer_lock.as_ref();
             let mut snap = writer.l0_manager.pin_snapshot();
             snap.pinned_storage = Some(Arc::new(
@@ -297,6 +340,7 @@ impl Transaction {
             for_update_guards: parking_lot::Mutex::new(Vec::new()),
             for_update_held: parking_lot::Mutex::new(std::collections::HashSet::new()),
             snapshot,
+            ephemeral,
         };
 
         // Transaction constructed successfully — its Drop impl will clear the
@@ -372,6 +416,7 @@ impl Transaction {
             self.tx_l0.clone(),
             Some(self.id_reservoir.clone()),
             self.read_snapshot(),
+            self.cancel_scope(None),
         );
         uni_query::maybe_scope_with_principal(principal, fut).await
     }
@@ -567,6 +612,7 @@ impl Transaction {
             cypher: cypher.to_string(),
             params: HashMap::new(),
             timeout: None,
+            cancellation_token: None,
         }
     }
 
@@ -637,7 +683,16 @@ impl Transaction {
 
         // From here on a failure can leave a partially-replayed `DerivedFactSet`
         // in `tx_l0`, so poison the transaction on any error (bug #15).
-        self.mark_on_err(Self::replay_facts(&self.db, &self.tx_l0, derived, version_gap).await)
+        self.mark_on_err(
+            Self::replay_facts(
+                &self.db,
+                &self.tx_l0,
+                derived,
+                version_gap,
+                self.cancel_scope(None),
+            )
+            .await,
+        )
     }
 
     /// Replays a `DerivedFactSet`'s mutation queries into `tx_l0`.
@@ -651,6 +706,7 @@ impl Transaction {
         tx_l0: &Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>,
         derived: DerivedFactSet,
         version_gap: u64,
+        cancel: crate::api::impl_query::CancelScope,
     ) -> Result<ApplyResult> {
         let mut facts_applied = 0;
         for query in derived.mutation_queries {
@@ -660,6 +716,7 @@ impl Transaction {
                 HashMap::new(),
                 db.config.clone(),
                 tx_l0.clone(),
+                cancel.clone(),
             )
             .await?;
             facts_applied += 1;
@@ -856,6 +913,7 @@ impl Transaction {
             locy_l0: Some(self.tx_l0.clone()),
             collect_derive: false,
             read_snapshot: self.read_snapshot(),
+            cancel: self.cancel_scope(None),
         };
         engine.evaluate(program).await
     }
@@ -889,8 +947,14 @@ impl Transaction {
             self.session_id.clone(),
             classify_verb(cypher).to_string(),
         );
-        crate::api::prepared::PreparedQuery::new_tx_bound(self.db.clone(), cypher, binding, guards)
-            .await
+        crate::api::prepared::PreparedQuery::new_tx_bound(
+            self.db.clone(),
+            cypher,
+            binding,
+            guards,
+            self.cancel_scope(None),
+        )
+        .await
     }
 
     /// Prepare a Locy program for repeated evaluation within this transaction.
@@ -910,6 +974,7 @@ impl Transaction {
     /// On commit, new rules are promoted to the session (best-effort).
     pub fn rules(&self) -> super::rule_registry::RuleRegistry<'_> {
         super::rule_registry::RuleRegistry::new(&self.rule_registry)
+            .with_plugin_registry(&self.db.plugin_registry)
     }
 
     // ── Lifecycle ─────────────────────────────────────────────────────
@@ -921,6 +986,14 @@ impl Transaction {
     #[instrument(skip(self), fields(transaction_id = %self.id, duration_ms), level = "info")]
     pub async fn commit(mut self) -> Result<CommitResult> {
         self.check_completed()?;
+
+        // G8/E2: a scratch transaction can never be committed — refuse before any
+        // writer lock or L0 merge, so its writes are always discarded on drop.
+        if self.ephemeral {
+            return Err(UniError::ReadOnly {
+                operation: "commit a scratch transaction (its writes are discarded on drop; use session.tx() to persist)".to_string(),
+            });
+        }
 
         let writer_lock = self.db.writer.as_ref().ok_or_else(|| UniError::ReadOnly {
             operation: "commit".to_string(),
@@ -1150,7 +1223,10 @@ impl Transaction {
                                 combined.push(src.clone());
                             }
                         }
-                        let rebuilt = super::impl_locy::rebuild_registry_from_sources(&combined);
+                        let rebuilt = super::impl_locy::rebuild_registry_from_sources(
+                            &combined,
+                            &self.db.plugin_registry,
+                        );
                         let preserved_all = |r: &super::impl_locy::LocyRuleRegistry| {
                             new_names.iter().all(|n| r.rules.contains_key(n))
                                 && session_reg.rules.keys().all(|n| r.rules.contains_key(n))
@@ -1387,6 +1463,20 @@ impl Transaction {
         self.cancellation_token.clone()
     }
 
+    /// The cancellation scope statements in this transaction run under.
+    ///
+    /// The transaction's token is a child of its session's, so cancelling the
+    /// session cascades here. Every terminal passes one of these down, which is
+    /// what makes [`Self::cancel`] mean anything — the child token created at
+    /// construction was previously never handed to an executor, so "cancel all
+    /// in-flight queries in this transaction" cancelled nothing.
+    pub(crate) fn cancel_scope(
+        &self,
+        caller: Option<CancellationToken>,
+    ) -> crate::api::impl_query::CancelScope {
+        crate::api::impl_query::CancelScope::new(Some(self.cancellation_token.clone()), caller)
+    }
+
     /// Snapshot the current L0 mutation count and stats for before/after comparison.
     fn snapshot_l0(&self) -> L0Snapshot {
         let l0 = self.tx_l0.read();
@@ -1499,9 +1589,19 @@ pub struct ExecuteBuilder<'a> {
     cypher: String,
     params: HashMap<String, Value>,
     timeout: Option<Duration>,
+    /// Mirrors [`TxQueryBuilder`]. Without it a caller could attach a token to
+    /// a read on this transaction but not to a write, and the mutation
+    /// terminal would silently ignore one.
+    cancellation_token: Option<CancellationToken>,
 }
 
 impl<'a> ExecuteBuilder<'a> {
+    /// Attach a cancellation token for cooperative cancellation.
+    pub fn cancellation_token(mut self, token: CancellationToken) -> Self {
+        self.cancellation_token = Some(token);
+        self
+    }
+
     /// Bind a parameter to the mutation.
     pub fn param<K: Into<String>, V: Into<Value>>(mut self, key: K, value: V) -> Self {
         self.params.insert(key.into(), value.into());
@@ -1534,12 +1634,14 @@ impl<'a> ExecuteBuilder<'a> {
         self.tx.check_completed()?;
         self.tx.run_exec_guards(&self.cypher, &self.params).await?;
         let before = self.tx.snapshot_l0();
+        let cancel = self.tx.cancel_scope(self.cancellation_token);
         let fut = self.tx.db.execute_internal_with_tx_l0(
             &self.cypher,
             self.params,
             self.tx.tx_l0.clone(),
             Some(self.tx.id_reservoir.clone()),
             self.tx.read_snapshot(),
+            cancel,
         );
         let result = if let Some(t) = self.timeout {
             tokio::time::timeout(t, fut)
@@ -1641,12 +1743,14 @@ impl<'a> TxQueryBuilder<'a> {
         self.tx.check_completed()?;
         self.tx.run_exec_guards(&self.cypher, &self.params).await?;
         let before = self.tx.snapshot_l0();
+        let cancel = self.tx.cancel_scope(self.cancellation_token);
         let fut = self.tx.db.execute_internal_with_tx_l0(
             &self.cypher,
             self.params,
             self.tx.tx_l0.clone(),
             Some(self.tx.id_reservoir.clone()),
             self.tx.read_snapshot(),
+            cancel,
         );
         let result = if let Some(t) = self.timeout {
             tokio::time::timeout(t, fut)
@@ -1674,12 +1778,14 @@ impl<'a> TxQueryBuilder<'a> {
     async fn fetch_all_inner(self) -> Result<QueryResult> {
         self.tx.check_completed()?;
         self.tx.run_exec_guards(&self.cypher, &self.params).await?;
+        let cancel = self.tx.cancel_scope(self.cancellation_token);
         let fut = self.tx.db.execute_internal_with_tx_l0(
             &self.cypher,
             self.params,
             self.tx.tx_l0.clone(),
             Some(self.tx.id_reservoir.clone()),
             self.tx.read_snapshot(),
+            cancel,
         );
         if let Some(t) = self.timeout {
             tokio::time::timeout(t, fut)
@@ -1709,9 +1815,28 @@ impl<'a> TxQueryBuilder<'a> {
     async fn cursor_inner(self) -> Result<QueryCursor> {
         self.tx.check_completed()?;
         self.tx.run_exec_guards(&self.cypher, &self.params).await?;
+
+        // `execute`/`fetch_all` apply `.timeout()` by wrapping their future in
+        // `tokio::time::timeout`. A cursor returns a stream that outlives this
+        // call, so the ceiling has to travel with the stream instead: it goes
+        // into the config the cursor guard reads. The token likewise has to be
+        // handed down rather than awaited here — until now `cursor_inner`
+        // dropped both on the floor, so a transaction cursor ran unbounded and
+        // uncancellable while the builder accepted the options.
+        let mut config = self.tx.db.config.clone();
+        if let Some(t) = self.timeout {
+            config.query_timeout = t;
+        }
+
         self.tx
             .db
-            .execute_cursor_internal_with_tx_l0(&self.cypher, self.params, self.tx.tx_l0.clone())
+            .execute_cursor_internal_with_tx_l0(
+                &self.cypher,
+                self.params,
+                self.tx.tx_l0.clone(),
+                config,
+                self.tx.cancel_scope(self.cancellation_token),
+            )
             .await
     }
 }
@@ -1806,5 +1931,49 @@ impl uni_fork::ForkPromoteSink for Transaction {
 
     async fn delete_vertex(&self, label: &str, vid: uni_common::core::id::Vid) -> Result<()> {
         Transaction::delete_vertex_by_vid(self, label, vid).await
+    }
+}
+
+#[cfg(test)]
+mod classify_verb_tests {
+    use super::classify_verb;
+
+    /// `classify_verb` sliced `s[..s.len().min(32)]` — a **byte** length, while
+    /// its comment said "up to 32 chars". Any statement whose 32nd byte landed
+    /// inside a multi-byte codepoint panicked, and because every write goes
+    /// through here the panic crossed the pyo3 boundary as an abort rather than
+    /// an exception.
+    ///
+    /// The sweep below necessarily places a multi-byte character across the
+    /// byte-32 boundary at some padding length.
+    #[test]
+    fn classify_verb_does_not_panic_on_multibyte_boundaries() {
+        // Sweep the padding rather than computing the offset by hand: some
+        // length in this range necessarily puts the two-byte `Î` across byte
+        // 32. (An earlier draft of this test guessed one offset, landed the
+        // codepoint at byte 35, and passed against the unfixed code.)
+        for pad in 0..40 {
+            let cypher = format!("CREATE (:T)-[:`{}Î`]->(:T)", "x".repeat(pad));
+            assert_eq!(
+                classify_verb(&cypher),
+                "write",
+                "panicked or misclassified at pad={pad}"
+            );
+        }
+    }
+
+    /// Non-ASCII must not change the classification of a leading keyword.
+    #[test]
+    fn classify_verb_still_recognises_keywords() {
+        assert_eq!(classify_verb("  CREATE INDEX idx ON :T(x)"), "schema");
+        assert_eq!(classify_verb("DROP CONSTRAINT c"), "schema");
+        assert_eq!(classify_verb("CREATE (:Café {n: 'Ünter'})"), "write");
+    }
+
+    /// A statement shorter than the prefix window is unaffected.
+    #[test]
+    fn classify_verb_handles_short_input() {
+        assert_eq!(classify_verb("CREATE (:T)"), "write");
+        assert_eq!(classify_verb(""), "write");
     }
 }

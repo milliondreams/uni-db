@@ -1200,6 +1200,30 @@ MainCsr {
 
 Each `CsrEdgeEntry` carries a `created_version` field, enabling snapshot queries without rebuilding the CSR.
 
+### ShadowCsr (Deleted-Edge Overlay)
+
+A deleted edge leaves the Main CSR but stays recorded in `ShadowCsr`, so snapshot and time-travel reads can resurrect it:
+
+```rust
+ShadowEdge {
+    neighbor_vid: Vid,
+    eid: Eid,
+    edge_type: u32,
+    created_version: u64,
+    deleted_version: u64,
+}
+```
+
+An entry is alive at `version` when `created_version <= version < deleted_version` (`get_entries_at_version`). Entries arrive from two places: `AdjacencyManager::compact`, which moves overlay tombstones into the shadow as it merges frozen segments, and `AdjacencyManager::warm`, which pushes one for every `op = 1` row it reads out of the L1 delta. The regular (non-snapshot) read path never consults it.
+
+**Retention.** `add_deleted_edge` ignores a repeat of an `Eid` it already holds. The dedup is load-bearing rather than tidiness: unlike `warm_coalesced`, `warm` has no `has_csr` short-circuit, so each warm of the same `(edge_type, direction)` re-pushed the *entire* delete history — growth was unbounded in the number of warms, not the number of deletes. Reads already dedupe by `Eid` downstream, which is why it surfaced as memory rather than as wrong answers.
+
+**GC bound.** `AdjacencyManager::gc_shadow(current_version)` drops entries whose `deleted_version` is at or below a floor, and is called after CSR compaction. The floor is `min(min_pinned_version, current_version)`, collapsing to `current_version` when nothing is pinned. `StorageManager::pinned_at_version` registers a `PinGuard` for the lifetime of the view it builds, and `PinnedVersions` is refcounted so the floor cannot rise while another reader still holds the same version.
+
+The bound is that narrow for a specific reason: `StorageManager::pinned()` and `at_fork` each build a **fresh** `AdjacencyManager` with its own empty `ShadowCsr`, so those readers never consult the live one. `pinned_at_version` — the path a read-write transaction takes whenever it pins at all (`ssi_enabled`, or any ephemeral/scratch transaction) — is the only one that shares it. `SnapshotManager` cannot supply the floor because it is a manifest reader-writer and tracks no live readers.
+
+**Observability.** `AdjacencyManager::memory_usage` adds `ShadowCsr::approx_bytes` to the main-CSR byte counter, so shadow retention is visible to the cache budget; `shadow_entry_count()` / `ShadowCsr::entry_count()` expose the raw count for retention tests and diagnostics.
+
 ### AdjacencyDataset (Persistent CSR)
 
 Stored as a LanceDB table (`adjacency_{edge_type}_{direction}`) with row-per-vertex format:
@@ -1373,8 +1397,14 @@ PropertyManager {
 1. Check if deleted in L0 → return None
 2. Check L0 chain (transaction → main → pending flush) → return if found
 3. Check LRU cache → return if found
-4. Fetch from Lance storage runs → update cache → return
+4. Fetch from Lance storage runs, bounded by the reader's version high water mark when it has one → update cache → return
 5. L0 properties **always** take precedence over storage
+
+Step 4 spans two tiers, and both conjoin `_version <= hwm` when the `PropertyManager`'s own `StorageManager` carries one: the per-type delta scan (via `StorageManager::apply_version_filter`) and the `props_json` fallback in the main edges table (via `MainEdgeDataset::find_props_by_eid`). Schemaless and overflow edge properties live *only* in `props_json`, so every such read reaches the fallback — not only reads that come after a compaction.
+
+> **Which readers are actually bounded.** The high water mark comes from the `StorageManager` the `PropertyManager` was *constructed* with, not from whatever manager the surrounding query routes its scans through. Only the manifest-pinned time-travel view built by `UniInner::at_snapshot` constructs a `PropertyManager` over pinned storage, so only it gets a bounded step 4. A read-write transaction routes *scans* through `pinned_at_version` but keeps the live database-level `PropertyManager` on purpose (see [Known Limitations](#known-limitations)), so its hwm is `None` and step 4 reads at HEAD; forks are likewise unbounded. Step 3's LRU cache is version-agnostic in every case.
+
+> **Embedder note (breaking).** `MainEdgeDataset::find_props_by_eid` takes a third argument, `version: Option<u64>`; pass `storage.version_high_water_mark()`, or `None` for an unbounded read at HEAD. Without it even a snapshot-pinned reader read L0 and the delta tier at its snapshot but this tier at HEAD, so a post-snapshot write leaked in and a post-snapshot delete made the edge vanish. The version bound is a *conjunct* — the highest-version-row-wins tombstone rule runs unchanged over whatever survives it. `exists_by_eid` stays deliberately unbounded: it is the compaction dual-write invariant check and must see rows at any version.
 
 ## Storage Best Practices
 
@@ -3215,7 +3245,7 @@ Both paths dispatch through `CALL` alongside the built-in `algo.*` procedures (m
 | **Use DirectTraversal for single paths** | Much faster than GraphProjection for point queries |
 | **Use GraphProjection for iterative algorithms** | PageRank, WCC, Louvain need full materialization |
 | **Set iteration limits** | Prevent infinite loops in convergence algorithms |
-| **Project only needed labels/types** | Smaller projection = faster execution + less memory |
+| **Project only needed labels/types** | Smaller projection = faster execution + less memory. For **guest GraphCompute** projections this is now enforced: an unscoped projection (no `nodeLabels`/`edgeTypes`) fails loud — name them, or pass `{projectAll: true}` to deliberately take the whole graph. |
 
 ## Algorithm Anti-Patterns
 
@@ -3339,6 +3369,16 @@ CREATE RULE total_exposure AS
 
 Supported aggregators: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `COLLECT`, `MSUM`, `MMAX`, `MMIN`, `MCOUNT`, `MNOR`, `MPROD`
 
+#### Monotonicity in Recursive Strata
+
+A rule in a recursive stratum may only `FOLD` with an aggregate the compiler can prove monotone; anything else fails with `NonMonotonicInRecursion` at compile time. The verdict comes from the plugin registry — `Semilattice::monotone_join` on the registered `LocyAggregate` — falling back to the built-in `M*` contract (`MMAX`, `MMIN`, `MCOUNT`, `MNOR`, `MPROD`, `MSUM`) when the registry has no entry, so a plugin-less embedding keeps working. The compile-time oracle and the planner's guard both go through the same `locy_monotonicity_verdict`; when they disagreed, a program could compile cleanly and then fail at plan time.
+
+Consequences:
+
+- `COUNT` and `COLLECT` are `monotone_join: true` in the builtin registry, so a recursive `FOLD n = COUNT(*)` or `FOLD xs = COLLECT(x)` **compiles**. Both are `has_top: false` — monotone but unbounded. The unboundedness only costs iterations for the aggregates the fixpoint loop actually tracks: `COUNT` overrides `update_step`, so its accumulator can keep changing and fail convergence condition (2) indefinitely, ending at `max_iterations`. `COLLECT` does not override `update_step`, so `AggregateTracker::update` skips it (the `CODE_UNKNOWN_FUNCTION` arm) and it is aggregated after the fixpoint via `LocyAggState::ingest` — it cannot itself keep the loop iterating. The iteration cap is the backstop, not a proof of termination.
+- `SUM` and `AVG` are `monotone_join: false` and remain rejected in recursion. Use `MSUM` (caller-asserted non-negative) when a recursive sum is genuinely wanted.
+- A plugin-registered aggregate declaring `monotone_join: true` works in a recursive stratum. That includes rules registered through `db.rules().register(...)` — the facade chains `RuleRegistry::with_plugin_registry` so registration compiles against the same aggregates queries see. It does **not** extend to reopening the database: `UniBuilder` has no plugin-registration hook (`Uni::add_plugin` is only reachable after open), and `build_locy_registry_from_persisted` runs immediately after `register_builtin_plugins` with a registry that holds builtins only. A persisted rule folding over a plugin aggregate therefore fails the open naming that rule, unless `skip_invalid_locy_rules(true)` is set — in which case it is dropped with a warning and must be re-registered after `add_plugin`. Rules folding over built-in aggregates reload normally.
+
 ### Post-FOLD WHERE (HAVING)
 
 A `WHERE` clause after `FOLD` filters aggregated groups — equivalent to SQL's `HAVING`:
@@ -3453,6 +3493,8 @@ CREATE RULE best_route AS
 ```
 
 Enables `LIMIT 1` optimization — the engine can prune suboptimal paths early during semi-naive evaluation.
+
+`BEST BY` cannot be combined with a *declared lattice fold* — `MMAX`, `MMIN`, `MCOUNT`, `MNOR`, `MPROD`, `MSUM` — and the combination is rejected with `BestByWithMonotonicFold`. That guard is purely syntactic over those six spellings and is deliberately decoupled from the monotonicity oracle above: the oracle asks whether an aggregate is sound under a fixpoint, this asks whether the user wrote a lattice fold. It also runs for **every** rule, not just recursive ones. `BEST BY … FOLD MAX(x)` / `MIN` / `COUNT` / `COLLECT` are therefore legal, even though those aggregates are `monotone_join: true`.
 
 ### YIELD KEY (Grouping)
 
@@ -3878,10 +3920,16 @@ lose updates in this mode.
 - **Flush-boundary edge cases**: transactions pin the L1 vertex-scan tier
   (vertex rows filter to `_version <=` the snapshot version, so
   post-snapshot inserts flushed mid-transaction stay invisible). The pin is
-  on row *existence*, not property values or edges: property point-reads and
-  edge traversals stay on live storage so a transaction reads its own
-  uncommitted writes (tx_l0), and cross-transaction property/edge skew on an
-  already-visible row is caught by OCC validation at commit. A vertex whose
+  on row *existence*, not property values or edges. Scans route through the
+  version-pinned `StorageManager`, but the `PropertyManager` deliberately
+  stays on **live** storage: a transaction must read its own uncommitted
+  properties out of tx_l0, and a version filter would hide them (it would
+  break e.g. MERGE's edge-property match). The edge/adjacency tier stays
+  live for the mirror-image reason — a `pinned_at_version` view *shares* the
+  live `AdjacencyManager`, so the transaction's own unflushed edges stay
+  visible to traversal. Cross-transaction property/edge skew on an
+  already-visible row is therefore caught by OCC validation at commit (edge
+  reads are recorded in the read-set), not by the pin. A vertex whose
   only pre-transaction state is in L1 and that is updated-and-flushed
   mid-transaction is *excluded* from the pinned scan rather than shown old
   (L1 rows are single-versioned).
@@ -3948,6 +3996,16 @@ let commit_result = tx.commit().await?;
 println!("Version: {}, mutations: {}", commit_result.version, commit_result.mutations_committed);
 // OR: tx.rollback();
 // OR: drop tx (auto-rollback with warning if dirty)
+
+// Scratch (ephemeral, write-isolated) transaction — the cheap per-rollout
+// "fork" (G8/E2). Behaves like tx() with read-your-writes, but commit() is
+// REFUSED: all writes are discarded on drop. ~1 ms (a pinned snapshot), no
+// Lance branch / registry / WAL, and the global id allocator is never advanced
+// — so thousands of speculative open-write-discard rollouts are affordable.
+let scratch = session.scratch().await?;
+scratch.execute("CREATE (:Person {name: 'speculative'})").await?;
+let _n = scratch.query("MATCH (n:Person) RETURN count(*) AS c").await?; // read-your-writes
+// scratch.commit() would return an error; drop discards the writes.
 ```
 
 ### DerivedFactSet Workflow
@@ -4315,6 +4373,7 @@ The first matching trigger fires a compaction task. After semantic compaction co
 - **CompactionGuard** (RAII): Only one compaction task at a time
 - Frozen L0 segments remain readable during CSR rebuild until atomic swap
 - Snapshot-based reads are completely unaffected by compaction
+- Shadow-CSR GC (`AdjacencyManager::gc_shadow`) runs on the same task, right after CSR compaction, bounded by the versions in-flight `pinned_at_version` views hold — an entry a live reader still resolves is never reclaimed (see [ShadowCsr](#shadowcsr-deleted-edge-overlay))
 - OOM guard prevents loading more than `max_compaction_rows` into memory
 
 ---
@@ -5360,6 +5419,11 @@ Forks unlock four broad use-cases the existing snapshot mechanism cannot cover, 
 - **Scenario exploration.** Run regulatory or compliance simulations on isolated copies of production data without coordinating maintenance windows.
 - **Long-lived sandboxes.** A pinned snapshot expires when its retention window passes; a fork persists until explicitly dropped, with its own session lifecycle.
 
+**When *not* to fork — cheap ephemeral isolation.** A fork is the right tool when you need a *durable, promotable* writable copy. For discardable *ephemeral* isolation — a per-rollout MCTS that speculatively writes then throws the result away, thousands of times — a fork's ~10 ms create/drop (N Lance branch-manifest writes + registry 2PC + per-fork WAL + allocator PUT) dominates the compute. Two lighter primitives cover those cases:
+
+- **`Session::pin_to_version(snapshot_id)`** — a fork-free, read-consistent snapshot for *read-only* rollouts. It is an in-memory `StorageManager` pin (`pinned_at_version`, ~1 ms) with no branch, registry, or WAL; writes are rejected.
+- **`Session::scratch()`** — a *write-isolated* transient "fork" for *mutating* rollouts (G8/E2). It returns a transaction whose writes land in a **private L0 over a pinned read base** (`pinned_at_version`, which shares the adjacency manager so scratch edges are traversable) with an **in-memory id allocator seeded above the primary HWM**, gives full read-your-writes, and whose **`commit()` is refused** — the writes are always discarded on drop. It costs ~1 ms, does no branch / registry 2PC / per-fork WAL work, and never advances or rewrites the durable `id_allocator.json`, so thousands of open-write-discard rollouts leave the primary and its id counter untouched. Reach for a real fork only when you need to keep or **promote** the result.
+
 Phase 1 shipped read-only forks. Phase 2 made forks writable. Phase 3 enabled nested forks (`forked.fork(name)`). Phase 4 added TTL, tags, watch filtering, hooks/params propagation, and the full Python binding surface. Phase 5 landed fork-local index fusion (lossless types in 5a, vector + FTS in 5b). Phase 6 / 6b shipped structural diff and write-audit-publish promote with content-addressed UID identity. Phase 7 closed out the user-facing surface — Python bindings for diff/promote, end-to-end use-case suite, schema-evolution × forks test, and the Fork* error-variant audit.
 
 ## Anatomy of a Fork
@@ -5642,7 +5706,7 @@ The foundation crate is `uni-plugin` (traits, manifest, capability, registry, re
 
 ## Why Plugins?
 
-- **Closing closed-enum dispatch.** Before the framework, adding an aggregate or procedure meant editing a `match` in the executor. That coupling is gone: a new `LocyAggregate` or `ProcedurePlugin` registers and is dispatched purely through its trait object. The non-recursive Locy `FOLD` executor, the last holdout, now dispatches through `LocyAggState` rather than a name match (`crates/uni-query/src/query/df_graph/locy_fold.rs`).
+- **Closing closed-enum dispatch.** Before the framework, adding an aggregate or procedure meant editing a `match` in the executor. That coupling is gone: a new `LocyAggregate` or `ProcedurePlugin` registers and is dispatched purely through its trait object. The non-recursive Locy `FOLD` executor, the last holdout, now dispatches through `LocyAggState` rather than a name match (`crates/uni-query/src/query/df_graph/locy_fold.rs`). The Locy compiler's recursive-stratum monotonicity gate was a *second* hardcoded name list until it too was routed through the registry: it now reads `Semilattice::monotone_join` off the registered `LocyAggregate` (`locy_monotonicity_verdict`, falling back to the built-in `M*` names on a registry miss), so a plugin aggregate declaring `monotone_join: true` is accepted in a recursive stratum — via `session.locy(...)` and via `db.rules().register(...)`. The reopen path threads the same registry into `build_locy_registry_from_persisted`, but it runs before any plugin can be added, so only built-in aggregates survive a reopen (see [Monotonicity in Recursive Strata](#monotonicity-in-recursive-strata)).
 - **Host-language extensibility.** Five loaders cover the spectrum: Rust for native performance, WASM (Component Model and Extism) for sandboxed polyglot third parties, PyO3 for data scientists authoring in-process, Rhai for sandboxed pure-Rust ops scripts.
 - **Capability gating as a security boundary.** A plugin gets only the host services its grant intersection permits. An untrusted WASM scalar fn that declared only `[ScalarFn]` cannot touch the filesystem, the network, or run a host query — the relevant host functions are not even linked into its instance.
 - **A measured perf path.** Scalar fns that declare a primitive Arrow return type (the native path) skip the `LargeBinary` `CypherValue` round-trip — the proposal's criterion #9 perf win.
@@ -5709,7 +5773,7 @@ All five loaders converge on `PluginRegistrar`; the execution layer is loader-ag
 | Reload | full | epoch-fenced | epoch-fenced | full | session-scope unregister |
 | Parity test | (reference) | `m6_cross_abi_parity.rs` | (same) | `m7_rhai_cross_loader_parity.rs` | `m8_pyo3_cross_loader_parity.rs` |
 
-> **Note:** Only the Rust path can author all 26 extension surfaces. As of 3.0.0 the four non-Rust loaders author **scalar, aggregate, procedure, and graph algorithms** — the WASM Component Model now defines *four* WIT worlds (`scalar-plugin`, `aggregate-plugin`, `procedure-plugin`, and `algorithm-plugin` in `crates/uni-plugin-wasm/wit/world.wit`, the last importing the `host-graph` interface); Extism, Rhai, and PyO3 carry the matching GraphCompute host surface (`graph_compute` + `adapter_algorithm`). Guest graph algorithms drive the coarse GraphCompute kernels over opaque handles (see [§GraphCompute — Guest-Authorable Graph Algorithms](#graphcompute--guest-authorable-graph-algorithms)). The remaining surfaces are compile-time-Rust-only. Vectorized scalar evaluation is implemented for PyO3 only; CM/Extism are IPC-batch, Rhai is row-mode.
+> **Note:** Only the Rust path can author all 26 extension surfaces. As of 3.0.0 the four non-Rust loaders author **scalar, aggregate, procedure, and graph algorithms** — the WASM Component Model now defines *four* WIT worlds (`scalar-plugin`, `aggregate-plugin`, `procedure-plugin`, and `algorithm-plugin` in `crates/uni-plugin-wasm/wit/world.wit`, the last importing both the `host-graph` interface and the typed `host-arena` interface); Extism, Rhai, and PyO3 carry the matching GraphCompute host surface (`graph_compute` + `adapter_algorithm`). Guest graph algorithms drive the coarse GraphCompute kernels over opaque handles, and may grow their own mutable structure through the `graph-arena@1` kernels (see [§GraphCompute — Guest-Authorable Graph Algorithms](#graphcompute--guest-authorable-graph-algorithms)). The remaining surfaces are compile-time-Rust-only. Vectorized scalar evaluation is implemented for PyO3 only; CM/Extism are IPC-batch, Rhai is row-mode.
 
 ## Loading a Plugin (Host API)
 
@@ -5817,21 +5881,26 @@ The authoritative *surface count* is the `Capability` enum's **26 extension vari
 
 A guest implements **`AlgorithmProvider`** (`crates/uni-plugin/src/traits/algorithm.rs`):
 
-- **`signature() -> &AlgorithmSignature`** — declares `output_fields` (Arrow), `docs`, typed positional `args: Vec<NamedArgType>` (arity- and type-checked, default-filled at call time via `coerce_config_json`), and required host kernel-slices `slices: Vec<SliceReq>` (checked at registration via `check_slices`; the host implements `graph-compute@1`, `HOST_CAPABILITY_SLICES`).
+- **`signature() -> &AlgorithmSignature`** — declares `output_fields` (Arrow), `docs`, typed positional `args: Vec<NamedArgType>` (arity- and type-checked, default-filled at call time via `coerce_config_json`), and required host kernel-slices. A guest loader's manifest `args` are now populated into this signature and genuinely validated — they were previously parsed then silently ignored, so a guest got no arity/type checking. The manifest arg-type vocabulary (shared by all loaders via `adapter_common::arrow_types::arg_type_from_token`) covers the primitives plus **`value`/`cypherValue`** (accepts a scalar *or* an array — a variable-length seed set) and **`list`/`array`** (array-shaped). A guest therefore declares one `value`-typed argument and passes a Cypher list as a single argument — `CALL myco.spread([1,2,3,4], {nodeLabels:['N'],edgeTypes:['E']})` — instead of generating the plugin per-arity and padding unused slots with a `-1` sentinel. The trailing projection-config object is an implicit optional final argument (`NamedArgType::projection_config`), so it never counts against the declared arity. Required host kernel-slices `slices: Vec<SliceReq>` (checked at registration via `check_slices`; the host implements **`graph-compute@1`** — the read-only kernels over a projection — and **`graph-arena@1`** — mutable session-local structure; `HOST_CAPABILITY_SLICES`). A guest declaring a slice the host lacks fails registration with a typed `0x86A` rather than trapping later on an unknown op.
 - **`run(ctx: AlgorithmContext) -> SendableRecordBatchStream`** — the control loop. `AlgorithmContext { config_json, host }` gives the parsed args and the `AlgorithmHost`.
 
 The guest builds a graph and drives kernels through an **`AlgoSession`** (the kernel session; `crates/uni-plugin-builtin/src/algorithms/graph_compute/session.rs`). JSON kernel requests are dispatched by `GraphComputeRegistry` (`KernelRequest` / `KernelResponse`), so the same coarse kernel catalog is reachable from any loader.
 
+**The catalog is a type, not a set of strings.** `kernel_id.rs` declares every kernel once; a `kernels!` macro generates the `KernelId` enum, `ALL`, `op_name`, `reach` and `from_op_name` from that single declaration, so those cannot drift apart. `dispatch.rs` matches on `KernelId` with **no wildcard arm**, so a catalogued kernel fails to compile until it is dispatched, and per-loader contract tests assert every `AllLoaders` kernel is actually registered on Rhai and present on the PyO3 `GcSession`. This is the structural fix for the defect class of issues #151/#152 — a kernel reachable from one loader and silently invisible to another. Sandboxed loaders share one generic entrypoint and inherit new kernels automatically; the in-process loaders need per-kernel registration and are therefore the ones that drift.
+
 ### Kernel catalog & handles
 
-Values are Arrow-backed; **handles are opaque, generational, epoch-tagged, kind-checked, and session-scoped** (`handle.rs` / `value.rs`). The kernel families:
+Values are Arrow-backed; **handles are opaque, generational, epoch-tagged, kind-checked, and session-scoped** (`handle.rs` / `value.rs`). A handle packs `[epoch:16 | kind:4 | generation:12 | slot:32]`; the 4-bit kind tag admits up to 16 kinds, of which eight are live: `VertexSet = 0`, `Tensor = 1`, `Graph = 2`, `Walks = 3`, `Levels = 4`, `Pairs = 5`, `EdgeSet = 6`, `Arena = 7`.
 
-- **Topology** — `bind_graph` / `project` a CSR snapshot (a `GraphView`); frontier/expand (direction-optimized, mask-fused).
-- **Linear algebra** — SpMV over named semirings; map / reduce / scatter.
+The catalog is **67 kernels** — 66 reachable from every loader, plus `graph`, which sandboxed guests receive through the `invoke-algorithm` arguments rather than as an op. The families:
+
+- **Topology** — `bind_graph` / `project` a CSR snapshot (a `GraphView`); frontier / `expand` (direction `out` / `in` / **`both`** — the union of out- and in-edges, mask-fused). A **`both`** traversal requires a projection built with `includeReverse: true` (the reverse CSR): it fails loud with a typed error naming `includeReverse` rather than silently degrading to out-only. **`reach_fixpoint(g, seeds, dir)`** collapses the whole BFS-to-fixpoint (the reachable set) into one native O(V+E) call, so a guest never hand-writes the frontier loop — and cannot accidentally write the O(V·E) version that re-expands the visited set each round.
+- **Linear algebra** — SpMV over named semirings (direction `out` / `in` / `both`; `both` is an unweighted union, as the reverse CSR carries no weights); element-wise `map_apply` (`scale`, `recip`, `log`, **`exp`**, **`sqrt`**, affine, normalize) and `ewise` (`add`, `mul`, `min`, `max`, `axpy`, **`div`** with the `x/0 = 0` convention); reduce / scatter. `exp`/`log`/`sqrt`/`div` make the canonical UCT/PUCT term `c·√(ln N / n)` composable from kernels.
 - **Set & selection** — set ops, arg-extreme / top-k, `next_bucket`.
-- **Edge kernels (Mode A, proposal §5)** — a `[E]` per-edge tensor (`edge_weights`, CSR out-edge order, `Shape::E`) and an **edge mask** handle (`HandleKind::EdgeSet`): `edges_all`, `sample_edges(prob, seed, iter)` (per-edge Bernoulli mask from the same counter-hash), `edge_mask_window(vals, lo, hi)` (deterministic threshold → edge mask, e.g. a temporal window), `edge_intersect` / `edge_union`, and edge-masked traversal `expand_masked` / `spmv_masked` (out-direction; result equals the kernel on the subgraph of exactly the masked edges). Together these express reachability/spmv over a per-iteration random edge subset (grid-reliability Monte-Carlo, percolation, influence-max) or a per-event-time subset (temporal reachability) with no guest per-element body.
+- **Edge kernels (Mode A, proposal §5)** — a `[E]` per-edge tensor (`edge_weights`, CSR out-edge order, `Shape::E`) and an **edge mask** handle (`HandleKind::EdgeSet`): `edges_all`, `sample_edges(prob, seed, iter)` (per-edge Bernoulli mask from the same counter-hash), `edge_mask_window(vals, lo, hi)` (deterministic threshold → edge mask, e.g. a temporal window), `edge_intersect` / `edge_union`, and edge-masked traversal `expand_masked` / `spmv_masked` (out-direction; result equals the kernel on the subgraph of exactly the masked edges). Two further primitives sharpen this for percolation: **`expand_sampled(g, frontier, dir, exclude, prob, seed, iter)`** fuses the draw and the expansion — it draws a Bernoulli only for the *current frontier's* out-edges (O(frontier out-edges)) rather than the eager O(E) whole-graph draw of `sample_edges`, so a native influence cascade matches the algorithmic work of a lazy BFS; and **`sample_edges_undirected(g, prob, seed, iter)`** keys each Bernoulli on the *canonical unordered endpoint pair* `(min(u,v), max(u,v))` recomputed from the CSR, so both half-edges of an undirected link (`u→v` and `v→u`) share one draw — the link is up or down *as a unit* (correct for simple undirected graphs; parallel edges in a multigraph collide on the key). Together these express reachability/spmv over a per-iteration random edge subset (grid-reliability Monte-Carlo, percolation, influence-max) or a per-event-time subset (temporal reachability) with no guest per-element body.
 - **Deterministic segmented reduce (Mode A, §6/§8)** — `segmented_reduce(values, groups)` reduces a `[V]` map grouped by a label/component map, using the determinism-owning accumulator (`uni_algo::algo::reduce::deterministic_sum`), so each group's total is **bitwise-identical regardless of vertex order or partitioning** — the reproducible reduction stock partitioned float `SUM` cannot give.
 - **Sampling & similarity** — `random_walks`; `sample(prob, seed, iter)` — a reproducible `Bernoulli(prob[v])` mask over a `[V]` tensor drawn from a stateless counter-hash stream (`counter_hash(seed, iter, elem)`, shared with the walk seeding), so masks are bitwise-identical across runs/threads and a fresh `iter` decorrelates; all-pairs / neighbourhood overlap (Jaccard, cosine, Adamic–Adar, triangle count).
+- **Mutable arena (`graph-arena@1`, `HandleKind::Arena`)** — session-local *synthetic* structure a guest **grows**, rather than reads from the store: search trees, residual networks, agent populations. Eleven kernels: `arena_new(capacity, branching)`, `arena_alloc`, `arena_expand(parents, fanout)` (allocate-and-link, the tree-growth primitive), `arena_link`, `arena_column` (a `[capacity]` `f64` state column, so a node can carry *both* visits and value), `arena_candidates` (the children of a frontier, so guest scoring is **candidate-scoped** — `O(frontier × branching)` — rather than whole-column `O(N)`), `arena_gather` / `arena_scatter`, `arena_descend(score_col, visit_col, maximize, vloss)`, **`arena_backup(value_col, leaves, deltas)`** (adds each leaf's `delta` along its *full root path* by walking parents — the value-backprop primitive that lifts a guest from a depth-1 bandit to a general-depth UCT/PUCT tree search; `arena_scatter` alone can only write the leaf), and `arena_freeze`. Adjacency is flat **CSR-with-slack**, so a live arena has no dense `[E]` numbering; `arena_freeze` compacts it into an ordinary `GraphProjection` behind an ordinary `Graph` handle, which is what makes the *whole* `graph-compute@1` library apply to guest-grown structure. Freezing is a **snapshot**, deliberately: the Mode-A kernels assume a graph that cannot change while they iterate it. `arena_descend` applies one visit and the virtual loss **in the descent loop** — omitting that collapses a 1024-rollout batch onto 16 distinct leaves. Its `vloss` is a **flat linear offset** added to the precomputed score column, *not* a per-visit UCB recomputed from `visits + vloss`; a guest that needs bit-exact parity with a hand-written per-visit-UCB engine runs at `vloss = 0`. Batched kernels charge the full native work they do, so batching amortizes the boundary crossing but never the meter.
 - **Egress** — `emit` result rows, including ragged walk (`take_emitted_walks`) and pairwise (`take_emitted_pairs`) shapes.
 
 The read-only **`GraphView`** (topology accessors `vertex_count` / `edge_count` / `out_neighbors(slot)` / `out_degree` / `in_neighbors` / `out_weight` / `to_vid` / `to_slot` / …, vertices addressed by dense `u32` slots) is obtained via **`AlgorithmHost::project(&GraphProjectionSpec) -> Arc<dyn GraphView>`**.
@@ -5839,7 +5908,7 @@ The read-only **`GraphView`** (topology accessors `vertex_count` / `edge_count` 
 ### Determinism, budgets & safety
 
 - **Deterministic** — deterministic CSR ordering and fixed-order reductions give bitwise-reproducible results across thread counts.
-- **Fail-closed budgets** — a native-work budget (`Capability::GraphComputeWork`, tracked by `AlgoSession::work_spent` / `work_budget`) and a per-session handle-memory arena (`Capability::GraphComputeArenaBytes`, `bytes_live` / `live_handles`) are enforced and fail-closed. The work budget resolves through one helper, `WorkBudget::resolve`: an explicit `GraphComputeWork` grant is **authoritative and may raise the ceiling** above the size-derived default `min(10_000·(|V|+|E|+1), 1e9)` (which applies only when ungranted). A grant that authorizes more native work is a real authorization to review — not a clamp that can only lower the default.
+- **Fail-closed budgets** — a native-work budget (`Capability::GraphComputeWork`, tracked by `AlgoSession::work_spent_units` / `work_budget_units`, and readable by a guest through the zero-charge `work_budget` / `work_spent` / `work_remaining` kernels) and a per-session handle-memory budget (`Capability::GraphComputeArenaBytes`, `bytes_live` / `live_handles` — note this is the *value-arena byte cap*, distinct from the `HandleKind::Arena` graph arena, which is charged against it) are enforced and fail-closed. The work budget resolves through one helper, `WorkBudget::resolve`: an explicit `GraphComputeWork` grant is **authoritative and replaces** the size-derived default `min(10_000·(|V|+|E|+1), 1e9)` (which applies only when ungranted) — in either direction. A grant that authorizes more native work is a real authorization to review — not a clamp that can only lower the default.
 - **Non-convergence is a hard error** — `GraphComputeIncomplete` with distinct Exhausted / IterationLimit / Timeout reasons (never a silent partial).
 - **Bounded guest loops** — Rhai `catch_unwind`, a Python `KeyboardInterrupt` watchdog, and WASM/Extism epoch interruption stop a runaway guest.
 
@@ -5847,13 +5916,25 @@ The read-only **`GraphView`** (topology accessors `vertex_count` / `edge_count` 
 
 `Capability::GraphCompute` gates the kernel surface; `Capability::HostQuery` **additionally** gates the data-read `project` kernel (the CSR topology snapshot). A guest granted only `GraphCompute` can compute over a graph it was handed but cannot itself project one.
 
+### Projection contract — scoped-or-loud, L0-consistent
+
+The `GraphProjectionSpec` boundary is **fail-loud and L0-consistent**: a projection either returns the graph the guest asked for or errors — it never silently hands back a plausible-but-wrong one (the "no silent drop" discipline applied to the compute boundary).
+
+- **Scoped-or-loud (⚠️ breaking).** A projection naming neither `nodeLabels` nor `edgeTypes` no longer silently pulls in *every* declared label/edge-type. It **fails loud unless the caller opts into the whole graph with `projectAll: true`**. This closes a silent-corruption default: an index-keyed kernel (`sample_edges`, anything keyed on CSR position) over an unscoped projection would shift edge indices as unrelated data — a coexisting MCTS `:MCTSNode` / `:PARENT` search tree, say — entered the CSR, yielding non-deterministic, un-oracle-able numbers with no error. **Migration:** name the labels/edge-types you want (recommended), or pass `{projectAll: true}`. First-party `uni.algo.gc*` providers set `projectAll` internally, preserving their whole-graph default; third-party guests must scope or opt in.
+- **Named emit mismatch.** `emit` rejects a bad column at the guest's `emit` call rather than letting the opaque Arrow "all columns must have the same length" detonate far downstream in the loader's batch assembly. Identity is checked first — a column whose `Origin` is not the primary projection is named as coming from a different projection — then length (`emit column length N != projected input node count M`). Identity subsumes most length faults now that every value is tagged, since a wrong-length column almost always also has a wrong origin.
+- **Index space is a value property, not a session property.** Tensors, vertex sets, edge sets, walk matrices and pair lists all carry the projection (or arena) their slots are keyed to, and every kernel that mixes two of them, or one of them with a graph, rejects a mismatch with `0x862`. The kernels that egress vertex ids (`emit`, `topk`, `arg_extreme`, `emit_walks`, `emit_pairs`) translate slots through the value's own projection, so a second bound graph cannot silently borrow the first one's vids. This is the invariant that makes more than one projection per session safe to expose.
+- **Named scopes (multi-projection).** A CALL may pre-declare extra projections with a `scopes` map on the trailing config object; the guest reaches them with `graph_named(name)`. Three properties are load-bearing. (1) **Scopes are built before the guest runs.** `graph_named` is a lookup, never a projection — a guest able to project on demand could project in a loop, and projection is `O(V+E)` storage work the native-work meter does not govern. (2) **The primary binds first.** `bind_graph` treats the first bind as primary, which is what `emit` keys its `nodeId` column to, so every adapter binds the primary spec before the scope loop. (3) **The budget spans every projection.** `WorkBudget::resolve` is sized from the summed vertex/edge counts, since a guest can do `O(V+E)` work on each scope. Each scope independently chooses Native or Cypher/Named mode, so `AlgorithmHostBridge::project_scope` takes the `graphRef` per call rather than reading the bridge's single stored one; `uni-query` installs the resolver when the primary *or* any scope is Cypher.
+- **`rekey` is the checked escape hatch, and the only one.** Values do not cross index spaces — but comparing two layers over the same vertices is the reason scopes exist. `rekey(value, g)` walks both projections' slot→Vid maps and re-tags the value only if they agree vertex for vertex, naming the first divergent slot otherwise. It charges `O(V)` and accepts `[V]` tensors and vertex sets only; `[E]` values are refused because CSR edge order belongs to one topology. **Slot correspondence is enforced by construction for Native projections only** — `ProjectionBuilder` sorts and dedups vids before interning (`IdMap::compact`'s sortedness check is a `debug_assert!`), while `GraphProjection::from_rows` interns in row order and deliberately does not sort. `rekey` is what makes the difference safe: it checks rather than assumes, so a Cypher scope simply fails the check instead of producing right-looking wrong answers.
+- **Undeclared-label drift.** A whole-graph (`projectAll`) projection fails loud naming any *schemaless* label present in storage/L0 but absent from the schema (uni-db permits `CREATE (:X)` without a prior `schema().label("X")`), rather than silently omitting those vertices.
+- **L0-consistent property values.** Stored node/edge property values (`gc.node_property` / `gc.edge_property`) and edge weights now project correctly from committed-but-unflushed L0 — they previously read `NaN` (properties) or silently defaulted to `1.0` (weights) until a flush, because the property read skipped the L0 overlay the structure read already applied.
+
 ### First-party providers (dogfooding)
 
 Three GraphCompute `CALL` procedures dogfood the guest surface end-to-end: **`uni.algo.gcpagerank`** (`GraphComputePageRankProvider`), **`uni.algo.gcwalks`** (`GraphComputeWalksProvider`), **`uni.algo.gcoverlap`** (`GraphComputeOverlapProvider`) — all in `crates/uni-plugin-builtin/src/algorithms/graph_compute/`. Separately, the GraphView in-process path backs first-party native algorithms authored purely against the public trait (`personalized_pagerank`, `reachable_set`, `wcc_labels`, `bellman_ford`, `k_core`, `eigenvector_centrality`), and `AlgorithmProvider::run` is wired into `CALL` dispatch on both the planner and simple-executor paths (miss-only, so built-in `algo.*` never regress).
 
 ### Loader surfaces
 
-The WASM Component Model adds an **`algorithm-plugin`** WIT world importing the `host-graph` interface (`graph-call: func(req: string) -> result<string, fn-error>`); Extism, Rhai, and PyO3 each carry the matching `graph_compute` host surface + `adapter_algorithm`. Design: `docs/proposals/graphcompute_plugin_api_2026-07-10.md`.
+The WASM Component Model adds an **`algorithm-plugin`** WIT world importing **two** capability-gated interfaces: `host-graph` (`graph-call: func(req: string) -> result<string, fn-error>` — one generic entrypoint carrying the whole catalog as JSON) and `host-arena` (typed component functions carrying handles as `u64` and scalars directly). The typed interface exists because JSON costs ~2 µs per crossing against a batched kernel's microseconds of native work — a 32× tax at batch granularity — while a typed crossing costs ~134 ns. It is strictly **additive**: a guest built before it existed imports only `host-graph` and is unaffected, which is why the prebuilt component fixtures still instantiate unchanged. Extism, Rhai, and PyO3 each carry the matching `graph_compute` host surface + `adapter_algorithm`; Extism reaches the arena kernels through the JSON path (reachable, not yet typed). Design: `docs/proposals/graphcompute_plugin_api_2026-07-10.md` and `docs/proposals/guest_stateful_compute_2026-07-20.md`.
 
 ## The PluginRegistry — Read Side
 
@@ -5978,6 +6059,17 @@ Explicit deferrals, matching the proposal §19 scorecard (▶ in place / ⏳ pen
 > - **Landed (determinism accumulator, DF-6 core):** `uni_algo::algo::reduce::deterministic_sum` — a canonical-order + Neumaier-compensated reduction that is bitwise-identical across input permutations and partition splits (DataFusion's partitioned float `SUM` is not). This is the determinism-owning accumulator a reducing stage must use for a reproducible study number; wiring it into a DataFusion UDAF reducing-stage operator (the full DF-6 operator + A-4 segmented-reduce) is the remaining integration.
 > - **Landed (fixpoint iteration driver, DF-5):** `IterationDriver` + `PowerStepExec` (`uni-query` `df_graph::iteration_driver`) — a graph fixpoint driven by **re-invoking a cached physical sub-plan once per round** (`plan_count` stays 1; the round body reads swappable `[V]` state from a shared handle and feeds its output back), converging via L1 and matching an independent PageRank reference to `1e-9`. This is the lift the Mode B-vec message-passing iteration builds on.
 > - **Landed (Mode B-vec gather mechanism, §7a):** `GraphGatherStepExec` — the message-passing round the proposal names, `edges → GROUP BY dst → aggregate`, with the destination aggregate a **pluggable `MessageAggregate` monoid** (the guest-UDAF slot; `SumAggregate` reproduces PageRank). Driven by the DF-5 `IterationDriver`, it matches the native PageRank reference to `1e-9` and agrees bitwise with the vertex-centric formulation — proving the graph-gather + driver with a swappable aggregate body.
+>
+> **Superseded (2026-07-21).** The Mode B-seq bullets below describe `ScratchGraph` /
+> `ScratchRegistry` / `LoaderClass` / `require_compiled_body`, all now `#[deprecated]` and
+> removed at the next major. They were a *parallel* stack — own registry, own JSON ABI, own
+> WIT package — which is precisely why no production loader could reach them (issue #152).
+> The replacement is `HandleKind::Arena` and the eleven `arena_*` kernels documented above:
+> one substrate, one handle table, one dispatch table, one host import. Measurement also
+> refuted `require_compiled_body`: an *interpreted* Rhai guest on batched kernels beats a
+> compiled WASM guest on the per-op JSON ABI, so loader class does not predict throughput.
+> Retained below for the history; see `docs/proposals/guest_stateful_compute_2026-07-20.md`.
+>
 > - **Landed (Mode B-seq runtime core, §7b):** `ScratchGraph` (`graph_compute::scratch`) — a per-invocation, session-local **mutable** graph a sequential guest builds and walks (`add_node`/`add_edge`/`neighbors`/`get`/`set`/`sample`), **metered per random-access op** (the §5.1 work meter extended to pointer-chasing; a runaway loop halts at `0x865`) with a **bounded mutable arena** (`0x864` on growth). Sampling is the reproducible counter-hash, so a seeded search is bitwise-repeatable (verified by an AT-MCTS-lite rollout). This is also the host-resident baseline the `Q-5` perf gate measures against.
 > - **Landed (A-4 segmented reduce, F-11 temporal reachability):** the deterministic `segmented_reduce` kernel (above) closes A-4's determinism contract as a bespoke Mode-A primitive; `edge_mask_window` + fixpoint edge-masked expansion closes F-11 (temporal reachability matches a naive time-respecting BFS oracle). *(The proposal also lists a UDAF-delegated segmented reduce as a §6 preference; the bespoke determinism-owning kernel satisfies the same §6/§8 contract, and the DataFusion-UDAF delegation remains an optional alternative.)*
 > - **Landed (AT-ABM SIR, Mode B-seq guest ABI):** a seeded SIR epidemic ABM tick on the message-passing kernels (`sample_edges` firing + `expand_masked` gather + `sample` recovery) matches an independent native SIR oracle exactly and is reproducible; and `ScratchGraph::call_json` / `ScratchResponse` — the host-side JSON ABI a compiled Mode B-seq guest drives (each random-access op metered, errors typed), the same `host-graph` dispatch shape the Mode-A kernels use.

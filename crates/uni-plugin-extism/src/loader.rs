@@ -319,9 +319,10 @@ impl ExtismLoader {
         // Effective = declared ∩ granted (retains per-variant attenuation).
         let declared = manifest.declared_capability_set();
         let effective = declared.intersect(grants);
+        // Shared variant-aware derivation via `CapabilitySet::denied_against`.
         let denied: Vec<String> = declared
+            .denied_against(&effective)
             .iter()
-            .filter(|c| !effective.contains_variant(c))
             .map(|c| format!("{c:?}"))
             .collect();
 
@@ -479,6 +480,7 @@ impl ExtismLoader {
         let mut scalars_registered: Vec<String> = Vec::new();
         let mut aggregates_registered: Vec<String> = Vec::new();
         let mut procedures_registered: Vec<String> = Vec::new();
+        let mut algorithms_registered: Vec<String> = Vec::new();
 
         for entry in registration.entries {
             match entry {
@@ -541,7 +543,7 @@ impl ExtismLoader {
                 }
                 crate::exports::RegistrationEntry::Algorithm {
                     qname,
-                    args: _,
+                    args,
                     yields,
                 } => {
                     let parsed_qname = parse_entry_qname(&qname)?;
@@ -551,7 +553,7 @@ impl ExtismLoader {
                              (call ExtismLoader::with_graph)"
                         ))
                     })?;
-                    let sig = build_algorithm_signature(&yields)?;
+                    let sig = build_algorithm_signature(&args, &yields)?;
                     let adapter =
                         std::sync::Arc::new(crate::adapter_algorithm::ExtismAlgorithm::new(
                             std::sync::Arc::clone(&pool),
@@ -562,6 +564,7 @@ impl ExtismLoader {
                     registrar.algorithm(parsed_qname, adapter).map_err(|e| {
                         ExtismError::Internal(format!("registrar.algorithm `{qname}`: {e}"))
                     })?;
+                    algorithms_registered.push(qname);
                 }
             }
         }
@@ -578,6 +581,7 @@ impl ExtismLoader {
             scalars_registered,
             aggregates_registered,
             procedures_registered,
+            algorithms_registered,
             pool,
         })
     }
@@ -593,11 +597,32 @@ fn parse_entry_qname(qname: &str) -> Result<uni_plugin::QName, ExtismError> {
         .map_err(|e| ExtismError::OutputDecode(format!("invalid qname `{qname}`: {e}")))
 }
 
-/// Build an `AlgorithmSignature` from declared `"name:type"` yield strings.
+/// Build an `AlgorithmSignature` from declared wire arg types + `"name:type"`
+/// yield strings. Declared args are now typed and validated (G4): they were
+/// parsed then dropped, leaving `signature.args` empty so `coerce_config_json`
+/// was a no-op. `WireArgType::CypherValue` lets a guest declare a
+/// variable-length seed set without generating the plugin per-arity.
 fn build_algorithm_signature(
+    args: &[crate::exports::WireArgType],
     yields: &[String],
 ) -> Result<uni_plugin::traits::algorithm::AlgorithmSignature, ExtismError> {
     use arrow_schema::{DataType, Field};
+    use uni_plugin::traits::procedure::NamedArgType;
+    let mut named_args: Vec<NamedArgType> = args
+        .iter()
+        .enumerate()
+        .map(|(i, w)| {
+            Ok(NamedArgType {
+                name: format!("arg{i}").into(),
+                ty: crate::wire_translate::wire_arg_to_internal(w)?,
+                default: None,
+                doc: String::new(),
+            })
+        })
+        .collect::<Result<_, ExtismError>>()?;
+    // Accept the optional trailing projection-config object the CALL convention
+    // appends after the guest args (stripped by the adapter before the guest runs).
+    named_args.push(NamedArgType::projection_config());
     let output_fields: Vec<Field> = yields
         .iter()
         .enumerate()
@@ -620,6 +645,7 @@ fn build_algorithm_signature(
         .collect::<Result<_, ExtismError>>()?;
     Ok(uni_plugin::traits::algorithm::AlgorithmSignature {
         output_fields,
+        args: named_args,
         docs: String::new(),
         ..Default::default()
     })
@@ -716,6 +742,8 @@ pub struct LoadOutcome {
     pub aggregates_registered: Vec<String>,
     /// Qnames registered as procedures.
     pub procedures_registered: Vec<String>,
+    /// Qnames registered as graph-compute algorithms.
+    pub algorithms_registered: Vec<String>,
     /// The instance pool, shared across every adapter bound to this
     /// plugin. Adapters hold an `Arc` clone; the pool is kept alive as
     /// long as any adapter remains in the registry.
@@ -732,6 +760,7 @@ impl std::fmt::Debug for LoadOutcome {
             .field("scalars_registered", &self.scalars_registered)
             .field("aggregates_registered", &self.aggregates_registered)
             .field("procedures_registered", &self.procedures_registered)
+            .field("algorithms_registered", &self.algorithms_registered)
             .finish_non_exhaustive()
     }
 }

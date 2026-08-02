@@ -28,11 +28,16 @@
 //
 // Rust guideline compliant
 
+pub mod arena;
+#[cfg(test)]
+mod composition_recipes;
 pub mod conformance;
 pub mod dispatch;
 pub mod error;
 pub mod first_party;
 pub mod handle;
+pub mod kernel_id;
+pub mod op_parse;
 pub mod scratch;
 pub mod session;
 pub mod table;
@@ -45,14 +50,23 @@ pub mod provider;
 pub mod provider_pairs;
 pub mod provider_walks;
 
+pub use arena::GraphArena;
 pub use conformance::{ProbeResult, run_probes};
 pub use dispatch::{GraphComputeRegistry, KernelRequest, KernelResponse, SharedRegistry};
 pub use handle::{Handle, HandleKind};
+pub use kernel_id::{KernelId, KernelReach};
+pub use op_parse::{
+    METHOD_RECIPES, OpFamily, RECIPES, method_recipe_for, recipe_for, rejection,
+    unknown_method_message,
+};
+// Re-exported for one more minor release so downstream code gets a deprecation
+// warning rather than a hard break; removed at the next major (§13.4).
+#[allow(deprecated)]
 pub use scratch::{LoaderClass, ScratchGraph, ScratchRegistry, ScratchRequest, ScratchResponse};
 pub use session::{
     AlgoSession, Direction, EwiseOp, GraphCompute, MapOp, Norm, Predicate, ReduceOp, Semiring,
 };
-pub use table::HandleTable;
+pub use table::{HandleTable, force_tracing_for_test};
 pub use value::{DType, PairList, Scalar, Shape, Tensor, VertexSet};
 
 /// The capability-slice name the GraphCompute kernel catalog is versioned under.
@@ -75,6 +89,82 @@ pub fn graph_compute_slice_req() -> uni_plugin::traits::algorithm::SliceReq {
     }
 }
 
+/// The capability-slice name the mutable-arena kernel family is versioned under.
+///
+/// Implemented as of the arena kernels (`arena_*`); see
+/// [`kernel_id::KernelId`]. The constant remains the single place the
+/// slice name is written.
+pub const GRAPH_ARENA_SLICE: &str = "graph-arena";
+
+/// The arena slice version the kernels below will land under (proposal §5.5).
+pub const GRAPH_ARENA_SLICE_VERSION: u16 = 1;
+
+/// Retired `ScratchGraph` op names, kept only to give a guest a useful redirect.
+///
+/// These were the per-op scratch API measured at 59 K rollouts/s and superseded
+/// by the batched `arena_*` kernels (proposal §6 / §12). A guest written against
+/// the old names is not making a typo, so it earns a pointer to the replacement
+/// rather than "unknown op" — the issue #152 defect, in its residual form.
+///
+/// Names that also exist in the `graph-compute@1` catalog (`sample`,
+/// `edge_count`) are deliberately absent: a guest calling those resolves against
+/// the implemented kernel, and only an *unresolved* op ever consults this list.
+pub const GRAPH_ARENA_OPS: &[&str] = &[
+    "add_node",
+    "add_child",
+    "add_edge",
+    "add_flow_edge",
+    "neighbors",
+    "get_field",
+    "set_field",
+    "edge_field",
+    "node_count",
+    "descend_batch",
+    "visit_batch",
+    "batch_new",
+    "batch_slots",
+    "batch_distinct",
+    "advance_batch",
+    "advance_batch_scored",
+    "advance_array",
+    "augment_batch",
+    "column_new",
+    "column",
+    "visits",
+    "col_fill",
+    "col_ewise",
+    "col_map",
+    "col_load_visits",
+    "col_gather_parent",
+];
+
+/// Classifies an unresolved kernel op into a typed, actionable error.
+///
+/// An op in [`GRAPH_ARENA_OPS`] is not unknown — it is a real kernel belonging
+/// to a capability slice this host does not provide, so it earns `0x86A`
+/// (`SliceVersionMismatch`) naming that slice. Anything else is a genuine
+/// unknown name and earns `0x86E` (`ArgValidation`), since the `op` field is
+/// the invalid argument.
+///
+/// Both beat the previous untyped `0x01`, which told a guest author nothing
+/// about whether to fix their spelling or their host build (issue #152).
+#[must_use]
+pub fn unresolved_op_error(op: &str) -> uni_plugin::errors::FnError {
+    if GRAPH_ARENA_OPS.contains(&op) {
+        uni_plugin::errors::FnError::new(
+            error::SLICE_VERSION_MISMATCH,
+            format!(
+                "kernel `{op}` is a retired scratch-graph op; use the batched \
+                 `arena_*` kernels of `{GRAPH_ARENA_SLICE}@{GRAPH_ARENA_SLICE_VERSION}` \
+                 (arena_new / arena_alloc / arena_link / arena_column / \
+                 arena_candidates / arena_gather / arena_scatter / arena_descend)"
+            ),
+        )
+    } else {
+        error::arg_validation(format!("unknown kernel op `{op}`"))
+    }
+}
+
 /// Name of the host-generated vertex-id column, prepended to every result batch.
 ///
 /// The guest never emits it — the adapters synthesize it by slot→Vid translation
@@ -94,6 +184,32 @@ pub fn guest_emit_columns(fields: &[arrow_schema::Field]) -> Vec<String> {
         .map(|f| f.name().clone())
         .filter(|n| n != HOST_NODE_ID_COLUMN)
         .collect()
+}
+
+/// Map an algorithm `yields` type token to the Arrow [`arrow_schema::DataType`]
+/// the emit path can actually build.
+///
+/// Deliberately narrower than the loaders' general `type_name_to_datatype`,
+/// which also serves scalar UDFs and procedures where `Utf8`/`Boolean` are
+/// perfectly buildable. The algorithm emit channel is `Vec<f64>` per column, and
+/// every `build_batch` handles exactly `Int64` and `Float64` — so a declaration
+/// of `score:string` used to register cleanly and then fail on *every* CALL with
+/// "unsupported emit column type". Rejecting at load turns a permanently broken
+/// algorithm into an immediate, legible error.
+///
+/// Do not widen this to `arg_type_from_token`: that maps `value` to
+/// `CypherValue` and `list` to `Vector`, which are right for *arguments* and
+/// which `build_batch` can build even less than `Utf8`.
+///
+/// Returns `None` for anything unbuildable, so each loader can wrap the failure
+/// in its own error type.
+#[must_use]
+pub fn algorithm_yield_datatype(token: &str) -> Option<arrow_schema::DataType> {
+    match token.trim().to_ascii_lowercase().as_str() {
+        "float" | "float64" | "double" | "f64" => Some(arrow_schema::DataType::Float64),
+        "int" | "int64" | "long" | "i64" => Some(arrow_schema::DataType::Int64),
+        _ => None,
+    }
 }
 
 /// Native-work budget multiplier applied to graph size to derive the default cap.
@@ -156,21 +272,61 @@ pub const DEFAULT_MAX_SUPERSTEPS: usize = 10_000;
 /// the epoch is defense-in-depth, not the primary lifetime bound.
 static SESSION_EPOCH: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(1);
 
-/// Returns the next per-process session epoch, never `0`.
+/// Returns the next per-process session epoch, or fails closed once exhausted.
 ///
-/// Epoch `0` is skipped so the all-zeros handle `Handle::from_u64(0)` (epoch 0,
-/// kind `VertexSet`, gen 0, slot 0) can never match a live session — closing a
-/// forged-handle alias on epoch wrap (proposal §4.2 fail-closed intent). Full
-/// wrap *rejection* (erroring after 65_535 sessions) remains a follow-up; this
-/// removes the acute aliasing without changing the infallible signature.
-#[must_use]
-pub fn next_session_epoch() -> u16 {
-    let e = SESSION_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if e == 0 {
-        SESSION_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    } else {
-        e
+/// The epoch is what makes a handle minted in one invocation structurally
+/// unusable in another. It is 16 bits, so it can only name 65_535 sessions; the
+/// previous implementation wrapped silently, after which two concurrently-live
+/// sessions could share an epoch. On the JSON registry path (Extism/WASM), where
+/// the guest supplies both the session id and the handle, the epoch is the *only*
+/// cross-session guard — a collision there resolves one session's handle against
+/// another's table.
+///
+/// So the counter now saturates rather than wrapping, and the factory refuses.
+/// [`MAX_EPOCH`](handle::MAX_EPOCH) has always documented this behaviour; this
+/// makes it true.
+///
+/// Epoch `0` is never handed out, so the all-zeros handle `Handle::from_u64(0)`
+/// (epoch 0, kind `VertexSet`, gen 0, slot 0) can never match a live session.
+///
+/// # Errors
+/// Returns `0x86B` (`WRAP_FAIL_CLOSED`) once the process has exhausted its
+/// epochs — the same code the generational slot wrap uses, for the same reason.
+pub fn next_session_epoch() -> Result<u16, uni_plugin::errors::FnError> {
+    // A compare-and-swap so the ceiling is observed atomically: a blind
+    // `fetch_add` would let a racing thread wrap past the check.
+    let mut cur = SESSION_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+    loop {
+        // `MAX_EPOCH` is `u16::MAX`, so equality is the whole condition.
+        if cur == handle::MAX_EPOCH {
+            return Err(error::wrap_fail_closed(format!(
+                "session epochs exhausted after {} sessions in this process; \
+                 a new epoch would alias a live session's handles",
+                handle::MAX_EPOCH
+            )));
+        }
+        // Skip 0 so the all-zeros handle can never match a live session. The
+        // counter starts at 1, so this only matters if it is ever reset.
+        let next = if cur == 0 { 1 } else { cur };
+        match SESSION_EPOCH.compare_exchange_weak(
+            cur,
+            next + 1,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => return Ok(next),
+            Err(observed) => cur = observed,
+        }
     }
+}
+
+/// Resets the session-epoch counter. Tests only.
+///
+/// The counter is a process-global that a test cannot exercise by burning
+/// 65_535 sessions, so the wrap boundary is only reachable by setting it.
+#[cfg(test)]
+pub(crate) fn set_session_epoch_for_test(value: u16) {
+    SESSION_EPOCH.store(value, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The native-work meter for a single GraphCompute invocation.
@@ -490,6 +646,65 @@ impl Arena {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The session factory refuses once epochs are exhausted.
+    ///
+    /// A 16-bit epoch names only 65_535 sessions. Wrapping used to be silent,
+    /// after which two concurrently-live sessions could share one — and on the
+    /// JSON registry path the epoch is the only thing keeping one session's
+    /// handles out of another's table. `MAX_EPOCH`'s doc always claimed the
+    /// factory failed closed here; this is that claim, tested.
+    ///
+    /// Serialized against the other epoch test: both move a process-global.
+    #[test]
+    fn session_epochs_fail_closed_when_exhausted() {
+        let _guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let restore = SESSION_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+
+        set_session_epoch_for_test(super::handle::MAX_EPOCH - 1);
+        let last = next_session_epoch().expect("the final epoch is still handed out");
+        assert_eq!(last, super::handle::MAX_EPOCH - 1);
+
+        let err = next_session_epoch().expect_err("the next one must be refused");
+        assert_eq!(
+            err.code,
+            error::WRAP_FAIL_CLOSED,
+            "exhaustion is fail-closed, not a generic error"
+        );
+        assert!(
+            err.message.contains("alias"),
+            "the error must say why it refuses: {}",
+            err.message
+        );
+        // Still refused on a second attempt: the counter saturates, it does not wrap.
+        assert_eq!(
+            next_session_epoch().expect_err("still refused").code,
+            error::WRAP_FAIL_CLOSED
+        );
+
+        SESSION_EPOCH.store(restore, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Epoch `0` is never handed out, so the all-zeros forged handle cannot
+    /// match a live session.
+    #[test]
+    fn session_epochs_never_hand_out_zero() {
+        let _guard = EPOCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let restore = SESSION_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+
+        set_session_epoch_for_test(0);
+        assert_eq!(
+            next_session_epoch().expect("a zero counter is still serviceable"),
+            1,
+            "epoch 0 must never be handed out, or `Handle::from_u64(0)` would \
+             match a live session"
+        );
+
+        SESSION_EPOCH.store(restore, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Both epoch tests move a process-global counter, so they must not overlap.
+    static EPOCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn work_budget_charges_and_reports_remaining() {

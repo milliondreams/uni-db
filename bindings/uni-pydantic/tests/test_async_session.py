@@ -6,6 +6,7 @@
 from datetime import date, datetime
 
 import pytest
+from pydantic import field_validator
 
 from uni_pydantic import (
     AsyncUniSession,
@@ -249,3 +250,139 @@ class TestAsyncLifecycleHooks:
         await async_session.commit()
 
         assert alice.created_at is not None
+
+
+# ---------------------------------------------------------------------------
+# Async hydration must not silently drop rows either
+# ---------------------------------------------------------------------------
+#
+# `AsyncUniSession._result_to_model` is a second copy of the sync method, with
+# its own `except Exception: return None`. The row-mapping helpers in
+# `query.py` are shared, so the truthiness guards were common to both; the
+# swallow was not.
+
+
+class AsyncFalsyThing(UniNode):
+    """Legitimately falsy when empty — must survive hydration."""
+
+    __label__ = "AsyncFalsyThing"
+
+    name: str
+    count: int = 0
+
+    def __bool__(self) -> bool:
+        return self.count > 0
+
+
+class AsyncBuggyThing(UniNode):
+    """Raises a non-validation error during hydration."""
+
+    __label__ = "AsyncBuggyThing"
+
+    name: str
+
+    @field_validator("name")
+    @classmethod
+    def _boom(cls, v: str) -> str:
+        if v == "boom":
+            raise RuntimeError("async hydration bug, not a validation failure")
+        return v
+
+
+async def _async_raw_create(async_session, cypher: str) -> None:
+    tx = await async_session._db_session.tx()
+    await tx.execute(cypher)
+    await tx.commit()
+
+
+class TestAsyncHydrationDoesNotDropRows:
+    async def test_falsy_instance_is_not_dropped(self, async_session):
+        async_session.register(AsyncFalsyThing)
+        await async_session.sync_schema()
+
+        await _async_raw_create(
+            async_session,
+            "CREATE (:AsyncFalsyThing {name: 'empty', count: 0}) "
+            "CREATE (:AsyncFalsyThing {name: 'full', count: 3})",
+        )
+
+        found = await async_session.query(AsyncFalsyThing).all()
+        names = sorted(f.name for f in found)
+        assert names == ["empty", "full"], (
+            f"a validly hydrated but falsy model was dropped; got {names}"
+        )
+
+    async def test_hydration_bug_is_not_swallowed(self, async_session):
+        async_session.register(AsyncBuggyThing)
+        await async_session.sync_schema()
+
+        await _async_raw_create(
+            async_session,
+            "CREATE (:AsyncBuggyThing {name: 'ok'}) "
+            "CREATE (:AsyncBuggyThing {name: 'boom'})",
+        )
+
+        with pytest.raises(RuntimeError, match="async hydration bug"):
+            await async_session.query(AsyncBuggyThing).all()
+
+
+# ---------------------------------------------------------------------------
+# eager_load() on the async session
+# ---------------------------------------------------------------------------
+#
+# `AsyncUniSession._load_relationship` raises and tells the caller to use
+# `eager_load()`, so the eager path is the only relationship path async has --
+# and it was the one caching raw dicts. An entity with nothing attached was
+# left with no cache entry at all, which sent the descriptor down that raising
+# lazy path on first access.
+
+
+class AsyncTag(UniNode):
+    __label__ = "AsyncTag"
+
+    name: str
+
+
+class AsyncDoc(UniNode):
+    __label__ = "AsyncDoc"
+
+    title: str
+
+    tags: list[AsyncTag] = Relationship("TAGGED")
+
+
+class TestAsyncEagerLoad:
+    async def _seed(self, async_session):
+        async_session.register(AsyncDoc, AsyncTag)
+        await async_session.sync_schema()
+
+        doc = AsyncDoc(title="Guide")
+        tag = AsyncTag(name="howto")
+        bare = AsyncDoc(title="Untagged")
+        async_session.add_all([doc, tag, bare])
+        await async_session.commit()
+
+        await async_session.create_edge(doc, "TAGGED", tag, {})
+        await async_session._db.flush()
+
+    async def test_eager_load_yields_models(self, async_session):
+        await self._seed(async_session)
+
+        docs = await async_session.query(AsyncDoc).eager_load("tags").all()
+        guide = next(d for d in docs if d.title == "Guide")
+
+        assert len(guide.tags) == 1
+        assert isinstance(guide.tags[0], AsyncTag), (
+            f"eager_load cached a raw {type(guide.tags[0]).__name__}"
+        )
+        assert guide.tags[0].name == "howto"
+
+    async def test_entity_without_relations_does_not_lazy_load(self, async_session):
+        await self._seed(async_session)
+
+        docs = await async_session.query(AsyncDoc).eager_load("tags").all()
+        untagged = next(d for d in docs if d.title == "Untagged")
+
+        # Must not raise: with no cache entry the descriptor would fall through
+        # to the async lazy path, which raises on principle.
+        assert untagged.tags == []

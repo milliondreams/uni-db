@@ -22,11 +22,16 @@ use uni_common::api::error::UniError;
 use uni_common::core::fork::{ForkInfo, ForkStatus};
 
 use super::registry::ForkRegistryHandle;
+use crate::backend::branching::ForkBranching;
 
 /// Resume any partial create/drop left behind by a crash.
 ///
 /// Returns the number of registry entries reconciled, useful for tests
 /// and observability.
+///
+/// `branching` is `None` for a backend without copy-on-write branching. Such a
+/// backend cannot have created any branches, so registry reconciliation still
+/// runs in full and only the branch-deletion steps are skipped.
 ///
 /// # Errors
 ///
@@ -35,18 +40,15 @@ use super::registry::ForkRegistryHandle;
 /// branches: a missing branch on a `Pending` rollback path is
 /// success.
 #[instrument(
-    skip(registry, storage_store, candidate_datasets, dataset_uri_for),
+    skip(registry, storage_store, candidate_datasets, branching),
     level = "info"
 )]
-pub async fn recover_forks<F>(
+pub async fn recover_forks(
     registry: &ForkRegistryHandle,
     storage_store: &Arc<dyn ObjectStore>,
     candidate_datasets: &[String],
-    mut dataset_uri_for: F,
-) -> Result<usize, UniError>
-where
-    F: FnMut(&str) -> String,
-{
+    branching: Option<&dyn ForkBranching>,
+) -> Result<usize, UniError> {
     let mut reconciled = 0usize;
 
     // 1. Resume any `Pending` create — for Phase 1 we always roll back.
@@ -65,7 +67,7 @@ where
     for info in pending {
         info!(fork_name = %info.name, fork_id = %info.id, "rolling back Pending create");
         // Walk any partial branches and force-delete them.
-        rollback_branches(&info, candidate_datasets, &mut dataset_uri_for).await;
+        rollback_branches(&info, candidate_datasets, branching).await;
         registry.rollback_create(&info.name).await?;
         reconciled += 1;
     }
@@ -81,7 +83,7 @@ where
 
     for info in tombstoned {
         info!(fork_name = %info.name, fork_id = %info.id, "completing tombstoned drop");
-        delete_all_branches(&info, &mut dataset_uri_for).await;
+        delete_all_branches(&info, branching).await;
         registry.finish_drop(&info).await?;
         super::delete_fork_artifacts(storage_store, &info.id).await;
         reconciled += 1;
@@ -97,7 +99,7 @@ where
             fork_id = %info.id,
             "sweeping orphan tombstone"
         );
-        delete_all_branches(&info, &mut dataset_uri_for).await;
+        delete_all_branches(&info, branching).await;
         registry.finish_drop(&info).await?;
         super::delete_fork_artifacts(storage_store, &info.id).await;
         reconciled += 1;
@@ -109,25 +111,18 @@ where
 /// Best-effort: try to remove every branch in `info.datasets`. Errors
 /// are logged at warn level and otherwise ignored, since the whole
 /// point of force-delete is to mop up partial state.
-async fn delete_all_branches<F>(info: &ForkInfo, dataset_uri_for: &mut F)
-where
-    F: FnMut(&str) -> String,
-{
-    #[cfg(feature = "lance-backend")]
+async fn delete_all_branches(info: &ForkInfo, branching: Option<&dyn ForkBranching>) {
+    let Some(branching) = branching else {
+        return;
+    };
     for (dataset, branch) in &info.datasets {
-        let uri = dataset_uri_for(dataset);
-        if let Err(e) = crate::backend::lance_branch::delete_branch(&uri, branch).await {
+        if let Err(e) = branching.delete_branch(dataset, branch).await {
             warn!(
                 dataset = %dataset,
                 branch = %branch,
                 "delete_branch during recovery failed: {e}"
             );
         }
-    }
-
-    #[cfg(not(feature = "lance-backend"))]
-    {
-        let _ = (info, dataset_uri_for);
     }
 }
 
@@ -137,16 +132,14 @@ where
 /// names already recorded; un-recorded zombie branches are surfaced
 /// in the spike binary's fault-injection scenario rather than
 /// silently force-deleted, since we don't know what name to use.
-async fn rollback_branches<F>(
+async fn rollback_branches(
     info: &ForkInfo,
     candidate_datasets: &[String],
-    dataset_uri_for: &mut F,
-) where
-    F: FnMut(&str) -> String,
-{
+    branching: Option<&dyn ForkBranching>,
+) {
     // Recorded branches (the writer got far enough to persist `datasets`).
     if !info.datasets.is_empty() {
-        delete_all_branches(info, dataset_uri_for).await;
+        delete_all_branches(info, branching).await;
     }
 
     // L3: a create that failed before recording any branch leaves a Pending
@@ -158,32 +151,17 @@ async fn rollback_branches<F>(
     // candidate datasets; a branch whose dataset has since left the schema
     // is not reconstructable here (accepted: schema is persisted, so drift
     // between the crashed create and recovery is unlikely).
-    #[cfg(feature = "lance-backend")]
+    let Some(branching) = branching else {
+        return;
+    };
     for dataset in candidate_datasets {
         let branch = format!("fork_{}_{}", info.id, dataset);
-        let uri = dataset_uri_for(dataset);
-        if let Err(e) = crate::backend::lance_branch::delete_branch(&uri, &branch).await {
+        if let Err(e) = branching.delete_branch(dataset, &branch).await {
             warn!(
                 dataset = %dataset,
                 branch = %branch,
                 "zombie-branch reclamation during recovery failed: {e}"
             );
-        }
-    }
-
-    #[cfg(not(feature = "lance-backend"))]
-    let _ = candidate_datasets;
-}
-
-/// Convenience for tests: a `dataset_uri_for` closure that joins a
-/// fixed base URI with each dataset name.
-#[doc(hidden)]
-pub fn join_uri_with(base_uri: String) -> impl FnMut(&str) -> String {
-    move |dataset: &str| {
-        if base_uri.ends_with('/') {
-            format!("{base_uri}{dataset}.lance")
-        } else {
-            format!("{base_uri}/{dataset}.lance")
         }
     }
 }

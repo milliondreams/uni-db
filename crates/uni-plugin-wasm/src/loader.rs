@@ -105,18 +105,10 @@ fn default_proc_mode() -> String {
     "read".to_owned()
 }
 
-/// Wire-level argument type shipped by a plugin.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum WireArgType {
-    /// Native Arrow primitive (`int64`, `float64`, `utf8`, …).
-    Primitive {
-        /// Arrow primitive name.
-        arrow: String,
-    },
-    /// Opaque `CypherValue` transported as `LargeBinary`.
-    CypherValue,
-}
+// Shared with the Extism loader — see `uni_plugin::wire_manifest`. This
+// loader's copy used to omit `Vector` and `Variadic`, so a manifest declaring
+// either loaded over Extism and failed to parse here.
+pub use uni_plugin::wire_manifest::WireArgType;
 
 /// One registration entry.
 #[derive(Debug, Clone, Deserialize)]
@@ -574,10 +566,11 @@ impl WasmLoader {
         let declared = manifest.declared_capability_set();
         // Effective = declared ∩ granted (retains per-variant attenuation).
         let effective = declared.intersect(grants);
-        // Declared variants the host did not grant — diagnostics only.
+        // Declared variants the host did not grant — diagnostics only. Shared
+        // variant-aware derivation via `CapabilitySet::denied_against`.
         let denied: Vec<String> = declared
+            .denied_against(&effective)
             .iter()
-            .filter(|c| !effective.contains_variant(c))
             .map(|c| format!("{c:?}"))
             .collect();
         PreparedComponent {
@@ -671,6 +664,7 @@ impl WasmLoader {
             scalars_registered: names.scalars,
             aggregates_registered: names.aggregates,
             procedures_registered: names.procedures,
+            algorithms_registered: names.algorithms,
             pool,
         })
     }
@@ -738,6 +732,8 @@ pub struct LoadOutcome {
     pub aggregates_registered: Vec<String>,
     /// Qnames registered as procedures.
     pub procedures_registered: Vec<String>,
+    /// Qnames registered as graph-compute algorithms.
+    pub algorithms_registered: Vec<String>,
     /// Scalar-plugin instance pool — `None` if no scalars registered.
     pub pool: Arc<WasmInstancePool<ScalarPluginInstance>>,
 }
@@ -752,6 +748,7 @@ impl std::fmt::Debug for LoadOutcome {
             .field("scalars_registered", &self.scalars_registered)
             .field("aggregates_registered", &self.aggregates_registered)
             .field("procedures_registered", &self.procedures_registered)
+            .field("algorithms_registered", &self.algorithms_registered)
             .finish_non_exhaustive()
     }
 }
@@ -995,6 +992,7 @@ struct RegisteredQNames {
     scalars: Vec<String>,
     aggregates: Vec<String>,
     procedures: Vec<String>,
+    algorithms: Vec<String>,
 }
 
 /// Replay a parsed `register` manifest into `registrar`.
@@ -1013,6 +1011,7 @@ fn apply_registration(
     let mut scalars = Vec::new();
     let mut aggregates = Vec::new();
     let mut procedures = Vec::new();
+    let mut algorithms = Vec::new();
     let mut agg_pool: Option<Arc<WasmInstancePool<AggregatePluginInstance>>> = None;
     let mut proc_pool: Option<Arc<WasmInstancePool<ProcedurePluginInstance>>> = None;
     let mut algo_pool: Option<Arc<WasmInstancePool<AlgorithmPluginInstance>>> = None;
@@ -1089,7 +1088,11 @@ fn apply_registration(
                     })?;
                 procedures.push(qname);
             }
-            RegistrationEntry::Algorithm { qname, yields, .. } => {
+            RegistrationEntry::Algorithm {
+                qname,
+                args,
+                yields,
+            } => {
                 let parsed_qname = parse_qname(&qname)?;
                 let registry = prepared.graph.clone().ok_or_else(|| {
                     WasmError::Internal(format!(
@@ -1097,7 +1100,7 @@ fn apply_registration(
                          (call WasmLoader::with_graph)"
                     ))
                 })?;
-                let sig = build_algorithm_signature(&yields)?;
+                let sig = build_algorithm_signature(&args, &yields)?;
                 let pool_ref = match &algo_pool {
                     Some(p) => Arc::clone(p),
                     None => {
@@ -1115,6 +1118,7 @@ fn apply_registration(
                 registrar.algorithm(parsed_qname, adapter).map_err(|e| {
                     WasmError::Internal(format!("registrar.algorithm `{qname}`: {e}"))
                 })?;
+                algorithms.push(qname);
             }
         }
     }
@@ -1123,6 +1127,7 @@ fn apply_registration(
         scalars,
         aggregates,
         procedures,
+        algorithms,
     })
 }
 
@@ -1390,9 +1395,30 @@ fn build_algorithm_pool(
 
 /// Build an `AlgorithmSignature` from declared `"name:type"` yield strings.
 fn build_algorithm_signature(
+    args: &[WireArgType],
     yields: &[String],
 ) -> Result<uni_plugin::traits::algorithm::AlgorithmSignature, WasmError> {
     use arrow_schema::{DataType, Field};
+    use uni_plugin::traits::procedure::NamedArgType;
+    // Declared algorithm args are now typed and validated (G4): they were parsed
+    // then dropped, leaving `signature.args` empty so `coerce_config_json` was a
+    // no-op. `WireArgType::CypherValue` lets a guest declare a variable-length
+    // seed set without generating the plugin per-arity.
+    let mut named_args: Vec<NamedArgType> = args
+        .iter()
+        .enumerate()
+        .map(|(i, w)| {
+            Ok(NamedArgType {
+                name: format!("arg{i}").into(),
+                ty: wire_arg(w)?,
+                default: None,
+                doc: String::new(),
+            })
+        })
+        .collect::<Result<_, WasmError>>()?;
+    // Accept the optional trailing projection-config object the CALL convention
+    // appends after the guest args (stripped by the adapter before the guest runs).
+    named_args.push(NamedArgType::projection_config());
     let output_fields: Vec<Field> = yields
         .iter()
         .enumerate()
@@ -1415,6 +1441,7 @@ fn build_algorithm_signature(
         .collect::<Result<_, WasmError>>()?;
     Ok(uni_plugin::traits::algorithm::AlgorithmSignature {
         output_fields,
+        args: named_args,
         docs: String::new(),
         ..Default::default()
     })
@@ -1426,6 +1453,11 @@ fn wire_arg(w: &WireArgType) -> Result<uni_plugin::traits::scalar::ArgType, Wasm
     Ok(match w {
         WireArgType::Primitive { arrow } => ArgType::Primitive(arrow_name_to_dt(arrow)?),
         WireArgType::CypherValue => ArgType::CypherValue,
+        WireArgType::Vector { len, element } => ArgType::Vector {
+            len: *len,
+            element: arrow_name_to_dt(element)?,
+        },
+        WireArgType::Variadic { inner } => ArgType::Variadic(Box::new(wire_arg(inner)?)),
     })
 }
 
@@ -1573,6 +1605,45 @@ mod tests {
     use super::*;
 
     use uni_plugin::{Capability, CapabilitySet};
+
+    /// A `kind:"vector"` arg used to load over Extism and be *rejected* here:
+    /// this loader carried its own `WireArgType` with only `Primitive` and
+    /// `CypherValue`, and `deny_unknown_fields` turned the extra variants into
+    /// a parse error. The schema is now shared, so it must both parse and
+    /// convert to a `FixedSizeList`-backed `ArgType::Vector`.
+    #[test]
+    fn vector_wire_arg_parses_and_converts() {
+        use uni_plugin::traits::scalar::ArgType;
+
+        let json = r#"{"kind":"vector","len":128,"element":"float32"}"#;
+        let wire: WireArgType = serde_json::from_str(json).expect("vector arg must parse");
+
+        let converted = wire_arg(&wire).expect("vector arg must convert");
+        match converted {
+            ArgType::Vector { len, element } => {
+                assert_eq!(len, 128);
+                assert_eq!(element, arrow_schema::DataType::Float32);
+            }
+            other => panic!("expected ArgType::Vector, got {other:?}"),
+        }
+    }
+
+    /// Same story for `kind:"variadic"`, including the recursive inner type.
+    #[test]
+    fn variadic_wire_arg_parses_and_converts() {
+        use uni_plugin::traits::scalar::ArgType;
+
+        let json = r#"{"kind":"variadic","inner":{"kind":"primitive","arrow":"int64"}}"#;
+        let wire: WireArgType = serde_json::from_str(json).expect("variadic arg must parse");
+
+        match wire_arg(&wire).expect("variadic arg must convert") {
+            ArgType::Variadic(inner) => match *inner {
+                ArgType::Primitive(dt) => assert_eq!(dt, arrow_schema::DataType::Int64),
+                other => panic!("expected inner Primitive, got {other:?}"),
+            },
+            other => panic!("expected ArgType::Variadic, got {other:?}"),
+        }
+    }
 
     /// Build a manifest JSON declaring the given (kebab-case) capability names.
     fn manifest_json(caps: &[&str]) -> String {

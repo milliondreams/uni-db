@@ -215,7 +215,11 @@ impl AsyncDatabase {
         let inner = Arc::clone(&self.inner);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let cap_set = crate::builders::build_capability_set(grants);
-            let loader = uni_plugin_wasm::WasmLoader::new();
+            // Wire a fresh GraphCompute registry so guest `algorithm` entries can
+            // register; harmless for scalar-only plugins.
+            let loader = uni_plugin_wasm::WasmLoader::new().with_graph(std::sync::Arc::new(
+                uni_plugin_builtin::algorithms::graph_compute::GraphComputeRegistry::new(),
+            ));
             let outcome = inner
                 .load_wasm_component(&loader, &wasm_bytes, &cap_set, &cap_set)
                 .map_err(crate::exceptions::uni_error_to_pyerr)?;
@@ -227,6 +231,7 @@ impl AsyncDatabase {
                     outcome.scalars_registered,
                     outcome.aggregates_registered,
                     outcome.procedures_registered,
+                    outcome.algorithms_registered,
                     outcome.effective_capabilities,
                     outcome.denied_capabilities,
                 )
@@ -251,6 +256,11 @@ impl AsyncDatabase {
             let cap_set = crate::builders::build_capability_set(grants);
             let mut loader = uni_plugin_extism::ExtismLoader::new();
             uni_plugin_extism::register_default_host_svc(&mut loader);
+            // Wire a fresh GraphCompute registry so guest `algorithm` entries can
+            // register; harmless for scalar-only plugins.
+            let loader = loader.with_graph(std::sync::Arc::new(
+                uni_plugin_builtin::algorithms::graph_compute::GraphComputeRegistry::new(),
+            ));
             let outcome = inner
                 .load_wasm_extism(&loader, &wasm_bytes, &cap_set, &cap_set)
                 .map_err(crate::exceptions::uni_error_to_pyerr)?;
@@ -262,6 +272,7 @@ impl AsyncDatabase {
                     outcome.scalars_registered,
                     outcome.aggregates_registered,
                     outcome.procedures_registered,
+                    outcome.algorithms_registered,
                     outcome.effective_capabilities,
                     outcome.denied_capabilities,
                 )
@@ -304,6 +315,7 @@ impl AsyncDatabase {
                 dict.set_item("scalars_registered", outcome.scalars_registered)?;
                 dict.set_item("aggregates_registered", outcome.aggregates_registered)?;
                 dict.set_item("procedures_registered", outcome.procedures_registered)?;
+                dict.set_item("algorithms_registered", outcome.algorithms_registered)?;
                 let denied: Vec<String> = outcome
                     .denied_capabilities
                     .iter()
@@ -332,10 +344,14 @@ impl AsyncDatabase {
         _exc_val: Option<Py<PyAny>>,
         _exc_tb: Option<Py<PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        // Shutdown on exit.
+        // Shutdown on exit — really, not just a flush. The sync facade's
+        // `__exit__` delegates to `shutdown`; this one open-coded a flush, so
+        // `async with AsyncUni.in_memory() as db:` left the background tasks
+        // running and stranded the scratch directory on exit. That is the
+        // idiomatic path, so it leaked more often than the explicit call did.
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let _ = inner.flush().await;
+            let _ = inner.shutdown_in_place().await;
             Ok(false)
         })
     }
@@ -503,7 +519,8 @@ impl AsyncDatabase {
     fn shutdown<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let db = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            db.flush()
+            // Same correction as the sync facade: flushing is not shutting down.
+            db.shutdown_in_place()
                 .await
                 .map_err(crate::exceptions::uni_error_to_pyerr)
         })
@@ -1553,6 +1570,7 @@ impl AsyncTransaction {
             cypher: cypher.to_string(),
             params: HashMap::new(),
             timeout_secs: None,
+            cancellation_token: None,
         }
     }
 
@@ -3113,10 +3131,18 @@ pub struct AsyncQueryCursor {
 ///
 /// Free function over the cursor/buffer `Arc`s so the awaitable cursor methods
 /// can drive it without rebuilding a throwaway `AsyncQueryCursor`.
+///
+/// The error type is deliberately `UniError`, not `String`: stringifying here
+/// erases the variant, and every caller is then forced to invent an exception
+/// class. They all guessed `PyRuntimeError`, so a retriable conflict surfaced
+/// through `fetch_one`/`fetch_many`/`async for` could not be recognised by
+/// `_retry.RETRIABLE_EXCEPTIONS`, which matches by class. The sync twin
+/// (`sync_api.rs`) and `fetch_all` below both keep the typed error; this path
+/// was the odd one out.
 async fn next_row_async(
     cursor: &Arc<tokio::sync::Mutex<Option<core::QueryCursor>>>,
     buffer: &Arc<tokio::sync::Mutex<VecDeque<core::Row>>>,
-) -> Result<Option<core::Row>, String> {
+) -> Result<Option<core::Row>, uni_common::UniError> {
     {
         let mut buf = buffer.lock().await;
         if let Some(row) = buf.pop_front() {
@@ -3137,7 +3163,7 @@ async fn next_row_async(
             buf.extend(iter);
             Ok(first)
         }
-        Some(Err(e)) => Err(e.to_string()),
+        Some(Err(e)) => Err(e),
         None => Ok(None),
     }
 }
@@ -3154,7 +3180,7 @@ impl AsyncQueryCursor {
                     Python::attach(|py| Ok(Some(convert::row_to_dict(py, &row)?.into_py_any(py)?)))
                 }
                 Ok(None) => Ok(None),
-                Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
+                Err(e) => Err(crate::exceptions::uni_error_to_pyerr(e)),
             }
         })
     }
@@ -3170,7 +3196,7 @@ impl AsyncQueryCursor {
                 match next_row_async(&cursor, &buffer).await {
                     Ok(Some(row)) => rows.push(row),
                     Ok(None) => break,
-                    Err(e) => return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
+                    Err(e) => return Err(crate::exceptions::uni_error_to_pyerr(e)),
                 }
             }
             Python::attach(|py| convert::rows_to_py(py, rows))
@@ -3229,7 +3255,7 @@ impl AsyncQueryCursor {
                 Ok(None) => Err(pyo3::exceptions::PyStopAsyncIteration::new_err(
                     "end of cursor",
                 )),
-                Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e)),
+                Err(e) => Err(crate::exceptions::uni_error_to_pyerr(e)),
             }
         })
     }
@@ -3640,6 +3666,9 @@ pub struct AsyncTxQueryBuilder {
     cypher: String,
     params: HashMap<String, Py<PyAny>>,
     timeout_secs: Option<f64>,
+    /// Mirrors the sync `TxQueryBuilder`; the cross-language surfaces must not
+    /// drift apart.
+    cancellation_token: Option<crate::types::PyCancellationToken>,
 }
 
 #[pymethods]
@@ -3656,12 +3685,22 @@ impl AsyncTxQueryBuilder {
         slf
     }
 
+    /// Attach a cancellation token for cooperative query cancellation.
+    fn cancellation_token(
+        mut slf: PyRefMut<'_, Self>,
+        token: crate::types::PyCancellationToken,
+    ) -> PyRefMut<'_, Self> {
+        slf.cancellation_token = Some(token);
+        slf
+    }
+
     /// Fetch all results (returns awaitable QueryResult).
     fn fetch_all<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let rust_params = convert::convert_params_ref(py, &self.params)?;
         let inner = self.inner.clone();
         let cypher = self.cypher.clone();
         let timeout_secs = self.timeout_secs;
+        let cancel_token = self.cancellation_token.as_ref().map(|t| t.inner.clone());
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let guard = inner.lock().await;
             let tx = active_tx(&guard)?;
@@ -3671,6 +3710,9 @@ impl AsyncTxQueryBuilder {
             }
             if let Some(t) = timeout_secs {
                 builder = builder.timeout(std::time::Duration::from_secs_f64(t));
+            }
+            if let Some(ct) = cancel_token {
+                builder = builder.cancellation_token(ct);
             }
             let result = builder
                 .fetch_all()
@@ -3686,6 +3728,7 @@ impl AsyncTxQueryBuilder {
         let inner = self.inner.clone();
         let cypher = self.cypher.clone();
         let timeout_secs = self.timeout_secs;
+        let cancel_token = self.cancellation_token.as_ref().map(|t| t.inner.clone());
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let guard = inner.lock().await;
             let tx = active_tx(&guard)?;
@@ -3695,6 +3738,9 @@ impl AsyncTxQueryBuilder {
             }
             if let Some(t) = timeout_secs {
                 builder = builder.timeout(std::time::Duration::from_secs_f64(t));
+            }
+            if let Some(ct) = cancel_token {
+                builder = builder.cancellation_token(ct);
             }
             // `fetch_one` returns at most one `Row`, so only that row is
             // converted to Python instead of materializing the whole result set.
@@ -3715,6 +3761,7 @@ impl AsyncTxQueryBuilder {
         let inner = self.inner.clone();
         let cypher = self.cypher.clone();
         let timeout_secs = self.timeout_secs;
+        let cancel_token = self.cancellation_token.as_ref().map(|t| t.inner.clone());
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let guard = inner.lock().await;
             let tx = active_tx(&guard)?;
@@ -3724,6 +3771,9 @@ impl AsyncTxQueryBuilder {
             }
             if let Some(t) = timeout_secs {
                 builder = builder.timeout(std::time::Duration::from_secs_f64(t));
+            }
+            if let Some(ct) = cancel_token {
+                builder = builder.cancellation_token(ct);
             }
             let result = builder
                 .run()
@@ -3742,6 +3792,7 @@ impl AsyncTxQueryBuilder {
         let inner = self.inner.clone();
         let cypher = self.cypher.clone();
         let timeout_secs = self.timeout_secs;
+        let cancel_token = self.cancellation_token.as_ref().map(|t| t.inner.clone());
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let guard = inner.lock().await;
             let tx = active_tx(&guard)?;
@@ -3751,6 +3802,9 @@ impl AsyncTxQueryBuilder {
             }
             if let Some(t) = timeout_secs {
                 builder = builder.timeout(std::time::Duration::from_secs_f64(t));
+            }
+            if let Some(ct) = cancel_token {
+                builder = builder.cancellation_token(ct);
             }
             let cursor = builder
                 .cursor()

@@ -120,7 +120,20 @@ async fn pyo3_haversine_matches_native_within_4_ulp() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn pyo3_haversine_vectorized_matches_native_within_4_ulp() -> anyhow::Result<()> {
+    // The guest module imports `pyarrow` at top level, so it needs the package
+    // in the *embedded* interpreter — which pyo3's `auto-initialize` links from
+    // the system, not from the project venv. Skip loudly rather than failing a
+    // bare checkout with a `ModuleNotFoundError` at plugin load; CI enforces it
+    // (pr.yml, the pyo3 step in the Python job) where pyarrow is installed.
     Python::initialize();
+    if !Python::attach(|py| py.import("pyarrow").is_ok()) {
+        eprintln!(
+            "SKIPPED: the embedded interpreter cannot import `pyarrow`.\n\
+             Run with: PYTHONPATH=$(cd bindings/uni-db && uv run python -c \
+             'import site; print(site.getsitepackages()[0])')"
+        );
+        return Ok(());
+    }
     let uni = Uni::in_memory().build().await?;
     let caps = CapabilitySet::from_iter_of([Capability::ScalarFn]);
     let loader = PythonPluginLoader::with_default_plugin_id("ai.example.geo_v");

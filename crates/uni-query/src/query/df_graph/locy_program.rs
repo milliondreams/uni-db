@@ -10,7 +10,7 @@
 
 use crate::query::df_graph::GraphExecutionContext;
 use crate::query::df_graph::common::{
-    collect_all_partitions, compute_plan_properties, execute_subplan, execute_subplan_collecting,
+    collect_all_partitions, compute_plan_properties, execute_locy_clause_body, execute_subplan,
 };
 use crate::query::df_graph::locy_best_by::SortCriterion;
 use crate::query::df_graph::locy_explain::ProvenanceStore;
@@ -1019,33 +1019,17 @@ async fn run_program(
                     // Phase B A4 follow-up: the planner inserts
                     // `LocyModelInvoke` between body and `LocyProject`
                     // when the clause has neural invocations.
-                    let mut batches = if collector.is_some() {
-                        let (b, ops) = execute_subplan_collecting(
-                            &clause.body,
-                            &params,
-                            &HashMap::new(),
-                            &graph_ctx,
-                            &session_ctx,
-                            &storage,
-                            &schema_info,
-                            None, // Locy clause body is read-only
-                        )
-                        .await?;
-                        iter_ops.extend(ops);
-                        b
-                    } else {
-                        execute_subplan(
-                            &clause.body,
-                            &params,
-                            &HashMap::new(),
-                            &graph_ctx,
-                            &session_ctx,
-                            &storage,
-                            &schema_info,
-                            None, // Locy clause body is read-only
-                        )
-                        .await?
-                    };
+                    let mut batches = execute_locy_clause_body(
+                        &clause.body,
+                        &params,
+                        &graph_ctx,
+                        &session_ctx,
+                        &storage,
+                        &schema_info,
+                        collector.is_some(),
+                        &mut iter_ops,
+                    )
+                    .await?;
 
                     // Apply negated IS-ref semantics per-clause.
                     for binding in &fp_clause.is_ref_bindings {

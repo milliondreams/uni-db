@@ -25,9 +25,7 @@ def _one_row(query: str):
 
 
 def test_scalar_variants_do_not_become_none():
-    row = _one_row(
-        "RETURN 'hello' AS s, 42 AS i, 1.5 AS f, true AS b, null AS n"
-    )
+    row = _one_row("RETURN 'hello' AS s, 42 AS i, 1.5 AS f, true AS b, null AS n")
     assert row["s"] == "hello", f"String became {row['s']!r}"
     assert row["i"] == 42, f"Int became {row['i']!r}"
     assert row["f"] == 1.5, f"Float became {row['f']!r}"

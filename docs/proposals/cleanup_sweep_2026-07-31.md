@@ -716,6 +716,96 @@ and localise the defect.
 
 Each needs a call made, not just a patch. Do not start these as "quick fixes."
 
+### Tier 1 implementation status
+
+*Last updated 2026-08-01. All changes below are **uncommitted**. Every fix was
+observed failing first; where a test could not be made to fail, or turned out to
+pass for the wrong reason, that is recorded rather than glossed over.*
+
+| Item | Status | Evidence before the fix |
+|---|---|---|
+| 1.10a error classification | ✅ done | transient `Generic` reading "not found" abandoned on attempt 1; a terminal error on the final attempt charged the breaker |
+| *(adjacent)* `put_opts` breaker | ✅ done | 5 typed `AlreadyExists` opened the breaker; the 6th write never reached the store |
+| 1.5 BEST BY decoupling | ✅ done | zero behaviour change; 4 tests go red under a simulated re-coupling |
+| 1.8 `plan_children` | ✅ done | `children.len()` was 0, not 1, for `FusedIndexScanWrapped` |
+| 1.1 edge snapshot bound | ✅ done | pinned read returned `Int(2)` past the pin; a post-pin delete erased the edge entirely |
+| 1.6 `get_edge_type_info` | ✅ done | `HAS-PART` reported **0** edges of 3 |
+| *(adjacent)* `get_label_info` | ✅ done | reported **0** for 4 live unflushed vertices |
+| *(adjacent)* `classify_verb` | ✅ done | **panic**: byte-32 slice inside a multi-byte codepoint |
+| 1.9 SSI read-set | ✅ docs-only | refuted as a bug — see below |
+| 1.7 tx cancellation | ✅ already closed | committed as `b63deba8a`; the doc's "uncommitted" tag was stale |
+| *(adjacent)* `LocyBuilder` token + tx-bound AST | ✅ done | a pre-cancelled Locy query ran to completion and returned 100 facts |
+| **1.3 + 2.8** `map_variables` | ⬜ not started | |
+| **1.2** ShadowCsr GC | ⬜ not started | |
+| **1.4** CHECK evaluator | ⬜ not started | |
+| **1.5** oracle wiring (P1+P2) | ⬜ not started | prerequisite BEST BY decoupling is done |
+
+**Gates after the above:** `uni-db` **2322/2322** · `uni-store` **640/640** ·
+`uni-query` **763/763** · `uni-locy` **133/133** · Locy TCK **504/504** ·
+`cargo fmt --check` and per-crate `clippy -D warnings` clean.
+
+#### Corrections to this document found while implementing
+
+1. **1.7 was already done and committed** (`b63deba8a`), not uncommitted. Two
+   same-class defects remained and are now fixed: `LocyBuilder::cancellation_token`
+   was write-only while the Python bindings actively fed it, and
+   `execute_ast_internal_with_tx_l0` was cancellation-blind.
+2. **1.9 is refuted as a bug.** The SSI read set is item-granular
+   (`HashSet<Vid>`/`HashSet<Eid>`), so recording an id once already covers its
+   property reads, and every call site records via a sibling first. Adding the
+   recording would double lock acquisitions on the per-row materialisation path
+   for zero coverage — against a codebase that deliberately optimises the other
+   way (`get_neighbors_batch(record_reads = false)`). Landed as documentation.
+3. **1.6's prescribed fix was unimplementable.** `edge_table_name` does not
+   exist — all edges live in one `edges` table keyed by a `type` column — and
+   `count_rows` is L0-blind. Fixed by backtick-quoting the Cypher identifier and
+   propagating the error instead.
+4. **`get_label_info`'s defect was mis-diagnosed as an MVCC overcount.** The
+   per-label vertex tables are written through `merge_insert`/`delete_rows`
+   (upsert and physical delete), so `count_rows` accumulates nothing. Measuring
+   showed the real defect is L0-blindness: `count: 0` for unflushed rows. A
+   Python assertion had already been weakened to tolerate exactly this.
+5. **1.5's oracle is consumed *inverted* by a second check.**
+   `check_best_by_monotonic_fold` treats "monotone" as an error and runs for
+   *every* rule, not just recursive ones, so pointing the oracle at a registry
+   would newly reject ordinary `BEST BY … FOLD MAX(x)` programs. Decoupling it
+   onto a syntactic six-name predicate landed first, with two tripwire tests.
+6. **1.10's amplification is GET-only** (put/delete/list are 4/1/1), and the
+   "not every store is resilient" premise is **confirmed** — the primary WAL,
+   primary IdAllocator and ForkRegistry all run on raw stores. The layers cannot
+   be collapsed; only the classifier was fixed.
+7. **1.8's `LogicalPlan::input()` does not exist** — it is `input_mut`, and its
+   `_ => None` is pushdown-perf only, no routing impact. Filed, not fixed.
+8. **1.2's anchors are swapped** (`:86` is `get_entries`, `:99` is `gc`) and its
+   trap omits the decisive fact: `pinned_at_version` *shares* the live
+   `AdjacencyManager` while `pinned()`/`at_fork` build fresh ones, so the GC
+   bound is the min in-flight `started_at_version`, not anything from
+   `SnapshotManager`. No such registry exists.
+
+#### Bugs discovered during implementation, not in this audit
+
+* **`classify_verb` char-boundary panic** (`api/transaction.rs:176`). Sliced
+  `s[..s.len().min(32)]` — a *byte* length — while its own comment said "up to
+  32 chars". Any statement with non-ASCII near the start panicked, and since
+  every write routes through it the panic crossed the pyo3 boundary as an abort
+  rather than an exception. Found by a non-ASCII edge-type test. Swept for
+  siblings: the other `len().min()` sites operate on `char` vectors or
+  pest-aligned offsets and are safe.
+* **Locy cancellation needed a top-level race, not just statement plumbing.**
+  Threading the scope into every Cypher statement Locy dispatches was necessary
+  but *not sufficient* — a plain rule body evaluates through the native/DataFusion
+  stratum path and never reaches those calls, so the common case (a long-running
+  fixpoint) stayed unguarded. `evaluate_compiled_capturing` now races the whole
+  evaluation, mirroring the Cypher terminals.
+
+#### Still open
+
+`1.3`+`2.8`, `1.2`, `1.4`, and `1.5`'s two oracle-wiring phases. Also filed and
+not taken: the GET retry-amplification asymmetry (primary WAL 4 attempts, fork
+WAL 16 for the same work), `find_edges_by_type_names`' topology-level snapshot
+leak, `input_mut`'s missing arms, and Python `TxExecuteBuilder`'s missing
+`cancellation_token`.
+
 ### 1.1 — Schemaless edge property reads escape snapshot isolation
 
 **Files:** `crates/uni-store/src/storage/main_edge.rs:296`, `runtime/property_manager.rs:368,946,1576`

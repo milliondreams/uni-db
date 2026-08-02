@@ -974,6 +974,7 @@ impl Transaction {
     /// On commit, new rules are promoted to the session (best-effort).
     pub fn rules(&self) -> super::rule_registry::RuleRegistry<'_> {
         super::rule_registry::RuleRegistry::new(&self.rule_registry)
+            .with_plugin_registry(&self.db.plugin_registry)
     }
 
     // ── Lifecycle ─────────────────────────────────────────────────────
@@ -1222,7 +1223,10 @@ impl Transaction {
                                 combined.push(src.clone());
                             }
                         }
-                        let rebuilt = super::impl_locy::rebuild_registry_from_sources(&combined);
+                        let rebuilt = super::impl_locy::rebuild_registry_from_sources(
+                            &combined,
+                            &self.db.plugin_registry,
+                        );
                         let preserved_all = |r: &super::impl_locy::LocyRuleRegistry| {
                             new_names.iter().all(|n| r.rules.contains_key(n))
                                 && session_reg.rules.keys().all(|n| r.rules.contains_key(n))

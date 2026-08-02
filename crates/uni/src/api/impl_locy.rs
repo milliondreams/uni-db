@@ -15,7 +15,7 @@ use uni_cypher::locy_ast::RuleOutput;
 use uni_locy::types::CompiledCommand;
 use uni_locy::{
     CommandResult, CompiledProgram, DerivedFactSet, FactRow, LocyCompileError, LocyConfig,
-    LocyError, LocyStats, RuntimeWarning, compile,
+    LocyError, LocyStats, RuntimeWarning,
 };
 use uni_query::{QueryMetrics, QueryPlanner};
 
@@ -57,17 +57,16 @@ pub struct LocyRuleRegistry {
 /// that no longer parses or compiles.
 pub(crate) fn rebuild_registry_from_sources(
     sources: &[crate::api::locy_rule_catalog::RegisteredSource],
+    plugin_registry: &uni_plugin::PluginRegistry,
 ) -> Result<LocyRuleRegistry> {
+    let oracle = plugin_monotonicity_oracle(plugin_registry);
     let mut registry = LocyRuleRegistry::default();
     for src in sources {
         let ast = uni_cypher::parse_locy(&src.source).map_err(map_parse_error)?;
-        let compiled = if registry.rules.is_empty() {
-            compile(&ast).map_err(map_compile_error)?
-        } else {
-            let external_names: Vec<String> = registry.rules.keys().cloned().collect();
-            uni_locy::compile_with_external_rules(&ast, &external_names)
-                .map_err(map_compile_error)?
-        };
+        let external_names: Vec<String> = registry.rules.keys().cloned().collect();
+        let compiled =
+            uni_locy::compile_with_oracle(&ast, &HashMap::new(), &external_names, &oracle)
+                .map_err(map_compile_error)?;
         let base_id = registry.strata.len();
         let mut this_names: Vec<String> = Vec::with_capacity(compiled.rule_catalog.len());
         for (name, rule) in compiled.rule_catalog {
@@ -104,9 +103,10 @@ pub(crate) fn rebuild_registry_from_sources(
 pub(crate) fn build_locy_registry_from_persisted(
     sources: &[crate::api::locy_rule_catalog::RegisteredSource],
     skip_invalid: bool,
+    plugin_registry: &uni_plugin::PluginRegistry,
 ) -> Result<LocyRuleRegistry> {
     if !skip_invalid {
-        return rebuild_registry_from_sources(sources).map_err(|e| {
+        return rebuild_registry_from_sources(sources, plugin_registry).map_err(|e| {
             UniError::Internal(anyhow::anyhow!(
                 "a persisted Locy rule in catalog/locy_rules.json no longer compiles: {e}. \
                  Re-register the rule, or open with skip_invalid_locy_rules(true) to skip it."
@@ -121,7 +121,7 @@ pub(crate) fn build_locy_registry_from_persisted(
     for src in sources {
         let mut trial = good.clone();
         trial.push(src.clone());
-        match rebuild_registry_from_sources(&trial) {
+        match rebuild_registry_from_sources(&trial, plugin_registry) {
             Ok(_) => good.push(src.clone()),
             Err(e) => {
                 tracing::warn!(
@@ -133,7 +133,7 @@ pub(crate) fn build_locy_registry_from_persisted(
             }
         }
     }
-    rebuild_registry_from_sources(&good)
+    rebuild_registry_from_sources(&good, plugin_registry)
 }
 
 /// Registers a Locy program into a registry, rebuilding from sources.
@@ -152,6 +152,7 @@ pub(crate) fn build_locy_registry_from_persisted(
 pub(crate) fn register_rules_on_registry(
     registry_lock: &std::sync::RwLock<LocyRuleRegistry>,
     program: &str,
+    plugin_registry: &uni_plugin::PluginRegistry,
 ) -> Result<bool> {
     // Hold the WRITE lock across the whole read → compile → rebuild → assign so
     // concurrent register/remove calls serialize and cannot clobber each other's
@@ -168,7 +169,7 @@ pub(crate) fn register_rules_on_registry(
     // Discover the rule names this program defines so that any prior source
     // defining them is superseded — the last registration of a name wins, and
     // each name is owned by exactly one source (keeping `remove` unambiguous).
-    let new_names = compile_defined_names(program, &existing)?;
+    let new_names = compile_defined_names(program, &existing, plugin_registry)?;
 
     let mut kept: Vec<crate::api::locy_rule_catalog::RegisteredSource> =
         Vec::with_capacity(existing.len() + 1);
@@ -204,7 +205,7 @@ pub(crate) fn register_rules_on_registry(
         rule_names: new_names,
     });
 
-    let rebuilt = rebuild_registry_from_sources(&kept)?;
+    let rebuilt = rebuild_registry_from_sources(&kept, plugin_registry)?;
     *registry = rebuilt;
     Ok(true)
 }
@@ -221,17 +222,16 @@ pub(crate) fn register_rules_on_registry(
 fn compile_defined_names(
     program: &str,
     existing: &[crate::api::locy_rule_catalog::RegisteredSource],
+    plugin_registry: &uni_plugin::PluginRegistry,
 ) -> Result<Vec<String>> {
     let ast = uni_cypher::parse_locy(program).map_err(map_parse_error)?;
     let external: Vec<String> = existing
         .iter()
         .flat_map(|s| s.rule_names.iter().cloned())
         .collect();
-    let compiled = if external.is_empty() {
-        compile(&ast).map_err(map_compile_error)?
-    } else {
-        uni_locy::compile_with_external_rules(&ast, &external).map_err(map_compile_error)?
-    };
+    let oracle = plugin_monotonicity_oracle(plugin_registry);
+    let compiled = uni_locy::compile_with_oracle(&ast, &HashMap::new(), &external, &oracle)
+        .map_err(map_compile_error)?;
     let mut names: Vec<String> = compiled.rule_catalog.keys().cloned().collect();
     names.sort();
     Ok(names)

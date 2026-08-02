@@ -92,3 +92,60 @@ async fn builtin_m_prefixed_folds_still_compile_in_recursion() {
         "MSUM must remain legal in a recursive stratum"
     );
 }
+
+// ── Phase 2: registration and persisted reload ──────────────────────────
+
+/// `rules().register()` compiled against a builtin-only registry, so a program
+/// legal through `session.locy()` was refused at registration.
+///
+/// The blocker was ordering, not plumbing: `Uni::build` loaded and recompiled
+/// the persisted rules before it constructed the plugin registry, so there was
+/// nothing to compile against. The registry construction is now hoisted above
+/// that load.
+#[tokio::test]
+async fn a_registry_monotone_fold_can_be_registered() {
+    let db = db().await;
+
+    db.rules()
+        .register(RECURSIVE_MAX)
+        .await
+        .expect("registering a recursive FOLD over a registry-monotone aggregate must succeed");
+
+    let names = db.rules().list();
+    assert!(
+        names.iter().any(|n| n == "reach"),
+        "the rule should be registered; got {names:?}"
+    );
+}
+
+/// The reload half: a registered rule must still compile when the database is
+/// reopened, which is the path `build_locy_registry_from_persisted` drives.
+#[tokio::test]
+async fn a_registered_rule_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_str().unwrap().to_string();
+
+    {
+        let db = Uni::open(&path).build().await.unwrap();
+        db.schema().label("N").apply().await.unwrap();
+        db.schema()
+            .edge_type("E", &["N"], &["N"])
+            .apply()
+            .await
+            .unwrap();
+        db.rules().register(RECURSIVE_MAX).await.unwrap();
+        db.shutdown().await.unwrap();
+    }
+
+    // Reopening recompiles every persisted source. Before the registry was
+    // hoisted this ran against a builtin-only registry and the open failed.
+    let db = Uni::open(&path)
+        .build()
+        .await
+        .expect("reopening must recompile the persisted rule against the plugin registry");
+    let names = db.rules().list();
+    assert!(
+        names.iter().any(|n| n == "reach"),
+        "the persisted rule should reload; got {names:?}"
+    );
+}

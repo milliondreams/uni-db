@@ -713,6 +713,7 @@ impl Session {
     /// Access the session-scoped rule registry.
     pub fn rules(&self) -> super::rule_registry::RuleRegistry<'_> {
         super::rule_registry::RuleRegistry::new(&self.rule_registry)
+            .with_plugin_registry(&self.db.plugin_registry)
     }
 
     /// Compile a Locy program without executing it, using this session's rule registry.

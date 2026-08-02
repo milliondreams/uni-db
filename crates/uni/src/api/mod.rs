@@ -2052,6 +2052,7 @@ impl Uni {
             ),
             None => rule_registry::RuleRegistry::new(&self.inner.locy_rule_registry),
         }
+        .with_plugin_registry(&self.inner.plugin_registry)
     }
 
     // ── Configuration & Introspection ─────────────────────────────────
@@ -3305,6 +3306,38 @@ impl UniBuilder {
                 .map_err(UniError::Internal)?,
         );
 
+        // Hoisted above the persisted-Locy-rule load below, which needs the
+        // registry to compile rules against a registry-backed monotonicity
+        // oracle. Nothing between here and its previous position depended on
+        // it, and it still precedes the `Arc::new(storage)` wrap that
+        // `set_plugin_registry` requires.
+        // Plugin registry is built early so `PropertyManager` can
+        // share it for registry-dispatched CRDT merges. Built-ins are
+        // registered against this same Arc below; the registry is
+        // shared by-reference, so the registrations are visible to
+        // every later consumer.
+        //
+        // Built BEFORE the StorageManager is wrapped in `Arc` so the same
+        // registry can be stamped onto it via `set_plugin_registry`, wiring
+        // the durable CRDT merge paths (compaction, L0 flush) to the same
+        // provider set that governs `PropertyManager`. Behavior-preserving
+        // when no `CrdtKindProvider` is registered (native `try_merge`).
+        let plugin_registry = Arc::new(uni_plugin::PluginRegistry::new());
+        // M11 A.2: pass the data directory so `SystemLabelPersistence`
+        // can be wired as the meta-plugin persistence backend. Remote /
+        // object-store URIs (those containing "://") have no local
+        // sidecar root — for those, persistence falls back to
+        // `NullPersistence`.
+        let persistence_data_path: Option<std::path::PathBuf> = if is_remote_uri {
+            None
+        } else {
+            Some(std::path::PathBuf::from(&uri))
+        };
+        let custom_persistence_sink =
+            register_builtin_plugins(&plugin_registry, persistence_data_path.as_deref()).expect(
+                "BuiltinPlugin / ApocCorePlugin registration must succeed against fresh registry",
+            );
+
         // Load and recompile persisted Locy rules (catalog/locy_rules.json).
         // A missing file yields an empty registry; a rule that no longer
         // compiles fails the open unless `skip_invalid_locy_rules` is set.
@@ -3315,6 +3348,7 @@ impl UniBuilder {
         let loaded_locy_registry = impl_locy::build_locy_registry_from_persisted(
             &persisted_locy_sources,
             self.skip_invalid_locy_rules,
+            &plugin_registry,
         )?;
         let locy_rule_persister = Arc::new(locy_rule_catalog::LocyRulePersister::new(
             data_store.clone(),
@@ -3348,33 +3382,6 @@ impl UniBuilder {
             .await
             .map_err(UniError::Internal)?
         };
-
-        // Plugin registry is built early so `PropertyManager` can
-        // share it for registry-dispatched CRDT merges. Built-ins are
-        // registered against this same Arc below; the registry is
-        // shared by-reference, so the registrations are visible to
-        // every later consumer.
-        //
-        // Built BEFORE the StorageManager is wrapped in `Arc` so the same
-        // registry can be stamped onto it via `set_plugin_registry`, wiring
-        // the durable CRDT merge paths (compaction, L0 flush) to the same
-        // provider set that governs `PropertyManager`. Behavior-preserving
-        // when no `CrdtKindProvider` is registered (native `try_merge`).
-        let plugin_registry = Arc::new(uni_plugin::PluginRegistry::new());
-        // M11 A.2: pass the data directory so `SystemLabelPersistence`
-        // can be wired as the meta-plugin persistence backend. Remote /
-        // object-store URIs (those containing "://") have no local
-        // sidecar root — for those, persistence falls back to
-        // `NullPersistence`.
-        let persistence_data_path: Option<std::path::PathBuf> = if is_remote_uri {
-            None
-        } else {
-            Some(std::path::PathBuf::from(&uri))
-        };
-        let custom_persistence_sink =
-            register_builtin_plugins(&plugin_registry, persistence_data_path.as_deref()).expect(
-                "BuiltinPlugin / ApocCorePlugin registration must succeed against fresh registry",
-            );
 
         // Stamp the registry onto the owned StorageManager (before it is
         // shared) so compaction and L0 flush route custom CRDT merges through

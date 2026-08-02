@@ -34,6 +34,15 @@ pub struct RuleInfo {
 pub struct RuleRegistry<'a> {
     registry: &'a Arc<std::sync::RwLock<LocyRuleRegistry>>,
     persister: Option<&'a Arc<LocyRulePersister>>,
+    /// Plugin registry backing the monotonicity oracle used when compiling
+    /// registered rules.
+    ///
+    /// `None` falls back to the builtin-only registry, which is what an
+    /// external caller of [`RuleRegistry::new`] gets — preserving the public
+    /// constructor. Every internal construction site chains
+    /// [`RuleRegistry::with_plugin_registry`], so a rule registered through the
+    /// database sees the same aggregates its queries do.
+    plugin_registry: Option<&'a Arc<uni_plugin::PluginRegistry>>,
 }
 
 impl<'a> RuleRegistry<'a> {
@@ -42,6 +51,7 @@ impl<'a> RuleRegistry<'a> {
         Self {
             registry,
             persister: None,
+            plugin_registry: None,
         }
     }
 
@@ -53,6 +63,29 @@ impl<'a> RuleRegistry<'a> {
         Self {
             registry,
             persister: Some(persister),
+            plugin_registry: None,
+        }
+    }
+
+    /// Compile registered rules against `plugin_registry`'s aggregates.
+    ///
+    /// Without this the rules are compiled against a builtin-only registry, so
+    /// a plugin-registered monotone aggregate is rejected at registration even
+    /// though the same program runs fine through `session.locy()`.
+    #[must_use]
+    pub fn with_plugin_registry(
+        mut self,
+        plugin_registry: &'a Arc<uni_plugin::PluginRegistry>,
+    ) -> Self {
+        self.plugin_registry = Some(plugin_registry);
+        self
+    }
+
+    /// The registry to compile against, defaulting to builtins only.
+    fn effective_plugin_registry(&self) -> Arc<uni_plugin::PluginRegistry> {
+        match self.plugin_registry {
+            Some(r) => Arc::clone(r),
+            None => uni_query::query::df_graph::locy_fold::default_locy_plugin_registry(),
         }
     }
 
@@ -68,7 +101,9 @@ impl<'a> RuleRegistry<'a> {
     /// Returns a parse or compile error for an invalid program, or an
     /// I/O error if persistence fails.
     pub async fn register(&self, program: &str) -> Result<()> {
-        let changed = super::impl_locy::register_rules_on_registry(self.registry, program)?;
+        let plugins = self.effective_plugin_registry();
+        let changed =
+            super::impl_locy::register_rules_on_registry(self.registry, program, &plugins)?;
         if changed && let Some(persister) = self.persister {
             persister.save(self.registry).await?;
         }
@@ -128,7 +163,8 @@ impl<'a> RuleRegistry<'a> {
                 .filter(|s| !s.rule_names.iter().any(|r| r == name))
                 .cloned()
                 .collect::<Vec<_>>();
-            let rebuilt = super::impl_locy::rebuild_registry_from_sources(&new_sources)?;
+            let plugins = self.effective_plugin_registry();
+            let rebuilt = super::impl_locy::rebuild_registry_from_sources(&new_sources, &plugins)?;
             *registry = rebuilt;
         }
         if let Some(persister) = self.persister {

@@ -683,7 +683,16 @@ impl Transaction {
 
         // From here on a failure can leave a partially-replayed `DerivedFactSet`
         // in `tx_l0`, so poison the transaction on any error (bug #15).
-        self.mark_on_err(Self::replay_facts(&self.db, &self.tx_l0, derived, version_gap).await)
+        self.mark_on_err(
+            Self::replay_facts(
+                &self.db,
+                &self.tx_l0,
+                derived,
+                version_gap,
+                self.cancel_scope(None),
+            )
+            .await,
+        )
     }
 
     /// Replays a `DerivedFactSet`'s mutation queries into `tx_l0`.
@@ -697,6 +706,7 @@ impl Transaction {
         tx_l0: &Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>,
         derived: DerivedFactSet,
         version_gap: u64,
+        cancel: crate::api::impl_query::CancelScope,
     ) -> Result<ApplyResult> {
         let mut facts_applied = 0;
         for query in derived.mutation_queries {
@@ -706,6 +716,7 @@ impl Transaction {
                 HashMap::new(),
                 db.config.clone(),
                 tx_l0.clone(),
+                cancel.clone(),
             )
             .await?;
             facts_applied += 1;
@@ -902,6 +913,7 @@ impl Transaction {
             locy_l0: Some(self.tx_l0.clone()),
             collect_derive: false,
             read_snapshot: self.read_snapshot(),
+            cancel: self.cancel_scope(None),
         };
         engine.evaluate(program).await
     }

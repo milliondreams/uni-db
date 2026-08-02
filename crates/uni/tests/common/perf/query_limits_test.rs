@@ -503,3 +503,60 @@ async fn test_uncancelled_transaction_is_unaffected() -> Result<()> {
 
     Ok(())
 }
+
+/// `LocyBuilder::cancellation_token` was write-only.
+///
+/// The setter existed on both the session and transaction Locy builders, the
+/// Python bindings called it (`builders.rs`), and nothing ever read the field:
+/// `LocyEngine` carried no cancellation state at all, so every Cypher statement
+/// the evaluation ran — clause bodies, DERIVE mutations, trailing reads — ran
+/// unguarded. A caller who cancelled observed the program run to completion.
+///
+/// Pre-cancelled so the outcome is deterministic rather than a race.
+#[tokio::test]
+async fn test_cancellation_token_aborts_a_locy_program() -> Result<()> {
+    let db = seeded_db().await?;
+
+    let token = tokio_util::sync::CancellationToken::new();
+    token.cancel();
+
+    let result = db
+        .session()
+        .locy_with("CREATE RULE r AS MATCH (n:Node) YIELD KEY n")
+        .cancellation_token(token)
+        .run()
+        .await;
+
+    let err = result.expect_err(
+        "the Locy program ran to completion despite an already-cancelled token; \
+         `LocyBuilder::cancellation_token` was never read",
+    );
+    assert!(
+        matches!(err, uni_db::UniError::Cancelled),
+        "expected UniError::Cancelled, got: {err:?}"
+    );
+
+    Ok(())
+}
+
+/// Inverse guard: an uncancelled Locy program still returns its rows.
+///
+/// Wiring a scope into every Locy execution path must not make ordinary
+/// evaluation abort.
+#[tokio::test]
+async fn test_uncancelled_locy_program_still_runs() -> Result<()> {
+    let db = seeded_db().await?;
+
+    let result = db
+        .session()
+        .locy_with("CREATE RULE r AS MATCH (n:Node) YIELD KEY n")
+        .run()
+        .await?;
+
+    assert!(
+        result.into_inner().stats.derived_nodes > 0,
+        "the program should derive at least one fact"
+    );
+
+    Ok(())
+}

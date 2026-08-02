@@ -441,6 +441,10 @@ impl PreparedLocy {
             locy_l0: None,
             collect_derive: true,
             read_snapshot: None,
+            // `PreparedLocy` is owned by the instance, not a session, so it
+            // has no enclosing scope to inherit; `PreparedLocyBinder` is where
+            // a per-execution token would attach.
+            cancel: crate::api::impl_query::CancelScope::default(),
         };
         engine
             .evaluate_compiled_with_config(compiled, &config)

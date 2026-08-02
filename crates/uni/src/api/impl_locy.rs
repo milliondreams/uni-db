@@ -285,8 +285,9 @@ pub(crate) async fn evaluate_with_db_and_config(
     program: &str,
     config: &LocyConfig,
     rule_registry: &std::sync::RwLock<LocyRuleRegistry>,
+    cancel: crate::api::impl_query::CancelScope,
 ) -> Result<LocyResult> {
-    evaluate_with_db_and_config_capturing(db, program, config, rule_registry, None).await
+    evaluate_with_db_and_config_capturing(db, program, config, rule_registry, None, cancel).await
 }
 
 /// Like [`evaluate_with_db_and_config`], but optionally captures a structured
@@ -297,6 +298,7 @@ pub(crate) async fn evaluate_with_db_and_config_capturing(
     config: &LocyConfig,
     rule_registry: &std::sync::RwLock<LocyRuleRegistry>,
     profile_capture: Option<&Arc<std::sync::Mutex<Option<uni_query::LocyExecProfile>>>>,
+    cancel: crate::api::impl_query::CancelScope,
 ) -> Result<LocyResult> {
     // Compile with the given registry
     let ast = match uni_cypher::parse_locy(program) {
@@ -364,6 +366,7 @@ pub(crate) async fn evaluate_with_db_and_config_capturing(
         locy_l0,
         collect_derive: true,
         read_snapshot: None,
+        cancel,
     };
     engine
         .evaluate_compiled_capturing(compiled, config, profile_capture)
@@ -390,6 +393,14 @@ pub struct LocyEngine<'a> {
     /// the version-pinned L1 view instead of live state. `None` at session
     /// level or with SSI disabled (live reads — a safe no-op downstream).
     pub(crate) read_snapshot: Option<uni_store::runtime::SnapshotView>,
+    /// Cancellation scope for every Cypher statement this evaluation runs.
+    ///
+    /// Carries the enclosing session/transaction scope plus any per-call token
+    /// set via `LocyBuilder::cancellation_token`. Before this existed the
+    /// builder's setter wrote a field nothing ever read, so a caller that
+    /// cancelled a Locy query — which the Python bindings expose and call —
+    /// observed it run to completion.
+    pub(crate) cancel: crate::api::impl_query::CancelScope,
 }
 
 impl crate::api::Uni {
@@ -404,6 +415,7 @@ impl crate::api::Uni {
             locy_l0: None,
             collect_derive: true,
             read_snapshot: None,
+            cancel: crate::api::impl_query::CancelScope::default(),
         }
     }
 }
@@ -570,7 +582,31 @@ impl<'a> LocyEngine<'a> {
     /// profiling enabled and the resulting [`uni_query::LocyExecProfile`] is
     /// stored into the slot for the caller (the `profile()` builder path) to
     /// read. `None` → zero profiling overhead.
+    /// Evaluate a compiled program, racing the whole evaluation against the
+    /// cancellation scope.
+    ///
+    /// The guard has to be here rather than deeper: the fixpoint runtime has no
+    /// cooperative cancellation check of its own, and a rule body evaluates
+    /// through the native/DataFusion stratum path without ever reaching
+    /// `execute_ast_internal_with_tx_l0`. Guarding only the Cypher statements
+    /// Locy dispatches therefore left the common case — a long-running
+    /// fixpoint — completely unguarded. This mirrors how the Cypher terminals
+    /// enforce cancellation: race the execution, do not rely on the inner
+    /// layers to poll a token.
     pub(crate) async fn evaluate_compiled_capturing(
+        &self,
+        compiled: CompiledProgram,
+        config: &LocyConfig,
+        profile_capture: Option<&Arc<std::sync::Mutex<Option<uni_query::LocyExecProfile>>>>,
+    ) -> Result<LocyResult> {
+        tokio::select! {
+            biased;
+            () = self.cancel.cancelled() => Err(UniError::Cancelled),
+            res = self.evaluate_compiled_capturing_inner(compiled, config, profile_capture) => res,
+        }
+    }
+
+    async fn evaluate_compiled_capturing_inner(
         &self,
         compiled: CompiledProgram,
         config: &LocyConfig,
@@ -794,6 +830,7 @@ impl<'a> LocyEngine<'a> {
             config.params.clone(),
             self.tx_l0_override.clone(),
             self.read_snapshot.clone(),
+            self.cancel.clone(),
         );
         // Propagate locy_l0 to the adapter for DERIVE/ASSUME/ABDUCE scoping.
         *native_ctx.locy_l0.lock().unwrap() = self.locy_l0.clone();
@@ -1039,6 +1076,9 @@ struct NativeExecutionAdapter<'a> {
     /// Stack of saved L0 states for nested fork/restore (ASSUME inside ASSUME).
     l0_save_stack:
         std::sync::Mutex<Vec<Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>>,
+    /// Cancellation scope, cloned from the `LocyEngine`, for the Cypher
+    /// statements command dispatch runs.
+    cancel: crate::api::impl_query::CancelScope,
 }
 
 impl<'a> NativeExecutionAdapter<'a> {
@@ -1055,6 +1095,7 @@ impl<'a> NativeExecutionAdapter<'a> {
         params: HashMap<String, Value>,
         tx_l0_override: Option<Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
         read_snapshot: Option<uni_store::runtime::SnapshotView>,
+        cancel: crate::api::impl_query::CancelScope,
     ) -> Self {
         Self {
             db,
@@ -1067,6 +1108,7 @@ impl<'a> NativeExecutionAdapter<'a> {
             read_snapshot,
             locy_l0: std::sync::Mutex::new(None),
             l0_save_stack: std::sync::Mutex::new(Vec::new()),
+            cancel,
         }
     }
 
@@ -1372,6 +1414,7 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
                     HashMap::new(),
                     self.db.config.clone(),
                     l0.clone(),
+                    self.cancel.clone(),
                 )
                 .await
         } else if let Some(ref tx_l0) = self.tx_l0_override {
@@ -1382,6 +1425,7 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
                     HashMap::new(),
                     self.db.config.clone(),
                     tx_l0.clone(),
+                    self.cancel.clone(),
                 )
                 .await
         } else {
@@ -1424,6 +1468,7 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
                     params,
                     self.db.config.clone(),
                     l0.clone(),
+                    self.cancel.clone(),
                 )
                 .await
                 .map_err(|e| LocyError::ExecutorError {
@@ -1441,6 +1486,7 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
                     params,
                     self.db.config.clone(),
                     tx_l0.clone(),
+                    self.cancel.clone(),
                 )
                 .await
                 .map_err(|e| LocyError::ExecutorError {
@@ -1514,6 +1560,7 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
             locy_l0,
             collect_derive: false,
             read_snapshot: None,
+            cancel: self.cancel.clone(),
         };
         let native_store = engine
             .run_strata_native(&strata_only, config)

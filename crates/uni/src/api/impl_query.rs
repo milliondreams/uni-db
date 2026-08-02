@@ -1110,6 +1110,7 @@ impl crate::api::UniInner {
         params: HashMap<String, ApiValue>,
         config: UniConfig,
         tx_l0: std::sync::Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>,
+        cancel: CancelScope,
     ) -> Result<QueryResult> {
         let total_start = Instant::now();
 
@@ -1122,14 +1123,22 @@ impl crate::api::UniInner {
         executor.set_config(config.clone());
         self.apply_session_executor_state(&mut executor);
         executor.set_transaction_l0(tx_l0);
+        cancel.install(&mut executor);
 
         let projection_order = extract_projection_order(&logical_plan);
 
         let exec_start = Instant::now();
-        let results = executor
-            .execute(logical_plan, &self.properties, &params)
-            .await
-            .map_err(|e| into_execution_error(e, cypher, config.query_timeout))?;
+        // Mirrors `execute_ast_internal`: the executor's own token only reaches
+        // operators that happen to call `check_timeout`, so correctness comes
+        // from racing the scope against execution here. This twin was the one
+        // AST path that did neither, which is why `Transaction::cancel()` was
+        // inert for `Transaction::apply` and tx-bound Locy.
+        let results = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(UniError::Cancelled),
+            res = executor.execute(logical_plan, &self.properties, &params) => res
+                .map_err(|e| into_execution_error(e, cypher, config.query_timeout))?,
+        };
         let exec_time = exec_start.elapsed();
 
         let columns = columns_for_results(&results, projection_order);

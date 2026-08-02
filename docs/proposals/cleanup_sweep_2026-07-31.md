@@ -27,8 +27,8 @@ Every item below landed test-first: the regression test was written and **observ
 | 0.9 algorithm yield types | ✅ done, **uncommitted** | — | `yields=["label:string"]` loaded cleanly and failed on **every** CALL |
 | 0.7 plugin CypherValue transport | ✅ done, **uncommitted** | — | a plugin yielding a CypherValue got its wire bytes |
 | 0.2 Locy `prev.X` in comparison | ✅ done, **uncommitted** | — | `prev.h + 1` refused in a base case; `prev.h > 5` **accepted**, binding lost |
-| 0.4 ASSUME drops MODULE context | ⬜ pending, riskiest | — | has a stop-and-rescope gate |
-| **0.15 `properties()` empty on a multi-label edge endpoint** | ⬜ **new — not in the original 84** | — | `properties(b)` returns `{}` while `labels(b)` reports correctly |
+| 0.4 ASSUME drops MODULE context | ✅ done, **uncommitted** | — | two layers: compile-time namespace mismatch **and** a runtime plan-build gap that made the feature unusable either way |
+| **0.15 `properties()` empty on a multi-label edge endpoint** | ✅ done, **uncommitted** | — | `properties(b)` returned `{}` while `labels(b)` reported correctly; **two sites, not one** |
 
 Plus **D1/D2/D3** — three cursor-path bugs not in the original 84 findings, discovered while
 reproducing 0.10 and fixed on request. See *Bugs discovered during implementation* below.
@@ -334,6 +334,69 @@ The ASSUME branch rebuilds the body program with `module: None, uses: vec![]`, `
 
 Probe: without `MODULE` → `Ok(None)`; add a leading `MODULE acme` to the identical program → `Err(UndefinedRule{name:"adult"})`.
 
+**⚠️ PARTIALLY DONE (uncommitted) — the stop-and-rescope gate fired.**
+
+The compile-time half is fixed and tested: outer rules are now visible inside an ASSUME body
+under **both** their qualified and bare spellings, so `MODULE m` + a body referencing `adult`
+compiles exactly as the same program without `MODULE` does.
+
+That fix is deliberately narrower than this document proposes. It does **not** hand the body the
+outer module context, because that would qualify the body's *own* rules (`m.eligible`) while the
+runtime looks those up unqualified straight from the AST — the trap recorded above. Aliasing
+leaves every catalog key and every lookup untouched, so the trap never fires.
+
+**The gate stopped the second half, and for a stronger reason than expected.** Running the
+program end to end shows the feature does not work at all:
+
+```
+LocyPlanBuildError: IS-reference to unknown rule 'adult'
+```
+
+— and that is the **no-`MODULE` control**, which compiles cleanly. An ASSUME body rule that
+IS-references an outer rule has never worked at runtime, with or without a module. So the
+pre-existing `dispatch_body_command` gap this document flags is not a hazard to route around
+while fixing the compiler; it is the actual reason the feature is unusable, and it is a separate
+change.
+
+Per the instruction — *"if the `dispatch_body_command` gap turns out to be load-bearing, stop and
+re-scope rather than fixing two layers at once"* — the runtime layer is left untouched and filed.
+
+What the compile fix bought, and what the tests now pin: the two spellings **fail identically**.
+Before it, the `MODULE` form failed earlier and differently (`UndefinedRule` at compile time),
+which masked the fact that neither form works. `locy_assume_module_context.rs` asserts that
+parity and names the runtime gap, so a future fix flips those assertions rather than
+rediscovering the problem.
+
+**✅ SECOND LAYER NOW DONE (uncommitted).** The re-scope was the right call — the runtime half
+turned out to be a different fix in a different crate, and doing it separately kept each half
+verifiable.
+
+`evaluate_assume` now builds **one merged rule catalog** — the parent's rules, plus the body's
+shadowing on collision, with module-qualified parent rules also exposed under their bare last
+segment (mirroring what the compiler does when it validates the body). That catalog is used for
+two things:
+
+* planning the body's own strata, which previously saw only the body's catalog and failed with
+  `IS-reference to unknown rule`;
+* dispatching the body's commands, which previously consulted the parent's catalog and so could
+  not see the body's own rules.
+
+Each construction keeps its own `strata`: the body-evaluation program keeps the body's, and the
+command program keeps the parent's, so a nested ASSUME still sees the parent's strata as its
+parent. Merging the catalogs without merging the strata is what makes this safe.
+
+**Two corrections earned while writing the tests.** The first runtime test program was
+malformed — `YIELD p` gives zero KEY columns, so `WHERE p IS adult` failed on arity, not on
+resolution; it needs `YIELD KEY p`. And an `ASSUME … THEN { … }` surfaces as a single
+`CommandResult::Assume` carrying its body's rows, not as a trailing `Cypher` result. Both were
+my errors, and both would have made the tests pass or fail for the wrong reason.
+
+**Tests:** 5 in `locy_assume_module_context.rs`, all verified to fail against the un-merged
+runtime — including a parity test asserting `MODULE` and non-`MODULE` return the same rows, and
+an inverse guard that an undefined rule is still refused.
+
+**Gates:** workspace **6123/6123** · Locy TCK **502/502**.
+
 This is the MODULE-qualified sibling of the bug already pinned by `crates/uni-locy/tests/repro_assume_body_outer_rule_ref.rs`, whose comment shows `external_rules` were threaded but module context was not. Thread `module_ctx` (and outer `module`/`uses`) into the ASSUME branch via `group_rules_with_context`. Deleting the now-unused `group_rules` falls out. Add the case as a second `#[test]` **inside the existing repro file** — no new test binary.
 
 > **Trap:** Qualifying body rule names as `module.rule` changes the keys of the body's `rule_catalog` and `Stratum.rules`. Anything looking up body rules by unqualified name at runtime (the ASSUME body executor, body `QUERY`/`DERIVE` commands, explain output) silently misses. It also puts body rules in the same namespace as outer rules, so a name collision replaces shadowing. **Trace the `CompiledCommand::Assume` consumer in uni-query before changing the naming.**
@@ -616,6 +679,36 @@ profile, which is why it is filed rather than folded into an OGM commit.
 
 **Repro:** `bindings/uni-db` Python, no OGM — declare the edge type both ways, create
 `(:Author {name})-[:WROTE]->(:Book {title})`, compare the two `properties(b)` results.
+
+**✅ DONE (uncommitted).** Root cause was not in `properties()` at all. Two things compose:
+
+1. `planner.rs::plan_traverse_with_source` collapses a multi-label destination set to `None`
+   (`if unique_dsts.len() == 1 { .. } else { None }`) rather than to a union, so the traverse
+   takes its label-agnostic branch.
+2. That branch filtered `_all_props` out of the requested property list and then — with nothing
+   left to ask for — **skipped the storage read entirely**, returning an empty map.
+
+`_all_props` is not an internal name to strip: it is the wildcard
+`PropertyManager::get_batch_vertex_props` understands, reading declared columns, the overflow
+blob and the L0 overlay. The sibling `build_edge_adjacency_and_target_props` already passes the
+sentinel straight through and documents why — that was the **issue #135 fix, which reached
+`GraphTraverseMainStream` and not `GraphTraverseStream`**. This is the same defect, in the copy
+that fix missed.
+
+**Two sites, not one.** `hydrate_vlp_target_properties` carried an identical copy, so
+variable-length paths were broken the same way. Fixing only the single-hop site would have left
+`MATCH (a)-[:R*1..2]->(b)` still returning propertyless targets; the VLP test failed while the
+single-hop one passed, which is how the second site was caught rather than assumed.
+
+The planner's collapse is left alone: making it emit a *union* of candidate labels is a larger
+change, and passing the wildcard through makes the label-agnostic path correct regardless of why
+it was chosen.
+
+**Tests:** 5 in `crates/uni/tests/common/bugs/` — the multi-label case, the VLP case, and three
+controls (labels-still-correct, naming-the-label, single-label endpoints) that passed throughout
+and localise the defect.
+
+**Gates:** workspace **6120/6120** · Locy TCK **502/502** · openCypher TCK **3925/3925**.
 
 ---
 

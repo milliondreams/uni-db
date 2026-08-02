@@ -5866,8 +5866,18 @@ impl Writer {
             if previous_still_running {
                 info!("Skipping compaction: previous compaction still in progress");
             } else {
+                // Reclaim shadow-CSR entries no in-flight reader can reach.
+                // The floor is the minimum version pinned by a live
+                // `pinned_at_version` view, or the current version when none is
+                // pinned — a reader starting now pins at the current version,
+                // so anything deleted at or below it is already unreachable.
+                let gc_version = shared
+                    .storage
+                    .version_high_water_mark()
+                    .unwrap_or_else(|| shared.l0_manager.get_current().read().current_version);
                 let handle = tokio::spawn(async move {
                     am.compact();
+                    am.gc_shadow(gc_version);
                 });
                 *shared.compaction_handle.write() = Some(handle);
             }

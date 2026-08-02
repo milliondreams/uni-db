@@ -45,6 +45,69 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use uni_common::core::id::{Eid, Vid};
 
+/// Versions currently pinned by in-flight snapshot readers.
+///
+/// Exists so shadow-CSR entries can be reclaimed without dropping any a live
+/// reader still resolves. The bound is subtle and worth stating once:
+///
+/// * `StorageManager::pinned()` and `at_fork` each build a **fresh**
+///   [`AdjacencyManager`] with its own empty `ShadowCsr`, so those readers
+///   never consult the live instance.
+/// * `StorageManager::pinned_at_version` **shares** the live manager, and is
+///   the path every read-write transaction takes.
+///
+/// So the only readers of the live shadow are in-flight `pinned_at_version`
+/// views, and the safe floor is the minimum version among them.
+/// `SnapshotManager` cannot supply this — it is a manifest reader-writer and
+/// tracks no live readers.
+///
+/// Refcounted rather than a set: several transactions routinely pin the same
+/// version, and the floor must not rise until the last of them is gone.
+#[derive(Debug, Default)]
+pub struct PinnedVersions {
+    counts: parking_lot::Mutex<std::collections::BTreeMap<u64, usize>>,
+}
+
+impl PinnedVersions {
+    /// Register `version` as pinned until the returned guard drops.
+    pub fn pin(self: &Arc<Self>, version: u64) -> PinGuard {
+        *self.counts.lock().entry(version).or_insert(0) += 1;
+        PinGuard {
+            versions: Arc::clone(self),
+            version,
+        }
+    }
+
+    /// The lowest version any in-flight reader is pinned at.
+    pub fn min_pinned(&self) -> Option<u64> {
+        self.counts.lock().keys().next().copied()
+    }
+
+    /// Number of distinct pinned versions; for tests and diagnostics.
+    pub fn distinct_pinned(&self) -> usize {
+        self.counts.lock().len()
+    }
+}
+
+/// Releases its version from [`PinnedVersions`] on drop.
+#[derive(Debug)]
+pub struct PinGuard {
+    versions: Arc<PinnedVersions>,
+    version: u64,
+}
+
+impl Drop for PinGuard {
+    fn drop(&mut self) {
+        let mut counts = self.versions.counts.lock();
+        if let Some(n) = counts.get_mut(&self.version) {
+            *n -= 1;
+            if *n == 0 {
+                counts.remove(&self.version);
+            }
+        }
+    }
+}
+
 /// Unified adjacency manager for the dual-CSR architecture.
 ///
 /// Orchestrates Main CSR (packed alive edges), L0-csr overlay
@@ -63,6 +126,9 @@ pub struct AdjacencyManager {
 
     /// Shadow CSR for time-travel deleted edge tracking.
     shadow: ShadowCsr,
+    /// Versions pinned by in-flight `pinned_at_version` readers; the floor for
+    /// shadow GC. See [`PinnedVersions`].
+    pinned_versions: Arc<PinnedVersions>,
 
     /// Current approximate memory usage in bytes.
     current_bytes: AtomicUsize,
@@ -87,6 +153,7 @@ impl AdjacencyManager {
             active_overlay: Arc::new(RwLock::new(L0CsrSegment::new())),
             frozen_segments: RwLock::new(Vec::new()),
             shadow: ShadowCsr::new(),
+            pinned_versions: Arc::new(PinnedVersions::default()),
             current_bytes: AtomicUsize::new(0),
             max_bytes,
             warm_guards: DashMap::new(),
@@ -784,6 +851,29 @@ impl AdjacencyManager {
         // than tracked incrementally: the shadow is small when healthy, and an
         // exact counter would need hooks on every retain in `gc`.
         self.current_bytes.load(Ordering::Relaxed) + self.shadow.approx_bytes()
+    }
+
+    /// The pinned-version registry backing shadow GC.
+    pub fn pinned_versions(&self) -> &Arc<PinnedVersions> {
+        &self.pinned_versions
+    }
+
+    /// Reclaim shadow entries no in-flight reader can reach.
+    ///
+    /// The floor is the minimum pinned version, or `current_version` when
+    /// nothing is pinned — a reader starting now pins at the current version,
+    /// so entries deleted at or below it are unreachable. `current_version` is
+    /// passed in because the manager does not track it; the writer does.
+    ///
+    /// Called after compaction. Safe to call at any time: it only ever removes
+    /// entries whose `deleted_version` is at or below the floor, which is
+    /// exactly the set `get_entries_at_version` can no longer return.
+    pub fn gc_shadow(&self, current_version: u64) {
+        let floor = self
+            .pinned_versions
+            .min_pinned()
+            .map_or(current_version, |pinned| pinned.min(current_version));
+        self.shadow.gc(floor);
     }
 
     /// Shadow-CSR entries currently retained.

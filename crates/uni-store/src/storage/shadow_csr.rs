@@ -129,24 +129,24 @@ impl ShadowCsr {
     ///
     /// # Choosing the bound
     ///
-    /// Not currently called from production. The bound it needs is narrower
-    /// than "the oldest snapshot", and getting it wrong drops entries a live
-    /// reader still resolves through [`Self::get_entries_at_version`]:
+    /// Callers must pass the floor computed by
+    /// [`AdjacencyManager::gc_shadow`](crate::storage::adjacency_manager::AdjacencyManager::gc_shadow),
+    /// never a raw version. The bound is narrower than "the oldest snapshot",
+    /// and getting it wrong drops entries a live reader still resolves through
+    /// [`Self::get_entries_at_version`]:
     ///
     /// * `StorageManager::pinned()` and `at_fork` each build a **fresh**
     ///   `AdjacencyManager` with its own empty `ShadowCsr`, so those readers
-    ///   never consult this instance at all.
+    ///   never consult this instance.
     /// * `StorageManager::pinned_at_version` **shares** the live
     ///   `AdjacencyManager`, and is the path every read-write transaction
     ///   takes.
     ///
-    /// So the only readers of the live shadow are in-flight
-    /// `pinned_at_version` transactions, and the correct bound is the minimum
-    /// `started_at_version` among them — falling back to the current version
-    /// high-water mark when none are in flight. `SnapshotManager` cannot supply
-    /// it: it is a manifest reader-writer and tracks no live readers. No such
-    /// registry exists yet, which is the remaining work; retention is bounded
-    /// in the meantime by the dedup in [`Self::add_deleted_edge`].
+    /// So the floor is the minimum version among in-flight `pinned_at_version`
+    /// views — tracked by `PinnedVersions`, refcounted so it cannot rise while
+    /// another reader holds the same version — falling back to the current
+    /// version when nothing is pinned. `SnapshotManager` cannot supply this: it
+    /// is a manifest reader-writer and tracks no live readers.
     pub fn gc(&self, oldest_active_snapshot_version: u64) {
         for mut entry in self.entries.iter_mut() {
             let map = entry.value_mut();

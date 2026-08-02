@@ -82,3 +82,86 @@ fn shadow_bytes_are_reported() {
     shadow.add_deleted_edge(Vid::new(1), edge(100), Direction::Outgoing);
     assert!(shadow.approx_bytes() > 0);
 }
+
+// ── GC bound (Tier 1.2 remainder) ────────────────────────────────────────
+
+use std::sync::Arc;
+use uni_store::storage::adjacency_manager::PinnedVersions;
+
+/// A pinned reader must keep its entries, even after GC runs.
+///
+/// This is the direction that catches a too-aggressive bound. The audit's
+/// prescription — "the oldest live snapshot", sourced from `SnapshotManager` —
+/// would have collected these, because `SnapshotManager` tracks no live
+/// readers at all.
+#[test]
+fn gc_retains_entries_a_pinned_reader_can_still_resolve() {
+    let shadow = ShadowCsr::new();
+    let src = Vid::new(1);
+    // Deleted at v10, so a reader pinned at v5 must still see it.
+    shadow.add_deleted_edge(src, edge(100), Direction::Outgoing);
+
+    let pins = Arc::new(PinnedVersions::default());
+    let _guard = pins.pin(5);
+
+    let floor = pins.min_pinned().expect("a pin is held");
+    shadow.gc(floor);
+
+    let alive = shadow.get_entries_at_version(src, 1, Direction::Outgoing, 5);
+    assert_eq!(
+        alive.len(),
+        1,
+        "GC must not drop an entry a pinned reader still resolves"
+    );
+}
+
+/// The counterpart: once the pin is released the floor rises and the entry is
+/// reclaimed. Without this, a GC that never collected anything would satisfy
+/// the test above.
+#[test]
+fn gc_reclaims_once_the_pin_is_released() {
+    let shadow = ShadowCsr::new();
+    let src = Vid::new(1);
+    shadow.add_deleted_edge(src, edge(100), Direction::Outgoing);
+
+    let pins = Arc::new(PinnedVersions::default());
+    {
+        let _guard = pins.pin(5);
+        assert_eq!(pins.min_pinned(), Some(5));
+    }
+    assert_eq!(pins.min_pinned(), None, "the guard must release on drop");
+
+    // No pin: the floor is the current version, past the deletion at v10.
+    shadow.gc(20);
+    assert_eq!(
+        shadow.entry_count(),
+        0,
+        "an entry no reader can reach must be reclaimed"
+    );
+}
+
+/// The floor is the *minimum* pin, and refcounted so it does not rise while
+/// another reader still holds the same version.
+#[test]
+fn the_floor_is_the_minimum_pin_and_is_refcounted() {
+    let pins = Arc::new(PinnedVersions::default());
+
+    let low = pins.pin(3);
+    let high = pins.pin(9);
+    let low_again = pins.pin(3);
+    assert_eq!(pins.min_pinned(), Some(3));
+    assert_eq!(pins.distinct_pinned(), 2);
+
+    // One of the two v3 readers finishes; the floor must not move.
+    drop(low);
+    assert_eq!(
+        pins.min_pinned(),
+        Some(3),
+        "the floor must not rise while another reader holds the same version"
+    );
+
+    drop(low_again);
+    assert_eq!(pins.min_pinned(), Some(9));
+    drop(high);
+    assert_eq!(pins.min_pinned(), None);
+}

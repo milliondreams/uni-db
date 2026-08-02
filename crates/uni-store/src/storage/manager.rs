@@ -82,6 +82,18 @@ pub struct StorageManager {
     /// post-snapshot rows into its scans. Mutually exclusive with
     /// `pinned_snapshot`.
     pinned_version_hwm: Option<u64>,
+    /// Keeps this view's version registered in the shared
+    /// [`PinnedVersions`](crate::storage::adjacency_manager::PinnedVersions)
+    /// registry so shadow-CSR GC cannot reclaim entries it still resolves.
+    ///
+    /// Only `pinned_at_version` sets it: `pinned()` and `at_fork` each build a
+    /// *fresh* `AdjacencyManager`, so they read their own empty shadow and have
+    /// nothing to protect. Released when the view drops.
+    #[expect(
+        dead_code,
+        reason = "RAII guard: held solely so its Drop deregisters this view's pinned version. Never read."
+    )]
+    pin_guard: Option<crate::storage::adjacency_manager::PinGuard>,
     /// Optional fork scope for branch-aware reads (Phase 1 read-only).
     ///
     /// Mutually exclusive with `pinned_snapshot`: a single
@@ -311,6 +323,7 @@ impl StorageManager {
             flush_in_progress: std::sync::atomic::AtomicUsize::new(0),
             pinned_snapshot: None,
             pinned_version_hwm: None,
+            pin_guard: None,
             fork_scope: None,
             backend,
             vid_labels_index: Arc::new(parking_lot::RwLock::new(
@@ -479,6 +492,7 @@ impl StorageManager {
             flush_in_progress: std::sync::atomic::AtomicUsize::new(0),
             pinned_snapshot: Some(snapshot),
             pinned_version_hwm: None,
+            pin_guard: None,
             fork_scope: self.fork_scope.clone(),
             backend: self.backend.clone(),
             // Deep-copy, not Arc-clone: a fork/pin must get its OWN label index
@@ -512,6 +526,9 @@ impl StorageManager {
     /// C2); edge reads are recorded in the OCC read-set, so a conflicting
     /// read-modify-write still aborts at commit.
     pub fn pinned_at_version(&self, hwm: u64) -> Self {
+        // Register the pin for as long as this view lives, so shadow GC cannot
+        // reclaim entries this reader still resolves. Dropped with the view.
+        let pin_guard = Some(self.adjacency_manager.pinned_versions().pin(hwm));
         Self {
             base_uri: self.base_uri.clone(),
             store: self.store.clone(),
@@ -523,6 +540,7 @@ impl StorageManager {
             flush_in_progress: std::sync::atomic::AtomicUsize::new(0),
             pinned_snapshot: None,
             pinned_version_hwm: Some(hwm),
+            pin_guard,
             fork_scope: self.fork_scope.clone(),
             backend: self.backend.clone(),
             // Deep-copy, not Arc-clone: a fork/pin must get its OWN label index
@@ -593,6 +611,7 @@ impl StorageManager {
             flush_in_progress: std::sync::atomic::AtomicUsize::new(0),
             pinned_snapshot: None,
             pinned_version_hwm: None,
+            pin_guard: None,
             fork_scope: Some(scope),
             backend: branched_backend,
             // Deep-copy, not Arc-clone: a fork/pin must get its OWN label index

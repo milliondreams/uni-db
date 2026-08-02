@@ -92,3 +92,6 @@ pub mod repro_multi_label_endpoint_properties;
 // Tier 1.6: get_edge_type_info interpolated the type name into Cypher unquoted
 // and swallowed the resulting parse error as a count of 0.
 pub mod repro_edge_type_info_count;
+// Tier 1.4: the CHECK evaluator existed as two copies whose equality operators
+// had drifted, so bulk and tx disagreed on the same row.
+pub mod repro_tx_check_int_float;

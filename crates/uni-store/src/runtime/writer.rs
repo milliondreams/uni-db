@@ -1865,7 +1865,7 @@ impl Writer {
                         }
                     }
                     ConstraintType::Check { expression } => {
-                        if !self.evaluate_check_constraint(expression, properties)? {
+                        if !uni_common::core::check_constraint::evaluate(expression, properties)? {
                             return Err(anyhow!(
                                 "CHECK constraint '{}' violated: expression '{}' evaluated to false",
                                 constraint.name,
@@ -2223,7 +2223,9 @@ impl Writer {
                         ));
                     }
                     ConstraintType::Check { expression }
-                        if !self.evaluate_check_constraint(expression, properties)? =>
+                        if !uni_common::core::check_constraint::evaluate(
+                            expression, properties,
+                        )? =>
                     {
                         return Err(anyhow!(
                             "Constraint violation at index {}: CHECK constraint '{}' violated",
@@ -2496,116 +2498,6 @@ impl Writer {
         tx_l0: Option<&Arc<RwLock<L0Buffer>>>,
     ) {
         self.resolve_l0(tx_l0).write().set_edge_type(eid, type_name);
-    }
-
-    /// Evaluate a simple CHECK constraint expression.
-    /// Supports: "property op value" (e.g., "age > 18", "status = 'active'")
-    fn evaluate_check_constraint(&self, expression: &str, properties: &Properties) -> Result<bool> {
-        let parts: Vec<&str> = expression.split_whitespace().collect();
-        if parts.len() != 3 {
-            // For now, only support "prop op val"
-            // Fallback to true if too complex to avoid breaking, but warn
-            log::warn!(
-                "Complex CHECK constraint expression '{}' not fully supported yet; allowing write.",
-                expression
-            );
-            return Ok(true);
-        }
-
-        let prop_part = parts[0].trim_start_matches('(');
-        // Handle "variable.property" format - take the part after the dot
-        let prop_name = if let Some(idx) = prop_part.find('.') {
-            &prop_part[idx + 1..]
-        } else {
-            prop_part
-        };
-
-        let op = parts[1];
-        let val_str = parts[2].trim_end_matches(')');
-
-        let prop_val = match properties.get(prop_name) {
-            Some(v) => v,
-            None => return Ok(true), // If property missing, CHECK usually passes (unless NOT NULL)
-        };
-
-        // Parse value string (handle quotes for strings)
-        let target_val = if (val_str.starts_with('\'') && val_str.ends_with('\''))
-            || (val_str.starts_with('"') && val_str.ends_with('"'))
-        {
-            Value::String(val_str[1..val_str.len() - 1].to_string())
-        } else if let Ok(n) = val_str.parse::<i64>() {
-            Value::Int(n)
-        } else if let Ok(n) = val_str.parse::<f64>() {
-            Value::Float(n)
-        } else if let Ok(b) = val_str.parse::<bool>() {
-            Value::Bool(b)
-        } else {
-            // Check for internal format wrappers if they somehow leaked through
-            if val_str.starts_with("Number(") && val_str.ends_with(')') {
-                let n_str = &val_str[7..val_str.len() - 1];
-                if let Ok(n) = n_str.parse::<i64>() {
-                    Value::Int(n)
-                } else if let Ok(n) = n_str.parse::<f64>() {
-                    Value::Float(n)
-                } else {
-                    Value::String(val_str.to_string())
-                }
-            } else {
-                Value::String(val_str.to_string())
-            }
-        };
-
-        match op {
-            "=" | "==" => Ok(prop_val == &target_val),
-            "!=" | "<>" => Ok(prop_val != &target_val),
-            ">" => self
-                .compare_values(prop_val, &target_val)
-                .map(|o| o.is_gt()),
-            "<" => self
-                .compare_values(prop_val, &target_val)
-                .map(|o| o.is_lt()),
-            ">=" => self
-                .compare_values(prop_val, &target_val)
-                .map(|o| o.is_ge()),
-            "<=" => self
-                .compare_values(prop_val, &target_val)
-                .map(|o| o.is_le()),
-            _ => {
-                log::warn!("Unsupported operator '{}' in CHECK constraint", op);
-                Ok(true)
-            }
-        }
-    }
-
-    fn compare_values(&self, a: &Value, b: &Value) -> Result<std::cmp::Ordering> {
-        use std::cmp::Ordering;
-
-        fn cmp_f64(x: f64, y: f64) -> Ordering {
-            x.partial_cmp(&y).unwrap_or(Ordering::Equal)
-        }
-
-        match (a, b) {
-            (Value::Int(n1), Value::Int(n2)) => Ok(n1.cmp(n2)),
-            (Value::Float(f1), Value::Float(f2)) => Ok(cmp_f64(*f1, *f2)),
-            // Exact i64-vs-f64 order (no lossy `as f64` cast above 2^53);
-            // preserve `cmp_f64`'s NaN-as-Equal behavior for the degenerate case.
-            (Value::Int(n), Value::Float(f)) => Ok(if f.is_nan() {
-                Ordering::Equal
-            } else {
-                uni_common::cmp_i64_f64(*n, *f)
-            }),
-            (Value::Float(f), Value::Int(n)) => Ok(if f.is_nan() {
-                Ordering::Equal
-            } else {
-                uni_common::cmp_i64_f64(*n, *f).reverse()
-            }),
-            (Value::String(s1), Value::String(s2)) => Ok(s1.cmp(s2)),
-            _ => Err(anyhow!(
-                "Cannot compare incompatible types: {:?} vs {:?}",
-                a,
-                b
-            )),
-        }
     }
 
     async fn check_unique_constraint_multi(

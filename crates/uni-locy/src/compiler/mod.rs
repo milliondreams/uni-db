@@ -269,7 +269,30 @@ fn extract_commands(
                 };
                 let body_module_ctx = modules::ModuleContext::default();
                 let body_rule_groups = group_rules(&body_program_ast);
-                let all_rule_names: Vec<String> = defined_rules
+
+                // The body compiles with no module of its own, so a reference
+                // to an outer rule resolves bare (`adult`) while the enclosing
+                // `MODULE m` catalogued that rule qualified (`m.adult`) -- and
+                // the reference failed with `UndefinedRule`. Offer every outer
+                // rule under both spellings: inside `MODULE m`, writing `adult`
+                // *is* how you name `m.adult`.
+                //
+                // Deliberately NOT fixed by handing the body the outer module
+                // context. That would also qualify the body's *own* rules
+                // (`m.eligible`), while the runtime looks those up unqualified
+                // straight from the AST -- `locy_assume.rs` and `locy_query.rs`
+                // both do `program.rule_catalog.get(&rule_name)` -- so
+                // `QUERY eligible` would compile and then fail at run time with
+                // "rule not found". Aliasing leaves every catalog key and every
+                // lookup exactly as it was.
+                let outer_visible: Vec<String> = defined_rules
+                    .iter()
+                    .flat_map(|qualified| {
+                        let bare = qualified.rsplit_once('.').map(|(_, bare)| bare.to_string());
+                        std::iter::once(qualified.clone()).chain(bare)
+                    })
+                    .collect();
+                let all_rule_names: Vec<String> = outer_visible
                     .iter()
                     .chain(body_rule_groups.keys())
                     .cloned()
@@ -294,7 +317,7 @@ fn extract_commands(
                     compile_with_context(
                         &body_program_ast,
                         &HashMap::new(),
-                        defined_rules,
+                        &outer_visible,
                         neural_predicates_preview_flag,
                         &default_monotonicity_oracle,
                     )?

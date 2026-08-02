@@ -1,4 +1,5 @@
 pub mod btic_cypher_test;
+pub mod locy_assume_module_context;
 pub mod locy_assume_params;
 pub mod locy_derive_visibility;
 pub mod locy_fold_having;

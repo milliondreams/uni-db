@@ -53,3 +53,7 @@ pub mod repro_id_allocator_substring_notfound;
 // classifier/attempt-budget ordering bug in ResilientObjectStore::retry.
 pub mod repro_resilient_stringly_classifier;
 
+// Tier 1.1 — the L1 main-edge property fallback read at HEAD while L0 and the
+// delta tier were bounded by the snapshot.
+pub mod repro_schemaless_edge_props_escape_pin;
+

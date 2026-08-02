@@ -293,16 +293,40 @@ impl MainEdgeDataset {
     ///
     /// Returns the props_json parsed into a Properties HashMap if found.
     /// This is used as a fallback for unknown/schemaless edge types.
+    ///
+    /// # Arguments
+    /// * `version` - Optional version high water mark for snapshot isolation.
+    ///   Mirrors [`MainVertexDataset::find_props_by_vid`]; without it a pinned
+    ///   or SSI transaction reads L0 and the delta tier at its snapshot but
+    ///   this L1 fallback at HEAD, so a post-snapshot write becomes visible.
+    ///   Schemaless and overflow edge properties live only in `props_json`
+    ///   (never in delta columns), so this path is reached on *every* such
+    ///   read — not only after compaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table query fails or JSON parsing fails.
+    ///
+    /// [`MainVertexDataset::find_props_by_vid`]: crate::storage::main_vertex::MainVertexDataset::find_props_by_vid
     pub async fn find_props_by_eid(
         backend: &dyn StorageBackend,
         eid: Eid,
+        version: Option<u64>,
     ) -> Result<Option<Properties>> {
         // MVCC (review C2): the scan must see deletion tombstones — the
         // highest-version row wins, and a deleted winner yields `None`.
         // Filtering `_deleted = false` here would let an OLDER live version
         // resurrect an edge whose tombstone is the true (highest-version)
         // winner.
-        let filter = FilterExpr::equals("_eid", Scalar::UInt(eid.as_u64()));
+        //
+        // The version bound is a *conjunct*, not a substitute for that rule: it
+        // narrows the candidate set to rows visible at the snapshot, and the
+        // tombstone-winner selection below then runs unchanged over whatever
+        // survives. This is the same composition `find_props_by_vid` uses.
+        let filter = super::with_version_bound(
+            FilterExpr::equals("_eid", Scalar::UInt(eid.as_u64())),
+            version,
+        );
         let batches = Self::execute_query(
             backend,
             filter,
@@ -637,7 +661,7 @@ mod tests {
 
         // Sanity: visible while live.
         assert!(
-            MainEdgeDataset::find_props_by_eid(backend, Eid::new(1))
+            MainEdgeDataset::find_props_by_eid(backend, Eid::new(1), None)
                 .await
                 .unwrap()
                 .is_some()
@@ -661,7 +685,7 @@ mod tests {
         MainEdgeDataset::write_batch(backend, dead).await.unwrap();
 
         assert_eq!(
-            MainEdgeDataset::find_props_by_eid(backend, Eid::new(1))
+            MainEdgeDataset::find_props_by_eid(backend, Eid::new(1), None)
                 .await
                 .unwrap(),
             None,

@@ -363,9 +363,17 @@ impl PropertyManager {
             }
         }
 
-        // Fallback to main edges table props_json for unknown/schemaless types
+        // Fallback to main edges table props_json for unknown/schemaless types.
+        // Bounded by the same high water mark the delta tier is filtered by
+        // above — otherwise this tier alone reads at HEAD and leaks writes made
+        // after a pinned/SSI transaction's snapshot.
         use crate::storage::main_edge::MainEdgeDataset;
-        if let Some(props) = MainEdgeDataset::find_props_by_eid(self.storage.backend(), eid).await?
+        if let Some(props) = MainEdgeDataset::find_props_by_eid(
+            self.storage.backend(),
+            eid,
+            self.storage.version_high_water_mark(),
+        )
+        .await?
         {
             return Ok(Some(props));
         }
@@ -942,8 +950,12 @@ impl PropertyManager {
                 if !missing_any {
                     continue;
                 }
-                if let Some(props) =
-                    MainEdgeDataset::find_props_by_eid(self.storage.backend(), eid).await?
+                if let Some(props) = MainEdgeDataset::find_props_by_eid(
+                    self.storage.backend(),
+                    eid,
+                    self.storage.version_high_water_mark(),
+                )
+                .await?
                 {
                     let entry = result.entry(key).or_default();
                     for (k, v) in props {
@@ -1572,8 +1584,12 @@ impl PropertyManager {
             if !needs_fallback {
                 continue;
             }
-            if let Some(props) =
-                MainEdgeDataset::find_props_by_eid(self.storage.backend(), eid).await?
+            if let Some(props) = MainEdgeDataset::find_props_by_eid(
+                self.storage.backend(),
+                eid,
+                self.storage.version_high_water_mark(),
+            )
+            .await?
             {
                 let entry = result.entry(eid).or_default();
                 for (k, v) in props {

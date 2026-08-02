@@ -42,20 +42,7 @@ pub struct MainVertexDataset {
     _base_uri: String,
 }
 
-/// Conjoin the snapshot-isolation version bound onto a scan `filter`.
-///
-/// When `version` is `Some(hwm)`, restricts the scan to rows at or below the
-/// high water mark; `None` leaves the filter unchanged (global visibility).
-/// This bound is SSI/OCC-critical and must be applied identically across all
-/// snapshot reads — conjoining structured nodes is what guarantees that, where
-/// the previous `push_str(" AND …")` would have mis-bound against any body
-/// carrying a top-level `OR`.
-fn with_version_bound(filter: FilterExpr, version: Option<u64>) -> FilterExpr {
-    match version {
-        Some(hwm) => FilterExpr::all([filter, FilterExpr::version_at_most(hwm)]),
-        None => filter,
-    }
-}
+use super::with_version_bound;
 
 /// Extract a label vector from one row of a `List<Utf8>` labels column.
 ///

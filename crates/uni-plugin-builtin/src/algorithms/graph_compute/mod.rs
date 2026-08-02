@@ -186,8 +186,8 @@ pub fn guest_emit_columns(fields: &[arrow_schema::Field]) -> Vec<String> {
         .collect()
 }
 
-/// Map an algorithm `yields` type token to the Arrow [`DataType`] the emit path
-/// can actually build.
+/// Map an algorithm `yields` type token to the Arrow [`arrow_schema::DataType`]
+/// the emit path can actually build.
 ///
 /// Deliberately narrower than the loaders' general `type_name_to_datatype`,
 /// which also serves scalar UDFs and procedures where `Utf8`/`Boolean` are

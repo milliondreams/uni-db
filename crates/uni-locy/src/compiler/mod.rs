@@ -738,6 +738,77 @@ mod tests {
         }
     }
 
+    // ── BEST BY is decided syntactically, not by the oracle ─────────
+
+    /// Tripwire for the registry-backed oracle.
+    ///
+    /// `check_best_by_monotonic_fold` consumes its predicate **inverted** —
+    /// "monotone" means *reject*. It also runs for every rule, not only
+    /// recursive ones. So the moment the injected `MonotonicityOracle` is
+    /// pointed at a plugin registry, any rule combining `BEST BY` with a fold
+    /// the registry calls monotone starts failing to compile — and the builtin
+    /// registry marks `MAX`, `MIN`, `COUNT`, `COUNTALL` and `COLLECT` as
+    /// `monotone_join: true`.
+    ///
+    /// `BEST BY score DESC … FOLD peak = MAX(a.cost)` is an ordinary,
+    /// runtime-correct program. This test compiles one under an oracle that
+    /// answers `Some(true)` for `MAX` — exactly what a registry-backed oracle
+    /// does — and asserts it is accepted. If someone re-unifies the BEST BY
+    /// guard with the oracle, this goes red.
+    #[test]
+    fn best_by_with_registry_monotone_fold_still_compiles() {
+        let prog = parse_locy(
+            "CREATE RULE r AS MATCH (a)-[:E]->(b) \
+             FOLD peak = MAX(a.cost) BEST BY peak ASC YIELD KEY a, KEY b, peak",
+        )
+        .unwrap();
+
+        // Stands in for the registry: MAX/MIN/COUNT/COLLECT are monotone joins.
+        let registry_like = |name: &str| match name.to_uppercase().as_str() {
+            "MAX" | "MIN" | "COUNT" | "COUNTALL" | "COLLECT" => Some(true),
+            "SUM" | "AVG" => Some(false),
+            _ => None,
+        };
+
+        let result = compile_with_oracle(&prog, &HashMap::new(), &[], &registry_like);
+        assert!(
+            result.is_ok(),
+            "BEST BY with a registry-monotone fold must still compile; got {:?}",
+            result.err()
+        );
+    }
+
+    /// Inverse guard: the six declared `M*` lattice folds are still refused,
+    /// even when the oracle claims to know nothing about them.
+    ///
+    /// The rule is deliberately **non-recursive**. A recursive one would trip
+    /// `check_non_monotonic_in_recursion` first (that check *does* consult the
+    /// oracle, and correctly so), and the BEST BY guard would never be reached —
+    /// the test would pass for the wrong reason.
+    #[test]
+    fn best_by_with_declared_lattice_fold_still_rejected_under_registry_oracle() {
+        let prog = parse_locy(
+            "CREATE RULE r AS MATCH (a)-[:E]->(b) \
+             FOLD total = MSUM(a.cost) BEST BY total ASC YIELD KEY a, KEY b, total",
+        )
+        .unwrap();
+
+        // Answers `None` for MSUM — if the guard consulted the oracle, this
+        // program would now be accepted.
+        let registry_like = |name: &str| match name.to_uppercase().as_str() {
+            "MAX" | "MIN" => Some(true),
+            _ => None,
+        };
+
+        match compile_with_oracle(&prog, &HashMap::new(), &[], &registry_like).unwrap_err() {
+            LocyCompileError::BestByWithMonotonicFold { rule, fold } => {
+                assert_eq!(rule, "r");
+                assert_eq!(fold.to_uppercase(), "MSUM");
+            }
+            e => panic!("expected BestByWithMonotonicFold, got {e:?}"),
+        }
+    }
+
     // ── HAVING without FOLD → HavingWithoutFold error ───────────────
 
     #[test]

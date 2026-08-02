@@ -24,9 +24,14 @@ pub type MonotonicityOracle<'a> = &'a (dyn Fn(&str) -> Option<bool> + 'a);
 
 /// Default oracle for callers without a `PluginRegistry`.
 ///
-/// Honors the `M`-prefix convention (`MMAX`/`MMIN`/`MCOUNT`/`MNOR`/`MPROD`/
-/// `MSUM`) as a user-asserted monotonicity contract. Returns `None` for
-/// everything else, which the recursive-stratum check rejects.
+/// Recognises exactly the six built-in `M`-prefixed lattice folds —
+/// `MMAX`, `MMIN`, `MCOUNT`, `MNOR`, `MPROD`, `MSUM` — as a user-asserted
+/// monotonicity contract, and answers `None` for everything else, which the
+/// recursive-stratum check rejects.
+///
+/// This is an **exact list, not an `M`-prefix rule**: `MFOO` answers `None`.
+/// (An earlier version of this comment claimed a prefix convention the body has
+/// never implemented.)
 ///
 /// Hosts that load `uni-plugin-builtin` should supply a registry-backed
 /// oracle instead so user-registered aggregates participate in the check.
@@ -36,6 +41,31 @@ pub fn default_monotonicity_oracle(name: &str) -> Option<bool> {
         "MMAX" | "MMIN" | "MCOUNT" | "MNOR" | "MPROD" | "MSUM" => Some(true),
         _ => None,
     }
+}
+
+/// Names Locy treats as a *declared* lattice fold for the `BEST BY` guard.
+///
+/// Deliberately **not** the injected [`MonotonicityOracle`], and deliberately
+/// not implemented in terms of it. The two ask different questions that only
+/// happen to share a signature:
+///
+/// * the oracle asks *"is this aggregate sound under a fixpoint?"* — a lattice
+///   property, which a plugin registry answers authoritatively;
+/// * this asks *"did the user write a declared lattice fold?"* — a syntactic
+///   marker over the six built-in `M*` spellings.
+///
+/// Conflating them inverts the oracle's meaning: `check_best_by_monotonic_fold`
+/// treats `Some(true)` as an *error*, so pointing it at a registry would newly
+/// reject `BEST BY … FOLD MAX(x)` / `MIN` / `COUNT` / `COLLECT` — all of which
+/// are `monotone_join: true` in the builtin registry, and all of which are
+/// ordinary, runtime-correct programs. The guard also runs for *every* rule,
+/// not just recursive ones, so that rejection would not even be confined to
+/// recursion.
+fn is_declared_lattice_fold(name: &str) -> bool {
+    matches!(
+        name.to_uppercase().as_str(),
+        "MMAX" | "MMIN" | "MCOUNT" | "MNOR" | "MPROD" | "MSUM"
+    )
 }
 
 /// Validate all rules and produce `CompiledRule` entries plus warnings.
@@ -151,7 +181,9 @@ pub fn check(
                 check_fold_in_recursive_path(rule_name, def, scc_rules, &mut warnings);
             }
 
-            check_best_by_monotonic_fold(rule_name, def, is_monotonic)?;
+            // NB: deliberately outside the `is_recursive` block above — a
+            // BEST BY / lattice-fold contradiction is wrong in any rule.
+            check_best_by_monotonic_fold(rule_name, def)?;
 
             // Validate model invocations in this clause's body. Each call
             // `model_name(arg1, ..., argN)` must (1) refer to a declared
@@ -569,16 +601,24 @@ fn check_cross_predicate_correlation(
 
 // ─── BEST BY + monotonic fold ────────────────────────────────────────────────
 
+/// Reject `BEST BY` combined with a declared lattice fold.
+///
+/// `BEST BY` selects one witness row; a lattice fold aggregates across all of
+/// them. Writing both in one rule is a semantic contradiction the user almost
+/// certainly did not intend.
+///
+/// Membership comes from [`is_declared_lattice_fold`], **not** from the
+/// injected [`MonotonicityOracle`] — see that function for why the two must not
+/// be unified.
 fn check_best_by_monotonic_fold(
     rule_name: &str,
     def: &RuleDefinition,
-    is_monotonic: MonotonicityOracle<'_>,
 ) -> Result<(), LocyCompileError> {
     if def.best_by.is_none() {
         return Ok(());
     }
     try_for_each_fold_call(&def.fold, |_fold, name, _args| {
-        if matches!(is_monotonic(name), Some(true)) {
+        if is_declared_lattice_fold(name) {
             Err(LocyCompileError::BestByWithMonotonicFold {
                 rule: rule_name.to_string(),
                 fold: name.to_string(),

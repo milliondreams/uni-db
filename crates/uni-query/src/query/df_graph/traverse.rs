@@ -837,17 +837,37 @@ async fn build_target_property_columns(
         }
     } else {
         // No label name — use label-agnostic property lookup.
-        let non_internal_props: Vec<&str> = target_properties
-            .iter()
-            .filter(|p| *p != "_all_props")
-            .map(|s| s.as_str())
-            .collect();
+        //
+        // `_all_props` is not an internal marker to be filtered out: it is the
+        // wildcard `get_batch_vertex_props` understands, reading declared
+        // per-label columns, the overflow blob and the L0 overlay. Stripping it
+        // left nothing to request, so the storage read was skipped entirely and
+        // every property came back null — `properties(b)` on an unlabelled
+        // target rendered as `{}` while `labels(b)` stayed correct, because
+        // label resolution goes through the VidLabelsIndex rather than the
+        // planner's guess.
+        //
+        // An unlabelled target is not exotic: the planner collapses a
+        // *multi-label* edge endpoint declaration to "no label" rather than to a
+        // union, so `MATCH (a:A)-[:R]->(b)` takes this path whenever `R`
+        // declares more than one destination label.
+        //
+        // The sibling `build_edge_adjacency_and_target_props` already passes the
+        // sentinel straight through — that was the issue #135 fix, which reached
+        // `GraphTraverseMainStream` and not this stream.
+        let wants_all = target_properties.iter().any(|p| p == "_all_props");
+        let requested: Vec<&str> = if wants_all {
+            // The wildcard subsumes any individually-named properties.
+            vec!["_all_props"]
+        } else {
+            target_properties.iter().map(|s| s.as_str()).collect()
+        };
         let property_manager = graph_ctx.property_manager();
         let query_ctx = graph_ctx.query_context();
 
-        let props_map = if !non_internal_props.is_empty() {
+        let props_map = if !requested.is_empty() {
             property_manager
-                .get_batch_vertex_props(target_vids, &non_internal_props, Some(&query_ctx))
+                .get_batch_vertex_props(target_vids, &requested, Some(&query_ctx))
                 .await
                 .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?
         } else {
@@ -3976,17 +3996,23 @@ async fn hydrate_vlp_target_properties(
     } else {
         // No label name — use label-agnostic property lookup.
         // This scans all label datasets, slower but correct for label-less traversals.
-        let non_internal_props: Vec<&str> = target_properties
-            .iter()
-            .filter(|p| *p != "_all_props")
-            .map(|s| s.as_str())
-            .collect();
+        //
+        // Same wildcard handling as `build_target_property_columns`: stripping
+        // `_all_props` left nothing to request, so a variable-length path to an
+        // unlabelled target hydrated with no properties at all. See that
+        // function for why an unlabelled target is common rather than exotic.
+        let wants_all = target_properties.iter().any(|p| p == "_all_props");
+        let requested: Vec<&str> = if wants_all {
+            vec!["_all_props"]
+        } else {
+            target_properties.iter().map(|s| s.as_str()).collect()
+        };
         let property_manager = graph_ctx.property_manager();
         let query_ctx = graph_ctx.query_context();
 
-        let props_map = if !non_internal_props.is_empty() {
+        let props_map = if !requested.is_empty() {
             property_manager
-                .get_batch_vertex_props(&target_vids, &non_internal_props, Some(&query_ctx))
+                .get_batch_vertex_props(&target_vids, &requested, Some(&query_ctx))
                 .await
                 .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?
         } else {

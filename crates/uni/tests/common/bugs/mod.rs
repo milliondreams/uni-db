@@ -87,3 +87,5 @@ pub mod unwind_correlated_hash_index_pushdown;
 pub mod vlp_label_filter_after_flush;
 // `VERSION AS OF` reaching the planner un-unwrapped (explain/profile/cursor).
 pub mod repro_time_travel_explain_profile_cursor;
+// Tier 0 item 0.15: properties() empty for an unlabelled multi-label endpoint.
+pub mod repro_multi_label_endpoint_properties;

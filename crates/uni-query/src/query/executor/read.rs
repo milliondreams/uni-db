@@ -1059,6 +1059,19 @@ impl Executor {
     /// Note: `Foreach` returns only its `input`; the `body: Vec<LogicalPlan>`
     /// is not included because it requires special iteration. Callers that
     /// need to inspect the body should handle `Foreach` before falling through.
+    ///
+    /// The match is intentionally exhaustive — do NOT add a `_ => vec![]` arm;
+    /// a new `LogicalPlan` variant should fail to compile here until it is
+    /// classified as child-bearing or leaf. This walker previously ended in
+    /// such a wildcard, which silently made `FusedIndexScanWrapped` and the
+    /// five `Locy*` operators look like leaves. That matters because
+    /// `plan_children` drives `is_ddl_or_admin` (which routes a plan to the
+    /// DataFusion engine or the row-fallback executor) and
+    /// `contains_write_operations` (which decides whether a `MutationContext`
+    /// is built) — the same failure mode as issue #131, where a variant missing
+    /// from a plan walker silently degraded an equi-join to a quadratic
+    /// `CrossJoinExec`. The five sibling walkers in `df_planner.rs` carry this
+    /// guarantee already; this one was the exception.
     fn plan_children(plan: &LogicalPlan) -> Vec<&LogicalPlan> {
         match plan {
             // Single-input wrappers
@@ -1104,8 +1117,69 @@ impl Executor {
                 ..
             } => vec![input.as_ref(), pattern_plan.as_ref()],
 
-            // Leaf nodes (scans, DDL, admin, etc.)
-            _ => vec![],
+            // Observability wrapper around a fusion-eligible operator
+            // (`VectorKnn`, `InvertedIndexLookup`, or a `ProcedureCall` to
+            // `uni.search` / `uni.vector.query` / `uni.fts.query` /
+            // `uni.sparse.query`). Runtime behaviour is identical to the
+            // unwrapped node, so `inner` is a genuine child: treating it as a
+            // leaf hid the wrapped operator from every consumer of this walker.
+            LogicalPlan::FusedIndexScanWrapped { inner, .. } => vec![inner.as_ref()],
+
+            // Locy post-fixpoint operators. Reachable only as a
+            // `LocyClausePlan.body` beneath `LocyProgram`, never from a root
+            // plan — so these arms are inert today and exist to keep the match
+            // honest rather than to change any current answer.
+            LogicalPlan::LocyFold { input, .. }
+            | LogicalPlan::LocyBestBy { input, .. }
+            | LogicalPlan::LocyPriority { input, .. }
+            | LogicalPlan::LocyProject { input, .. }
+            | LogicalPlan::LocyModelInvoke { input, .. } => vec![input.as_ref()],
+
+            // ── Leaves ───────────────────────────────────────────────────
+            //
+            // `LocyProgram` belongs here deliberately. Its clause bodies hang
+            // off `strata → rules → clauses → body`, not a direct field, so
+            // yielding them would *change* what callers see rather than harden
+            // it: `contains_write_operations` and `is_ddl_or_admin` would begin
+            // descending into Locy rule bodies, and `is_ddl_or_admin` is the
+            // sole gate routing a plan to the row-fallback executor, whose Locy
+            // arms are `unreachable!()`. Do not "complete" this arm.
+            LogicalPlan::Scan { .. }
+            | LogicalPlan::ScanAll { .. }
+            | LogicalPlan::ScanMainByLabels { .. }
+            | LogicalPlan::ExtIdLookup { .. }
+            | LogicalPlan::FusedIndexScan { .. }
+            | LogicalPlan::VectorKnn { .. }
+            | LogicalPlan::InvertedIndexLookup { .. }
+            | LogicalPlan::ProcedureCall { .. }
+            | LogicalPlan::LocyProgram { .. }
+            | LogicalPlan::LocyDerivedScan { .. }
+            | LogicalPlan::Empty
+            | LogicalPlan::CreateVectorIndex { .. }
+            | LogicalPlan::CreateSparseIndex { .. }
+            | LogicalPlan::CreateFullTextIndex { .. }
+            | LogicalPlan::CreateScalarIndex { .. }
+            | LogicalPlan::CreateJsonFtsIndex { .. }
+            | LogicalPlan::DropIndex { .. }
+            | LogicalPlan::ShowIndexes { .. }
+            | LogicalPlan::Copy { .. }
+            | LogicalPlan::Backup { .. }
+            | LogicalPlan::CopyTo { .. }
+            | LogicalPlan::CopyFrom { .. }
+            | LogicalPlan::ShowDatabase
+            | LogicalPlan::ShowConfig
+            | LogicalPlan::ShowStatistics
+            | LogicalPlan::Vacuum
+            | LogicalPlan::Checkpoint
+            | LogicalPlan::CreateLabel(_)
+            | LogicalPlan::CreateEdgeType(_)
+            | LogicalPlan::AlterLabel(_)
+            | LogicalPlan::AlterEdgeType(_)
+            | LogicalPlan::DropLabel(_)
+            | LogicalPlan::DropEdgeType(_)
+            | LogicalPlan::CreateConstraint(_)
+            | LogicalPlan::DropConstraint(_)
+            | LogicalPlan::ShowConstraints(_) => vec![],
         }
     }
 
@@ -5672,5 +5746,70 @@ impl Executor {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod plan_children_tests {
+    use super::*;
+    use crate::query::planner::FusionKind;
+    use parking_lot::RwLock;
+
+    /// `FusedIndexScanWrapped` carries a real child plan.
+    ///
+    /// Before the wildcard was removed this returned `vec![]`, so every
+    /// consumer of `plan_children` — `is_ddl_or_admin` (engine routing) and
+    /// `contains_write_operations` (`MutationContext` construction) — saw a
+    /// fusion-wrapped operator as a leaf and never inspected what it wrapped.
+    #[test]
+    fn plan_children_descends_into_fused_index_scan_wrapped() {
+        let plan = LogicalPlan::FusedIndexScanWrapped {
+            inner: Box::new(LogicalPlan::Empty),
+            kind: FusionKind::BtreeUnion,
+        };
+        let children = Executor::plan_children(&plan);
+        assert_eq!(children.len(), 1, "the wrapped operator must be a child");
+        assert!(matches!(children[0], LogicalPlan::Empty));
+    }
+
+    /// The five Locy post-fixpoint operators likewise carry an `input`.
+    #[test]
+    fn plan_children_descends_into_locy_operators() {
+        let plan = LogicalPlan::LocyFold {
+            input: Box::new(LogicalPlan::Empty),
+            key_columns: vec![],
+            fold_bindings: vec![],
+            strict_probability_domain: false,
+            probability_epsilon: 0.0,
+        };
+        let children = Executor::plan_children(&plan);
+        assert_eq!(children.len(), 1);
+        assert!(matches!(children[0], LogicalPlan::Empty));
+    }
+
+    /// Inverse guard: a Locy *scan* is a leaf and must stay one.
+    ///
+    /// `LocyProgram` is the load-bearing case of this rule — its clause bodies
+    /// hang off `strata → rules → clauses → body` rather than a direct field,
+    /// so yielding them would make `is_ddl_or_admin` recurse into Locy rule
+    /// bodies, and that predicate is the sole gate sending a plan to the
+    /// row-fallback executor, whose Locy arms are `unreachable!()`. A wrong
+    /// `true` there is a panic, not a wrong answer.
+    ///
+    /// It is not constructed here: it carries sixteen fields including three
+    /// `Arc`-wrapped registries, and building one would test the constructor
+    /// rather than the walker. `LocyDerivedScan` shares the arm and the
+    /// property, and the arm's comment carries the reasoning for both.
+    #[test]
+    fn plan_children_treats_a_locy_scan_as_a_leaf() {
+        let plan = LogicalPlan::LocyDerivedScan {
+            scan_index: 0,
+            data: Arc::new(RwLock::new(Vec::new())),
+            schema: Arc::new(arrow_schema::Schema::empty()),
+        };
+        assert!(
+            Executor::plan_children(&plan).is_empty(),
+            "Locy scans must remain leaves — see the arm's comment"
+        );
     }
 }

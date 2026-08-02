@@ -434,6 +434,35 @@ pub fn get_edge_endpoints(eid: Eid, ctx: &QueryContext) -> Option<(Vid, Vid)> {
 /// Get the properties for a vertex from the L0 chain.
 /// Returns properties from the most recent L0 buffer that has the vertex.
 /// Returns None if the vertex is not in any L0 buffer.
+///
+/// # Why this does not record an SSI read
+///
+/// Eleven sibling accessors in this module call `record_vertex_read` /
+/// `record_edge_read`; this one, [`get_edge_properties`] and
+/// [`edge_exists_in_l0`] deliberately do not. That asymmetry is safe, not an
+/// oversight, and it was checked rather than assumed:
+///
+/// * **The read set is item-granular**, not field-granular — `HashSet<Vid>` /
+///   `HashSet<Eid>` in `runtime/l0.rs`. Recording an id once therefore covers
+///   *every* read of that item, its properties included. A second record of the
+///   same vid adds no conflict coverage.
+/// * **Every caller has already recorded the id.** Node materialisation calls
+///   `get_vertex_labels` (which records) immediately before this, in
+///   `df_graph/common.rs`. On the edge side the eid is recorded by
+///   `get_edge_type` or, where the type came from a batch column, by
+///   `resolve_stored_edge_endpoints` → `get_edge_endpoints`. The traverse paths
+///   inherit it from `get_neighbors`' `record_neighbor_reads`, or from
+///   `record_edge_adjacency` on the schemaless path.
+/// * **The cost is not free.** `record_vertex_read` takes an unconditional
+///   `RwLock::read` plus a `Mutex::lock` with no membership pre-check, and this
+///   function sits on the per-row materialisation path. Adding it would double
+///   the read-set lock acquisitions for a `RETURN n` over N rows and buy nothing
+///   — while the surrounding code deliberately optimises the other way
+///   (`get_neighbors_batch` passes `record_reads = false` precisely to collapse
+///   per-vertex locking into one batch acquisition).
+///
+/// If a future caller reaches this without a preceding sibling record, the fix
+/// is to record at *that* call site, not here.
 pub fn get_vertex_properties(vid: Vid, ctx: &QueryContext) -> Option<uni_common::Properties> {
     // Check transaction L0 first (newest)
     if let Some(tx_l0_arc) = &ctx.transaction_l0 {
@@ -465,6 +494,10 @@ pub fn get_vertex_properties(vid: Vid, ctx: &QueryContext) -> Option<uni_common:
 /// Get the properties for an edge from the L0 chain.
 /// Returns properties from the most recent L0 buffer that has the edge.
 /// Returns None if the edge is not in any L0 buffer.
+///
+/// Records no SSI read, for the reasons given on [`get_vertex_properties`] —
+/// the read set is item-granular and every caller has already recorded the eid
+/// via `get_edge_type`, `get_edge_endpoints` or `record_edge_adjacency`.
 pub fn get_edge_properties(eid: Eid, ctx: &QueryContext) -> Option<uni_common::Properties> {
     // Check transaction L0 first (newest)
     if let Some(tx_l0_arc) = &ctx.transaction_l0 {
@@ -502,7 +535,12 @@ pub fn edge_exists_in_l0(eid: Eid, ctx: Option<&QueryContext>) -> bool {
     };
 
     // NB: unlike `vertex_exists_in_l0` this deliberately does not record an SSI
-    // read; preserved as-is.
+    // read. The reason — which the previous "preserved as-is" comment did not
+    // give — is that its sole caller, the edge-property fetch in
+    // `property_manager.rs`, calls `is_edge_deleted(eid, ctx)` a few lines
+    // earlier, and that *does* record. This function only disambiguates
+    // "absent" from "present but propertyless" for an eid already in the read
+    // set, and the set is item-granular (see `get_vertex_properties`).
     visit_l0_buffers(Some(ctx), |buf| buf.edge_endpoints.contains_key(&eid))
 }
 
@@ -598,6 +636,15 @@ mod tests {
     /// H1: label / existence / liveness / edge-endpoint reads consulted under a
     /// write-tx must land in the SSI read-set — otherwise a concurrent mutation
     /// to the observed item escapes the antidependency check (write-skew).
+    ///
+    /// This covers the seven *keyed* accessors. Three siblings are deliberately
+    /// absent and must stay absent: `get_vertex_properties`,
+    /// `get_edge_properties` and `edge_exists_in_l0`. The read set is
+    /// item-granular, so an id recorded by the accessor that necessarily runs
+    /// first already covers the property read; adding it here would double the
+    /// lock traffic on the per-row materialisation path for zero extra
+    /// coverage. See `get_vertex_properties`' doc comment for the call-site
+    /// evidence. Do not "complete" this list.
     #[test]
     fn test_keyed_reads_recorded_in_ssi_read_set() {
         use crate::runtime::l0::OccReadSet;

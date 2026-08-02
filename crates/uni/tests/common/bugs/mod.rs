@@ -89,3 +89,6 @@ pub mod vlp_label_filter_after_flush;
 pub mod repro_time_travel_explain_profile_cursor;
 // Tier 0 item 0.15: properties() empty for an unlabelled multi-label endpoint.
 pub mod repro_multi_label_endpoint_properties;
+// Tier 1.6: get_edge_type_info interpolated the type name into Cypher unquoted
+// and swallowed the resulting parse error as a count of 0.
+pub mod repro_edge_type_info_count;

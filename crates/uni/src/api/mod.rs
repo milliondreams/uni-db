@@ -292,6 +292,34 @@ fn element_active(state: Option<&uni_common::core::schema::SchemaElementState>) 
     )
 }
 
+/// Backtick-quote a schema element name for interpolation into Cypher.
+///
+/// `validate_schema_element_name` admits far more than Cypher's unquoted
+/// identifier grammar (`[A-Za-z_][A-Za-z0-9_]*`): punctuation such as `-` and
+/// `.` — the latter explicitly documented as supported for qualified names —
+/// leading digits, and every non-ASCII character, since `cypher.pest` matches
+/// `ASCII_ALPHA` only. Interpolating any of those unquoted produces a parse
+/// error rather than a query.
+///
+/// # Errors
+///
+/// A name containing a backtick cannot be expressed at all: the grammar's
+/// quoted form is `` "`" ~ (!"`" ~ ANY)* ~ "`" `` with no doubling or escape
+/// rule, so there is no encoding for it. Such a name is refused rather than
+/// silently mis-parsed.
+fn quote_cypher_identifier(name: &str) -> Result<String> {
+    if name.contains('`') {
+        return Err(UniError::Query {
+            message: format!(
+                "schema element name {name:?} contains a backtick, which Cypher's \
+                 quoted-identifier syntax cannot escape"
+            ),
+            query: None,
+        });
+    }
+    Ok(format!("`{name}`"))
+}
+
 /// Build the `PropertyInfo` projection for a label or edge type.
 ///
 /// Shared by [`Uni::get_label_info`] and [`Uni::get_edge_type_info`];
@@ -2769,22 +2797,27 @@ impl Uni {
     ) -> Result<Option<crate::api::schema::LabelInfo>> {
         let schema = self.inner.schema.schema();
         if let Some(label_meta) = schema.labels.get(name) {
-            // Row count via the `StorageBackend` (correct `.lance` path); the
-            // prior raw-dataset read reported 0 for flushed tables (#115).
-            let backend = self.inner.storage.backend();
-            let table = uni_store::backend::table_names::vertex_table_name(name);
-            let count = if backend
-                .table_exists(&table)
-                .await
-                .map_err(|e| UniError::Internal(anyhow::anyhow!(e)))?
-            {
-                backend
-                    .count_rows(&table, None)
-                    .await
-                    .map_err(|e| UniError::Internal(anyhow::anyhow!(e)))?
-            } else {
-                0
-            };
+            // Row count via Cypher, matching `get_edge_type_info`.
+            //
+            // `backend.count_rows` reads flushed storage only, so a label whose
+            // rows were still in the L0 buffers reported `count: 0` — a silent
+            // wrong answer, and the reason a Python assertion on this value was
+            // once weakened rather than fixed.
+            //
+            // This does not reintroduce #115: that fix moved the count off the
+            // raw-dataset `open_raw()` path, whose `.lance` URI was wrong so it
+            // reported 0 for *flushed* tables. Cypher is a third path and is
+            // subject to neither failure.
+            let quoted = quote_cypher_identifier(name)?;
+            let query = format!("MATCH (n:{quoted}) RETURN count(n) AS cnt");
+            let count = self
+                .inner
+                .execute_internal(&query, HashMap::new())
+                .await?
+                .rows()
+                .first()
+                .and_then(|r| r.get::<i64>("cnt").ok())
+                .unwrap_or(0) as usize;
 
             Ok(Some(crate::api::schema::LabelInfo {
                 name: name.to_string(),
@@ -2813,17 +2846,30 @@ impl Uni {
             None => return Ok(None),
         };
 
-        // Count edges via internal query
+        // Count edges via internal query.
+        //
+        // The Cypher round-trip is deliberate: unlike `count_rows` it sees the
+        // L0 buffers as well as flushed storage, and it respects MVCC — the
+        // main tables are append-only with `_deleted`/`_version` columns, so a
+        // bare row count would include tombstones and superseded versions.
+        //
+        // The type name MUST be backtick-quoted. `relationship_types` in
+        // `cypher.pest` accepts `identifier_or_keyword`, whose unquoted form is
+        // `[A-Za-z_][A-Za-z0-9_]*` — so an unquoted interpolation is a parse
+        // error for any name outside that shape, and
+        // `validate_schema_element_name` admits far more than that: punctuation
+        // (including `.`, which it documents as supported), leading digits, and
+        // all non-ASCII. Paired with the `Err(_) => 0` this silently reported an
+        // empty edge type instead of failing.
         let count = {
-            let query = format!("MATCH ()-[r:{}]->() RETURN count(r) AS cnt", name);
-            match self.inner.execute_internal(&query, HashMap::new()).await {
-                Ok(result) => result
-                    .rows()
-                    .first()
-                    .and_then(|r| r.get::<i64>("cnt").ok())
-                    .unwrap_or(0) as usize,
-                Err(_) => 0,
-            }
+            let quoted = quote_cypher_identifier(name)?;
+            let query = format!("MATCH ()-[r:{quoted}]->() RETURN count(r) AS cnt");
+            let result = self.inner.execute_internal(&query, HashMap::new()).await?;
+            result
+                .rows()
+                .first()
+                .and_then(|r| r.get::<i64>("cnt").ok())
+                .unwrap_or(0) as usize
         };
 
         let source_labels = edge_meta.src_labels.clone();

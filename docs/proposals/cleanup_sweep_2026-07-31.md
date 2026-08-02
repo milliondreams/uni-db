@@ -735,14 +735,16 @@ pass for the wrong reason, that is recorded rather than glossed over.*
 | 1.9 SSI read-set | ✅ docs-only | refuted as a bug — see below |
 | 1.7 tx cancellation | ✅ already closed | committed as `b63deba8a`; the doc's "uncommitted" tag was stale |
 | *(adjacent)* `LocyBuilder` token + tx-bound AST | ✅ done | a pre-cancelled Locy query ran to completion and returned 100 facts |
-| **1.3 + 2.8** `map_variables` | ⬜ not started | |
-| **1.2** ShadowCsr GC | ⬜ not started | |
-| **1.4** CHECK evaluator | ⬜ not started | |
-| **1.5** oracle wiring (P1+P2) | ⬜ not started | prerequisite BEST BY decoupling is done |
+| 1.3 + 2.8 `map_variables` | ✅ done | an ALONG binding in a `LabelCheck` / map-projection / comprehension-source position was left un-inlined |
+| 1.2 ShadowCsr retention | ✅ partial | each warm re-pushed the whole delete history; GC bound documented, registry deferred |
+| 1.4 CHECK evaluator | ✅ done | bulk and tx disagreed on `CHECK (score = 5)` against `Float(5.0)` |
+| 1.5 oracle wiring, phase 1 | ✅ done | a recursive `FOLD MAX(x)` was refused as "non-monotonic" while the planner's own guard accepted it |
+| **1.5 oracle wiring, phase 2** | ⬜ not started | registration + persisted reload still use the default oracle |
 
-**Gates after the above:** `uni-db` **2322/2322** · `uni-store` **640/640** ·
-`uni-query` **763/763** · `uni-locy` **133/133** · Locy TCK **504/504** ·
-`cargo fmt --check` and per-crate `clippy -D warnings` clean.
+**Gates after the above:** `uni-db` **2331/2331** · `uni-store` **643/643** ·
+`uni-query` **766/766** · `uni-locy` + Locy TCK **637/637** · `uni-common` +
+`uni-bulk` + `uni-store` **779/779** · `cargo fmt --check` and per-crate
+`clippy -D warnings` clean. Every commit was verified to build on its own.
 
 #### Corrections to this document found while implementing
 
@@ -798,13 +800,55 @@ pass for the wrong reason, that is recorded rather than glossed over.*
   fixpoint) stayed unguarded. `evaluate_compiled_capturing` now races the whole
   evaluation, mirroring the Cypher terminals.
 
+#### Further corrections, from the second half of the work
+
+9. **1.4 had a fifth divergence that was textual only.** The writer copy's
+   `Number(...)` unwrap was dead code: `val_str` comes from
+   `trim_end_matches(')')`, which strips every trailing paren, so its
+   `ends_with(')')` guard could never hold. Dropped rather than resurrected —
+   making it reachable would add a capability neither path has. Found by testing
+   it, not by reading it.
+10. **1.5 had a fifth `&default_monotonicity_oracle` call site**, inside
+    `compile_with_context`'s ASSUME-body recursion, plus `extract_commands`.
+    Left alone, a host oracle would have stopped silently at the ASSUME
+    boundary.
+11. **1.2's leak is unbounded in the number of *warms*, not deletes.**
+    `AdjacencyManager::warm` lacks `warm_coalesced`'s `has_csr` short-circuit,
+    so each warm re-pushed the entire delete history — sharper than the audited
+    ~2-entries-per-delete. Fixed by deduping on `Eid` rather than skipping the
+    warm, which would have dropped deletions occurring *between* warms.
+12. **1.3's fix is a deletion, not an addition.** `Expr::map_children` is
+    already the canonical wildcard-free match over all 27 variants, so
+    delegating to `map_children_in_scope` relocates the compile-time guarantee
+    instead of creating a second exhaustive match to keep in sync. The audit's
+    hand-enumeration would have reproduced the very divergence being removed.
+
 #### Still open
 
-`1.3`+`2.8`, `1.2`, `1.4`, and `1.5`'s two oracle-wiring phases. Also filed and
-not taken: the GET retry-amplification asymmetry (primary WAL 4 attempts, fork
-WAL 16 for the same work), `find_edges_by_type_names`' topology-level snapshot
-leak, `input_mut`'s missing arms, and Python `TxExecuteBuilder`'s missing
-`cancellation_token`.
+**`1.5` phase 2** — the rule-registration and persisted-reload paths, and the
+TCK's `when_compile` step, still compile with the default oracle. The seam is
+fail-closed and self-consistent (`register` and reload agree with each other),
+so no program silently changes meaning; a plugin aggregate simply cannot be
+pre-registered yet.
+
+The blocking piece is a `Uni::build` reordering: `build_locy_registry_from_persisted`
+runs at `api/mod.rs:3315` while `plugin_registry` is not constructed until
+`:3363`. Tracing the intervening bindings says the move is feasible —
+`persistence_data_path` depends only on `uri` / `is_remote_uri`, both bound
+earlier, and hoisting the registry keeps it before the `StorageManager` is
+wrapped in `Arc`, which is the constraint documented at that site. It remains
+the single highest-risk edit in the sweep (the audit records five undocumented
+ordering dependencies in that function), so it wants its own change with room to
+verify.
+
+**`1.2`'s GC bound** — `ShadowCsr::gc` stays unwired pending a registry of
+in-flight `pinned_at_version` transactions. The bound and why `SnapshotManager`
+cannot supply it are documented on the function.
+
+Also filed and not taken: the GET retry-amplification asymmetry (primary WAL 4
+attempts, fork WAL 16 for the same work), `find_edges_by_type_names`'
+topology-level snapshot leak, `input_mut`'s missing arms, and Python
+`TxExecuteBuilder`'s missing `cancellation_token`.
 
 ### 1.1 — Schemaless edge property reads escape snapshot isolation
 

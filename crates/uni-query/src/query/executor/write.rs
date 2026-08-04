@@ -192,6 +192,11 @@ fn reject_virtual_edge_type_write(
     Ok(())
 }
 
+/// Error for a `COPY TO` format the exporters do not implement.
+fn unsupported_copy_format(format: &str) -> anyhow::Error {
+    anyhow!("COPY TO only supports 'parquet' and 'csv' formats, got '{format}'")
+}
+
 impl Executor {
     /// Extracts labels from a node value.
     ///
@@ -266,6 +271,47 @@ impl Executor {
         }
     }
 
+    /// Merge, enrich, validate and persist a vertex's properties for the
+    /// whole-entity `SET n = map` / `SET n += map` forms.
+    ///
+    /// Returns the enriched property map so the caller can refresh its
+    /// in-memory row binding (which differs between the typed `Value::Node`
+    /// and the map-encoded node shapes).
+    #[expect(clippy::too_many_arguments)]
+    async fn write_vertex_props(
+        &self,
+        vid: Vid,
+        labels: &[String],
+        new_props: HashMap<String, Value>,
+        replace: bool,
+        schema: &uni_common::core::schema::Schema,
+        writer: &Writer,
+        prop_manager: &PropertyManager,
+        params: &HashMap<String, Value>,
+        ctx: Option<&QueryContext>,
+        tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
+        prefetched: &Prefetch,
+    ) -> Result<HashMap<String, Value>> {
+        let current = read_vertex_props_with_prefetch(vid, prefetched, prop_manager, ctx).await?;
+        let write_props = Self::merge_props(current, new_props, replace);
+        let mut enriched = write_props.clone();
+        for label_name in labels {
+            self.enrich_properties_with_generated_columns(
+                label_name,
+                &mut enriched,
+                prop_manager,
+                params,
+                ctx,
+            )
+            .await?;
+        }
+        let enriched = Self::coerce_and_validate_props(enriched, schema, labels)?;
+        let _ = writer
+            .insert_vertex_with_labels(vid, enriched.clone(), labels, tx_l0)
+            .await?;
+        Ok(enriched)
+    }
+
     /// Applies a property map to a vertex or edge entity bound to `variable` in `row`.
     ///
     /// When `replace` is `true` the entity's property set is replaced: keys absent
@@ -307,23 +353,20 @@ impl Executor {
             Some(Value::Node(ref node)) => {
                 let vid = node.vid;
                 let labels = node.labels.clone();
-                let current =
-                    read_vertex_props_with_prefetch(vid, prefetched, prop_manager, ctx).await?;
-                let write_props = Self::merge_props(current, new_props, replace);
-                let mut enriched = write_props.clone();
-                for label_name in &labels {
-                    self.enrich_properties_with_generated_columns(
-                        label_name,
-                        &mut enriched,
+                let enriched = self
+                    .write_vertex_props(
+                        vid,
+                        &labels,
+                        new_props,
+                        replace,
+                        &schema,
+                        writer,
                         prop_manager,
                         params,
                         ctx,
+                        tx_l0,
+                        prefetched,
                     )
-                    .await?;
-                }
-                let enriched = Self::coerce_and_validate_props(enriched, &schema, &labels)?;
-                let _ = writer
-                    .insert_vertex_with_labels(vid, enriched.clone(), &labels, tx_l0)
                     .await?;
                 // Update the in-memory row binding
                 if let Some(Value::Node(n)) = row.get_mut(variable) {
@@ -333,23 +376,20 @@ impl Executor {
             Some(ref node_val) if Self::vid_from_value(node_val).is_ok() => {
                 let vid = Self::vid_from_value(node_val)?;
                 let labels = Self::extract_labels_from_node(node_val).unwrap_or_default();
-                let current =
-                    read_vertex_props_with_prefetch(vid, prefetched, prop_manager, ctx).await?;
-                let write_props = Self::merge_props(current, new_props, replace);
-                let mut enriched = write_props.clone();
-                for label_name in &labels {
-                    self.enrich_properties_with_generated_columns(
-                        label_name,
-                        &mut enriched,
+                let enriched = self
+                    .write_vertex_props(
+                        vid,
+                        &labels,
+                        new_props,
+                        replace,
+                        &schema,
+                        writer,
                         prop_manager,
                         params,
                         ctx,
+                        tx_l0,
+                        prefetched,
                     )
-                    .await?;
-                }
-                let enriched = Self::coerce_and_validate_props(enriched, &schema, &labels)?;
-                let _ = writer
-                    .insert_vertex_with_labels(vid, enriched.clone(), &labels, tx_l0)
                     .await?;
                 // Update the in-memory map-encoded node binding
                 if let Some(Value::Map(node_map)) = row.get_mut(variable) {
@@ -608,7 +648,9 @@ impl Executor {
         identifier: &str,
         path: &str,
         format: &str,
-        options: &HashMap<String, Value>,
+        // `LogicalPlan::CopyTo` carries format options, but neither exporter
+        // consumes them yet.
+        _options: &HashMap<String, Value>,
     ) -> Result<usize> {
         // Check schema to determine if identifier is an edge type or vertex label
         let schema = self.storage.schema_manager().schema();
@@ -623,7 +665,7 @@ impl Executor {
         // Try as vertex label
         if schema.get_label_case_insensitive(identifier).is_some() {
             return self
-                .export_vertex_label_in_format(identifier, path, format, options)
+                .export_vertex_label_in_format(identifier, path, format)
                 .await;
         }
 
@@ -636,7 +678,6 @@ impl Executor {
         label: &str,
         path: &str,
         format: &str,
-        _options: &HashMap<String, Value>,
     ) -> Result<usize> {
         match format {
             "parquet" => self.export_vertex_label(label, path).await,
@@ -711,10 +752,7 @@ impl Executor {
                 wtr.flush()?;
                 Ok(all_rows.len())
             }
-            _ => Err(anyhow!(
-                "COPY TO only supports 'parquet' and 'csv' formats, got '{}'",
-                format
-            )),
+            _ => Err(unsupported_copy_format(format)),
         }
     }
 
@@ -727,10 +765,7 @@ impl Executor {
         match format {
             "parquet" => self.export_edge_type(edge_type, path).await,
             "csv" => Err(anyhow!("CSV export not yet supported for edge types")),
-            _ => Err(anyhow!(
-                "COPY TO only supports 'parquet' and 'csv' formats, got '{}'",
-                format
-            )),
+            _ => Err(unsupported_copy_format(format)),
         }
     }
 
@@ -1725,17 +1760,7 @@ impl Executor {
     /// returned unchanged. Used only to build match keys / comparisons, never the
     /// value written to a created node.
     fn canonical_key_value(v: &Value) -> Value {
-        match v {
-            Value::Float(f)
-                if f.is_finite()
-                    && f.fract() == 0.0
-                    && *f >= i64::MIN as f64
-                    && *f <= i64::MAX as f64 =>
-            {
-                Value::Int(*f as i64)
-            }
-            other => other.clone(),
-        }
+        canonical_numeric_key(v)
     }
 
     /// Canonical sorted `(name, value)` key tuple for a MERGE row's key map.
@@ -3966,6 +3991,30 @@ impl Executor {
         ))
     }
 
+    /// Delete every element of a path: edges first, then nodes.
+    ///
+    /// Shared by the typed `Value::Path` arm and the `Path::try_from`
+    /// reconstruction fallback (Arrow round-trips lose the `Path` type).
+    async fn execute_delete_path(
+        &self,
+        path: &Path,
+        detach: bool,
+        writer: &Writer,
+        tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
+    ) -> Result<()> {
+        for edge in &path.edges {
+            let etype = self.resolve_edge_type_id_for_edge(edge, writer, tx_l0)?;
+            writer
+                .delete_edge(edge.eid, edge.src, edge.dst, etype, tx_l0)
+                .await?;
+        }
+        for node in &path.nodes {
+            self.execute_delete_vertex(node.vid, detach, Some(node.labels.clone()), writer, tx_l0)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Execute DELETE clause for a single item (vertex, edge, path, or null).
     pub(crate) async fn execute_delete_item_locked(
         &self,
@@ -3979,43 +4028,14 @@ impl Executor {
                 // DELETE null is a no-op per OpenCypher spec
             }
             Value::Path(path) => {
-                // Delete path edges first, then nodes
-                for edge in &path.edges {
-                    let etype = self.resolve_edge_type_id_for_edge(edge, writer, tx_l0)?;
-                    writer
-                        .delete_edge(edge.eid, edge.src, edge.dst, etype, tx_l0)
-                        .await?;
-                }
-                for node in &path.nodes {
-                    self.execute_delete_vertex(
-                        node.vid,
-                        detach,
-                        Some(node.labels.clone()),
-                        writer,
-                        tx_l0,
-                    )
+                self.execute_delete_path(path, detach, writer, tx_l0)
                     .await?;
-                }
             }
             _ => {
                 // Try Path reconstruction from Map first (Arrow loses Path type)
                 if let Ok(path) = Path::try_from(val) {
-                    for edge in &path.edges {
-                        let etype = self.resolve_edge_type_id_for_edge(edge, writer, tx_l0)?;
-                        writer
-                            .delete_edge(edge.eid, edge.src, edge.dst, etype, tx_l0)
-                            .await?;
-                    }
-                    for node in &path.nodes {
-                        self.execute_delete_vertex(
-                            node.vid,
-                            detach,
-                            Some(node.labels.clone()),
-                            writer,
-                            tx_l0,
-                        )
+                    self.execute_delete_path(&path, detach, writer, tx_l0)
                         .await?;
-                    }
                 } else if let Ok(vid) = Self::vid_from_value(val) {
                     let labels = Self::extract_labels_from_node(val);
                     self.execute_delete_vertex(vid, detach, labels, writer, tx_l0)
@@ -4081,20 +4101,7 @@ impl Executor {
         let edge_type_ids: Vec<u32> = schema.all_edge_type_ids();
 
         // Collect tombstoned edge IDs from both the writer L0 and tx L0.
-        let mut tombstoned_eids = std::collections::HashSet::new();
-        {
-            let writer_l0 = writer.l0_manager.get_current();
-            let guard = writer_l0.read();
-            for &eid in guard.tombstones.keys() {
-                tombstoned_eids.insert(eid);
-            }
-        }
-        if let Some(tx) = tx_l0 {
-            let guard = tx.read();
-            for &eid in guard.tombstones.keys() {
-                tombstoned_eids.insert(eid);
-            }
-        }
+        let tombstoned_eids = collect_tombstoned_eids(writer, tx_l0);
 
         let out_graph = self
             .storage

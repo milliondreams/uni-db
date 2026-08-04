@@ -38,8 +38,7 @@ use arrow_array::{Array, BooleanArray, RecordBatch, StringArray, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::ColumnarValue;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use futures::stream;
+use uni_plugin::adapter_common::batch_builder::batch_into_stream;
 use uni_plugin::scheduler::SchedulerControl;
 use uni_plugin::traits::background::Schedule;
 use uni_plugin::traits::procedure::{
@@ -372,16 +371,13 @@ fn list_invoke(scheduler: &dyn SchedulerControl) -> Result<SendableRecordBatchSt
         Arc::new(StringArray::from(statuses)),
         Arc::new(UInt32Array::from(failures)),
     ];
-    let batch = RecordBatch::try_new(Arc::clone(&schema), cols).map_err(|e| {
+    let batch = RecordBatch::try_new(schema, cols).map_err(|e| {
         FnError::new(
             0xB34,
             format!("uni.periodic.list: failed to build batch: {e}"),
         )
     })?;
-    Ok(Box::pin(RecordBatchStreamAdapter::new(
-        schema,
-        stream::iter(vec![Ok(batch)]),
-    )))
+    Ok(batch_into_stream(batch))
 }
 
 fn submit_invoke(
@@ -410,12 +406,9 @@ fn iterate_invoke(
         false,
     )]));
     let arr = Arc::new(UInt32Array::from(vec![1_u32])) as Arc<dyn Array>;
-    let batch = RecordBatch::try_new(Arc::clone(&schema), vec![arr])
+    let batch = RecordBatch::try_new(schema, vec![arr])
         .map_err(|e| FnError::new(0xB36, format!("uni.periodic.iterate: build batch: {e}")))?;
-    Ok(Box::pin(RecordBatchStreamAdapter::new(
-        schema,
-        stream::iter(vec![Ok(batch)]),
-    )))
+    Ok(batch_into_stream(batch))
 }
 
 fn commit_invoke(scheduler: &dyn SchedulerControl) -> Result<SendableRecordBatchStream, FnError> {
@@ -438,12 +431,9 @@ fn single_bool(name: &str, value: bool) -> Result<SendableRecordBatchStream, FnE
         false,
     )]));
     let arr = Arc::new(BooleanArray::from(vec![value])) as Arc<dyn Array>;
-    let batch = RecordBatch::try_new(Arc::clone(&schema), vec![arr])
+    let batch = RecordBatch::try_new(schema, vec![arr])
         .map_err(|e| FnError::new(0xB35, format!("uni.periodic.*: failed to build batch: {e}")))?;
-    Ok(Box::pin(RecordBatchStreamAdapter::new(
-        schema,
-        stream::iter(vec![Ok(batch)]),
-    )))
+    Ok(batch_into_stream(batch))
 }
 
 #[cfg(test)]

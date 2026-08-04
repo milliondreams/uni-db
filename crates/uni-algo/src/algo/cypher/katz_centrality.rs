@@ -4,7 +4,7 @@
 //! uni.algo.katzCentrality procedure implementation.
 
 use crate::algo::algorithms::{Algorithm, KatzCentrality, KatzCentralityConfig};
-use crate::algo::procedure_template::{GenericAlgoProcedure, GraphAlgoAdapter};
+use crate::algo::procedure_template::{GenericAlgoProcedure, GraphAlgoAdapter, vid_pair_rows};
 use crate::algo::procedures::{AlgoResultRow, ValueType};
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -39,13 +39,7 @@ impl GraphAlgoAdapter for KatzCentralityAdapter {
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {
-        Ok(result
-            .scores
-            .into_iter()
-            .map(|(vid, score)| AlgoResultRow {
-                values: vec![json!(vid.as_u64()), json!(score)],
-            })
-            .collect())
+        Ok(vid_pair_rows(result.scores))
     }
 
     fn include_reverse() -> bool {

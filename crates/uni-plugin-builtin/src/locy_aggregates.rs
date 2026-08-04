@@ -384,10 +384,8 @@ impl LocyAggState for SumState {
                 continue;
             }
             self.has_value = true;
-            if let Some(a) = col.as_any().downcast_ref::<Float64Array>() {
-                self.value += a.value(i);
-            } else if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
-                self.value += a.value(i) as f64;
+            if let Some(v) = numeric_at(col, i) {
+                self.value += v;
             }
         }
         Ok(())
@@ -560,10 +558,8 @@ impl LocyAggState for AvgState {
                 continue;
             }
             self.count += 1;
-            if let Some(a) = col.as_any().downcast_ref::<Float64Array>() {
-                self.sum += a.value(i);
-            } else if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
-                self.sum += a.value(i) as f64;
+            if let Some(v) = numeric_at(col, i) {
+                self.sum += v;
             }
         }
         Ok(())

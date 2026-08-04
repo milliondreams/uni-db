@@ -160,7 +160,10 @@ pub struct LocyModelInvokeExec {
 }
 
 impl LocyModelInvokeExec {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "constructor mirrors the exec's fields; a builder would add no clarity"
+    )]
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
         invocations: Vec<ModelInvocation>,

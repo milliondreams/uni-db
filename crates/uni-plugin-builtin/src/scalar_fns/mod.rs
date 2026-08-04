@@ -5,9 +5,8 @@
 //! once by `crate::BuiltinPlugin::register`.
 //!
 //! As of M2 only a placeholder identity function is wired; subsequent M2
-//! commits migrate the existing built-ins from
-//! `crates/uni-query/src/query/df_expr.rs:2130` and
-//! `crates/uni-query/src/query/df_udfs.rs:79` into this module hierarchy.
+//! commits migrate the existing built-ins from the `uni_query::query::df_expr`
+//! and `uni_query::query::df_udfs` modules into this module hierarchy.
 
 use std::sync::{Arc, OnceLock};
 

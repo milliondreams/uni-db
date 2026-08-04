@@ -11,9 +11,12 @@ use anyhow::{Result, anyhow};
 use arrow_array::builder::{
     BinaryBuilder, BooleanBufferBuilder, BooleanBuilder, Date32Builder, DurationMicrosecondBuilder,
     FixedSizeBinaryBuilder, FixedSizeListBuilder, Float32Builder, Float64Builder, Int32Builder,
-    Int64Builder, IntervalMonthDayNanoBuilder, LargeBinaryBuilder, ListBuilder, StringBuilder,
-    StructBuilder, Time64MicrosecondBuilder, Time64NanosecondBuilder, TimestampNanosecondBuilder,
-    UInt8Builder, UInt32Builder, UInt64Builder,
+    Int64Builder, IntervalMonthDayNanoBuilder, LargeBinaryBuilder, ListBuilder, PrimitiveBuilder,
+    StringBuilder, StructBuilder, Time64MicrosecondBuilder, Time64NanosecondBuilder,
+    TimestampNanosecondBuilder, UInt8Builder, UInt32Builder,
+};
+use arrow_array::types::{
+    ArrowPrimitiveType, Float32Type, Float64Type, Int32Type, Int64Type, UInt64Type,
 };
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, FixedSizeBinaryArray,
@@ -752,40 +755,34 @@ pub fn arrow_to_value(col: &dyn Array, row: usize, data_type: Option<&DataType>)
     Value::Null
 }
 
-fn values_to_uint64_array(values: &[Value]) -> ArrayRef {
-    let mut builder = UInt64Builder::with_capacity(values.len());
+/// Shared body of the primitive `values_to_*_array` helpers: build a nullable
+/// Arrow primitive array, appending a null wherever `extract` yields `None`.
+fn values_to_primitive<T: ArrowPrimitiveType>(
+    values: &[Value],
+    extract: impl Fn(&Value) -> Option<T::Native>,
+) -> ArrayRef {
+    let mut builder = PrimitiveBuilder::<T>::with_capacity(values.len());
     for v in values {
-        if let Some(n) = v.as_u64() {
-            builder.append_value(n);
-        } else {
-            builder.append_null();
+        match extract(v) {
+            Some(n) => builder.append_value(n),
+            None => builder.append_null(),
         }
     }
     Arc::new(builder.finish())
+}
+
+fn values_to_uint64_array(values: &[Value]) -> ArrayRef {
+    values_to_primitive::<UInt64Type>(values, Value::as_u64)
 }
 
 fn values_to_int64_array(values: &[Value]) -> ArrayRef {
-    let mut builder = Int64Builder::with_capacity(values.len());
-    for v in values {
-        if let Some(n) = v.as_i64() {
-            builder.append_value(n);
-        } else {
-            builder.append_null();
-        }
-    }
-    Arc::new(builder.finish())
+    values_to_primitive::<Int64Type>(values, Value::as_i64)
 }
 
 fn values_to_int32_array(values: &[Value]) -> ArrayRef {
-    let mut builder = Int32Builder::with_capacity(values.len());
-    for v in values {
-        if let Some(n) = v.as_i64() {
-            builder.append_value(n as i32);
-        } else {
-            builder.append_null();
-        }
-    }
-    Arc::new(builder.finish())
+    // Wrapping `as i32` is this path's long-standing narrowing behavior; do not
+    // swap it for `i32::try_from` (which would null out-of-range values).
+    values_to_primitive::<Int32Type>(values, |v| v.as_i64().map(|n| n as i32))
 }
 
 fn values_to_string_array(values: &[Value]) -> ArrayRef {
@@ -815,27 +812,11 @@ fn values_to_bool_array(values: &[Value]) -> ArrayRef {
 }
 
 fn values_to_float32_array(values: &[Value]) -> ArrayRef {
-    let mut builder = Float32Builder::with_capacity(values.len());
-    for v in values {
-        if let Some(n) = v.as_f64() {
-            builder.append_value(n as f32);
-        } else {
-            builder.append_null();
-        }
-    }
-    Arc::new(builder.finish())
+    values_to_primitive::<Float32Type>(values, |v| v.as_f64().map(|n| n as f32))
 }
 
 fn values_to_float64_array(values: &[Value]) -> ArrayRef {
-    let mut builder = Float64Builder::with_capacity(values.len());
-    for v in values {
-        if let Some(n) = v.as_f64() {
-            builder.append_value(n);
-        } else {
-            builder.append_null();
-        }
-    }
-    Arc::new(builder.finish())
+    values_to_primitive::<Float64Type>(values, Value::as_f64)
 }
 
 fn values_to_fixed_size_binary_array(values: &[Value], size: i32) -> Result<ArrayRef> {
@@ -1528,6 +1509,24 @@ pub fn build_multivector_array(values: &[Option<Value>], dimensions: usize) -> A
     Arc::new(builder.finish())
 }
 
+/// Collect one nullable scalar per row for a `PropertyExtractor` column build.
+///
+/// A row whose property is absent yields `None`, except on a *deleted* row,
+/// where `deleted_placeholder` stands in — deleted rows carry a type-specific
+/// zero so the column stays non-null for tombstones.
+fn collect_scalar<T: Copy>(
+    len: usize,
+    deleted: &[bool],
+    extract: impl Fn(usize) -> Option<T>,
+    deleted_placeholder: T,
+) -> Vec<Option<T>> {
+    let mut values = Vec::with_capacity(len);
+    for (i, &is_deleted) in deleted.iter().enumerate().take(len) {
+        values.push(extract(i).or(is_deleted.then_some(deleted_placeholder)));
+    }
+    values
+}
+
 impl<'a> PropertyExtractor<'a> {
     pub fn new(name: &'a str, data_type: &'a DataType) -> Self {
         Self { name, data_type }
@@ -1598,19 +1597,18 @@ impl<'a> PropertyExtractor<'a> {
     where
         F: Fn(usize) -> Option<&'a Value>,
     {
-        let mut values = Vec::with_capacity(len);
-        for (i, &is_deleted) in deleted.iter().enumerate().take(len) {
+        let values = collect_scalar(
+            len,
+            deleted,
             // i64 -> i32 via try_from: an out-of-range value becomes NULL rather
             // than silently wrapping to a different number. (review H13)
-            let val = get_props(i)
-                .and_then(|v| v.as_i64())
-                .and_then(|v| i32::try_from(v).ok());
-            if val.is_none() && is_deleted {
-                values.push(Some(0));
-            } else {
-                values.push(val);
-            }
-        }
+            |i| {
+                get_props(i)
+                    .and_then(|v| v.as_i64())
+                    .and_then(|v| i32::try_from(v).ok())
+            },
+            0,
+        );
         Ok(Arc::new(Int32Array::from(values)))
     }
 
@@ -1618,15 +1616,7 @@ impl<'a> PropertyExtractor<'a> {
     where
         F: Fn(usize) -> Option<&'a Value>,
     {
-        let mut values = Vec::with_capacity(len);
-        for (i, &is_deleted) in deleted.iter().enumerate().take(len) {
-            let val = get_props(i).and_then(|v| v.as_i64());
-            if val.is_none() && is_deleted {
-                values.push(Some(0));
-            } else {
-                values.push(val);
-            }
-        }
+        let values = collect_scalar(len, deleted, |i| get_props(i).and_then(|v| v.as_i64()), 0);
         Ok(Arc::new(Int64Array::from(values)))
     }
 
@@ -1845,15 +1835,12 @@ impl<'a> PropertyExtractor<'a> {
     where
         F: Fn(usize) -> Option<&'a Value>,
     {
-        let mut values = Vec::with_capacity(len);
-        for (i, &is_deleted) in deleted.iter().enumerate().take(len) {
-            let val = get_props(i).and_then(|v| v.as_f64()).map(|v| v as f32);
-            if val.is_none() && is_deleted {
-                values.push(Some(0.0));
-            } else {
-                values.push(val);
-            }
-        }
+        let values = collect_scalar(
+            len,
+            deleted,
+            |i| get_props(i).and_then(|v| v.as_f64()).map(|v| v as f32),
+            0.0,
+        );
         Ok(Arc::new(Float32Array::from(values)))
     }
 
@@ -1866,15 +1853,7 @@ impl<'a> PropertyExtractor<'a> {
     where
         F: Fn(usize) -> Option<&'a Value>,
     {
-        let mut values = Vec::with_capacity(len);
-        for (i, &is_deleted) in deleted.iter().enumerate().take(len) {
-            let val = get_props(i).and_then(|v| v.as_f64());
-            if val.is_none() && is_deleted {
-                values.push(Some(0.0));
-            } else {
-                values.push(val);
-            }
-        }
+        let values = collect_scalar(len, deleted, |i| get_props(i).and_then(|v| v.as_f64()), 0.0);
         Ok(Arc::new(Float64Array::from(values)))
     }
 
@@ -1882,15 +1861,12 @@ impl<'a> PropertyExtractor<'a> {
     where
         F: Fn(usize) -> Option<&'a Value>,
     {
-        let mut values = Vec::with_capacity(len);
-        for (i, &is_deleted) in deleted.iter().enumerate().take(len) {
-            let val = get_props(i).and_then(|v| v.as_bool());
-            if val.is_none() && is_deleted {
-                values.push(Some(false));
-            } else {
-                values.push(val);
-            }
-        }
+        let values = collect_scalar(
+            len,
+            deleted,
+            |i| get_props(i).and_then(|v| v.as_bool()),
+            false,
+        );
         Ok(Arc::new(BooleanArray::from(values)))
     }
 

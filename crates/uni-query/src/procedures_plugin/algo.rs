@@ -54,6 +54,8 @@ use uni_plugin::traits::procedure::{
 use uni_plugin::traits::scalar::ArgType;
 use uni_plugin::{FnError, PluginError, PluginRegistrar, QName, SideEffects};
 
+use crate::procedures_plugin::host_args::arg;
+use crate::query::df_graph::common::exec_err;
 use crate::query::df_graph::procedure_call::{
     build_typed_column, is_complex_value_type, json_to_value, value_type_to_arrow,
 };
@@ -262,12 +264,9 @@ impl ProcedurePlugin for AlgorithmProcedureAdapter {
             let mut rows: Vec<AlgoResultRow> = Vec::new();
             while let Some(row_res) = algo_stream.next().await {
                 if rows.len().is_multiple_of(1000) {
-                    host.check_timeout().map_err(|e| {
-                        datafusion::error::DataFusionError::Execution(e.to_string())
-                    })?;
+                    host.check_timeout().map_err(exec_err)?;
                 }
-                let row = row_res
-                    .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+                let row = row_res.map_err(exec_err)?;
                 rows.push(row);
             }
             build_algo_record_batch(&rows, &algo_yields, &plugin_yields)
@@ -514,12 +513,7 @@ fn build_plugin_signature(
     let mut args: Vec<NamedArgType> =
         Vec::with_capacity(algo_sig.args.len() + algo_sig.optional_args.len());
     for (name, vt) in &algo_sig.args {
-        args.push(NamedArgType {
-            name: smol_str::SmolStr::new(*name),
-            ty: ArgType::Primitive(value_type_to_arrow(vt)),
-            default: None,
-            doc: String::new(),
-        });
+        args.push(arg(name, ArgType::Primitive(value_type_to_arrow(vt)), ""));
     }
     for (name, vt, default) in &algo_sig.optional_args {
         args.push(NamedArgType {

@@ -4,10 +4,10 @@
 //! uni.algo.kCore procedure implementation.
 
 use crate::algo::algorithms::{Algorithm, KCore, KCoreConfig};
-use crate::algo::procedure_template::{GenericAlgoProcedure, GraphAlgoAdapter};
+use crate::algo::procedure_template::{GenericAlgoProcedure, GraphAlgoAdapter, vid_pair_rows};
 use crate::algo::procedures::{AlgoResultRow, ValueType};
 use anyhow::Result;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 pub struct KCoreAdapter;
 
@@ -30,13 +30,7 @@ impl GraphAlgoAdapter for KCoreAdapter {
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {
-        Ok(result
-            .core_numbers
-            .into_iter()
-            .map(|(vid, core)| AlgoResultRow {
-                values: vec![json!(vid.as_u64()), json!(core)],
-            })
-            .collect())
+        Ok(vid_pair_rows(result.core_numbers))
     }
 }
 

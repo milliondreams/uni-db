@@ -34,6 +34,24 @@ struct L0Snapshot {
     mutation_stats: uni_store::runtime::l0::MutationStats,
 }
 
+/// Await `fut`, bounded by `timeout` when the builder set one.
+///
+/// A `None` timeout awaits unbounded; an elapsed deadline surfaces as
+/// [`UniError::Timeout`] rather than a `tokio` `Elapsed`.
+async fn with_optional_timeout<T>(
+    timeout: Option<Duration>,
+    fut: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    match timeout {
+        Some(t) => tokio::time::timeout(t, fut)
+            .await
+            .map_err(|_| UniError::Timeout {
+                timeout_ms: t.as_millis() as u64,
+            })?,
+        None => fut.await,
+    }
+}
+
 /// Transaction isolation level.
 ///
 /// Uses commit-time serialization: `tx()` allocates a private L0 buffer
@@ -1477,6 +1495,36 @@ impl Transaction {
         crate::api::impl_query::CancelScope::new(Some(self.cancellation_token.clone()), caller)
     }
 
+    /// Run a parameterized mutation against this transaction's private L0 and
+    /// report the affected-row counters derived from the before/after L0 diff.
+    ///
+    /// Shared by the `ExecuteBuilder::run` and `TxQueryBuilder::execute`
+    /// terminals, which differ only in which builder holds the inputs. The
+    /// caller is responsible for the `mark_on_err` poisoning wrap.
+    pub(crate) async fn run_tx_mutation(
+        &self,
+        cypher: &str,
+        params: HashMap<String, Value>,
+        cancellation_token: Option<CancellationToken>,
+        timeout: Option<Duration>,
+    ) -> Result<ExecuteResult> {
+        self.check_completed()?;
+        self.run_exec_guards(cypher, &params).await?;
+        let before = self.snapshot_l0();
+        let cancel = self.cancel_scope(cancellation_token);
+        let fut = self.db.execute_internal_with_tx_l0(
+            cypher,
+            params,
+            self.tx_l0.clone(),
+            Some(self.id_reservoir.clone()),
+            self.read_snapshot(),
+            cancel,
+        );
+        let result = with_optional_timeout(timeout, fut).await?;
+        let after = self.snapshot_l0();
+        Ok(Self::compute_execute_result(&before, &after, &result))
+    }
+
     /// Snapshot the current L0 mutation count and stats for before/after comparison.
     fn snapshot_l0(&self) -> L0Snapshot {
         let l0 = self.tx_l0.read();
@@ -1631,31 +1679,14 @@ impl<'a> ExecuteBuilder<'a> {
     /// Inner body of [`Self::run`]; the public method wraps the result in
     /// `mark_on_err` so any failure poisons the transaction (bug #15).
     async fn run_inner(self) -> Result<ExecuteResult> {
-        self.tx.check_completed()?;
-        self.tx.run_exec_guards(&self.cypher, &self.params).await?;
-        let before = self.tx.snapshot_l0();
-        let cancel = self.tx.cancel_scope(self.cancellation_token);
-        let fut = self.tx.db.execute_internal_with_tx_l0(
-            &self.cypher,
-            self.params,
-            self.tx.tx_l0.clone(),
-            Some(self.tx.id_reservoir.clone()),
-            self.tx.read_snapshot(),
-            cancel,
-        );
-        let result = if let Some(t) = self.timeout {
-            tokio::time::timeout(t, fut)
-                .await
-                .map_err(|_| UniError::Timeout {
-                    timeout_ms: t.as_millis() as u64,
-                })??
-        } else {
-            fut.await?
-        };
-        let after = self.tx.snapshot_l0();
-        Ok(Transaction::compute_execute_result(
-            &before, &after, &result,
-        ))
+        self.tx
+            .run_tx_mutation(
+                &self.cypher,
+                self.params,
+                self.cancellation_token,
+                self.timeout,
+            )
+            .await
     }
 
     /// Execute the mutation with profiling, returning the [`ExecuteResult`]
@@ -1686,15 +1717,7 @@ impl<'a> ExecuteBuilder<'a> {
             Some(self.tx.id_reservoir.clone()),
             self.tx.read_snapshot(),
         );
-        let (result, profile) = if let Some(t) = self.timeout {
-            tokio::time::timeout(t, fut)
-                .await
-                .map_err(|_| UniError::Timeout {
-                    timeout_ms: t.as_millis() as u64,
-                })??
-        } else {
-            fut.await?
-        };
+        let (result, profile) = with_optional_timeout(self.timeout, fut).await?;
         let after = self.tx.snapshot_l0();
         Ok((
             Transaction::compute_execute_result(&before, &after, &result),
@@ -1740,31 +1763,14 @@ impl<'a> TxQueryBuilder<'a> {
     /// Inner body of [`Self::execute`]; the public method wraps the result in
     /// `mark_on_err` so any failure poisons the transaction (bug #15).
     async fn execute_inner(self) -> Result<ExecuteResult> {
-        self.tx.check_completed()?;
-        self.tx.run_exec_guards(&self.cypher, &self.params).await?;
-        let before = self.tx.snapshot_l0();
-        let cancel = self.tx.cancel_scope(self.cancellation_token);
-        let fut = self.tx.db.execute_internal_with_tx_l0(
-            &self.cypher,
-            self.params,
-            self.tx.tx_l0.clone(),
-            Some(self.tx.id_reservoir.clone()),
-            self.tx.read_snapshot(),
-            cancel,
-        );
-        let result = if let Some(t) = self.timeout {
-            tokio::time::timeout(t, fut)
-                .await
-                .map_err(|_| UniError::Timeout {
-                    timeout_ms: t.as_millis() as u64,
-                })??
-        } else {
-            fut.await?
-        };
-        let after = self.tx.snapshot_l0();
-        Ok(Transaction::compute_execute_result(
-            &before, &after, &result,
-        ))
+        self.tx
+            .run_tx_mutation(
+                &self.cypher,
+                self.params,
+                self.cancellation_token,
+                self.timeout,
+            )
+            .await
     }
 
     /// Execute as a query and return rows.
@@ -1787,15 +1793,7 @@ impl<'a> TxQueryBuilder<'a> {
             self.tx.read_snapshot(),
             cancel,
         );
-        if let Some(t) = self.timeout {
-            tokio::time::timeout(t, fut)
-                .await
-                .map_err(|_| UniError::Timeout {
-                    timeout_ms: t.as_millis() as u64,
-                })?
-        } else {
-            fut.await
-        }
+        with_optional_timeout(self.timeout, fut).await
     }
 
     /// Execute the query and return the first row, or `None` if empty.

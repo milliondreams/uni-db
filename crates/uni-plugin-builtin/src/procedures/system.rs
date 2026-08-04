@@ -6,8 +6,7 @@ use arrow_array::{Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::ColumnarValue;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use futures::stream;
+use uni_plugin::adapter_common::batch_builder::batch_into_stream;
 use uni_plugin::traits::procedure::{
     NamedArgType, ProcedureContext, ProcedureMode, ProcedurePlugin, ProcedureSignature,
 };
@@ -63,16 +62,13 @@ impl ProcedurePlugin for EchoProcedure {
         let schema: SchemaRef =
             Arc::new(Schema::new(vec![Field::new("echo", DataType::Utf8, false)]));
         let arr = Arc::new(StringArray::from(vec![message])) as Arc<dyn Array>;
-        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![arr]).map_err(|e| {
+        let batch = RecordBatch::try_new(schema, vec![arr]).map_err(|e| {
             FnError::new(
                 0x600,
                 format!("uni.system.echo: failed to build output batch: {e}"),
             )
         })?;
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            stream::iter(vec![Ok(batch)]),
-        )))
+        Ok(batch_into_stream(batch))
     }
 }
 

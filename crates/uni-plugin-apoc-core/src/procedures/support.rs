@@ -9,13 +9,12 @@
 
 use std::sync::{Arc, OnceLock};
 
-use arrow_array::{Array, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow_array::{Array, BooleanArray, Float64Array, Int64Array, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::ColumnarValue;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::scalar::ScalarValue;
-use futures::stream;
+use uni_plugin::adapter_common::batch_builder::{batch_into_stream, single_row_record_batch};
 use uni_plugin::traits::procedure::{ProcedurePlugin, ProcedureSignature};
 use uni_plugin::{FnError, PluginError, PluginRegistrar, QName};
 
@@ -97,12 +96,9 @@ pub(super) fn one_row_stream(
     batch_code: u32,
     label: &str,
 ) -> Result<SendableRecordBatchStream, FnError> {
-    let batch = RecordBatch::try_new(Arc::clone(&schema), vec![array])
+    let batch = single_row_record_batch(schema, vec![array])
         .map_err(|e| FnError::new(batch_code, format!("{label}: {e}")))?;
-    Ok(Box::pin(RecordBatchStreamAdapter::new(
-        schema,
-        stream::iter(vec![Ok(batch)]),
-    )))
+    Ok(batch_into_stream(batch))
 }
 
 /// Single-column `result` schema of the given type and nullability.

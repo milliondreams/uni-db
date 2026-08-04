@@ -1674,7 +1674,6 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
                 right.clone(),
                 &left_type,
                 &right_type,
-                input_schema,
             )? {
                 return Ok(result);
             }
@@ -1760,7 +1759,6 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
         right: Arc<dyn PhysicalExpr>,
         left_type: &Option<DataType>,
         right_type: &Option<DataType>,
-        _input_schema: &Schema,
     ) -> Result<Option<Arc<dyn PhysicalExpr>>> {
         use datafusion::logical_expr::Operator;
 

@@ -82,6 +82,55 @@ fn check_no_reserved_columns(schema: &SchemaRef) -> Result<(), String> {
     Ok(())
 }
 
+/// Build the `{variable}.{prop}` property fields of an adapted output schema.
+///
+/// Property types are resolved by name against the catalog table's schema;
+/// properties the table does not expose materialize as nullable `Utf8`.
+/// Names listed in `skip` are surfaced via synthesized system columns instead
+/// and must not be double-projected.
+fn property_fields(
+    variable: &str,
+    properties: &[String],
+    table_schema: &SchemaRef,
+    skip: &[&str],
+) -> Vec<Field> {
+    let table_by_name: HashMap<&str, &Field> = table_schema
+        .fields()
+        .iter()
+        .map(|f| (f.name().as_str(), f.as_ref()))
+        .collect();
+    let mut fields = Vec::with_capacity(properties.len());
+    for prop in properties {
+        if skip.contains(&prop.as_str()) {
+            continue;
+        }
+        let col_name = format!("{variable}.{prop}");
+        let (dtype, nullable) = match table_by_name.get(prop.as_str()) {
+            Some(f) => (f.data_type().clone(), true),
+            None => (DataType::Utf8, true),
+        };
+        fields.push(Field::new(&col_name, dtype, nullable));
+    }
+    fields
+}
+
+/// Open a catalog table scan, mapping an empty projection to "all columns".
+fn scan_table(
+    table: &dyn CatalogTable,
+    projection: &[usize],
+    filters: &[DfExpr],
+    limit: Option<usize>,
+) -> DFResult<SendableRecordBatchStream> {
+    let projection_opt = if projection.is_empty() {
+        None
+    } else {
+        Some(projection)
+    };
+    table.scan(projection_opt, filters, limit).map_err(|e| {
+        datafusion::error::DataFusionError::Execution(format!("CatalogTable::scan failed: {e}"))
+    })
+}
+
 // ── Vertex scan ──────────────────────────────────────────────────────
 
 /// Adapts a virtual-label `CatalogTable` into a graph-row-shaped
@@ -175,19 +224,7 @@ impl CatalogVertexScanExec {
             Field::new(format!("{variable}._vid"), DataType::UInt64, false),
             Field::new(format!("{variable}._labels"), labels_data_type(), false),
         ];
-        let table_by_name: HashMap<&str, &Field> = table_schema
-            .fields()
-            .iter()
-            .map(|f| (f.name().as_str(), f.as_ref()))
-            .collect();
-        for prop in properties {
-            let col_name = format!("{variable}.{prop}");
-            let (dtype, nullable) = match table_by_name.get(prop.as_str()) {
-                Some(f) => (f.data_type().clone(), true),
-                None => (DataType::Utf8, true),
-            };
-            fields.push(Field::new(&col_name, dtype, nullable));
-        }
+        fields.extend(property_fields(variable, properties, table_schema, &[]));
         Arc::new(Schema::new(fields))
     }
 }
@@ -258,19 +295,12 @@ impl ExecutionPlan for CatalogVertexScanExec {
             .iter()
             .filter_map(|p| table_schema.index_of(p).ok())
             .collect();
-        let projection_opt = if projection.is_empty() {
-            None
-        } else {
-            Some(projection.as_slice())
-        };
-        let stream = self
-            .table
-            .scan(projection_opt, &self.pushdown_filters, self.pushdown_limit)
-            .map_err(|e| {
-                datafusion::error::DataFusionError::Execution(format!(
-                    "CatalogTable::scan failed: {e}"
-                ))
-            })?;
+        let stream = scan_table(
+            self.table.as_ref(),
+            &projection,
+            &self.pushdown_filters,
+            self.pushdown_limit,
+        )?;
         Ok(Box::pin(VertexAdapterStream {
             inner: stream,
             output_schema: self.schema.clone(),
@@ -471,24 +501,14 @@ impl CatalogEdgeScanExec {
             Field::new(format!("{variable}._src_vid"), DataType::UInt64, false),
             Field::new(format!("{variable}._dst_vid"), DataType::UInt64, false),
         ];
-        let table_by_name: HashMap<&str, &Field> = table_schema
-            .fields()
-            .iter()
-            .map(|f| (f.name().as_str(), f.as_ref()))
-            .collect();
-        for prop in properties {
-            if prop == "src_id" || prop == "dst_id" {
-                // These are surfaced via the synthesized `_src_vid` /
-                // `_dst_vid` system columns; don't double-project.
-                continue;
-            }
-            let col_name = format!("{variable}.{prop}");
-            let (dtype, nullable) = match table_by_name.get(prop.as_str()) {
-                Some(f) => (f.data_type().clone(), true),
-                None => (DataType::Utf8, true),
-            };
-            fields.push(Field::new(&col_name, dtype, nullable));
-        }
+        // `src_id` / `dst_id` are surfaced via the synthesized `_src_vid` /
+        // `_dst_vid` system columns; don't double-project them.
+        fields.extend(property_fields(
+            variable,
+            properties,
+            table_schema,
+            &["src_id", "dst_id"],
+        ));
         Arc::new(Schema::new(fields))
     }
 }
@@ -550,19 +570,12 @@ impl ExecutionPlan for CatalogEdgeScanExec {
             .iter()
             .filter_map(|p| table_schema.index_of(p).ok())
             .collect();
-        let projection_opt = if projection.is_empty() {
-            None
-        } else {
-            Some(projection.as_slice())
-        };
-        let stream = self
-            .table
-            .scan(projection_opt, &self.pushdown_filters, self.pushdown_limit)
-            .map_err(|e| {
-                datafusion::error::DataFusionError::Execution(format!(
-                    "CatalogTable::scan failed: {e}"
-                ))
-            })?;
+        let stream = scan_table(
+            self.table.as_ref(),
+            &projection,
+            &self.pushdown_filters,
+            self.pushdown_limit,
+        )?;
         Ok(Box::pin(EdgeAdapterStream {
             inner: stream,
             output_schema: self.schema.clone(),

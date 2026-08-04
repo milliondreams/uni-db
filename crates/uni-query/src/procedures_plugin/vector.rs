@@ -16,12 +16,12 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
 use uni_common::Value;
 use uni_plugin::traits::procedure::{
-    NamedArgType, ProcedureContext, ProcedureMode, ProcedurePlugin, ProcedureSignature,
+    ProcedureContext, ProcedureMode, ProcedurePlugin, ProcedureSignature,
 };
 use uni_plugin::traits::scalar::ArgType;
 use uni_plugin::{FnError, PluginError, PluginRegistrar, QName, SideEffects};
 
-use crate::procedures_plugin::host_args::{columnar_args_to_values, require_host};
+use crate::procedures_plugin::host_args::{arg, columnar_args_to_values, require_host};
 use crate::query::df_graph::search_procedures::run_vector_query;
 use crate::query::executor::procedure_host::QueryProcedureHost;
 
@@ -31,50 +31,42 @@ fn signature() -> &'static ProcedureSignature {
     static SIG: OnceLock<ProcedureSignature> = OnceLock::new();
     SIG.get_or_init(|| ProcedureSignature {
         args: vec![
-            NamedArgType {
-                name: smol_str::SmolStr::new("label"),
-                ty: ArgType::Primitive(DataType::Utf8),
-                default: None,
-                doc: "Vertex label to search.".to_owned(),
-            },
-            NamedArgType {
-                name: smol_str::SmolStr::new("property"),
-                ty: ArgType::Primitive(DataType::Utf8),
-                default: None,
-                doc: "Vector property name on the label.".to_owned(),
-            },
-            NamedArgType {
-                name: smol_str::SmolStr::new("query"),
-                ty: ArgType::CypherValue,
-                default: None,
-                doc: "Query vector (List<Float>) or query text (String, auto-embedded).".to_owned(),
-            },
-            NamedArgType {
-                name: smol_str::SmolStr::new("k"),
-                ty: ArgType::Primitive(DataType::Int64),
-                default: None,
-                doc: "Number of nearest neighbours to return.".to_owned(),
-            },
-            NamedArgType {
-                name: smol_str::SmolStr::new("filter"),
-                ty: ArgType::Primitive(DataType::Utf8),
-                default: None,
-                doc: "Optional pushdown filter expression.".to_owned(),
-            },
-            NamedArgType {
-                name: smol_str::SmolStr::new("threshold"),
-                ty: ArgType::Primitive(DataType::Float64),
-                default: None,
-                doc: "Optional maximum distance threshold (post-filter).".to_owned(),
-            },
-            NamedArgType {
-                name: smol_str::SmolStr::new("options"),
-                ty: ArgType::CypherValue,
-                default: None,
-                doc: "Optional options map: ANN tuning (`nprobes`, `refine_factor`, \
-                      `ef_search`), candidate `over_fetch`, and reranker keys."
-                    .to_owned(),
-            },
+            arg(
+                "label",
+                ArgType::Primitive(DataType::Utf8),
+                "Vertex label to search.",
+            ),
+            arg(
+                "property",
+                ArgType::Primitive(DataType::Utf8),
+                "Vector property name on the label.",
+            ),
+            arg(
+                "query",
+                ArgType::CypherValue,
+                "Query vector (List<Float>) or query text (String, auto-embedded).",
+            ),
+            arg(
+                "k",
+                ArgType::Primitive(DataType::Int64),
+                "Number of nearest neighbours to return.",
+            ),
+            arg(
+                "filter",
+                ArgType::Primitive(DataType::Utf8),
+                "Optional pushdown filter expression.",
+            ),
+            arg(
+                "threshold",
+                ArgType::Primitive(DataType::Float64),
+                "Optional maximum distance threshold (post-filter).",
+            ),
+            arg(
+                "options",
+                ArgType::CypherValue,
+                "Optional options map: ANN tuning (`nprobes`, `refine_factor`, \
+                 `ef_search`), candidate `over_fetch`, and reranker keys.",
+            ),
         ],
         yields: vector_query_yields(),
         mode: ProcedureMode::Read,

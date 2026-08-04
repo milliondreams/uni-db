@@ -4,10 +4,10 @@
 //! uni.algo.topoSort procedure implementation.
 
 use crate::algo::algorithms::{Algorithm, TopologicalSort, TopologicalSortConfig};
-use crate::algo::procedure_template::{GenericAlgoProcedure, GraphAlgoAdapter};
+use crate::algo::procedure_template::{GenericAlgoProcedure, GraphAlgoAdapter, vid_pair_rows};
 use crate::algo::procedures::{AlgoResultRow, ValueType};
 use anyhow::{Result, anyhow};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 pub struct TopologicalSortAdapter;
 
@@ -34,14 +34,12 @@ impl GraphAlgoAdapter for TopologicalSortAdapter {
             ));
         }
 
-        Ok(result
+        let ranked = result
             .sorted_nodes
             .into_iter()
             .enumerate()
-            .map(|(i, vid)| AlgoResultRow {
-                values: vec![json!(vid.as_u64()), json!(i as i64)],
-            })
-            .collect())
+            .map(|(i, vid)| (vid, i as i64));
+        Ok(vid_pair_rows(ranked))
     }
 }
 

@@ -4387,6 +4387,45 @@ impl Executor {
         }
     }
 
+    /// Resolve a COPY target to its label / edge-type metadata.
+    ///
+    /// Exactly one of the two is `Some` in practice; the error covers the
+    /// "neither" case so callers can branch on `label_meta` directly.
+    fn resolve_copy_target<'s>(
+        schema: &'s uni_common::core::schema::Schema,
+        target: &str,
+    ) -> Result<(
+        Option<&'s uni_common::core::schema::LabelMeta>,
+        Option<&'s uni_common::core::schema::EdgeTypeMeta>,
+    )> {
+        let label_meta = schema.labels.get(target);
+        let edge_meta = schema.edge_types.get(target);
+
+        if label_meta.is_none() && edge_meta.is_none() {
+            return Err(anyhow!("Target '{}' not found in schema", target));
+        }
+        Ok((label_meta, edge_meta))
+    }
+
+    /// Parse the CSV `delimiter` / `header` COPY options, returning
+    /// `(delimiter, has_header)`.
+    fn csv_dialect(options: &HashMap<String, Value>) -> (u8, bool) {
+        let delimiter_str = options
+            .get("delimiter")
+            .and_then(|v| v.as_str())
+            .unwrap_or(",");
+        let delimiter = if delimiter_str.is_empty() {
+            b','
+        } else {
+            delimiter_str.as_bytes()[0]
+        };
+        let has_header = options
+            .get("header")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        (delimiter, has_header)
+    }
+
     pub(crate) async fn execute_csv_import(
         &self,
         target: &str,
@@ -4404,27 +4443,10 @@ impl Executor {
         let schema = self.storage.schema_manager().schema();
 
         // 1. Determine if target is Label or EdgeType
-        let label_meta = schema.labels.get(target);
-        let edge_meta = schema.edge_types.get(target);
-
-        if label_meta.is_none() && edge_meta.is_none() {
-            return Err(anyhow!("Target '{}' not found in schema", target));
-        }
+        let (label_meta, edge_meta) = Self::resolve_copy_target(&schema, target)?;
 
         // 2. Open CSV
-        let delimiter_str = options
-            .get("delimiter")
-            .and_then(|v| v.as_str())
-            .unwrap_or(",");
-        let delimiter = if delimiter_str.is_empty() {
-            b','
-        } else {
-            delimiter_str.as_bytes()[0]
-        };
-        let has_header = options
-            .get("header")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
+        let (delimiter, has_header) = Self::csv_dialect(options);
 
         let mut rdr = csv::ReaderBuilder::new()
             .delimiter(delimiter)
@@ -4559,12 +4581,7 @@ impl Executor {
         let schema = self.storage.schema_manager().schema();
 
         // 1. Determine if target is Label or EdgeType
-        let label_meta = schema.labels.get(target);
-        let edge_meta = schema.edge_types.get(target);
-
-        if label_meta.is_none() && edge_meta.is_none() {
-            return Err(anyhow!("Target '{}' not found in schema", target));
-        }
+        let (label_meta, edge_meta) = Self::resolve_copy_target(&schema, target)?;
 
         // 2. Open Parquet - support both local and cloud URLs
         let reader = if is_cloud_url(source) {
@@ -5242,26 +5259,9 @@ impl Executor {
         let validated_dest = self.validate_path(source)?;
 
         let schema = self.storage.schema_manager().schema();
-        let label_meta = schema.labels.get(target);
-        let edge_meta = schema.edge_types.get(target);
+        let (label_meta, edge_meta) = Self::resolve_copy_target(&schema, target)?;
 
-        if label_meta.is_none() && edge_meta.is_none() {
-            return Err(anyhow!("Target '{}' not found in schema", target));
-        }
-
-        let delimiter_str = options
-            .get("delimiter")
-            .and_then(|v| v.as_str())
-            .unwrap_or(",");
-        let delimiter = if delimiter_str.is_empty() {
-            b','
-        } else {
-            delimiter_str.as_bytes()[0]
-        };
-        let has_header = options
-            .get("header")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
+        let (delimiter, has_header) = Self::csv_dialect(options);
 
         let mut wtr = csv::WriterBuilder::new()
             .delimiter(delimiter)
@@ -5363,12 +5363,7 @@ impl Executor {
     ) -> Result<Vec<HashMap<String, Value>>> {
         let schema_manager = self.storage.schema_manager();
         let schema = schema_manager.schema();
-        let label_meta = schema.labels.get(target);
-        let edge_meta = schema.edge_types.get(target);
-
-        if label_meta.is_none() && edge_meta.is_none() {
-            return Err(anyhow!("Target '{}' not found in schema", target));
-        }
+        let (label_meta, edge_meta) = Self::resolve_copy_target(&schema, target)?;
 
         let arrow_schema = if label_meta.is_some() {
             let dataset = self.storage.vertex_dataset(target)?;
@@ -5719,21 +5714,7 @@ impl Executor {
             return Ok(());
         }
 
-        let mut tombstoned_eids: std::collections::HashSet<uni_common::core::id::Eid> =
-            std::collections::HashSet::new();
-        {
-            let writer_l0 = writer.l0_manager.get_current();
-            let guard = writer_l0.read();
-            for &eid in guard.tombstones.keys() {
-                tombstoned_eids.insert(eid);
-            }
-        }
-        if let Some(tx) = tx_l0 {
-            let guard = tx.read();
-            for &eid in guard.tombstones.keys() {
-                tombstoned_eids.insert(eid);
-            }
-        }
+        let tombstoned_eids = collect_tombstoned_eids(writer, tx_l0);
 
         let (out_graph, in_graph) = self.batch_load_incident_edges(vids, writer).await?;
 

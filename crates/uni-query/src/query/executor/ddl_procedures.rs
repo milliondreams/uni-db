@@ -93,6 +93,38 @@ struct ConstraintConfig {
     name: Option<String>,
 }
 
+/// Deserialize the `config` map of `create_label` / `create_edge_type`.
+fn parse_label_config(config_val: &Value) -> Result<LabelConfig> {
+    let json_val: serde_json::Value = config_val.clone().into();
+    serde_json::from_value(json_val).map_err(|e| {
+        UniError::InvalidArgument {
+            arg: "config".to_string(),
+            message: e.to_string(),
+        }
+        .into()
+    })
+}
+
+/// Register every declared property against `name` (a label or an edge type).
+fn add_properties(
+    storage: &StorageManager,
+    name: &str,
+    properties: HashMap<String, PropertyConfig>,
+) -> Result<()> {
+    for (prop_name, prop_config) in properties {
+        validate_identifier(&prop_name)?;
+        let data_type = parse_data_type(&prop_config.data_type)?;
+        storage.schema_manager().add_property_with_desc(
+            name,
+            &prop_name,
+            data_type,
+            prop_config.nullable,
+            prop_config.description,
+        )?;
+    }
+    Ok(())
+}
+
 pub async fn create_label(
     storage: &StorageManager,
     name: &str,
@@ -107,12 +139,7 @@ pub async fn create_label(
         .into());
     }
 
-    let json_val: serde_json::Value = config_val.clone().into();
-    let config: LabelConfig =
-        serde_json::from_value(json_val).map_err(|e| UniError::InvalidArgument {
-            arg: "config".to_string(),
-            message: e.to_string(),
-        })?;
+    let config = parse_label_config(config_val)?;
 
     // Create label
     storage
@@ -120,17 +147,7 @@ pub async fn create_label(
         .add_label_with_desc(name, config.description)?;
 
     // Add properties
-    for (prop_name, prop_config) in config.properties {
-        validate_identifier(&prop_name)?;
-        let data_type = parse_data_type(&prop_config.data_type)?;
-        storage.schema_manager().add_property_with_desc(
-            name,
-            &prop_name,
-            data_type,
-            prop_config.nullable,
-            prop_config.description,
-        )?;
-    }
+    add_properties(storage, name, config.properties)?;
 
     // Add indexes
     for idx in config.indexes {
@@ -162,12 +179,7 @@ pub async fn create_edge_type(
 ) -> Result<bool> {
     validate_identifier(name)?;
 
-    let json_val: serde_json::Value = config_val.clone().into();
-    let config: LabelConfig =
-        serde_json::from_value(json_val).map_err(|e| UniError::InvalidArgument {
-            arg: "config".to_string(),
-            message: e.to_string(),
-        })?;
+    let config = parse_label_config(config_val)?;
 
     storage.schema_manager().add_edge_type_with_desc(
         name,
@@ -176,17 +188,7 @@ pub async fn create_edge_type(
         config.description,
     )?;
 
-    for (prop_name, prop_config) in config.properties {
-        validate_identifier(&prop_name)?;
-        let data_type = parse_data_type(&prop_config.data_type)?;
-        storage.schema_manager().add_property_with_desc(
-            name,
-            &prop_name,
-            data_type,
-            prop_config.nullable,
-            prop_config.description,
-        )?;
-    }
+    add_properties(storage, name, config.properties)?;
 
     // Constraints
     for c in config.constraints {

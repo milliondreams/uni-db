@@ -34,7 +34,7 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Pla
 use parking_lot::RwLock;
 use uni_algo::algo::GraphProjection;
 
-use crate::query::df_graph::common::{collect_all_partitions, compute_plan_properties};
+use crate::query::df_graph::common::{collect_all_partitions, compute_plan_properties, exec_err};
 
 /// The per-round state shared between the driver and its cached round plan.
 ///
@@ -216,7 +216,7 @@ impl ExecutionPlan for PowerStepExec {
                 Arc::new(Float64Array::from(next)),
             ],
         )
-        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+        .map_err(exec_err)?;
         let schema = self.schema.clone();
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             schema,
@@ -421,7 +421,7 @@ impl ExecutionPlan for GraphGatherStepExec {
                 Arc::new(Float64Array::from(next)),
             ],
         )
-        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+        .map_err(exec_err)?;
         let schema = self.schema.clone();
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             schema,

@@ -23,7 +23,7 @@
 //!           {"list": [1,2,3], "item": 3}]
 //! ```
 
-use crate::query::df_graph::common::{arrow_err, compute_plan_properties};
+use crate::query::df_graph::common::{arrow_err, compute_plan_properties, exec_err};
 use arrow::compute::take;
 use arrow_array::builder::{
     BooleanBuilder, Float64Builder, Int64Builder, LargeBinaryBuilder, StringBuilder,
@@ -470,16 +470,14 @@ impl GraphUnwindStream {
                             &name.to_uppercase(),
                             &eval_args,
                         )
-                        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))
+                        .map_err(exec_err)
                     }
                     "split" => {
                         let mut eval_args = Vec::with_capacity(args.len());
                         for arg in args {
                             eval_args.push(self.evaluate_expr_impl(arg, batch, row_idx)?);
                         }
-                        crate::query::expr_eval::eval_split(&eval_args).map_err(|e| {
-                            datafusion::error::DataFusionError::Execution(e.to_string())
-                        })
+                        crate::query::expr_eval::eval_split(&eval_args).map_err(exec_err)
                     }
                     _ => {
                         // Unsupported function - return empty list
@@ -492,8 +490,7 @@ impl GraphUnwindStream {
             Expr::BinaryOp { left, op, right } => {
                 let l = self.evaluate_expr_impl(left, batch, row_idx)?;
                 let r = self.evaluate_expr_impl(right, batch, row_idx)?;
-                crate::query::expr_eval::eval_binary_op(&l, op, &r)
-                    .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))
+                crate::query::expr_eval::eval_binary_op(&l, op, &r).map_err(exec_err)
             }
 
             // Map literal: {a: 1, b: 'x'}

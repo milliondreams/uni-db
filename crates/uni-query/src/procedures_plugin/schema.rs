@@ -22,11 +22,13 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
 use uni_common::Value;
 use uni_plugin::traits::procedure::{
-    NamedArgType, ProcedureContext, ProcedureMode, ProcedurePlugin, ProcedureSignature,
+    ProcedureContext, ProcedureMode, ProcedurePlugin, ProcedureSignature,
 };
 use uni_plugin::traits::scalar::ArgType;
 use uni_plugin::{FnError, PluginError, PluginRegistrar, QName, SideEffects};
 
+use crate::procedures_plugin::host_args::arg;
+use crate::query::df_graph::common::exec_err;
 use crate::query::df_graph::procedure_call::build_typed_column;
 use crate::query::executor::procedure_host::QueryProcedureHost;
 
@@ -152,8 +154,7 @@ impl ProcedurePlugin for SchemaLabelsProc {
                 ]));
             }
             let schema = Arc::new(Schema::new(schema_labels_signature().yields.clone()));
-            rows_to_batch(rows, schema)
-                .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))
+            rows_to_batch(rows, schema).map_err(exec_err)
         });
         let out_schema = Arc::new(Schema::new(schema_labels_signature().yields.clone()));
         Ok(Box::pin(RecordBatchStreamAdapter::new(out_schema, stream)))
@@ -414,12 +415,11 @@ struct SchemaLabelInfoProc;
 fn schema_label_info_signature() -> &'static ProcedureSignature {
     static SIG: OnceLock<ProcedureSignature> = OnceLock::new();
     SIG.get_or_init(|| ProcedureSignature {
-        args: vec![NamedArgType {
-            name: smol_str::SmolStr::new("label"),
-            ty: ArgType::Primitive(DataType::Utf8),
-            default: None,
-            doc: "Label name to introspect.".to_owned(),
-        }],
+        args: vec![arg(
+            "label",
+            ArgType::Primitive(DataType::Utf8),
+            "Label name to introspect.",
+        )],
         yields: vec![
             Field::new("property", DataType::Utf8, true),
             Field::new("dataType", DataType::Utf8, true),

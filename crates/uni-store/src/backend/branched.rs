@@ -268,7 +268,6 @@ impl StorageBackend for BranchedBackend {
         // `_deleted = false` guard, and the version HWM pin are all
         // honored — matching the non-branch path's semantics.
         if let Some(branch) = self.scope.branch_for(table) {
-            let _ = metric;
             return self
                 .branching()?
                 .vector_search_on_branch(table, &branch, column, query, k, &filter, opts)

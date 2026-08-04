@@ -19,10 +19,9 @@ use arrow_array::{Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::ColumnarValue;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::scalar::ScalarValue;
-use futures::stream;
 use uni_plugin::FnError;
+use uni_plugin::adapter_common::batch_builder::batch_into_stream;
 use uni_plugin::traits::procedure::{
     ProcedureContext, ProcedureMode, ProcedurePlugin, ProcedureSignature,
 };
@@ -189,16 +188,13 @@ impl ProcedurePlugin for SyntheticProcedurePlugin {
             .map(|r| serde_json::to_string(r).unwrap_or_else(|_| "{}".to_owned()))
             .collect();
         let arr = Arc::new(StringArray::from(row_jsons)) as Arc<dyn Array>;
-        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![arr]).map_err(|e| {
+        let batch = RecordBatch::try_new(schema, vec![arr]).map_err(|e| {
             FnError::new(
                 0xD04,
                 format!("declared procedure `{}`: build batch: {e}", self.qname),
             )
         })?;
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            stream::iter(vec![Ok(batch)]),
-        )))
+        Ok(batch_into_stream(batch))
     }
 }
 

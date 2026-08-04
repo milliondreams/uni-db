@@ -32,7 +32,7 @@ use uni_cypher::ast::Expr;
 
 use crate::query::df_graph::GraphExecutionContext;
 use crate::query::df_graph::common::{
-    arrow_err, compute_plan_properties, evaluate_simple_expr, labels_data_type,
+    arrow_err, compute_plan_properties, evaluate_simple_expr, exec_err, labels_data_type,
 };
 use crate::query::df_graph::scan::{property_field, resolve_property_type};
 
@@ -560,9 +560,7 @@ impl Stream for ProcedureCallStream {
                     let schema = self.schema.clone();
 
                     let fut = async move {
-                        graph_ctx.check_timeout().map_err(|e| {
-                            datafusion::error::DataFusionError::Execution(e.to_string())
-                        })?;
+                        graph_ctx.check_timeout().map_err(exec_err)?;
 
                         // DF-4 streaming lift: an algorithm provider (procedure-
                         // table miss + algorithm-registry hit) is forwarded

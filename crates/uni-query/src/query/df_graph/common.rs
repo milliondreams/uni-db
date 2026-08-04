@@ -39,6 +39,82 @@ pub fn arrow_err(e: arrow::error::ArrowError) -> datafusion::error::DataFusionEr
     datafusion::error::DataFusionError::ArrowError(Box::new(e), None)
 }
 
+/// Convert any displayable error into `DataFusionError::Execution`.
+///
+/// Shorthand for the ubiquitous
+/// `.map_err(|e| DataFusionError::Execution(e.to_string()))` closure used when
+/// bubbling storage/plugin errors out of a physical operator.
+pub(crate) fn exec_err<E: std::fmt::Display>(e: E) -> datafusion::error::DataFusionError {
+    datafusion::error::DataFusionError::Execution(e.to_string())
+}
+
+/// Check a query's cancellation token and deadline.
+///
+/// Shared body behind `GraphExecutionContext::check_timeout` and
+/// `QueryProcedureHost::check_timeout`, which carry the same two fields.
+///
+/// # Errors
+///
+/// Returns an error if the token has been cancelled or the deadline has passed.
+pub(crate) fn check_deadline(
+    token: Option<&tokio_util::sync::CancellationToken>,
+    deadline: Option<std::time::Instant>,
+) -> anyhow::Result<()> {
+    if let Some(token) = token
+        && token.is_cancelled()
+    {
+        return Err(anyhow::anyhow!("Query cancelled"));
+    }
+    if let Some(deadline) = deadline
+        && std::time::Instant::now() > deadline
+    {
+        return Err(anyhow::anyhow!("Query timed out"));
+    }
+    Ok(())
+}
+
+/// Block on `fut` from a synchronous context without touching the caller's runtime.
+///
+/// Physical operators run inside a DataFusion stream `poll_next`, so they cannot
+/// `block_on` the ambient runtime. This spawns a scoped thread with a fresh
+/// current-thread runtime, drives the future there, and translates both runtime
+/// creation failures and thread panics into `DataFusionError::Execution`.
+///
+/// `what` names the operation for the error messages (`"{what} failed: {e}"` and
+/// `"{what} thread panicked"`).
+///
+/// # Errors
+///
+/// Returns an error if the runtime cannot be built, the future fails, or the
+/// worker thread panics.
+pub(crate) fn block_on_scoped<T, F>(what: &str, fut: F) -> DFResult<T>
+where
+    T: Send,
+    F: std::future::Future<Output = anyhow::Result<T>> + Send,
+{
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| {
+                    datafusion::error::DataFusionError::Execution(format!(
+                        "Runtime creation failed: {e}"
+                    ))
+                })?;
+            rt.block_on(fut).map_err(|e| {
+                datafusion::error::DataFusionError::Execution(format!("{what} failed: {e}"))
+            })
+        })
+        .join()
+        .unwrap_or_else(|_| {
+            Err(datafusion::error::DataFusionError::Execution(format!(
+                "{what} thread panicked"
+            )))
+        })
+    })
+}
+
 /// Compute standard plan properties for graph operators.
 ///
 /// All graph operators use the same plan properties:

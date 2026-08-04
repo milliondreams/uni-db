@@ -51,6 +51,7 @@ pub mod locy_ast_builder;
 pub(crate) mod locy_bdd;
 pub mod locy_best_by;
 pub mod locy_calibrate;
+pub mod locy_complement;
 pub mod locy_delta;
 pub mod locy_derive;
 pub mod locy_errors;
@@ -438,17 +439,7 @@ impl GraphExecutionContext {
     ///
     /// Returns an error if the deadline has passed.
     pub fn check_timeout(&self) -> anyhow::Result<()> {
-        if let Some(ref token) = self.cancellation_token
-            && token.is_cancelled()
-        {
-            return Err(anyhow::anyhow!("Query cancelled"));
-        }
-        if let Some(deadline) = self.deadline
-            && Instant::now() > deadline
-        {
-            return Err(anyhow::anyhow!("Query timed out"));
-        }
-        Ok(())
+        common::check_deadline(self.cancellation_token.as_ref(), self.deadline)
     }
 
     /// Get a reference to the storage manager.
@@ -598,7 +589,7 @@ impl GraphExecutionContext {
         Box::pin(async move {
             ctx.ensure_adjacency_warmed(&edge_type_ids, direction)
                 .await
-                .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))
+                .map_err(common::exec_err)
         })
     }
 

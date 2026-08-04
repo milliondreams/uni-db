@@ -190,6 +190,73 @@ where
     unreachable!("retry loop exits via Ok or Err")
 }
 
+/// Combine a version high-water-mark predicate with an optional caller filter.
+///
+/// `hwm` is passed in rather than read off `StorageManager` because the vertex
+/// and edge scan paths deliberately source it differently — see the call sites.
+fn combine_hwm_filter(hwm: Option<u64>, extra: Option<&FilterExpr>) -> Option<FilterExpr> {
+    match (hwm, extra) {
+        (Some(hwm), Some(f)) => Some(FilterExpr::all([
+            FilterExpr::version_at_most(hwm),
+            f.clone(),
+        ])),
+        (Some(hwm), None) => Some(FilterExpr::version_at_most(hwm)),
+        (None, Some(f)) => Some(f.clone()),
+        (None, None) => None,
+    }
+}
+
+/// Narrow `columns` to those that physically exist in the table's schema.
+///
+/// Returns `None` when the table has no readable schema — callers treat that
+/// as "table absent" and return `Ok(None)`. An empty `Vec` is distinct: the
+/// schema exists but none of the requested columns do, and the scan still runs.
+async fn existing_columns(
+    backend: &dyn StorageBackend,
+    table_name: &str,
+    columns: &[&str],
+) -> Result<Option<Vec<String>>> {
+    let Some(table_schema) = backend.get_table_schema(table_name).await? else {
+        return Ok(None);
+    };
+    let table_field_names: HashSet<&str> = table_schema
+        .fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect();
+    Ok(Some(
+        columns
+            .iter()
+            .copied()
+            .filter(|c| table_field_names.contains(c))
+            .map(|s| s.to_string())
+            .collect(),
+    ))
+}
+
+/// Run a scan and concatenate its batches, or `Ok(None)` when it yields none.
+///
+/// Fail closed: a scan error (transient I/O, an unparsable filter, a
+/// corrupt fragment) must propagate, never be silently mapped to
+/// `Ok(None)`. Callers treat `Ok(None)` as "no rows" — e.g. the MERGE
+/// fast path would create a duplicate node on a transient failure (review
+/// bug #3a) — so an error here must surface as an error. A genuinely-
+/// absent table is handled by the caller before it gets here.
+async fn scan_concat(
+    backend: &dyn StorageBackend,
+    request: ScanRequest,
+) -> Result<Option<arrow_array::RecordBatch>> {
+    let batches = backend.scan(request).await?;
+    if batches.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(arrow::compute::concat_batches(
+            &batches[0].schema(),
+            &batches,
+        )?))
+    }
+}
+
 /// MergeInsert sibling of `write_batch_with_lance_conflict_retry`.
 ///
 /// Source `batch` must contain the join columns in `on` plus any
@@ -1373,54 +1440,19 @@ impl StorageManager {
         }
 
         // Filter columns to those that exist in the table
-        let actual_columns =
-            if let Some(table_schema) = backend.get_table_schema(&table_name).await? {
-                let table_field_names: HashSet<&str> = table_schema
-                    .fields()
-                    .iter()
-                    .map(|f| f.name().as_str())
-                    .collect();
-                columns
-                    .iter()
-                    .copied()
-                    .filter(|c| table_field_names.contains(c))
-                    .map(|s| s.to_string())
-                    .collect::<Vec<_>>()
-            } else {
-                return Ok(None);
-            };
+        let Some(actual_columns) = existing_columns(backend, &table_name, columns).await? else {
+            return Ok(None);
+        };
 
         // Build filter with version HWM + optional additional filter
-        let filter = match (self.version_high_water_mark(), additional_filter) {
-            (Some(hwm), Some(f)) => Some(FilterExpr::all([
-                FilterExpr::version_at_most(hwm),
-                f.clone(),
-            ])),
-            (Some(hwm), None) => Some(FilterExpr::version_at_most(hwm)),
-            (None, Some(f)) => Some(f.clone()),
-            (None, None) => None,
-        };
+        let filter = combine_hwm_filter(self.version_high_water_mark(), additional_filter);
 
         let mut request = ScanRequest::all(&table_name).with_columns(actual_columns);
         if let Some(f) = filter {
             request = request.with_filter(f);
         }
 
-        // Fail closed: a scan error (transient I/O, an unparsable filter, a
-        // corrupt fragment) must propagate, never be silently mapped to
-        // `Ok(None)`. Callers treat `Ok(None)` as "no rows" — e.g. the MERGE
-        // fast path would create a duplicate node on a transient failure (review
-        // bug #3a) — so an error here must surface as an error. A genuinely-
-        // absent table is already handled above.
-        let batches = backend.scan(request).await?;
-        if batches.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(arrow::compute::concat_batches(
-                &batches[0].schema(),
-                &batches,
-            )?))
-        }
+        scan_concat(backend, request).await
     }
 
     /// Scan a delta table for an edge type + direction.
@@ -1446,53 +1478,18 @@ impl StorageManager {
         }
 
         // Filter columns to those that exist
-        let actual_columns =
-            if let Some(table_schema) = backend.get_table_schema(&table_name).await? {
-                let table_field_names: HashSet<&str> = table_schema
-                    .fields()
-                    .iter()
-                    .map(|f| f.name().as_str())
-                    .collect();
-                columns
-                    .iter()
-                    .copied()
-                    .filter(|c| table_field_names.contains(c))
-                    .map(|s| s.to_string())
-                    .collect::<Vec<_>>()
-            } else {
-                return Ok(None);
-            };
-
-        let filter = match (edge_hwm, additional_filter) {
-            (Some(hwm), Some(f)) => Some(FilterExpr::all([
-                FilterExpr::version_at_most(hwm),
-                f.clone(),
-            ])),
-            (Some(hwm), None) => Some(FilterExpr::version_at_most(hwm)),
-            (None, Some(f)) => Some(f.clone()),
-            (None, None) => None,
+        let Some(actual_columns) = existing_columns(backend, &table_name, columns).await? else {
+            return Ok(None);
         };
+
+        let filter = combine_hwm_filter(edge_hwm, additional_filter);
 
         let mut request = ScanRequest::all(&table_name).with_columns(actual_columns);
         if let Some(f) = filter {
             request = request.with_filter(f);
         }
 
-        // Fail closed: a scan error (transient I/O, an unparsable filter, a
-        // corrupt fragment) must propagate, never be silently mapped to
-        // `Ok(None)`. Callers treat `Ok(None)` as "no rows" — e.g. the MERGE
-        // fast path would create a duplicate node on a transient failure (review
-        // bug #3a) — so an error here must surface as an error. A genuinely-
-        // absent table is already handled above.
-        let batches = backend.scan(request).await?;
-        if batches.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(arrow::compute::concat_batches(
-                &batches[0].schema(),
-                &batches,
-            )?))
-        }
+        scan_concat(backend, request).await
     }
 
     /// Scan the unified main vertex table. Returns `None` if table doesn't exist.
@@ -1512,15 +1509,7 @@ impl StorageManager {
         }
 
         // Combine caller filter with version HWM for snapshot isolation
-        let full_filter = match (self.version_high_water_mark(), filter) {
-            (Some(hwm), Some(f)) => Some(FilterExpr::all([
-                FilterExpr::version_at_most(hwm),
-                f.clone(),
-            ])),
-            (Some(hwm), None) => Some(FilterExpr::version_at_most(hwm)),
-            (None, Some(f)) => Some(f.clone()),
-            (None, None) => None,
-        };
+        let full_filter = combine_hwm_filter(self.version_high_water_mark(), filter);
 
         let request = ScanRequest::all(table_name)
             .with_columns(columns.iter().map(|s| s.to_string()).collect());
@@ -1529,21 +1518,7 @@ impl StorageManager {
             None => request,
         };
 
-        // Fail closed: a scan error (transient I/O, an unparsable filter, a
-        // corrupt fragment) must propagate, never be silently mapped to
-        // `Ok(None)`. Callers treat `Ok(None)` as "no rows" — e.g. the MERGE
-        // fast path would create a duplicate node on a transient failure (review
-        // bug #3a) — so an error here must surface as an error. A genuinely-
-        // absent table is already handled above.
-        let batches = backend.scan(request).await?;
-        if batches.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(arrow::compute::concat_batches(
-                &batches[0].schema(),
-                &batches,
-            )?))
-        }
+        scan_concat(backend, request).await
     }
 
     /// Scan the main edge table as a stream. Returns `None` if table doesn't exist.
@@ -2609,6 +2584,18 @@ fn extract_embedding_from_props(
     Vec::<f32>::try_from(props.get(property)?).ok()
 }
 
+/// Collects the query's L0 buffers in precedence order: pending flush → main
+/// → transaction. Earliest first, so a later buffer's write wins.
+fn l0_buffers_in_precedence(ctx: &QueryContext) -> Vec<Arc<parking_lot::RwLock<L0Buffer>>> {
+    let mut buffers: Vec<Arc<parking_lot::RwLock<L0Buffer>>> =
+        ctx.pending_flush_l0s.iter().map(Arc::clone).collect();
+    buffers.push(Arc::clone(&ctx.l0));
+    if let Some(ref txn) = ctx.transaction_l0 {
+        buffers.push(Arc::clone(txn));
+    }
+    buffers
+}
+
 /// Merges L0 buffer vertices into LanceDB vector search results.
 ///
 /// Visits L0 buffers in precedence order (pending flush → main → transaction),
@@ -2627,13 +2614,7 @@ fn merge_l0_into_vector_results(
     k: usize,
     metric: &DistanceMetric,
 ) {
-    // Collect all L0 buffers in precedence order (earliest first, last writer wins).
-    let mut buffers: Vec<Arc<parking_lot::RwLock<L0Buffer>>> =
-        ctx.pending_flush_l0s.iter().map(Arc::clone).collect();
-    buffers.push(Arc::clone(&ctx.l0));
-    if let Some(ref txn) = ctx.transaction_l0 {
-        buffers.push(Arc::clone(txn));
-    }
+    let buffers = l0_buffers_in_precedence(ctx);
 
     // Maps VID → distance for L0 candidates (last writer wins).
     let mut l0_candidates: HashMap<Vid, f32> = HashMap::new();
@@ -2718,13 +2699,7 @@ fn merge_l0_into_vector_results(
 /// scale is opaque) can build a candidate set without duplicating the
 /// tombstone/precedence semantics.
 pub fn collect_l0_label_candidates(ctx: &QueryContext, label: &str) -> (Vec<Vid>, HashSet<Vid>) {
-    // Buffers in precedence order: pending flush → main → transaction.
-    let mut buffers: Vec<Arc<parking_lot::RwLock<L0Buffer>>> =
-        ctx.pending_flush_l0s.iter().map(Arc::clone).collect();
-    buffers.push(Arc::clone(&ctx.l0));
-    if let Some(ref txn) = ctx.transaction_l0 {
-        buffers.push(Arc::clone(txn));
-    }
+    let buffers = l0_buffers_in_precedence(ctx);
 
     let mut live: HashSet<Vid> = HashSet::new();
     let mut tombstoned: HashSet<Vid> = HashSet::new();
@@ -2797,13 +2772,7 @@ fn merge_l0_into_fts_results(
     query: &str,
     k: usize,
 ) {
-    // Collect all L0 buffers in precedence order (earliest first, last writer wins).
-    let mut buffers: Vec<Arc<parking_lot::RwLock<L0Buffer>>> =
-        ctx.pending_flush_l0s.iter().map(Arc::clone).collect();
-    buffers.push(Arc::clone(&ctx.l0));
-    if let Some(ref txn) = ctx.transaction_l0 {
-        buffers.push(Arc::clone(txn));
-    }
+    let buffers = l0_buffers_in_precedence(ctx);
 
     // Maps VID → relevance score for L0 candidates (last writer wins).
     let mut l0_candidates: HashMap<Vid, f32> = HashMap::new();

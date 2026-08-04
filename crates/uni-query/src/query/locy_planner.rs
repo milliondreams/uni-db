@@ -117,7 +117,10 @@ fn property_arrow_type(
 /// `is_key`, `schema`, and `var_labels` let an integer-typed property in a KEY
 /// position keep its `Int64` type instead of being widened to the default
 /// `Float64` (issue #94); `var_labels` describes `first_clause`'s node vars.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "yield-type inference needs the full clause context: name sets, catalog and schema"
+)]
 fn infer_yield_type(
     name: &str,
     first_clause: &CompiledClause,
@@ -144,7 +147,10 @@ fn infer_yield_type(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors `infer_yield_type`'s context, plus the cycle-guard visited set"
+)]
 fn infer_yield_type_rec(
     name: &str,
     first_clause: &CompiledClause,

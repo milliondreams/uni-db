@@ -17,7 +17,7 @@
 
 use crate::query::df_graph::GraphExecutionContext;
 use crate::query::df_graph::common::{
-    arrow_err, column_as_vid_array, compute_plan_properties, edge_struct_fields,
+    arrow_err, column_as_vid_array, compute_plan_properties, edge_struct_fields, exec_err,
     new_node_list_builder,
 };
 use arrow::compute::take;
@@ -663,9 +663,7 @@ impl Stream for GraphShortestPathStream {
                 ShortestPathStreamState::Reading => {
                     // Check timeout
                     if let Err(e) = self.graph_ctx.check_timeout() {
-                        return Poll::Ready(Some(Err(
-                            datafusion::error::DataFusionError::Execution(e.to_string()),
-                        )));
+                        return Poll::Ready(Some(Err(exec_err(e))));
                     }
 
                     match self.input.poll_next_unpin(cx) {

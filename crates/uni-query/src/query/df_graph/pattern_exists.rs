@@ -33,7 +33,7 @@ use uni_store::storage::direction::Direction;
 
 use super::GraphExecutionContext;
 use super::pattern_comprehension::TraversalStep;
-use crate::query::df_graph::common::column_as_vid_array;
+use crate::query::df_graph::common::{block_on_scoped, column_as_vid_array};
 
 /// A property equality predicate extracted from a node pattern's property map.
 ///
@@ -207,27 +207,11 @@ impl PhysicalExpr for PatternExistsExecExpr {
 
         // Step 2: Warm CSR for all edge types in the traversal.
         for step in &self.traversal_steps {
-            std::thread::scope(|s| {
-                s.spawn(|| {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|e| {
-                            DataFusionError::Execution(format!("Runtime creation failed: {e}"))
-                        })?;
-                    rt.block_on(
-                        self.graph_ctx
-                            .ensure_adjacency_warmed(&step.edge_type_ids, step.direction),
-                    )
-                    .map_err(|e| DataFusionError::Execution(format!("CSR warming failed: {e}")))
-                })
-                .join()
-                .unwrap_or_else(|_| {
-                    Err(DataFusionError::Execution(
-                        "CSR warming thread panicked".to_string(),
-                    ))
-                })
-            })?;
+            block_on_scoped(
+                "CSR warming",
+                self.graph_ctx
+                    .ensure_adjacency_warmed(&step.edge_type_ids, step.direction),
+            )?;
         }
 
         // Step 3: Evaluate pattern existence per row using batch CSR lookups.
@@ -356,32 +340,14 @@ impl PhysicalExpr for PatternExistsExecExpr {
                     let prop_names: Vec<&str> =
                         resolved_preds.iter().map(|(n, _)| n.as_str()).collect();
 
-                    let props_map = std::thread::scope(|s| {
-                        s.spawn(|| {
-                            let rt = tokio::runtime::Builder::new_current_thread()
-                                .enable_all()
-                                .build()
-                                .map_err(|e| {
-                                    DataFusionError::Execution(format!(
-                                        "Runtime creation failed: {e}"
-                                    ))
-                                })?;
-                            rt.block_on(self.graph_ctx.property_manager().get_batch_vertex_props(
-                                &unique_vids,
-                                &prop_names,
-                                Some(&query_ctx),
-                            ))
-                            .map_err(|e| {
-                                DataFusionError::Execution(format!("Vertex prop load failed: {e}"))
-                            })
-                        })
-                        .join()
-                        .unwrap_or_else(|_| {
-                            Err(DataFusionError::Execution(
-                                "Vertex prop load thread panicked".to_string(),
-                            ))
-                        })
-                    })?;
+                    let props_map = block_on_scoped(
+                        "Vertex prop load",
+                        self.graph_ctx.property_manager().get_batch_vertex_props(
+                            &unique_vids,
+                            &prop_names,
+                            Some(&query_ctx),
+                        ),
+                    )?;
 
                     for (row_idx, target_vid) in &candidates {
                         if result[*row_idx as usize] {

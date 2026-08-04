@@ -606,50 +606,12 @@ impl L0Buffer {
             });
         }
 
-        self.vertex_tombstones.remove(&vid);
-
         // Full-row insert supersedes any pending partial-update state for
         // this VID.
         self.vertex_partial_keys.remove(&vid);
 
-        // Size/count computed up front so `properties` can be moved into the
-        // CRDT merge below instead of deep-cloned.
-        let props_size = Self::estimate_properties_size(&properties);
-        let props_count = properties.len();
-        let tracks_extid = properties.contains_key("ext_id");
-
-        let entry = self.vertex_properties.entry(vid).or_default();
-        let old_extid = if tracks_extid {
-            Self::extid_of(entry)
-        } else {
-            None
-        };
-        Self::merge_crdt_properties(entry, properties, self.plugin_registry.as_ref());
-        if tracks_extid {
-            let new_extid =
-                Self::extid_of(self.vertex_properties.get(&vid).expect("just inserted"));
-            self.sync_extid_index(vid, old_extid, new_extid);
-        }
-        self.vertex_versions.insert(vid, version);
-
-        // Set timestamps - created_at only set if this is a new vertex
-        self.vertex_created_at.entry(vid).or_insert(now);
-        self.vertex_updated_at.insert(vid, now);
-
-        // Track labels — always create an entry so unlabeled vertices are
-        // distinguishable from "not in L0" when queried via get_vertex_labels.
-        let labels_size: usize = labels.iter().map(|l| l.len() + 24).sum();
-        let existing = self.vertex_labels.entry(vid).or_default();
-        Self::append_unique_labels(existing, labels);
-        self.index_labels_for_vid(vid, labels);
-
-        self.graph.add_vertex(vid);
-        self.mutation_count += 1;
+        self.apply_vertex_write(vid, properties, labels, version, now);
         self.mutation_stats.nodes_created += 1;
-        self.mutation_stats.properties_set += props_count;
-        self.mutation_stats.labels_added += labels.len();
-
-        self.estimated_size += 8 + props_size + 16 + labels_size + 32;
     }
 
     /// Insert a vertex's FULL property row, tagging `touched_keys` so the
@@ -752,9 +714,29 @@ impl L0Buffer {
             });
         }
 
-        self.vertex_tombstones.remove(&vid);
         // NOTE: deliberately DOES NOT remove from vertex_partial_keys.
         // The caller (`insert_vertex_partial`) extends that set after.
+        // Partial writes also don't bump `nodes_created` — they update
+        // existing nodes; `properties_set` is the correct counter.
+        self.apply_vertex_write(vid, properties, labels, version, now);
+    }
+
+    /// Shared body of the full-row and partial vertex-write paths: clear the
+    /// tombstone, CRDT-merge the properties (keeping the `ext_id` index in
+    /// sync), stamp version/timestamps, append the labels, and update the
+    /// mutation counters and size estimate.
+    ///
+    /// Reads nothing from `vertex_partial_keys`, so the two callers are free
+    /// to clear or preserve that entry around this call.
+    fn apply_vertex_write(
+        &mut self,
+        vid: Vid,
+        properties: Properties,
+        labels: &[String],
+        version: u64,
+        now: i64,
+    ) {
+        self.vertex_tombstones.remove(&vid);
 
         // Size/count computed up front so `properties` can be moved into the
         // CRDT merge below instead of deep-cloned.
@@ -776,9 +758,12 @@ impl L0Buffer {
         }
         self.vertex_versions.insert(vid, version);
 
+        // Set timestamps - created_at only set if this is a new vertex
         self.vertex_created_at.entry(vid).or_insert(now);
         self.vertex_updated_at.insert(vid, now);
 
+        // Track labels — always create an entry so unlabeled vertices are
+        // distinguishable from "not in L0" when queried via get_vertex_labels.
         let labels_size: usize = labels.iter().map(|l| l.len() + 24).sum();
         let existing = self.vertex_labels.entry(vid).or_default();
         Self::append_unique_labels(existing, labels);
@@ -786,8 +771,6 @@ impl L0Buffer {
 
         self.graph.add_vertex(vid);
         self.mutation_count += 1;
-        // Partial writes don't create new nodes — they update existing ones.
-        // But counting under properties_set is correct.
         self.mutation_stats.properties_set += props_count;
         self.mutation_stats.labels_added += labels.len();
 

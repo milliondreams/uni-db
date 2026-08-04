@@ -283,7 +283,10 @@ impl FoldExec {
     /// alone is insufficient — its entries are keyed by post-YIELD
     /// row hashes and are only populated after FOLD runs; the pre-fold
     /// body rows seen here would never hit. The map closes that gap.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "constructor mirrors the FoldExec fields; a builder would add no clarity"
+    )]
     pub fn new_with_topk(
         input: Arc<dyn ExecutionPlan>,
         key_indices: Vec<usize>,

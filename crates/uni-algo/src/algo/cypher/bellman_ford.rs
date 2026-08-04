@@ -4,10 +4,12 @@
 //! uni.algo.bellmanFord procedure implementation.
 
 use crate::algo::algorithms::{Algorithm, BellmanFord, BellmanFordConfig};
-use crate::algo::procedure_template::{GenericAlgoProcedure, GraphAlgoAdapter, parse_vid_arg};
+use crate::algo::procedure_template::{
+    GenericAlgoProcedure, GraphAlgoAdapter, parse_vid_arg, vid_pair_rows,
+};
 use crate::algo::procedures::{AlgoResultRow, ValueType};
 use anyhow::{Result, anyhow};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 pub struct BellmanFordAdapter;
 
@@ -37,13 +39,7 @@ impl GraphAlgoAdapter for BellmanFordAdapter {
             return Err(anyhow!("Negative cycle detected"));
         }
 
-        Ok(result
-            .distances
-            .into_iter()
-            .map(|(vid, dist)| AlgoResultRow {
-                values: vec![json!(vid.as_u64()), json!(dist)],
-            })
-            .collect())
+        Ok(vid_pair_rows(result.distances))
     }
 
     fn include_reverse() -> bool {

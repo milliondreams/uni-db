@@ -1068,9 +1068,6 @@ pub(crate) trait DynPendingRegistration: Send + Sync {
         plugin: PluginId,
         record: &mut PluginRecord,
     );
-    /// Short human-readable label (for error/debug messages). Diagnostic-only.
-    #[allow(dead_code, reason = "Diagnostic surface for future error formatting.")]
-    fn debug_label(&self) -> String;
 
     /// The qname a UNIQUE registration claims (for intra-batch duplicate
     /// detection), or `None` for repeatable (append) surfaces. Two pending
@@ -1111,9 +1108,6 @@ where
     ) {
         S::insert(registry, plugin, self.q, self.sig, self.provider, record);
     }
-    fn debug_label(&self) -> String {
-        format!("{:?}({})", S::KIND, self.q)
-    }
     fn dedup_key(&self) -> Option<QName> {
         // Name-unique surface: the qname must be unique across the batch.
         Some(self.q.clone())
@@ -1148,9 +1142,6 @@ where
         record: &mut PluginRecord,
     ) {
         S::insert(registry, plugin, self.q, self.sig, self.provider, record);
-    }
-    fn debug_label(&self) -> String {
-        format!("{:?}({})", S::KIND, self.q)
     }
 }
 
@@ -1217,13 +1208,6 @@ where
         };
         S::insert(registry, key, self.provider, record);
     }
-    fn debug_label(&self) -> String {
-        let k = self
-            .resolve_key()
-            .map(|k| format!("{k:?}"))
-            .unwrap_or_else(|_| "<unresolved>".into());
-        format!("{:?}({k})", S::KIND)
-    }
 }
 
 /// Heterogeneous-batch payload for an [`AppendOps`] registration.
@@ -1249,9 +1233,6 @@ where
         record: &mut PluginRecord,
     ) {
         S::insert(registry, plugin, self.provider, record);
-    }
-    fn debug_label(&self) -> String {
-        format!("{:?}", S::KIND)
     }
 }
 

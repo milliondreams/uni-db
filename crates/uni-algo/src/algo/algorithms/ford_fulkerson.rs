@@ -7,6 +7,7 @@
 
 use crate::algo::GraphProjection;
 use crate::algo::algorithms::Algorithm;
+use crate::algo::algorithms::residual::build_residual;
 use uni_common::core::id::Vid;
 
 pub struct FordFulkerson;
@@ -28,14 +29,6 @@ impl Default for FordFulkersonConfig {
 
 pub struct FordFulkersonResult {
     pub max_flow: f64,
-}
-
-#[derive(Clone, Copy)]
-struct Edge {
-    to: usize,
-    rev: usize,
-    cap: f64,
-    flow: f64,
 }
 
 impl Algorithm for FordFulkerson {
@@ -63,35 +56,7 @@ impl Algorithm for FordFulkerson {
         }
 
         let n = graph.vertex_count();
-        let mut adj: Vec<Vec<Edge>> = (0..n).map(|_| Vec::new()).collect();
-
-        // Build residual graph
-        for u in 0..n {
-            for (i, &v_u32) in graph.out_neighbors(u as u32).iter().enumerate() {
-                let v = v_u32 as usize;
-                let cap = if graph.has_weights() {
-                    graph.out_weight(u as u32, i)
-                } else {
-                    1.0
-                };
-
-                let a_len = adj[u].len();
-                let b_len = adj[v].len();
-
-                adj[u].push(Edge {
-                    to: v,
-                    rev: b_len,
-                    cap,
-                    flow: 0.0,
-                });
-                adj[v].push(Edge {
-                    to: u,
-                    rev: a_len,
-                    cap: 0.0,
-                    flow: 0.0,
-                });
-            }
-        }
+        let mut adj = build_residual(graph);
 
         let mut max_flow = 0.0;
 

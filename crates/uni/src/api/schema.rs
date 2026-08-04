@@ -2,6 +2,7 @@
 // Copyright 2024-2026 Dragonscale Team
 
 use crate::api::Uni;
+use std::collections::HashMap;
 use std::path::Path;
 use uni_common::core::schema::{
     AnalyzerConfig, DataType, DistanceMetric, EmbeddingConfig, FullTextIndexConfig,
@@ -57,6 +58,26 @@ pub enum SchemaChange {
         to_labels: Vec<String>,
         description: Option<String>,
     },
+}
+
+/// Stage an `AddProperty` change; shared by the identical `property` /
+/// `property_nullable` / `property_described` methods on `LabelBuilder`
+/// and `EdgeTypeBuilder`.
+fn push_add_property(
+    pending: &mut Vec<SchemaChange>,
+    owner: &str,
+    name: &str,
+    data_type: DataType,
+    nullable: bool,
+    description: Option<String>,
+) {
+    pending.push(SchemaChange::AddProperty {
+        label_or_type: owner.to_string(),
+        name: name.to_string(),
+        data_type,
+        nullable,
+        description,
+    });
 }
 
 impl<'a> SchemaBuilder<'a> {
@@ -285,35 +306,38 @@ impl<'a> LabelBuilder<'a> {
     }
 
     pub fn property(mut self, name: &str, data_type: DataType) -> Self {
-        self.builder.pending.push(SchemaChange::AddProperty {
-            label_or_type: self.name.clone(),
-            name: name.to_string(),
+        push_add_property(
+            &mut self.builder.pending,
+            &self.name,
+            name,
             data_type,
-            nullable: false,
-            description: None,
-        });
+            false,
+            None,
+        );
         self
     }
 
     pub fn property_nullable(mut self, name: &str, data_type: DataType) -> Self {
-        self.builder.pending.push(SchemaChange::AddProperty {
-            label_or_type: self.name.clone(),
-            name: name.to_string(),
+        push_add_property(
+            &mut self.builder.pending,
+            &self.name,
+            name,
             data_type,
-            nullable: true,
-            description: None,
-        });
+            true,
+            None,
+        );
         self
     }
 
     pub fn property_described(mut self, name: &str, data_type: DataType, desc: &str) -> Self {
-        self.builder.pending.push(SchemaChange::AddProperty {
-            label_or_type: self.name.clone(),
-            name: name.to_string(),
+        push_add_property(
+            &mut self.builder.pending,
+            &self.name,
+            name,
             data_type,
-            nullable: false,
-            description: Some(desc.to_string()),
-        });
+            false,
+            Some(desc.to_string()),
+        );
         self
     }
 
@@ -433,35 +457,38 @@ impl<'a> EdgeTypeBuilder<'a> {
     }
 
     pub fn property(mut self, name: &str, data_type: DataType) -> Self {
-        self.builder.pending.push(SchemaChange::AddProperty {
-            label_or_type: self.name.clone(),
-            name: name.to_string(),
+        push_add_property(
+            &mut self.builder.pending,
+            &self.name,
+            name,
             data_type,
-            nullable: false,
-            description: None,
-        });
+            false,
+            None,
+        );
         self
     }
 
     pub fn property_nullable(mut self, name: &str, data_type: DataType) -> Self {
-        self.builder.pending.push(SchemaChange::AddProperty {
-            label_or_type: self.name.clone(),
-            name: name.to_string(),
+        push_add_property(
+            &mut self.builder.pending,
+            &self.name,
+            name,
             data_type,
-            nullable: true,
-            description: None,
-        });
+            true,
+            None,
+        );
         self
     }
 
     pub fn property_described(mut self, name: &str, data_type: DataType, desc: &str) -> Self {
-        self.builder.pending.push(SchemaChange::AddProperty {
-            label_or_type: self.name.clone(),
-            name: name.to_string(),
+        push_add_property(
+            &mut self.builder.pending,
+            &self.name,
+            name,
             data_type,
-            nullable: false,
-            description: Some(desc.to_string()),
-        });
+            false,
+            Some(desc.to_string()),
+        );
         self
     }
 
@@ -806,6 +833,207 @@ impl ScalarType {
     }
 }
 
+// ============================================================================
+// Schema introspection
+// ============================================================================
+
+/// Whether a schema element (label or edge type) is present and `Active`.
+///
+/// Shared by `label_exists` / `edge_type_exists`; `state` is the looked-up
+/// element's state (`None` when the element is absent from the schema).
+fn element_active(state: Option<&uni_common::core::schema::SchemaElementState>) -> bool {
+    matches!(
+        state,
+        Some(uni_common::core::schema::SchemaElementState::Active)
+    )
+}
+
+/// Backtick-quote a schema element name for interpolation into Cypher.
+///
+/// `validate_schema_element_name` admits far more than Cypher's unquoted
+/// identifier grammar (`[A-Za-z_][A-Za-z0-9_]*`): punctuation such as `-` and
+/// `.` — the latter explicitly documented as supported for qualified names —
+/// leading digits, and every non-ASCII character, since `cypher.pest` matches
+/// `ASCII_ALPHA` only. Interpolating any of those unquoted produces a parse
+/// error rather than a query.
+///
+/// # Errors
+///
+/// A name containing a backtick cannot be expressed at all: the grammar's
+/// quoted form is `` "`" ~ (!"`" ~ ANY)* ~ "`" `` with no doubling or escape
+/// rule, so there is no encoding for it. Such a name is refused rather than
+/// silently mis-parsed.
+fn quote_cypher_identifier(name: &str) -> Result<String> {
+    if name.contains('`') {
+        return Err(UniError::Query {
+            message: format!(
+                "schema element name {name:?} contains a backtick, which Cypher's \
+                 quoted-identifier syntax cannot escape"
+            ),
+            query: None,
+        });
+    }
+    Ok(format!("`{name}`"))
+}
+
+/// Build the `PropertyInfo` projection for a label or edge type.
+///
+/// Shared by [`Uni::get_label_info`] and [`Uni::get_edge_type_info`];
+/// `is_indexed` is supplied per element kind because labels consult more
+/// index variants (vector / JSON-FTS) than edge types do — keeping the
+/// exact per-kind predicate preserves the original behavior.
+fn property_infos_for(
+    schema: &uni_common::core::schema::Schema,
+    name: &str,
+    is_indexed: impl Fn(&uni_common::core::schema::IndexDefinition, &str, &str) -> bool,
+) -> Vec<crate::api::schema::PropertyInfo> {
+    let mut properties = Vec::new();
+    if let Some(props) = schema.properties.get(name) {
+        for (prop_name, prop_meta) in props {
+            properties.push(crate::api::schema::PropertyInfo {
+                name: prop_name.clone(),
+                data_type: format!("{:?}", prop_meta.r#type),
+                nullable: prop_meta.nullable,
+                is_indexed: schema
+                    .indexes
+                    .iter()
+                    .any(|idx| is_indexed(idx, name, prop_name)),
+                description: prop_meta.description.clone(),
+            });
+        }
+    }
+    properties
+}
+
+/// Build the `IndexInfo` projection for a label or edge type.
+///
+/// `descriptor` maps each index targeting `name` to its `(type, props)`
+/// pair, returning `None` to skip variants that do not apply to this
+/// element kind (e.g. edge types skip vector / JSON-FTS indexes).
+fn index_infos_for(
+    schema: &uni_common::core::schema::Schema,
+    name: &str,
+    descriptor: impl Fn(
+        &uni_common::core::schema::IndexDefinition,
+    ) -> Option<(&'static str, Vec<String>)>,
+) -> Vec<crate::api::schema::IndexInfo> {
+    let mut indexes = Vec::new();
+    for idx in schema.indexes.iter().filter(|i| i.label() == name) {
+        let Some((idx_type, idx_props)) = descriptor(idx) else {
+            continue;
+        };
+        indexes.push(crate::api::schema::IndexInfo {
+            name: idx.name().to_string(),
+            index_type: idx_type.to_string(),
+            properties: idx_props,
+            status: "ONLINE".to_string(), // TODO: Check actual status
+        });
+    }
+    indexes
+}
+
+/// Build the `ConstraintInfo` projection for a label or edge type.
+///
+/// `target_matches` selects the constraints whose target matches `name`
+/// (`ConstraintTarget::Label` for labels, `EdgeType` for edge types).
+fn constraint_infos_for(
+    schema: &uni_common::core::schema::Schema,
+    target_matches: impl Fn(&uni_common::core::schema::Constraint) -> bool,
+) -> Vec<crate::api::schema::ConstraintInfo> {
+    use uni_common::core::schema::ConstraintType;
+    let mut constraints = Vec::new();
+    for c in &schema.constraints {
+        if !target_matches(c) {
+            continue;
+        }
+        let (ctype, cprops) = match &c.constraint_type {
+            ConstraintType::Unique { properties } => ("UNIQUE", properties.clone()),
+            ConstraintType::Exists { property } => ("EXISTS", vec![property.clone()]),
+            ConstraintType::Check { expression } => ("CHECK", vec![expression.clone()]),
+            ConstraintType::NodeKey { properties } => ("NODE KEY", properties.clone()),
+            _ => ("UNKNOWN", vec![]),
+        };
+        constraints.push(crate::api::schema::ConstraintInfo {
+            name: c.name.clone(),
+            constraint_type: ctype.to_string(),
+            properties: cprops,
+            enabled: c.enabled,
+        });
+    }
+    constraints
+}
+
+/// `is_indexed` predicate for label properties (consults vector, scalar,
+/// full-text, inverted, and JSON-FTS index variants).
+fn label_property_is_indexed(
+    idx: &uni_common::core::schema::IndexDefinition,
+    name: &str,
+    prop_name: &str,
+) -> bool {
+    use uni_common::core::schema::IndexDefinition;
+    match idx {
+        IndexDefinition::Vector(v) => v.label == name && v.property.as_str() == prop_name,
+        IndexDefinition::Scalar(s) => {
+            s.label == name && s.properties.iter().any(|p| p == prop_name)
+        }
+        IndexDefinition::FullText(f) => {
+            f.label == name && f.properties.iter().any(|p| p == prop_name)
+        }
+        IndexDefinition::Inverted(inv) => inv.label == name && inv.property.as_str() == prop_name,
+        IndexDefinition::JsonFullText(j) => j.label == name,
+        _ => false,
+    }
+}
+
+/// `is_indexed` predicate for edge-type properties (scalar, full-text,
+/// and inverted only — edges carry no vector / JSON-FTS indexes).
+///
+/// Every other variant defers to [`label_property_is_indexed`]; a future
+/// `IndexDefinition` variant therefore starts applying to edge types too
+/// unless it is added to the skip list here.
+fn edge_property_is_indexed(
+    idx: &uni_common::core::schema::IndexDefinition,
+    name: &str,
+    prop_name: &str,
+) -> bool {
+    use uni_common::core::schema::IndexDefinition;
+    match idx {
+        IndexDefinition::Vector(_) | IndexDefinition::JsonFullText(_) => false,
+        other => label_property_is_indexed(other, name, prop_name),
+    }
+}
+
+/// Index `(type, props)` descriptor for labels (maps all five variants).
+fn label_index_descriptor(
+    idx: &uni_common::core::schema::IndexDefinition,
+) -> Option<(&'static str, Vec<String>)> {
+    use uni_common::core::schema::IndexDefinition;
+    match idx {
+        IndexDefinition::Vector(v) => Some(("VECTOR", vec![v.property.clone()])),
+        IndexDefinition::Scalar(s) => Some(("SCALAR", s.properties.clone())),
+        IndexDefinition::FullText(f) => Some(("FULLTEXT", f.properties.clone())),
+        IndexDefinition::Inverted(inv) => Some(("INVERTED", vec![inv.property.clone()])),
+        IndexDefinition::JsonFullText(j) => Some(("JSON_FTS", vec![j.column.clone()])),
+        _ => None,
+    }
+}
+
+/// Index `(type, props)` descriptor for edge types (skips vector /
+/// JSON-FTS variants).
+///
+/// Every other variant defers to [`label_index_descriptor`]; a future
+/// `IndexDefinition` variant therefore starts being reported for edge types
+/// too unless it is added to the skip list here.
+fn edge_index_descriptor(
+    idx: &uni_common::core::schema::IndexDefinition,
+) -> Option<(&'static str, Vec<String>)> {
+    use uni_common::core::schema::IndexDefinition;
+    match idx {
+        IndexDefinition::Vector(_) | IndexDefinition::JsonFullText(_) => None,
+        other => label_index_descriptor(other),
+    }
+}
+
 impl Uni {
     pub fn schema(&self) -> SchemaBuilder<'_> {
         SchemaBuilder::new(self)
@@ -839,5 +1067,172 @@ impl Uni {
             .await
             .map_err(UniError::Io)?;
         Ok(())
+    }
+
+    /// Check if a label exists in the schema.
+    pub async fn label_exists(&self, name: &str) -> Result<bool> {
+        let schema = self.inner.schema.schema();
+        Ok(element_active(schema.labels.get(name).map(|l| &l.state)))
+    }
+
+    /// Check if an edge type exists in the schema.
+    pub async fn edge_type_exists(&self, name: &str) -> Result<bool> {
+        let schema = self.inner.schema.schema();
+        Ok(element_active(
+            schema.edge_types.get(name).map(|e| &e.state),
+        ))
+    }
+
+    /// Get all label names.
+    /// Returns the union of schema-registered labels (Active state) and labels
+    /// discovered from data (for schemaless mode where labels may not be in the
+    /// schema). This is consistent with `list_edge_types()` for schema labels
+    /// while also supporting schemaless workflows.
+    pub async fn list_labels(&self) -> Result<Vec<String>> {
+        let mut all_labels = std::collections::HashSet::new();
+
+        // Schema labels (covers schema-defined labels that may not have data yet)
+        for (name, label) in self.inner.schema.schema().labels.iter() {
+            if matches!(
+                label.state,
+                uni_common::core::schema::SchemaElementState::Active
+            ) {
+                all_labels.insert(name.clone());
+            }
+        }
+
+        // Data labels (covers schemaless labels that aren't in the schema)
+        let query = "MATCH (n) RETURN DISTINCT labels(n) AS labels";
+        let result = self.inner.execute_internal(query, HashMap::new()).await?;
+        for row in result.rows() {
+            if let Ok(labels_list) = row.get::<Vec<String>>("labels") {
+                for label in labels_list {
+                    all_labels.insert(label);
+                }
+            }
+        }
+
+        Ok(all_labels.into_iter().collect())
+    }
+
+    /// Get all edge type names.
+    pub async fn list_edge_types(&self) -> Result<Vec<String>> {
+        Ok(self
+            .inner
+            .schema
+            .schema()
+            .edge_types
+            .iter()
+            .filter(|(_, e)| {
+                matches!(
+                    e.state,
+                    uni_common::core::schema::SchemaElementState::Active
+                )
+            })
+            .map(|(name, _)| name.clone())
+            .collect())
+    }
+
+    // (schema-projection helpers `property_infos_for` / `index_infos_for`
+    //  / `constraint_infos_for` are free functions defined above this impl.)
+
+    /// Get detailed information about a label.
+    pub async fn get_label_info(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::api::schema::LabelInfo>> {
+        let schema = self.inner.schema.schema();
+        if let Some(label_meta) = schema.labels.get(name) {
+            // Row count via Cypher, matching `get_edge_type_info`.
+            //
+            // `backend.count_rows` reads flushed storage only, so a label whose
+            // rows were still in the L0 buffers reported `count: 0` — a silent
+            // wrong answer, and the reason a Python assertion on this value was
+            // once weakened rather than fixed.
+            //
+            // This does not reintroduce #115: that fix moved the count off the
+            // raw-dataset `open_raw()` path, whose `.lance` URI was wrong so it
+            // reported 0 for *flushed* tables. Cypher is a third path and is
+            // subject to neither failure.
+            let quoted = quote_cypher_identifier(name)?;
+            let query = format!("MATCH (n:{quoted}) RETURN count(n) AS cnt");
+            let count = self
+                .inner
+                .execute_internal(&query, HashMap::new())
+                .await?
+                .rows()
+                .first()
+                .and_then(|r| r.get::<i64>("cnt").ok())
+                .unwrap_or(0) as usize;
+
+            Ok(Some(crate::api::schema::LabelInfo {
+                name: name.to_string(),
+                count,
+                properties: property_infos_for(&schema, name, label_property_is_indexed),
+                indexes: index_infos_for(&schema, name, label_index_descriptor),
+                constraints: constraint_infos_for(
+                    &schema,
+                    |c| matches!(&c.target, uni_common::core::schema::ConstraintTarget::Label(l) if l == name),
+                ),
+                description: label_meta.description.clone(),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get detailed information about an edge type.
+    pub async fn get_edge_type_info(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::api::schema::EdgeTypeInfo>> {
+        let schema = self.inner.schema.schema();
+        let edge_meta = match schema.edge_types.get(name) {
+            Some(meta) => meta,
+            None => return Ok(None),
+        };
+
+        // Count edges via internal query.
+        //
+        // The Cypher round-trip is deliberate: unlike `count_rows` it sees the
+        // L0 buffers as well as flushed storage, and it respects MVCC — the
+        // main tables are append-only with `_deleted`/`_version` columns, so a
+        // bare row count would include tombstones and superseded versions.
+        //
+        // The type name MUST be backtick-quoted. `relationship_types` in
+        // `cypher.pest` accepts `identifier_or_keyword`, whose unquoted form is
+        // `[A-Za-z_][A-Za-z0-9_]*` — so an unquoted interpolation is a parse
+        // error for any name outside that shape, and
+        // `validate_schema_element_name` admits far more than that: punctuation
+        // (including `.`, which it documents as supported), leading digits, and
+        // all non-ASCII. Paired with the `Err(_) => 0` this silently reported an
+        // empty edge type instead of failing.
+        let count = {
+            let quoted = quote_cypher_identifier(name)?;
+            let query = format!("MATCH ()-[r:{quoted}]->() RETURN count(r) AS cnt");
+            let result = self.inner.execute_internal(&query, HashMap::new()).await?;
+            result
+                .rows()
+                .first()
+                .and_then(|r| r.get::<i64>("cnt").ok())
+                .unwrap_or(0) as usize
+        };
+
+        let source_labels = edge_meta.src_labels.clone();
+        let target_labels = edge_meta.dst_labels.clone();
+
+        Ok(Some(crate::api::schema::EdgeTypeInfo {
+            name: name.to_string(),
+            count,
+            source_labels,
+            target_labels,
+            properties: property_infos_for(&schema, name, edge_property_is_indexed),
+            indexes: index_infos_for(&schema, name, edge_index_descriptor),
+            constraints: constraint_infos_for(
+                &schema,
+                |c| matches!(&c.target, uni_common::core::schema::ConstraintTarget::EdgeType(et) if et == name),
+            ),
+            description: edge_meta.description.clone(),
+        }))
     }
 }

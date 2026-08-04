@@ -15,7 +15,7 @@
 //! - `{variable}.{property}` - materialized properties
 
 use crate::query::df_graph::GraphExecutionContext;
-use crate::query::df_graph::common::{arrow_err, compute_plan_properties};
+use crate::query::df_graph::common::{arrow_err, compute_plan_properties, exec_err};
 use arrow_array::builder::StringBuilder;
 use arrow_array::{ArrayRef, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -272,9 +272,7 @@ impl Stream for ExtIdLookupStream {
 
                     let fut = async move {
                         // Check timeout
-                        graph_ctx.check_timeout().map_err(|e| {
-                            datafusion::error::DataFusionError::Execution(e.to_string())
-                        })?;
+                        graph_ctx.check_timeout().map_err(exec_err)?;
 
                         execute_lookup(
                             &graph_ctx,
@@ -335,7 +333,7 @@ async fn execute_lookup(
     let found_vid = storage
         .find_vertex_by_ext_id(ext_id)
         .await
-        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+        .map_err(exec_err)?;
 
     let Some(vid) = found_vid else {
         // No match found
@@ -352,7 +350,7 @@ async fn execute_lookup(
     let props_opt = property_manager
         .get_all_vertex_props_with_ctx(vid, Some(&query_ctx))
         .await
-        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+        .map_err(exec_err)?;
 
     let Some(props) = props_opt else {
         // Vertex was deleted
@@ -366,7 +364,7 @@ async fn execute_lookup(
     let labels = storage
         .find_vertex_labels_by_vid(vid)
         .await
-        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?
+        .map_err(exec_err)?
         .unwrap_or_default();
 
     let label_name = labels

@@ -25,7 +25,9 @@
 
 use crate::query::datetime::parse_datetime_utc;
 use crate::query::df_graph::GraphExecutionContext;
-use crate::query::df_graph::common::{arrow_err, compute_plan_properties, labels_data_type};
+use crate::query::df_graph::common::{
+    arrow_err, compute_plan_properties, exec_err, labels_data_type,
+};
 use arrow_array::builder::{
     BinaryBuilder, BooleanBuilder, Date32Builder, FixedSizeListBuilder, Float32Builder,
     Float64Builder, Int32Builder, Int64Builder, ListBuilder, StringBuilder,
@@ -259,9 +261,26 @@ impl GraphScanExec {
         projected_properties: Vec<String>,
         filter: Option<Arc<dyn PhysicalExpr>>,
     ) -> Self {
-        let label = label_name.into();
-        let variable = variable.into();
+        Self::new_schemaless_inner(
+            graph_ctx,
+            label_name.into(),
+            variable.into(),
+            projected_properties,
+            filter,
+        )
+    }
 
+    /// Shared body of the schemaless vertex-scan constructors.
+    ///
+    /// `label` carries the variant-specific encoding: a single label name, the
+    /// colon-joined multi-label set, or the empty string for "scan all".
+    fn new_schemaless_inner(
+        graph_ctx: Arc<GraphExecutionContext>,
+        label: String,
+        variable: String,
+        projected_properties: Vec<String>,
+        filter: Option<Arc<dyn PhysicalExpr>>,
+    ) -> Self {
         // Filter out system columns that are already materialized as dedicated columns
         // (_vid as UInt64, _labels as List<Utf8>). If these appear in projected_properties
         // (e.g., from collect_properties_from_plan extracting _vid from filter expressions),
@@ -303,33 +322,16 @@ impl GraphScanExec {
         projected_properties: Vec<String>,
         filter: Option<Arc<dyn PhysicalExpr>>,
     ) -> Self {
-        let variable = variable.into();
-        let projected_properties: Vec<String> = projected_properties
-            .into_iter()
-            .filter(|p| p != "_vid" && p != "_labels")
-            .collect();
-        let uni_schema = graph_ctx.storage().schema_manager().schema();
-        let schema =
-            Self::build_schemaless_vertex_schema(&variable, &projected_properties, &uni_schema);
-        let properties = compute_plan_properties(schema.clone());
-
         // Encode labels as colon-separated for the stream to parse
         let encoded_labels = labels.join(":");
 
-        Self {
+        Self::new_schemaless_inner(
             graph_ctx,
-            label: encoded_labels,
-            variable,
+            encoded_labels,
+            variable.into(),
             projected_properties,
             filter,
-            vid_list_filter: None,
-            extra_lance_filter: None,
-            extra_runtime_filter: None,
-            is_schemaless: true,
-            schema,
-            properties,
-            metrics: ExecutionPlanMetricsSet::new(),
-        }
+        )
     }
 
     /// Create a new schemaless scan for all vertices.
@@ -343,31 +345,14 @@ impl GraphScanExec {
         projected_properties: Vec<String>,
         filter: Option<Arc<dyn PhysicalExpr>>,
     ) -> Self {
-        let variable = variable.into();
-        let projected_properties: Vec<String> = projected_properties
-            .into_iter()
-            .filter(|p| p != "_vid" && p != "_labels")
-            .collect();
-
-        let uni_schema = graph_ctx.storage().schema_manager().schema();
-        let schema =
-            Self::build_schemaless_vertex_schema(&variable, &projected_properties, &uni_schema);
-        let properties = compute_plan_properties(schema.clone());
-
-        Self {
+        // Empty label signals "scan all vertices"
+        Self::new_schemaless_inner(
             graph_ctx,
-            label: String::new(), // Empty label signals "scan all vertices"
-            variable,
+            String::new(),
+            variable.into(),
             projected_properties,
             filter,
-            vid_list_filter: None,
-            extra_lance_filter: None,
-            extra_runtime_filter: None,
-            is_schemaless: true,
-            schema,
-            properties,
-            metrics: ExecutionPlanMetricsSet::new(),
-        }
+        )
     }
 
     /// Build schema for schemaless vertex scan.
@@ -760,7 +745,7 @@ async fn drop_superseded_pushdown_rows(
                     .await
             }
         }
-        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+        .map_err(exec_err)?;
         let Some(vbatch) = scanned else { continue };
         let (Some(v_vid), Some(v_ver)) = (
             vbatch
@@ -1803,7 +1788,7 @@ async fn columnar_scan_vertex_batch_static(
             storage
                 .scan_vertex_table(label, &lance_columns_refs, combined_filter.as_ref())
                 .await
-                .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?,
+                .map_err(exec_err)?,
             extra_lance_filter.is_some(),
         ),
     };
@@ -2011,7 +1996,7 @@ async fn columnar_scan_schemaless_vertex_batch_static(
             filter.as_ref(),
         )
         .await
-        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+        .map_err(exec_err)?;
 
     // A pushed property predicate hides a vid's CURRENT row from the scan when
     // that row no longer matches (MVCC-append: the stale still-matching row
@@ -3408,9 +3393,7 @@ impl Stream for GraphScanStream {
                     let schema = self.schema.clone();
 
                     let fut = async move {
-                        graph_ctx.check_timeout().map_err(|e| {
-                            datafusion::error::DataFusionError::Execution(e.to_string())
-                        })?;
+                        graph_ctx.check_timeout().map_err(exec_err)?;
 
                         let batch = if is_schemaless {
                             columnar_scan_schemaless_vertex_batch_static(

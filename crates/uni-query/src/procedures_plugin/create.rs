@@ -47,11 +47,12 @@ use datafusion::scalar::ScalarValue;
 use uni_common::Properties;
 use uni_common::core::id::{Eid, Vid};
 use uni_plugin::traits::procedure::{
-    NamedArgType, ProcedureContext, ProcedureMode, ProcedurePlugin, ProcedureSignature,
+    ProcedureContext, ProcedureMode, ProcedurePlugin, ProcedureSignature,
 };
 use uni_plugin::traits::scalar::ArgType;
 use uni_plugin::{FnError, PluginError, PluginRegistrar, QName, SideEffects};
 
+use crate::procedures_plugin::host_args::{arg, arg_with_default};
 use crate::query::df_graph::common::edge_struct_fields;
 use crate::query::df_graph::procedure_call::map_yield_to_canonical;
 use crate::query::df_graph::scan::{build_property_column_static, resolve_property_type};
@@ -157,18 +158,18 @@ impl VNodeProcedure {
         static SIG: OnceLock<ProcedureSignature> = OnceLock::new();
         SIG.get_or_init(|| ProcedureSignature {
             args: vec![
-                NamedArgType {
-                    name: smol_str::SmolStr::new("labels"),
-                    ty: ArgType::Primitive(DataType::LargeBinary),
-                    default: Some(ScalarValue::LargeBinary(Some(b"[]".to_vec()))),
-                    doc: "List of label names (JSON-encoded array).".to_owned(),
-                },
-                NamedArgType {
-                    name: smol_str::SmolStr::new("props"),
-                    ty: ArgType::Primitive(DataType::LargeBinary),
-                    default: Some(ScalarValue::LargeBinary(Some(b"{}".to_vec()))),
-                    doc: "Property map (JSON-encoded object).".to_owned(),
-                },
+                arg_with_default(
+                    "labels",
+                    ArgType::Primitive(DataType::LargeBinary),
+                    ScalarValue::LargeBinary(Some(b"[]".to_vec())),
+                    "List of label names (JSON-encoded array).",
+                ),
+                arg_with_default(
+                    "props",
+                    ArgType::Primitive(DataType::LargeBinary),
+                    ScalarValue::LargeBinary(Some(b"{}".to_vec())),
+                    "Property map (JSON-encoded object).",
+                ),
             ],
             yields: vec![vid_node_yield_field()],
             mode: ProcedureMode::Read,
@@ -346,30 +347,27 @@ impl VEdgeProcedure {
         static SIG: OnceLock<ProcedureSignature> = OnceLock::new();
         SIG.get_or_init(|| ProcedureSignature {
             args: vec![
-                NamedArgType {
-                    name: smol_str::SmolStr::new("src"),
-                    ty: ArgType::Primitive(DataType::Int64),
-                    default: None,
-                    doc: "Source vid (stored or ephemeral).".to_owned(),
-                },
-                NamedArgType {
-                    name: smol_str::SmolStr::new("type"),
-                    ty: ArgType::Primitive(DataType::Utf8),
-                    default: None,
-                    doc: "Edge type name.".to_owned(),
-                },
-                NamedArgType {
-                    name: smol_str::SmolStr::new("props"),
-                    ty: ArgType::Primitive(DataType::LargeBinary),
-                    default: Some(ScalarValue::LargeBinary(Some(b"{}".to_vec()))),
-                    doc: "Property map (JSON-encoded object).".to_owned(),
-                },
-                NamedArgType {
-                    name: smol_str::SmolStr::new("dst"),
-                    ty: ArgType::Primitive(DataType::Int64),
-                    default: None,
-                    doc: "Destination vid (stored or ephemeral).".to_owned(),
-                },
+                arg(
+                    "src",
+                    ArgType::Primitive(DataType::Int64),
+                    "Source vid (stored or ephemeral).",
+                ),
+                arg(
+                    "type",
+                    ArgType::Primitive(DataType::Utf8),
+                    "Edge type name.",
+                ),
+                arg_with_default(
+                    "props",
+                    ArgType::Primitive(DataType::LargeBinary),
+                    ScalarValue::LargeBinary(Some(b"{}".to_vec())),
+                    "Property map (JSON-encoded object).",
+                ),
+                arg(
+                    "dst",
+                    ArgType::Primitive(DataType::Int64),
+                    "Destination vid (stored or ephemeral).",
+                ),
             ],
             yields: vec![edge_yield_field()],
             mode: ProcedureMode::Read,

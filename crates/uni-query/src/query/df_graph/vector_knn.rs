@@ -35,7 +35,8 @@ use uni_plugin::traits::index::{IndexHandle, IndexKind};
 
 use crate::query::df_graph::GraphExecutionContext;
 use crate::query::df_graph::common::{
-    arrow_err, calculate_score, compute_plan_properties, evaluate_simple_expr, labels_data_type,
+    arrow_err, calculate_score, compute_plan_properties, evaluate_simple_expr, exec_err,
+    labels_data_type,
 };
 use crate::query::df_graph::scan::{property_field, resolve_property_type};
 
@@ -64,7 +65,6 @@ pub(crate) enum VectorSource {
     Plugin {
         /// Kind that produced the handle. Informational; kept so the
         /// planner-level dispatch log can include it.
-        #[allow(dead_code)]
         kind: IndexKind,
         /// The handle to probe.
         handle: Arc<dyn IndexHandle>,
@@ -526,9 +526,7 @@ impl Stream for VectorKnnStream {
 
                     let fut = async move {
                         // Check timeout
-                        graph_ctx.check_timeout().map_err(|e| {
-                            datafusion::error::DataFusionError::Execution(e.to_string())
-                        })?;
+                        graph_ctx.check_timeout().map_err(exec_err)?;
 
                         execute_vector_search(
                             &graph_ctx,
@@ -735,7 +733,7 @@ async fn retrieve_vid_scores(
                     Some(&query_ctx),
                 )
                 .await
-                .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))
+                .map_err(exec_err)
         }
         VectorSource::Plugin { handle, .. } => {
             // Build a single-row query batch:
@@ -877,7 +875,7 @@ async fn build_result_batch(
                 Some(target_properties),
             )
             .await
-            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+            .map_err(exec_err)?;
 
         let uni_schema = graph_ctx.storage().schema_manager().schema();
         let label_props = uni_schema.properties.get(label_name);

@@ -193,6 +193,62 @@ pub fn column_as_vid_array(
     )))
 }
 
+/// Resolve the named edge-ID columns used for Cypher relationship-uniqueness,
+/// failing closed on anything unexpected.
+///
+/// The traversal operators harvest these column names from their own input plan
+/// and use the resulting arrays to skip edges already bound by an earlier
+/// element of the same MATCH. The sites previously used
+/// `filter_map(|col| batch.column_by_name(col).and_then(downcast::<UInt64Array>))`,
+/// which drops a column that is absent or not `UInt64` — and a dropped column
+/// contributes no entries, so the `used_eids` check silently never fires for it
+/// and a path may reuse an edge. That is relationship-isomorphism quietly
+/// disabled, with no error and no residual re-check.
+///
+/// No current producer can trigger it: every `_eid`-shaped column is declared
+/// `UInt64`, the names come from the very plan that becomes the operator's
+/// child, and graph plans execute directly so no projection pushdown can prune
+/// one away. This exists so that a future change to the eid encoding fails
+/// loudly here instead of silently weakening path semantics — the same reason
+/// [`column_as_vid_array`] errors rather than skipping, in these same functions.
+///
+/// # Errors
+///
+/// Returns `DataFusionError::Execution` if a named column is missing from the
+/// batch or is not a `UInt64` array.
+pub fn used_edge_id_arrays<'a>(
+    batch: &'a arrow_array::RecordBatch,
+    used_edge_columns: &[String],
+) -> datafusion::error::Result<Vec<&'a arrow_array::UInt64Array>> {
+    used_edge_columns
+        .iter()
+        .map(|col| {
+            let column = batch.column_by_name(col).ok_or_else(|| {
+                datafusion::error::DataFusionError::Execution(format!(
+                    "relationship-uniqueness column '{col}' is missing from the traversal input \
+                     (columns: {:?}); proceeding would silently allow an edge to be reused",
+                    batch
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|f| f.name().as_str())
+                        .collect::<Vec<_>>()
+                ))
+            })?;
+            column
+                .as_any()
+                .downcast_ref::<arrow_array::UInt64Array>()
+                .ok_or_else(|| {
+                    datafusion::error::DataFusionError::Execution(format!(
+                        "relationship-uniqueness column '{col}' has type {:?}, expected UInt64; \
+                         proceeding would silently allow an edge to be reused",
+                        column.data_type()
+                    ))
+                })
+        })
+        .collect()
+}
+
 /// Extract a VID from a CypherValue.
 ///
 /// Handles both `Value::Node` (native node) and `Value::Map` with `_id` field

@@ -45,3 +45,6 @@ pub mod locy_issue_160_query_derived_parity;
 // reports NULL for strings and floats for ints while QUERY reports the real
 // value. Found by the generic QUERY/derived parity guard.
 pub mod locy_schemaless_property_type_inference;
+// A string literal in YIELD is NULL in `derived` while QUERY returns it.
+// Same class as the schemaless property defect, different cause.
+pub mod locy_string_literal_yield;

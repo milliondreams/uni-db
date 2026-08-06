@@ -46,6 +46,12 @@ Feature: Prioritized Rules (PRIORITY)
     Then evaluation should succeed
     And the derived relation 'classify' should have 2 facts
     And the derived relation 'classify' should contain a fact where n.name = 'B'
+    # A (risk 0.8) is matched by BOTH rules, so PRIORITY 2 must win: 'high'.
+    # B (risk 0.2) is matched only by PRIORITY 1, so it keeps 'low'.
+    # Asserting `level` is the whole point of the scenario — without it the
+    # scenario passes identically whether priority resolution works or not.
+    And the derived relation 'classify' should contain a fact where n.name = 'A' and level = 'high'
+    And the derived relation 'classify' should contain a fact where n.name = 'B' and level = 'low'
 
   Scenario: Key matched only by lower priority retains lower
     Given having executed:
@@ -63,6 +69,10 @@ Feature: Prioritized Rules (PRIORITY)
       """
     Then evaluation should succeed
     And the derived relation 'classify' should have 1 facts
+    # risk 0.2 never satisfies PRIORITY 2's `risk > 0.5`, so the lower-priority
+    # value must survive untouched. A fact count of 1 alone cannot tell 'low'
+    # from a wrongly-promoted 'high'.
+    And the derived relation 'classify' should contain a fact where level = 'low'
 
   Scenario: Equal priority produces union
     Given having executed:
@@ -81,3 +91,8 @@ Feature: Prioritized Rules (PRIORITY)
       """
     Then evaluation should succeed
     And the derived relation 'routes' should contain at least 2 facts
+    # Equal priority means neither rule suppresses the other, so BOTH mode
+    # values must survive. "at least 2 facts" alone would pass if one rule
+    # contributed both facts.
+    And the derived relation 'routes' should contain a fact where mode = 'fast'
+    And the derived relation 'routes' should contain a fact where mode = 'slow'

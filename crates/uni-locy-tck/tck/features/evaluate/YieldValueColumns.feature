@@ -73,10 +73,7 @@ Feature: YIELD Value Columns
       """
     Then evaluation should succeed
     And the derived relation 'tagged' should have 2 facts
-    # NOTE: the derived VALUE of `action` is deliberately not asserted here.
-    # A string literal in YIELD comes back NULL from `derived` while QUERY
-    # returns it correctly — a separate open defect, pinned by
-    # `locy_string_literal_yield.rs`. Assert it here once that is fixed.
+    And the derived relation 'tagged' should contain a fact where action = 'patch-now'
     And the command result 0 should be a Query with 1 rows
     And the command result 0 should be a Query containing row where nid = 'A'
     And the command result 0 should be a Query containing row where action = 'patch-now'

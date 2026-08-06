@@ -4618,14 +4618,46 @@ pub(crate) async fn apply_post_fixpoint_chain(
     // the actual batch may have different column ordering after schema
     // reconciliation during fixpoint iteration (same pattern as
     // FixpointState::reconcile_schema).
+    //
+    // Fails closed on any name that does not resolve. A `filter_map` here would
+    // silently *shorten* the KEY tuple, and these indices feed PriorityExec,
+    // FoldExec and BestByExec below — grouping by a subset of the KEY merges
+    // groups that must stay distinct, so FOLD over-aggregates, PRIORITY drops
+    // rows that were max-priority in their true group, and BEST BY keeps one
+    // row where it should keep several. With every name missing it degenerates
+    // to a single global group. All silent wrong answers, and unlike
+    // `FixpointState::reconcile_schema` (which guards by comparing arity and
+    // keeping its original indices) there is nothing downstream to re-check.
     let key_column_indices: Vec<usize> = rule
         .key_column_indices
         .iter()
-        .filter_map(|&i| {
-            let name = rule.yield_schema.field(i).name();
-            schema.index_of(name).ok()
+        .map(|&i| {
+            // Positional index into the rule's own yield schema; out of range
+            // would otherwise panic inside `field(i)`.
+            let name = rule
+                .yield_schema
+                .fields()
+                .get(i)
+                .ok_or_else(|| {
+                    datafusion::common::DataFusionError::Internal(format!(
+                        "KEY column index {i} out of range for yield schema with {} fields",
+                        rule.yield_schema.fields().len()
+                    ))
+                })?
+                .name();
+            schema.index_of(name).map_err(|_| {
+                datafusion::common::DataFusionError::Internal(format!(
+                    "KEY column '{name}' missing from the post-fixpoint batch schema \
+                     (columns: {:?}); grouping on a partial KEY would silently merge groups",
+                    schema
+                        .fields()
+                        .iter()
+                        .map(|f| f.name().as_str())
+                        .collect::<Vec<_>>()
+                ))
+            })
         })
-        .collect();
+        .collect::<datafusion::common::Result<Vec<usize>>>()?;
 
     // Apply PRIORITY first — keeps only rows with max __priority per KEY group,
     // then strips the __priority column from output.

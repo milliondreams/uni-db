@@ -21,8 +21,9 @@ use arrow_array::types::{
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, FixedSizeBinaryArray,
     FixedSizeListArray, Float32Array, Float64Array, Int32Array, Int64Array,
-    IntervalMonthDayNanoArray, LargeBinaryArray, ListArray, StringArray, StructArray,
-    Time64NanosecondArray, TimestampNanosecondArray, UInt8Array, UInt32Array, UInt64Array,
+    IntervalMonthDayNanoArray, LargeBinaryArray, LargeStringArray, ListArray, StringArray,
+    StructArray, Time64NanosecondArray, TimestampNanosecondArray, UInt8Array, UInt32Array,
+    UInt64Array,
 };
 use arrow_schema::{DataType as ArrowDataType, Field};
 use std::collections::HashMap;
@@ -430,6 +431,17 @@ pub fn arrow_to_value(col: &dyn Array, row: usize, data_type: Option<&DataType>)
     if let Some(s) = col.as_any().downcast_ref::<StringArray>() {
         return Value::String(s.value(row).to_string());
     }
+    // `LargeUtf8`. Distinct from `Utf8` at the Arrow level, so it needs its own
+    // downcast — a `StringArray` downcast does not match a `LargeStringArray`.
+    // Locy reaches this constantly: `infer_expr_type` types string literals and
+    // every string-returning function (`toUpper`, `substring`, `toString`, ...)
+    // as `LargeUtf8`, and `plan_locy_project` casts the column to match. Without
+    // this arm all of those fell through to the `Value::Null` fallback below,
+    // so `derived` reported NULL while `QUERY` (which evaluates natively, never
+    // touching Arrow) reported the real value.
+    if let Some(s) = col.as_any().downcast_ref::<LargeStringArray>() {
+        return Value::String(s.value(row).to_string());
+    }
 
     // Integer types
     if let Some(u) = col.as_any().downcast_ref::<UInt64Array>() {
@@ -751,7 +763,39 @@ pub fn arrow_to_value(col: &dyn Array, row: usize, data_type: Option<&DataType>)
             .unwrap_or(Value::Null);
     }
 
-    // Fallback
+    // Arrow's Null type carries no values by construction, so `Value::Null` is
+    // the correct decode, not a gap. Listed explicitly so it does not reach the
+    // diagnostic below.
+    if *col.data_type() == ArrowDataType::Null {
+        return Value::Null;
+    }
+
+    // `_uid` — the 32-byte content hash on vertex/index datasets
+    // (`vertex.rs`, `main_vertex.rs`, `index.rs`). Internal, never user-facing,
+    // and by far the most common visitor here (~750 calls in one integration
+    // run), which is why it is matched explicitly rather than left to warn on
+    // every cell. The `FixedSizeBinary(24)` arm above claims BTIC; every other
+    // width is this.
+    if matches!(col.data_type(), ArrowDataType::FixedSizeBinary(_)) {
+        return Value::Null;
+    }
+
+    // Fallback: an Arrow type no arm above handles. Decoding to `Null` silently
+    // is how the missing `LargeUtf8` arm survived long enough to be written down
+    // as a Locy language constraint — every string literal and string-returning
+    // function in a `YIELD` came back NULL with no diagnostic anywhere. Warn so
+    // the next gap is visible.
+    //
+    // Deliberately not an error: this decoder is shared with the Cypher read
+    // path and not every caller has been audited for types that legitimately
+    // land here. The two high-volume benign cases are handled above, so
+    // reaching this point is genuinely unexpected and worth a line in the log.
+    log::warn!(
+        "arrow_to_value: no decoder for Arrow type {:?}; returning Null. \
+         This is a silent wrong answer if the column holds real data — \
+         add a downcast arm for it.",
+        col.data_type()
+    );
     Value::Null
 }
 
@@ -1209,6 +1253,13 @@ fn values_to_large_binary_array(values: &[Value]) -> ArrayRef {
 }
 
 /// Convert a slice of JSON Values to an Arrow array based on the target Arrow DataType.
+///
+/// Note: there is deliberately no `LargeUtf8` arm, unlike the read direction in
+/// [`arrow_to_value`]. Checked when the missing `LargeUtf8` *read* arm was
+/// fixed: no Uni `DataType` maps to `LargeUtf8` (`DataType::String` →
+/// `Utf8`), and no UDF declares it as a return type, so nothing reaches here
+/// with it. Should that change, the fallthrough is an `Err` — loud, and the
+/// right direction — not a silent null.
 pub fn values_to_array(values: &[Value], dt: &ArrowDataType) -> Result<ArrayRef> {
     match dt {
         ArrowDataType::UInt64 => Ok(values_to_uint64_array(values)),
@@ -2520,6 +2571,29 @@ mod tests {
     #[test]
     fn test_arrow_to_value_string() {
         let arr = StringArray::from(vec![Some("hello"), None, Some("world")]);
+        assert_eq!(
+            arrow_to_value(&arr, 0, None),
+            Value::String("hello".to_string())
+        );
+        assert_eq!(arrow_to_value(&arr, 1, None), Value::Null);
+        assert_eq!(
+            arrow_to_value(&arr, 2, None),
+            Value::String("world".to_string())
+        );
+    }
+
+    /// `LargeUtf8` is a distinct Arrow type from `Utf8` and needs its own
+    /// downcast — this decoder had a `StringArray` arm but no
+    /// `LargeStringArray` one, so every `LargeUtf8` column fell through to the
+    /// trailing `Value::Null` fallback.
+    ///
+    /// Locy hit this on every string literal and every string-returning
+    /// function in a `YIELD` (all typed `LargeUtf8` by `infer_expr_type`),
+    /// reporting NULL from `derived` while `QUERY` — which never touches Arrow
+    /// — reported the real value.
+    #[test]
+    fn test_arrow_to_value_large_string() {
+        let arr = LargeStringArray::from(vec![Some("hello"), None, Some("world")]);
         assert_eq!(
             arrow_to_value(&arr, 0, None),
             Value::String("hello".to_string())

@@ -732,15 +732,8 @@ impl GraphTraverseStream {
         let bound_target_vids: Option<&UInt64Array> = bound_target_cow.as_deref();
 
         // Collect edge ID arrays from previous hops for relationship uniqueness filtering.
-        let used_edge_arrays: Vec<&UInt64Array> = self
-            .used_edge_columns
-            .iter()
-            .filter_map(|col| {
-                batch
-                    .column_by_name(col)
-                    .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
-            })
-            .collect();
+        let used_edge_arrays: Vec<&UInt64Array> =
+            super::common::used_edge_id_arrays(batch, &self.used_edge_columns)?;
 
         let mut expanded_rows: Vec<(usize, Vid, u64, u32)> = Vec::new();
         let is_undirected = matches!(self.direction, Direction::Both);
@@ -2147,15 +2140,8 @@ impl GraphTraverseMainStream {
         let expected_targets: Option<&UInt64Array> = bound_target_cow.as_deref();
 
         // Collect edge ID arrays from previous hops for relationship uniqueness filtering.
-        let used_edge_arrays: Vec<&UInt64Array> = self
-            .used_edge_columns
-            .iter()
-            .filter_map(|col| {
-                input
-                    .column_by_name(col)
-                    .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
-            })
-            .collect();
+        let used_edge_arrays: Vec<&UInt64Array> =
+            super::common::used_edge_id_arrays(input, &self.used_edge_columns)?;
 
         // Build expansions: (input_row_idx, target_vid, eid, edge_type, edge_props).
         // Type/props are Arc-shared with the adjacency map (pointer clones).
@@ -3693,17 +3679,8 @@ impl GraphVariableLengthTraverseStream {
         let expected_targets: Option<&UInt64Array> = bound_target_cow.as_deref();
 
         // Extract used edge columns for cross-pattern relationship uniqueness
-        let used_edge_arrays: Vec<&UInt64Array> = self
-            .exec
-            .used_edge_columns
-            .iter()
-            .filter_map(|col| {
-                batch
-                    .column_by_name(col)?
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-            })
-            .collect();
+        let used_edge_arrays: Vec<&UInt64Array> =
+            super::common::used_edge_id_arrays(&batch, &self.exec.used_edge_columns)?;
 
         // Collect all BFS results
         let mut expansions: Vec<VarLengthExpansion> = Vec::new();
@@ -4571,16 +4548,8 @@ impl GraphVariableLengthTraverseMainStream {
         let expected_targets: Option<&UInt64Array> = bound_target_cow.as_deref();
 
         // Extract used edge columns for cross-pattern relationship uniqueness
-        let used_edge_arrays: Vec<&UInt64Array> = self
-            .used_edge_columns
-            .iter()
-            .filter_map(|col| {
-                batch
-                    .column_by_name(col)?
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-            })
-            .collect();
+        let used_edge_arrays: Vec<&UInt64Array> =
+            super::common::used_edge_id_arrays(&batch, &self.used_edge_columns)?;
 
         // Collect BFS results: (original_row_idx, target_vid, hop_count, node_path, edge_path)
         let mut expansions: Vec<ExpansionRecord> = Vec::new();

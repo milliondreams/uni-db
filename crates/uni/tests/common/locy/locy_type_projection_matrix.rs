@@ -298,3 +298,55 @@ async fn matrix_s6_schemad_key_round_trips_typed_in_derived() -> Result<()> {
     }
     Ok(())
 }
+
+/// S7: **`LargeUtf8`-producing expressions** — the arm the matrix was missing.
+///
+/// The cases above all project a stored *property*, whose Arrow type comes from
+/// the declared schema (`Utf8`) or from cv-encoded storage (`LargeBinary`).
+/// Neither reaches `LargeUtf8`, which is what `infer_expr_type` assigns to
+/// string literals and to every string-returning function — and which had no
+/// decode arm at all, so all of them silently produced NULL in `derived`.
+///
+/// A matrix keyed on *storage* types could never have caught it; the gap was
+/// only reachable through *expression* types. That is the generalizable lesson
+/// and the reason this arm exists.
+#[tokio::test]
+async fn matrix_s7_large_utf8_expressions_round_trip_on_both_surfaces() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("M")
+        .property("val", DataType::String)
+        .apply()
+        .await?;
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (:M {val: 'x'})").await?;
+    tx.commit().await?;
+
+    for expr in [
+        "'lit'",
+        "toUpper(n.val)",
+        "toLower('ABC')",
+        "toString(1)",
+        "substring('abcdef', 1, 2)",
+        "trim('  s  ')",
+    ] {
+        let program =
+            format!("CREATE RULE r AS MATCH (n:M) YIELD KEY n, {expr} AS v\nQUERY r RETURN v");
+        let result = db.session().locy(&program).await?;
+        let empty = vec![];
+
+        let derived = result.derived_facts("r").unwrap_or(&empty);
+        assert_column_non_null(derived, "v");
+        assert_column_typed(derived, "v", TypeTag::Str);
+
+        let queried = result.rows().unwrap_or(&empty);
+        assert_column_typed(queried, "v", TypeTag::Str);
+        assert_eq!(
+            derived.first().and_then(|r| r.get("v")),
+            queried.first().and_then(|r| r.get("v")),
+            "{expr}: derived and QUERY must agree"
+        );
+    }
+    Ok(())
+}

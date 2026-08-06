@@ -112,13 +112,34 @@ impl PatternExistsExecExpr {
     }
 
     /// Resolves a `PropertyPredicate` to a concrete `Value` at evaluate time.
-    fn resolve_predicate_value(&self, pred: &PropertyPredicate) -> Option<Value> {
+    ///
+    /// Fails closed. This used to return `Option` and the caller dropped a
+    /// `None` from the predicate list, which meant an unsupplied parameter
+    /// silently removed the property check: `WHERE (a)-[:R]->(:B {name: $p})`
+    /// degenerated to "any neighbour labelled `B`" and matched, while under
+    /// `NOT` it excluded rows that should have been kept. Both are silent wrong
+    /// answers, and there is no residual re-check anywhere downstream that
+    /// would re-apply the dropped predicate.
+    ///
+    /// An unbound parameter is a hard error everywhere else in this crate (see
+    /// `common.rs::resolve_value_expr` and `unwind.rs`); this site was the
+    /// outlier. Note that a parameter bound to an explicit `null` is *supplied*
+    /// and still resolves to `Ok(Value::Null)` — "absent" and "null" must stay
+    /// distinguishable.
+    fn resolve_predicate_value(&self, pred: &PropertyPredicate) -> DFResult<Value> {
         if let Some(ref val) = pred.literal_value {
-            Some(val.clone())
+            Ok(val.clone())
         } else if let Some(ref param_name) = pred.param_name {
-            self.params.get(param_name).cloned()
+            self.params.get(param_name).cloned().ok_or_else(|| {
+                DataFusionError::Execution(format!("Parameter '{}' not found", param_name))
+            })
         } else {
-            None
+            // Impossible by construction: `build_property_predicates` sets one
+            // of the two arms or bails at plan time. Loud rather than silent.
+            Err(DataFusionError::Execution(format!(
+                "Pattern property predicate for '{}' has neither a literal nor a parameter",
+                pred.property_name
+            )))
         }
     }
 }
@@ -257,14 +278,17 @@ impl PhysicalExpr for PatternExistsExecExpr {
                 };
 
             // Resolve property predicate values for this step.
+            // `collect::<DFResult<Vec<_>>>()` propagates instead of dropping:
+            // a predicate that cannot be resolved must fail the query, never
+            // silently vanish from the filter.
             let resolved_preds: Vec<(String, Value)> = if has_property_preds {
                 self.target_property_predicates[step_idx]
                     .iter()
-                    .filter_map(|p| {
+                    .map(|p| {
                         self.resolve_predicate_value(p)
                             .map(|v| (p.property_name.clone(), v))
                     })
-                    .collect()
+                    .collect::<DFResult<Vec<_>>>()?
             } else {
                 Vec::new()
             };

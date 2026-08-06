@@ -29,6 +29,185 @@ fn where_clause_cannot_filter(expr: &uni_cypher::ast::Expr) -> bool {
     }
 }
 
+/// A comparable value, normalized so the two engines can be compared at all.
+///
+/// `Value`'s own `Hash`/`Eq` cover every property of a `Node`, which makes
+/// whole-node comparison unusable across engines: they legitimately populate
+/// different property sets for the same node. Identity is the only stable part.
+#[derive(PartialEq, Eq, Hash, Debug, Clone)]
+enum IdentKey {
+    Vid(u64),
+    Eid(u64),
+    Scalar(String),
+    /// A value deliberately excluded from comparison — see
+    /// [`normalize_for_compare`].
+    Opaque,
+}
+
+/// Normalizes a value for cross-engine comparison.
+///
+/// Floats collapse to [`IdentKey::Opaque`]: the fixpoint and SLG paths perform
+/// probability arithmetic in different orders and differ in the last bits, so
+/// including them would produce false failures rather than real findings.
+fn normalize_for_compare(value: &uni_common::Value) -> IdentKey {
+    use uni_common::Value;
+    match value {
+        Value::Node(n) => IdentKey::Vid(n.vid.as_u64()),
+        Value::Edge(e) => IdentKey::Eid(e.eid.as_u64()),
+        Value::Float(_) => IdentKey::Opaque,
+        other => IdentKey::Scalar(format!("{other:?}")),
+    }
+}
+
+/// Maps each rule name to its KEY column names, by re-parsing the program.
+///
+/// Uses `resolve_yield_column_names` — the same function the planner and the SLG
+/// resolver use — so the names are authoritative rather than a second guess at
+/// the naming convention. A rule may have several clauses; the first with a
+/// `YIELD` wins, and they must agree on the schema anyway.
+fn key_columns_by_rule(
+    ast: &uni_cypher::locy_ast::LocyProgram,
+) -> std::collections::HashMap<String, Vec<String>> {
+    use uni_cypher::locy_ast::{resolve_yield_column_names, LocyStatement, RuleOutput};
+
+    let mut out: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    for stmt in &ast.statements {
+        let LocyStatement::Rule(def) = stmt else {
+            continue;
+        };
+        let RuleOutput::Yield(yield_clause) = &def.output else {
+            continue;
+        };
+        let name = def.name.to_string();
+        if out.contains_key(&name) {
+            continue;
+        }
+        let names = resolve_yield_column_names(&yield_clause.items);
+        let keys: Vec<String> = names
+            .iter()
+            .zip(&yield_clause.items)
+            .filter(|(_, item)| item.is_key)
+            .map(|(n, _)| n.clone())
+            .collect();
+        if !keys.is_empty() {
+            out.insert(name, keys);
+        }
+    }
+    out
+}
+
+/// One comparable key column, and how to read it from each surface.
+///
+/// A `RETURN a.name` projects a *property* of the key, so the two surfaces hold
+/// different things for it: `derived` carries the whole node under `a`, while
+/// the query row carries the string under `a.name`. Comparing them directly
+/// would compare a vid against a string and fail on every scenario — the same
+/// property has to be extracted from the derived node as well.
+#[derive(Debug, Clone)]
+struct KeyProjection {
+    /// Column holding the key in `derived` rows.
+    key_col: String,
+    /// Property to read off it, when the RETURN projected one.
+    prop: Option<String>,
+    /// Column holding the value in the QUERY rows.
+    out_name: String,
+}
+
+/// Reads a key projection from a `derived` row.
+fn derived_side(row: &uni_locy::FactRow, p: &KeyProjection) -> IdentKey {
+    use uni_common::Value;
+    let Some(base) = row.get(&p.key_col) else {
+        return IdentKey::Opaque;
+    };
+    let Some(prop) = &p.prop else {
+        return normalize_for_compare(base);
+    };
+    match base {
+        Value::Node(n) => n
+            .properties
+            .get(prop)
+            .map_or(IdentKey::Opaque, normalize_for_compare),
+        Value::Edge(e) => e
+            .properties
+            .get(prop)
+            .map_or(IdentKey::Opaque, normalize_for_compare),
+        Value::Map(m) => m.get(prop).map_or(IdentKey::Opaque, normalize_for_compare),
+        // A scalar key column with a property access is not comparable.
+        _ => IdentKey::Opaque,
+    }
+}
+
+/// Which output column each key column is visible under in a `QUERY`'s rows.
+///
+/// With no `RETURN`, rows carry the rule's yield names directly. With a
+/// `RETURN`, a key is only comparable when some item projects it as a bare
+/// variable (`RETURN p`) or a property of it (`RETURN a.name`); the output name
+/// follows the alias, else the OpenCypher default. Keys that no item projects
+/// are simply not comparable and are dropped.
+///
+/// Returns `None` when the RETURN contains an aggregate, which can collapse
+/// rows and makes any cardinality comparison meaningless.
+fn comparable_key_projection(
+    keys: &[String],
+    return_clause: Option<&uni_cypher::ast::ReturnClause>,
+) -> Option<Vec<KeyProjection>> {
+    use uni_cypher::ast::{Expr, ReturnItem};
+
+    let bare = |k: &String| KeyProjection {
+        key_col: k.clone(),
+        prop: None,
+        out_name: k.clone(),
+    };
+    let Some(rc) = return_clause else {
+        return Some(keys.iter().map(bare).collect());
+    };
+
+    let mut out = Vec::new();
+    for item in &rc.items {
+        // `RETURN *` keeps the underlying names.
+        let ReturnItem::Expr { expr, alias, .. } = item else {
+            out.extend(keys.iter().map(bare));
+            continue;
+        };
+        if expr_contains_aggregate(expr) {
+            return None;
+        }
+        let (key_col, prop, default_name) = match expr {
+            Expr::Variable(v) if keys.contains(v) => (v.clone(), None, v.clone()),
+            Expr::Property(inner, prop) => match inner.as_ref() {
+                Expr::Variable(v) if keys.contains(v) => {
+                    (v.clone(), Some(prop.clone()), format!("{v}.{prop}"))
+                }
+                _ => continue,
+            },
+            _ => continue,
+        };
+        out.push(KeyProjection {
+            key_col,
+            prop,
+            out_name: alias.clone().unwrap_or(default_name),
+        });
+    }
+    Some(out)
+}
+
+/// Conservative aggregate detection — any known aggregate function name.
+fn expr_contains_aggregate(expr: &uni_cypher::ast::Expr) -> bool {
+    use uni_cypher::ast::Expr;
+    match expr {
+        Expr::FunctionCall { name, args, .. } => {
+            const AGGREGATES: [&str; 7] = ["count", "sum", "avg", "min", "max", "collect", "stdev"];
+            AGGREGATES.contains(&name.to_lowercase().as_str())
+                || args.iter().any(expr_contains_aggregate)
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            expr_contains_aggregate(left) || expr_contains_aggregate(right)
+        }
+        Expr::UnaryOp { expr, .. } => expr_contains_aggregate(expr),
+        _ => false,
+    }
+}
+
 /// Asserts that `QUERY <rule>` does not go vacuous while `derived[<rule>]` holds
 /// facts — checked on **every** scenario that evaluates a program.
 ///
@@ -86,9 +265,11 @@ fn assert_query_derived_parity(program: &str, result: &uni_locy::LocyResult) {
         return;
     }
 
+    let key_columns = key_columns_by_rule(&ast);
+
     for (gq, rows) in goal_queries.iter().zip(query_rows) {
-        // A real WHERE or a LIMIT can legitimately empty the result; a
-        // self-comparison tautology cannot.
+        // A real WHERE, a LIMIT or a SKIP can legitimately empty or shrink the
+        // result; a self-comparison tautology cannot.
         if gq
             .where_expr
             .as_ref()
@@ -96,7 +277,11 @@ fn assert_query_derived_parity(program: &str, result: &uni_locy::LocyResult) {
         {
             continue;
         }
-        if gq.return_clause.as_ref().is_some_and(|r| r.limit.is_some()) {
+        if gq
+            .return_clause
+            .as_ref()
+            .is_some_and(|r| r.limit.is_some() || r.skip.is_some())
+        {
             continue;
         }
 
@@ -104,21 +289,68 @@ fn assert_query_derived_parity(program: &str, result: &uni_locy::LocyResult) {
         let Some(derived) = result.derived.get(&rule) else {
             continue;
         };
-        if derived.is_empty() || !rows.is_empty() {
+        if derived.is_empty() {
             continue;
         }
 
-        panic!(
-            "QUERY/derived parity violated for rule `{rule}`: the fixpoint derived \
-             {} fact(s) but QUERY returned 0 rows, and the query has no WHERE or \
-             LIMIT that could explain it.\n\
-             This is the issue #160 class: `derived` (fixpoint) and `QUERY` (SLG) \
-             disagree. A known trigger is an IS-ref that introduces a variable \
-             binding the MATCH pattern does not provide — the SLG resolver can \
-             filter on an already-bound subject but cannot bind a fresh one.\n\
-             Program:\n{program}",
-            derived.len()
-        );
+        // Strong check: every key tuple the fixpoint derived must appear in the
+        // QUERY result. Subset rather than equality — the SLG path may carry
+        // extra columns, and a superset is not a divergence in the direction
+        // that hurts (silently missing answers is).
+        let projection = key_columns
+            .get(&rule)
+            .and_then(|keys| comparable_key_projection(keys, gq.return_clause.as_ref()))
+            .filter(|p| !p.is_empty());
+
+        if let Some(projection) = projection {
+            let derived_keys: std::collections::HashSet<Vec<IdentKey>> = derived
+                .iter()
+                .map(|row| projection.iter().map(|p| derived_side(row, p)).collect())
+                .collect();
+            let query_keys: std::collections::HashSet<Vec<IdentKey>> = rows
+                .iter()
+                .map(|row| {
+                    projection
+                        .iter()
+                        .map(|p| {
+                            row.get(&p.out_name)
+                                .map(normalize_for_compare)
+                                .unwrap_or(IdentKey::Opaque)
+                        })
+                        .collect()
+                })
+                .collect();
+
+            let missing: Vec<_> = derived_keys.difference(&query_keys).collect();
+            assert!(
+                missing.is_empty(),
+                "QUERY/derived parity violated for rule `{rule}`: {} of {} derived \
+                 key tuple(s) are absent from the QUERY result ({} rows), and the \
+                 query has no WHERE / LIMIT / SKIP that could explain it.\n\
+                 Missing: {missing:?}\n\
+                 This is the issue #160 class: `derived` (fixpoint) and `QUERY` \
+                 (SLG) disagree.\n\
+                 Program:\n{program}",
+                missing.len(),
+                derived_keys.len(),
+                rows.len()
+            );
+            continue;
+        }
+
+        // Fallback when no key column is comparable (RETURN projects only
+        // expressions or aggregates): the original non-vacuity invariant.
+        if rows.is_empty() {
+            panic!(
+                "QUERY/derived parity violated for rule `{rule}`: the fixpoint \
+                 derived {} fact(s) but QUERY returned 0 rows, and the query has \
+                 no WHERE / LIMIT / SKIP that could explain it.\n\
+                 This is the issue #160 class: `derived` (fixpoint) and `QUERY` \
+                 (SLG) disagree.\n\
+                 Program:\n{program}",
+                derived.len()
+            );
+        }
     }
 }
 

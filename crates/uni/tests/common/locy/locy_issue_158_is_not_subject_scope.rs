@@ -19,42 +19,44 @@
 //! | `YIELD KEY b, a AS s`     | `a`             | **no**   |
 //! | `YIELD KEY b`             | `a`             | **no**   |
 //!
-//! A *non*-KEY column filters correctly (row 1) and a *KEY* column fails once
-//! aliased (row 4). The real predicate is purely name-based: does a column with
-//! that exact name exist in the rule's **projected output**?
+//! A *non*-KEY column filtered correctly (row 1) and a *KEY* column failed once
+//! aliased (row 4). The real predicate was purely name-based: did a column with
+//! that exact name exist in the rule's **projected output**? All five rows now
+//! filter.
 //!
-//! ## Root cause
+//! ## Root cause (FIXED)
 //!
-//! Two independent faults compose.
+//! Two independent faults composed.
 //!
 //! 1. **Phase ordering.** The anti-join runs *after* `LocyProject`
-//!    (`Body(yield + positive IS) -> IS NOT(anti-join) -> PROB -> post-fixpoint`).
-//!    `LocyProject` emits exactly the YIELD names
-//!    (`uni-query/src/query/locy_planner.rs:1364`), so a variable that is bound
-//!    in MATCH but not yielded — or yielded under an alias — no longer exists as
-//!    a column by the time the negation is evaluated. The user writes `WHERE` as
-//!    scoping over MATCH variables; it is implemented as scoping over projection
-//!    outputs. `is_not_positive_is_ref_is_unaffected` pins the asymmetry: the
-//!    *positive* `IS` form resolves the same subject correctly, because it is
-//!    evaluated inside the body plan, before projection.
+//!    (`Body(yield + positive IS) -> IS NOT(anti-join) -> PROB -> post-fixpoint`),
+//!    and `LocyProject` emits exactly the YIELD names. A variable bound in
+//!    MATCH but not yielded — or yielded under an alias — no longer existed as
+//!    a column by the time the negation was evaluated. The user writes `WHERE`
+//!    as scoping over MATCH variables; it was implemented as scoping over
+//!    projection outputs. `issue_158_positive_is_ref_is_unaffected` pins the
+//!    asymmetry that gave this away: the *positive* `IS` form resolves the same
+//!    subject correctly, because it runs inside the body plan.
 //!
-//! 2. **Fail-open degradation.** Given an unresolvable column,
-//!    `uni-query/src/query/df_graph/locy_complement.rs:205-212` executes
-//!    `result.push(batch); continue` — it emits precisely the rows it was asked
-//!    to exclude. A second pass-through at `:213-222` does the same when the
-//!    column is not `UInt64`.
+//! 2. **Fail-open degradation.** Given an unresolvable column, the anti-join
+//!    emitted precisely the rows it was asked to exclude — silent, and in the
+//!    security-relevant direction. The originating report describes a
+//!    tax-exemption guard (`WHERE c IS NOT exempt_customer`) with no effect at
+//!    all.
 //!
-//! Fault 2 is what makes this silent, and it is the security-relevant one: the
-//! originating report describes a tax-exemption guard
-//! (`WHERE c IS NOT exempt_customer`) that had no effect at all.
+//! Fault 2 was closed first (unresolvable subjects became a hard error). Fault
+//! 1 is closed by projecting a hidden `{var}._vid` column for every negated
+//! subject that is a MATCH-bound node variable, so resolution keys on node
+//! identity rather than on whatever YIELD chose to call things — see
+//! `LocyIsRef::subject_vid_cols` and `strip_isnot_vid_columns`.
 //!
-//! The condition is decidable at compile time. `uni-locy/src/compiler/
-//! typecheck.rs:252-284` already walks every `IsReference` to check arity and
-//! holds the consuming rule's `yield_schema` at that point.
+//! Subjects that are *not* MATCH-bound node variables have no `._vid` column
+//! (relationship variables expose `._eid`; scalar and ALONG-bound subjects have
+//! neither). Those keep the by-name path and still error rather than failing
+//! open — pinned by `issue_158_non_node_subject_still_errors_rather_than_failing_open`.
 //!
 //! Run with:
-//!   cargo nextest run -p uni-db --test integration \
-//!     -E 'test(issue_158)' --run-ignored all
+//!   cargo nextest run -p uni-db --test integration -E 'test(issue_158)'
 
 // Rust guideline compliant
 
@@ -195,48 +197,37 @@ async fn issue_158_positive_is_ref_is_unaffected() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Wave 0: the negation now FAILS LOUDLY instead of returning unfiltered rows.
+// The fix: resolution by node identity, not by projected name.
 //
-// These two programs are semantically valid — `a` is bound in MATCH — so
-// erroring is not the final answer, it is the safe intermediate one. Wave 1
-// carries a hidden `a._vid` column through `LocyProject` so the anti-join can
-// resolve the subject regardless of what YIELD named it; at that point both
-// tests flip again, to assert filtering (`["a2"]`). Until then, a loud error
-// beats a confident wrong answer.
+// The planner now projects a hidden `{var}._vid` column for every negated
+// subject that is a MATCH-bound node variable, and the anti-join keys on that
+// (see `LocyIsRef::subject_vid_cols`). Both programs below are semantically
+// valid — `a` is bound in MATCH — and now filter correctly regardless of what
+// YIELD named it.
+//
+// Wave 0 made these error rather than silently return every row; this is the
+// second half, which makes them work.
 // ---------------------------------------------------------------------------
 
-/// Asserts the error surfaced by an unresolvable `IS NOT` subject names the
-/// column and explains the projection requirement.
-fn assert_unresolvable_subject_error(err: &anyhow::Error, subject: &str) {
-    let msg = err.to_string();
-    assert!(
-        msg.contains("IS NOT") && msg.contains(subject),
-        "error must name the unresolvable subject `{subject}`; got: {msg}"
-    );
-    assert!(
-        msg.contains("projected"),
-        "error must explain the projection requirement; got: {msg}"
-    );
-}
-
-/// The subject is bound in MATCH and yielded, but under an alias — so the bare
-/// name no longer names a column. Previously the anti-join was skipped and
-/// every row was returned.
+/// The subject is bound in MATCH and yielded, but under an alias, so the bare
+/// name is not a post-projection column. Resolution now goes through `a._vid`.
 #[tokio::test]
-async fn issue_158_aliased_subject_errors_rather_than_failing_open() -> Result<()> {
+async fn issue_158_aliased_subject_filters_correctly() -> Result<()> {
     let db = setup().await?;
-    let err = probe(&db, "YIELD KEY b, a AS subj", "a", "subj")
-        .await
-        .expect_err("an unresolvable IS NOT subject must not silently succeed");
-    assert_unresolvable_subject_error(&err, "a");
+    let got = probe(&db, "YIELD KEY b, a AS subj", "a", "subj").await?;
+    assert_eq!(
+        got,
+        vec!["a2".to_string()],
+        "`a` is MATCH-bound, so renaming it in YIELD must not disable the negation"
+    );
     Ok(())
 }
 
-/// The worst shape: the subject is bound in MATCH but never yielded as a node
-/// column, so no name could reach it. This is the exemption-guard case from the
-/// originating report — the one that billed tax to exempt customers.
+/// The subject is bound in MATCH but never yielded as a node column, so no
+/// name could reach it. This is the exemption-guard case from the originating
+/// report — the one that billed tax to exempt customers.
 #[tokio::test]
-async fn issue_158_unprojected_subject_errors_rather_than_failing_open() -> Result<()> {
+async fn issue_158_unprojected_subject_filters_correctly() -> Result<()> {
     let db = setup().await?;
     let program = format!(
         "{FLAGGED}\n\
@@ -245,13 +236,86 @@ async fn issue_158_unprojected_subject_errors_rather_than_failing_open() -> Resu
            WHERE a IS NOT flagged\n\
            YIELD KEY b, a.n AS name\n"
     );
+    let result = db.session().locy(&program).await?;
+    let empty = vec![];
+    let facts = result.derived_facts("probe").unwrap_or(&empty);
+    let mut names: Vec<String> = facts
+        .iter()
+        .filter_map(|row| match row.get("name") {
+            Some(Value::String(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["a2".to_string()],
+        "the subject need not be projected at all — it is resolved by node identity"
+    );
+    Ok(())
+}
+
+/// A subject that is **not** a MATCH-bound node variable has no `._vid` column,
+/// so it keeps the by-name path — and must still fail loudly rather than
+/// silently returning every row.
+///
+/// Here `x` is bound only by the YIELD alias, never by the MATCH pattern.
+#[tokio::test]
+async fn issue_158_non_node_subject_still_errors_rather_than_failing_open() -> Result<()> {
+    let db = setup().await?;
+    let program = format!(
+        "{FLAGGED}\n\
+         CREATE RULE probe AS\n\
+           MATCH (a:A), (b:B)\n\
+           WHERE x IS NOT flagged\n\
+           YIELD KEY b, a.n AS x\n"
+    );
     let err = db
         .session()
         .locy(&program)
         .await
         .err()
-        .map(anyhow::Error::from)
-        .expect("an unresolvable IS NOT subject must not silently succeed");
-    assert_unresolvable_subject_error(&err, "a");
+        .expect("a non-node IS NOT subject must not silently pass every row");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("IS NOT"),
+        "error must identify the failing negation; got: {msg}"
+    );
+    Ok(())
+}
+
+/// The hidden `_vid` column must not survive into the derived relation.
+///
+/// If the strip is missed, `reconcile_schema` adopts the widened schema as the
+/// rule's fact identity and `write_facts_to_registry` silently falls back to it
+/// — corrupting cross-stratum IS-refs with no diagnostic. FOLD would mask this
+/// (`FoldExec` emits only key + fold columns), so this asserts on a **non-FOLD**
+/// rule.
+#[tokio::test]
+async fn issue_158_hidden_vid_column_does_not_leak_into_derived() -> Result<()> {
+    let db = setup().await?;
+    let program = format!(
+        "{FLAGGED}\n\
+         CREATE RULE probe AS\n\
+           MATCH (a:A), (b:B)\n\
+           WHERE a IS NOT flagged\n\
+           YIELD KEY b, a AS subj\n"
+    );
+    let result = db.session().locy(&program).await?;
+    let empty = vec![];
+    let facts = result.derived_facts("probe").unwrap_or(&empty);
+    assert!(
+        !facts.is_empty(),
+        "precondition: the rule must derive facts"
+    );
+    for row in facts {
+        let leaked: Vec<&String> = row.keys().filter(|k| k.starts_with("__isnot")).collect();
+        assert!(
+            leaked.is_empty(),
+            "hidden anti-join column leaked into derived facts: {leaked:?} \
+             (columns: {:?})",
+            row.keys().collect::<Vec<_>>()
+        );
+    }
     Ok(())
 }

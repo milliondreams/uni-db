@@ -68,6 +68,32 @@ pub fn extract_cypher_conditions(conditions: &[RuleCondition]) -> Vec<Expr> {
 
 // ── In-memory IS-ref join helpers ─────────────────────────────────────────────
 
+/// How an unbound subject is treated when matching an IS-ref.
+///
+/// The two modes exist because `is_ref_matches` backs both the positive
+/// semi-join and the negation paths, and relaxing it for one silently changes
+/// the semantics of the other.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SubjectMode {
+    /// A subject absent from the base row is a **generator**: it matches every
+    /// derived fact and is bound from it by [`semi_join_is_ref`].
+    ///
+    /// This is what makes `WHERE (r, p) IS role_perm` work when `p` appears
+    /// nowhere in the MATCH pattern. Previously the absent subject collapsed to
+    /// `Value::Null`, compared unequal to every fact, and the whole query
+    /// silently returned zero rows while the fixpoint derived facts normally
+    /// (issue #160).
+    Bind,
+    /// A subject absent from the base row compares as `Null` and therefore
+    /// matches nothing — the historical behaviour, kept for the negation and
+    /// probabilistic-complement paths.
+    ///
+    /// Applying `Bind` there would flip `IS NOT` with an unbindable subject
+    /// from keep-all to keep-**nothing**. That case is meaningless (an unbound
+    /// variable under negation) and is rejected at compile time instead.
+    Strict,
+}
+
 /// Check whether a derived fact matches the subject bindings from a base row.
 ///
 /// Positional: `subjects[i]` maps to `schema[i]` in the derived relation.
@@ -76,13 +102,25 @@ fn is_ref_matches(
     derived_fact: &FactRow,
     is_ref: &IsReference,
     schema: &[String],
+    mode: SubjectMode,
 ) -> bool {
     // Check subject columns.
     for (i, subject) in is_ref.subjects.iter().enumerate() {
         if i >= schema.len() {
             break;
         }
-        let base_val = base_row.get(subject).cloned().unwrap_or(Value::Null);
+        // Distinguish "not bound at all" from "bound to NULL". Only the former
+        // is a generator; a genuine NULL binding must still compare.
+        //
+        // `Strict` deliberately keeps the historical `unwrap_or(Value::Null)`
+        // rather than short-circuiting: `values_equal(Null, Null)` is `true`, so
+        // an absent subject matching an absent fact column is an existing
+        // behaviour the negation paths may depend on.
+        let base_val = match base_row.get(subject) {
+            Some(v) => v.clone(),
+            None if mode == SubjectMode::Bind => continue,
+            None => Value::Null,
+        };
         let fact_val = derived_fact.get(&schema[i]).cloned().unwrap_or(Value::Null);
         if !values_equal_for_join(&base_val, &fact_val) {
             return false;
@@ -122,8 +160,22 @@ fn semi_join_is_ref(
     let mut result = Vec::new();
     for base_row in base_rows {
         for derived_fact in derived_facts {
-            if is_ref_matches(base_row, derived_fact, is_ref, schema) {
+            if is_ref_matches(base_row, derived_fact, is_ref, schema, SubjectMode::Bind) {
                 let mut row = base_row.clone();
+
+                // Bind subject variables the MATCH pattern did not provide.
+                // This loop is what turns an IS-ref into a generator: the outer
+                // nested loop is already a cross product, so a fresh subject
+                // simply fans one base row out to one row per derived fact.
+                // Mirrors the target binding just below.
+                for (i, subject) in is_ref.subjects.iter().enumerate() {
+                    if i >= schema.len() || base_row.contains_key(subject) {
+                        continue;
+                    }
+                    if let Some(val) = derived_fact.get(&schema[i]) {
+                        row.insert(subject.clone(), val.clone());
+                    }
+                }
 
                 // Bind target variable (column after subjects in the derived schema).
                 if let Some(target) = &is_ref.target {
@@ -173,7 +225,7 @@ fn anti_join_is_ref(
         .filter(|base_row| {
             !derived_facts
                 .iter()
-                .any(|df| is_ref_matches(base_row, df, is_ref, schema))
+                .any(|df| is_ref_matches(base_row, df, is_ref, schema, SubjectMode::Strict))
         })
         .cloned()
         .collect()
@@ -202,7 +254,7 @@ fn prob_complement_is_ref(
             // Find all matching derived facts and combine via noisy-OR.
             let mut combined_p = 0.0_f64;
             for df in derived_facts {
-                if is_ref_matches(base_row, df, is_ref, schema) {
+                if is_ref_matches(base_row, df, is_ref, schema, SubjectMode::Strict) {
                     let p = df
                         .get(target_prob_col)
                         .and_then(|v| v.as_f64())
@@ -254,13 +306,24 @@ pub async fn resolve_clause_with_is_refs(
     calling_rule_prob_col: Option<&str>,
 ) -> Result<Vec<FactRow>, LocyError> {
     // Collect all variable names introduced by IS-ref joins:
-    // target variables AND non-KEY value columns from target rules.
-    // These must be deferred until after the IS-ref join resolves.
+    // subjects the MATCH pattern does not bind, target variables, AND non-KEY
+    // value columns from target rules. These must be deferred until after the
+    // IS-ref join resolves.
+    let match_bound = super::mutation_common::pattern_variable_names(&clause.match_pattern);
     let mut is_ref_vars: Vec<String> = Vec::new();
     for cond in &clause.where_conditions {
         if let RuleCondition::IsReference(is_ref) = cond
             && !is_ref.negated
         {
+            // A subject the MATCH pattern does not provide is bound *by* this
+            // IS-ref (see `SubjectMode::Bind`). Without listing it here, a
+            // predicate referencing it is classified `match_safe` and pushed
+            // into the base Cypher MATCH with an unbound variable.
+            for subject in &is_ref.subjects {
+                if !match_bound.contains(subject) {
+                    is_ref_vars.push(subject.clone());
+                }
+            }
             if let Some(target) = &is_ref.target {
                 is_ref_vars.push(target.clone());
             }

@@ -41,3 +41,7 @@ pub mod locy_issue_159_recursive_fold_dedup;
 // Issue #160: QUERY (SLG) and derived (fixpoint) diverge when an IS-ref
 // introduces a variable binding the MATCH pattern does not provide.
 pub mod locy_issue_160_query_derived_parity;
+// Schemaless YIELD property columns are inferred as Float64, so `derived`
+// reports NULL for strings and floats for ints while QUERY reports the real
+// value. Found by the generic QUERY/derived parity guard.
+pub mod locy_schemaless_property_type_inference;

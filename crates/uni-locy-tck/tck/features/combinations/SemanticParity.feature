@@ -291,3 +291,64 @@ Feature: Semantic Parity — QUERY Results Must Match Derived Relations
     Then evaluation should succeed
     And the derived relation 'role_perm' should have 3 facts
     And the command result 0 should be a Query with 3 rows
+
+  # ── Bare QUERY (no RETURN) ────────────────────────────────────────────
+  #
+  # With no RETURN clause the rows carry the rule's own YIELD names, so every
+  # KEY column is directly comparable between `derived` and the QUERY result.
+  # That is the shape the generic parity guard can check most strongly, and
+  # almost nothing in the corpus used it — 113 of 116 QUERY statements carry a
+  # RETURN, and only one evaluated query had none. These exist so the guard's
+  # key-tuple comparison is exercised by construction rather than by accident.
+
+  Scenario: Bare QUERY over a plain rule matches derived key-for-key
+    Given having executed:
+      """
+      CREATE (:Node {name: 'A', score: 0.8}),
+             (:Node {name: 'B', score: 0.9}),
+             (:Node {name: 'C', score: 0.1})
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE high AS
+        MATCH (n:Node)
+        WHERE n.score > 0.5
+        YIELD KEY n
+
+      QUERY high
+      """
+    Then evaluation should succeed
+    And the derived relation 'high' should have 2 facts
+    And the command result 0 should be a Query with 2 rows
+
+  Scenario: Bare QUERY over a composite-key rule matches derived key-for-key
+    Given having executed:
+      """
+      CREATE (:Node {name: 'A'}), (:Node {name: 'B'}), (:Node {name: 'C'})
+      """
+    And having executed:
+      """
+      MATCH (a:Node {name: 'A'}), (b:Node {name: 'B'})
+      CREATE (a)-[:LINK]->(b)
+      """
+    And having executed:
+      """
+      MATCH (b:Node {name: 'B'}), (c:Node {name: 'C'})
+      CREATE (b)-[:LINK]->(c)
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE reach AS
+        MATCH (a:Node)-[:LINK]->(b:Node)
+        YIELD KEY a, KEY b
+
+      CREATE RULE reach AS
+        MATCH (a:Node)-[:LINK]->(mid:Node)
+        WHERE (mid, b) IS reach
+        YIELD KEY a, KEY b
+
+      QUERY reach
+      """
+    Then evaluation should succeed
+    And the derived relation 'reach' should have 3 facts
+    And the command result 0 should be a Query with 3 rows

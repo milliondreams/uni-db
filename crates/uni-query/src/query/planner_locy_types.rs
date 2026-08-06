@@ -91,7 +91,34 @@ pub struct LocyIsRef {
     pub target_has_prob: bool,
     /// Name of the PROB column in the target rule, if any.
     pub target_prob_col: Option<String>,
+    /// For negated IS-refs: subject/target variable → the hidden `_vid` column
+    /// the planner projected for it (`__isnot{n}_{var}`).
+    ///
+    /// The anti-join runs *after* `LocyProject`, so resolving a subject by its
+    /// bare variable name only works when YIELD happens to project that exact
+    /// name. A subject that YIELD renamed with `AS`, or did not project at all,
+    /// was previously unresolvable — and the anti-join silently emitted the
+    /// rows it was asked to exclude (issue #158).
+    ///
+    /// Carrying `{var}._vid` through the projection under a reserved name makes
+    /// resolution depend on node identity rather than on what YIELD chose to
+    /// call things. Empty for positive IS-refs, and for subjects that are not
+    /// MATCH-bound node variables (relationship variables expose `_eid`, not
+    /// `_vid`; scalar and ALONG-bound subjects have neither) — those keep the
+    /// by-name path and its error.
+    pub subject_vid_cols: std::collections::HashMap<String, String>,
 }
+
+/// Prefix for the hidden `_vid` columns described on
+/// [`LocyIsRef::subject_vid_cols`].
+///
+/// Two constraints, both load-bearing:
+/// * It must not begin with `__prob_complement_`, which the anti-join
+///   post-processing scans for by prefix.
+/// * These projections are pushed **last**, so the positional
+///   `0..yield_schema.len()` scans in provenance recording stay aligned even if
+///   a strip is ever missed.
+pub const ISNOT_VID_COL_PREFIX: &str = "__isnot_vid_";
 
 /// A column in a rule's yield schema.
 #[derive(Debug, Clone)]

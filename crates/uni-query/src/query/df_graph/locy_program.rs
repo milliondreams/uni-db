@@ -1090,6 +1090,11 @@ async fn run_program(
                         )?;
                     }
 
+                    // The anti-join has run; drop its hidden subject-`_vid`
+                    // columns before `write_facts_to_registry`, which would
+                    // otherwise silently fall back to the widened schema.
+                    batches = super::locy_complement::strip_isnot_vid_columns(batches)?;
+
                     tagged_clause_facts.push((clause_idx, batches));
                 }
 
@@ -1598,9 +1603,25 @@ fn convert_is_refs(
                 })?;
 
             // For negated IS-refs, compute (left_body_col, right_derived_col) pairs for
-            // anti-join filtering. Subject vars are assumed to be node variables, so
-            // the body column is `{var}._vid` (UInt64). The derived column name is taken
-            // positionally from the registry entry's schema (KEY columns come first).
+            // anti-join filtering. The derived column name is taken positionally from
+            // the registry entry's schema (KEY columns come first).
+            //
+            // The left name prefers the hidden `{var}._vid` column the planner
+            // projected (`LocyIsRef::subject_vid_cols`). The anti-join runs after
+            // `LocyProject`, so the bare variable name only resolves when YIELD
+            // happened to project that exact name — an aliased or unprojected
+            // subject was previously unresolvable and the negation silently
+            // became a no-op (issue #158). The bare-name fallback remains for
+            // subjects that are not MATCH-bound node variables, which have no
+            // `._vid` column; those still error in `apply_anti_join_composite`
+            // rather than failing open.
+            let left_col = |var: &String| {
+                is_ref
+                    .subject_vid_cols
+                    .get(var)
+                    .cloned()
+                    .unwrap_or_else(|| var.clone())
+            };
             let anti_join_cols = if is_ref.negated {
                 let mut cols: Vec<(String, String)> = is_ref
                     .subjects
@@ -1614,9 +1635,7 @@ fn convert_is_refs(
                                 .get(i)
                                 .map(|f| f.name().clone())
                                 .unwrap_or_else(|| var.clone());
-                            // After LocyProject the subject column is renamed to the yield
-                            // column name (just `var`, not `var._vid`). Use bare var as left.
-                            Some((var.clone(), right_col))
+                            Some((left_col(var), right_col))
                         } else {
                             None
                         }
@@ -1629,7 +1648,7 @@ fn convert_is_refs(
                 if let Some(uni_cypher::ast::Expr::Variable(target_var)) = &is_ref.target {
                     let target_idx = is_ref.subjects.len();
                     if let Some(field) = entry.schema.fields().get(target_idx) {
-                        cols.push((target_var.clone(), field.name().clone()));
+                        cols.push((left_col(target_var), field.name().clone()));
                     }
                 }
                 cols
@@ -1640,6 +1659,11 @@ fn convert_is_refs(
             // Provenance join cols: for ALL IS-refs (not just negated), compute
             // (body_col, derived_col) pairs so shared-proof detection can trace
             // which source facts contributed to each derived row.
+            //
+            // Uses the same `left_col` resolution as the anti-join above: for a
+            // negated ref whose subject was renamed by YIELD, the bare name does
+            // not exist post-projection and lineage would silently attribute to
+            // nothing.
             let provenance_join_cols: Vec<(String, String)> = is_ref
                 .subjects
                 .iter()
@@ -1652,7 +1676,7 @@ fn convert_is_refs(
                             .get(i)
                             .map(|f| f.name().clone())
                             .unwrap_or_else(|| var.clone());
-                        Some((var.clone(), right_col))
+                        Some((left_col(var), right_col))
                     } else {
                         None
                     }

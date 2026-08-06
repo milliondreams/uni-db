@@ -1002,18 +1002,34 @@ fn extract_properties_from_map(map: &HashMap<String, Value>) -> HashMap<String, 
     // Primary source: _all_props contains all properties from storage
     if let Some(Value::Map(all_props)) = map.get("_all_props") {
         for (k, v) in all_props {
-            properties.insert(k.clone(), v.clone());
+            if is_user_visible_property(k) {
+                properties.insert(k.clone(), v.clone());
+            }
         }
     }
 
     // Secondary: inline non-internal keys (schema-defined property columns)
     for (k, v) in map {
-        if !k.starts_with('_') && k != "properties" {
+        if is_user_visible_property(k) && k != "properties" {
             properties.entry(k.clone()).or_insert_with(|| v.clone());
         }
     }
 
     properties
+}
+
+/// Whether a storage column name is a real, user-visible node/edge property.
+///
+/// `overflow_json` is a materialized storage column holding non-schema
+/// properties, not a property itself. It does not start with `_`, so the
+/// leading-underscore convention alone let it through and it surfaced in
+/// user-visible properties on the SLG `QUERY` path while the fixpoint path
+/// filtered it — the two surfaces disagreeing about the same node.
+///
+/// Mirrors the predicate the scan layer already applies
+/// (`df_graph/scan.rs`, the projected-property filter).
+fn is_user_visible_property(name: &str) -> bool {
+    !name.starts_with('_') && name != "overflow_json" && name != "_all_props"
 }
 
 #[cfg(test)]

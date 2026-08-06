@@ -377,7 +377,8 @@ fn infer_expr_type(expr: &Expr, node_vars: &HashSet<String>) -> DataType {
 use super::df_graph::locy_fixpoint::{DerivedScanEntry, DerivedScanRegistry};
 use super::planner::{LogicalPlan, QueryPlanner};
 use super::planner_locy_types::{
-    LocyClausePlan, LocyCommand, LocyIsRef, LocyRulePlan, LocyStratum, LocyYieldColumn,
+    ISNOT_VID_COL_PREFIX, LocyClausePlan, LocyCommand, LocyIsRef, LocyRulePlan, LocyStratum,
+    LocyYieldColumn,
 };
 
 // ---------------------------------------------------------------------------
@@ -1043,6 +1044,13 @@ impl<'a> LocyPlanBuilder<'a> {
         let mut is_ref_col_aliases: HashMap<String, String> = HashMap::new();
         let mut bare_is_ref_cols: HashSet<String> = HashSet::new();
 
+        // Hidden `{var}._vid` projections for negated IS-ref subjects, so the
+        // anti-join can resolve them by node identity instead of by whatever
+        // name YIELD gave them. Pushed onto `projections` after everything else
+        // (see `ISNOT_VID_COL_PREFIX`) and stripped once the anti-join has run.
+        let mut isnot_vid_projections: Vec<(String, String)> = Vec::new();
+        let mut isnot_ref_index: usize = 0;
+
         for condition in &clause.where_conditions {
             if let RuleCondition::IsReference(is_ref) = condition {
                 let target_rule_name = is_ref.rule_name.to_string();
@@ -1089,6 +1097,31 @@ impl<'a> LocyPlanBuilder<'a> {
                     })
                     .unwrap_or((false, None));
 
+                // For a negated IS-ref, mint a hidden `{var}._vid` projection
+                // for every subject (and TO target) that is a MATCH-bound node
+                // variable. Only those have an expanded `._vid` column in the
+                // scan output — relationship variables expose `._eid`, and
+                // scalar / ALONG-bound subjects have neither, so they keep the
+                // by-name resolution path (and its error) unchanged.
+                let mut subject_vid_cols: HashMap<String, String> = HashMap::new();
+                if is_ref.negated {
+                    let n = isnot_ref_index;
+                    isnot_ref_index += 1;
+                    let mut record = |var: &String| {
+                        if clause_node_vars.contains(var) {
+                            let hidden = format!("{ISNOT_VID_COL_PREFIX}{n}_{var}");
+                            isnot_vid_projections.push((var.clone(), hidden.clone()));
+                            subject_vid_cols.insert(var.clone(), hidden);
+                        }
+                    };
+                    for subject in &is_ref.subjects {
+                        record(subject);
+                    }
+                    if let Some(target_var) = &is_ref.target {
+                        record(target_var);
+                    }
+                }
+
                 // Build LocyIsRef metadata
                 let locy_is_ref = LocyIsRef {
                     rule_name: target_rule_name.clone(),
@@ -1101,6 +1134,7 @@ impl<'a> LocyPlanBuilder<'a> {
                     negated: is_ref.negated,
                     target_has_prob,
                     target_prob_col,
+                    subject_vid_cols,
                 };
                 is_refs.push(locy_is_ref);
 
@@ -1442,6 +1476,19 @@ impl<'a> LocyPlanBuilder<'a> {
                 let e = rewrite_is_ref_cols(e, &is_ref_col_aliases);
                 projections.push((e, Some(hidden.clone())));
             }
+        }
+
+        // Hidden `{var}._vid` columns for negated IS-ref subjects (issue #158).
+        // Pushed LAST and with no `target_types` entry, for the same reason as
+        // the `__feat_*` columns above: `plan_locy_project` skips the coercion
+        // cast when `target_types.get(i)` is `None`, preserving the native
+        // UInt64 the anti-join requires.
+        //
+        // `Expr::Variable("a._vid")` is a raw dotted column reference, not a
+        // property access — `plan_locy_project` resolves it against the input
+        // schema by full name, which is where the graph scan emits it.
+        for (var, hidden) in &isnot_vid_projections {
+            projections.push((Expr::Variable(format!("{var}._vid")), Some(hidden.clone())));
         }
 
         // Phase B A4 follow-up: when the clause has neural-model

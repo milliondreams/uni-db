@@ -32,7 +32,7 @@
 //! The recursive case only looks special because its recursive clause
 //! (`WHERE (parent, p) IS role_perm`) happens to introduce `p`.
 //!
-//! ## Root cause
+//! ## Root cause (FIXED)
 //!
 //! `derived` and `QUERY` are served by two different engines.
 //!
@@ -47,19 +47,29 @@
 //! refs match nothing and the row is dropped.
 //!
 //! The bottom-up engine implements the full language; the top-down engine
-//! implements a strictly weaker subset, and the weaker one backs `QUERY`.
+//! implemented a strictly weaker subset, and the weaker one backs `QUERY`.
+//!
+//! The fix is narrower than "SLG cannot bind": `is_ref_matches` conflated *not
+//! bound* with *bound to NULL*, so an absent subject compared as NULL and
+//! matched nothing. The subject branch now distinguishes the two, and
+//! `semi_join_is_ref` binds absent subjects from the derived fact — the outer
+//! loop was already a cross product, so an IS-ref becomes a generator for free.
+//! The negation paths keep the strict comparison (see `SubjectMode`): relaxing
+//! them would flip `IS NOT` with an unbindable subject from keep-all to
+//! keep-nothing.
 //!
 //! ## Test-coverage gap that let this ship
 //!
 //! `uni-locy-tck/tck/features/combinations/SemanticParity.feature` exists and is
 //! titled "QUERY Results Must Match Derived Relations ... to catch SLG/fixpoint
 //! divergences". Its scenarios cover FOLD, `IS NOT`, PROB and a three-stratum
-//! chain — but none has a fresh-binding `IS`-ref, and the recursion feature
-//! files contain no `QUERY` at all. The guard was built with a hole in it.
+//! chain — but none had a fresh-binding `IS`-ref, and the recursion feature
+//! files contained no `QUERY` at all. The guard was built with a hole in it.
+//! That is now closed by a generic parity check in the TCK's `store_result`,
+//! which compares derived key tuples against QUERY rows on every scenario.
 //!
 //! Run with:
-//!   cargo nextest run -p uni-db --test integration \
-//!     -E 'test(issue_160)' --run-ignored all
+//!   cargo nextest run -p uni-db --test integration -E 'test(issue_160)'
 
 // Rust guideline compliant
 
@@ -110,10 +120,10 @@ async fn setup() -> Result<Uni> {
 
 /// Runs `program` and returns `(derived_row_count, query_row_count)` for `rule`.
 ///
-/// Row *counts* rather than contents: the two engines render node properties
-/// differently (the SLG path leaks the internal `overflow_json` column into
-/// user-visible properties), which is a separate defect and would otherwise
-/// mask the cardinality divergence under test.
+/// Row *counts* rather than contents, because cardinality is what diverged.
+/// (The SLG path also used to leak the internal `overflow_json` column into
+/// user-visible properties, which would have masked this; that is fixed and
+/// pinned by `issue_160_query_path_must_not_leak_internal_columns`.)
 async fn counts(db: &Uni, program: &str, rule: &str) -> Result<(usize, usize)> {
     let result = db.session().locy(program).await?;
     let empty = vec![];
@@ -188,7 +198,6 @@ async fn issue_160_single_subject_is_ref_match_bound_agrees() -> Result<()> {
 /// This is the true root shape, and it is two levels shallower than the report
 /// claims is necessary.
 #[tokio::test]
-#[ignore = "open bug #160: SLG QUERY path cannot bind a variable introduced by an IS-ref"]
 async fn issue_160_is_ref_introducing_a_binding_must_agree() -> Result<()> {
     let db = setup().await?;
     let program = format!(
@@ -215,7 +224,6 @@ async fn issue_160_is_ref_introducing_a_binding_must_agree() -> Result<()> {
 /// `(senior, READ)` fact is missing under `QUERY`, because the recursive clause
 /// `WHERE (parent, p) IS role_perm` introduces `p`.
 #[tokio::test]
-#[ignore = "open bug #160: recursive rule under QUERY undercounts (same fresh-binding cause)"]
 async fn issue_160_recursive_rule_queried_directly_must_agree() -> Result<()> {
     let db = setup().await?;
     let program = "CREATE RULE role_perm AS\n\
@@ -240,7 +248,6 @@ async fn issue_160_recursive_rule_queried_directly_must_agree() -> Result<()> {
 /// two permissions. Kept because it is the user-facing shape, but note the two
 /// tests above show neither the depth nor the repeated `IS`-ref matters.
 #[tokio::test]
-#[ignore = "open bug #160: the issue's original reproduction"]
 async fn issue_160_original_sod_check_must_agree() -> Result<()> {
     let db = setup().await?;
     let program = "CREATE RULE role_perm AS\n\
@@ -273,7 +280,6 @@ async fn issue_160_original_sod_check_must_agree() -> Result<()> {
 /// node properties, while the fixpoint path does not. Independent evidence that
 /// the two engines were never held to output parity.
 #[tokio::test]
-#[ignore = "open defect: SLG QUERY path leaks the internal overflow_json column"]
 async fn issue_160_query_path_must_not_leak_internal_columns() -> Result<()> {
     let db = setup().await?;
     let program = format!("{RP_BASE}QUERY rp");

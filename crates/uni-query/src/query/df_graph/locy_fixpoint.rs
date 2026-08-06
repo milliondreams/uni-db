@@ -1385,6 +1385,10 @@ async fn run_fixpoint_loop(
                     )?;
                 }
 
+                // The anti-join has run; drop its hidden subject-`_vid` columns
+                // before anything downstream can absorb them into fact identity.
+                batches = super::locy_complement::strip_isnot_vid_columns(batches)?;
+
                 clause_candidates.push(batches.clone());
                 all_candidates.extend(batches);
             }

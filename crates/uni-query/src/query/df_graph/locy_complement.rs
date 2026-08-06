@@ -109,6 +109,52 @@ fn verify_key_columns_are_vids(
     Ok(())
 }
 
+/// Drops the hidden `IS NOT` subject-`_vid` columns after the anti-join has run.
+///
+/// The planner projects `{var}._vid` under a reserved name so the anti-join can
+/// resolve its subject by node identity rather than by whatever YIELD called it
+/// (issue #158, see `LocyIsRef::subject_vid_cols`). Those columns must not
+/// outlive the anti-join.
+///
+/// **Placement is load-bearing.** This must run before the batches reach
+/// `merge_delta`, whose `reconcile_schema` adopts the first non-empty batch's
+/// schema as the rule's *fact identity* and would permanently widen the
+/// relation; and before `write_facts_to_registry`, which silently falls back to
+/// the batch's own schema on mismatch rather than erroring — corrupting
+/// cross-stratum IS-refs with no diagnostic at all.
+///
+/// A no-op when no hidden column is present, so it is safe to call
+/// unconditionally on every clause-body result.
+pub fn strip_isnot_vid_columns(
+    batches: Vec<RecordBatch>,
+) -> datafusion::error::Result<Vec<RecordBatch>> {
+    use crate::query::planner_locy_types::ISNOT_VID_COL_PREFIX;
+
+    let mut result = Vec::with_capacity(batches.len());
+    for batch in batches {
+        let keep: Vec<usize> = batch
+            .schema()
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| !f.name().starts_with(ISNOT_VID_COL_PREFIX))
+            .map(|(i, _)| i)
+            .collect();
+        if keep.len() == batch.num_columns() {
+            result.push(batch);
+            continue;
+        }
+        let fields: Vec<_> = keep
+            .iter()
+            .map(|&i| batch.schema().field(i).clone())
+            .collect();
+        let columns: Vec<_> = keep.iter().map(|&i| batch.column(i).clone()).collect();
+        let schema = Arc::new(arrow_schema::Schema::new(fields));
+        result.push(RecordBatch::try_new(schema, columns).map_err(arrow_err)?);
+    }
+    Ok(result)
+}
+
 /// Probabilistic complement for composite (multi-column) join keys.
 ///
 /// Builds a composite key from all `join_cols` right-side columns in

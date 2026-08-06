@@ -26,6 +26,62 @@ Feature: Stratified Negation (IS NOT)
     Then the program should compile successfully
     And the program should have 2 strata
 
+  # ── Compile level: the negation subject must be a node ────────────────
+  #
+  # Negation joins on node identity, so an IS NOT subject has to have a vid.
+  # These used to compile and fail only once evaluation reached the anti-join.
+
+  Scenario: IS NOT subject bound only by a YIELD alias is rejected
+    When compiling the following Locy program:
+      """
+      CREATE RULE flagged AS MATCH (a:A)-[:E]->(b:B) YIELD KEY a, KEY b
+      CREATE RULE probe AS
+        MATCH (a:A), (b:B)
+        WHERE x IS NOT flagged
+        YIELD KEY b, a.n AS x
+      """
+    Then the program should fail to compile
+    And the compile error should mention 'IS NOT subject'
+
+  Scenario: IS NOT subject that is a relationship variable is rejected
+    When compiling the following Locy program:
+      """
+      CREATE RULE flagged AS MATCH (n:Node) WHERE n.risk > 0.5 YIELD KEY n
+      CREATE RULE probe AS
+        MATCH (a:Node)-[e:R]->(b:Node)
+        WHERE e IS NOT flagged
+        YIELD KEY a, KEY b
+      """
+    Then the program should fail to compile
+    And the compile error should mention 'relationship variable'
+
+  Scenario: IS NOT subject bound by an earlier positive IS TO target compiles
+    When compiling the following Locy program:
+      """
+      CREATE RULE link AS MATCH (a:Node)-[:R]->(b:Node) YIELD KEY a, KEY b
+      CREATE RULE blocked AS MATCH (n:Node) WHERE n.risk > 0.5 YIELD KEY n
+      CREATE RULE ok AS
+        MATCH (a:Node)
+        WHERE a IS link TO mid, mid IS NOT blocked
+        YIELD KEY a, KEY mid
+      """
+    Then the program should compile successfully
+
+  # The TO-target of an IS NOT is bound by the preceding positive reference,
+  # never by MATCH. Only the SUBJECT is constrained — this shape appears in
+  # seven feature files, a Python binding test and a published notebook.
+  Scenario: IS NOT TO-target bound by an earlier positive IS TO compiles
+    When compiling the following Locy program:
+      """
+      CREATE RULE signal AS MATCH (d:Drug)-[:HINTS]->(x:Disease) YIELD KEY d, KEY x
+      CREATE RULE known AS MATCH (d:Drug)-[:TREATS]->(x:Disease) YIELD KEY d, KEY x
+      CREATE RULE novel AS
+        MATCH (d:Drug)
+        WHERE d IS signal TO dis, d IS NOT known TO dis
+        YIELD KEY d, KEY dis
+      """
+    Then the program should compile successfully
+
   # ── Evaluate level ────────────────────────────────────────────────────
 
   Scenario: IS NOT excludes matching nodes

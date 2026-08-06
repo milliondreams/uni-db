@@ -1267,4 +1267,202 @@ mod tests {
             compiled.warnings
         );
     }
+
+    // ── IS NOT subject must be a node ────────────────────────────────────
+
+    /// The shape that must keep compiling: `dis` is bound by the *positive*
+    /// `IS ... TO`, not by MATCH.
+    ///
+    /// This is the highest-value assertion in the group. Eleven programs use it
+    /// — the `novel`/`known` drug-repurposing family across seven TCK feature
+    /// files, a Python binding test, and a published website notebook — and all
+    /// eleven break if the check ever validates `is_ref.target` instead of only
+    /// `is_ref.subjects`.
+    #[test]
+    fn is_not_to_target_bound_by_earlier_positive_is_ref_compiles() {
+        let prog = parse_locy(
+            "CREATE RULE signal AS MATCH (d:Drug)-[:HINTS]->(x:Disease) YIELD KEY d, KEY x \
+             CREATE RULE known AS MATCH (d:Drug)-[:TREATS]->(x:Disease) YIELD KEY d, KEY x \
+             CREATE RULE novel AS MATCH (d:Drug) \
+             WHERE d IS signal TO dis, d IS NOT known TO dis \
+             YIELD KEY d, KEY dis",
+        )
+        .unwrap();
+        assert!(
+            compile(&prog).is_ok(),
+            "an IS NOT TO-target bound by an earlier positive IS ... TO must compile"
+        );
+    }
+
+    /// A subject bound by an earlier positive `IS ... TO` target is itself a
+    /// node, so it is a valid negation subject. Binding is order-sensitive:
+    /// `mid` exists only because the positive reference precedes the negation.
+    #[test]
+    fn is_not_subject_bound_by_earlier_positive_is_ref_compiles() {
+        let prog = parse_locy(
+            "CREATE RULE link AS MATCH (a:N)-[:R]->(b:N) YIELD KEY a, KEY b \
+             CREATE RULE blocked AS MATCH (n:N) WHERE n.bad = true YIELD KEY n \
+             CREATE RULE ok AS MATCH (a:N) \
+             WHERE a IS link TO mid, mid IS NOT blocked \
+             YIELD KEY a, KEY mid",
+        )
+        .unwrap();
+        assert!(
+            compile(&prog).is_ok(),
+            "a subject bound by an earlier positive IS ... TO target is a node"
+        );
+    }
+
+    /// A YIELD alias that renames a MATCH-bound **node** is still a node.
+    ///
+    /// `YIELD KEY a AS subj` makes `subj` another name for the node `a`, and
+    /// the projected column still holds a vid, so `subj IS NOT flagged`
+    /// resolves at runtime. A first version of this check looked only at the
+    /// MATCH pattern and false-rejected this shape — two working tests in
+    /// `locy_issue_158_is_not_subject_scope.rs` caught it. Aliases of
+    /// *non*-node expressions stay rejected; see
+    /// `is_not_yield_alias_subject_is_rejected`, whose alias is `a.n`.
+    #[test]
+    fn is_not_yield_alias_of_a_node_compiles() {
+        let prog = parse_locy(
+            "CREATE RULE flagged AS MATCH (a:A)-[:E]->(b:B) YIELD KEY a, KEY b \
+             CREATE RULE probe AS MATCH (a:A), (b:B) WHERE subj IS NOT flagged \
+             YIELD KEY b, KEY a AS subj",
+        )
+        .unwrap();
+        assert!(
+            compile(&prog).is_ok(),
+            "an alias of a MATCH-bound node is itself a valid negation subject"
+        );
+    }
+
+    /// A plain MATCH-bound node subject, and the tuple form, both compile.
+    #[test]
+    fn is_not_match_bound_node_subjects_compile() {
+        let prog = parse_locy(
+            "CREATE RULE risk AS MATCH (a:N)-[:R]->(b:N) YIELD KEY a, KEY b \
+             CREATE RULE safe AS MATCH (a:N), (b:N) WHERE (a, b) IS NOT risk \
+             YIELD KEY a, KEY b",
+        )
+        .unwrap();
+        assert!(
+            compile(&prog).is_ok(),
+            "a tuple of MATCH-bound node subjects must compile"
+        );
+    }
+
+    /// A subject bound inside a parenthesized sub-pattern must compile.
+    ///
+    /// `collect_path_vars` carries a comment recording that an empty
+    /// `Parenthesized` arm previously caused false `WardednessViolation`s on
+    /// valid rules; a quantified sub-pattern has to be parenthesised, so the
+    /// node-only collector this check uses must recurse the same way.
+    #[test]
+    fn is_not_subject_inside_parenthesized_subpattern_compiles() {
+        let prog = parse_locy(
+            "CREATE RULE flagged AS MATCH (n:N) WHERE n.bad = true YIELD KEY n \
+             CREATE RULE probe AS MATCH (a:N)-[:R]->(b:N) WHERE b IS NOT flagged \
+             YIELD KEY a, KEY b",
+        )
+        .unwrap();
+        assert!(compile(&prog).is_ok());
+    }
+
+    /// The target case: the subject is only a YIELD alias, never MATCH-bound.
+    /// Before this check it compiled and failed at evaluation time.
+    #[test]
+    fn is_not_yield_alias_subject_is_rejected() {
+        let prog = parse_locy(
+            "CREATE RULE flagged AS MATCH (a:A)-[:E]->(b:B) YIELD KEY a, KEY b \
+             CREATE RULE probe AS MATCH (a:A), (b:B) WHERE x IS NOT flagged \
+             YIELD KEY b, a.n AS x",
+        )
+        .unwrap();
+        match compile(&prog).unwrap_err() {
+            LocyCompileError::IsNotSubjectNotANode { rule, variable } => {
+                assert_eq!(rule, "probe");
+                assert_eq!(variable, "x");
+            }
+            e => panic!("expected IsNotSubjectNotANode, got {e:?}"),
+        }
+    }
+
+    /// A relationship variable exposes `_eid`, not `_vid`, so it cannot key the
+    /// anti-join. The runtime rejects it; this rejects it earlier.
+    #[test]
+    fn is_not_relationship_variable_subject_is_rejected() {
+        let prog = parse_locy(
+            "CREATE RULE flagged AS MATCH (n:N) WHERE n.bad = true YIELD KEY n \
+             CREATE RULE probe AS MATCH (a:N)-[e:R]->(b:N) WHERE e IS NOT flagged \
+             YIELD KEY a, KEY b",
+        )
+        .unwrap();
+        match compile(&prog).unwrap_err() {
+            LocyCompileError::IsNotSubjectNotANode { rule, variable } => {
+                assert_eq!(rule, "probe");
+                assert_eq!(variable, "e");
+            }
+            e => panic!("expected IsNotSubjectNotANode, got {e:?}"),
+        }
+    }
+
+    /// An ALONG name used as a negation subject is rejected — it is a scalar.
+    ///
+    /// Note the clause order: the grammar fixes `MATCH → WHERE → ALONG → FOLD`
+    /// (`locy.pest` `rule_definition`), so an ALONG or FOLD name is *declared
+    /// after* the WHERE that would reference it and can never legally precede
+    /// it. Writing them in the other order is a parse error, not a compile
+    /// error. So in a well-formed program the name is simply unbound at WHERE
+    /// time, which is what this asserts — and it is why the negation-subject
+    /// check never needs a special case for ALONG or FOLD names.
+    #[test]
+    fn is_not_along_name_as_subject_is_rejected() {
+        let prog = parse_locy(
+            "CREATE RULE flagged AS MATCH (n:N) WHERE n.bad = true YIELD KEY n \
+             CREATE RULE probe AS MATCH (a:N)-[e:R]->(b:N) \
+             WHERE total IS NOT flagged ALONG total = e.weight \
+             YIELD KEY a, KEY b, total",
+        )
+        .unwrap();
+        match compile(&prog).unwrap_err() {
+            LocyCompileError::IsNotSubjectNotANode { rule, variable } => {
+                assert_eq!(rule, "probe");
+                assert_eq!(variable, "total");
+            }
+            e => panic!("expected IsNotSubjectNotANode, got {e:?}"),
+        }
+    }
+
+    /// A subject that is bound nowhere at all.
+    #[test]
+    fn is_not_entirely_unbound_subject_is_rejected() {
+        let prog = parse_locy(
+            "CREATE RULE flagged AS MATCH (n:N) WHERE n.bad = true YIELD KEY n \
+             CREATE RULE probe AS MATCH (a:N) WHERE ghost IS NOT flagged YIELD KEY a",
+        )
+        .unwrap();
+        match compile(&prog).unwrap_err() {
+            LocyCompileError::IsNotSubjectNotANode { rule, variable } => {
+                assert_eq!(rule, "probe");
+                assert_eq!(variable, "ghost");
+            }
+            e => panic!("expected IsNotSubjectNotANode, got {e:?}"),
+        }
+    }
+
+    /// Only the *negated* form is constrained — a positive `IS` resolves in the
+    /// body plan before projection and does not join on node identity.
+    #[test]
+    fn positive_is_ref_with_non_node_subject_still_compiles() {
+        let prog = parse_locy(
+            "CREATE RULE flagged AS MATCH (n:N) WHERE n.bad = true YIELD KEY n \
+             CREATE RULE probe AS MATCH (a:N)-[e:R]->(b:N) WHERE e IS flagged \
+             YIELD KEY a, KEY b",
+        )
+        .unwrap();
+        assert!(
+            compile(&prog).is_ok(),
+            "positive IS is unaffected by the negation-subject rule"
+        );
+    }
 }

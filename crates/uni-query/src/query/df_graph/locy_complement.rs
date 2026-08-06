@@ -63,13 +63,22 @@ fn resolve_key_indices(
                 .collect::<Vec<_>>()
                 .join(", ");
             return Err(datafusion::error::DataFusionError::Plan(match side {
+                // A MATCH-bound node variable no longer reaches this arm: the
+                // planner carries a hidden `{var}._vid` column through
+                // `LocyProject` so the anti-join resolves it by node identity
+                // whatever YIELD called it. Non-node subjects are now rejected
+                // at compile time (`LocyCompileError::IsNotSubjectNotANode`).
+                // So this is a defensive backstop, and its advice must not
+                // repeat the old "add it to your YIELD" suggestion, which is
+                // both unnecessary for node subjects and useless for the rest.
                 KeySide::Body => format!(
                     "Locy `IS NOT` cannot resolve subject column `{name}`. Available \
-                     columns: [{available}]. The negated subject must be a projected \
-                     output column of the consuming rule — the anti-join is applied \
-                     after YIELD projection, so a variable that is only bound in \
-                     MATCH, or that YIELD renamed via `AS`, is not visible to it. \
-                     Add `{name}` to the rule's YIELD, or negate the alias instead."
+                     columns: [{available}]. Negation joins on node identity, so the \
+                     subject must be a node variable bound by the rule's MATCH \
+                     pattern (or by an earlier positive `IS ... TO` target), which \
+                     the planner carries through projection as a hidden `_vid` \
+                     column. Reaching this point means that column was expected but \
+                     is absent from the projected batch."
                 ),
                 KeySide::NegatedFacts => format!(
                     "Locy `IS NOT` cannot resolve column `{name}` in the negated \

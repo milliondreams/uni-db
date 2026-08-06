@@ -51,9 +51,11 @@
 //! `LocyIsRef::subject_vid_cols` and `strip_isnot_vid_columns`.
 //!
 //! Subjects that are *not* MATCH-bound node variables have no `._vid` column
-//! (relationship variables expose `._eid`; scalar and ALONG-bound subjects have
-//! neither). Those keep the by-name path and still error rather than failing
-//! open — pinned by `issue_158_non_node_subject_still_errors_rather_than_failing_open`.
+//! (relationship variables expose `._eid`; scalar subjects have neither), so
+//! they cannot key an anti-join that joins on node identity. Those are now
+//! **rejected at compile time** by `LocyCompileError::IsNotSubjectNotANode`,
+//! rather than reaching the runtime error Wave 0 introduced — pinned by
+//! `issue_158_non_node_subject_is_rejected_rather_than_failing_open`.
 //!
 //! Run with:
 //!   cargo nextest run -p uni-db --test integration -E 'test(issue_158)'
@@ -256,12 +258,20 @@ async fn issue_158_unprojected_subject_filters_correctly() -> Result<()> {
 }
 
 /// A subject that is **not** a MATCH-bound node variable has no `._vid` column,
-/// so it keeps the by-name path — and must still fail loudly rather than
-/// silently returning every row.
+/// so it cannot key an anti-join that joins on node identity — and must fail
+/// loudly rather than silently returning every row.
 ///
 /// Here `x` is bound only by the YIELD alias, never by the MATCH pattern.
+///
+/// The failure has moved phase twice. Originally it silently returned every
+/// row; Wave 0 made it a runtime error; it is now rejected at **compile time**
+/// (`LocyCompileError::IsNotSubjectNotANode`), so the program never evaluates
+/// at all. The assertion is deliberately phase-agnostic — it asserts the error
+/// identifies the negation, not where it came from — but the message check is
+/// tightened here to confirm the compile-time path specifically, since a
+/// silent regression to the runtime path would still contain `IS NOT`.
 #[tokio::test]
-async fn issue_158_non_node_subject_still_errors_rather_than_failing_open() -> Result<()> {
+async fn issue_158_non_node_subject_is_rejected_rather_than_failing_open() -> Result<()> {
     let db = setup().await?;
     let program = format!(
         "{FLAGGED}\n\
@@ -280,6 +290,11 @@ async fn issue_158_non_node_subject_still_errors_rather_than_failing_open() -> R
     assert!(
         msg.contains("IS NOT"),
         "error must identify the failing negation; got: {msg}"
+    );
+    assert!(
+        msg.contains("IS NOT subject 'x'"),
+        "must be the compile-time rejection naming the subject, not the later \
+         runtime resolution failure; got: {msg}"
     );
     Ok(())
 }

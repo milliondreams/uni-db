@@ -1239,8 +1239,16 @@ mod tests {
     }
 
     #[test]
-    fn phase_b_f1_suppressed_when_along_present() {
-        // Same recursive structure but with ALONG — F1 must NOT fire.
+    fn phase_b_f1_fires_even_when_along_present() {
+        // Same recursive structure but with ALONG. F1 used to be suppressed
+        // here, on the theory that ALONG gives per-path aggregation and so
+        // avoids the problem. It does not: the ALONG accumulator is an
+        // ordinary non-KEY column and is deduplicated by the fixpoint exactly
+        // like a FOLD input, so two paths carrying an equal accumulated value
+        // still collapse (issue #159, pinned by
+        // `locy_issue_159_along_must_not_collapse_equal_valued_paths`).
+        // Suppressing here silenced the formulation the warning itself used to
+        // recommend, so the ALONG case is now warned about too.
         let prog = parse_locy(
             "CREATE RULE r AS MATCH (a)-[e:E]->(b) ALONG total = e.weight \
              YIELD a, b, total \
@@ -1251,11 +1259,11 @@ mod tests {
         .unwrap();
         let compiled = compile(&prog).unwrap();
         assert!(
-            !compiled
+            compiled
                 .warnings
                 .iter()
                 .any(|w| w.code == WarningCode::FoldInRecursivePath),
-            "FoldInRecursivePath should be suppressed when ALONG is present, got: {:?}",
+            "FoldInRecursivePath must fire for a recursive fold even with ALONG, got: {:?}",
             compiled.warnings
         );
     }

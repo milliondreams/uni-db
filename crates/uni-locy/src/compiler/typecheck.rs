@@ -632,10 +632,18 @@ fn check_best_by_monotonic_fold(
 // ─── F1: FOLD in recursive path without ALONG ───────────────────────────────
 
 /// Phase B F1 (Stress Corpus B3): a clause has a FOLD aggregate AND
-/// references a rule in its own SCC (recursive IS-ref) AND lacks an
-/// `ALONG` clause. This pattern is almost always a semantic mistake —
-/// FOLD groups by KEY columns, but in recursive contexts the user
-/// usually means per-path aggregation, which requires `ALONG`.
+/// references a rule in its own SCC (recursive IS-ref). Aggregating inside a
+/// recursive stratum currently **under-counts**: the semi-naive fixpoint
+/// deduplicates intermediate rows by all columns, so two derivations that
+/// reach the same KEY with numerically equal values collapse into one before
+/// the fold observes them (<https://github.com/rustic-ai/uni-db/issues/159>).
+///
+/// This fires whether or not an `ALONG` clause is present. ALONG was
+/// previously treated as a fix and suppressed the warning, but ALONG
+/// accumulators are ordinary non-KEY columns and participate in the same
+/// dedup — two distinct paths carrying an equal accumulated value collapse
+/// exactly as FOLD inputs do. Suppressing on ALONG therefore silenced the
+/// case the user had just been advised to write.
 ///
 /// Conservative scope: only fires for self-SCC IS-refs (the common
 /// recursive case). Cross-SCC recursion via non-recursive stratification
@@ -646,7 +654,7 @@ fn check_fold_in_recursive_path(
     scc_rules: &std::collections::HashSet<String>,
     warnings: &mut Vec<CompilerWarning>,
 ) {
-    if def.fold.is_empty() || !def.along.is_empty() {
+    if def.fold.is_empty() {
         return;
     }
     let has_recursive_is_ref = def.where_conditions.iter().any(|cond| {
@@ -660,9 +668,12 @@ fn check_fold_in_recursive_path(
         warnings.push(CompilerWarning {
             code: WarningCode::FoldInRecursivePath,
             message: format!(
-                "rule '{}' has both FOLD and a recursive IS-reference but no ALONG \
-                 clause; FOLD groups by KEY columns, not by path — did you mean to \
-                 add ALONG for per-path aggregation? (Stress Corpus B3)",
+                "rule '{}' aggregates inside a recursive stratum; results may \
+                 UNDER-COUNT. Derivations reaching the same KEY with numerically \
+                 equal values are deduplicated before the fold sees them, so N \
+                 siblings each contributing the same amount are counted once. \
+                 ALONG does not avoid this — its accumulator is deduplicated the \
+                 same way. See issue #159. (Stress Corpus B3)",
                 rule_name
             ),
             rule_name: rule_name.to_string(),

@@ -206,3 +206,88 @@ Feature: Semantic Parity — QUERY Results Must Match Derived Relations
     Then evaluation should succeed
     And the derived relation 'safe_drug' should have 1 facts
     And the command result 0 should be a Query with 1 rows
+
+  # ── IS-refs that introduce bindings ───────────────────────────────────
+  #
+  # The scenarios above all bind every IS-ref subject in the MATCH pattern.
+  # That left a hole: an IS-ref may also *introduce* a variable the MATCH
+  # pattern does not provide, and the SLG resolver behind QUERY can filter on
+  # an already-bound subject but cannot bind a fresh one — so QUERY silently
+  # returns nothing while the fixpoint derives facts. See issue #160.
+  #
+  # These two scenarios are the difference between the generic parity guard
+  # protecting against future regressions and actually exercising the bug.
+
+  Scenario: QUERY matches derived when an IS-ref introduces a binding
+    Given having executed:
+      """
+      CREATE (:Person {name: 'alice'}),
+             (:Role {name: 'senior'}),
+             (:Perm {action: 'WRITE'})
+      """
+    And having executed:
+      """
+      MATCH (p:Person {name: 'alice'}), (r:Role {name: 'senior'})
+      CREATE (p)-[:HAS_ROLE]->(r)
+      """
+    And having executed:
+      """
+      MATCH (r:Role {name: 'senior'}), (p:Perm {action: 'WRITE'})
+      CREATE (r)-[:GRANTS]->(p)
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE role_perm AS
+        MATCH (r:Role)-[:GRANTS]->(p:Perm)
+        YIELD KEY r, KEY p
+
+      CREATE RULE holds AS
+        MATCH (e:Person)-[:HAS_ROLE]->(r:Role)
+        WHERE (r, p) IS role_perm
+        YIELD KEY e, KEY p
+
+      QUERY holds WHERE e = e RETURN e.name AS who
+      """
+    Then evaluation should succeed
+    And the derived relation 'holds' should have 1 facts
+    And the command result 0 should be a Query with 1 rows
+
+  Scenario: QUERY matches derived for a recursive rule with a fresh binding
+    Given having executed:
+      """
+      CREATE (:Role {name: 'senior'}),
+             (:Role {name: 'junior'}),
+             (:Perm {action: 'READ'}),
+             (:Perm {action: 'WRITE'})
+      """
+    And having executed:
+      """
+      MATCH (s:Role {name: 'senior'}), (j:Role {name: 'junior'})
+      CREATE (s)-[:INHERITS]->(j)
+      """
+    And having executed:
+      """
+      MATCH (r:Role {name: 'junior'}), (p:Perm {action: 'READ'})
+      CREATE (r)-[:GRANTS]->(p)
+      """
+    And having executed:
+      """
+      MATCH (r:Role {name: 'senior'}), (p:Perm {action: 'WRITE'})
+      CREATE (r)-[:GRANTS]->(p)
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE role_perm AS
+        MATCH (r:Role)-[:GRANTS]->(p:Perm)
+        YIELD KEY r, KEY p
+
+      CREATE RULE role_perm AS
+        MATCH (r:Role)-[:INHERITS]->(parent:Role)
+        WHERE (parent, p) IS role_perm
+        YIELD KEY r, KEY p
+
+      QUERY role_perm WHERE r = r RETURN r.name AS role
+      """
+    Then evaluation should succeed
+    And the derived relation 'role_perm' should have 3 facts
+    And the command result 0 should be a Query with 3 rows

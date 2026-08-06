@@ -2,6 +2,126 @@ use crate::LocyWorld;
 use cucumber::when;
 use uni_locy::LocyConfig;
 
+/// True when a `QUERY ... WHERE` clause cannot remove any row.
+///
+/// The corpus idiom is `QUERY r WHERE n = n RETURN ...`, a self-comparison used
+/// to bind the goal variable rather than to filter. It appears in **56 of the
+/// 99** `QUERY ... WHERE` clauses in the feature files; treating every `WHERE`
+/// as potentially-filtering would drop the parity check from 71 of 114 queries
+/// to 15, which is the difference between a guard with teeth and a decorative
+/// one.
+///
+/// Deliberately conservative: only `x = x` on a bare variable, and `AND` of
+/// such terms, count as tautologies. Anything else — a property comparison, a
+/// parameter, a function call — is treated as a real filter and skipped.
+fn where_clause_cannot_filter(expr: &uni_cypher::ast::Expr) -> bool {
+    use uni_cypher::ast::{BinaryOp, Expr};
+    match expr {
+        Expr::BinaryOp { left, op, right } => match op {
+            BinaryOp::Eq => {
+                matches!((left.as_ref(), right.as_ref()),
+                    (Expr::Variable(a), Expr::Variable(b)) if a == b)
+            }
+            BinaryOp::And => where_clause_cannot_filter(left) && where_clause_cannot_filter(right),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Asserts that `QUERY <rule>` does not go vacuous while `derived[<rule>]` holds
+/// facts — checked on **every** scenario that evaluates a program.
+///
+/// `derived` is served by the DataFusion semi-naive fixpoint; `QUERY` is served
+/// by a separate top-down SLG resolver that re-derives from scratch. The two
+/// engines do not have equal expressive power, so a rule can derive facts on one
+/// surface and return nothing on the other
+/// (<https://github.com/rustic-ai/uni-db/issues/160>). That is a silent
+/// wrong-answer bug: an ad-hoc `QUERY` reports "nothing found" about data that
+/// does contain matches.
+///
+/// `SemanticParity.feature` already tried to catch this class with seven
+/// hand-written scenarios, and #160 slipped through the gap between them. This
+/// is the same idea moved to the funnel every evaluation passes through, so
+/// coverage is a property of the corpus rather than of what someone remembered
+/// to write.
+///
+/// **Non-vacuity, not equality.** Strict row-count equality is not assertable
+/// generically because `QUERY` carries `WHERE` / `RETURN` / `LIMIT`. But no
+/// projection, `DISTINCT`, `ORDER BY` or aggregate can turn a non-empty
+/// relation into zero rows — only a `WHERE` or a `LIMIT` can. So for a `QUERY`
+/// with neither, non-empty `derived` implies non-empty rows. Every other shape
+/// is skipped rather than guessed at.
+fn assert_query_derived_parity(program: &str, result: &uni_locy::LocyResult) {
+    use uni_cypher::locy_ast::LocyStatement;
+
+    // A program the TCK feeds us that does not re-parse is not this guard's
+    // problem — the scenario's own assertions cover it.
+    let Ok(ast) = uni_cypher::parse_locy(program) else {
+        return;
+    };
+
+    let goal_queries: Vec<_> = ast
+        .statements
+        .iter()
+        .filter_map(|s| match s {
+            LocyStatement::GoalQuery(gq) => Some(gq),
+            _ => None,
+        })
+        .collect();
+
+    let query_rows: Vec<_> = result
+        .command_results
+        .iter()
+        .filter_map(|cr| match cr {
+            uni_locy::CommandResult::Query(rows) => Some(rows),
+            _ => None,
+        })
+        .collect();
+
+    // Both sequences follow program order, so index i is the same QUERY on both
+    // sides. If the counts disagree the alignment is unknown — skip rather than
+    // risk blaming the wrong rule.
+    if goal_queries.len() != query_rows.len() {
+        return;
+    }
+
+    for (gq, rows) in goal_queries.iter().zip(query_rows) {
+        // A real WHERE or a LIMIT can legitimately empty the result; a
+        // self-comparison tautology cannot.
+        if gq
+            .where_expr
+            .as_ref()
+            .is_some_and(|w| !where_clause_cannot_filter(w))
+        {
+            continue;
+        }
+        if gq.return_clause.as_ref().is_some_and(|r| r.limit.is_some()) {
+            continue;
+        }
+
+        let rule = gq.rule_name.to_string();
+        let Some(derived) = result.derived.get(&rule) else {
+            continue;
+        };
+        if derived.is_empty() || !rows.is_empty() {
+            continue;
+        }
+
+        panic!(
+            "QUERY/derived parity violated for rule `{rule}`: the fixpoint derived \
+             {} fact(s) but QUERY returned 0 rows, and the query has no WHERE or \
+             LIMIT that could explain it.\n\
+             This is the issue #160 class: `derived` (fixpoint) and `QUERY` (SLG) \
+             disagree. A known trigger is an IS-ref that introduces a variable \
+             binding the MATCH pattern does not provide — the SLG resolver can \
+             filter on an already-bound subject but cannot bind a fresh one.\n\
+             Program:\n{program}",
+            derived.len()
+        );
+    }
+}
+
 /// If the Locy evaluation produced a `DerivedFactSet`, apply it to the database
 /// via a transaction so that DERIVE mutations are visible to subsequent `then` steps.
 ///
@@ -11,22 +131,25 @@ use uni_locy::LocyConfig;
 /// to reflect the actual mutations performed.
 async fn apply_derived_and_store(
     world: &mut LocyWorld,
+    program: &str,
     result: Result<uni_db::locy::LocyResult, uni_common::UniError>,
 ) {
-    store_result(world, result, true).await;
+    store_result(world, program, result, true).await;
 }
 
 /// Store the evaluation result without applying derived facts.
 /// Used by scenarios that test DERIVE isolation (e.g. "edges do not persist without tx.apply").
 async fn store_without_apply(
     world: &mut LocyWorld,
+    program: &str,
     result: Result<uni_db::locy::LocyResult, uni_common::UniError>,
 ) {
-    store_result(world, result, false).await;
+    store_result(world, program, result, false).await;
 }
 
 async fn store_result(
     world: &mut LocyWorld,
+    program: &str,
     result: Result<uni_db::locy::LocyResult, uni_common::UniError>,
     apply_derived: bool,
 ) {
@@ -48,6 +171,9 @@ async fn store_result(
                     inner.stats.mutations_executed += apply_result.facts_applied;
                 }
             }
+            // Checked on every scenario, not just the parity feature. An `Err`
+            // result is skipped — a failed evaluation has no parity to violate.
+            assert_query_derived_parity(program, &inner);
             Ok(inner)
         }
         Err(e) => Err(e),
@@ -67,7 +193,7 @@ async fn when_evaluating_locy_program(world: &mut LocyWorld, step: &cucumber::gh
         .expect("Failed to initialize database");
 
     let result = world.db().session().locy(program).await;
-    apply_derived_and_store(world, result).await;
+    apply_derived_and_store(world, program, result).await;
 }
 
 #[when("evaluating the following Locy program without applying derived facts:")]
@@ -85,7 +211,7 @@ async fn when_evaluating_locy_program_without_apply(
         .expect("Failed to initialize database");
 
     let result = world.db().session().locy(program).await;
-    store_without_apply(world, result).await;
+    store_without_apply(world, program, result).await;
 }
 
 /// Initialize the DB, build a `LocyConfig` via `mutate`, run the program in
@@ -114,7 +240,7 @@ async fn run_with_config(
         .with_config(config)
         .run()
         .await;
-    apply_derived_and_store(world, result).await;
+    apply_derived_and_store(world, program, result).await;
 }
 
 #[when(regex = r#"^evaluating the following Locy program with max_iterations (\d+):$"#)]

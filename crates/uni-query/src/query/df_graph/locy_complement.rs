@@ -21,6 +21,94 @@ use arrow_array::RecordBatch;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+/// Which side of a negation join key is being resolved. Error messages only.
+#[derive(Clone, Copy)]
+enum KeySide {
+    /// The consuming rule's body output — the `IS NOT` subject.
+    Body,
+    /// The negated rule's derived facts.
+    NegatedFacts,
+}
+
+/// Resolves the composite negation key's column indices, or fails.
+///
+/// **This must never degrade to "return the rows unfiltered".** Every one of
+/// these lookups used to fall back to passing the batch through, which emitted
+/// precisely the rows the negation was asked to exclude — a silent, fail-open
+/// wrong answer in the direction that matters (exemption guards, access-control
+/// filters). See <https://github.com/rustic-ai/uni-db/issues/158>.
+///
+/// A missing body column is a user-facing condition: the anti-join runs after
+/// `LocyProject`, so the subject must be a projected output column. A missing
+/// negated-facts column is schema drift between a rule's declared YIELD schema
+/// and its materialized facts, and is a bug rather than a user error — both are
+/// reported, neither is swallowed.
+fn resolve_key_indices(
+    batch: &RecordBatch,
+    join_cols: &[(String, String)],
+    side: KeySide,
+) -> datafusion::error::Result<Vec<usize>> {
+    let schema = batch.schema();
+    let mut indices = Vec::with_capacity(join_cols.len());
+    for (left, right) in join_cols {
+        let name = match side {
+            KeySide::Body => left,
+            KeySide::NegatedFacts => right,
+        };
+        let Ok(idx) = schema.index_of(name) else {
+            let available = schema
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(datafusion::error::DataFusionError::Plan(match side {
+                KeySide::Body => format!(
+                    "Locy `IS NOT` cannot resolve subject column `{name}`. Available \
+                     columns: [{available}]. The negated subject must be a projected \
+                     output column of the consuming rule — the anti-join is applied \
+                     after YIELD projection, so a variable that is only bound in \
+                     MATCH, or that YIELD renamed via `AS`, is not visible to it. \
+                     Add `{name}` to the rule's YIELD, or negate the alias instead."
+                ),
+                KeySide::NegatedFacts => format!(
+                    "Locy `IS NOT` cannot resolve column `{name}` in the negated \
+                     rule's derived facts. Available columns: [{available}]. This is \
+                     schema drift between the negated rule's declared YIELD schema \
+                     and its materialized facts."
+                ),
+            }));
+        };
+        indices.push(idx);
+    }
+    Ok(indices)
+}
+
+/// Verifies every negation key column is `UInt64` (a node id).
+///
+/// Like [`resolve_key_indices`], a mismatch used to pass the batch through
+/// unfiltered. It now fails, for the same reason.
+fn verify_key_columns_are_vids(
+    batch: &RecordBatch,
+    indices: &[usize],
+) -> datafusion::error::Result<()> {
+    use arrow_array::{Array as _, UInt64Array};
+    for &ci in indices {
+        let col = batch.column(ci);
+        if col.as_any().downcast_ref::<UInt64Array>().is_none() {
+            let field = batch.schema().field(ci).clone();
+            return Err(datafusion::error::DataFusionError::Plan(format!(
+                "Locy `IS NOT` key column `{}` has type {:?}, expected UInt64 (a node \
+                 id). Negation keys join on node identity; a scalar property cannot be \
+                 used as an `IS NOT` subject.",
+                field.name(),
+                col.data_type()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Probabilistic complement for composite (multi-column) join keys.
 ///
 /// Builds a composite key from all `join_cols` right-side columns in
@@ -39,16 +127,14 @@ pub fn apply_prob_complement_composite(
     // Build composite-key → probability lookup from negative facts.
     let mut prob_map: HashMap<Vec<u64>, f64> = HashMap::new();
     for batch in neg_facts {
-        let right_indices: Vec<usize> = join_cols
-            .iter()
-            .filter_map(|(_, rc)| batch.schema().index_of(rc).ok())
-            .collect();
-        if right_indices.len() != join_cols.len() {
-            continue;
-        }
-        let Ok(prob_idx) = batch.schema().index_of(prob_col) else {
-            continue;
-        };
+        let right_indices = resolve_key_indices(batch, join_cols, KeySide::NegatedFacts)?;
+        let prob_idx = batch.schema().index_of(prob_col).map_err(|_| {
+            datafusion::error::DataFusionError::Plan(format!(
+                "Locy `IS NOT` probabilistic complement cannot resolve PROB column \
+                 `{prob_col}` in the negated rule's derived facts. Dropping the batch \
+                 would silently yield a complement factor of 1.0, i.e. no negation."
+            ))
+        })?;
         let prob_arr = batch.column(prob_idx);
         let probs = prob_arr.as_any().downcast_ref::<Float64Array>();
         for row in 0..batch.num_rows() {
@@ -92,25 +178,8 @@ pub fn apply_prob_complement_composite(
     // Add complement column to each batch.
     let mut result = Vec::new();
     for batch in batches {
-        let left_indices: Vec<usize> = join_cols
-            .iter()
-            .filter_map(|(lc, _)| batch.schema().index_of(lc).ok())
-            .collect();
-        if left_indices.len() != join_cols.len() {
-            result.push(batch);
-            continue;
-        }
-        let all_u64 = left_indices.iter().all(|&ci| {
-            batch
-                .column(ci)
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .is_some()
-        });
-        if !all_u64 {
-            result.push(batch);
-            continue;
-        }
+        let left_indices = resolve_key_indices(&batch, join_cols, KeySide::Body)?;
+        verify_key_columns_are_vids(&batch, &left_indices)?;
 
         let complements: Vec<f64> = (0..batch.num_rows())
             .map(|row| {
@@ -166,13 +235,7 @@ pub fn apply_anti_join_composite(
     // Collect composite keys from the negated rule's derived facts.
     let mut banned: HashSet<Vec<u64>> = HashSet::new();
     for batch in neg_facts {
-        let right_indices: Vec<usize> = join_cols
-            .iter()
-            .filter_map(|(_, rc)| batch.schema().index_of(rc).ok())
-            .collect();
-        if right_indices.len() != join_cols.len() {
-            continue;
-        }
+        let right_indices = resolve_key_indices(batch, join_cols, KeySide::NegatedFacts)?;
         for row in 0..batch.num_rows() {
             let mut key = Vec::with_capacity(right_indices.len());
             let mut valid = true;
@@ -195,6 +258,11 @@ pub fn apply_anti_join_composite(
         }
     }
 
+    // Returning every row is correct here *only* because the loop above can no
+    // longer skip a batch: it errors rather than `continue`-ing on an
+    // unresolvable column. Previously a schema mismatch emptied `banned`, and
+    // this fast path then laundered "we gave up" into "nothing was excluded".
+    // Keep that coupling in mind before reintroducing any skip above.
     if banned.is_empty() {
         return Ok(batches);
     }
@@ -202,25 +270,8 @@ pub fn apply_anti_join_composite(
     // Filter body batches: keep rows where composite left key NOT IN banned.
     let mut result = Vec::new();
     for batch in batches {
-        let left_indices: Vec<usize> = join_cols
-            .iter()
-            .filter_map(|(lc, _)| batch.schema().index_of(lc).ok())
-            .collect();
-        if left_indices.len() != join_cols.len() {
-            result.push(batch);
-            continue;
-        }
-        let all_u64 = left_indices.iter().all(|&ci| {
-            batch
-                .column(ci)
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .is_some()
-        });
-        if !all_u64 {
-            result.push(batch);
-            continue;
-        }
+        let left_indices = resolve_key_indices(&batch, join_cols, KeySide::Body)?;
+        verify_key_columns_are_vids(&batch, &left_indices)?;
 
         let keep: Vec<bool> = (0..batch.num_rows())
             .map(|row| {
@@ -258,6 +309,15 @@ pub fn apply_anti_join_composite(
 ///
 /// If the rule has no PROB column, complement columns are simply removed
 /// (the complement information is discarded and IS NOT acts as a keep-all).
+///
+/// **That keep-all is a known fail-open hole, deliberately left in place.**
+/// Unlike the resolution failures in this module — which now error — it is a
+/// semantics question (should a probabilistic `IS NOT` on a non-probabilistic
+/// rule fall back to a boolean anti-join, or be rejected at compile time?)
+/// rather than a missing check, so it needs a decision rather than a guard. It
+/// is unreachable from the batch path, which gates on
+/// `binding.target_has_prob && rule.prob_column_name.is_some()`, but reachable
+/// via the SLG path.
 pub fn multiply_prob_factors(
     batches: Vec<RecordBatch>,
     prob_col: Option<&str>,
@@ -297,49 +357,66 @@ pub fn multiply_prob_factors(
         // 1. Compute product of all complement factors
         let mut combined = vec![1.0f64; num_rows];
         for col_name in complement_cols {
-            if let Ok(idx) = batch.schema().index_of(col_name) {
-                let arr = batch
-                    .column(idx)
-                    .as_any()
-                    .downcast_ref::<Float64Array>()
-                    .ok_or_else(|| {
-                        datafusion::error::DataFusionError::Internal(format!(
-                            "Expected Float64 for complement column {col_name}"
-                        ))
-                    })?;
-                for (i, val) in combined.iter_mut().enumerate().take(num_rows) {
-                    if !arr.is_null(i) {
-                        *val *= arr.value(i);
-                    }
+            // A missing column used to be skipped, leaving the factor at 1.0 —
+            // i.e. the negation silently contributing nothing. `complement_cols`
+            // is derived by scanning these batches' own schema at the call site,
+            // so a miss is impossible by construction and must be loud.
+            let idx = batch.schema().index_of(col_name).map_err(|_| {
+                datafusion::error::DataFusionError::Plan(format!(
+                    "Locy `IS NOT` complement column `{col_name}` is missing from the \
+                     batch it was collected from; a factor of 1.0 would silently \
+                     discard the negation."
+                ))
+            })?;
+            let arr = batch
+                .column(idx)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| {
+                    datafusion::error::DataFusionError::Plan(format!(
+                        "Expected Float64 for complement column {col_name}"
+                    ))
+                })?;
+            for (i, val) in combined.iter_mut().enumerate().take(num_rows) {
+                if !arr.is_null(i) {
+                    *val *= arr.value(i);
                 }
             }
         }
 
         // 2. If there's a PROB column, multiply combined into it
         let final_prob: Vec<f64> = if let Some(prob_name) = prob_col {
-            if let Ok(idx) = batch.schema().index_of(prob_name) {
-                let arr = batch
-                    .column(idx)
-                    .as_any()
-                    .downcast_ref::<Float64Array>()
-                    .ok_or_else(|| {
-                        datafusion::error::DataFusionError::Internal(format!(
-                            "Expected Float64 for PROB column {prob_name}"
-                        ))
-                    })?;
-                (0..num_rows)
-                    .map(|i| {
-                        if arr.is_null(i) {
-                            combined[i]
-                        } else {
-                            arr.value(i) * combined[i]
-                        }
-                    })
-                    .collect()
-            } else {
-                combined
-            }
+            // A declared-but-absent PROB column used to fall through to
+            // `combined`, silently discarding the complement. `prob_col` comes
+            // from the rule's YIELD schema, so its absence means the projection
+            // dropped a declared column — a bug, not a tolerable state.
+            let idx = batch.schema().index_of(prob_name).map_err(|_| {
+                datafusion::error::DataFusionError::Plan(format!(
+                    "Locy rule declares PROB column `{prob_name}` but it is absent from \
+                     the projected batch; the `IS NOT` complement would be silently \
+                     discarded."
+                ))
+            })?;
+            let arr = batch
+                .column(idx)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| {
+                    datafusion::error::DataFusionError::Plan(format!(
+                        "Expected Float64 for PROB column {prob_name}"
+                    ))
+                })?;
+            (0..num_rows)
+                .map(|i| {
+                    if arr.is_null(i) {
+                        combined[i]
+                    } else {
+                        arr.value(i) * combined[i]
+                    }
+                })
+                .collect()
         } else {
+            // No PROB column on the rule: the documented keep-all noted above.
             combined
         };
 

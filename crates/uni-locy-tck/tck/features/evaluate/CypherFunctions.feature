@@ -30,6 +30,7 @@ Feature: Cypher Functions in Locy Expressions
       QUERY result WHERE sqrt(v) > 2.5 RETURN n.name AS id
       """
     Then evaluation should succeed
+    And the derived relation 'result' should have 2 facts
     And the command result 0 should be a Query with 1 rows
     And the command result 0 should be a Query containing row where id = 'b'
 
@@ -44,6 +45,7 @@ Feature: Cypher Functions in Locy Expressions
       QUERY result WHERE exp(v) > 1.5 RETURN n.name AS id
       """
     Then evaluation should succeed
+    And the derived relation 'result' should have 2 facts
     And the command result 0 should be a Query with 1 rows
     And the command result 0 should be a Query containing row where id = 'one'
 
@@ -58,6 +60,7 @@ Feature: Cypher Functions in Locy Expressions
       QUERY result WHERE log(v) > 3.0 RETURN n.name AS id
       """
     Then evaluation should succeed
+    And the derived relation 'result' should have 2 facts
     And the command result 0 should be a Query with 1 rows
     And the command result 0 should be a Query containing row where id = 'big'
 
@@ -75,6 +78,7 @@ Feature: Cypher Functions in Locy Expressions
       QUERY result WHERE n.name = 'x' RETURN n.name AS id, exp(v) AS e
       """
     Then evaluation should succeed
+    And the derived relation 'result' should have 1 facts
     And the command result 0 should be a Query with 1 rows
     And the command result 0 should be a Query containing row where e = 1.0
 
@@ -89,6 +93,7 @@ Feature: Cypher Functions in Locy Expressions
       QUERY result WHERE n.name = 'y' RETURN n.name AS id, sqrt(v) AS s
       """
     Then evaluation should succeed
+    And the derived relation 'result' should have 1 facts
     And the command result 0 should be a Query with 1 rows
     And the command result 0 should be a Query containing row where s = 2.0
 
@@ -105,6 +110,7 @@ Feature: Cypher Functions in Locy Expressions
       QUERY result RETURN toUpper(raw) AS upper
       """
     Then evaluation should succeed
+    And the derived relation 'result' should have 1 facts
     And the command result 0 should be a Query with 1 rows
     And the command result 0 should be a Query containing row where upper = 'HELLO'
 
@@ -119,6 +125,7 @@ Feature: Cypher Functions in Locy Expressions
       QUERY result WHERE toLower(raw) = 'match_me' RETURN raw AS id
       """
     Then evaluation should succeed
+    And the derived relation 'result' should have 2 facts
     And the command result 0 should be a Query with 1 rows
     And the command result 0 should be a Query containing row where id = 'MATCH_ME'
 
@@ -135,6 +142,7 @@ Feature: Cypher Functions in Locy Expressions
       QUERY result RETURN toString(datetime()) AS ts
       """
     Then evaluation should succeed
+    And the derived relation 'result' should have 1 facts
     And the command result 0 should be a Query with 1 rows
 
   # ── Relevance decay pattern (exp + WHERE on QUERY) ───────────────────────
@@ -155,5 +163,6 @@ Feature: Cypher Functions in Locy Expressions
       QUERY scored WHERE imp * exp(-0.05 * age_d) > 0.1 RETURN e.eid AS id
       """
     Then evaluation should succeed
+    And the derived relation 'scored' should have 2 facts
     And the command result 0 should be a Query with 1 rows
     And the command result 0 should be a Query containing row where id = 'ep1'

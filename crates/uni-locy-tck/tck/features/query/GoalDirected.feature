@@ -54,6 +54,7 @@ Feature: QUERY Goal-Directed
       QUERY reachable
       """
     Then evaluation should succeed
+    And the derived relation 'reachable' should have 2 facts
     And the command result 0 should be a Query with 2 rows
 
   Scenario: QUERY filters to matching goal bindings
@@ -68,6 +69,7 @@ Feature: QUERY Goal-Directed
       QUERY reachable WHERE a.name = 'A' RETURN b.name AS person
       """
     Then evaluation should succeed
+    And the derived relation 'reachable' should have 3 facts
     And the command result 0 should be a Query with 2 rows
 
   Scenario: QUERY returns empty when no match
@@ -81,6 +83,7 @@ Feature: QUERY Goal-Directed
       QUERY reachable WHERE a.name = 'Z' RETURN b.name AS person
       """
     Then evaluation should succeed
+    And the derived relation 'reachable' should have 1 facts
     And the command result 0 should be a Query with 0 rows
 
   Scenario: QUERY terminates on cyclic graph

@@ -858,7 +858,24 @@ pub fn record_batches_to_locy_rows(batches: &[RecordBatch]) -> Vec<FactRow> {
                     continue;
                 }
                 let column = batch.column(col_idx);
-                let data_type = if uni_common::core::schema::is_datetime_struct(field.data_type()) {
+                // Recover the Uni DataType so LargeBinary / struct columns decode
+                // correctly. `Bytes`, `CypherValue` and `Duration` all map to Arrow
+                // `LargeBinary` and are indistinguishable here, so raw `Bytes`
+                // columns are tagged with `uni_raw_bytes` at scan time
+                // (`scan.rs::property_field`). Without the hint a raw `Bytes` value
+                // is run through the CypherValue codec and decodes to `Null`.
+                //
+                // This mirrors the Cypher read path (`executor/read.rs`), which has
+                // had the check since issue #93; the Locy copy never did, so a
+                // typed `Bytes` property came back `Null` from `derived` while the
+                // same property read through Cypher was intact.
+                let data_type = if field
+                    .metadata()
+                    .get("uni_raw_bytes")
+                    .is_some_and(|v| v == "true")
+                {
+                    Some(&uni_common::DataType::Bytes)
+                } else if uni_common::core::schema::is_datetime_struct(field.data_type()) {
                     Some(&uni_common::DataType::DateTime)
                 } else if uni_common::core::schema::is_time_struct(field.data_type()) {
                     Some(&uni_common::DataType::Time)

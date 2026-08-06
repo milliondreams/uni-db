@@ -105,6 +105,28 @@ fn property_arrow_type(
     Some(meta.r#type.to_arrow())
 }
 
+/// The Arrow type the *scan* will emit for a property of a label that is not
+/// declared in the schema.
+///
+/// This must mirror `df_graph::scan::build_schemaless_vertex_schema` exactly:
+/// it merges property metadata across **all** labels and only falls back to
+/// `LargeBinary` when no label declares that property name. Guessing
+/// differently makes the projection's declared type disagree with the column it
+/// actually receives, and the resulting coercion silently nulls the value —
+/// which is the whole bug this function exists to avoid.
+///
+/// The merge matters in the realistic partial-schema case: with `Sensor.name`
+/// declared and label `Tag` undeclared, `t.name` still arrives as `Utf8`, not
+/// as cv-encoded bytes.
+fn undeclared_property_arrow_type(schema: &Schema, prop: &str) -> DataType {
+    schema
+        .properties
+        .values()
+        .find_map(|label_props| label_props.get(prop))
+        .map(|meta| meta.r#type.to_arrow())
+        .unwrap_or(DataType::LargeBinary)
+}
+
 /// Infer the Arrow DataType for a yield column based on its expression in the first clause.
 ///
 /// `rule_catalog` lets a yield column that merely forwards a NON-KEY value column
@@ -224,9 +246,36 @@ fn infer_yield_type_rec(
                 // #112: a schemaless/typed property KEY projected Null).
                 if let Expr::Property(object, prop) = &item.expr
                     && let Expr::Variable(var) = object.as_ref()
-                    && let Some(dt) = property_arrow_type(schema, var_labels, var, prop)
                 {
-                    return dt;
+                    if let Some(dt) = property_arrow_type(schema, var_labels, var, prop) {
+                        return dt;
+                    }
+                    // `property_arrow_type` returns `None` for three different
+                    // reasons, and only two of them mean "schemaless":
+                    //
+                    //   a. `var` is a labeled node variable whose label, or whose
+                    //      property, is absent from the schema. The value lives
+                    //      in `overflow_json` and the scan emits it as
+                    //      LargeBinary — declare LargeBinary so the declared and
+                    //      actual types match, no coercion runs, and the cv bytes
+                    //      are decoded at read time.
+                    //   b. `var` is not a labeled node variable at all — an edge
+                    //      variable, or an unlabeled node. `clause_var_labels`
+                    //      only maps labeled *node* vars, so an edge property
+                    //      like `e.weight` always lands here regardless of
+                    //      schema, and its column may well be a typed Float64.
+                    //      Declaring LargeBinary for those breaks schema'd edge
+                    //      properties, so keep the historical inference.
+                    //
+                    // Without this distinction the fallback fires for edge
+                    // properties too and regresses six schema-mode TCK scenarios.
+                    //
+                    // PROB columns are also excluded: a probability is numeric by
+                    // definition and the complement / noisy-OR arithmetic reads it
+                    // as a real Float64, so there the coercion is exactly right.
+                    if var_labels.contains_key(var) && !item.is_prob {
+                        return undeclared_property_arrow_type(schema, prop);
+                    }
                 }
                 let _ = is_key;
                 return infer_expr_type(&item.expr, node_vars);

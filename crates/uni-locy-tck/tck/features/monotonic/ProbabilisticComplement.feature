@@ -332,6 +332,7 @@ Feature: Probabilistic Complement (PROB + IS NOT)
       QUERY safe_drug WHERE d = d RETURN d.name AS drug, safety ORDER BY drug
       """
     Then evaluation should succeed
+    And the derived relation 'safe_drug' should have 2 facts
     And the command result 0 should be a Query with 2 rows
 
   Scenario: QUERY with cross-predicate IS + IS NOT PROB
@@ -360,6 +361,9 @@ Feature: Probabilistic Complement (PROB + IS NOT)
       QUERY net_risk WHERE a = a RETURN a.name AS name, combined ORDER BY name
       """
     Then evaluation should succeed
+    And the derived relation 'risky' should have 2 facts
+    And the derived relation 'trusted' should have 1 facts
+    And the derived relation 'net_risk' should have 2 facts
     And the command result 0 should be a Query with 2 rows
 
   Scenario: QUERY FOLD rule returns node properties after enrichment
@@ -378,6 +382,7 @@ Feature: Probabilistic Complement (PROB + IS NOT)
       QUERY risk_agg WHERE n = n RETURN n.name AS name, total_risk ORDER BY name
       """
     Then evaluation should succeed
+    And the derived relation 'risk_agg' should have 2 facts
     And the command result 0 should be a Query with 2 rows
     And the command result 0 should be a Query containing row where name = 'Alice'
     And the command result 0 should be a Query containing row where name = 'Bob'

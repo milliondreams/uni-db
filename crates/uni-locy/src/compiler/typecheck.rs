@@ -250,6 +250,7 @@ pub fn check(
     for (rule_name, rule) in &compiled_rules {
         for clause in &rule.clauses {
             check_cross_predicate_correlation(rule_name, clause, &compiled_rules, &mut warnings);
+            check_is_not_subjects_are_nodes(rule_name, clause)?;
             // Collect IS references that are within the same SCC (self-IS-refs)
             let scc_idx = strat.scc_map[rule_name.as_str()];
             let scc_rules = &strat.sccs[scc_idx];
@@ -497,6 +498,75 @@ fn check_probability_domain_warning(
     });
 }
 
+// ─── IS NOT subject must be a node ─────────────────────────────────────────
+
+/// Reject an `IS NOT` whose subject cannot carry node identity.
+///
+/// The anti-join keys on vids — `verify_key_columns_are_vids` in
+/// `uni-query`'s `locy_complement.rs` enforces exactly this at runtime, with
+/// "a scalar property cannot be used as an `IS NOT` subject". So every program
+/// this rejects already fails; the only change is that it now fails at compile
+/// time, before any evaluation, with a message that names the variable.
+///
+/// Two things this must NOT do, both of which would reject valid programs:
+///
+/// 1. **Never validate `is_ref.target`.** The shape
+///    `WHERE d IS signal TO dis, d IS NOT known TO dis` binds `dis` through the
+///    *positive* reference's TO-target, not through MATCH. It appears in 11
+///    programs across the TCK, the Python binding tests and a published
+///    notebook. Only `is_ref.subjects` is checked.
+/// 2. **Accumulate bindings left to right.** A positive `x IS rule TO y` makes
+///    `y` a node for *later* conditions (the planner emits a `ScanAll` for it),
+///    so a pre-scan that ignored ordering would be wrong in the other
+///    direction — accepting a subject bound only by a later condition.
+///
+/// Tuple subjects (`(a, b) IS NOT risk`) are checked element-wise.
+///
+/// A **YIELD alias of a node** counts as a node: `YIELD KEY a AS subj` makes
+/// `subj` another name for the node `a`, and `WHERE subj IS NOT flagged`
+/// resolves fine at runtime because the projected column still holds a vid.
+/// Only aliases of non-node expressions (`YIELD a.n AS x`) are rejected. An
+/// earlier version of this check ignored aliases entirely and false-rejected
+/// two working programs.
+fn check_is_not_subjects_are_nodes(
+    rule_name: &str,
+    clause: &CompiledClause,
+) -> Result<(), LocyCompileError> {
+    let mut bound_nodes = super::warded::extract_pattern_node_variables(&clause.match_pattern);
+
+    // YIELD aliases that rename a node keep denoting that node.
+    if let RuleOutput::Yield(yield_clause) = &clause.output {
+        for item in &yield_clause.items {
+            if let (Some(alias), Expr::Variable(var)) = (&item.alias, &item.expr)
+                && bound_nodes.contains(var)
+            {
+                bound_nodes.insert(alias.clone());
+            }
+        }
+    }
+
+    for cond in &clause.where_conditions {
+        let RuleCondition::IsReference(is_ref) = cond else {
+            continue;
+        };
+        if is_ref.negated {
+            for subject in &is_ref.subjects {
+                if !bound_nodes.contains(subject) {
+                    return Err(LocyCompileError::IsNotSubjectNotANode {
+                        rule: rule_name.to_string(),
+                        variable: subject.clone(),
+                    });
+                }
+            }
+        } else if let Some(target) = &is_ref.target {
+            // A positive IS-ref's TO-target is materialized as a node, so it is
+            // a valid subject for any *subsequent* condition.
+            bound_nodes.insert(target.clone());
+        }
+    }
+    Ok(())
+}
+
 // ─── Phase D F3 case 3: positive + complement on same subject ──────────────
 
 fn check_positive_complement_pair(
@@ -632,10 +702,18 @@ fn check_best_by_monotonic_fold(
 // ─── F1: FOLD in recursive path without ALONG ───────────────────────────────
 
 /// Phase B F1 (Stress Corpus B3): a clause has a FOLD aggregate AND
-/// references a rule in its own SCC (recursive IS-ref) AND lacks an
-/// `ALONG` clause. This pattern is almost always a semantic mistake —
-/// FOLD groups by KEY columns, but in recursive contexts the user
-/// usually means per-path aggregation, which requires `ALONG`.
+/// references a rule in its own SCC (recursive IS-ref). Aggregating inside a
+/// recursive stratum currently **under-counts**: the semi-naive fixpoint
+/// deduplicates intermediate rows by all columns, so two derivations that
+/// reach the same KEY with numerically equal values collapse into one before
+/// the fold observes them (<https://github.com/rustic-ai/uni-db/issues/159>).
+///
+/// This fires whether or not an `ALONG` clause is present. ALONG was
+/// previously treated as a fix and suppressed the warning, but ALONG
+/// accumulators are ordinary non-KEY columns and participate in the same
+/// dedup — two distinct paths carrying an equal accumulated value collapse
+/// exactly as FOLD inputs do. Suppressing on ALONG therefore silenced the
+/// case the user had just been advised to write.
 ///
 /// Conservative scope: only fires for self-SCC IS-refs (the common
 /// recursive case). Cross-SCC recursion via non-recursive stratification
@@ -646,7 +724,7 @@ fn check_fold_in_recursive_path(
     scc_rules: &std::collections::HashSet<String>,
     warnings: &mut Vec<CompilerWarning>,
 ) {
-    if def.fold.is_empty() || !def.along.is_empty() {
+    if def.fold.is_empty() {
         return;
     }
     let has_recursive_is_ref = def.where_conditions.iter().any(|cond| {
@@ -660,9 +738,16 @@ fn check_fold_in_recursive_path(
         warnings.push(CompilerWarning {
             code: WarningCode::FoldInRecursivePath,
             message: format!(
-                "rule '{}' has both FOLD and a recursive IS-reference but no ALONG \
-                 clause; FOLD groups by KEY columns, not by path — did you mean to \
-                 add ALONG for per-path aggregation? (Stress Corpus B3)",
+                "rule '{}' aggregates inside a recursive stratum. The fold \
+                 aggregates across derivations, so N siblings contributing the \
+                 same amount are counted N times (issue #159 — this previously \
+                 under-counted). Two cautions remain: an unbounded aggregate \
+                 (MSUM, MCOUNT, COUNT, COLLECT) over CYCLIC data has no \
+                 fixpoint and will run to the iteration limit rather than \
+                 converge; and MNOR/MPROD assume derivations are independent, \
+                 which is false when they share base facts — enable \
+                 exact_probability for the BDD computation there. \
+                 (Stress Corpus B3)",
                 rule_name
             ),
             rule_name: rule_name.to_string(),

@@ -231,8 +231,19 @@ Feature: Probabilistic Stress Corpus
         YIELD KEY a, KEY b, p
       """
     Then evaluation should succeed
+    # risk(A,C) has two derivations carrying DISTINCT values — 0.3 direct and
+    # 0.4 via B — so 1-(1-0.3)(1-0.4) = 0.58 was always right.
     And the derived relation 'risk' should contain a fact where a.name = 'A' and p = 0.58
-    And the derived relation 'risk' should contain a fact where a.name = 'A' and p = 0.6
+    # risk(A,D) has two derivations carrying the SAME value 0.6: via mid=B
+    # (risk(B,D)=0.6) and via mid=C (risk(C,D)=0.6). All-column dedup used to
+    # collapse them and this asserted 0.6 — the artefact, not the answer. Both
+    # paths contribute, so 1-(1-0.6)(1-0.6) = 0.84 (issue #159).
+    #
+    # Note the two derivations share the C->D edge, so 0.84 is the
+    # independence-assumption result. That is correct for this scenario, which
+    # does not enable exact_probability; the BDD path is covered separately in
+    # ExactProbability.feature.
+    And the derived relation 'risk' should contain a fact where a.name = 'A' and p = 0.84
 
   Scenario: ALONG expression feeds MNOR feeds MPROD
     Given having executed:

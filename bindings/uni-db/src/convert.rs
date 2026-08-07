@@ -946,6 +946,48 @@ fn locy_incomplete_to_py(
     Ok(dict.into())
 }
 
+/// Convert compile-time warnings to a Python list of dicts.
+///
+/// Mirrors the `RuntimeWarning` shape (`code` / `message` / `rule_name`);
+/// `CompilerWarning` carries no `variable_count` or `key_group`.
+///
+/// These were previously dropped at the PyO3 boundary entirely, so warnings the
+/// compiler had already emitted were invisible from Python. Issue #159 was
+/// filed against a program that warns at compile time.
+///
+/// The match is deliberately exhaustive rather than using a `_` arm, so a new
+/// `WarningCode` variant fails the build here instead of silently reaching
+/// Python under a wrong or generic name.
+fn compile_warnings_to_py(
+    py: Python,
+    warnings: &[uni_locy::types::CompilerWarning],
+) -> PyResult<Py<PyAny>> {
+    use uni_locy::types::WarningCode;
+
+    let list = PyList::empty(py);
+    for w in warnings {
+        let wd = PyDict::new(py);
+        let code_str = match w.code {
+            WarningCode::MsumNonNegativity => "msum_non_negativity",
+            WarningCode::ProbabilityDomainViolation => "probability_domain_violation",
+            WarningCode::FoldInRecursivePath => "fold_in_recursive_path",
+            WarningCode::EceBinningBias => "ece_binning_bias",
+            WarningCode::UncalibratedLLMLogprobs => "uncalibrated_llm_logprobs",
+            WarningCode::UncalibratedNeuralPredicate => "uncalibrated_neural_predicate",
+            WarningCode::SharedNeuralInputArgument => "shared_neural_input_argument",
+            WarningCode::SharedNeuralFeatureValue => "shared_neural_feature_value",
+            WarningCode::PositiveComplementCorrelation => "positive_complement_correlation",
+            WarningCode::CrossPredicateCorrelation => "cross_predicate_correlation",
+            WarningCode::SharedRetrievalContext => "shared_retrieval_context",
+        };
+        wd.set_item("code", code_str)?;
+        wd.set_item("message", &w.message)?;
+        wd.set_item("rule_name", &w.rule_name)?;
+        list.append(wd)?;
+    }
+    Ok(list.into())
+}
+
 /// Convert a LocyResult to a Python dict.
 pub fn locy_result_to_py(py: Python, result: uni_db::locy::LocyResult) -> PyResult<Py<PyAny>> {
     let result = result.into_inner();
@@ -1012,6 +1054,12 @@ pub fn locy_result_to_py(py: Python, result: uni_db::locy::LocyResult) -> PyResu
         warn_list.append(wd)?;
     }
     dict.set_item("warnings", warn_list)?;
+
+    // compile_warnings: Vec<CompilerWarning> -> list of dicts
+    dict.set_item(
+        "compile_warnings",
+        compile_warnings_to_py(py, &result.compile_warnings)?,
+    )?;
 
     // approximate_groups: HashMap<String, Vec<String>> -> Python dict of lists
     let approx_dict = PyDict::new(py);
@@ -1096,6 +1144,9 @@ pub fn locy_result_to_py_class(
         cmd_list.append(command_result_to_py(py, cmd)?)?;
     }
 
+    // Built before `result.warnings` is moved below.
+    let compile_warn_list = compile_warnings_to_py(py, &result.compile_warnings)?;
+
     let warn_list = pyo3::types::PyList::empty(py);
     for w in result.warnings {
         let wd = pyo3::types::PyDict::new(py);
@@ -1148,6 +1199,7 @@ pub fn locy_result_to_py_class(
         stats: stats.into_py_any(py)?,
         command_results: cmd_list.into(),
         warnings: warn_list.into(),
+        compile_warnings: compile_warn_list,
         approximate_groups: approx_dict.into(),
         derived_fact_set,
         timed_out,

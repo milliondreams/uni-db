@@ -220,6 +220,35 @@ fn parse_timezone(tz_str: &str) -> Result<TimezoneInfo> {
     Ok(TimezoneInfo::FixedOffset(offset))
 }
 
+/// Extract the timezone carried by a [`TemporalValue`], if any.
+///
+/// A `DateTime` prefers its IANA `timezone_name` and falls back to its fixed
+/// offset; a `Time` only ever carries a fixed offset. Every other variant is
+/// timezone-less.
+fn tz_info_from_temporal(tv: &TemporalValue) -> Result<Option<TimezoneInfo>> {
+    match tv {
+        TemporalValue::DateTime {
+            offset_seconds,
+            timezone_name,
+            ..
+        } => {
+            if let Some(name) = timezone_name {
+                Ok(Some(parse_timezone(name)?))
+            } else {
+                let fo = FixedOffset::east_opt(*offset_seconds)
+                    .ok_or_else(|| anyhow!("Invalid offset"))?;
+                Ok(Some(TimezoneInfo::FixedOffset(fo)))
+            }
+        }
+        TemporalValue::Time { offset_seconds, .. } => {
+            let fo =
+                FixedOffset::east_opt(*offset_seconds).ok_or_else(|| anyhow!("Invalid offset"))?;
+            Ok(Some(TimezoneInfo::FixedOffset(fo)))
+        }
+        _ => Ok(None),
+    }
+}
+
 // ============================================================================
 // Public API
 // ============================================================================
@@ -724,23 +753,17 @@ fn eval_extract(args: &[Value], component: Component) -> Result<Value> {
 
             match component {
                 Component::Year | Component::Month | Component::Day => {
-                    if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-                        return Ok(Value::Int(match component {
-                            Component::Year => d.year() as i64,
-                            Component::Month => d.month() as i64,
-                            Component::Day => d.day() as i64,
-                            _ => unreachable!(),
-                        }));
+                    if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                        && let Some(v) = date_component(&d, &component)
+                    {
+                        return Ok(Value::Int(v as i64));
                     }
                 }
                 Component::Hour | Component::Minute | Component::Second => {
-                    if let Ok(t) = NaiveTime::parse_from_str(s, "%H:%M:%S") {
-                        return Ok(Value::Int(match component {
-                            Component::Hour => t.hour() as i64,
-                            Component::Minute => t.minute() as i64,
-                            Component::Second => t.second() as i64,
-                            _ => unreachable!(),
-                        }));
+                    if let Ok(t) = NaiveTime::parse_from_str(s, "%H:%M:%S")
+                        && let Some(v) = time_component(&t, &component)
+                    {
+                        return Ok(Value::Int(v as i64));
                     }
                 }
             }
@@ -756,12 +779,32 @@ fn eval_extract(args: &[Value], component: Component) -> Result<Value> {
 
 fn extract_component<T: Datelike + Timelike>(dt: &T, component: &Component) -> i32 {
     match component {
-        Component::Year => dt.year(),
-        Component::Month => dt.month() as i32,
-        Component::Day => dt.day() as i32,
-        Component::Hour => dt.hour() as i32,
-        Component::Minute => dt.minute() as i32,
-        Component::Second => dt.second() as i32,
+        Component::Year | Component::Month | Component::Day => {
+            date_component(dt, component).expect("date_component covers every date component")
+        }
+        Component::Hour | Component::Minute | Component::Second => {
+            time_component(dt, component).expect("time_component covers every time component")
+        }
+    }
+}
+
+/// Project the date half of `Component`; `None` for the time components.
+fn date_component<T: Datelike>(d: &T, component: &Component) -> Option<i32> {
+    match component {
+        Component::Year => Some(d.year()),
+        Component::Month => Some(d.month() as i32),
+        Component::Day => Some(d.day() as i32),
+        Component::Hour | Component::Minute | Component::Second => None,
+    }
+}
+
+/// Project the time half of `Component`; `None` for the date components.
+fn time_component<T: Timelike>(t: &T, component: &Component) -> Option<i32> {
+    match component {
+        Component::Hour => Some(t.hour() as i32),
+        Component::Minute => Some(t.minute() as i32),
+        Component::Second => Some(t.second() as i32),
+        Component::Year | Component::Month | Component::Day => None,
     }
 }
 
@@ -777,25 +820,30 @@ pub fn eval_temporal_accessor(temporal_str: &str, component: &str) -> Result<Val
     let component_lower = component.to_lowercase();
     match component_lower.as_str() {
         // Basic date components (already handled by eval_extract but also here for consistency)
-        "year" => extract_year(temporal_str),
-        "month" => extract_month(temporal_str),
-        "day" => extract_day(temporal_str),
-        "hour" => extract_hour(temporal_str),
-        "minute" => extract_minute(temporal_str),
-        "second" => extract_second(temporal_str),
+        "year" => extract_date_component(temporal_str, |d| d.year() as i64),
+        "month" => extract_date_component(temporal_str, |d| d.month() as i64),
+        "day" => extract_date_component(temporal_str, |d| d.day() as i64),
+        "hour" => extract_time_component(temporal_str, |t| t.hour() as i64),
+        "minute" => extract_time_component(temporal_str, |t| t.minute() as i64),
+        "second" => extract_time_component(temporal_str, |t| t.second() as i64),
 
         // Extended date components
-        "quarter" => extract_quarter(temporal_str),
-        "week" => extract_week(temporal_str),
-        "weekyear" => extract_week_year(temporal_str),
-        "ordinalday" => extract_ordinal_day(temporal_str),
-        "dayofweek" | "weekday" => extract_day_of_week(temporal_str),
+        "quarter" => extract_date_component(temporal_str, |d| ((d.month() - 1) / 3 + 1) as i64),
+        "week" => extract_date_component(temporal_str, |d| d.iso_week().week() as i64),
+        "weekyear" => extract_date_component(temporal_str, |d| d.iso_week().year() as i64),
+        "ordinalday" => extract_date_component(temporal_str, |d| d.ordinal() as i64),
+        // ISO weekday: Monday = 1, Sunday = 7
+        "dayofweek" | "weekday" => extract_date_component(temporal_str, |d| {
+            (d.weekday().num_days_from_monday() + 1) as i64
+        }),
         "dayofquarter" => extract_day_of_quarter(temporal_str),
 
         // Sub-second components
-        "millisecond" => extract_millisecond(temporal_str),
-        "microsecond" => extract_microsecond(temporal_str),
-        "nanosecond" => extract_nanosecond(temporal_str),
+        "millisecond" => {
+            extract_time_component(temporal_str, |t| (t.nanosecond() / 1_000_000) as i64)
+        }
+        "microsecond" => extract_time_component(temporal_str, |t| (t.nanosecond() / 1_000) as i64),
+        "nanosecond" => extract_time_component(temporal_str, |t| t.nanosecond() as i64),
 
         // Timezone components
         "timezone" => extract_timezone_name_from_str(temporal_str),
@@ -979,51 +1027,6 @@ fn extract_time_component(s: &str, f: impl FnOnce(NaiveTime) -> i64) -> Result<V
     Ok(Value::Int(f(time)))
 }
 
-fn extract_year(s: &str) -> Result<Value> {
-    extract_date_component(s, |d| d.year() as i64)
-}
-
-fn extract_month(s: &str) -> Result<Value> {
-    extract_date_component(s, |d| d.month() as i64)
-}
-
-fn extract_day(s: &str) -> Result<Value> {
-    extract_date_component(s, |d| d.day() as i64)
-}
-
-fn extract_hour(s: &str) -> Result<Value> {
-    extract_time_component(s, |t| t.hour() as i64)
-}
-
-fn extract_minute(s: &str) -> Result<Value> {
-    extract_time_component(s, |t| t.minute() as i64)
-}
-
-fn extract_second(s: &str) -> Result<Value> {
-    extract_time_component(s, |t| t.second() as i64)
-}
-
-fn extract_quarter(s: &str) -> Result<Value> {
-    extract_date_component(s, |d| ((d.month() - 1) / 3 + 1) as i64)
-}
-
-fn extract_week(s: &str) -> Result<Value> {
-    extract_date_component(s, |d| d.iso_week().week() as i64)
-}
-
-fn extract_week_year(s: &str) -> Result<Value> {
-    extract_date_component(s, |d| d.iso_week().year() as i64)
-}
-
-fn extract_ordinal_day(s: &str) -> Result<Value> {
-    extract_date_component(s, |d| d.ordinal() as i64)
-}
-
-fn extract_day_of_week(s: &str) -> Result<Value> {
-    // ISO weekday: Monday = 1, Sunday = 7
-    extract_date_component(s, |d| (d.weekday().num_days_from_monday() + 1) as i64)
-}
-
 fn extract_day_of_quarter(s: &str) -> Result<Value> {
     let (date, _, _) = parse_datetime_with_tz(s)?;
     let quarter = (date.month() - 1) / 3;
@@ -1038,18 +1041,6 @@ fn extract_day_of_quarter(s: &str) -> Result<Value> {
         })?;
     let day_of_quarter = (date - quarter_start).num_days() + 1;
     Ok(Value::Int(day_of_quarter))
-}
-
-fn extract_millisecond(s: &str) -> Result<Value> {
-    extract_time_component(s, |t| (t.nanosecond() / 1_000_000) as i64)
-}
-
-fn extract_microsecond(s: &str) -> Result<Value> {
-    extract_time_component(s, |t| (t.nanosecond() / 1_000) as i64)
-}
-
-fn extract_nanosecond(s: &str) -> Result<Value> {
-    extract_time_component(s, |t| t.nanosecond() as i64)
 }
 
 fn extract_timezone_name_from_str(s: &str) -> Result<Value> {
@@ -2033,27 +2024,7 @@ fn extract_time_and_tz_from_value(val: &Value) -> Result<(NaiveTime, Option<Time
             let time = tv
                 .to_time()
                 .unwrap_or_else(|| NaiveTime::from_hms_opt(0, 0, 0).unwrap());
-            let tz = match tv {
-                TemporalValue::DateTime {
-                    offset_seconds,
-                    timezone_name,
-                    ..
-                } => {
-                    if let Some(name) = timezone_name {
-                        Some(parse_timezone(name)?)
-                    } else {
-                        let fo = FixedOffset::east_opt(*offset_seconds)
-                            .ok_or_else(|| anyhow!("Invalid offset"))?;
-                        Some(TimezoneInfo::FixedOffset(fo))
-                    }
-                }
-                TemporalValue::Time { offset_seconds, .. } => {
-                    let fo = FixedOffset::east_opt(*offset_seconds)
-                        .ok_or_else(|| anyhow!("Invalid offset"))?;
-                    Some(TimezoneInfo::FixedOffset(fo))
-                }
-                _ => None,
-            };
+            let tz = tz_info_from_temporal(tv)?;
             Ok((time, tz))
         }
         Value::String(s) => {
@@ -2289,27 +2260,7 @@ fn eval_datetime_from_date_and_time(
             let time = tv
                 .to_time()
                 .unwrap_or_else(|| NaiveTime::from_hms_opt(0, 0, 0).unwrap());
-            let tz = match tv {
-                TemporalValue::DateTime {
-                    offset_seconds,
-                    timezone_name,
-                    ..
-                } => {
-                    if let Some(name) = timezone_name {
-                        Some(parse_timezone(name)?)
-                    } else {
-                        let fo = FixedOffset::east_opt(*offset_seconds)
-                            .ok_or_else(|| anyhow!("Invalid offset"))?;
-                        Some(TimezoneInfo::FixedOffset(fo))
-                    }
-                }
-                TemporalValue::Time { offset_seconds, .. } => {
-                    let fo = FixedOffset::east_opt(*offset_seconds)
-                        .ok_or_else(|| anyhow!("Invalid offset"))?;
-                    Some(TimezoneInfo::FixedOffset(fo))
-                }
-                _ => None,
-            };
+            let tz = tz_info_from_temporal(tv)?;
             (time, tz)
         }
         Value::String(s) => {
@@ -2499,27 +2450,7 @@ fn temporal_or_string_to_components(
             let time = tv
                 .to_time()
                 .unwrap_or_else(|| NaiveTime::from_hms_opt(0, 0, 0).unwrap());
-            let tz_info = match tv {
-                TemporalValue::DateTime {
-                    offset_seconds,
-                    timezone_name,
-                    ..
-                } => {
-                    if let Some(name) = timezone_name {
-                        Some(parse_timezone(name)?)
-                    } else {
-                        let fo = FixedOffset::east_opt(*offset_seconds)
-                            .ok_or_else(|| anyhow!("Invalid offset"))?;
-                        Some(TimezoneInfo::FixedOffset(fo))
-                    }
-                }
-                TemporalValue::Time { offset_seconds, .. } => {
-                    let fo = FixedOffset::east_opt(*offset_seconds)
-                        .ok_or_else(|| anyhow!("Invalid offset"))?;
-                    Some(TimezoneInfo::FixedOffset(fo))
-                }
-                _ => None,
-            };
+            let tz_info = tz_info_from_temporal(tv)?;
             Ok((date, time, tz_info))
         }
         Value::String(s) => parse_datetime_with_tz(s),

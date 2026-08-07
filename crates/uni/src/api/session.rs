@@ -478,29 +478,7 @@ impl Session {
             |r| {
                 loader
                     .load(py, module_src, module_name, r, registrar_caps)
-                    .map_err(|e| match e {
-                        uni_plugin_pyo3::PyPluginError::PythonException {
-                            qname,
-                            message,
-                            traceback,
-                        } => UniError::InvalidArgument {
-                            arg: "module_src".to_owned(),
-                            message: format!("python exception in {qname}: {message}\n{traceback}"),
-                        },
-                        uni_plugin_pyo3::PyPluginError::ManifestInvalid(m) => {
-                            UniError::InvalidArgument {
-                                arg: "module_src".to_owned(),
-                                message: format!("python plugin manifest: {m}"),
-                            }
-                        }
-                        uni_plugin_pyo3::PyPluginError::ArrowConversion(m) => {
-                            UniError::InvalidArgument {
-                                arg: "module_src".to_owned(),
-                                message: format!("python plugin arrow conversion: {m}"),
-                            }
-                        }
-                        other => UniError::Internal(anyhow::anyhow!(other.to_string())),
-                    })
+                    .map_err(|e| crate::api::py_plugin_err_to_uni("module_src", e))
             },
         )
     }

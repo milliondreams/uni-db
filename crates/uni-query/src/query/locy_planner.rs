@@ -105,6 +105,28 @@ fn property_arrow_type(
     Some(meta.r#type.to_arrow())
 }
 
+/// The Arrow type the *scan* will emit for a property of a label that is not
+/// declared in the schema.
+///
+/// This must mirror `df_graph::scan::build_schemaless_vertex_schema` exactly:
+/// it merges property metadata across **all** labels and only falls back to
+/// `LargeBinary` when no label declares that property name. Guessing
+/// differently makes the projection's declared type disagree with the column it
+/// actually receives, and the resulting coercion silently nulls the value —
+/// which is the whole bug this function exists to avoid.
+///
+/// The merge matters in the realistic partial-schema case: with `Sensor.name`
+/// declared and label `Tag` undeclared, `t.name` still arrives as `Utf8`, not
+/// as cv-encoded bytes.
+fn undeclared_property_arrow_type(schema: &Schema, prop: &str) -> DataType {
+    schema
+        .properties
+        .values()
+        .find_map(|label_props| label_props.get(prop))
+        .map(|meta| meta.r#type.to_arrow())
+        .unwrap_or(DataType::LargeBinary)
+}
+
 /// Infer the Arrow DataType for a yield column based on its expression in the first clause.
 ///
 /// `rule_catalog` lets a yield column that merely forwards a NON-KEY value column
@@ -117,7 +139,10 @@ fn property_arrow_type(
 /// `is_key`, `schema`, and `var_labels` let an integer-typed property in a KEY
 /// position keep its `Int64` type instead of being widened to the default
 /// `Float64` (issue #94); `var_labels` describes `first_clause`'s node vars.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "yield-type inference needs the full clause context: name sets, catalog and schema"
+)]
 fn infer_yield_type(
     name: &str,
     first_clause: &CompiledClause,
@@ -144,7 +169,10 @@ fn infer_yield_type(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors `infer_yield_type`'s context, plus the cycle-guard visited set"
+)]
 fn infer_yield_type_rec(
     name: &str,
     first_clause: &CompiledClause,
@@ -218,9 +246,36 @@ fn infer_yield_type_rec(
                 // #112: a schemaless/typed property KEY projected Null).
                 if let Expr::Property(object, prop) = &item.expr
                     && let Expr::Variable(var) = object.as_ref()
-                    && let Some(dt) = property_arrow_type(schema, var_labels, var, prop)
                 {
-                    return dt;
+                    if let Some(dt) = property_arrow_type(schema, var_labels, var, prop) {
+                        return dt;
+                    }
+                    // `property_arrow_type` returns `None` for three different
+                    // reasons, and only two of them mean "schemaless":
+                    //
+                    //   a. `var` is a labeled node variable whose label, or whose
+                    //      property, is absent from the schema. The value lives
+                    //      in `overflow_json` and the scan emits it as
+                    //      LargeBinary — declare LargeBinary so the declared and
+                    //      actual types match, no coercion runs, and the cv bytes
+                    //      are decoded at read time.
+                    //   b. `var` is not a labeled node variable at all — an edge
+                    //      variable, or an unlabeled node. `clause_var_labels`
+                    //      only maps labeled *node* vars, so an edge property
+                    //      like `e.weight` always lands here regardless of
+                    //      schema, and its column may well be a typed Float64.
+                    //      Declaring LargeBinary for those breaks schema'd edge
+                    //      properties, so keep the historical inference.
+                    //
+                    // Without this distinction the fallback fires for edge
+                    // properties too and regresses six schema-mode TCK scenarios.
+                    //
+                    // PROB columns are also excluded: a probability is numeric by
+                    // definition and the complement / noisy-OR arithmetic reads it
+                    // as a real Float64, so there the coercion is exactly right.
+                    if var_labels.contains_key(var) && !item.is_prob {
+                        return undeclared_property_arrow_type(schema, prop);
+                    }
                 }
                 let _ = is_key;
                 return infer_expr_type(&item.expr, node_vars);
@@ -304,6 +359,20 @@ fn infer_expr_type(expr: &Expr, node_vars: &HashSet<String>) -> DataType {
         Expr::Literal(CypherLiteral::String(_)) => DataType::LargeUtf8,
         Expr::Literal(CypherLiteral::Bool(_)) => DataType::Boolean,
         Expr::Literal(CypherLiteral::Null) => DataType::LargeUtf8,
+        // A duration accessor on a computed value — `duration.inDays(a, b).days`,
+        // `.months`, `.secondsOfMinute`, … — is integral. Every arm of
+        // `datetime::duration_component` returns `Value::Int`, so typing these
+        // `Float64` made `derived` report `20.0` where the value is `20`.
+        //
+        // Restricted to a non-`Variable` object on purpose: `n.days` is an
+        // ordinary node property whose type the schema decides, and a column
+        // that merely happens to be called `days` must not be forced to Int64.
+        Expr::Property(object, prop)
+            if !matches!(object.as_ref(), Expr::Variable(_))
+                && uni_query_functions::datetime::is_duration_accessor(prop) =>
+        {
+            DataType::Int64
+        }
         Expr::Property(_, _) => DataType::Float64,
         // Binary operations: infer from operator and operand types.
         Expr::BinaryOp { left, op, right } => {
@@ -371,7 +440,8 @@ fn infer_expr_type(expr: &Expr, node_vars: &HashSet<String>) -> DataType {
 use super::df_graph::locy_fixpoint::{DerivedScanEntry, DerivedScanRegistry};
 use super::planner::{LogicalPlan, QueryPlanner};
 use super::planner_locy_types::{
-    LocyClausePlan, LocyCommand, LocyIsRef, LocyRulePlan, LocyStratum, LocyYieldColumn,
+    FOLD_DISCRIMINATOR_COL_PREFIX, ISNOT_VID_COL_PREFIX, LocyClausePlan, LocyCommand, LocyIsRef,
+    LocyRulePlan, LocyStratum, LocyYieldColumn,
 };
 
 // ---------------------------------------------------------------------------
@@ -428,10 +498,93 @@ struct ClassifierContext {
 /// the in-progress stratum's rule names, and the clause's bound node
 /// variables. Bundled to keep `build_clause` under the
 /// too-many-arguments threshold.
+/// The derivation-discriminator columns for a rule (issue #159), in projection
+/// order: the clause index, then one `_vid` column per discriminating variable.
+///
+/// A discriminating variable is a MATCH-bound **node** variable that no clause
+/// of the rule yields bare — precisely the binding that distinguishes one
+/// derivation of an output row from another, and which projection would
+/// otherwise erase.
+///
+/// Returns empty unless the rule is recursive *and* carries `FOLD` or `ALONG`.
+/// The restriction is a correctness requirement, not an optimisation: a
+/// key-only recursive rule such as a transitive closure depends on set
+/// semantics, and widening its dedup key both explodes its fact count and
+/// breaks termination on cyclic data.
+///
+/// The union is taken across clauses and sorted, so every clause of the rule
+/// emits an identical schema in a stable order — `reconcile_schema` treats the
+/// first non-empty batch's shape as the rule's fact identity, so an
+/// iteration-order-dependent schema would be non-deterministic.
+fn derivation_discriminator_columns(
+    rule: &CompiledRule,
+    is_recursive: bool,
+) -> Vec<(String, DataType)> {
+    let carries_fold_or_along = rule
+        .clauses
+        .iter()
+        .any(|c| !c.fold.is_empty() || !c.along.is_empty());
+    if !is_recursive || !carries_fold_or_along {
+        return Vec::new();
+    }
+
+    let yielded_bare: HashSet<&str> = rule
+        .clauses
+        .iter()
+        .filter_map(|c| match &c.output {
+            RuleOutput::Yield(y) => Some(y.items.iter()),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|item| match &item.expr {
+            Expr::Variable(v) => Some(v.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    let mut vars: Vec<String> = rule
+        .clauses
+        .iter()
+        .flat_map(|c| {
+            let mut per_clause = HashSet::new();
+            collect_match_node_vars(c, &mut per_clause);
+            per_clause.into_iter()
+        })
+        .filter(|v| !yielded_bare.contains(v.as_str()))
+        .collect();
+    vars.sort();
+    vars.dedup();
+
+    std::iter::once((
+        format!("{FOLD_DISCRIMINATOR_COL_PREFIX}clause"),
+        DataType::Int64,
+    ))
+    .chain(vars.into_iter().map(|v| {
+        (
+            format!("{FOLD_DISCRIMINATOR_COL_PREFIX}vid_{v}"),
+            DataType::UInt64,
+        )
+    }))
+    .collect()
+}
+
 struct ClauseCtx<'a> {
     stratum_rule_names: &'a HashSet<String>,
     rule_catalog: &'a HashMap<String, CompiledRule>,
     node_vars: &'a HashSet<String>,
+    /// Rule-level derivation-discriminator variables (issue #159), sorted.
+    ///
+    /// The **union across the rule's clauses**, so every clause emits the same
+    /// schema: a clause that binds the variable projects `{var}._vid`, one that
+    /// does not projects a typed NULL. Empty unless the rule is recursive and
+    /// carries FOLD or ALONG. See [`FOLD_DISCRIMINATOR_COL_PREFIX`].
+    deriv_vars: &'a [String],
+    /// Whether this rule's stratum is recursive — needed to compute a
+    /// same-stratum IS-ref target's own discriminator columns.
+    is_recursive: bool,
+    /// This clause's index within the rule, projected as `__deriv_clause` so
+    /// two clauses' rows can never collide through NULL padding.
+    clause_index: usize,
 }
 
 impl<'a> LocyPlanBuilder<'a> {
@@ -716,8 +869,20 @@ impl<'a> LocyPlanBuilder<'a> {
         // Collect node variable names from match patterns for VID-based joins
         let node_vars = collect_node_vars(&rule.clauses);
 
+        // Derivation discriminators for a recursive FOLD / ALONG rule (#159).
+        // See `derivation_discriminator_columns`.
+        let deriv_columns = derivation_discriminator_columns(rule, is_recursive);
+        let deriv_vars: Vec<String> = deriv_columns
+            .iter()
+            .skip(1) // [0] is the clause index, not a variable
+            .map(|(name, _)| {
+                name.trim_start_matches(&format!("{FOLD_DISCRIMINATOR_COL_PREFIX}vid_"))
+                    .to_string()
+            })
+            .collect();
+
         let mut clauses = Vec::with_capacity(rule.clauses.len());
-        for clause in &rule.clauses {
+        for (clause_index, clause) in rule.clauses.iter().enumerate() {
             clauses.push(self.build_clause(
                 clause,
                 &rule.yield_schema,
@@ -726,6 +891,9 @@ impl<'a> LocyPlanBuilder<'a> {
                     stratum_rule_names,
                     rule_catalog,
                     node_vars: &node_vars,
+                    deriv_vars: &deriv_vars,
+                    is_recursive,
+                    clause_index,
                 },
                 classifiers,
             )?);
@@ -907,6 +1075,7 @@ impl<'a> LocyPlanBuilder<'a> {
             having,
             best_by_criteria,
             yield_projection,
+            deriv_columns,
         })
     }
 
@@ -1037,6 +1206,13 @@ impl<'a> LocyPlanBuilder<'a> {
         let mut is_ref_col_aliases: HashMap<String, String> = HashMap::new();
         let mut bare_is_ref_cols: HashSet<String> = HashSet::new();
 
+        // Hidden `{var}._vid` projections for negated IS-ref subjects, so the
+        // anti-join can resolve them by node identity instead of by whatever
+        // name YIELD gave them. Pushed onto `projections` after everything else
+        // (see `ISNOT_VID_COL_PREFIX`) and stripped once the anti-join has run.
+        let mut isnot_vid_projections: Vec<(String, String)> = Vec::new();
+        let mut isnot_ref_index: usize = 0;
+
         for condition in &clause.where_conditions {
             if let RuleCondition::IsReference(is_ref) = condition {
                 let target_rule_name = is_ref.rule_name.to_string();
@@ -1065,11 +1241,16 @@ impl<'a> LocyPlanBuilder<'a> {
                 }
 
                 let is_self_ref = stratum_rule_names.contains(&target_rule_name);
-                let handle = self.get_or_create_derived_scan_handle(
+                // A same-stratum handle is fed live pre-fold facts, so it must
+                // declare the TARGET rule's discriminators — which in a
+                // mutually-recursive stratum need not match this rule's.
+                let target_deriv = derivation_discriminator_columns(target_rule, ctx.is_recursive);
+                let handle = self.get_or_create_derived_scan_handle_with_deriv(
                     &target_rule_name,
                     target_rule,
                     is_self_ref,
                     rule_catalog,
+                    &target_deriv,
                 );
 
                 // Look up target rule's PROB column (if any)
@@ -1083,6 +1264,31 @@ impl<'a> LocyPlanBuilder<'a> {
                     })
                     .unwrap_or((false, None));
 
+                // For a negated IS-ref, mint a hidden `{var}._vid` projection
+                // for every subject (and TO target) that is a MATCH-bound node
+                // variable. Only those have an expanded `._vid` column in the
+                // scan output — relationship variables expose `._eid`, and
+                // scalar / ALONG-bound subjects have neither, so they keep the
+                // by-name resolution path (and its error) unchanged.
+                let mut subject_vid_cols: HashMap<String, String> = HashMap::new();
+                if is_ref.negated {
+                    let n = isnot_ref_index;
+                    isnot_ref_index += 1;
+                    let mut record = |var: &String| {
+                        if clause_node_vars.contains(var) {
+                            let hidden = format!("{ISNOT_VID_COL_PREFIX}{n}_{var}");
+                            isnot_vid_projections.push((var.clone(), hidden.clone()));
+                            subject_vid_cols.insert(var.clone(), hidden);
+                        }
+                    };
+                    for subject in &is_ref.subjects {
+                        record(subject);
+                    }
+                    if let Some(target_var) = &is_ref.target {
+                        record(target_var);
+                    }
+                }
+
                 // Build LocyIsRef metadata
                 let locy_is_ref = LocyIsRef {
                     rule_name: target_rule_name.clone(),
@@ -1095,6 +1301,7 @@ impl<'a> LocyPlanBuilder<'a> {
                     negated: is_ref.negated,
                     target_has_prob,
                     target_prob_col,
+                    subject_vid_cols,
                 };
                 is_refs.push(locy_is_ref);
 
@@ -1415,6 +1622,54 @@ impl<'a> LocyPlanBuilder<'a> {
             target_types.push(DataType::Int64);
         }
 
+        // Derivation-discriminator columns for a recursive FOLD / ALONG rule
+        // (issue #159). See `FOLD_DISCRIMINATOR_COL_PREFIX`.
+        //
+        // These are pushed HERE — before the untyped `__feat_*` /
+        // `__isnot_vid_*` tails below — because `target_types` is index-parallel
+        // with `projections` and those tails deliberately push no `target_types`
+        // entry. Appending after them would desynchronize the two vectors.
+        //
+        // Every clause emits the same set, so the clauses stay union-compatible:
+        // a clause that binds the variable projects its `_vid`, one that does
+        // not projects a typed NULL.
+        if !ctx.deriv_vars.is_empty() {
+            // The clause index, so a NULL-padded row from one clause can never
+            // collide with a real row from another.
+            projections.push((
+                Expr::Literal(CypherLiteral::Integer(ctx.clause_index as i64)),
+                Some(format!("{FOLD_DISCRIMINATOR_COL_PREFIX}clause")),
+            ));
+            target_types.push(DataType::Int64);
+
+            let mut bound_here = HashSet::new();
+            collect_match_node_vars(clause, &mut bound_here);
+            for var in ctx.deriv_vars {
+                // `Expr::Variable("a._vid")` is a raw dotted column reference,
+                // resolved against the input schema by full name — the same
+                // mechanism the issue #158 columns use.
+                //
+                // The explicit `UInt64` target type is load-bearing for the NULL
+                // arm: `CypherLiteral::Null` compiles to `DataType::Null`, which
+                // is neither string nor numeric, so it misses
+                // `plan_locy_project`'s cross-domain guard and reaches the
+                // catch-all cast. Inferring the type instead would make it
+                // `LargeUtf8`, which IS cross-domain against `UInt64` — the cast
+                // would be skipped and the clauses would silently diverge in
+                // schema. For the bound arm the cast is a no-op.
+                let expr = if bound_here.contains(var) {
+                    Expr::Variable(format!("{var}._vid"))
+                } else {
+                    Expr::Literal(CypherLiteral::Null)
+                };
+                projections.push((
+                    expr,
+                    Some(format!("{FOLD_DISCRIMINATOR_COL_PREFIX}vid_{var}")),
+                ));
+                target_types.push(DataType::UInt64);
+            }
+        }
+
         // Hidden YIELD items emitted by `extract_model_invocations` for
         // property feature exprs (e.g. `scorer(s.tier)`). These columns
         // (named `__feat_<var>_<prop>`) flow through the body batch so
@@ -1436,6 +1691,19 @@ impl<'a> LocyPlanBuilder<'a> {
                 let e = rewrite_is_ref_cols(e, &is_ref_col_aliases);
                 projections.push((e, Some(hidden.clone())));
             }
+        }
+
+        // Hidden `{var}._vid` columns for negated IS-ref subjects (issue #158).
+        // Pushed LAST and with no `target_types` entry, for the same reason as
+        // the `__feat_*` columns above: `plan_locy_project` skips the coercion
+        // cast when `target_types.get(i)` is `None`, preserving the native
+        // UInt64 the anti-join requires.
+        //
+        // `Expr::Variable("a._vid")` is a raw dotted column reference, not a
+        // property access — `plan_locy_project` resolves it against the input
+        // schema by full name, which is where the graph scan emits it.
+        for (var, hidden) in &isnot_vid_projections {
+            projections.push((Expr::Variable(format!("{var}._vid")), Some(hidden.clone())));
         }
 
         // Phase B A4 follow-up: when the clause has neural-model
@@ -1561,6 +1829,32 @@ impl<'a> LocyPlanBuilder<'a> {
         is_self_ref: bool,
         rule_catalog: &HashMap<String, CompiledRule>,
     ) -> DerivedScanHandle {
+        self.get_or_create_derived_scan_handle_with_deriv(
+            rule_name,
+            target_rule,
+            is_self_ref,
+            rule_catalog,
+            &[],
+        )
+    }
+
+    /// As [`Self::get_or_create_derived_scan_handle`], but widens a **self-ref**
+    /// handle's schema with the rule's derivation-discriminator columns.
+    ///
+    /// A same-stratum (self-ref) handle is fed the `FixpointState`'s live facts,
+    /// which during iteration are *pre-fold* and therefore carry the
+    /// discriminators (issue #159). A cross-stratum handle reads the published,
+    /// already-stripped facts and must stay narrow. `DerivedScanExec` re-stamps
+    /// its declared schema onto every batch, so a mismatch here is a hard Arrow
+    /// error, not a silent fallback.
+    fn get_or_create_derived_scan_handle_with_deriv(
+        &self,
+        rule_name: &str,
+        target_rule: &CompiledRule,
+        is_self_ref: bool,
+        rule_catalog: &HashMap<String, CompiledRule>,
+        deriv_columns: &[(String, DataType)],
+    ) -> DerivedScanHandle {
         let mut handles = self.derived_scan_handles.borrow_mut();
 
         // Reuse existing handle with same (rule_name, is_self_ref)
@@ -1572,8 +1866,17 @@ impl<'a> LocyPlanBuilder<'a> {
         }
 
         let scan_index = handles.len();
-        let schema =
+        let base =
             yield_schema_to_arrow_from_rule(target_rule, rule_catalog, self.planner.schema());
+        let schema = if is_self_ref && !deriv_columns.is_empty() {
+            let mut fields: Vec<Arc<arrow_schema::Field>> = base.fields().iter().cloned().collect();
+            for (name, dt) in deriv_columns {
+                fields.push(Arc::new(arrow_schema::Field::new(name, dt.clone(), true)));
+            }
+            Arc::new(arrow_schema::Schema::new(fields))
+        } else {
+            base
+        };
         let data = Arc::new(RwLock::new(Vec::new()));
         let handle = DerivedScanHandle {
             rule_name: rule_name.to_string(),
@@ -2622,6 +2925,9 @@ mod tests {
                     stratum_rule_names: &names,
                     rule_catalog: &catalog,
                     node_vars: &HashSet::new(),
+                    deriv_vars: &[],
+                    is_recursive: false,
+                    clause_index: 0,
                 },
                 &test_classifier_ctx(),
             )
@@ -2666,6 +2972,9 @@ mod tests {
                     stratum_rule_names: &names,
                     rule_catalog: &catalog,
                     node_vars: &HashSet::new(),
+                    deriv_vars: &[],
+                    is_recursive: false,
+                    clause_index: 0,
                 },
                 &test_classifier_ctx(),
             )
@@ -2721,6 +3030,9 @@ mod tests {
                     stratum_rule_names: &names,
                     rule_catalog: &catalog,
                     node_vars: &HashSet::new(),
+                    deriv_vars: &[],
+                    is_recursive: false,
+                    clause_index: 0,
                 },
                 &test_classifier_ctx(),
             )
@@ -2786,6 +3098,9 @@ mod tests {
                     stratum_rule_names: &names,
                     rule_catalog: &catalog,
                     node_vars: &HashSet::new(),
+                    deriv_vars: &[],
+                    is_recursive: false,
+                    clause_index: 0,
                 },
                 &test_classifier_ctx(),
             )
@@ -2839,6 +3154,9 @@ mod tests {
                     stratum_rule_names: &names,
                     rule_catalog: &catalog,
                     node_vars: &HashSet::new(),
+                    deriv_vars: &[],
+                    is_recursive: false,
+                    clause_index: 0,
                 },
                 &test_classifier_ctx(),
             )
@@ -2914,6 +3232,9 @@ mod tests {
                     stratum_rule_names: &names,
                     rule_catalog: &catalog,
                     node_vars: &HashSet::new(),
+                    deriv_vars: &[],
+                    is_recursive: false,
+                    clause_index: 0,
                 },
                 &test_classifier_ctx(),
             )
@@ -3133,6 +3454,9 @@ mod tests {
                     stratum_rule_names: &names,
                     rule_catalog: &catalog,
                     node_vars: &HashSet::new(),
+                    deriv_vars: &[],
+                    is_recursive: false,
+                    clause_index: 0,
                 },
                 &test_classifier_ctx(),
             )
@@ -3188,6 +3512,9 @@ mod tests {
                     stratum_rule_names: &names,
                     rule_catalog: &catalog,
                     node_vars: &HashSet::new(),
+                    deriv_vars: &[],
+                    is_recursive: false,
+                    clause_index: 0,
                 },
                 &test_classifier_ctx(),
             )
@@ -3241,6 +3568,9 @@ mod tests {
                     stratum_rule_names: &names,
                     rule_catalog: &catalog,
                     node_vars: &HashSet::new(),
+                    deriv_vars: &[],
+                    is_recursive: false,
+                    clause_index: 0,
                 },
                 &test_classifier_ctx(),
             )
@@ -3286,6 +3616,9 @@ mod tests {
                     stratum_rule_names: &names,
                     rule_catalog: &catalog,
                     node_vars: &HashSet::new(),
+                    deriv_vars: &[],
+                    is_recursive: false,
+                    clause_index: 0,
                 },
                 &test_classifier_ctx(),
             )
@@ -3324,6 +3657,9 @@ mod tests {
                     stratum_rule_names: &names,
                     rule_catalog: &catalog,
                     node_vars: &HashSet::new(),
+                    deriv_vars: &[],
+                    is_recursive: false,
+                    clause_index: 0,
                 },
                 &test_classifier_ctx(),
             )
@@ -3402,6 +3738,9 @@ mod tests {
                     stratum_rule_names: &names,
                     rule_catalog: &catalog,
                     node_vars: &HashSet::new(),
+                    deriv_vars: &[],
+                    is_recursive: false,
+                    clause_index: 0,
                 },
                 &test_classifier_ctx(),
             )
@@ -4142,6 +4481,9 @@ mod tests {
                 stratum_rule_names: &names,
                 rule_catalog: &catalog,
                 node_vars: &HashSet::new(),
+                deriv_vars: &[],
+                is_recursive: false,
+                clause_index: 0,
             },
             &test_classifier_ctx(),
         );
@@ -4190,6 +4532,9 @@ mod tests {
                 stratum_rule_names: &names,
                 rule_catalog: &catalog,
                 node_vars: &HashSet::new(),
+                deriv_vars: &[],
+                is_recursive: false,
+                clause_index: 0,
             },
             &test_classifier_ctx(),
         );
@@ -4241,6 +4586,9 @@ mod tests {
                 stratum_rule_names: &names,
                 rule_catalog: &catalog,
                 node_vars: &HashSet::new(),
+                deriv_vars: &[],
+                is_recursive: false,
+                clause_index: 0,
             },
             &test_classifier_ctx(),
         );
@@ -4286,6 +4634,9 @@ mod tests {
                 stratum_rule_names: &names,
                 rule_catalog: &catalog,
                 node_vars: &HashSet::new(),
+                deriv_vars: &[],
+                is_recursive: false,
+                clause_index: 0,
             },
             &test_classifier_ctx(),
         );
@@ -4335,6 +4686,9 @@ mod tests {
                     stratum_rule_names: &names,
                     rule_catalog: &catalog,
                     node_vars: &HashSet::new(),
+                    deriv_vars: &[],
+                    is_recursive: false,
+                    clause_index: 0,
                 },
                 &test_classifier_ctx(),
             );
@@ -4385,6 +4739,9 @@ mod tests {
                 stratum_rule_names: &names,
                 rule_catalog: &catalog,
                 node_vars: &HashSet::new(),
+                deriv_vars: &[],
+                is_recursive: false,
+                clause_index: 0,
             },
             &test_classifier_ctx(),
         );

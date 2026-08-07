@@ -10,11 +10,12 @@ use arrow_schema::DataType;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::ColumnarValue;
 use uni_plugin::traits::procedure::{
-    NamedArgType, ProcedureContext, ProcedureMode, ProcedurePlugin, ProcedureSignature,
+    ProcedureContext, ProcedureMode, ProcedurePlugin, ProcedureSignature,
 };
 use uni_plugin::traits::scalar::ArgType;
 use uni_plugin::{FnError, PluginError, PluginRegistrar, QName, SideEffects};
 
+use crate::procedures_plugin::host_args::arg;
 use crate::procedures_plugin::vector::{fts_query_yields, run_search_procedure};
 use crate::query::df_graph::search_procedures::run_fts_query;
 
@@ -24,48 +25,41 @@ fn signature() -> &'static ProcedureSignature {
     static SIG: OnceLock<ProcedureSignature> = OnceLock::new();
     SIG.get_or_init(|| ProcedureSignature {
         args: vec![
-            NamedArgType {
-                name: smol_str::SmolStr::new("label"),
-                ty: ArgType::Primitive(DataType::Utf8),
-                default: None,
-                doc: "Vertex label to search.".to_owned(),
-            },
-            NamedArgType {
-                name: smol_str::SmolStr::new("property"),
-                ty: ArgType::Primitive(DataType::Utf8),
-                default: None,
-                doc: "FTS property name on the label.".to_owned(),
-            },
-            NamedArgType {
-                name: smol_str::SmolStr::new("search_term"),
-                ty: ArgType::Primitive(DataType::Utf8),
-                default: None,
-                doc: "Free-text search term.".to_owned(),
-            },
-            NamedArgType {
-                name: smol_str::SmolStr::new("k"),
-                ty: ArgType::Primitive(DataType::Int64),
-                default: None,
-                doc: "Number of top hits to return.".to_owned(),
-            },
-            NamedArgType {
-                name: smol_str::SmolStr::new("filter"),
-                ty: ArgType::Primitive(DataType::Utf8),
-                default: None,
-                doc: "Optional pushdown filter expression.".to_owned(),
-            },
-            NamedArgType {
-                name: smol_str::SmolStr::new("threshold"),
-                ty: ArgType::Primitive(DataType::Float64),
-                default: None,
-                doc: "Optional minimum score threshold (post-filter).".to_owned(),
-            },
-            NamedArgType {
-                name: smol_str::SmolStr::new("options"),
-                ty: ArgType::CypherValue,
-                default: None,
-                doc: "Optional reranker / extra options map.".to_owned(),
-            },
+            arg(
+                "label",
+                ArgType::Primitive(DataType::Utf8),
+                "Vertex label to search.",
+            ),
+            arg(
+                "property",
+                ArgType::Primitive(DataType::Utf8),
+                "FTS property name on the label.",
+            ),
+            arg(
+                "search_term",
+                ArgType::Primitive(DataType::Utf8),
+                "Free-text search term.",
+            ),
+            arg(
+                "k",
+                ArgType::Primitive(DataType::Int64),
+                "Number of top hits to return.",
+            ),
+            arg(
+                "filter",
+                ArgType::Primitive(DataType::Utf8),
+                "Optional pushdown filter expression.",
+            ),
+            arg(
+                "threshold",
+                ArgType::Primitive(DataType::Float64),
+                "Optional minimum score threshold (post-filter).",
+            ),
+            arg(
+                "options",
+                ArgType::CypherValue,
+                "Optional reranker / extra options map.",
+            ),
         ],
         yields: fts_query_yields(),
         mode: ProcedureMode::Read,

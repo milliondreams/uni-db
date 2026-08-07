@@ -102,6 +102,7 @@ Feature: DERIVE Visibility — Trailing Cypher Sees Derived Edges
       MATCH ()-[r:FRIEND]->() RETURN count(r) AS cnt
       """
     Then evaluation should succeed
+    And the derived relation 'knows_rule' should have 1 facts
     And the command result 0 should be a Query with at least 1 rows
     And the command result 1 should be a Derive with at least 1 affected
     And the command result 2 should be a Cypher with at least 1 rows

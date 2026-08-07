@@ -206,3 +206,149 @@ Feature: Semantic Parity — QUERY Results Must Match Derived Relations
     Then evaluation should succeed
     And the derived relation 'safe_drug' should have 1 facts
     And the command result 0 should be a Query with 1 rows
+
+  # ── IS-refs that introduce bindings ───────────────────────────────────
+  #
+  # The scenarios above all bind every IS-ref subject in the MATCH pattern.
+  # That left a hole: an IS-ref may also *introduce* a variable the MATCH
+  # pattern does not provide, and the SLG resolver behind QUERY can filter on
+  # an already-bound subject but cannot bind a fresh one — so QUERY silently
+  # returns nothing while the fixpoint derives facts. See issue #160.
+  #
+  # These two scenarios are the difference between the generic parity guard
+  # protecting against future regressions and actually exercising the bug.
+
+  Scenario: QUERY matches derived when an IS-ref introduces a binding
+    Given having executed:
+      """
+      CREATE (:Person {name: 'alice'}),
+             (:Role {name: 'senior'}),
+             (:Perm {action: 'WRITE'})
+      """
+    And having executed:
+      """
+      MATCH (p:Person {name: 'alice'}), (r:Role {name: 'senior'})
+      CREATE (p)-[:HAS_ROLE]->(r)
+      """
+    And having executed:
+      """
+      MATCH (r:Role {name: 'senior'}), (p:Perm {action: 'WRITE'})
+      CREATE (r)-[:GRANTS]->(p)
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE role_perm AS
+        MATCH (r:Role)-[:GRANTS]->(p:Perm)
+        YIELD KEY r, KEY p
+
+      CREATE RULE holds AS
+        MATCH (e:Person)-[:HAS_ROLE]->(r:Role)
+        WHERE (r, p) IS role_perm
+        YIELD KEY e, KEY p
+
+      QUERY holds WHERE e = e RETURN e.name AS who
+      """
+    Then evaluation should succeed
+    And the derived relation 'holds' should have 1 facts
+    And the command result 0 should be a Query with 1 rows
+
+  Scenario: QUERY matches derived for a recursive rule with a fresh binding
+    Given having executed:
+      """
+      CREATE (:Role {name: 'senior'}),
+             (:Role {name: 'junior'}),
+             (:Perm {action: 'READ'}),
+             (:Perm {action: 'WRITE'})
+      """
+    And having executed:
+      """
+      MATCH (s:Role {name: 'senior'}), (j:Role {name: 'junior'})
+      CREATE (s)-[:INHERITS]->(j)
+      """
+    And having executed:
+      """
+      MATCH (r:Role {name: 'junior'}), (p:Perm {action: 'READ'})
+      CREATE (r)-[:GRANTS]->(p)
+      """
+    And having executed:
+      """
+      MATCH (r:Role {name: 'senior'}), (p:Perm {action: 'WRITE'})
+      CREATE (r)-[:GRANTS]->(p)
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE role_perm AS
+        MATCH (r:Role)-[:GRANTS]->(p:Perm)
+        YIELD KEY r, KEY p
+
+      CREATE RULE role_perm AS
+        MATCH (r:Role)-[:INHERITS]->(parent:Role)
+        WHERE (parent, p) IS role_perm
+        YIELD KEY r, KEY p
+
+      QUERY role_perm WHERE r = r RETURN r.name AS role
+      """
+    Then evaluation should succeed
+    And the derived relation 'role_perm' should have 3 facts
+    And the command result 0 should be a Query with 3 rows
+
+  # ── Bare QUERY (no RETURN) ────────────────────────────────────────────
+  #
+  # With no RETURN clause the rows carry the rule's own YIELD names, so every
+  # KEY column is directly comparable between `derived` and the QUERY result.
+  # That is the shape the generic parity guard can check most strongly, and
+  # almost nothing in the corpus used it — 113 of 116 QUERY statements carry a
+  # RETURN, and only one evaluated query had none. These exist so the guard's
+  # key-tuple comparison is exercised by construction rather than by accident.
+
+  Scenario: Bare QUERY over a plain rule matches derived key-for-key
+    Given having executed:
+      """
+      CREATE (:Node {name: 'A', score: 0.8}),
+             (:Node {name: 'B', score: 0.9}),
+             (:Node {name: 'C', score: 0.1})
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE high AS
+        MATCH (n:Node)
+        WHERE n.score > 0.5
+        YIELD KEY n
+
+      QUERY high
+      """
+    Then evaluation should succeed
+    And the derived relation 'high' should have 2 facts
+    And the command result 0 should be a Query with 2 rows
+
+  Scenario: Bare QUERY over a composite-key rule matches derived key-for-key
+    Given having executed:
+      """
+      CREATE (:Node {name: 'A'}), (:Node {name: 'B'}), (:Node {name: 'C'})
+      """
+    And having executed:
+      """
+      MATCH (a:Node {name: 'A'}), (b:Node {name: 'B'})
+      CREATE (a)-[:LINK]->(b)
+      """
+    And having executed:
+      """
+      MATCH (b:Node {name: 'B'}), (c:Node {name: 'C'})
+      CREATE (b)-[:LINK]->(c)
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE reach AS
+        MATCH (a:Node)-[:LINK]->(b:Node)
+        YIELD KEY a, KEY b
+
+      CREATE RULE reach AS
+        MATCH (a:Node)-[:LINK]->(mid:Node)
+        WHERE (mid, b) IS reach
+        YIELD KEY a, KEY b
+
+      QUERY reach
+      """
+    Then evaluation should succeed
+    And the derived relation 'reach' should have 3 facts
+    And the command result 0 should be a Query with 3 rows

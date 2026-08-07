@@ -36,6 +36,7 @@ Feature: YIELD Value Columns
       QUERY reading WHERE n.name = 'S1' RETURN n.name AS nid, v
       """
     Then evaluation should succeed
+    And the derived relation 'reading' should have 2 facts
     And the command result 0 should be a Query with 1 rows
     And the command result 0 should be a Query containing row where nid = 'S1'
     And the command result 0 should be a Query containing row where v = 0.8
@@ -53,6 +54,8 @@ Feature: YIELD Value Columns
       QUERY tagged WHERE n.name = 'A' RETURN n.name AS nid, score
       """
     Then evaluation should succeed
+    And the derived relation 'tagged' should have 1 facts
+    And the derived relation 'tagged' should contain a fact where score = 0.5
     And the command result 0 should be a Query with 1 rows
     And the command result 0 should be a Query containing row where score = 0.5
 
@@ -69,6 +72,8 @@ Feature: YIELD Value Columns
       QUERY tagged WHERE n.name = 'A' RETURN n.name AS nid, action
       """
     Then evaluation should succeed
+    And the derived relation 'tagged' should have 2 facts
+    And the derived relation 'tagged' should contain a fact where action = 'patch-now'
     And the command result 0 should be a Query with 1 rows
     And the command result 0 should be a Query containing row where nid = 'A'
     And the command result 0 should be a Query containing row where action = 'patch-now'
@@ -86,6 +91,8 @@ Feature: YIELD Value Columns
       QUERY severity WHERE n.name = 'S1' RETURN n.name AS nid, sev
       """
     Then evaluation should succeed
+    And the derived relation 'severity' should have 1 facts
+    And the derived relation 'severity' should contain a fact where sev = 0.2
     And the command result 0 should be a Query with 1 rows
     And the command result 0 should be a Query containing row where nid = 'S1'
 
@@ -104,6 +111,8 @@ Feature: YIELD Value Columns
       QUERY connected WHERE a.name = 'D1' RETURN a.name AS src, b.name AS dst, w
       """
     Then evaluation should succeed
+    And the derived relation 'connected' should have 1 facts
+    And the derived relation 'connected' should contain a fact where w = 0.9
     And the command result 0 should be a Query with 1 rows
     And the command result 0 should be a Query containing row where src = 'D1'
     And the command result 0 should be a Query containing row where w = 0.9
@@ -121,5 +130,7 @@ Feature: YIELD Value Columns
       QUERY tags RETURN tag
       """
     Then evaluation should succeed
+    And the derived relation 'tags' should have 1 facts
+    And the derived relation 'tags' should contain a fact where tag = 'a'
     And the command result 0 should be a Query with 1 rows
     And the command result 0 should be a Query containing row where tag = 'a'

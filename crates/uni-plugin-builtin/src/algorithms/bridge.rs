@@ -392,23 +392,7 @@ impl AlgorithmHostBridge {
         let l0 = self.algo_ctx.l0_manager.as_ref().map(Arc::clone);
         let spec = spec.clone();
         Box::pin(async move {
-            let node_labels: Vec<&str> = spec.node_labels.iter().map(String::as_str).collect();
-            let edge_types: Vec<&str> = spec.edge_types.iter().map(String::as_str).collect();
-            let node_props: Vec<&str> = spec.node_properties.iter().map(String::as_str).collect();
-            let edge_props: Vec<&str> = spec.edge_properties.iter().map(String::as_str).collect();
-            let mut builder = ProjectionBuilder::new(storage)
-                .l0_manager(l0)
-                .node_labels(&node_labels)
-                .edge_types(&edge_types)
-                .include_reverse(spec.include_reverse)
-                .node_properties(&node_props)
-                .edge_properties(&edge_props);
-            if let Some(prop) = spec.weight_property.as_deref() {
-                builder = builder.weight_property(prop);
-            }
-            let projection = builder.build().await.map_err(|e| {
-                FnError::new(0x803, format!("GraphCompute project build failed: {e}"))
-            })?;
+            let projection = build_projection(storage, l0, spec, "GraphCompute project").await?;
             Ok(Arc::new(projection))
         })
     }
@@ -487,26 +471,41 @@ impl AlgorithmHost for AlgorithmHostBridge {
         let spec = spec.clone();
 
         Box::pin(async move {
-            let node_labels: Vec<&str> = spec.node_labels.iter().map(String::as_str).collect();
-            let edge_types: Vec<&str> = spec.edge_types.iter().map(String::as_str).collect();
-            let node_props: Vec<&str> = spec.node_properties.iter().map(String::as_str).collect();
-            let edge_props: Vec<&str> = spec.edge_properties.iter().map(String::as_str).collect();
-            let mut builder = ProjectionBuilder::new(storage)
-                .l0_manager(l0)
-                .node_labels(&node_labels)
-                .edge_types(&edge_types)
-                .include_reverse(spec.include_reverse)
-                .node_properties(&node_props)
-                .edge_properties(&edge_props);
-            if let Some(prop) = spec.weight_property.as_deref() {
-                builder = builder.weight_property(prop);
-            }
-            let projection = builder.build().await.map_err(|e| {
-                FnError::new(0x803, format!("AlgorithmHost::project build failed: {e}"))
-            })?;
+            let projection = build_projection(storage, l0, spec, "AlgorithmHost::project").await?;
             Ok(Arc::new(GraphViewImpl(Arc::new(projection))) as Arc<dyn GraphView>)
         })
     }
+}
+
+/// Materializes a [`GraphProjection`] from a [`GraphProjectionSpec`].
+///
+/// Shared by [`AlgorithmHostBridge::project_scope`] and the
+/// [`AlgorithmHost::project`] impl; `err_ctx` prefixes the build-failure
+/// message so each entry point keeps its own wording.
+async fn build_projection(
+    storage: Arc<uni_store::storage::manager::StorageManager>,
+    l0: Option<Arc<uni_store::runtime::L0Manager>>,
+    spec: GraphProjectionSpec,
+    err_ctx: &'static str,
+) -> Result<GraphProjection, FnError> {
+    let node_labels: Vec<&str> = spec.node_labels.iter().map(String::as_str).collect();
+    let edge_types: Vec<&str> = spec.edge_types.iter().map(String::as_str).collect();
+    let node_props: Vec<&str> = spec.node_properties.iter().map(String::as_str).collect();
+    let edge_props: Vec<&str> = spec.edge_properties.iter().map(String::as_str).collect();
+    let mut builder = ProjectionBuilder::new(storage)
+        .l0_manager(l0)
+        .node_labels(&node_labels)
+        .edge_types(&edge_types)
+        .include_reverse(spec.include_reverse)
+        .node_properties(&node_props)
+        .edge_properties(&edge_props);
+    if let Some(prop) = spec.weight_property.as_deref() {
+        builder = builder.weight_property(prop);
+    }
+    builder
+        .build()
+        .await
+        .map_err(|e| FnError::new(0x803, format!("{err_ctx} build failed: {e}")))
 }
 
 /// Provider wrapping a single [`AlgoProcedure`].

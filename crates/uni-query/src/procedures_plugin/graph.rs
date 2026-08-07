@@ -26,11 +26,12 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::scalar::ScalarValue;
 use uni_algo::{ProjectionInput, parse_graph_ref};
 use uni_plugin::traits::procedure::{
-    NamedArgType, ProcedureContext, ProcedureMode, ProcedurePlugin, ProcedureSignature,
+    ProcedureContext, ProcedureMode, ProcedurePlugin, ProcedureSignature,
 };
 use uni_plugin::traits::scalar::ArgType;
 use uni_plugin::{FnError, PluginError, PluginRegistrar, QName, SideEffects};
 
+use crate::procedures_plugin::host_args::{arg, arg_with_default};
 use crate::projection_store::{ProjectionEntry, ProjectionSourceKind, estimate_bytes, for_storage};
 use crate::query::executor::procedure_host::QueryProcedureHost;
 
@@ -131,24 +132,22 @@ impl ProjectProcedure {
         static SIG: OnceLock<ProcedureSignature> = OnceLock::new();
         SIG.get_or_init(|| ProcedureSignature {
             args: vec![
-                NamedArgType {
-                    name: smol_str::SmolStr::new("name"),
-                    ty: ArgType::Primitive(DataType::Utf8),
-                    default: None,
-                    doc: "Name to register the materialised projection under.".to_owned(),
-                },
-                NamedArgType {
-                    name: smol_str::SmolStr::new("graphRef"),
-                    ty: ArgType::Primitive(DataType::LargeBinary),
-                    default: None,
-                    doc: "Native or Cypher projection descriptor (Map).".to_owned(),
-                },
-                NamedArgType {
-                    name: smol_str::SmolStr::new("config"),
-                    ty: ArgType::Primitive(DataType::LargeBinary),
-                    default: Some(ScalarValue::LargeBinary(Some(b"{}".to_vec()))),
-                    doc: "Materialisation options (currently unused).".to_owned(),
-                },
+                arg(
+                    "name",
+                    ArgType::Primitive(DataType::Utf8),
+                    "Name to register the materialised projection under.",
+                ),
+                arg(
+                    "graphRef",
+                    ArgType::Primitive(DataType::LargeBinary),
+                    "Native or Cypher projection descriptor (Map).",
+                ),
+                arg_with_default(
+                    "config",
+                    ArgType::Primitive(DataType::LargeBinary),
+                    ScalarValue::LargeBinary(Some(b"{}".to_vec())),
+                    "Materialisation options (currently unused).",
+                ),
             ],
             yields: vec![
                 Field::new("name", DataType::Utf8, false),
@@ -330,12 +329,11 @@ impl DropProcedure {
     fn signature_static() -> &'static ProcedureSignature {
         static SIG: OnceLock<ProcedureSignature> = OnceLock::new();
         SIG.get_or_init(|| ProcedureSignature {
-            args: vec![NamedArgType {
-                name: smol_str::SmolStr::new("name"),
-                ty: ArgType::Primitive(DataType::Utf8),
-                default: None,
-                doc: "Projection name to evict from the store.".to_owned(),
-            }],
+            args: vec![arg(
+                "name",
+                ArgType::Primitive(DataType::Utf8),
+                "Projection name to evict from the store.",
+            )],
             yields: vec![Field::new("dropped", DataType::Boolean, false)],
             mode: ProcedureMode::Read,
             side_effects: SideEffects::ReadOnly,
@@ -466,12 +464,11 @@ impl ExistsProcedure {
     fn signature_static() -> &'static ProcedureSignature {
         static SIG: OnceLock<ProcedureSignature> = OnceLock::new();
         SIG.get_or_init(|| ProcedureSignature {
-            args: vec![NamedArgType {
-                name: smol_str::SmolStr::new("name"),
-                ty: ArgType::Primitive(DataType::Utf8),
-                default: None,
-                doc: "Projection name to probe.".to_owned(),
-            }],
+            args: vec![arg(
+                "name",
+                ArgType::Primitive(DataType::Utf8),
+                "Projection name to probe.",
+            )],
             yields: vec![Field::new("exists", DataType::Boolean, false)],
             mode: ProcedureMode::Read,
             side_effects: SideEffects::ReadOnly,

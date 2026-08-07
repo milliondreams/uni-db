@@ -33,8 +33,8 @@ use crate::query::df_graph::GraphExecutionContext;
 use crate::query::df_graph::bitmap::{EidFilter, VidFilter};
 use crate::query::df_graph::common::{
     append_edge_to_struct, append_node_to_struct, arrow_err, build_edge_list_field,
-    build_path_struct_field, column_as_vid_array, compute_plan_properties, labels_data_type,
-    new_edge_list_builder, new_node_list_builder,
+    build_path_struct_field, column_as_vid_array, compute_plan_properties, exec_err,
+    labels_data_type, new_edge_list_builder, new_node_list_builder,
 };
 use crate::query::df_graph::nfa::{NfaStateId, PathNfa, PathSelector, VlpOutputMode};
 use crate::query::df_graph::pred_dag::PredecessorDag;
@@ -176,6 +176,110 @@ use crate::query::df_graph::common::merged_edge_schema_props;
 
 /// Expansion tuple for variable-length traversal: (input_row_idx, target_vid, hop_count, node_path, edge_path)
 type VarLengthExpansion = (usize, Vid, usize, Vec<Vid>, Vec<Eid>);
+
+/// Build the `path` StructArray (`nodes` + `relationships` lists) for a
+/// variable-length traversal batch.
+///
+/// `existing_path` is the incoming path column when a prior `BindFixedPath`
+/// already bound the variable; its prefix is prepended and the VLP's first node
+/// (the junction point) is skipped.
+///
+/// `fixed_type_name` supplies the relationship type name for every edge; pass
+/// `None` to resolve each edge's type individually through the L0 visibility
+/// chain.
+fn build_vlp_path_column(
+    expansions: &[VarLengthExpansion],
+    existing_path: Option<&arrow_array::StructArray>,
+    graph_ctx: &GraphExecutionContext,
+    edge_type_ids: &[u32],
+    fixed_type_name: Option<&str>,
+) -> DFResult<ArrayRef> {
+    let mut nodes_builder = new_node_list_builder();
+    let mut rels_builder = new_edge_list_builder();
+    let query_ctx = graph_ctx.query_context();
+    let mut path_validity = Vec::with_capacity(expansions.len());
+
+    for (row_out_idx, (_, _, _, node_path, edge_path)) in expansions.iter().enumerate() {
+        if node_path.is_empty() && edge_path.is_empty() {
+            nodes_builder.append(false);
+            rels_builder.append(false);
+            path_validity.push(false);
+            continue;
+        }
+
+        // Prepend existing path prefix if extending
+        let skip_first_vlp_node = if let Some(existing) = existing_path {
+            if !existing.is_null(row_out_idx) {
+                prepend_existing_path(
+                    existing,
+                    row_out_idx,
+                    &mut nodes_builder,
+                    &mut rels_builder,
+                    &query_ctx,
+                );
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        // Append VLP nodes (skip first if extending — it's the junction point)
+        let start_idx = if skip_first_vlp_node { 1 } else { 0 };
+        for vid in &node_path[start_idx..] {
+            append_node_to_struct(nodes_builder.values(), *vid, &query_ctx);
+        }
+        nodes_builder.append(true);
+
+        for (i, eid) in edge_path.iter().enumerate() {
+            let resolved_type_name;
+            let type_name: &str = match fixed_type_name {
+                Some(name) => name,
+                None => {
+                    resolved_type_name = l0_visibility::get_edge_type(*eid, &query_ctx)
+                        .unwrap_or_else(|| "UNKNOWN".to_string());
+                    &resolved_type_name
+                }
+            };
+            // Report the relationship's STORED direction, not the traversal
+            // order (`node_path[i]` -> `node_path[i + 1]`). Resolves flushed
+            // (L1-resident) edges too, where the L0 chain no longer holds
+            // the stored endpoints.
+            let (src, dst) = graph_ctx.resolve_stored_edge_endpoints(
+                *eid,
+                node_path[i],
+                node_path[i + 1],
+                edge_type_ids,
+            );
+            append_edge_to_struct(rels_builder.values(), *eid, type_name, src, dst, &query_ctx);
+        }
+        rels_builder.append(true);
+        path_validity.push(true);
+    }
+
+    // Finish builders and get ListArrays
+    let nodes_array = Arc::new(nodes_builder.finish()) as ArrayRef;
+    let rels_array = Arc::new(rels_builder.finish()) as ArrayRef;
+
+    // Build the path struct fields
+    let nodes_field = Arc::new(Field::new("nodes", nodes_array.data_type().clone(), true));
+    let rels_field = Arc::new(Field::new(
+        "relationships",
+        rels_array.data_type().clone(),
+        true,
+    ));
+
+    // Create the path struct array
+    let path_struct = arrow_array::StructArray::try_new(
+        vec![nodes_field, rels_field].into(),
+        vec![nodes_array, rels_array],
+        Some(arrow::buffer::NullBuffer::from(path_validity)),
+    )
+    .map_err(arrow_err)?;
+
+    Ok(Arc::new(path_struct))
+}
 
 /// Single-hop graph traversal execution plan.
 ///
@@ -628,15 +732,8 @@ impl GraphTraverseStream {
         let bound_target_vids: Option<&UInt64Array> = bound_target_cow.as_deref();
 
         // Collect edge ID arrays from previous hops for relationship uniqueness filtering.
-        let used_edge_arrays: Vec<&UInt64Array> = self
-            .used_edge_columns
-            .iter()
-            .filter_map(|col| {
-                batch
-                    .column_by_name(col)
-                    .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
-            })
-            .collect();
+        let used_edge_arrays: Vec<&UInt64Array> =
+            super::common::used_edge_id_arrays(batch, &self.used_edge_columns)?;
 
         let mut expanded_rows: Vec<(usize, Vid, u64, u32)> = Vec::new();
         let is_undirected = matches!(self.direction, Direction::Both);
@@ -824,7 +921,7 @@ async fn build_target_property_columns(
         let props_map = property_manager
             .get_batch_vertex_props_for_label(target_vids, label_name, Some(&query_ctx))
             .await
-            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+            .map_err(exec_err)?;
 
         let uni_schema = graph_ctx.storage().schema_manager().schema();
         let label_props = uni_schema.properties.get(label_name.as_str());
@@ -869,7 +966,7 @@ async fn build_target_property_columns(
             property_manager
                 .get_batch_vertex_props(target_vids, &requested, Some(&query_ctx))
                 .await
-                .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?
+                .map_err(exec_err)?
         } else {
             std::collections::HashMap::new()
         };
@@ -967,7 +1064,7 @@ async fn build_edge_columns(
         let props_map = property_manager
             .get_batch_edge_props(&eids, &prop_name_refs, Some(&query_ctx))
             .await
-            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+            .map_err(exec_err)?;
 
         let uni_schema = graph_ctx.storage().schema_manager().schema();
         let merged_edge_props = merged_edge_schema_props(&uni_schema, edge_type_ids);
@@ -1334,9 +1431,7 @@ impl Stream for GraphTraverseStream {
                 TraverseStreamState::Reading => {
                     // Check timeout
                     if let Err(e) = self.graph_ctx.check_timeout() {
-                        return Poll::Ready(Some(Err(
-                            datafusion::error::DataFusionError::Execution(e.to_string()),
-                        )));
+                        return Poll::Ready(Some(Err(exec_err(e))));
                     }
 
                     match self.input.poll_next_unpin(cx) {
@@ -2045,15 +2140,8 @@ impl GraphTraverseMainStream {
         let expected_targets: Option<&UInt64Array> = bound_target_cow.as_deref();
 
         // Collect edge ID arrays from previous hops for relationship uniqueness filtering.
-        let used_edge_arrays: Vec<&UInt64Array> = self
-            .used_edge_columns
-            .iter()
-            .filter_map(|col| {
-                input
-                    .column_by_name(col)
-                    .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
-            })
-            .collect();
+        let used_edge_arrays: Vec<&UInt64Array> =
+            super::common::used_edge_id_arrays(input, &self.used_edge_columns)?;
 
         // Build expansions: (input_row_idx, target_vid, eid, edge_type, edge_props).
         // Type/props are Arc-shared with the adjacency map (pointer clones).
@@ -2381,7 +2469,7 @@ async fn build_edge_adjacency_map(
     let edges_with_type = storage
         .find_edges_by_type_names(&type_refs, endpoint_filter)
         .await
-        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+        .map_err(exec_err)?;
 
     // Edge filter matching the pushed-down scan, applied to the L0 overlay
     // below so the map (and therefore the SSI read-set recorded from it) has
@@ -2569,7 +2657,7 @@ async fn build_edge_adjacency_and_target_props(
         .property_manager()
         .get_batch_vertex_props(&target_vids, &name_refs, Some(&query_ctx))
         .await
-        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+        .map_err(exec_err)?;
     Ok((adjacency, props))
 }
 
@@ -2722,9 +2810,7 @@ impl Stream for GraphTraverseMainStream {
                 } => {
                     // Check timeout
                     if let Err(e) = self.graph_ctx.check_timeout() {
-                        return Poll::Ready(Some(Err(
-                            datafusion::error::DataFusionError::Execution(e.to_string()),
-                        )));
+                        return Poll::Ready(Some(Err(exec_err(e))));
                     }
 
                     match buffered.next() {
@@ -3097,7 +3183,7 @@ impl ExecutionPlan for GraphVariableLengthTraverseExec {
                 graph_ctx
                     .ensure_adjacency_warmed(&edge_type_ids, direction)
                     .await
-                    .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+                    .map_err(exec_err)?;
                 build_edge_property_filter(
                     &graph_ctx,
                     &edge_type_ids,
@@ -3478,9 +3564,7 @@ impl Stream for GraphVariableLengthTraverseStream {
                 VarLengthStreamState::Reading => {
                     // Check timeout
                     if let Err(e) = self.exec.graph_ctx.check_timeout() {
-                        return Poll::Ready(Some(Err(
-                            datafusion::error::DataFusionError::Execution(e.to_string()),
-                        )));
+                        return Poll::Ready(Some(Err(exec_err(e))));
                     }
 
                     match self.input.poll_next_unpin(cx) {
@@ -3595,17 +3679,8 @@ impl GraphVariableLengthTraverseStream {
         let expected_targets: Option<&UInt64Array> = bound_target_cow.as_deref();
 
         // Extract used edge columns for cross-pattern relationship uniqueness
-        let used_edge_arrays: Vec<&UInt64Array> = self
-            .exec
-            .used_edge_columns
-            .iter()
-            .filter_map(|col| {
-                batch
-                    .column_by_name(col)?
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-            })
-            .collect();
+        let used_edge_arrays: Vec<&UInt64Array> =
+            super::common::used_edge_id_arrays(&batch, &self.exec.used_edge_columns)?;
 
         // Collect all BFS results
         let mut expansions: Vec<VarLengthExpansion> = Vec::new();
@@ -3823,94 +3898,18 @@ impl GraphVariableLengthTraverseStream {
                 .as_ref()
                 .and_then(|arc| arc.as_any().downcast_ref::<arrow_array::StructArray>());
 
-            let mut nodes_builder = new_node_list_builder();
-            let mut rels_builder = new_edge_list_builder();
-            let query_ctx = self.exec.graph_ctx.query_context();
-            let mut path_validity = Vec::with_capacity(expansions.len());
-
-            for (row_out_idx, (_, _, _, node_path, edge_path)) in expansions.iter().enumerate() {
-                if node_path.is_empty() && edge_path.is_empty() {
-                    nodes_builder.append(false);
-                    rels_builder.append(false);
-                    path_validity.push(false);
-                    continue;
-                }
-
-                // Prepend existing path prefix if extending
-                let skip_first_vlp_node = if let Some(existing) = existing_path {
-                    if !existing.is_null(row_out_idx) {
-                        prepend_existing_path(
-                            existing,
-                            row_out_idx,
-                            &mut nodes_builder,
-                            &mut rels_builder,
-                            &query_ctx,
-                        );
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-
-                // Append VLP nodes (skip first if extending — it's the junction point)
-                let start_idx = if skip_first_vlp_node { 1 } else { 0 };
-                for vid in &node_path[start_idx..] {
-                    append_node_to_struct(nodes_builder.values(), *vid, &query_ctx);
-                }
-                nodes_builder.append(true);
-
-                for (i, eid) in edge_path.iter().enumerate() {
-                    let type_name = l0_visibility::get_edge_type(*eid, &query_ctx)
-                        .unwrap_or_else(|| "UNKNOWN".to_string());
-                    // Report the relationship's STORED direction, not the traversal
-                    // order (`node_path[i]` -> `node_path[i + 1]`). Resolves flushed
-                    // (L1-resident) edges too, where the L0 chain no longer holds
-                    // the stored endpoints.
-                    let (src, dst) = self.exec.graph_ctx.resolve_stored_edge_endpoints(
-                        *eid,
-                        node_path[i],
-                        node_path[i + 1],
-                        &self.exec.edge_type_ids,
-                    );
-                    append_edge_to_struct(
-                        rels_builder.values(),
-                        *eid,
-                        &type_name,
-                        src,
-                        dst,
-                        &query_ctx,
-                    );
-                }
-                rels_builder.append(true);
-                path_validity.push(true);
-            }
-
-            // Finish builders and get ListArrays
-            let nodes_array = Arc::new(nodes_builder.finish()) as ArrayRef;
-            let rels_array = Arc::new(rels_builder.finish()) as ArrayRef;
-
-            // Build the path struct fields
-            let nodes_field = Arc::new(Field::new("nodes", nodes_array.data_type().clone(), true));
-            let rels_field = Arc::new(Field::new(
-                "relationships",
-                rels_array.data_type().clone(),
-                true,
-            ));
-
-            // Create the path struct array
-            let path_struct = arrow_array::StructArray::try_new(
-                vec![nodes_field, rels_field].into(),
-                vec![nodes_array, rels_array],
-                Some(arrow::buffer::NullBuffer::from(path_validity)),
-            )
-            .map_err(arrow_err)?;
+            let path_struct = build_vlp_path_column(
+                expansions,
+                existing_path,
+                &self.exec.graph_ctx,
+                &self.exec.edge_type_ids,
+                None,
+            )?;
 
             if let Some(idx) = existing_path_col_idx {
-                columns[idx] = Arc::new(path_struct);
+                columns[idx] = path_struct;
             } else {
-                columns.push(Arc::new(path_struct));
+                columns.push(path_struct);
             }
         }
 
@@ -3982,7 +3981,7 @@ async fn hydrate_vlp_target_properties(
         let props_map = property_manager
             .get_batch_vertex_props_for_label(&target_vids, label_name, Some(&query_ctx))
             .await
-            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+            .map_err(exec_err)?;
 
         let uni_schema = graph_ctx.storage().schema_manager().schema();
         let label_props = uni_schema.properties.get(label_name.as_str());
@@ -4014,7 +4013,7 @@ async fn hydrate_vlp_target_properties(
             property_manager
                 .get_batch_vertex_props(&target_vids, &requested, Some(&query_ctx))
                 .await
-                .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?
+                .map_err(exec_err)?
         } else {
             std::collections::HashMap::new()
         };
@@ -4549,16 +4548,8 @@ impl GraphVariableLengthTraverseMainStream {
         let expected_targets: Option<&UInt64Array> = bound_target_cow.as_deref();
 
         // Extract used edge columns for cross-pattern relationship uniqueness
-        let used_edge_arrays: Vec<&UInt64Array> = self
-            .used_edge_columns
-            .iter()
-            .filter_map(|col| {
-                batch
-                    .column_by_name(col)?
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-            })
-            .collect();
+        let used_edge_arrays: Vec<&UInt64Array> =
+            super::common::used_edge_id_arrays(&batch, &self.used_edge_columns)?;
 
         // Collect BFS results: (original_row_idx, target_vid, hop_count, node_path, edge_path)
         let mut expansions: Vec<ExpansionRecord> = Vec::new();
@@ -4749,93 +4740,19 @@ impl GraphVariableLengthTraverseMainStream {
                 .as_ref()
                 .and_then(|arc| arc.as_any().downcast_ref::<arrow_array::StructArray>());
 
-            let mut nodes_builder = new_node_list_builder();
-            let mut rels_builder = new_edge_list_builder();
-            let query_ctx = self.graph_ctx.query_context();
             let type_names_str = self.type_names.join("|");
-            let mut path_validity = Vec::with_capacity(expansions.len());
-
-            for (row_out_idx, (_, _, _, node_path, edge_path)) in expansions.iter().enumerate() {
-                if node_path.is_empty() && edge_path.is_empty() {
-                    nodes_builder.append(false);
-                    rels_builder.append(false);
-                    path_validity.push(false);
-                    continue;
-                }
-
-                // Prepend existing path prefix if extending
-                let skip_first_vlp_node = if let Some(existing) = existing_path {
-                    if !existing.is_null(row_out_idx) {
-                        prepend_existing_path(
-                            existing,
-                            row_out_idx,
-                            &mut nodes_builder,
-                            &mut rels_builder,
-                            &query_ctx,
-                        );
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-
-                // Append VLP nodes (skip first if extending — it's the junction point)
-                let start_idx = if skip_first_vlp_node { 1 } else { 0 };
-                for vid in &node_path[start_idx..] {
-                    append_node_to_struct(nodes_builder.values(), *vid, &query_ctx);
-                }
-                nodes_builder.append(true);
-
-                for (i, eid) in edge_path.iter().enumerate() {
-                    // Report the relationship's STORED direction, not the traversal
-                    // order (`node_path[i]` -> `node_path[i + 1]`). Resolves flushed
-                    // (L1-resident) edges too, where the L0 chain no longer holds
-                    // the stored endpoints.
-                    let (src, dst) = self.graph_ctx.resolve_stored_edge_endpoints(
-                        *eid,
-                        node_path[i],
-                        node_path[i + 1],
-                        &edge_type_ids,
-                    );
-                    append_edge_to_struct(
-                        rels_builder.values(),
-                        *eid,
-                        &type_names_str,
-                        src,
-                        dst,
-                        &query_ctx,
-                    );
-                }
-                rels_builder.append(true);
-                path_validity.push(true);
-            }
-
-            // Finish the builders to get the arrays
-            let nodes_array = Arc::new(nodes_builder.finish()) as ArrayRef;
-            let rels_array = Arc::new(rels_builder.finish()) as ArrayRef;
-
-            // Build the path struct with nodes and relationships fields
-            let nodes_field = Arc::new(Field::new("nodes", nodes_array.data_type().clone(), true));
-            let rels_field = Arc::new(Field::new(
-                "relationships",
-                rels_array.data_type().clone(),
-                true,
-            ));
-
-            // Create the path struct array
-            let path_struct = arrow_array::StructArray::try_new(
-                vec![nodes_field, rels_field].into(),
-                vec![nodes_array, rels_array],
-                Some(arrow::buffer::NullBuffer::from(path_validity)),
-            )
-            .map_err(arrow_err)?;
+            let path_struct = build_vlp_path_column(
+                &expansions,
+                existing_path,
+                &self.graph_ctx,
+                &edge_type_ids,
+                Some(&type_names_str),
+            )?;
 
             if let Some(idx) = existing_path_col_idx {
-                columns[idx] = Arc::new(path_struct);
+                columns[idx] = path_struct;
             } else {
-                columns.push(Arc::new(path_struct));
+                columns.push(path_struct);
             }
         }
 

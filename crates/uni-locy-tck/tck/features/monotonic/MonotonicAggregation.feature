@@ -64,6 +64,113 @@ Feature: Monotonic Aggregation (MSUM, MMAX, MMIN, MCOUNT)
     Then evaluation should succeed
     And the derived relation 'control' should have 3 facts
 
+  # ── Recursive FOLD must aggregate across DERIVATIONS, not distinct values ──
+  #
+  # A derived relation is a set of facts identified by KEY, but a FOLD consumes
+  # the BAG of derivations that produced them — "FOLD aggregates across paths".
+  # Before issue #159 these three scenarios were impossible to write: all-column
+  # dedup collapsed equal-valued sibling derivations before the fold ran, so a
+  # parent with N children of equal cost rolled up to one child's worth.
+  #
+  # There was previously NO evaluate-level scenario for a recursive MSUM or
+  # MCOUNT at all — only parse/compile ones — which is why the regression went
+  # unnoticed.
+  #
+  # The base clause yields a literal `1.0` rather than a node property on
+  # purpose: in schemaless mode (the TCK default) a property reads back as
+  # cv-encoded LargeBinary while the FOLD output is Float64, so the two clauses
+  # of `roll` would disagree on column type. That is a separate, pre-existing
+  # limitation of recursive FOLD over an undeclared property — unrelated to the
+  # multiplicity these scenarios pin.
+
+  Scenario: Recursive MSUM counts each equal-valued child derivation
+    Given having executed:
+      """
+      CREATE (t:Part {name: 'TOP'}),
+             (t)-[:HAS {q: 1.0}]->(:Part {name: 'L1'}),
+             (t)-[:HAS {q: 1.0}]->(:Part {name: 'L2'}),
+             (t)-[:HAS {q: 1.0}]->(:Part {name: 'L3'})
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE assembly AS
+        MATCH (p:Part)-[:HAS]->(:Part)
+        YIELD KEY p
+      CREATE RULE roll AS
+        MATCH (p:Part)
+        WHERE p IS NOT assembly
+        YIELD KEY p, 1.0 AS cost
+      CREATE RULE roll AS
+        MATCH (p:Part)-[e:HAS]->(c:Part)
+        WHERE c IS roll
+        FOLD cost = MSUM(cost * e.q)
+        YIELD KEY p, cost
+      """
+    Then evaluation should succeed
+    # Three leaves each contributing exactly 1.0 must sum to 3.0, not 1.0.
+    And the derived relation 'roll' should contain a fact where cost = 3.0
+
+  Scenario: Recursive MSUM over a diamond counts both paths to a shared child
+    Given having executed:
+      """
+      CREATE (t:Part {name: 'T'}),
+             (m1:Part {name: 'M1'}),
+             (m2:Part {name: 'M2'}),
+             (x:Part {name: 'X'}),
+             (t)-[:HAS {q: 1.0}]->(m1),
+             (t)-[:HAS {q: 1.0}]->(m2),
+             (m1)-[:HAS {q: 1.0}]->(x),
+             (m2)-[:HAS {q: 1.0}]->(x)
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE assembly AS
+        MATCH (p:Part)-[:HAS]->(:Part)
+        YIELD KEY p
+      CREATE RULE roll AS
+        MATCH (p:Part)
+        WHERE p IS NOT assembly
+        YIELD KEY p, 1.0 AS cost
+      CREATE RULE roll AS
+        MATCH (p:Part)-[e:HAS]->(c:Part)
+        WHERE c IS roll
+        FOLD cost = MSUM(cost * e.q)
+        YIELD KEY p, cost
+      """
+    Then evaluation should succeed
+    # X is the only leaf, so M1 and M2 both roll up to 1.0 — two intermediate
+    # facts carrying the IDENTICAL value, which is the case that used to
+    # collapse. T sums both, giving 2.0.
+    And the derived relation 'roll' should contain a fact where cost = 2.0
+
+  Scenario: Recursive MCOUNT counts derivations, not distinct values
+    Given having executed:
+      """
+      CREATE (t:Item {name: 'TOP'}),
+             (t)-[:LINK]->(:Item {name: 'L1'}),
+             (t)-[:LINK]->(:Item {name: 'L2'}),
+             (t)-[:LINK]->(:Item {name: 'L3'})
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE parent AS
+        MATCH (p:Item)-[:LINK]->(:Item)
+        YIELD KEY p
+      CREATE RULE tally AS
+        MATCH (p:Item)
+        WHERE p IS NOT parent
+        YIELD KEY p, 1.0 AS n
+      CREATE RULE tally AS
+        MATCH (p:Item)-[:LINK]->(c:Item)
+        WHERE c IS tally
+        FOLD n = MCOUNT(n)
+        YIELD KEY p, n
+      """
+    Then evaluation should succeed
+    # MCOUNT is `acc + 1` per contributing row. The three leaves all carry the
+    # identical value 1.0, so under the old collapse TOP counted 1.
+    And the derived relation 'tally' should contain a fact where n = 3
+
   Scenario: MMAX converges to true maximum
     Given having executed:
       """

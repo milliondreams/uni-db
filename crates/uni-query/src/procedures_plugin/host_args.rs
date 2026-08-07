@@ -16,11 +16,37 @@ use datafusion::logical_expr::ColumnarValue;
 use datafusion::scalar::ScalarValue;
 use uni_common::Value;
 use uni_plugin::FnError;
-use uni_plugin::traits::procedure::ProcedureContext;
+use uni_plugin::traits::procedure::{NamedArgType, ProcedureContext};
+use uni_plugin::traits::scalar::ArgType;
 
 use crate::query::executor::procedure_host::QueryProcedureHost;
 
 // Rust guideline compliant
+
+/// Build a required (no-default) named procedure argument.
+pub(super) fn arg(name: &str, ty: ArgType, doc: &str) -> NamedArgType {
+    NamedArgType {
+        name: smol_str::SmolStr::new(name),
+        ty,
+        default: None,
+        doc: doc.to_owned(),
+    }
+}
+
+/// Build a named procedure argument carrying a default value.
+pub(super) fn arg_with_default(
+    name: &str,
+    ty: ArgType,
+    default: ScalarValue,
+    doc: &str,
+) -> NamedArgType {
+    NamedArgType {
+        name: smol_str::SmolStr::new(name),
+        ty,
+        default: Some(default),
+        doc: doc.to_owned(),
+    }
+}
 
 /// Down-cast the procedure's host to a [`QueryProcedureHost`] or return a
 /// uniform error tagged with the calling procedure name.

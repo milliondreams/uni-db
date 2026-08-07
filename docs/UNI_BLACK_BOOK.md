@@ -3706,8 +3706,15 @@ CREATE RULE compliance_check AS
     MATCH (system:System)-[:HOSTS]->(service:Service)
     WHERE system IS reach TO service
     AND service IS NOT threat_model
-    YIELD KEY system, 'compliant' AS status
+    YIELD KEY system, KEY service, 'compliant' AS status
 ```
+
+> **Note the `KEY service` in the YIELD.** An `IS NOT` subject must appear as a
+> projected output column of the consuming rule — the anti-join resolves it by
+> name after projection. Being bound in `MATCH`, or being the `TO` target of a
+> positive `IS`, is *not* sufficient. Omitting `service` here would make the
+> negation unresolvable; the engine rejects that rather than silently returning
+> unfiltered rows (see issue #158).
 
 ## Configuration
 

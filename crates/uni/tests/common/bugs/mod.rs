@@ -49,6 +49,8 @@ pub mod issue_57_match_label_hash_index;
 pub mod issue_68_type_mismatch;
 pub mod issue_93_bytes_round_trip;
 pub mod locy_is_not_complement_recursion;
+pub mod pattern_exists_unbound_param;
+pub mod relationship_uniqueness_invariant;
 pub mod repro_edge_export;
 // Correctness-scan Wave 0 repros.
 pub mod repro_fork_sweeper_shutdown;

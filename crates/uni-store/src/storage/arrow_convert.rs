@@ -11,15 +11,19 @@ use anyhow::{Result, anyhow};
 use arrow_array::builder::{
     BinaryBuilder, BooleanBufferBuilder, BooleanBuilder, Date32Builder, DurationMicrosecondBuilder,
     FixedSizeBinaryBuilder, FixedSizeListBuilder, Float32Builder, Float64Builder, Int32Builder,
-    Int64Builder, IntervalMonthDayNanoBuilder, LargeBinaryBuilder, ListBuilder, StringBuilder,
-    StructBuilder, Time64MicrosecondBuilder, Time64NanosecondBuilder, TimestampNanosecondBuilder,
-    UInt8Builder, UInt32Builder, UInt64Builder,
+    Int64Builder, IntervalMonthDayNanoBuilder, LargeBinaryBuilder, ListBuilder, PrimitiveBuilder,
+    StringBuilder, StructBuilder, Time64MicrosecondBuilder, Time64NanosecondBuilder,
+    TimestampNanosecondBuilder, UInt8Builder, UInt32Builder,
+};
+use arrow_array::types::{
+    ArrowPrimitiveType, Float32Type, Float64Type, Int32Type, Int64Type, UInt64Type,
 };
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, FixedSizeBinaryArray,
     FixedSizeListArray, Float32Array, Float64Array, Int32Array, Int64Array,
-    IntervalMonthDayNanoArray, LargeBinaryArray, ListArray, StringArray, StructArray,
-    Time64NanosecondArray, TimestampNanosecondArray, UInt8Array, UInt32Array, UInt64Array,
+    IntervalMonthDayNanoArray, LargeBinaryArray, LargeStringArray, ListArray, StringArray,
+    StructArray, Time64NanosecondArray, TimestampNanosecondArray, UInt8Array, UInt32Array,
+    UInt64Array,
 };
 use arrow_schema::{DataType as ArrowDataType, Field};
 use std::collections::HashMap;
@@ -427,6 +431,17 @@ pub fn arrow_to_value(col: &dyn Array, row: usize, data_type: Option<&DataType>)
     if let Some(s) = col.as_any().downcast_ref::<StringArray>() {
         return Value::String(s.value(row).to_string());
     }
+    // `LargeUtf8`. Distinct from `Utf8` at the Arrow level, so it needs its own
+    // downcast — a `StringArray` downcast does not match a `LargeStringArray`.
+    // Locy reaches this constantly: `infer_expr_type` types string literals and
+    // every string-returning function (`toUpper`, `substring`, `toString`, ...)
+    // as `LargeUtf8`, and `plan_locy_project` casts the column to match. Without
+    // this arm all of those fell through to the `Value::Null` fallback below,
+    // so `derived` reported NULL while `QUERY` (which evaluates natively, never
+    // touching Arrow) reported the real value.
+    if let Some(s) = col.as_any().downcast_ref::<LargeStringArray>() {
+        return Value::String(s.value(row).to_string());
+    }
 
     // Integer types
     if let Some(u) = col.as_any().downcast_ref::<UInt64Array>() {
@@ -748,44 +763,70 @@ pub fn arrow_to_value(col: &dyn Array, row: usize, data_type: Option<&DataType>)
             .unwrap_or(Value::Null);
     }
 
-    // Fallback
+    // Arrow's Null type carries no values by construction, so `Value::Null` is
+    // the correct decode, not a gap. Listed explicitly so it does not reach the
+    // diagnostic below.
+    if *col.data_type() == ArrowDataType::Null {
+        return Value::Null;
+    }
+
+    // `_uid` — the 32-byte content hash on vertex/index datasets
+    // (`vertex.rs`, `main_vertex.rs`, `index.rs`). Internal, never user-facing,
+    // and by far the most common visitor here (~750 calls in one integration
+    // run), which is why it is matched explicitly rather than left to warn on
+    // every cell. The `FixedSizeBinary(24)` arm above claims BTIC; every other
+    // width is this.
+    if matches!(col.data_type(), ArrowDataType::FixedSizeBinary(_)) {
+        return Value::Null;
+    }
+
+    // Fallback: an Arrow type no arm above handles. Decoding to `Null` silently
+    // is how the missing `LargeUtf8` arm survived long enough to be written down
+    // as a Locy language constraint — every string literal and string-returning
+    // function in a `YIELD` came back NULL with no diagnostic anywhere. Warn so
+    // the next gap is visible.
+    //
+    // Deliberately not an error: this decoder is shared with the Cypher read
+    // path and not every caller has been audited for types that legitimately
+    // land here. The two high-volume benign cases are handled above, so
+    // reaching this point is genuinely unexpected and worth a line in the log.
+    log::warn!(
+        "arrow_to_value: no decoder for Arrow type {:?}; returning Null. \
+         This is a silent wrong answer if the column holds real data — \
+         add a downcast arm for it.",
+        col.data_type()
+    );
     Value::Null
 }
 
-fn values_to_uint64_array(values: &[Value]) -> ArrayRef {
-    let mut builder = UInt64Builder::with_capacity(values.len());
+/// Shared body of the primitive `values_to_*_array` helpers: build a nullable
+/// Arrow primitive array, appending a null wherever `extract` yields `None`.
+fn values_to_primitive<T: ArrowPrimitiveType>(
+    values: &[Value],
+    extract: impl Fn(&Value) -> Option<T::Native>,
+) -> ArrayRef {
+    let mut builder = PrimitiveBuilder::<T>::with_capacity(values.len());
     for v in values {
-        if let Some(n) = v.as_u64() {
-            builder.append_value(n);
-        } else {
-            builder.append_null();
+        match extract(v) {
+            Some(n) => builder.append_value(n),
+            None => builder.append_null(),
         }
     }
     Arc::new(builder.finish())
+}
+
+fn values_to_uint64_array(values: &[Value]) -> ArrayRef {
+    values_to_primitive::<UInt64Type>(values, Value::as_u64)
 }
 
 fn values_to_int64_array(values: &[Value]) -> ArrayRef {
-    let mut builder = Int64Builder::with_capacity(values.len());
-    for v in values {
-        if let Some(n) = v.as_i64() {
-            builder.append_value(n);
-        } else {
-            builder.append_null();
-        }
-    }
-    Arc::new(builder.finish())
+    values_to_primitive::<Int64Type>(values, Value::as_i64)
 }
 
 fn values_to_int32_array(values: &[Value]) -> ArrayRef {
-    let mut builder = Int32Builder::with_capacity(values.len());
-    for v in values {
-        if let Some(n) = v.as_i64() {
-            builder.append_value(n as i32);
-        } else {
-            builder.append_null();
-        }
-    }
-    Arc::new(builder.finish())
+    // Wrapping `as i32` is this path's long-standing narrowing behavior; do not
+    // swap it for `i32::try_from` (which would null out-of-range values).
+    values_to_primitive::<Int32Type>(values, |v| v.as_i64().map(|n| n as i32))
 }
 
 fn values_to_string_array(values: &[Value]) -> ArrayRef {
@@ -815,27 +856,11 @@ fn values_to_bool_array(values: &[Value]) -> ArrayRef {
 }
 
 fn values_to_float32_array(values: &[Value]) -> ArrayRef {
-    let mut builder = Float32Builder::with_capacity(values.len());
-    for v in values {
-        if let Some(n) = v.as_f64() {
-            builder.append_value(n as f32);
-        } else {
-            builder.append_null();
-        }
-    }
-    Arc::new(builder.finish())
+    values_to_primitive::<Float32Type>(values, |v| v.as_f64().map(|n| n as f32))
 }
 
 fn values_to_float64_array(values: &[Value]) -> ArrayRef {
-    let mut builder = Float64Builder::with_capacity(values.len());
-    for v in values {
-        if let Some(n) = v.as_f64() {
-            builder.append_value(n);
-        } else {
-            builder.append_null();
-        }
-    }
-    Arc::new(builder.finish())
+    values_to_primitive::<Float64Type>(values, Value::as_f64)
 }
 
 fn values_to_fixed_size_binary_array(values: &[Value], size: i32) -> Result<ArrayRef> {
@@ -1228,6 +1253,13 @@ fn values_to_large_binary_array(values: &[Value]) -> ArrayRef {
 }
 
 /// Convert a slice of JSON Values to an Arrow array based on the target Arrow DataType.
+///
+/// Note: there is deliberately no `LargeUtf8` arm, unlike the read direction in
+/// [`arrow_to_value`]. Checked when the missing `LargeUtf8` *read* arm was
+/// fixed: no Uni `DataType` maps to `LargeUtf8` (`DataType::String` →
+/// `Utf8`), and no UDF declares it as a return type, so nothing reaches here
+/// with it. Should that change, the fallthrough is an `Err` — loud, and the
+/// right direction — not a silent null.
 pub fn values_to_array(values: &[Value], dt: &ArrowDataType) -> Result<ArrayRef> {
     match dt {
         ArrowDataType::UInt64 => Ok(values_to_uint64_array(values)),
@@ -1528,6 +1560,24 @@ pub fn build_multivector_array(values: &[Option<Value>], dimensions: usize) -> A
     Arc::new(builder.finish())
 }
 
+/// Collect one nullable scalar per row for a `PropertyExtractor` column build.
+///
+/// A row whose property is absent yields `None`, except on a *deleted* row,
+/// where `deleted_placeholder` stands in — deleted rows carry a type-specific
+/// zero so the column stays non-null for tombstones.
+fn collect_scalar<T: Copy>(
+    len: usize,
+    deleted: &[bool],
+    extract: impl Fn(usize) -> Option<T>,
+    deleted_placeholder: T,
+) -> Vec<Option<T>> {
+    let mut values = Vec::with_capacity(len);
+    for (i, &is_deleted) in deleted.iter().enumerate().take(len) {
+        values.push(extract(i).or(is_deleted.then_some(deleted_placeholder)));
+    }
+    values
+}
+
 impl<'a> PropertyExtractor<'a> {
     pub fn new(name: &'a str, data_type: &'a DataType) -> Self {
         Self { name, data_type }
@@ -1598,19 +1648,18 @@ impl<'a> PropertyExtractor<'a> {
     where
         F: Fn(usize) -> Option<&'a Value>,
     {
-        let mut values = Vec::with_capacity(len);
-        for (i, &is_deleted) in deleted.iter().enumerate().take(len) {
+        let values = collect_scalar(
+            len,
+            deleted,
             // i64 -> i32 via try_from: an out-of-range value becomes NULL rather
             // than silently wrapping to a different number. (review H13)
-            let val = get_props(i)
-                .and_then(|v| v.as_i64())
-                .and_then(|v| i32::try_from(v).ok());
-            if val.is_none() && is_deleted {
-                values.push(Some(0));
-            } else {
-                values.push(val);
-            }
-        }
+            |i| {
+                get_props(i)
+                    .and_then(|v| v.as_i64())
+                    .and_then(|v| i32::try_from(v).ok())
+            },
+            0,
+        );
         Ok(Arc::new(Int32Array::from(values)))
     }
 
@@ -1618,15 +1667,7 @@ impl<'a> PropertyExtractor<'a> {
     where
         F: Fn(usize) -> Option<&'a Value>,
     {
-        let mut values = Vec::with_capacity(len);
-        for (i, &is_deleted) in deleted.iter().enumerate().take(len) {
-            let val = get_props(i).and_then(|v| v.as_i64());
-            if val.is_none() && is_deleted {
-                values.push(Some(0));
-            } else {
-                values.push(val);
-            }
-        }
+        let values = collect_scalar(len, deleted, |i| get_props(i).and_then(|v| v.as_i64()), 0);
         Ok(Arc::new(Int64Array::from(values)))
     }
 
@@ -1845,15 +1886,12 @@ impl<'a> PropertyExtractor<'a> {
     where
         F: Fn(usize) -> Option<&'a Value>,
     {
-        let mut values = Vec::with_capacity(len);
-        for (i, &is_deleted) in deleted.iter().enumerate().take(len) {
-            let val = get_props(i).and_then(|v| v.as_f64()).map(|v| v as f32);
-            if val.is_none() && is_deleted {
-                values.push(Some(0.0));
-            } else {
-                values.push(val);
-            }
-        }
+        let values = collect_scalar(
+            len,
+            deleted,
+            |i| get_props(i).and_then(|v| v.as_f64()).map(|v| v as f32),
+            0.0,
+        );
         Ok(Arc::new(Float32Array::from(values)))
     }
 
@@ -1866,15 +1904,7 @@ impl<'a> PropertyExtractor<'a> {
     where
         F: Fn(usize) -> Option<&'a Value>,
     {
-        let mut values = Vec::with_capacity(len);
-        for (i, &is_deleted) in deleted.iter().enumerate().take(len) {
-            let val = get_props(i).and_then(|v| v.as_f64());
-            if val.is_none() && is_deleted {
-                values.push(Some(0.0));
-            } else {
-                values.push(val);
-            }
-        }
+        let values = collect_scalar(len, deleted, |i| get_props(i).and_then(|v| v.as_f64()), 0.0);
         Ok(Arc::new(Float64Array::from(values)))
     }
 
@@ -1882,15 +1912,12 @@ impl<'a> PropertyExtractor<'a> {
     where
         F: Fn(usize) -> Option<&'a Value>,
     {
-        let mut values = Vec::with_capacity(len);
-        for (i, &is_deleted) in deleted.iter().enumerate().take(len) {
-            let val = get_props(i).and_then(|v| v.as_bool());
-            if val.is_none() && is_deleted {
-                values.push(Some(false));
-            } else {
-                values.push(val);
-            }
-        }
+        let values = collect_scalar(
+            len,
+            deleted,
+            |i| get_props(i).and_then(|v| v.as_bool()),
+            false,
+        );
         Ok(Arc::new(BooleanArray::from(values)))
     }
 
@@ -2544,6 +2571,29 @@ mod tests {
     #[test]
     fn test_arrow_to_value_string() {
         let arr = StringArray::from(vec![Some("hello"), None, Some("world")]);
+        assert_eq!(
+            arrow_to_value(&arr, 0, None),
+            Value::String("hello".to_string())
+        );
+        assert_eq!(arrow_to_value(&arr, 1, None), Value::Null);
+        assert_eq!(
+            arrow_to_value(&arr, 2, None),
+            Value::String("world".to_string())
+        );
+    }
+
+    /// `LargeUtf8` is a distinct Arrow type from `Utf8` and needs its own
+    /// downcast — this decoder had a `StringArray` arm but no
+    /// `LargeStringArray` one, so every `LargeUtf8` column fell through to the
+    /// trailing `Value::Null` fallback.
+    ///
+    /// Locy hit this on every string literal and every string-returning
+    /// function in a `YIELD` (all typed `LargeUtf8` by `infer_expr_type`),
+    /// reporting NULL from `derived` while `QUERY` — which never touches Arrow
+    /// — reported the real value.
+    #[test]
+    fn test_arrow_to_value_large_string() {
+        let arr = LargeStringArray::from(vec![Some("hello"), None, Some("world")]);
         assert_eq!(
             arrow_to_value(&arr, 0, None),
             Value::String("hello".to_string())

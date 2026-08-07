@@ -451,17 +451,10 @@ impl QueryProcedureHost {
     /// Returns an error if the deadline has passed or the cancellation
     /// token has been triggered.
     pub fn check_timeout(&self) -> anyhow::Result<()> {
-        if let Some(ref token) = self.cancellation_token
-            && token.is_cancelled()
-        {
-            return Err(anyhow::anyhow!("Query cancelled"));
-        }
-        if let Some(deadline) = self.deadline
-            && Instant::now() > deadline
-        {
-            return Err(anyhow::anyhow!("Query timed out"));
-        }
-        Ok(())
+        crate::query::df_graph::common::check_deadline(
+            self.cancellation_token.as_ref(),
+            self.deadline,
+        )
     }
 }
 

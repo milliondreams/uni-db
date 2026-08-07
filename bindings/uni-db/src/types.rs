@@ -1019,6 +1019,16 @@ pub struct PyLocyResult {
     pub command_results: Py<PyAny>,
     /// Runtime warnings emitted during evaluation.
     pub warnings: Py<PyAny>,
+    /// Compile-time warnings from rule compilation, as a list of dicts with
+    /// `code`, `message` and `rule_name`.
+    ///
+    /// These are emitted before evaluation starts and cover static hazards the
+    /// compiler can see — an aggregate inside a recursive stratum, an
+    /// uncalibrated neural predicate, a possibly-negative `MSUM` argument.
+    /// They were previously dropped at the PyO3 boundary, so a Python caller
+    /// had no way to see them (issue #159 was filed against a program the
+    /// compiler had already warned about).
+    pub compile_warnings: Py<PyAny>,
     /// Groups flagged as approximate (shared-proof detection).
     pub approximate_groups: Py<PyAny>,
     /// Opaque derived fact set, pass to `tx.apply()` to materialize.

@@ -4,10 +4,10 @@
 //! uni.algo.graphColoring procedure implementation.
 
 use crate::algo::algorithms::{Algorithm, GraphColoring, GraphColoringConfig};
-use crate::algo::procedure_template::{GenericAlgoProcedure, GraphAlgoAdapter};
+use crate::algo::procedure_template::{GenericAlgoProcedure, GraphAlgoAdapter, vid_pair_rows};
 use crate::algo::procedures::{AlgoResultRow, ValueType};
 use anyhow::Result;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 pub struct GraphColoringAdapter;
 
@@ -28,13 +28,7 @@ impl GraphAlgoAdapter for GraphColoringAdapter {
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {
-        Ok(result
-            .coloring
-            .into_iter()
-            .map(|(vid, color)| AlgoResultRow {
-                values: vec![json!(vid.as_u64()), json!(color)],
-            })
-            .collect())
+        Ok(vid_pair_rows(result.coloring))
     }
 }
 

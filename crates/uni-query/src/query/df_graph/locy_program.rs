@@ -83,6 +83,43 @@ impl DerivedStore {
         self.relations.get(rule_name)
     }
 
+    /// Look up a rule's facts, tolerating the bare/qualified split that
+    /// `MODULE` introduces.
+    ///
+    /// Inside `MODULE m`, writing `adult` *is* how you name `m.adult`. The
+    /// compiler makes that work by offering every outer rule under both
+    /// spellings in the catalog rather than by qualifying the referring rule —
+    /// see the note in `uni-locy/src/compiler/mod.rs` explaining why handing
+    /// the body the outer module context would break unqualified lookups
+    /// elsewhere. The catalog is aliased, so the fact store has to resolve the
+    /// same way, or an IS-ref compiles cleanly and then silently matches
+    /// nothing at run time.
+    ///
+    /// An exact hit always wins. A bare name falls back to a unique qualified
+    /// rule with that suffix; **ambiguity is not guessed at** — if two modules
+    /// export the same bare name this returns `None` rather than picking one.
+    pub fn get_module_aware(&self, rule_name: &str) -> Option<&Vec<RecordBatch>> {
+        if let Some(facts) = self.relations.get(rule_name) {
+            return Some(facts);
+        }
+        if rule_name.contains('.') {
+            return None;
+        }
+        let mut matched: Option<&Vec<RecordBatch>> = None;
+        for (name, facts) in &self.relations {
+            if name
+                .rsplit_once('.')
+                .is_some_and(|(_, bare)| bare == rule_name)
+            {
+                if matched.is_some() {
+                    return None;
+                }
+                matched = Some(facts);
+            }
+        }
+        matched
+    }
+
     pub fn fact_count(&self, rule_name: &str) -> usize {
         self.relations
             .get(rule_name)
@@ -1090,6 +1127,11 @@ async fn run_program(
                         )?;
                     }
 
+                    // The anti-join has run; drop its hidden subject-`_vid`
+                    // columns before `write_facts_to_registry`, which would
+                    // otherwise silently fall back to the widened schema.
+                    batches = super::locy_complement::strip_isnot_vid_columns(batches)?;
+
                     tagged_clause_facts.push((clause_idx, batches));
                 }
 
@@ -1276,10 +1318,18 @@ async fn run_program(
     }
 
     // Execute inline Cypher commands via execute_subplan.
-    // QUERY is deferred to the orchestrator: the DerivedStore uses inferred types
-    // (e.g. Float64 for property-derived columns) which don't preserve the actual
-    // property values. The orchestrator's SLG path re-derives with correct types.
-    // DERIVE/ASSUME/EXPLAIN/ABDUCE are also deferred (need L0 fork/restore, tree output, etc.).
+    //
+    // QUERY/DERIVE/ASSUME/EXPLAIN/ABDUCE are deferred to the orchestrator
+    // because they need orchestration the inline loop cannot provide: L0
+    // fork/restore, tree output, and a store that has been through
+    // `enrich_vids_with_nodes`.
+    //
+    // This comment used to give a different reason for QUERY specifically —
+    // that the DerivedStore carried inferred types which "don't preserve the
+    // actual property values", so the orchestrator's SLG path had to re-derive.
+    // `FixpointState::reconcile_schema` fixed that by adopting the physical
+    // plan's real output schema, and QUERY now answers from the derived store
+    // rather than re-deriving. Deferral is about orchestration, not types.
     //
     // Cypher commands that appear AFTER a DERIVE command are also deferred:
     // they need the ephemeral L0 overlay populated by DERIVE to see derived
@@ -1428,8 +1478,10 @@ fn write_cross_stratum_facts(
         for clause in &rule.clauses {
             for is_ref in &clause.is_refs {
                 // If this IS-ref points to a rule already in the derived store
-                // (i.e., from a previous stratum), write its facts into the registry
-                if let Some(facts) = derived_store.get(&is_ref.rule_name) {
+                // (i.e., from a previous stratum), write its facts into the
+                // registry. Module-aware: inside `MODULE m` the referring rule
+                // names `adult` while the store holds `m.adult`.
+                if let Some(facts) = derived_store.get_module_aware(&is_ref.rule_name) {
                     write_facts_to_registry(registry, &is_ref.rule_name, facts);
                 }
             }
@@ -1522,6 +1574,33 @@ fn convert_to_fixpoint_plans(
                 yield_schema
             };
 
+            // Derivation-discriminator columns for a recursive FOLD / ALONG rule
+            // (issue #159), appended in the same order the planner projects them.
+            //
+            // This schema is what `FixpointState::new` consumes to build both
+            // `RowDedupState` and `all_column_indices`, so appending here is what
+            // actually puts the discriminators into the dedup key.
+            //
+            // Widening it is also what keeps provenance correct rather than
+            // merely safe: `record_provenance`, `detect_shared_lineage`,
+            // `apply_exact_wmc` and `find_clause_for_row` all derive their column
+            // indices from this schema, so the fact hash becomes
+            // discriminator-aware — the semantics we want. Were the batches
+            // widened but this schema left narrow, provenance would hash only the
+            // leading columns (siblings would collide again, defeating the fix)
+            // and `find_clause_for_row` would skip every candidate and silently
+            // report clause 0.
+            let deriv_cols = &rule.deriv_columns;
+            let yield_schema = if deriv_cols.is_empty() {
+                yield_schema
+            } else {
+                let mut fields: Vec<Arc<Field>> = yield_schema.fields().iter().cloned().collect();
+                for (name, dt) in deriv_cols {
+                    fields.push(Arc::new(Field::new(name, dt.clone(), true)));
+                }
+                ArrowSchema::new(fields)
+            };
+
             let prob_column_name = rule
                 .yield_schema
                 .iter()
@@ -1598,9 +1677,25 @@ fn convert_is_refs(
                 })?;
 
             // For negated IS-refs, compute (left_body_col, right_derived_col) pairs for
-            // anti-join filtering. Subject vars are assumed to be node variables, so
-            // the body column is `{var}._vid` (UInt64). The derived column name is taken
-            // positionally from the registry entry's schema (KEY columns come first).
+            // anti-join filtering. The derived column name is taken positionally from
+            // the registry entry's schema (KEY columns come first).
+            //
+            // The left name prefers the hidden `{var}._vid` column the planner
+            // projected (`LocyIsRef::subject_vid_cols`). The anti-join runs after
+            // `LocyProject`, so the bare variable name only resolves when YIELD
+            // happened to project that exact name — an aliased or unprojected
+            // subject was previously unresolvable and the negation silently
+            // became a no-op (issue #158). The bare-name fallback remains for
+            // subjects that are not MATCH-bound node variables, which have no
+            // `._vid` column; those still error in `apply_anti_join_composite`
+            // rather than failing open.
+            let left_col = |var: &String| {
+                is_ref
+                    .subject_vid_cols
+                    .get(var)
+                    .cloned()
+                    .unwrap_or_else(|| var.clone())
+            };
             let anti_join_cols = if is_ref.negated {
                 let mut cols: Vec<(String, String)> = is_ref
                     .subjects
@@ -1614,9 +1709,7 @@ fn convert_is_refs(
                                 .get(i)
                                 .map(|f| f.name().clone())
                                 .unwrap_or_else(|| var.clone());
-                            // After LocyProject the subject column is renamed to the yield
-                            // column name (just `var`, not `var._vid`). Use bare var as left.
-                            Some((var.clone(), right_col))
+                            Some((left_col(var), right_col))
                         } else {
                             None
                         }
@@ -1629,7 +1722,7 @@ fn convert_is_refs(
                 if let Some(uni_cypher::ast::Expr::Variable(target_var)) = &is_ref.target {
                     let target_idx = is_ref.subjects.len();
                     if let Some(field) = entry.schema.fields().get(target_idx) {
-                        cols.push((target_var.clone(), field.name().clone()));
+                        cols.push((left_col(target_var), field.name().clone()));
                     }
                 }
                 cols
@@ -1640,6 +1733,11 @@ fn convert_is_refs(
             // Provenance join cols: for ALL IS-refs (not just negated), compute
             // (body_col, derived_col) pairs so shared-proof detection can trace
             // which source facts contributed to each derived row.
+            //
+            // Uses the same `left_col` resolution as the anti-join above: for a
+            // negated ref whose subject was renamed by YIELD, the bare name does
+            // not exist post-projection and lineage would silently attribute to
+            // nothing.
             let provenance_join_cols: Vec<(String, String)> = is_ref
                 .subjects
                 .iter()
@@ -1652,7 +1750,7 @@ fn convert_is_refs(
                             .get(i)
                             .map(|f| f.name().clone())
                             .unwrap_or_else(|| var.clone());
-                        Some((var.clone(), right_col))
+                        Some((left_col(var), right_col))
                     } else {
                         None
                     }

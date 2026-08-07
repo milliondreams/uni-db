@@ -6,7 +6,7 @@
 //! [`crate::traits::background::BackgroundJobProvider`]. This module
 //! ships the scheduler's public API + persistent state record + a
 //! `SchedulerPersistence` trait. The host-side Tokio driver
-//! (`crates/uni/src/scheduler.rs`) wraps a loop that calls
+//! (`crates/uni-plugin-host/src/scheduler.rs`) wraps a loop that calls
 //! `tick_at(SystemTime::now())`, dispatches the returned jobs through
 //! the plugin registry, and forwards lifecycle transitions to the
 //! configured persistence backend.
@@ -410,7 +410,8 @@ pub enum SchedulerPersistenceError {
 /// Persistence backend for [`Scheduler`] job state.
 ///
 /// Mirrors the meta-plugin's `Persistence` trait in shape but scoped
-/// to scheduler records. The Tokio driver (`crates/uni/src/scheduler.rs`)
+/// to scheduler records. The Tokio driver
+/// (`crates/uni-plugin-host/src/scheduler.rs`)
 /// invokes `record_started` / `record_finished` / `cancel` on each
 /// lifecycle transition; on startup the driver calls `load_all` and
 /// re-registers persisted jobs (followed by

@@ -104,7 +104,7 @@ pub struct RowFn<F> {
     signature: FnSignature,
     #[allow(
         dead_code,
-        reason = "row evaluation is wired by uni-query host adapter; field held for downstream extraction"
+        reason = "closure held for the host adapter that replaces `invoke` at registration"
     )]
     inner: Arc<F>,
 }

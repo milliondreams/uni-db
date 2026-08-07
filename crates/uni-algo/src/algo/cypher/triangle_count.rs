@@ -4,10 +4,10 @@
 //! uni.algo.triangleCount procedure implementation.
 
 use crate::algo::algorithms::{Algorithm, TriangleCount, TriangleCountConfig};
-use crate::algo::procedure_template::{GenericAlgoProcedure, GraphAlgoAdapter};
+use crate::algo::procedure_template::{GenericAlgoProcedure, GraphAlgoAdapter, vid_pair_rows};
 use crate::algo::procedures::{AlgoResultRow, ValueType};
 use anyhow::Result;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 pub struct TriangleCountAdapter;
 
@@ -31,13 +31,7 @@ impl GraphAlgoAdapter for TriangleCountAdapter {
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {
-        Ok(result
-            .node_counts
-            .into_iter()
-            .map(|(vid, count)| AlgoResultRow {
-                values: vec![json!(vid.as_u64()), json!(count)],
-            })
-            .collect())
+        Ok(vid_pair_rows(result.node_counts))
     }
 }
 

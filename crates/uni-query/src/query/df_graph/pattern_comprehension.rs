@@ -34,7 +34,9 @@ use uni_store::QueryContext;
 use uni_store::storage::direction::Direction;
 
 use super::GraphExecutionContext;
-use crate::query::df_graph::common::{build_path_struct_field, column_as_vid_array};
+use crate::query::df_graph::common::{
+    block_on_scoped, build_path_struct_field, column_as_vid_array,
+};
 use crate::query::df_graph::scan::build_property_column_static;
 
 /// A single hop derived from the pattern's elements.
@@ -230,27 +232,11 @@ impl PhysicalExpr for PatternComprehensionExecExpr {
                 step.edge_type_ids,
                 step.direction
             );
-            std::thread::scope(|s| {
-                s.spawn(|| {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|e| {
-                            DataFusionError::Execution(format!("Runtime creation failed: {e}"))
-                        })?;
-                    rt.block_on(
-                        self.graph_ctx
-                            .ensure_adjacency_warmed(&step.edge_type_ids, step.direction),
-                    )
-                    .map_err(|e| DataFusionError::Execution(format!("CSR warming failed: {e}")))
-                })
-                .join()
-                .unwrap_or_else(|_| {
-                    Err(DataFusionError::Execution(
-                        "CSR warming thread panicked".to_string(),
-                    ))
-                })
-            })?;
+            block_on_scoped(
+                "CSR warming",
+                self.graph_ctx
+                    .ensure_adjacency_warmed(&step.edge_type_ids, step.direction),
+            )?;
         }
 
         log::debug!(
@@ -310,30 +296,14 @@ impl PhysicalExpr for PatternComprehensionExecExpr {
 
                 let prop_refs: Vec<&str> = props.iter().map(|s| s.as_str()).collect();
 
-                let props_map = std::thread::scope(|s| {
-                    s.spawn(|| {
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .map_err(|e| {
-                                DataFusionError::Execution(format!("Runtime creation failed: {e}"))
-                            })?;
-                        rt.block_on(self.graph_ctx.property_manager().get_batch_vertex_props(
-                            &vids,
-                            &prop_refs,
-                            Some(&query_ctx),
-                        ))
-                        .map_err(|e| {
-                            DataFusionError::Execution(format!("Vertex prop load failed: {e}"))
-                        })
-                    })
-                    .join()
-                    .unwrap_or_else(|_| {
-                        Err(DataFusionError::Execution(
-                            "Vertex prop load thread panicked".to_string(),
-                        ))
-                    })
-                })?;
+                let props_map = block_on_scoped(
+                    "Vertex prop load",
+                    self.graph_ctx.property_manager().get_batch_vertex_props(
+                        &vids,
+                        &prop_refs,
+                        Some(&query_ctx),
+                    ),
+                )?;
 
                 for prop in props {
                     let col = build_property_column_static(
@@ -357,30 +327,14 @@ impl PhysicalExpr for PatternComprehensionExecExpr {
 
                 let prop_refs: Vec<&str> = props.iter().map(|s| s.as_str()).collect();
 
-                let props_map = std::thread::scope(|s| {
-                    s.spawn(|| {
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .map_err(|e| {
-                                DataFusionError::Execution(format!("Runtime creation failed: {e}"))
-                            })?;
-                        rt.block_on(self.graph_ctx.property_manager().get_batch_edge_props(
-                            &eids,
-                            &prop_refs,
-                            Some(&query_ctx),
-                        ))
-                        .map_err(|e| {
-                            DataFusionError::Execution(format!("Edge prop load failed: {e}"))
-                        })
-                    })
-                    .join()
-                    .unwrap_or_else(|_| {
-                        Err(DataFusionError::Execution(
-                            "Edge prop load thread panicked".to_string(),
-                        ))
-                    })
-                })?;
+                let props_map = block_on_scoped(
+                    "Edge prop load",
+                    self.graph_ctx.property_manager().get_batch_edge_props(
+                        &eids,
+                        &prop_refs,
+                        Some(&query_ctx),
+                    ),
+                )?;
 
                 // Edge props use Eid mapped to Vid keys in the HashMap
                 let vid_keys: Vec<Vid> = eids.iter().map(|e| Vid::from(e.as_u64())).collect();

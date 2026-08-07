@@ -5,7 +5,7 @@
 
 use crate::algo::algorithms::{Algorithm, LabelPropagation, LabelPropagationConfig};
 use crate::algo::procedure_template::{
-    GenericAlgoProcedure, GraphAlgoAdapter, arg_bool, arg_str, arg_u64,
+    GenericAlgoProcedure, GraphAlgoAdapter, arg_bool, arg_str, arg_u64, vid_pair_rows,
 };
 use crate::algo::procedures::{AlgoResultRow, ValueType};
 use anyhow::Result;
@@ -42,13 +42,7 @@ impl GraphAlgoAdapter for LabelPropagationAdapter {
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {
-        Ok(result
-            .communities
-            .into_iter()
-            .map(|(vid, cid)| AlgoResultRow {
-                values: vec![json!(vid.as_u64()), json!(cid)],
-            })
-            .collect())
+        Ok(vid_pair_rows(result.communities))
     }
 }
 

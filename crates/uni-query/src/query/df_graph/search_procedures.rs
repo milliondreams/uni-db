@@ -24,7 +24,7 @@ use uni_common::Value;
 use uni_common::core::id::Vid;
 use uni_common::core::schema::DistanceMetric;
 
-use crate::query::df_graph::common::{arrow_err, calculate_score};
+use crate::query::df_graph::common::{arrow_err, calculate_score, exec_err};
 use crate::query::df_graph::procedure_call::{
     create_empty_batch, extract_optional_filter, map_yield_to_canonical, require_string_arg,
 };
@@ -226,6 +226,26 @@ pub(super) struct RerankContext {
     pub props: HashMap<Vid, uni_common::Properties>,
 }
 
+/// Run the optional cross-encoder rerank stage over retrieval results.
+///
+/// With no `reranker_config` the results pass through untouched. Otherwise the
+/// reranker query is `query_override` when set, else `fallback_query`.
+async fn apply_rerank(
+    host: &QueryProcedureHost,
+    results: Vec<(Vid, f32)>,
+    label: &str,
+    reranker_config: Option<&RerankerConfig>,
+    fallback_query: &str,
+    k: usize,
+) -> DFResult<(Vec<(Vid, f32)>, Option<RerankContext>)> {
+    let Some(rcfg) = reranker_config else {
+        return Ok((results, None));
+    };
+    let reranker_query = rcfg.query_override.as_deref().unwrap_or(fallback_query);
+    let (reranked, ctx) = rerank_candidates(host, results, label, reranker_query, rcfg, k).await?;
+    Ok((reranked, Some(ctx)))
+}
+
 async fn rerank_candidates(
     host: &QueryProcedureHost,
     candidates: Vec<(Vid, f32)>,
@@ -245,7 +265,7 @@ async fn rerank_candidates(
     let props_map = property_manager
         .get_batch_vertex_props_for_label(&vids, label, Some(&query_ctx))
         .await
-        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+        .map_err(exec_err)?;
 
     // MaxSim (late-interaction / ColBERT) rerank: no neural model — score each
     // candidate's stored multi-vector property against the query multi-vector
@@ -267,7 +287,7 @@ async fn rerank_candidates(
                 .transpose()?
                 .unwrap_or_default();
             let score = uni_query_functions::similar_to::maxsim(query, &doc_tokens, &config.metric)
-                .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+                .map_err(exec_err)?;
             scored.push((*vid, score));
         }
         let rerank_map: HashMap<Vid, f32> = scored.iter().copied().collect();
@@ -307,10 +327,7 @@ async fn rerank_candidates(
             "Cannot rerank: Uni-Xervo runtime not configured".to_string(),
         )
     })?;
-    let reranker = runtime
-        .reranker(&config.alias)
-        .await
-        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+    let reranker = runtime.reranker(&config.alias).await.map_err(exec_err)?;
     let doc_refs: Vec<&str> = doc_texts.iter().map(|s| s.as_str()).collect();
     let scored = reranker.rerank(query_text, &doc_refs).await.map_err(|e| {
         datafusion::error::DataFusionError::Execution(format!("Reranker inference failed: {e}"))
@@ -401,11 +418,9 @@ pub(crate) async fn multivector_rerank(
         };
         match muvera_hits {
             Some(spec) => {
-                let encoder = uni_common::muvera::FdeEncoder::new(&spec.params)
-                    .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
-                let fde_q = encoder
-                    .encode_query(query)
-                    .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+                let encoder =
+                    uni_common::muvera::FdeEncoder::new(&spec.params).map_err(exec_err)?;
+                let fde_q = encoder.encode_query(query).map_err(exec_err)?;
                 storage
                     .muvera_fde_candidates(
                         label,
@@ -417,7 +432,7 @@ pub(crate) async fn multivector_rerank(
                         Some(query_ctx),
                     )
                     .await
-                    .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?
+                    .map_err(exec_err)?
             }
             None => storage
                 .multivector_search(
@@ -430,7 +445,7 @@ pub(crate) async fn multivector_rerank(
                     Some(query_ctx),
                 )
                 .await
-                .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?,
+                .map_err(exec_err)?,
         }
     };
 
@@ -463,7 +478,7 @@ pub(crate) async fn multivector_rerank(
     let props_map = property_manager
         .get_batch_vertex_props_for_label(&candidates, label, Some(query_ctx))
         .await
-        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+        .map_err(exec_err)?;
 
     // 5. Exact in-process MaxSim re-score. A vid absent from `props_map` is not
     //    visible (filtered by tombstone / version) and is dropped; a vid present
@@ -480,7 +495,7 @@ pub(crate) async fn multivector_rerank(
             None => Vec::new(),
         };
         let score = uni_query_functions::similar_to::maxsim(query, &doc_tokens, metric)
-            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+            .map_err(exec_err)?;
         scored.push((*vid, score));
     }
 
@@ -523,7 +538,7 @@ pub(crate) async fn sparse_rerank(
     let flushed = storage
         .sparse_search(label, property, &query_pairs, retrieval_k)
         .await
-        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+        .map_err(exec_err)?;
 
     // 2. Live L0 candidates (and tombstones) for the label.
     let (l0_live, tombstoned) = uni_store::collect_l0_label_candidates(query_ctx, label);
@@ -547,7 +562,7 @@ pub(crate) async fn sparse_rerank(
     let props_map = property_manager
         .get_batch_vertex_props_for_label(&candidates, label, Some(query_ctx))
         .await
-        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+        .map_err(exec_err)?;
 
     // 5. Exact dot re-score. Absent vid → not visible → dropped. Present but
     //    missing the property → no document terms → score 0. The fetched
@@ -772,7 +787,7 @@ async fn auto_embed_text(
     let embedder = runtime
         .embedding(&embedding_config.alias)
         .await
-        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+        .map_err(exec_err)?;
 
     let prefixed_query = match &embedding_config.query_prefix {
         Some(prefix) => format!("{prefix}{query_text}"),
@@ -782,7 +797,7 @@ async fn auto_embed_text(
     let embeddings = embedder
         .embed(&[prefixed_query.as_str()])
         .await
-        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?
+        .map_err(exec_err)?
         .vectors;
     embeddings.into_iter().next().ok_or_else(|| {
         datafusion::error::DataFusionError::Execution(
@@ -821,11 +836,11 @@ async fn auto_embed_sparse_text(
     let embedder = runtime
         .sparse_embedder(&embedding_config.alias)
         .await
-        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+        .map_err(exec_err)?;
     let pairs = embedder
         .embed(&[query_text])
         .await
-        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?
+        .map_err(exec_err)?
         .vectors
         .into_iter()
         .next()
@@ -888,6 +903,48 @@ fn node_yield_requested_props(batch_ctx: &BatchBuildCtx<'_>) -> Option<Vec<Strin
     Some(requested)
 }
 
+/// Load the vertex properties the node yield(s) need, or an empty map when
+/// none are needed.
+///
+/// Returns empty when a rerank stage already materialised the properties (the
+/// caller uses `RerankContext::props` instead) or when no yield is
+/// node-canonical.
+async fn hydrate_node_props(
+    vids: &[Vid],
+    label: &str,
+    batch_ctx: &BatchBuildCtx<'_>,
+) -> DFResult<HashMap<Vid, uni_common::Properties>> {
+    let has_node_yield = batch_ctx
+        .yield_items
+        .iter()
+        .any(|(name, _)| map_yield_to_canonical(name) == "node");
+    if batch_ctx.rerank_ctx.is_some() || !has_node_yield {
+        return Ok(HashMap::new());
+    }
+
+    let property_manager = batch_ctx.host.property_manager().ok_or_else(|| {
+        datafusion::error::DataFusionError::Execution(
+            "Cannot materialise node properties: property manager not available on host"
+                .to_string(),
+        )
+    })?;
+    // Only fetch the properties actually emitted for the node yield(s) —
+    // `build_node_yield_columns` emits exactly `target_properties[output]`,
+    // so pruning the Lance fetch to that set is lossless and avoids decoding
+    // unread heavy columns such as `List(Vector)` (issue #134).
+    let requested = node_yield_requested_props(batch_ctx);
+    let query_ctx = batch_ctx.host.query_context();
+    property_manager
+        .get_batch_vertex_props_for_label_projected(
+            vids,
+            label,
+            Some(&query_ctx),
+            requested.as_deref(),
+        )
+        .await
+        .map_err(exec_err)
+}
+
 fn build_node_yield_columns(
     vids: &[Vid],
     label: &str,
@@ -946,44 +1003,11 @@ async fn build_search_result_batch(
         .map(|dist| calculate_score(*dist, metric))
         .collect();
 
-    let query_ctx = batch_ctx.host.query_context();
     let uni_schema = batch_ctx.host.storage().schema_manager().schema();
     let label_props = uni_schema.properties.get(label);
 
-    let has_node_yield = batch_ctx
-        .yield_items
-        .iter()
-        .any(|(name, _)| map_yield_to_canonical(name) == "node");
-
-    let owned_props;
-    let props_map = if let Some(rctx) = batch_ctx.rerank_ctx {
-        &rctx.props
-    } else if has_node_yield {
-        let property_manager = batch_ctx.host.property_manager().ok_or_else(|| {
-            datafusion::error::DataFusionError::Execution(
-                "Cannot materialise node properties: property manager not available on host"
-                    .to_string(),
-            )
-        })?;
-        // Only fetch the properties actually emitted for the node yield(s) —
-        // `build_node_yield_columns` emits exactly `target_properties[output]`,
-        // so pruning the Lance fetch to that set is lossless and avoids decoding
-        // unread heavy columns such as `List(Vector)` (issue #134).
-        let requested = node_yield_requested_props(batch_ctx);
-        owned_props = property_manager
-            .get_batch_vertex_props_for_label_projected(
-                &vids,
-                label,
-                Some(&query_ctx),
-                requested.as_deref(),
-            )
-            .await
-            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
-        &owned_props
-    } else {
-        owned_props = HashMap::new();
-        &owned_props
-    };
+    let owned_props = hydrate_node_props(&vids, label, batch_ctx).await?;
+    let props_map = batch_ctx.rerank_ctx.map_or(&owned_props, |r| &r.props);
 
     let mut columns: Vec<ArrayRef> = Vec::new();
     for (name, alias) in batch_ctx.yield_items {
@@ -1060,44 +1084,11 @@ async fn build_hybrid_search_batch(
     let vids: Vec<Vid> = results.iter().map(|(vid, _)| *vid).collect();
     let fused_scores: Vec<f32> = results.iter().map(|(_, s)| *s).collect();
 
-    let query_ctx = batch_ctx.host.query_context();
     let uni_schema = batch_ctx.host.storage().schema_manager().schema();
     let label_props = uni_schema.properties.get(label);
 
-    let has_node_yield = batch_ctx
-        .yield_items
-        .iter()
-        .any(|(name, _)| map_yield_to_canonical(name) == "node");
-
-    let owned_props;
-    let props_map = if let Some(rctx) = batch_ctx.rerank_ctx {
-        &rctx.props
-    } else if has_node_yield {
-        let property_manager = batch_ctx.host.property_manager().ok_or_else(|| {
-            datafusion::error::DataFusionError::Execution(
-                "Cannot materialise node properties: property manager not available on host"
-                    .to_string(),
-            )
-        })?;
-        // Only fetch the properties actually emitted for the node yield(s) —
-        // `build_node_yield_columns` emits exactly `target_properties[output]`,
-        // so pruning the Lance fetch to that set is lossless and avoids decoding
-        // unread heavy columns such as `List(Vector)` (issue #134).
-        let requested = node_yield_requested_props(batch_ctx);
-        owned_props = property_manager
-            .get_batch_vertex_props_for_label_projected(
-                &vids,
-                label,
-                Some(&query_ctx),
-                requested.as_deref(),
-            )
-            .await
-            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
-        &owned_props
-    } else {
-        owned_props = HashMap::new();
-        &owned_props
-    };
+    let owned_props = hydrate_node_props(&vids, label, batch_ctx).await?;
+    let props_map = batch_ctx.rerank_ctx.map_or(&owned_props, |r| &r.props);
 
     let mut columns: Vec<ArrayRef> = Vec::new();
     for (name, alias) in batch_ctx.yield_items {
@@ -1365,7 +1356,7 @@ pub(crate) async fn run_vector_query(
             Some(&query_ctx),
         )
         .await
-        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+        .map_err(exec_err)?;
 
     if let Some(max_dist) = threshold {
         results.retain(|(_, dist)| *dist <= max_dist as f32);
@@ -1382,18 +1373,15 @@ pub(crate) async fn run_vector_query(
         .map(|config| config.metric.clone())
         .unwrap_or(DistanceMetric::L2);
 
-    let (results, rerank_ctx) = if let Some(ref rcfg) = reranker_config {
-        let reranker_query = rcfg
-            .query_override
-            .as_deref()
-            .or(query_text_from_arg.as_deref())
-            .unwrap_or("");
-        let (reranked, ctx) =
-            rerank_candidates(host, results, &label, reranker_query, rcfg, k).await?;
-        (reranked, Some(ctx))
-    } else {
-        (results, None)
-    };
+    let (results, rerank_ctx) = apply_rerank(
+        host,
+        results,
+        &label,
+        reranker_config.as_ref(),
+        query_text_from_arg.as_deref().unwrap_or(""),
+        k,
+    )
+    .await?;
 
     let batch_ctx = BatchBuildCtx {
         yield_items,
@@ -1437,7 +1425,7 @@ pub(crate) async fn run_fts_query(
             Some(&query_ctx),
         )
         .await
-        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+        .map_err(exec_err)?;
 
     if let Some(min_score) = threshold {
         results.retain(|(_, score)| *score as f64 >= min_score);
@@ -1447,14 +1435,15 @@ pub(crate) async fn run_fts_query(
         return Ok(Some(create_empty_batch(schema.clone())?));
     }
 
-    let (results, rerank_ctx) = if let Some(ref rcfg) = reranker_config {
-        let reranker_query = rcfg.query_override.as_deref().unwrap_or(&search_term);
-        let (reranked, ctx) =
-            rerank_candidates(host, results, &label, reranker_query, rcfg, k).await?;
-        (reranked, Some(ctx))
-    } else {
-        (results, None)
-    };
+    let (results, rerank_ctx) = apply_rerank(
+        host,
+        results,
+        &label,
+        reranker_config.as_ref(),
+        &search_term,
+        k,
+    )
+    .await?;
 
     let batch_ctx = BatchBuildCtx {
         yield_items,
@@ -1597,7 +1586,7 @@ pub(crate) async fn run_hybrid_search(
                     Some(&query_ctx),
                 )
                 .await
-                .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+                .map_err(exec_err)?;
         }
     }
 
@@ -1613,7 +1602,7 @@ pub(crate) async fn run_hybrid_search(
                 Some(&query_ctx),
             )
             .await
-            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+            .map_err(exec_err)?;
     }
 
     // Sparse arm: opt-in via a `sparse` property plus an `options.sparse_query`

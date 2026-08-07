@@ -224,6 +224,29 @@ impl HybridPhysicalPlanner {
         self
     }
 
+    /// Build a physical expression compiler pre-wired with this planner's
+    /// subquery context (graph context, schema, session context, storage,
+    /// parameters and outer entity variables) so EXISTS subqueries and
+    /// pattern comprehensions can execute.
+    fn expr_compiler<'a>(
+        &self,
+        state: &'a SessionState,
+        translation_ctx: Option<&'a TranslationContext>,
+    ) -> crate::query::df_graph::expr_compiler::CypherPhysicalExprCompiler<'a> {
+        crate::query::df_graph::expr_compiler::CypherPhysicalExprCompiler::new(
+            state,
+            translation_ctx,
+        )
+        .with_subquery_ctx(
+            self.graph_ctx.clone(),
+            self.schema.clone(),
+            self.session_ctx.clone(),
+            self.storage.clone(),
+            self.params.clone(),
+            self.outer_entity_vars.clone(),
+        )
+    }
+
     /// Resolve the set of property names for `variable` from the collected plan properties.
     ///
     /// If the property set contains `"*"`, expands to all schema-defined properties
@@ -3912,18 +3935,7 @@ impl HybridPhysicalPlanner {
         let ctx = self.translation_context_for_plan(input);
         let session = self.session_ctx.read();
         let state = session.state();
-        let compiler = crate::query::df_graph::expr_compiler::CypherPhysicalExprCompiler::new(
-            &state,
-            Some(&ctx),
-        )
-        .with_subquery_ctx(
-            self.graph_ctx.clone(),
-            self.schema.clone(),
-            self.session_ctx.clone(),
-            self.storage.clone(),
-            self.params.clone(),
-            self.outer_entity_vars.clone(),
-        );
+        let compiler = self.expr_compiler(&state, Some(&ctx));
         let physical_predicate = compiler.compile(predicate, &schema)?;
 
         // For OPTIONAL MATCH: use OptionalFilterExec for proper NULL row preservation.
@@ -4070,32 +4082,8 @@ impl HybridPhysicalPlanner {
             let session = self.session_ctx.read();
             let state = session.state();
 
-            let left_compiler =
-                crate::query::df_graph::expr_compiler::CypherPhysicalExprCompiler::new(
-                    &state,
-                    Some(&left_ctx),
-                )
-                .with_subquery_ctx(
-                    self.graph_ctx.clone(),
-                    self.schema.clone(),
-                    self.session_ctx.clone(),
-                    self.storage.clone(),
-                    self.params.clone(),
-                    self.outer_entity_vars.clone(),
-                );
-            let right_compiler =
-                crate::query::df_graph::expr_compiler::CypherPhysicalExprCompiler::new(
-                    &state,
-                    Some(&right_ctx),
-                )
-                .with_subquery_ctx(
-                    self.graph_ctx.clone(),
-                    self.schema.clone(),
-                    self.session_ctx.clone(),
-                    self.storage.clone(),
-                    self.params.clone(),
-                    self.outer_entity_vars.clone(),
-                );
+            let left_compiler = self.expr_compiler(&state, Some(&left_ctx));
+            let right_compiler = self.expr_compiler(&state, Some(&right_ctx));
 
             let mut pairs: Vec<(
                 Arc<dyn datafusion::physical_plan::PhysicalExpr>,
@@ -4159,18 +4147,7 @@ impl HybridPhysicalPlanner {
             let merged_ctx = self.translation_context_for_plan(&crossjoin_for_ctx);
             let session = self.session_ctx.read();
             let state = session.state();
-            let compiler = crate::query::df_graph::expr_compiler::CypherPhysicalExprCompiler::new(
-                &state,
-                Some(&merged_ctx),
-            )
-            .with_subquery_ctx(
-                self.graph_ctx.clone(),
-                self.schema.clone(),
-                self.session_ctx.clone(),
-                self.storage.clone(),
-                self.params.clone(),
-                self.outer_entity_vars.clone(),
-            );
+            let compiler = self.expr_compiler(&state, Some(&merged_ctx));
             let physical_residual = compiler.compile(&residual, &join_schema)?;
             return Ok(Some(Arc::new(FilterExec::try_new(
                 physical_residual,
@@ -4277,31 +4254,8 @@ impl HybridPhysicalPlanner {
 
         let session = self.session_ctx.read();
         let state = session.state();
-        let left_compiler = crate::query::df_graph::expr_compiler::CypherPhysicalExprCompiler::new(
-            &state,
-            Some(&left_ctx),
-        )
-        .with_subquery_ctx(
-            self.graph_ctx.clone(),
-            self.schema.clone(),
-            self.session_ctx.clone(),
-            self.storage.clone(),
-            self.params.clone(),
-            self.outer_entity_vars.clone(),
-        );
-        let right_compiler =
-            crate::query::df_graph::expr_compiler::CypherPhysicalExprCompiler::new(
-                &state,
-                Some(&right_ctx),
-            )
-            .with_subquery_ctx(
-                self.graph_ctx.clone(),
-                self.schema.clone(),
-                self.session_ctx.clone(),
-                self.storage.clone(),
-                self.params.clone(),
-                self.outer_entity_vars.clone(),
-            );
+        let left_compiler = self.expr_compiler(&state, Some(&left_ctx));
+        let right_compiler = self.expr_compiler(&state, Some(&right_ctx));
 
         let mut compiled: Vec<EquiPair> = Vec::with_capacity(equi_pairs.len());
         for (l_expr, r_expr) in equi_pairs {
@@ -4538,18 +4492,7 @@ impl HybridPhysicalPlanner {
                 continue;
             }
 
-            let compiler = crate::query::df_graph::expr_compiler::CypherPhysicalExprCompiler::new(
-                &state,
-                ctx.as_ref(),
-            )
-            .with_subquery_ctx(
-                self.graph_ctx.clone(),
-                self.schema.clone(),
-                self.session_ctx.clone(),
-                self.storage.clone(),
-                self.params.clone(),
-                self.outer_entity_vars.clone(),
-            );
+            let compiler = self.expr_compiler(&state, ctx.as_ref());
             let mut physical_expr = compiler.compile(expr, &schema)?;
 
             // Stamp the `uni_raw_bytes` marker on a computed raw-bytes scalar output
@@ -4631,18 +4574,7 @@ impl HybridPhysicalPlanner {
             }
 
             // Generic expression compilation (property access, literals, etc.)
-            let compiler = crate::query::df_graph::expr_compiler::CypherPhysicalExprCompiler::new(
-                &state,
-                Some(&ctx),
-            )
-            .with_subquery_ctx(
-                self.graph_ctx.clone(),
-                self.schema.clone(),
-                self.session_ctx.clone(),
-                self.storage.clone(),
-                self.params.clone(),
-                self.outer_entity_vars.clone(),
-            );
+            let compiler = self.expr_compiler(&state, Some(&ctx));
             let physical_expr = compiler.compile(expr, &schema)?;
 
             // CAST if the compiled expression's output type doesn't match target.
@@ -4719,15 +4651,7 @@ impl HybridPhysicalPlanner {
             let physical_expr = if CypherPhysicalExprCompiler::contains_custom_expr(expr) {
                 // Custom expressions (quantifiers, list comprehensions, reduce, etc.)
                 // cannot be translated via cypher_expr_to_df; compile them directly.
-                let compiler = CypherPhysicalExprCompiler::new(&state, Some(&ctx))
-                    .with_subquery_ctx(
-                        self.graph_ctx.clone(),
-                        self.schema.clone(),
-                        self.session_ctx.clone(),
-                        self.storage.clone(),
-                        self.params.clone(),
-                        self.outer_entity_vars.clone(),
-                    );
+                let compiler = self.expr_compiler(&state, Some(&ctx));
                 compiler.compile(expr, &schema)?
             } else {
                 // DateTime/Time struct grouping: group by UTC-normalized values
@@ -5199,15 +5123,7 @@ impl HybridPhysicalPlanner {
             for arg in args {
                 if CypherPhysicalExprCompiler::contains_custom_expr(arg) {
                     // Compile the custom expression
-                    let compiler = CypherPhysicalExprCompiler::new(state, Some(ctx))
-                        .with_subquery_ctx(
-                            self.graph_ctx.clone(),
-                            self.schema.clone(),
-                            self.session_ctx.clone(),
-                            self.storage.clone(),
-                            self.params.clone(),
-                            self.outer_entity_vars.clone(),
-                        );
+                    let compiler = self.expr_compiler(state, Some(ctx));
                     let physical_expr = compiler.compile(arg, schema)?;
 
                     // Add it as a projected column
@@ -5306,15 +5222,7 @@ impl HybridPhysicalPlanner {
             // and save as an override for the physical sort expression.
             if CypherPhysicalExprCompiler::contains_custom_expr(&sort_expr) {
                 let sort_state = session.state();
-                let compiler = CypherPhysicalExprCompiler::new(&sort_state, Some(&ctx))
-                    .with_subquery_ctx(
-                        self.graph_ctx.clone(),
-                        self.schema.clone(),
-                        self.session_ctx.clone(),
-                        self.storage.clone(),
-                        self.params.clone(),
-                        self.outer_entity_vars.clone(),
-                    );
+                let compiler = self.expr_compiler(&sort_state, Some(&ctx));
                 let inner_physical = compiler.compile(&sort_expr, &schema)?;
 
                 // Use a dummy column reference for the logical sort expression

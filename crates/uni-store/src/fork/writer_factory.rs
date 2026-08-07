@@ -90,14 +90,12 @@ mod tests {
     /// Build a primary StorageManager + SchemaManager from a temp dir.
     async fn primary_storage() -> (TempDir, Arc<StorageManager>, Arc<SchemaManager>) {
         let dir = TempDir::new().unwrap();
-        let schema_path = dir.path().join("schema.json");
         let schema_store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
         let schema =
             SchemaManager::load_from_store(schema_store, &ObjectStorePath::from("schema.json"))
                 .await
                 .unwrap();
-        let _ = schema_path; // path read by load_from_store
         let schema = Arc::new(schema);
 
         let storage_path = dir.path().join("storage");

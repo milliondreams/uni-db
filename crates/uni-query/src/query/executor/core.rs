@@ -60,11 +60,14 @@ fn numeric_to_value(val: f64) -> Value {
     }
 }
 
-/// Canonical key for `COUNT(DISTINCT …)`: integral finite floats collapse to
-/// `Int` so `1` and `1.0` count once (matching `cypher_eq`'s numeric
-/// coercion); every other value keeps its type. The accumulator previously
-/// stringified values, which also collapsed `1` with `'1'` — a wrong answer.
-fn distinct_key(val: &Value) -> Value {
+/// Collapse an integral finite `Float` to the equivalent `Int`; leave every
+/// other value untouched.
+///
+/// Shared *mechanism* only. The callers below each document their own
+/// specification for why they fold this way — they are governed by different
+/// rules (openCypher aggregation vs. the MERGE match-key coercion) and are
+/// deliberately kept as separate, individually-documented entry points.
+pub(crate) fn canonical_numeric_key(val: &Value) -> Value {
     match val {
         Value::Float(f)
             if f.is_finite()
@@ -76,6 +79,14 @@ fn distinct_key(val: &Value) -> Value {
         }
         other => other.clone(),
     }
+}
+
+/// Canonical key for `COUNT(DISTINCT …)`: integral finite floats collapse to
+/// `Int` so `1` and `1.0` count once (matching `cypher_eq`'s numeric
+/// coercion); every other value keeps its type. The accumulator previously
+/// stringified values, which also collapsed `1` with `'1'` — a wrong answer.
+fn distinct_key(val: &Value) -> Value {
+    canonical_numeric_key(val)
 }
 
 /// Cross-type ordering rank for Cypher min/max (lower rank = smaller).
@@ -120,6 +131,32 @@ fn cypher_cross_type_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
         (Value::Bytes(l), Value::Bytes(r)) => l.cmp(r),
         _ => Ordering::Equal,
     }
+}
+
+/// Collect every edge ID tombstoned in the writer's current L0 plus, when
+/// present, the transaction's L0.
+///
+/// Used by the non-DETACH DELETE guards so edges deleted earlier in the same
+/// statement are not counted as "still attached".
+pub(crate) fn collect_tombstoned_eids(
+    writer: &Writer,
+    tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
+) -> HashSet<uni_common::core::id::Eid> {
+    let mut tombstoned_eids = HashSet::new();
+    {
+        let writer_l0 = writer.l0_manager.get_current();
+        let guard = writer_l0.read();
+        for &eid in guard.tombstones.keys() {
+            tombstoned_eids.insert(eid);
+        }
+    }
+    if let Some(tx) = tx_l0 {
+        let guard = tx.read();
+        for &eid in guard.tombstones.keys() {
+            tombstoned_eids.insert(eid);
+        }
+    }
+    tombstoned_eids
 }
 
 impl Accumulator {

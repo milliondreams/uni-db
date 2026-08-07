@@ -108,6 +108,34 @@ impl Drop for PinGuard {
     }
 }
 
+/// Deduplicate `(offset, neighbor, eid, version)` entries by `Eid`, keeping the
+/// entry with the highest version for each. Multiple versions of the same edge
+/// can coexist in L2+L1, across L1 runs, and across frozen overlay segments.
+fn dedup_entries_by_eid(entries: &mut Vec<(u64, Vid, Eid, u64)>) {
+    use std::collections::hash_map::Entry;
+
+    let mut best: HashMap<Eid, usize> = HashMap::new();
+    for (idx, (_, _, eid, ver)) in entries.iter().enumerate() {
+        match best.entry(*eid) {
+            Entry::Vacant(e) => {
+                e.insert(idx);
+            }
+            Entry::Occupied(mut e) => {
+                if *ver > entries[*e.get()].3 {
+                    e.insert(idx);
+                }
+            }
+        }
+    }
+    let keep: HashSet<usize> = best.into_values().collect();
+    let mut idx = 0;
+    entries.retain(|_| {
+        let k = keep.contains(&idx);
+        idx += 1;
+        k
+    });
+}
+
 /// Unified adjacency manager for the dual-CSR architecture.
 ///
 /// Orchestrates Main CSR (packed alive edges), L0-csr overlay
@@ -505,31 +533,7 @@ impl AdjacencyManager {
                 }
             }
 
-            // Deduplicate by Eid — keep entry with highest version for each Eid
-            {
-                use std::collections::hash_map::Entry;
-
-                let mut best: HashMap<Eid, usize> = HashMap::new();
-                for (idx, (_, _, eid, ver)) in entries.iter().enumerate() {
-                    match best.entry(*eid) {
-                        Entry::Vacant(e) => {
-                            e.insert(idx);
-                        }
-                        Entry::Occupied(mut e) => {
-                            if *ver > entries[*e.get()].3 {
-                                e.insert(idx);
-                            }
-                        }
-                    }
-                }
-                let keep: HashSet<usize> = best.into_values().collect();
-                let mut idx = 0;
-                entries.retain(|_| {
-                    let k = keep.contains(&idx);
-                    idx += 1;
-                    k
-                });
-            }
+            dedup_entries_by_eid(&mut entries);
 
             // Build new Main CSR and install
             let new_csr = MainCsr::from_edge_entries(max_offset as usize, entries);
@@ -772,33 +776,7 @@ impl AdjacencyManager {
             entries.retain(|(_, _, eid, _)| !deleted_eids.contains(eid));
         }
 
-        // Deduplicate by Eid — keep entry with highest version for each Eid
-        // Multiple versions of the same edge can exist in L2+L1 or across L1 runs
-        {
-            use std::collections::hash_map::Entry;
-            use std::collections::{HashMap, HashSet};
-
-            let mut best: HashMap<Eid, usize> = HashMap::new();
-            for (idx, (_, _, eid, ver)) in entries.iter().enumerate() {
-                match best.entry(*eid) {
-                    Entry::Vacant(e) => {
-                        e.insert(idx);
-                    }
-                    Entry::Occupied(mut e) => {
-                        if *ver > entries[*e.get()].3 {
-                            e.insert(idx);
-                        }
-                    }
-                }
-            }
-            let keep: HashSet<usize> = best.into_values().collect();
-            let mut idx = 0;
-            entries.retain(|_| {
-                let k = keep.contains(&idx);
-                idx += 1;
-                k
-            });
-        }
+        dedup_entries_by_eid(&mut entries);
 
         // Build MainCsr
         let max_offset = entries.iter().map(|(o, _, _, _)| *o).max().unwrap_or(0);

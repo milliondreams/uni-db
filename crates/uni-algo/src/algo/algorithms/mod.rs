@@ -179,6 +179,9 @@ pub use mst::{MinimumSpanningTree, MstConfig, MstResult};
 mod max_matching;
 pub use max_matching::{MaximumMatching, MaximumMatchingConfig, MaximumMatchingResult};
 
+/// Residual-graph construction shared by the max-flow algorithms below.
+mod residual;
+
 mod dinic;
 pub use dinic::{Dinic, DinicConfig, DinicResult};
 

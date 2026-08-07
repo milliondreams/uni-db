@@ -45,6 +45,25 @@ pub enum LocyCompileError {
         actual: usize,
     },
 
+    /// The subject of an `IS NOT` reference is not a node.
+    ///
+    /// Negation joins on node identity, so the subject has to be something that
+    /// has a vid: a node variable bound by MATCH, or one bound by an earlier
+    /// positive `IS ... TO` target in the same WHERE. A scalar (a YIELD alias,
+    /// an ALONG or FOLD name, a generator output) or a relationship variable
+    /// cannot be one, and the runtime already rejects all of them — this just
+    /// says so at compile time instead of after evaluation starts.
+    ///
+    /// The message deliberately contains the literal `IS NOT`; callers and
+    /// tests match on it to identify negation failures regardless of phase.
+    #[error(
+        "IS NOT subject '{variable}' in rule '{rule}' is not a node bound by MATCH. \
+         Negation joins on node identity, so the subject must be a node variable \
+         bound by the rule's MATCH pattern (or by an earlier positive `IS ... TO` \
+         target); a scalar value or a relationship variable cannot be one."
+    )]
+    IsNotSubjectNotANode { rule: String, variable: String },
+
     #[error(
         "prev.{field} in rule '{rule}' references unknown column; available columns from IS references: {available}"
     )]

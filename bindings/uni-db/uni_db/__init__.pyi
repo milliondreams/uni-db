@@ -879,6 +879,7 @@ class LocyResult:
     stats: Any
     command_results: Any
     warnings: Any
+    compile_warnings: list[dict[str, str]]
     approximate_groups: Any
     derived_fact_set: Any
 

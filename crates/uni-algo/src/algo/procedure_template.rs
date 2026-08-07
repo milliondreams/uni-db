@@ -115,6 +115,19 @@ pub fn err_stream(e: anyhow::Error) -> BoxStream<'static, Result<AlgoResultRow>>
     stream::once(async move { Err(e) }).boxed()
 }
 
+/// Build the standard two-column `(nodeId, value)` result rows every
+/// per-vertex algorithm adapter emits from its `map_result`.
+pub(crate) fn vid_pair_rows<T: serde::Serialize>(
+    pairs: impl IntoIterator<Item = (Vid, T)>,
+) -> Vec<AlgoResultRow> {
+    pairs
+        .into_iter()
+        .map(|(vid, value)| AlgoResultRow {
+            values: vec![serde_json::json!(vid.as_u64()), serde_json::json!(value)],
+        })
+        .collect()
+}
+
 /// Adapter trait for specific graph algorithms.
 pub trait GraphAlgoAdapter: Send + Sync + 'static {
     /// Name of the procedure (e.g., "algo.pageRank").

@@ -23,6 +23,7 @@ Feature: Parameter Binding in Locy Programs
       QUERY episodes WHERE aid = $agent_id RETURN act
       """
     Then evaluation should succeed
+    And the derived relation 'episodes' should have 2 facts
     And the command result 0 should be a Query with 1 rows
     And the command result 0 should be a Query containing row where act = 'login'
 
@@ -39,6 +40,7 @@ Feature: Parameter Binding in Locy Programs
       QUERY episodes WHERE aid = $agent_id RETURN e.action AS act
       """
     Then evaluation should succeed
+    And the derived relation 'episodes' should have 2 facts
     And the command result 0 should be a Query with 1 rows
     And the command result 0 should be a Query containing row where act = 'start'
 
@@ -78,6 +80,7 @@ Feature: Parameter Binding in Locy Programs
       QUERY scores WHERE v > $threshold RETURN nm
       """
     Then evaluation should succeed
+    And the derived relation 'scores' should have 2 facts
     And the command result 0 should be a Query with 1 rows
     And the command result 0 should be a Query containing row where nm = 'high'
 
@@ -100,5 +103,6 @@ Feature: Parameter Binding in Locy Programs
       QUERY events WHERE aid = $agent_id AND score > $min_score RETURN kind
       """
     Then evaluation should succeed
+    And the derived relation 'events' should have 3 facts
     And the command result 0 should be a Query with 1 rows
     And the command result 0 should be a Query containing row where kind = 'login'

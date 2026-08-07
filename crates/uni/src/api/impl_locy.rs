@@ -43,6 +43,31 @@ pub struct LocyRuleRegistry {
     pub sources: Vec<crate::api::locy_rule_catalog::RegisteredSource>,
 }
 
+/// Merge a session's registered rules into a freshly compiled program.
+///
+/// Registered rules fill any `rule_catalog` slot the program does not already
+/// define, and the program's own strata are rebased above the registry's so
+/// the registered strata run first and dependency ids stay consistent.
+pub(crate) fn merge_registered_rules(compiled: &mut CompiledProgram, registry: &LocyRuleRegistry) {
+    if registry.rules.is_empty() {
+        return;
+    }
+    for (name, rule) in &registry.rules {
+        compiled
+            .rule_catalog
+            .entry(name.clone())
+            .or_insert_with(|| rule.clone());
+    }
+    let base_id = registry.strata.len();
+    for stratum in &mut compiled.strata {
+        stratum.id += base_id;
+        stratum.depends_on = stratum.depends_on.iter().map(|d| d + base_id).collect();
+    }
+    let mut merged_strata = registry.strata.clone();
+    merged_strata.append(&mut compiled.strata);
+    compiled.strata = merged_strata;
+}
+
 /// Rebuilds a fresh registry by recompiling each source in order.
 ///
 /// The returned registry is a pure function of `sources`: rules, strata, and
@@ -333,25 +358,7 @@ pub(crate) async fn evaluate_with_db_and_config_capturing(
     .map_err(map_compile_error)?;
 
     // Merge registered rules
-    {
-        let registry = rule_registry.read().unwrap();
-        if !registry.rules.is_empty() {
-            for (name, rule) in &registry.rules {
-                compiled
-                    .rule_catalog
-                    .entry(name.clone())
-                    .or_insert_with(|| rule.clone());
-            }
-            let base_id = registry.strata.len();
-            for stratum in &mut compiled.strata {
-                stratum.id += base_id;
-                stratum.depends_on = stratum.depends_on.iter().map(|d| d + base_id).collect();
-            }
-            let mut merged_strata = registry.strata.clone();
-            merged_strata.append(&mut compiled.strata);
-            compiled.strata = merged_strata;
-        }
-    }
+    merge_registered_rules(&mut compiled, &rule_registry.read().unwrap());
 
     // Create a LocyEngine directly from &UniInner.
     // Session-level: collect DERIVE output for deferred materialization.
@@ -418,23 +425,6 @@ pub struct LocyEngine<'a> {
     /// cancelled a Locy query — which the Python bindings expose and call —
     /// observed it run to completion.
     pub(crate) cancel: crate::api::impl_query::CancelScope,
-}
-
-impl crate::api::Uni {
-    /// Create a Locy evaluation engine bound to this database (internal).
-    ///
-    /// All external access goes through `Session::locy()` / `Session::locy_with()`.
-    #[allow(dead_code)]
-    pub(crate) fn locy(&self) -> LocyEngine<'_> {
-        LocyEngine {
-            db: &self.inner,
-            tx_l0_override: None,
-            locy_l0: None,
-            collect_derive: true,
-            read_snapshot: None,
-            cancel: crate::api::impl_query::CancelScope::default(),
-        }
-    }
 }
 
 impl<'a> LocyEngine<'a> {
@@ -556,25 +546,7 @@ impl<'a> LocyEngine<'a> {
         let mut compiled = self.compile_only_with_config(program, config)?;
 
         // Merge registered rules into the compiled program.
-        {
-            let registry = self.db.locy_rule_registry.read().unwrap();
-            if !registry.rules.is_empty() {
-                for (name, rule) in &registry.rules {
-                    compiled
-                        .rule_catalog
-                        .entry(name.clone())
-                        .or_insert_with(|| rule.clone());
-                }
-                let base_id = registry.strata.len();
-                for stratum in &mut compiled.strata {
-                    stratum.id += base_id;
-                    stratum.depends_on = stratum.depends_on.iter().map(|d| d + base_id).collect();
-                }
-                let mut merged_strata = registry.strata.clone();
-                merged_strata.append(&mut compiled.strata);
-                compiled.strata = merged_strata;
-            }
-        }
+        merge_registered_rules(&mut compiled, &self.db.locy_rule_registry.read().unwrap());
 
         self.evaluate_compiled_capturing(compiled, config, profile_capture)
             .await
@@ -1365,30 +1337,13 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
             return Ok(rows);
         }
 
-        let unique_vids: HashSet<i64> = rows
-            .iter()
-            .flat_map(|row| {
-                vid_columns.iter().filter_map(|col| {
-                    if let Some(Value::Int(vid)) = row.get(col) {
-                        Some(*vid)
-                    } else {
-                        None
-                    }
-                })
-            })
-            .collect();
+        let unique_vids = unique_vids_in(&rows, &vid_columns);
 
         if unique_vids.is_empty() {
             return Ok(rows);
         }
 
-        let vids_literal = unique_vids
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let query_str =
-            format!("MATCH (n) WHERE id(n) IN [{vids_literal}] RETURN id(n) AS _vid, n");
+        let query_str = vid_lookup_query(&unique_vids);
         let mut vid_to_node: HashMap<i64, Value> = HashMap::new();
         if let Ok(ast) = uni_cypher::parse(&query_str)
             && let Ok(batches) = self.execute_query_ast(ast).await
@@ -1400,22 +1355,7 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
             }
         }
 
-        Ok(rows
-            .into_iter()
-            .map(|row| {
-                row.into_iter()
-                    .map(|(k, v)| {
-                        if vid_columns.contains(&k)
-                            && let Value::Int(vid) = &v
-                        {
-                            let new_v = vid_to_node.get(vid).cloned().unwrap_or(v);
-                            return (k, new_v);
-                        }
-                        (k, v)
-                    })
-                    .collect()
-            })
-            .collect())
+        Ok(substitute_nodes(rows, &vid_columns, &vid_to_node))
     }
 
     async fn execute_cypher_read(
@@ -1791,6 +1731,55 @@ fn dispatch_native_command<'a>(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// Collect the distinct VIDs appearing under `vid_columns` across `rows`.
+fn unique_vids_in(rows: &[FactRow], vid_columns: &HashSet<String>) -> HashSet<i64> {
+    rows.iter()
+        .flat_map(|row| {
+            vid_columns.iter().filter_map(|col| {
+                if let Some(Value::Int(vid)) = row.get(col) {
+                    Some(*vid)
+                } else {
+                    None
+                }
+            })
+        })
+        .collect()
+}
+
+/// Build the Cypher statement that resolves each VID back to its node.
+fn vid_lookup_query(vids: &HashSet<i64>) -> String {
+    let vids_literal = vids
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("MATCH (n) WHERE id(n) IN [{vids_literal}] RETURN id(n) AS _vid, n")
+}
+
+/// Replace every VID-valued cell under `vid_columns` with its resolved node,
+/// leaving cells whose VID did not resolve untouched.
+fn substitute_nodes(
+    rows: Vec<FactRow>,
+    vid_columns: &HashSet<String>,
+    vid_to_node: &HashMap<i64, Value>,
+) -> Vec<FactRow> {
+    rows.into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|(k, v)| {
+                    if vid_columns.contains(&k)
+                        && let Value::Int(vid) = &v
+                    {
+                        let new_v = vid_to_node.get(vid).cloned().unwrap_or(v);
+                        return (k, new_v);
+                    }
+                    (k, v)
+                })
+                .collect()
+        })
+        .collect()
+}
+
 async fn enrich_vids_with_nodes(
     db: &crate::api::UniInner,
     native_store: &uni_query::query::df_graph::DerivedStore,
@@ -1821,33 +1810,14 @@ async fn enrich_vids_with_nodes(
             continue;
         }
 
-        let unique_vids: HashSet<i64> = rows
-            .iter()
-            .flat_map(|row| {
-                vid_columns.iter().filter_map(|col| {
-                    if let Some(Value::Int(vid)) = row.get(col) {
-                        Some(*vid)
-                    } else {
-                        None
-                    }
-                })
-            })
-            .collect();
+        let unique_vids = unique_vids_in(&rows, &vid_columns);
 
         if unique_vids.is_empty() {
             enriched.insert(name, rows);
             continue;
         }
 
-        let vids_literal = unique_vids
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let query_str = format!(
-            "MATCH (n) WHERE id(n) IN [{}] RETURN id(n) AS _vid, n",
-            vids_literal
-        );
+        let query_str = vid_lookup_query(&unique_vids);
         let mut vid_to_node: HashMap<i64, Value> = HashMap::new();
         if let Ok(ast) = uni_cypher::parse(&query_str) {
             let schema = db.schema.schema();
@@ -1877,23 +1847,7 @@ async fn enrich_vids_with_nodes(
             }
         }
 
-        let enriched_rows: Vec<FactRow> = rows
-            .into_iter()
-            .map(|row| {
-                row.into_iter()
-                    .map(|(k, v)| {
-                        if vid_columns.contains(&k)
-                            && let Value::Int(vid) = &v
-                        {
-                            let new_v = vid_to_node.get(vid).cloned().unwrap_or(v);
-                            return (k, new_v);
-                        }
-                        (k, v)
-                    })
-                    .collect()
-            })
-            .collect();
-        enriched.insert(name, enriched_rows);
+        enriched.insert(name, substitute_nodes(rows, &vid_columns, &vid_to_node));
     }
 
     enriched

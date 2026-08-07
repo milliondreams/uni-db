@@ -39,6 +39,82 @@ pub fn arrow_err(e: arrow::error::ArrowError) -> datafusion::error::DataFusionEr
     datafusion::error::DataFusionError::ArrowError(Box::new(e), None)
 }
 
+/// Convert any displayable error into `DataFusionError::Execution`.
+///
+/// Shorthand for the ubiquitous
+/// `.map_err(|e| DataFusionError::Execution(e.to_string()))` closure used when
+/// bubbling storage/plugin errors out of a physical operator.
+pub(crate) fn exec_err<E: std::fmt::Display>(e: E) -> datafusion::error::DataFusionError {
+    datafusion::error::DataFusionError::Execution(e.to_string())
+}
+
+/// Check a query's cancellation token and deadline.
+///
+/// Shared body behind `GraphExecutionContext::check_timeout` and
+/// `QueryProcedureHost::check_timeout`, which carry the same two fields.
+///
+/// # Errors
+///
+/// Returns an error if the token has been cancelled or the deadline has passed.
+pub(crate) fn check_deadline(
+    token: Option<&tokio_util::sync::CancellationToken>,
+    deadline: Option<std::time::Instant>,
+) -> anyhow::Result<()> {
+    if let Some(token) = token
+        && token.is_cancelled()
+    {
+        return Err(anyhow::anyhow!("Query cancelled"));
+    }
+    if let Some(deadline) = deadline
+        && std::time::Instant::now() > deadline
+    {
+        return Err(anyhow::anyhow!("Query timed out"));
+    }
+    Ok(())
+}
+
+/// Block on `fut` from a synchronous context without touching the caller's runtime.
+///
+/// Physical operators run inside a DataFusion stream `poll_next`, so they cannot
+/// `block_on` the ambient runtime. This spawns a scoped thread with a fresh
+/// current-thread runtime, drives the future there, and translates both runtime
+/// creation failures and thread panics into `DataFusionError::Execution`.
+///
+/// `what` names the operation for the error messages (`"{what} failed: {e}"` and
+/// `"{what} thread panicked"`).
+///
+/// # Errors
+///
+/// Returns an error if the runtime cannot be built, the future fails, or the
+/// worker thread panics.
+pub(crate) fn block_on_scoped<T, F>(what: &str, fut: F) -> DFResult<T>
+where
+    T: Send,
+    F: std::future::Future<Output = anyhow::Result<T>> + Send,
+{
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| {
+                    datafusion::error::DataFusionError::Execution(format!(
+                        "Runtime creation failed: {e}"
+                    ))
+                })?;
+            rt.block_on(fut).map_err(|e| {
+                datafusion::error::DataFusionError::Execution(format!("{what} failed: {e}"))
+            })
+        })
+        .join()
+        .unwrap_or_else(|_| {
+            Err(datafusion::error::DataFusionError::Execution(format!(
+                "{what} thread panicked"
+            )))
+        })
+    })
+}
+
 /// Compute standard plan properties for graph operators.
 ///
 /// All graph operators use the same plan properties:
@@ -115,6 +191,62 @@ pub fn column_as_vid_array(
         "VID column has type {:?}, expected UInt64 or Int64",
         col.data_type()
     )))
+}
+
+/// Resolve the named edge-ID columns used for Cypher relationship-uniqueness,
+/// failing closed on anything unexpected.
+///
+/// The traversal operators harvest these column names from their own input plan
+/// and use the resulting arrays to skip edges already bound by an earlier
+/// element of the same MATCH. The sites previously used
+/// `filter_map(|col| batch.column_by_name(col).and_then(downcast::<UInt64Array>))`,
+/// which drops a column that is absent or not `UInt64` — and a dropped column
+/// contributes no entries, so the `used_eids` check silently never fires for it
+/// and a path may reuse an edge. That is relationship-isomorphism quietly
+/// disabled, with no error and no residual re-check.
+///
+/// No current producer can trigger it: every `_eid`-shaped column is declared
+/// `UInt64`, the names come from the very plan that becomes the operator's
+/// child, and graph plans execute directly so no projection pushdown can prune
+/// one away. This exists so that a future change to the eid encoding fails
+/// loudly here instead of silently weakening path semantics — the same reason
+/// [`column_as_vid_array`] errors rather than skipping, in these same functions.
+///
+/// # Errors
+///
+/// Returns `DataFusionError::Execution` if a named column is missing from the
+/// batch or is not a `UInt64` array.
+pub fn used_edge_id_arrays<'a>(
+    batch: &'a arrow_array::RecordBatch,
+    used_edge_columns: &[String],
+) -> datafusion::error::Result<Vec<&'a arrow_array::UInt64Array>> {
+    used_edge_columns
+        .iter()
+        .map(|col| {
+            let column = batch.column_by_name(col).ok_or_else(|| {
+                datafusion::error::DataFusionError::Execution(format!(
+                    "relationship-uniqueness column '{col}' is missing from the traversal input \
+                     (columns: {:?}); proceeding would silently allow an edge to be reused",
+                    batch
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|f| f.name().as_str())
+                        .collect::<Vec<_>>()
+                ))
+            })?;
+            column
+                .as_any()
+                .downcast_ref::<arrow_array::UInt64Array>()
+                .ok_or_else(|| {
+                    datafusion::error::DataFusionError::Execution(format!(
+                        "relationship-uniqueness column '{col}' has type {:?}, expected UInt64; \
+                         proceeding would silently allow an edge to be reused",
+                        column.data_type()
+                    ))
+                })
+        })
+        .collect()
 }
 
 /// Extract a VID from a CypherValue.

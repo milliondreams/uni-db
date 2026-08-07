@@ -33,3 +33,18 @@ pub mod repro_locy_runtime_abduce_target_var;
 pub mod repro_locy_runtime_topk_mnor_mixed_support;
 pub mod repro_locy_runtime_wmc_shared_lineage;
 pub mod value_assert;
+// Issue #158: IS NOT fails open when the negated subject is not a projected
+// column name (the reported "must be a KEY column" trigger is incorrect).
+pub mod locy_issue_158_is_not_subject_scope;
+// Issue #159: aggregation inside a recursive rule dedups equal values.
+pub mod locy_issue_159_recursive_fold_dedup;
+// Issue #160: QUERY (SLG) and derived (fixpoint) diverge when an IS-ref
+// introduces a variable binding the MATCH pattern does not provide.
+pub mod locy_issue_160_query_derived_parity;
+// Schemaless YIELD property columns are inferred as Float64, so `derived`
+// reports NULL for strings and floats for ints while QUERY reports the real
+// value. Found by the generic QUERY/derived parity guard.
+pub mod locy_schemaless_property_type_inference;
+// A string literal in YIELD is NULL in `derived` while QUERY returns it.
+// Same class as the schemaless property defect, different cause.
+pub mod locy_string_literal_yield;

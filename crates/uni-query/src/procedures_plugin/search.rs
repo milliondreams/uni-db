@@ -10,11 +10,12 @@ use arrow_schema::DataType;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::ColumnarValue;
 use uni_plugin::traits::procedure::{
-    NamedArgType, ProcedureContext, ProcedureMode, ProcedurePlugin, ProcedureSignature,
+    ProcedureContext, ProcedureMode, ProcedurePlugin, ProcedureSignature,
 };
 use uni_plugin::traits::scalar::ArgType;
 use uni_plugin::{FnError, PluginError, PluginRegistrar, QName, SideEffects};
 
+use crate::procedures_plugin::host_args::arg;
 use crate::procedures_plugin::vector::{hybrid_search_yields, run_search_procedure};
 use crate::query::df_graph::search_procedures::run_hybrid_search;
 
@@ -24,49 +25,41 @@ fn signature() -> &'static ProcedureSignature {
     static SIG: OnceLock<ProcedureSignature> = OnceLock::new();
     SIG.get_or_init(|| ProcedureSignature {
         args: vec![
-            NamedArgType {
-                name: smol_str::SmolStr::new("label"),
-                ty: ArgType::Primitive(DataType::Utf8),
-                default: None,
-                doc: "Vertex label to search.".to_owned(),
-            },
-            NamedArgType {
-                name: smol_str::SmolStr::new("properties"),
-                ty: ArgType::CypherValue,
-                default: None,
-                doc: "Either a property name (used for both vector and fts) or a map `{vector: '...', fts: '...'}`."
-                    .to_owned(),
-            },
-            NamedArgType {
-                name: smol_str::SmolStr::new("query_text"),
-                ty: ArgType::Primitive(DataType::Utf8),
-                default: None,
-                doc: "Free-text query (used for FTS and, optionally, auto-embedding).".to_owned(),
-            },
-            NamedArgType {
-                name: smol_str::SmolStr::new("query_vector"),
-                ty: ArgType::CypherValue,
-                default: None,
-                doc: "Optional pre-computed query vector (List<Float>); omit to auto-embed.".to_owned(),
-            },
-            NamedArgType {
-                name: smol_str::SmolStr::new("k"),
-                ty: ArgType::Primitive(DataType::Int64),
-                default: None,
-                doc: "Number of fused results to return.".to_owned(),
-            },
-            NamedArgType {
-                name: smol_str::SmolStr::new("filter"),
-                ty: ArgType::Primitive(DataType::Utf8),
-                default: None,
-                doc: "Optional pushdown filter expression.".to_owned(),
-            },
-            NamedArgType {
-                name: smol_str::SmolStr::new("options"),
-                ty: ArgType::CypherValue,
-                default: None,
-                doc: "Optional options map (fusion method, alpha, rrf_k, reranker, …).".to_owned(),
-            },
+            arg(
+                "label",
+                ArgType::Primitive(DataType::Utf8),
+                "Vertex label to search.",
+            ),
+            arg(
+                "properties",
+                ArgType::CypherValue,
+                "Either a property name (used for both vector and fts) or a map `{vector: '...', fts: '...'}`.",
+            ),
+            arg(
+                "query_text",
+                ArgType::Primitive(DataType::Utf8),
+                "Free-text query (used for FTS and, optionally, auto-embedding).",
+            ),
+            arg(
+                "query_vector",
+                ArgType::CypherValue,
+                "Optional pre-computed query vector (List<Float>); omit to auto-embed.",
+            ),
+            arg(
+                "k",
+                ArgType::Primitive(DataType::Int64),
+                "Number of fused results to return.",
+            ),
+            arg(
+                "filter",
+                ArgType::Primitive(DataType::Utf8),
+                "Optional pushdown filter expression.",
+            ),
+            arg(
+                "options",
+                ArgType::CypherValue,
+                "Optional options map (fusion method, alpha, rrf_k, reranker, …).",
+            ),
         ],
         yields: hybrid_search_yields(),
         mode: ProcedureMode::Read,

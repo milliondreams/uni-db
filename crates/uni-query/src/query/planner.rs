@@ -6,8 +6,9 @@ use anyhow::{Result, anyhow};
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, SchemaRef};
 use parking_lot::RwLock;
+use regex::Regex;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use uni_common::Value;
 use uni_common::core::schema::{
     AnalyzerConfig, BaseTokenizer, EmbeddingConfig, FtsLanguage, FullTextIndexConfig,
@@ -59,6 +60,11 @@ pub(crate) const WITH_PASSTHROUGH_SENTINEL: &str = "__with_passthrough__";
 /// and consumed and removed by [`reconcile_passthrough_properties`]. Never
 /// reaches scan planning.
 pub(crate) const ALIAS_OF_PREFIX: &str = "__alias_of__";
+
+/// Matches a `variable.property` reference so `strip_variable_prefix` can
+/// rewrite it to the bare property name. Compiled once — the index-DDL /
+/// EXPLAIN path would otherwise recompile it on every call.
+static VAR_PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\w+\.(\w+)").unwrap());
 
 /// Type of variable in scope for semantic validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -846,6 +852,28 @@ fn collect_non_aggregate_refs(expr: &Expr, out: &mut Vec<NonAggregateRef>) {
             collect_non_aggregate_refs(child, out);
         }),
     }
+}
+
+/// Validate compound aggregate expressions: non-aggregate refs must be
+/// individually present in the group_by as simple variables or properties.
+fn validate_compound_aggregates(compound_agg_exprs: &[Expr], group_by: &[Expr]) -> Result<()> {
+    let group_by_reprs: HashSet<String> = group_by.iter().map(|e| e.to_string_repr()).collect();
+    for expr in compound_agg_exprs {
+        let mut refs = Vec::new();
+        collect_non_aggregate_refs(expr, &mut refs);
+        for r in &refs {
+            let is_covered = match r {
+                NonAggregateRef::Var(v) => group_by_reprs.contains(v),
+                NonAggregateRef::Property { repr, .. } => group_by_reprs.contains(repr),
+            };
+            if !is_covered {
+                return Err(anyhow!(
+                    "SyntaxError: AmbiguousAggregationExpression - Expression mixes aggregation with non-grouped reference"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_with_order_by_aggregate_item(
@@ -2814,26 +2842,8 @@ impl QueryPlanner {
             }
         }
 
-        // Validate compound aggregate expressions: non-aggregate refs must be
-        // individually present in the group_by as simple variables or properties.
         if has_agg {
-            let group_by_reprs: HashSet<String> =
-                group_by.iter().map(|e| e.to_string_repr()).collect();
-            for expr in &compound_agg_exprs {
-                let mut refs = Vec::new();
-                collect_non_aggregate_refs(expr, &mut refs);
-                for r in &refs {
-                    let is_covered = match r {
-                        NonAggregateRef::Var(v) => group_by_reprs.contains(v),
-                        NonAggregateRef::Property { repr, .. } => group_by_reprs.contains(repr),
-                    };
-                    if !is_covered {
-                        return Err(anyhow!(
-                            "SyntaxError: AmbiguousAggregationExpression - Expression mixes aggregation with non-grouped reference"
-                        ));
-                    }
-                }
-            }
+            validate_compound_aggregates(&compound_agg_exprs, &group_by)?;
         }
 
         if has_agg {
@@ -6875,26 +6885,8 @@ impl QueryPlanner {
             projections.push((Expr::Variable(extra.clone()), Some(extra.clone())));
         }
 
-        // Validate compound aggregate expressions: non-aggregate refs must be
-        // individually present in the group_by as simple variables or properties.
         if has_agg {
-            let group_by_reprs: HashSet<String> =
-                group_by.iter().map(|e| e.to_string_repr()).collect();
-            for expr in &compound_agg_exprs {
-                let mut refs = Vec::new();
-                collect_non_aggregate_refs(expr, &mut refs);
-                for r in &refs {
-                    let is_covered = match r {
-                        NonAggregateRef::Var(v) => group_by_reprs.contains(v),
-                        NonAggregateRef::Property { repr, .. } => group_by_reprs.contains(repr),
-                    };
-                    if !is_covered {
-                        return Err(anyhow!(
-                            "SyntaxError: AmbiguousAggregationExpression - Expression mixes aggregation with non-grouped reference"
-                        ));
-                    }
-                }
-            }
+            validate_compound_aggregates(&compound_agg_exprs, &group_by)?;
         }
 
         if has_agg {
@@ -8183,6 +8175,7 @@ impl QueryPlanner {
         match plan {
             LogicalPlan::Scan {
                 label_id,
+                variable,
                 filter: Some(filter),
                 ..
             } => {
@@ -8191,24 +8184,21 @@ impl QueryPlanner {
                 // hash-index hit, surface it in EXPLAIN.
                 if let Some(label_name) = self.schema.label_name_by_id(*label_id) {
                     let analyzer = crate::query::pushdown::IndexAwareAnalyzer::new(&self.schema);
-                    // The variable name is the scan's binding variable; we
-                    // reach for it via the Scan node directly.
-                    if let LogicalPlan::Scan { variable, .. } = plan {
-                        let strategy = analyzer.analyze(filter, variable, *label_id);
-                        for prop in strategy.hash_index_columns {
-                            usage.push(IndexUsage {
-                                label_or_type: label_name.to_string(),
-                                property: prop,
-                                index_type: "HASH".to_string(),
-                                used: true,
-                                reason: Some(
-                                    "Hash index point lookup pushed into Lance scan".to_string(),
-                                ),
-                            });
-                        }
+                    let strategy = analyzer.analyze(filter, variable, *label_id);
+                    for prop in strategy.hash_index_columns {
+                        usage.push(IndexUsage {
+                            label_or_type: label_name.to_string(),
+                            property: prop,
+                            index_type: "HASH".to_string(),
+                            used: true,
+                            reason: Some(
+                                "Hash index point lookup pushed into Lance scan".to_string(),
+                            ),
+                        });
                     }
                 }
             }
+            // An unfiltered scan uses no index.
             LogicalPlan::Scan { .. } => {}
             LogicalPlan::VectorKnn {
                 label_id, property, ..
@@ -8417,10 +8407,7 @@ impl QueryPlanner {
     /// Strip variable references like "u.prop" from expression strings
     /// Converts "lower(u.email)" to "lower(email)"
     fn strip_variable_prefix(expr_str: &str) -> String {
-        use regex::Regex;
-        // Match patterns like "word.property" and replace with just "property"
-        let re = Regex::new(r"\b\w+\.(\w+)").unwrap();
-        re.replace_all(expr_str, "$1").to_string()
+        VAR_PREFIX_RE.replace_all(expr_str, "$1").to_string()
     }
 
     /// Plan a schema command from the new AST

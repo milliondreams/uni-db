@@ -66,6 +66,8 @@ Feature: FOLD Execution Paths — All 6 FOLD Operators Across Execution Paths
       QUERY risk WHERE a = a RETURN a.name AS src, b.name AS dst, p
       """
     Then evaluation should succeed
+    And the derived relation 'risk' should have 1 facts
+    And the derived relation 'risk' should contain a fact where p = 0.65
     And the command result 0 should be a Query with 1 rows
     And the command result 0 should be a Query containing row where p = 0.65
 
@@ -178,6 +180,8 @@ Feature: FOLD Execution Paths — All 6 FOLD Operators Across Execution Paths
       QUERY coverage WHERE a = a RETURN a.name AS src, b.name AS dst, p
       """
     Then evaluation should succeed
+    And the derived relation 'coverage' should have 1 facts
+    And the derived relation 'coverage' should contain a fact where p = 0.72
     And the command result 0 should be a Query with 1 rows
     And the command result 0 should be a Query containing row where p = 0.72
 
@@ -300,6 +304,8 @@ Feature: FOLD Execution Paths — All 6 FOLD Operators Across Execution Paths
       QUERY dept_hours WHERE d = d RETURN d.name AS dept, total
       """
     Then evaluation should succeed
+    And the derived relation 'dept_hours' should have 1 facts
+    And the derived relation 'dept_hours' should contain a fact where total = 60.0
     And the command result 0 should be a Query with 1 rows
     And the command result 0 should be a Query containing row where total = 60.0
 
@@ -422,6 +428,8 @@ Feature: FOLD Execution Paths — All 6 FOLD Operators Across Execution Paths
       QUERY peak WHERE s = s RETURN s.name AS sensor, mx
       """
     Then evaluation should succeed
+    And the derived relation 'peak' should have 1 facts
+    And the derived relation 'peak' should contain a fact where mx = 10.0
     And the command result 0 should be a Query with 1 rows
     And the command result 0 should be a Query containing row where mx = 10.0
 
@@ -544,6 +552,8 @@ Feature: FOLD Execution Paths — All 6 FOLD Operators Across Execution Paths
       QUERY fastest WHERE s = s RETURN s.name AS server, mn
       """
     Then evaluation should succeed
+    And the derived relation 'fastest' should have 1 facts
+    And the derived relation 'fastest' should contain a fact where mn = 3.0
     And the command result 0 should be a Query with 1 rows
     And the command result 0 should be a Query containing row where mn = 3.0
 
@@ -666,6 +676,7 @@ Feature: FOLD Execution Paths — All 6 FOLD Operators Across Execution Paths
       QUERY team_size WHERE t = t RETURN t.name AS team, cnt
       """
     Then evaluation should succeed
+    And the derived relation 'team_size' should have 1 facts
     And the command result 0 should be a Query with 1 rows
     And the command result 0 should be a Query containing row where cnt = 3.0
 

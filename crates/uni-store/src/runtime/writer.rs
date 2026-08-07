@@ -483,10 +483,9 @@ pub struct Writer {
     flush_lock: Arc<tokio::sync::Mutex<()>>,
     /// Coordinator for async-flush pipeline. Owns the back-pressure
     /// semaphore, rotate-order sequence, single-finalizer task, and
-    /// pending-flush counter. Always present even when async flush is
-    /// disabled — the sync `flush_to_l1` path uses it for the future
-    /// `FlushInProgressGuard`/permit ownership model.
-    /// Coordinator is `None` when `async_flush_enabled = false`. The
+    /// pending-flush counter.
+    ///
+    /// `None` when `async_flush_enabled = false`. The
     /// coordinator's finalizer task captures `SharedFlushCtx` which
     /// includes `Arc<StorageManager>`; on a fork-scoped Writer that
     /// also pins the fork's `ForkScope` via `storage.fork_scope`, so
@@ -495,7 +494,6 @@ pub struct Writer {
     /// existing sync-flush paths. When async-flush graduates from
     /// opt-in to default (Commit 12), `drop_fork` (Commit 8) handles
     /// the drain explicitly.
-    #[allow(dead_code)] // first production use lands in Commit 6/7
     pub(crate) flush_coordinator: Option<Arc<crate::runtime::flush_coordinator::FlushCoordinator>>,
     /// Optimistic-concurrency commit-sequence counter (SSI). Incremented once
     /// per successful commit under `flush_lock`; a transaction captures the
@@ -2016,6 +2014,46 @@ impl Writer {
         }
     }
 
+    /// Records one batch row's composite constraint key, erroring if it
+    /// collides with an existing L0 key or with an earlier row in the batch.
+    ///
+    /// Shared by the `Unique` and `NodeKey` arms of
+    /// [`Writer::validate_vertex_batch_constraints`] — the two differ only in
+    /// how the key is built, not in how it is checked.
+    fn record_batch_constraint_key(
+        constraint_name: &str,
+        label: &str,
+        key: String,
+        idx: usize,
+        existing_keys: &HashMap<String, HashSet<String>>,
+        batch_keys: &mut HashMap<String, HashMap<String, usize>>,
+    ) -> Result<()> {
+        // Check against existing L0 keys
+        if let Some(keys) = existing_keys.get(constraint_name)
+            && keys.contains(&key)
+        {
+            return Err(anyhow!(
+                "Constraint violation at index {}: Duplicate composite key for label '{}' (constraint '{}')",
+                idx,
+                label,
+                constraint_name
+            ));
+        }
+
+        // Check for duplicates within batch
+        let batch_constraint_keys = batch_keys.entry(constraint_name.to_string()).or_default();
+        if let Some(first_idx) = batch_constraint_keys.get(&key) {
+            return Err(anyhow!(
+                "Constraint violation: Duplicate key '{}' in batch at indices {} and {}",
+                key,
+                first_idx,
+                idx
+            ));
+        }
+        batch_constraint_keys.insert(key, idx);
+        Ok(())
+    }
+
     /// Validates constraints for a batch of vertices efficiently.
     ///
     /// This method builds an in-memory index from L0 buffers ONCE instead of scanning
@@ -2184,33 +2222,17 @@ impl Writer {
                             }
                         }
 
+                        // Unlike NodeKey, a missing key property is not a
+                        // violation for Unique — the row is simply skipped.
                         if all_present {
-                            let key = key_parts.join("|");
-
-                            // Check against existing L0 keys
-                            if let Some(keys) = existing_keys.get(&constraint.name)
-                                && keys.contains(&key)
-                            {
-                                return Err(anyhow!(
-                                    "Constraint violation at index {}: Duplicate composite key for label '{}' (constraint '{}')",
-                                    idx,
-                                    label,
-                                    constraint.name
-                                ));
-                            }
-
-                            // Check for duplicates within batch
-                            let batch_constraint_keys =
-                                batch_keys.entry(constraint.name.clone()).or_default();
-                            if let Some(first_idx) = batch_constraint_keys.get(&key) {
-                                return Err(anyhow!(
-                                    "Constraint violation: Duplicate key '{}' in batch at indices {} and {}",
-                                    key,
-                                    first_idx,
-                                    idx
-                                ));
-                            }
-                            batch_constraint_keys.insert(key, idx);
+                            Self::record_batch_constraint_key(
+                                &constraint.name,
+                                label,
+                                key_parts.join("|"),
+                                idx,
+                                &existing_keys,
+                                &mut batch_keys,
+                            )?;
                         }
                     }
                     ConstraintType::Exists { property }
@@ -2255,28 +2277,14 @@ impl Writer {
                                 }
                             }
                         }
-                        let key = key_parts.join("|");
-                        if let Some(keys) = existing_keys.get(&constraint.name)
-                            && keys.contains(&key)
-                        {
-                            return Err(anyhow!(
-                                "Constraint violation at index {}: Duplicate composite key for label '{}' (constraint '{}')",
-                                idx,
-                                label,
-                                constraint.name
-                            ));
-                        }
-                        let batch_constraint_keys =
-                            batch_keys.entry(constraint.name.clone()).or_default();
-                        if let Some(first_idx) = batch_constraint_keys.get(&key) {
-                            return Err(anyhow!(
-                                "Constraint violation: Duplicate key '{}' in batch at indices {} and {}",
-                                key,
-                                first_idx,
-                                idx
-                            ));
-                        }
-                        batch_constraint_keys.insert(key, idx);
+                        Self::record_batch_constraint_key(
+                            &constraint.name,
+                            label,
+                            key_parts.join("|"),
+                            idx,
+                            &existing_keys,
+                            &mut batch_keys,
+                        )?;
                     }
                     _ => {}
                 }
@@ -5966,24 +5974,9 @@ impl Writer {
     /// Check rebuild thresholds and schedule background index rebuilds for
     /// labels that exceed growth or age limits. Marks affected indexes as
     /// `Stale` and spawns an async task to schedule the rebuild.
-    #[allow(dead_code)] // production path uses _static; kept as the
-    // documented instance entry point.
-    fn schedule_index_rebuilds_if_needed(
-        &self,
-        manifest: &SnapshotManifest,
-        rebuild_mgr: Arc<crate::storage::index_rebuild::IndexRebuildManager>,
-    ) {
-        Self::schedule_index_rebuilds_if_needed_static(
-            manifest,
-            rebuild_mgr,
-            self.schema_manager.clone(),
-            self.config.index_rebuild.clone(),
-        );
-    }
-
-    /// Static variant of [`Writer::schedule_index_rebuilds_if_needed`].
-    /// Used by the async-flush finalize path, where we hold the
-    /// [`SchemaManager`] via `SharedFlushCtx` rather than `&Writer`.
+    ///
+    /// Static rather than a method because the async-flush finalize path
+    /// holds the [`SchemaManager`] via `SharedFlushCtx` rather than `&Writer`.
     pub(crate) fn schedule_index_rebuilds_if_needed_static(
         manifest: &SnapshotManifest,
         rebuild_mgr: Arc<crate::storage::index_rebuild::IndexRebuildManager>,

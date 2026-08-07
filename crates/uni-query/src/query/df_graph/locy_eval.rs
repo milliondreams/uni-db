@@ -858,7 +858,24 @@ pub fn record_batches_to_locy_rows(batches: &[RecordBatch]) -> Vec<FactRow> {
                     continue;
                 }
                 let column = batch.column(col_idx);
-                let data_type = if uni_common::core::schema::is_datetime_struct(field.data_type()) {
+                // Recover the Uni DataType so LargeBinary / struct columns decode
+                // correctly. `Bytes`, `CypherValue` and `Duration` all map to Arrow
+                // `LargeBinary` and are indistinguishable here, so raw `Bytes`
+                // columns are tagged with `uni_raw_bytes` at scan time
+                // (`scan.rs::property_field`). Without the hint a raw `Bytes` value
+                // is run through the CypherValue codec and decodes to `Null`.
+                //
+                // This mirrors the Cypher read path (`executor/read.rs`), which has
+                // had the check since issue #93; the Locy copy never did, so a
+                // typed `Bytes` property came back `Null` from `derived` while the
+                // same property read through Cypher was intact.
+                let data_type = if field
+                    .metadata()
+                    .get("uni_raw_bytes")
+                    .is_some_and(|v| v == "true")
+                {
+                    Some(&uni_common::DataType::Bytes)
+                } else if uni_common::core::schema::is_datetime_struct(field.data_type()) {
                     Some(&uni_common::DataType::DateTime)
                 } else if uni_common::core::schema::is_time_struct(field.data_type()) {
                     Some(&uni_common::DataType::Time)
@@ -1002,18 +1019,34 @@ fn extract_properties_from_map(map: &HashMap<String, Value>) -> HashMap<String, 
     // Primary source: _all_props contains all properties from storage
     if let Some(Value::Map(all_props)) = map.get("_all_props") {
         for (k, v) in all_props {
-            properties.insert(k.clone(), v.clone());
+            if is_user_visible_property(k) {
+                properties.insert(k.clone(), v.clone());
+            }
         }
     }
 
     // Secondary: inline non-internal keys (schema-defined property columns)
     for (k, v) in map {
-        if !k.starts_with('_') && k != "properties" {
+        if is_user_visible_property(k) && k != "properties" {
             properties.entry(k.clone()).or_insert_with(|| v.clone());
         }
     }
 
     properties
+}
+
+/// Whether a storage column name is a real, user-visible node/edge property.
+///
+/// `overflow_json` is a materialized storage column holding non-schema
+/// properties, not a property itself. It does not start with `_`, so the
+/// leading-underscore convention alone let it through and it surfaced in
+/// user-visible properties on the SLG `QUERY` path while the fixpoint path
+/// filtered it — the two surfaces disagreeing about the same node.
+///
+/// Mirrors the predicate the scan layer already applies
+/// (`df_graph/scan.rs`, the projected-property filter).
+fn is_user_visible_property(name: &str) -> bool {
+    !name.starts_with('_') && name != "overflow_json" && name != "_all_props"
 }
 
 #[cfg(test)]

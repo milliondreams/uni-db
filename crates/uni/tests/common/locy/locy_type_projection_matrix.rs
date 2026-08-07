@@ -214,3 +214,139 @@ fn _expected_shapes() -> Vec<Value> {
         }),
     ]
 }
+
+// ---------------------------------------------------------------------------
+// Schemaless arm.
+//
+// Every arm above asserts only `result.rows()` — the QUERY surface. That is
+// exactly the blind spot that let the schemaless defect ship: `derived`
+// returned NULL for strings and floats for ints while QUERY was correct, and no
+// test compared them. These arms assert BOTH surfaces, and do it without a
+// declared schema, where the property type is unknown at plan time and the
+// column arrives cv-encoded as LargeBinary.
+// ---------------------------------------------------------------------------
+
+/// Seeds the same value with **no schema declared**, so the property lands in
+/// `overflow_json` and its type is unknown to the planner.
+async fn db_with_value_schemaless(case: &Case) -> Result<Uni> {
+    let db = Uni::in_memory().build().await?;
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute(&format!("CREATE (:M {{val: {}}})", case.literal))
+        .await?;
+    tx.commit().await?;
+    Ok(db)
+}
+
+/// S4: schemaless KEY property column, asserted on the `derived` surface.
+#[tokio::test]
+async fn matrix_s4_schemaless_key_round_trips_typed_in_derived() -> Result<()> {
+    for case in cases() {
+        let db = db_with_value_schemaless(&case).await?;
+        let program = "CREATE RULE r AS MATCH (n:M) YIELD KEY n.val AS v";
+        let result = db.session().locy(program).await?;
+        let empty = vec![];
+        let derived = result.derived_facts("r").unwrap_or(&empty);
+        assert_column_non_null(derived, "v");
+        assert_column_typed(derived, "v", case.tag);
+    }
+    Ok(())
+}
+
+/// S5: the same schemaless column must agree across `derived` and `QUERY`.
+///
+/// This is the assertion whose absence hid the defect — each surface was
+/// individually plausible, and only comparing them revealed the disagreement.
+#[tokio::test]
+async fn matrix_s5_schemaless_derived_and_query_agree() -> Result<()> {
+    for case in cases() {
+        let db = db_with_value_schemaless(&case).await?;
+        let program = "CREATE RULE r AS MATCH (n:M) YIELD KEY n.val AS v\nQUERY r RETURN v";
+        let result = db.session().locy(program).await?;
+        let empty = vec![];
+        let derived = result
+            .derived_facts("r")
+            .unwrap_or(&empty)
+            .first()
+            .and_then(|row| row.get("v").cloned());
+        let queried = result
+            .rows()
+            .unwrap_or(&empty)
+            .first()
+            .and_then(|row| row.get("v").cloned());
+        assert_eq!(
+            derived, queried,
+            "{}: schemaless column must agree across derived and QUERY",
+            case.name
+        );
+    }
+    Ok(())
+}
+
+/// S6: the schema'd arms above only check QUERY; assert `derived` too, so a
+/// regression on either surface alone is caught.
+#[tokio::test]
+async fn matrix_s6_schemad_key_round_trips_typed_in_derived() -> Result<()> {
+    for case in cases() {
+        let db = db_with_value(&case).await?;
+        let program = "CREATE RULE r AS MATCH (n:M) YIELD KEY n.val AS v";
+        let result = db.session().locy(program).await?;
+        let empty = vec![];
+        let derived = result.derived_facts("r").unwrap_or(&empty);
+        assert_column_non_null(derived, "v");
+        assert_column_typed(derived, "v", case.tag);
+    }
+    Ok(())
+}
+
+/// S7: **`LargeUtf8`-producing expressions** — the arm the matrix was missing.
+///
+/// The cases above all project a stored *property*, whose Arrow type comes from
+/// the declared schema (`Utf8`) or from cv-encoded storage (`LargeBinary`).
+/// Neither reaches `LargeUtf8`, which is what `infer_expr_type` assigns to
+/// string literals and to every string-returning function — and which had no
+/// decode arm at all, so all of them silently produced NULL in `derived`.
+///
+/// A matrix keyed on *storage* types could never have caught it; the gap was
+/// only reachable through *expression* types. That is the generalizable lesson
+/// and the reason this arm exists.
+#[tokio::test]
+async fn matrix_s7_large_utf8_expressions_round_trip_on_both_surfaces() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("M")
+        .property("val", DataType::String)
+        .apply()
+        .await?;
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (:M {val: 'x'})").await?;
+    tx.commit().await?;
+
+    for expr in [
+        "'lit'",
+        "toUpper(n.val)",
+        "toLower('ABC')",
+        "toString(1)",
+        "substring('abcdef', 1, 2)",
+        "trim('  s  ')",
+    ] {
+        let program =
+            format!("CREATE RULE r AS MATCH (n:M) YIELD KEY n, {expr} AS v\nQUERY r RETURN v");
+        let result = db.session().locy(&program).await?;
+        let empty = vec![];
+
+        let derived = result.derived_facts("r").unwrap_or(&empty);
+        assert_column_non_null(derived, "v");
+        assert_column_typed(derived, "v", TypeTag::Str);
+
+        let queried = result.rows().unwrap_or(&empty);
+        assert_column_typed(queried, "v", TypeTag::Str);
+        assert_eq!(
+            derived.first().and_then(|r| r.get("v")),
+            queried.first().and_then(|r| r.get("v")),
+            "{expr}: derived and QUERY must agree"
+        );
+    }
+    Ok(())
+}

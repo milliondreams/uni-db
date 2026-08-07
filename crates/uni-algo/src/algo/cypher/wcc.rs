@@ -4,7 +4,9 @@
 //! uni.algo.wcc procedure implementation.
 
 use crate::algo::algorithms::{Algorithm, Wcc, WccConfig};
-use crate::algo::procedure_template::{GenericAlgoProcedure, GraphAlgoAdapter, arg_u64};
+use crate::algo::procedure_template::{
+    GenericAlgoProcedure, GraphAlgoAdapter, arg_u64, vid_pair_rows,
+};
 use crate::algo::procedures::{AlgoResultRow, ValueType};
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -30,13 +32,7 @@ impl GraphAlgoAdapter for WccAdapter {
     }
 
     fn map_result(result: <Self::Algo as Algorithm>::Result) -> Result<Vec<AlgoResultRow>> {
-        Ok(result
-            .components
-            .into_iter()
-            .map(|(vid, cid)| AlgoResultRow {
-                values: vec![json!(vid.as_u64()), json!(cid)],
-            })
-            .collect())
+        Ok(vid_pair_rows(result.components))
     }
 }
 

@@ -171,6 +171,115 @@ Feature: Monotonic Aggregation (MSUM, MMAX, MMIN, MCOUNT)
     # identical value 1.0, so under the old collapse TOP counted 1.
     And the derived relation 'tally' should contain a fact where n = 3
 
+  # ── A recursive FOLD NESTS: a self-reference reads the child's FOLDED value ──
+  #
+  # Issue #162. Within a recursive stratum a self-reference observes one row per
+  # KEY carrying that KEY's folded value — not the child's pre-fold contribution
+  # rows. So an assembly's rollup is a fold over its CHILDREN, and a multi-level
+  # bill of materials composes level by level.
+  #
+  # The scenarios above are all single-level, where the distinction is invisible:
+  # MSUM and MPROD are associative, so folding a child's contributions and
+  # folding its folded value agree. These pin the cases where they do not.
+  #
+  # Base clauses yield literals for the reason given above the #159 block:
+  # schemaless property reads come back as LargeBinary and would disagree with
+  # the Float64 fold output.
+
+  Scenario: Recursive MPROD composes across two levels with equal-valued siblings
+    Given having executed:
+      """
+      CREATE (t:Unit {name: 'TOP'}),
+             (m:Unit {name: 'MID'}),
+             (t)-[:CONTAINS]->(m),
+             (m)-[:CONTAINS]->(:Unit {name: 'L1'}),
+             (m)-[:CONTAINS]->(:Unit {name: 'L2'})
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE assembly AS
+        MATCH (p:Unit)-[:CONTAINS]->(:Unit)
+        YIELD KEY p
+      CREATE RULE build AS
+        MATCH (p:Unit)
+        WHERE p IS NOT assembly
+        YIELD KEY p, 0.5 AS b
+      CREATE RULE build AS
+        MATCH (p:Unit)-[:CONTAINS]->(c:Unit)
+        WHERE c IS build
+        FOLD b = MPROD(b)
+        YIELD KEY p, b
+      """
+    Then evaluation should succeed
+    # MID = 0.5 × 0.5 = 0.25, and TOP folds MID's single child value, so TOP is
+    # also 0.25. Reading MID's two pre-fold contribution rows instead — both
+    # carrying 0.5, and collapsed to one by whole-row dedup — gave TOP = 0.5.
+    And the derived relation 'build' should contain a fact where b = 0.25
+
+  Scenario: Recursive MPROD composes across three levels
+    Given having executed:
+      """
+      CREATE (t:Unit {name: 'TOP'}),
+             (m:Unit {name: 'MID'}),
+             (x:Unit {name: 'X'}),
+             (t)-[:CONTAINS]->(m),
+             (m)-[:CONTAINS]->(x),
+             (x)-[:CONTAINS]->(:Unit {name: 'L1'}),
+             (x)-[:CONTAINS]->(:Unit {name: 'L2'})
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE assembly AS
+        MATCH (p:Unit)-[:CONTAINS]->(:Unit)
+        YIELD KEY p
+      CREATE RULE build AS
+        MATCH (p:Unit)
+        WHERE p IS NOT assembly
+        YIELD KEY p, 0.5 AS b
+      CREATE RULE build AS
+        MATCH (p:Unit)-[:CONTAINS]->(c:Unit)
+        WHERE c IS build
+        FOLD b = MPROD(b)
+        YIELD KEY p, b
+      """
+    Then evaluation should succeed
+    # X = 0.25, and MID and TOP each fold a single child, so the value carries
+    # up unchanged. The defect propagated: MID and TOP both reported 0.5.
+    And the derived relation 'build' should have 5 facts
+    And the derived relation 'build' should contain a fact where b = 0.25
+
+  Scenario: Recursive MCOUNT counts children, not leaves
+    Given having executed:
+      """
+      CREATE (t:Node {name: 'TOP'}),
+             (m:Node {name: 'MID'}),
+             (t)-[:LINK]->(m),
+             (m)-[:LINK]->(:Node {name: 'L1'}),
+             (m)-[:LINK]->(:Node {name: 'L2'})
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE parent AS
+        MATCH (p:Node)-[:LINK]->(:Node)
+        YIELD KEY p
+      CREATE RULE tally AS
+        MATCH (p:Node)
+        WHERE p IS NOT parent
+        YIELD KEY p, 1.0 AS n
+      CREATE RULE tally AS
+        MATCH (p:Node)-[:LINK]->(c:Node)
+        WHERE c IS tally
+        FOLD n = MCOUNT(n)
+        YIELD KEY p, n
+      """
+    Then evaluation should succeed
+    # This is the aggregate where nesting and flattening genuinely disagree, and
+    # MCOUNT is not associative so no coincidence hides it. MID has two children
+    # so MID = 2; TOP has exactly one child (MID) so TOP = 1. Folding MID's
+    # contribution rows instead would count MID's grandchildren and give 2.
+    And the derived relation 'tally' should contain a fact where n = 2.0
+    And the derived relation 'tally' should contain a fact where n = 1.0
+
   Scenario: MMAX converges to true maximum
     Given having executed:
       """

@@ -501,15 +501,27 @@ Declaring no KEY columns does not disable deduplication; it only removes the
 grouping, and is usually an anti-pattern in recursive rules (see
 [Section 19](#19-best-practices--anti-patterns)).
 
-**A FOLD aggregates the bag of derivations, not the set of distinct row
-values.** N sibling derivations reaching the same KEY with numerically equal
-values contribute N times, not once — consistent with "FOLD aggregates across
-paths" ([Section 19](#19-best-practices--anti-patterns)) and with `MCOUNT`
-being defined as `acc + 1` per contributing row. Inside a recursive stratum the
-engine keeps such derivations distinct by their bindings, so a bill-of-materials
-rollup sums every path (issue #159). Deduplication still suppresses
-*re-derivations* of the same fact by the same bindings, which is what makes the
-fixpoint terminate.
+**A FOLD aggregates the bag of rows its clause emits, not the set of distinct
+row values.** N derivations reaching the same KEY with numerically equal values
+contribute N times, not once — consistent with `MCOUNT` being defined as
+`acc + 1` per contributing row. Inside a recursive stratum the engine keeps such
+derivations distinct by their bindings (issue #159). Deduplication still
+suppresses *re-derivations* of the same fact by the same bindings, which is what
+makes the fixpoint terminate.
+
+**What a self-reference contributes is the target's folded value, not the rows
+behind it.** Within a recursive stratum, `WHERE c IS r` where `r` carries FOLD
+binds one row per KEY of `r`, carrying that KEY's aggregate as of the previous
+iteration. A bill-of-materials rollup therefore composes one level at a time:
+a parent folds its children's values, and each child has already folded its own.
+See [Section 8.2](#82-monotonic-aggregates-safe-in-recursion). A clause carrying
+ALONG is the exception — it reads the pre-fold rows, because `prev.x`
+accumulates along a single path and a per-KEY aggregate is not defined per path.
+
+The distinction is invisible for an associative aggregate over a bare inherited
+column (`MPROD(b)`, `MSUM(cost)`), where folding a child's rows and folding its
+folded value agree. It is visible for `MCOUNT` — which counts a node's children,
+not its leaves — and for any fold whose argument is a computed expression.
 
 ## 6.3 PROB Annotation
 
@@ -619,7 +631,11 @@ CREATE RULE spending AS
 
 ## 8.2 Monotonic Aggregates (Safe in Recursion)
 
-These aggregates are **monotonic** — their value can only move in one direction as new facts arrive — which guarantees fixpoint convergence.
+These aggregates are **monotonic** — their value can only move in one direction as new facts arrive — which is what makes them sound inside a recursive stratum.
+
+**Monotone does not imply convergent.** `MSUM`, `MCOUNT`, `COUNT` and `COLLECT` are monotone but *unbounded* — they have no top element — so a recursive fold over cyclic data can run to `max_iterations` instead of reaching a fixed point. The iteration cap is the backstop, not a proof of termination; over-budget evaluation surfaces as `LocyIncomplete`.
+
+**The six `M*` names are not the whole set.** Monotonicity is decided by the aggregate registry: the compiler reads the aggregate's `monotone_join` semilattice flag and only falls back to these names when the registry has no entry. `MIN`, `MAX`, `COUNT`, `COUNT(*)` and `COLLECT` are therefore legal in recursion too, and a plugin-registered aggregate declaring `monotone_join: true` participates on the same terms. `SUM` and `AVG` are non-monotone and rejected with `NonMonotonicInRecursion`.
 
 | Aggregate | Formula | Direction | Identity | Domain |
 |-----------|---------|-----------|----------|--------|
@@ -658,6 +674,12 @@ Semantics: "The probability that all conditions hold simultaneously." Uses **log
 Fixpoint converges when:
 1. No new KEY tuples are produced, **AND**
 2. All monotonic accumulators are stable (change < `f64::EPSILON` since last iteration)
+
+For a rule whose folded value is read by a self-reference, delta-emptiness is
+not sufficient on its own: the consuming clause re-derives from a full snapshot
+every iteration, and a value can move *in place* without any row being new.
+There convergence is "no KEY added and no value moved", compared over whole rows
+after the 12-decimal rounding the merge applies.
 
 ### Compiler Warnings
 
@@ -1239,7 +1261,7 @@ Strata are evaluated in topological order:
 
 1. **Non-recursive strata:** Single pass — evaluate all clause bodies once, collect output.
 2. **Recursive strata:** Semi-naive fixpoint iteration until convergence.
-3. **Post-fixpoint operators:** After convergence, apply FOLD, PRIORITY filtering, and BEST BY selection.
+3. **Post-fixpoint operators:** After convergence, apply PRIORITY filtering, FOLD, the post-FOLD `WHERE`, and BEST BY selection, in that order. PRIORITY and FOLD are *additionally* recomputed once per iteration for a rule whose folded value a same-stratum reference reads — that snapshot is what the reference sees. The post-FOLD `WHERE` and BEST BY stay post-fixpoint only: they filter the folded value, and a non-monotone filter applied per iteration would let a fact appear, vanish and reappear.
 4. **Store results:** Converged facts are placed in `DerivedStore` for downstream strata.
 
 ## 15.3 Semi-Naive Fixpoint
@@ -1286,9 +1308,19 @@ Each iteration:
 2. Check stability: compare current accumulators against previous snapshot
 3. If all accumulators are stable AND no new key tuples → convergence
 
+`MonotonicAggState` is fed the *delta* only, and the merge returns early
+without updating it when the delta is empty — so it cannot keep the loop alive
+on its own; only new rows can. That is sound wherever a value never moves
+without a new row. It stops being sound for a rule whose folded value a
+self-reference reads, which is why those rules carry their own whole-row change
+test (see [Section 8.2](#82-monotonic-aggregates-safe-in-recursion)) rather than
+relying on this state.
+
 ## 15.5 IS-Ref Resolution
 
 **Positive IS-ref (semi-join):** For each MATCH row, check if subject(s) exist in target rule's derived relation. If found, bind additional columns and pass through. If not, filter out.
+
+Which relation, exactly, depends on where the reference sits. A reference to a *lower stratum* reads that rule's published, folded facts. A reference *within the same recursive stratum* reads one of two views of the target's in-progress relation: its **folded** view — one row per KEY carrying that KEY's aggregate — when the target carries FOLD and the referring clause has no ALONG; otherwise its **contribution** rows, one per derivation. The contribution view is what ALONG's `prev.x`, a self-negated `IS NOT`, and provenance lineage all require.
 
 **IS NOT Boolean (anti-join):** Keep only MATCH rows where subject does NOT appear in target rule.
 
@@ -1684,7 +1716,7 @@ session.locy_with(program) \
 ### Recursive Rules
 
 - **Always define a base case** (clause without self-IS-reference) and a recursive case.
-- **Use ALONG for per-path metrics** (cost, hops), not FOLD. FOLD aggregates across paths; ALONG accumulates within a path.
+- **Use ALONG for per-path metrics** (cost, hops), not FOLD. FOLD rolls up per KEY, composing one level at a time; ALONG accumulates within a single path.
 - **Use BEST BY to prune dominated paths** early — dramatically reduces search space.
 - **Choose monotonic aggregates carefully:** MSUM for additive quantities, MNOR for probabilistic OR, MPROD for probabilistic AND.
 

@@ -26,6 +26,18 @@ Cause: a recursive rule folds with an aggregate whose registered semilattice dec
 
 Fix: switch to a monotone aggregate (`MSUM` for additive accumulation, `MMAX`/`MMIN`, or the plain `MIN`/`MAX`/`COUNT`/`COLLECT`), or move the non-monotone fold into a separate non-recursive rule that consumes the recursive relation with `IS`.
 
+### FoldInRecursivePath
+
+Cause: a clause has a recursive `IS`-reference and a `FOLD` aggregate but no `ALONG`. This is a warning, not an error, and the shape is legitimate — it is how a bill-of-materials or risk rollup is written.
+
+Fix: nothing, if you wanted a per-KEY rollup. The warning exists because authors who wanted a value accumulated along each *path* — a cost, a hop count — want `ALONG` instead. See [Rule semantics](locy/rule-semantics.md#what-a-self-reference-reads) for what the self-reference binds.
+
+### A recursive rollup returns a number that disagrees with its own children
+
+Cause: on releases before the issue #162 fix, a self-reference inside a recursive `FOLD` rule read the target's *pre-fold* rows rather than its folded value, and whole-row deduplication then collapsed equal-valued siblings. Any node with two or more children of equal value lost all but one of them, and the error propagated to every ancestor — optimistically, for `MNOR`/`MPROD`.
+
+Fix: upgrade. The invariant to check needs no external oracle: an assembly's rolled-up value must equal the fold of its children's rolled-up values.
+
 ### BestByWithMonotonicFold
 
 Cause: `BEST BY` used in the same rule as a declared lattice fold — `MSUM`, `MMAX`, `MMIN`, `MCOUNT`, `MNOR` or `MPROD`. The check is syntactic over those six names and applies to every rule, recursive or not.

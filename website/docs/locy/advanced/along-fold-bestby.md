@@ -24,6 +24,34 @@ FOLD total = SUM(b.value)
 YIELD KEY a, total
 ```
 
+### FOLD in a recursive rule
+
+A recursive `FOLD` rolls up **per KEY, one level at a time**: a self-reference
+binds one row per KEY of the target carrying that KEY's folded value, so a
+parent folds its children's values and each child has already folded its own.
+
+```cypher
+CREATE RULE build AS
+MATCH (p:Part) WHERE p IS NOT assembly
+YIELD KEY p, 0.5 AS b
+
+CREATE RULE build AS
+MATCH (p:Part)-[:CONTAINS]->(c:Part)
+WHERE c IS build
+FOLD b = MPROD(b)
+YIELD KEY p, b
+```
+
+For `TOP → MID → {L1, L2}` with both leaves at 0.5, `MID` is `0.25` and `TOP`
+folds that single value, so `TOP` is `0.25` too.
+
+`ALONG` is the per-path alternative, and it wins on its own clause: a clause
+carrying `ALONG` reads the pre-fold rows, because `prev.<field>` accumulates
+along one path and a per-KEY aggregate is not defined per path. The choice is
+made per clause, so a sibling clause of the same rule that folds an inherited
+value still gets the folded value. See
+[Rule semantics](../rule-semantics.md#what-a-self-reference-reads).
+
 ### Standard Aggregators
 
 | Operator | Description | Example |

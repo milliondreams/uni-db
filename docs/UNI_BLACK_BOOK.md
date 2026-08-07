@@ -3379,6 +3379,20 @@ Consequences:
 - `SUM` and `AVG` are `monotone_join: false` and remain rejected in recursion. Use `MSUM` (caller-asserted non-negative) when a recursive sum is genuinely wanted.
 - A plugin-registered aggregate declaring `monotone_join: true` works in a recursive stratum. That includes rules registered through `db.rules().register(...)` — the facade chains `RuleRegistry::with_plugin_registry` so registration compiles against the same aggregates queries see. It does **not** extend to reopening the database: `UniBuilder` has no plugin-registration hook (`Uni::add_plugin` is only reachable after open), and `build_locy_registry_from_persisted` runs immediately after `register_builtin_plugins` with a registry that holds builtins only. A persisted rule folding over a plugin aggregate therefore fails the open naming that rule, unless `skip_invalid_locy_rules(true)` is set — in which case it is dropped with a warning and must be re-registered after `add_plugin`. Rules folding over built-in aggregates reload normally.
 
+#### What a self-reference reads: the two derived-scan views
+
+A recursive rule's own facts exist in two shapes while the fixpoint runs, and different consumers need different ones. `DerivedScanView` (`crates/uni-query/src/query/df_graph/locy_fixpoint.rs`) names them, and the `DerivedScanRegistry` keys handles by `(rule_name, is_self_ref, view)` so both can be live at once:
+
+- **`Contributions`** — the pre-fold rows, one per derivation, carrying the hidden `__deriv_*` discriminators. ALONG's `prev.x` needs these (it accumulates along a single path); so do a self-negated `IS NOT` and provenance, whose `base_fact_id` hashes must stay joinable with the ones `record_provenance` records.
+- **`Folded`** — one row per KEY carrying that KEY's folded value, refreshed at the end of every merge by running `PriorityExec` + `FoldExec` — the same operators the post-fixpoint chain uses — over the accumulated contributions and grafting the result onto a representative row per KEY. A clause that folds a child's value reads this.
+
+The planner picks the view **per clause**: a positive same-stratum reference to a rule carrying FOLD gets `Folded` unless the clause carries ALONG, in which case ALONG wins for that clause only. Before this split (issue #162), every self-reference read contributions, so a parent joined one row per *contribution* of its child rather than one row per child, and whole-row dedup then collapsed the equal-valued ones — a silently optimistic rollup.
+
+Two consequences inside `FixpointState`:
+
+- Contributions are **replaced** on re-derivation, keyed on every column except the fold inputs, rather than appended. Once a child's folded value can move between iterations, a parent that already emitted a row against the child's partial value would otherwise fold the stale row in alongside the fresh one.
+- Convergence is **value-based**: a clause reading a full snapshot re-derives every iteration, so delta-emptiness alone is not progress. `MonotonicAggState` cannot serve here — it is only ever fed the delta.
+
 ### Post-FOLD WHERE (HAVING)
 
 A `WHERE` clause after `FOLD` filters aggregated groups — equivalent to SQL's `HAVING`:
@@ -3550,6 +3564,8 @@ CREATE RULE converging_score AS
     ALONG score = (prev.score + neighbor_avg) / 2.0
 ```
 
+`prev.<field>` is rewritten to a bare column reference over the self-referential derived scan, so a clause carrying `ALONG` always reads the **`Contributions`** view — a per-KEY aggregate is not defined per path. See *What a self-reference reads* above.
+
 ## Execution Model
 
 ### Two-Phase Execution Architecture
@@ -3636,6 +3652,8 @@ Iteration 2: delta₂ = evaluate(rules, delta₁) - known_facts
 ...
 Iteration n: deltaₙ = ∅ → fixpoint reached
 ```
+
+Two exceptions. A **non-linear** rule (≥2 positive same-stratum `IS`-refs in one clause) gets full facts, because a Δ×Δ join misses the Δ×F_old combinations. And a rule serving the **`Folded`** view publishes a full per-KEY snapshot rather than a delta — an aggregate is a whole-relation quantity — so for those rules the fixpoint has settled when no KEY has been added *and* no value has moved, not merely when the delta is empty.
 
 ## Locy Commands
 

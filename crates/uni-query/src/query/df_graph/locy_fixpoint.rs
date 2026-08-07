@@ -61,6 +61,31 @@ pub use super::locy_complement::{
 // DerivedScanRegistry — injection point for IS-ref data into subplans
 // ---------------------------------------------------------------------------
 
+/// Which view of a rule's derived relation a scan reads (issue #162).
+///
+/// A recursive rule's own facts exist in two shapes during iteration, and
+/// different consumers need different ones:
+///
+/// * [`Contributions`](DerivedScanView::Contributions) — the pre-fold rows, one
+///   per derivation. ALONG's `prev.x` needs these (it carries a value along one
+///   *path*, not a KEY's aggregate), and so do self-negated IS NOT and
+///   provenance, whose `base_fact_id` hashes must stay joinable with the hashes
+///   `record_provenance` records.
+/// * [`Folded`](DerivedScanView::Folded) — one row per KEY carrying that KEY's
+///   folded value. A clause that folds a child's value needs this; reading
+///   contributions instead makes it treat one child as N children, which is
+///   issue #162.
+///
+/// Both views of the same rule can be live at once — a rule may have an ALONG
+/// clause reading contributions and another clause folding its value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DerivedScanView {
+    /// Pre-fold rows, one per derivation.
+    Contributions,
+    /// KEY-grouped snapshot, one row per KEY carrying its folded value.
+    Folded,
+}
+
 /// A single entry in the derived scan registry.
 ///
 /// Each entry corresponds to one `LocyDerivedScan` node in the logical plan tree.
@@ -74,6 +99,8 @@ pub struct DerivedScanEntry {
     pub rule_name: String,
     /// Whether this is a self-referential scan (rule references itself).
     pub is_self_ref: bool,
+    /// Which view of the rule's relation this scan reads.
+    pub view: DerivedScanView,
     /// Shared data handle — write batches here to inject into subplans.
     pub data: Arc<RwLock<Vec<RecordBatch>>>,
     /// Schema of the derived relation.
@@ -469,6 +496,61 @@ pub struct FixpointState {
     strict_probability_domain: bool,
     /// Active probability semiring for this rule's MNOR/MPROD math.
     semiring_kind: SemiringKind,
+    /// Issue #162: per-iteration folded view, present exactly when some scan
+    /// in this stratum reads this rule's [`DerivedScanView::Folded`] view.
+    fold_view: Option<FoldViewState>,
+}
+
+/// State backing the per-iteration folded view (issue #162).
+///
+/// A self-reference inside a recursive FOLD rule currently joins the rule's
+/// pre-fold *contribution* rows, so a parent sees one row per contribution of
+/// its child rather than one row per child. This state keeps a KEY-grouped
+/// snapshot of the rule's own facts, refreshed at the end of every merge, and
+/// [`update_derived_scan_handles`] feeds *that* to same-stratum references.
+///
+/// Two things follow from a value that can now move between iterations:
+///
+/// * contributions must be **replaced** on re-derivation rather than appended,
+///   keyed on everything except the fold inputs — otherwise a parent that
+///   already emitted a row against a child's partial value folds the stale row
+///   in alongside the fresh one;
+/// * convergence can no longer be "the delta is empty", because a clause
+///   reading a full snapshot re-derives every iteration. `prev_rows` carries
+///   the whole-row set forward so a value that moves in place still counts as
+///   a change. Note [`MonotonicAggState`] cannot serve this role — it is only
+///   ever fed the delta, and `merge_delta` returns early without updating it
+///   when the delta is empty, so only *new rows* can keep the loop alive there.
+///
+/// # Which chain stages run per iteration
+///
+/// **PRIORITY and FOLD only.** Both produce the value a self-reference reads,
+/// and PRIORITY has to come first or [`FoldExec`] drops `__priority` before it
+/// can be honoured — the same ordering `apply_post_fixpoint_chain` uses.
+///
+/// **HAVING and BEST BY stay post-fixpoint.** They are filters over the folded
+/// value, and applying a non-monotone filter per iteration would let a fact
+/// appear, disappear and reappear, which the whole-row change test above reads
+/// as perpetual progress. A rule that self-references *and* carries HAVING is
+/// therefore evaluated against its unfiltered folded value and filtered once at
+/// the end. `issue_162_having_is_not_applied_to_the_per_iteration_snapshot`
+/// pins the distinction: a child that HAVING removes from the answer must still
+/// have been visible to its parent while the fixpoint ran.
+struct FoldViewState {
+    /// The rule's FOLD bindings — the same ones `apply_post_fixpoint_chain`
+    /// hands to [`FoldExec`], so the per-iteration snapshot and the final
+    /// answer come from one aggregation implementation.
+    bindings: Vec<FoldBinding>,
+    /// Whether the rule carries PRIORITY. PRIORITY must run *before* FOLD or
+    /// FOLD drops the `__priority` column, so the snapshot chain mirrors the
+    /// post-fixpoint chain's ordering.
+    has_priority: bool,
+    /// Tolerance for the probability-domain check, threaded to `FoldExec`.
+    probability_epsilon: f64,
+    /// KEY-grouped snapshot of `facts`, in the rule's contribution schema.
+    folded: Vec<RecordBatch>,
+    /// Whole-row set from the previous merge, for change detection.
+    prev_rows: HashSet<Vec<ScalarKey>>,
 }
 
 impl FixpointState {
@@ -524,7 +606,379 @@ impl FixpointState {
             row_dedup,
             strict_probability_domain,
             semiring_kind,
+            fold_view: None,
         }
+    }
+
+    /// Turn on the per-iteration folded view for this rule.
+    pub fn enable_fold_view(
+        &mut self,
+        bindings: Vec<FoldBinding>,
+        has_priority: bool,
+        probability_epsilon: f64,
+    ) {
+        self.fold_view = Some(FoldViewState {
+            bindings,
+            has_priority,
+            probability_epsilon,
+            folded: Vec::new(),
+            prev_rows: HashSet::new(),
+        });
+    }
+
+    /// Whether the per-iteration folded view is active.
+    pub fn has_fold_view(&self) -> bool {
+        self.fold_view.is_some()
+    }
+
+    /// The KEY-grouped snapshot a same-stratum reference should read.
+    pub fn folded_facts(&self) -> &[RecordBatch] {
+        self.fold_view.as_ref().map_or(&[], |fv| &fv.folded)
+    }
+
+    /// Resolve each fold binding's input column index against the live schema.
+    fn fold_input_indices(&self) -> Vec<usize> {
+        let Some(fv) = self.fold_view.as_ref() else {
+            return Vec::new();
+        };
+        fv.bindings
+            .iter()
+            .filter_map(|b| {
+                b.input_col_name
+                    .as_ref()
+                    .and_then(|n| self.schema.index_of(n).ok())
+                    .or(Some(b.input_col_index))
+                    .filter(|&i| i < self.schema.fields().len())
+            })
+            .collect()
+    }
+
+    /// Merge candidates by **replacing** any contribution
+    /// whose derivation key already exists, instead of appending it.
+    ///
+    /// The derivation key is every column except the fold inputs: the KEY
+    /// columns, the `__deriv_*` discriminators and any other yield column. Two
+    /// rows sharing it are the same derivation re-evaluated against a child
+    /// whose folded value has since moved, so the newer row wins.
+    ///
+    /// Returns `true` when the whole-row set changed — a new derivation, or an
+    /// existing one whose value moved.
+    pub async fn merge_fold_contributions(
+        &mut self,
+        candidates: Vec<RecordBatch>,
+        task_ctx: &Arc<TaskContext>,
+    ) -> DFResult<bool> {
+        if let Some(first) = candidates.iter().find(|b| b.num_rows() > 0) {
+            self.reconcile_schema(&first.schema());
+        }
+        let candidates = round_float_columns(&candidates);
+
+        // Existing facts first, candidates after, so the newest row for a
+        // derivation key is the one that survives.
+        let mut all: Vec<RecordBatch> = self
+            .facts
+            .iter()
+            .cloned()
+            .chain(candidates)
+            .filter(|b| b.num_rows() > 0)
+            .collect();
+        if all.is_empty() {
+            self.delta.clear();
+            return Ok(false);
+        }
+        let combined = if all.len() == 1 {
+            all.pop().expect("len checked")
+        } else {
+            arrow::compute::concat_batches(&self.schema, &all).map_err(arrow_err)?
+        };
+
+        let fold_inputs = self.fold_input_indices();
+        let deriv_key_indices: Vec<usize> = self
+            .all_column_indices
+            .iter()
+            .copied()
+            .filter(|i| !fold_inputs.contains(i))
+            .collect();
+
+        let mut latest: HashMap<Vec<ScalarKey>, u32> = HashMap::new();
+        for row in 0..combined.num_rows() {
+            let key = extract_scalar_key(&combined, &deriv_key_indices, row);
+            latest.insert(key, row as u32);
+        }
+        let mut keep: Vec<u32> = latest.into_values().collect();
+        keep.sort_unstable();
+
+        let indices = arrow_array::UInt32Array::from(keep);
+        let columns = combined
+            .columns()
+            .iter()
+            .map(|c| arrow::compute::take(c.as_ref(), &indices, None))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(arrow_err)?;
+        let retained =
+            RecordBatch::try_new(Arc::clone(&self.schema), columns).map_err(arrow_err)?;
+
+        // Change detection and delta over whole rows.
+        let mut rows_now: HashSet<Vec<ScalarKey>> = HashSet::new();
+        let mut new_row_indices: Vec<u32> = Vec::new();
+        {
+            let prev = &self.fold_view.as_ref().expect("fold view").prev_rows;
+            for row in 0..retained.num_rows() {
+                let full = extract_scalar_key(&retained, &self.all_column_indices, row);
+                if !prev.contains(&full) {
+                    new_row_indices.push(row as u32);
+                }
+                rows_now.insert(full);
+            }
+        }
+        let changed = rows_now != self.fold_view.as_ref().expect("fold view").prev_rows;
+
+        self.delta = if new_row_indices.is_empty() {
+            Vec::new()
+        } else {
+            let idx = arrow_array::UInt32Array::from(new_row_indices);
+            let cols = retained
+                .columns()
+                .iter()
+                .map(|c| arrow::compute::take(c.as_ref(), &idx, None))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(arrow_err)?;
+            vec![RecordBatch::try_new(Arc::clone(&self.schema), cols).map_err(arrow_err)?]
+        };
+
+        self.facts_bytes = batch_byte_size(&retained);
+        if self.facts_bytes > self.max_derived_bytes {
+            return Err(datafusion::error::DataFusionError::Execution(
+                LocyRuntimeError::MemoryLimitExceeded {
+                    rule: self.rule_name.clone(),
+                    bytes: self.facts_bytes,
+                    limit: self.max_derived_bytes,
+                }
+                .to_string(),
+            ));
+        }
+        self.facts = vec![retained];
+        if let Some(fv) = self.fold_view.as_mut() {
+            fv.prev_rows = rows_now;
+        }
+        self.recompute_folded(task_ctx).await?;
+        Ok(changed)
+    }
+
+    /// Recompute the KEY-grouped snapshot from the accumulated contributions.
+    ///
+    /// One output row per KEY: a representative contribution row with each
+    /// fold column overwritten by that KEY's aggregate. Keeping the
+    /// contribution schema means the reading clause resolves the same column
+    /// names it does today, and the `__deriv_*` columns it does not project
+    /// simply carry the representative's values.
+    ///
+    /// The aggregate itself comes from [`FoldExec`] — the same operator
+    /// `apply_post_fixpoint_chain` runs — rather than a second implementation.
+    /// That matters for aggregates with no row-level fast path (`AVG`,
+    /// `COLLECT`): a hand-rolled `update_step` loop cannot compute them, and
+    /// silently substituting the representative row's value would make a
+    /// same-stratum consumer read a sample instead of an aggregate.
+    ///
+    /// PRIORITY is applied first, mirroring the post-fixpoint chain's order —
+    /// `FoldExec` emits KEY plus fold columns only, so it would otherwise drop
+    /// `__priority` before it could be honoured. HAVING and BEST BY are
+    /// deliberately *not* applied here; see [`FoldViewState`].
+    async fn recompute_folded(&mut self, task_ctx: &Arc<TaskContext>) -> DFResult<()> {
+        if self.fold_view.is_none() {
+            return Ok(());
+        }
+        if self.facts.is_empty() || self.facts.iter().all(|b| b.num_rows() == 0) {
+            if let Some(fv) = self.fold_view.as_mut() {
+                fv.folded.clear();
+            }
+            return Ok(());
+        }
+
+        let batches: Vec<RecordBatch> = self
+            .facts
+            .iter()
+            .filter(|b| b.num_rows() > 0)
+            .cloned()
+            .collect();
+        let combined = if batches.len() == 1 {
+            batches[0].clone()
+        } else {
+            arrow::compute::concat_batches(&self.schema, &batches).map_err(arrow_err)?
+        };
+        let combined_schema = combined.schema();
+
+        // Group rows by KEY, preserving first-seen order.
+        let mut order: Vec<Vec<ScalarKey>> = Vec::new();
+        let mut groups: HashMap<Vec<ScalarKey>, Vec<usize>> = HashMap::new();
+        for row in 0..combined.num_rows() {
+            let key = extract_scalar_key(&combined, &self.key_column_indices, row);
+            match groups.entry(key.clone()) {
+                std::collections::hash_map::Entry::Occupied(mut e) => e.get_mut().push(row),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    order.push(key);
+                    e.insert(vec![row]);
+                }
+            }
+        }
+
+        // Representative = the group's first row, restricted to the rows that
+        // survive PRIORITY so the snapshot's non-fold columns agree with the
+        // rows the fold actually aggregated.
+        let priority_idx = combined_schema.index_of("__priority").ok();
+        let representatives: Vec<u32> = order
+            .iter()
+            .map(|k| {
+                let rows = &groups[k];
+                let pick = priority_idx
+                    .and_then(|pi| {
+                        let col = combined.column(pi);
+                        let best = rows
+                            .iter()
+                            .filter_map(|&r| extract_f64(col.as_ref(), r))
+                            .fold(f64::NEG_INFINITY, f64::max);
+                        rows.iter()
+                            .copied()
+                            .find(|&r| extract_f64(col.as_ref(), r).is_some_and(|v| v >= best))
+                    })
+                    .unwrap_or(rows[0]);
+                pick as u32
+            })
+            .collect();
+        let idx = arrow_array::UInt32Array::from(representatives);
+        let mut columns = combined
+            .columns()
+            .iter()
+            .map(|c| arrow::compute::take(c.as_ref(), &idx, None))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(arrow_err)?;
+
+        // PRIORITY -> FOLD over the accumulated contributions.
+        let fv = self.fold_view.as_ref().expect("fold view checked above");
+        let bindings = fv.bindings.clone();
+        let has_priority = fv.has_priority;
+        let epsilon = fv.probability_epsilon;
+        let mut plan: Arc<dyn ExecutionPlan> = MemorySourceConfig::try_new_exec(
+            &[vec![combined]],
+            Arc::clone(&combined_schema),
+            None,
+        )?;
+        if has_priority && let Some(pi) = priority_idx {
+            let keys = self.key_indices_in(&plan.schema())?;
+            plan = Arc::new(PriorityExec::new(plan, keys, pi));
+        }
+        let fold_keys = self.key_indices_in(&plan.schema())?;
+        let n_keys = fold_keys.len();
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(FoldExec::new_with_semiring(
+            plan,
+            fold_keys,
+            bindings.clone(),
+            self.strict_probability_domain,
+            epsilon,
+            self.semiring_kind,
+        ));
+        let folded_batches = collect_all_partitions(&plan, Arc::clone(task_ctx)).await?;
+        let folded_out = match folded_batches.iter().find(|b| b.num_rows() > 0) {
+            Some(b) => b.clone(),
+            None => {
+                // Nothing aggregated (all-empty input): leave the
+                // representative rows as they stand.
+                let folded =
+                    RecordBatch::try_new(Arc::clone(&self.schema), columns).map_err(arrow_err)?;
+                if let Some(fv) = self.fold_view.as_mut() {
+                    fv.folded = vec![folded];
+                }
+                return Ok(());
+            }
+        };
+
+        // `FoldExec` emits KEY columns (in `fold_keys` order) followed by one
+        // column per binding. Map each KEY back to its row so the aggregate can
+        // be grafted onto the representative.
+        let out_key_indices: Vec<usize> = (0..n_keys).collect();
+        let mut fold_row: HashMap<Vec<ScalarKey>, u32> = HashMap::new();
+        for row in 0..folded_out.num_rows() {
+            fold_row.insert(
+                extract_scalar_key(&folded_out, &out_key_indices, row),
+                row as u32,
+            );
+        }
+        let mut picks: Vec<u32> = Vec::with_capacity(order.len());
+        for key in &order {
+            let Some(&r) = fold_row.get(key) else {
+                return Err(datafusion::error::DataFusionError::Execution(format!(
+                    "rule '{}': FOLD produced no row for a KEY group present in \
+                     its own facts — the folded view and the contribution set \
+                     disagree",
+                    self.rule_name
+                )));
+            };
+            picks.push(r);
+        }
+        let picks = arrow_array::UInt32Array::from(picks);
+
+        for (pos, binding) in bindings.iter().enumerate() {
+            let Some(dest) = binding
+                .input_col_name
+                .as_ref()
+                .and_then(|n| combined_schema.index_of(n).ok())
+                .or(Some(binding.input_col_index))
+                .filter(|&i| i < columns.len())
+            else {
+                continue;
+            };
+            let src = folded_out.column(n_keys + pos);
+            let taken = arrow::compute::take(src.as_ref(), &picks, None).map_err(arrow_err)?;
+            let want = combined_schema.field(dest).data_type();
+            columns[dest] = if taken.data_type() == want {
+                taken
+            } else {
+                // A fold whose output type is not the contribution column's
+                // type (COLLECT -> List) cannot be carried in the contribution
+                // schema. Fail loudly: substituting the representative row's
+                // value here is exactly the silent-sample bug this rewrite
+                // exists to remove.
+                arrow::compute::cast(&taken, want).map_err(|_| {
+                    datafusion::error::DataFusionError::Execution(format!(
+                        "rule '{}': FOLD '{}' produces {:?}, which cannot be \
+                         represented in the '{}' column ({:?}) that a \
+                         same-stratum reference reads. Move the fold into a \
+                         separate non-recursive rule and consume that with IS.",
+                        self.rule_name,
+                        binding.output_name,
+                        taken.data_type(),
+                        combined_schema.field(dest).name(),
+                        want,
+                    ))
+                })?
+            };
+        }
+
+        let folded = RecordBatch::try_new(Arc::clone(&self.schema), columns).map_err(arrow_err)?;
+        if let Some(fv) = self.fold_view.as_mut() {
+            fv.folded = vec![folded];
+        }
+        Ok(())
+    }
+
+    /// Resolve this rule's KEY columns by name against `schema`.
+    ///
+    /// Positions drift as operators add and drop columns (`PriorityExec` drops
+    /// `__priority`), so the cached `key_column_indices` are only valid against
+    /// the contribution schema.
+    fn key_indices_in(&self, schema: &SchemaRef) -> DFResult<Vec<usize>> {
+        self.key_column_names
+            .iter()
+            .map(|n| {
+                schema.index_of(n).map_err(|_| {
+                    datafusion::error::DataFusionError::Execution(format!(
+                        "rule '{}': KEY column '{}' missing from the folded-view \
+                         input schema",
+                        self.rule_name, n
+                    ))
+                })
+            })
+            .collect()
     }
 
     /// Reconcile the pre-computed schema with the actual physical plan output.
@@ -1276,7 +1730,7 @@ async fn run_fixpoint_loop(
             } else {
                 None
             };
-            FixpointState::new_with_semiring(
+            let mut state = FixpointState::new_with_semiring(
                 rule.name.clone(),
                 Arc::clone(&rule.yield_schema),
                 rule.key_column_indices.clone(),
@@ -1284,7 +1738,22 @@ async fn run_fixpoint_loop(
                 monotonic_agg,
                 strict_probability_domain,
                 semiring_kind,
-            )
+            );
+            // Issue #162: maintain the folded snapshot exactly when some scan
+            // in this stratum asks for it. Deriving the decision from the
+            // registry the planner built keeps one authority for it.
+            let serves_folded_view = registry
+                .entries
+                .iter()
+                .any(|e| e.rule_name == rule.name && e.view == DerivedScanView::Folded);
+            if serves_folded_view && !rule.fold_bindings.is_empty() {
+                state.enable_fold_view(
+                    rule.fold_bindings.clone(),
+                    rule.has_priority,
+                    probability_epsilon,
+                );
+            }
+            state
         })
         .collect();
 
@@ -1398,6 +1867,12 @@ async fn run_fixpoint_loop(
             // best row per KEY group, enabling convergence on cyclic graphs.
             let changed = if rule.has_best_by && !rule.best_by_criteria.is_empty() {
                 states[rule_idx].merge_best_by(all_candidates, &rule.best_by_criteria)?
+            } else if states[rule_idx].has_fold_view() {
+                // Issue #162: replace contributions per derivation key and
+                // refresh the folded snapshot the self-refs read.
+                states[rule_idx]
+                    .merge_fold_contributions(all_candidates, &task_ctx)
+                    .await?
             } else {
                 states[rule_idx]
                     .merge_delta(all_candidates, Some(Arc::clone(&task_ctx)))
@@ -4220,7 +4695,12 @@ fn update_derived_scan_handles(
         };
 
         let is_self = entry.rule_name == *current_rule_name;
-        let data = if is_self && !rules[current_rule_idx].non_linear {
+        let data = if entry.view == DerivedScanView::Folded {
+            // Issue #162: this scan reads one row per KEY carrying that KEY's
+            // folded value, not one row per contribution. It is a full
+            // snapshot, so semi-naive delta injection does not apply.
+            states[source_idx].folded_facts().to_vec()
+        } else if is_self && !rules[current_rule_idx].non_linear {
             // Self-ref in a linear rule: inject delta for semi-naive
             states[source_idx].all_delta().to_vec()
         } else {
@@ -5565,6 +6045,7 @@ mod tests {
             scan_index: 0,
             rule_name: "reachable".into(),
             is_self_ref: true,
+            view: DerivedScanView::Contributions,
             data: Arc::clone(&data),
             schema: Arc::clone(&schema),
         });
@@ -5586,6 +6067,7 @@ mod tests {
             scan_index: 0,
             rule_name: "r1".into(),
             is_self_ref: true,
+            view: DerivedScanView::Contributions,
             data: Arc::new(RwLock::new(Vec::new())),
             schema: Arc::clone(&schema),
         });
@@ -5593,6 +6075,7 @@ mod tests {
             scan_index: 1,
             rule_name: "r2".into(),
             is_self_ref: false,
+            view: DerivedScanView::Contributions,
             data: Arc::new(RwLock::new(Vec::new())),
             schema: Arc::clone(&schema),
         });
@@ -5600,6 +6083,7 @@ mod tests {
             scan_index: 2,
             rule_name: "r1".into(),
             is_self_ref: false,
+            view: DerivedScanView::Contributions,
             data: Arc::new(RwLock::new(Vec::new())),
             schema: Arc::clone(&schema),
         });

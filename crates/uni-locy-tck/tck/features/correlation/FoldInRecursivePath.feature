@@ -2,9 +2,11 @@ Feature: FoldInRecursivePath compile warning (Semantic Stress Corpus B3)
 
   When a recursive rule (an IS-reference to a rule in the same SCC)
   carries a FOLD clause but no ALONG, the compiler emits
-  `FoldInRecursivePath`. FOLD groups by KEY columns, not by path —
-  authors who want per-path aggregation across recursive walks
-  almost always meant to add ALONG.
+  `FoldInRecursivePath`. A recursive FOLD rolls up per KEY, composing one
+  level at a time — a self-reference reads the target's folded value
+  (issue #162). That is a legitimate and common shape, so the warning
+  flags a choice rather than a defect: authors who wanted a value
+  accumulated along each PATH want ALONG instead.
 
   Background:
     Given an empty graph
@@ -32,9 +34,15 @@ Feature: FoldInRecursivePath compile warning (Semantic Stress Corpus B3)
     Then evaluation should succeed
     And the result should contain a FoldInRecursivePath warning
 
-  # ── Recursive + ALONG (path-aware) → no warning ───────────────────────
+  # ── Recursive + ALONG still warns ─────────────────────────────────────
+  #
+  # The scenario below used to be titled "... ALONG suppresses the warning",
+  # which never matched the compiler: `phase_b_f1_fires_even_when_along_present`
+  # asserts it fires regardless. The scenario asserted only that evaluation
+  # succeeded, so the mismatch went unnoticed. It now asserts what actually
+  # happens.
 
-  Scenario: Recursive IS-ref + FOLD + ALONG suppresses the warning
+  Scenario: Recursive IS-ref + FOLD + ALONG still emits FoldInRecursivePath
     Given having executed:
       """
       CREATE (:Node {name: 'A'})-[:EDGE]->(:Node {name: 'B'})
@@ -55,6 +63,7 @@ Feature: FoldInRecursivePath compile warning (Semantic Stress Corpus B3)
         YIELD KEY a, KEY b, risk
       """
     Then evaluation should succeed
+    And the result should contain a FoldInRecursivePath warning
 
   # ── Non-recursive rule with FOLD but no ALONG → no warning ───────────
 

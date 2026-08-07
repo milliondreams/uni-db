@@ -425,7 +425,7 @@ MATCH (a)-[r:KNOWS]->(b) RETURN r, created_at(r), updated_at(r)
 
 8. **Vector index metric must match embedding model** -- Use `cosine` for normalized embeddings (most models), `l2` for raw/unnormalized embeddings. Mismatched metric produces poor search results.
 
-9. **Locy rules are NOT standard Datalog** -- Locy has `ALONG`, `FOLD`, `BEST BY`, `PROB`, `DERIVE`, `ASSUME`, `ABDUCE` which do not exist in standard Datalog. IS/IS NOT references invoke other rules.
+9. **Locy rules are NOT standard Datalog** -- Locy has `ALONG`, `FOLD`, `BEST BY`, `PROB`, `DERIVE`, `ASSUME`, `ABDUCE` which do not exist in standard Datalog. IS/IS NOT references invoke other rules. A recursive `FOLD` rolls up **per KEY, one level at a time** -- a self-reference reads the target's folded value, not the derivations behind it. Use `ALONG` for per-path accumulation.
 
 10. **Unbounded variable-length paths** -- `[*]` without an upper bound causes exponential expansion. Always set an upper bound: `[*..5]`.
 

@@ -136,3 +136,43 @@ Feature: ALONG Path-Carried Values
       """
     Then evaluation should succeed
     And the derived relation 'outgoing' should have 1 facts
+
+  # ── ALONG opts out its own clause, not the whole rule (issue #162) ──────
+  #
+  # A self-reference in a clause carrying ALONG keeps reading pre-fold
+  # contribution rows: `prev.x` accumulates along one PATH, and a KEY-grouped
+  # folded value is not defined per path. But that choice is per clause. A
+  # sibling clause of the same rule that folds an inherited value still reads
+  # the folded view, so an ALONG anywhere in the rule must not silently put the
+  # rollup back on contribution rows.
+
+  Scenario: ALONG on one clause leaves a sibling clause folding the folded value
+    Given having executed:
+      """
+      CREATE (t:Unit {name: 'TOP'}),
+             (m:Unit {name: 'MID'}),
+             (t)-[:CONTAINS]->(m),
+             (m)-[:CONTAINS]->(:Unit {name: 'L1'}),
+             (m)-[:CONTAINS]->(:Unit {name: 'L2'})
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE assembly AS
+        MATCH (p:Unit)-[:CONTAINS]->(:Unit)
+        YIELD KEY p
+      CREATE RULE build AS
+        MATCH (p:Unit)
+        WHERE p IS NOT assembly
+        ALONG b = 0.5
+        YIELD KEY p, b
+      CREATE RULE build AS
+        MATCH (p:Unit)-[:CONTAINS]->(c:Unit)
+        WHERE c IS build
+        FOLD b = MPROD(b)
+        YIELD KEY p, b
+      """
+    Then evaluation should succeed
+    # MID = 0.5 × 0.5 = 0.25 and TOP folds that single child value, so TOP is
+    # 0.25 as well. A rule-level "has ALONG anywhere ⇒ read contributions"
+    # would put TOP back at 0.5.
+    And the derived relation 'build' should contain a fact where b = 0.25

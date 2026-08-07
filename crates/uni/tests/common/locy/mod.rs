@@ -48,3 +48,10 @@ pub mod locy_schemaless_property_type_inference;
 // A string literal in YIELD is NULL in `derived` while QUERY returns it.
 // Same class as the schemaless property defect, different cause.
 pub mod locy_string_literal_yield;
+// Issue #162: a PROB fold that is correct in its own rule arrives one factor
+// short at the rule that consumes it, when the folded values are equal.
+pub mod locy_issue_162_prob_fold_consumer;
+// Issue #162 diagnostic: which BOM shapes the recursive MPROD rollup gets wrong.
+pub mod locy_issue_162_shape_matrix;
+// Issue #162: scaling guard for the per-iteration folded view.
+pub mod locy_issue_162_fold_scaling;

@@ -279,7 +279,7 @@ Locy distinguishes two warning channels. **Compile-time warnings** (`WarningCode
 | `UncalibratedNeuralPredicate` | A rule invokes a PROB model that declares no `CALIBRATION` (or `CALIBRATION none`) | The uncalibrated probability flows into the probabilistic stack, compounding miscalibration. Run a `CALIBRATE` statement or acknowledge with `CALIBRATION none`. |
 | `UncalibratedLLMLogprobs` | An uncalibrated `CREATE MODEL` whose `xervo_alias` looks like an LLM provider | Raw LLM logprobs are not calibrated probabilities. |
 | `ProbabilityDomainViolation` | A probability input falls outside `[0, 1]` | The value was clamped (or rejected under `strict_probability_domain`). |
-| `FoldInRecursivePath` | A clause has a recursive IS-ref and a FOLD aggregate but no ALONG | Almost always a semantic mistake — FOLD groups by KEY columns, not by path. |
+| `FoldInRecursivePath` | A clause has a recursive IS-ref and a FOLD aggregate but no ALONG | The rule rolls up per KEY, composing level by level. Use `ALONG` if you meant per-path accumulation. |
 | `EceBinningBias` | `VALIDATE METRICS ece` was requested | Equal-width-binning ECE is biased in the small-sample regime; prefer `debiased_ece`. |
 
 ## Errors

@@ -113,7 +113,7 @@ The physics is encoded. Now you can *use* it.
 
 **ASSUME + DERIVE: Forward simulation.** "Given the world as it is, what happens if I change X?"
 
-```cypher
+```locy
 ASSUME {
     DELETE (firewall)-[:PROTECTS]->(server)
 }
@@ -128,7 +128,7 @@ Apply a hypothetical mutation inside a transaction savepoint. All rules re-evalu
 
 **ABDUCE: Backward imagination.** "Given a desired future, what changes would produce it?"
 
-```cypher
+```locy
 ABDUCE compliant 
 WHERE system.name = 'ProductionCluster' 
 RETURN required_changes
@@ -142,7 +142,7 @@ Together: **two directions of the same cognitive capability — thinking about s
 
 Every conclusion Uni reaches via Locy has a full derivation tree.
 
-```cypher
+```locy
 EXPLAIN RULE flagged 
 WHERE account.id = 'ACC-001' 
 RETURN derivation

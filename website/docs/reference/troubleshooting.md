@@ -154,6 +154,7 @@ Error: Parse error at line 1, column 15: unexpected token
 **Common Causes:**
 
 1. **Missing quotes around strings:**
+   <!-- doctest: skip -->
    ```cypher
    // Wrong
    WHERE p.title = My Paper
@@ -163,6 +164,7 @@ Error: Parse error at line 1, column 15: unexpected token
    ```
 
 2. **Wrong comparison operator:**
+   <!-- doctest: skip -->
    ```cypher
    // Wrong (SQL style)
    WHERE p.year == 2023
@@ -223,13 +225,13 @@ Error: Query timeout after 300 seconds
    ```cypher
    MATCH (p:Paper)-[:CITES]->(cited)
    RETURN p.title, cited.title
-   LIMIT 1000  -- Add limit
+   LIMIT 1000  // Add limit
    ```
 
 2. **Add filters:**
    ```cypher
    MATCH (p:Paper)-[:CITES]->(cited)
-   WHERE p.year > 2020  -- Filter early
+   WHERE p.year > 2020  // Filter early
    RETURN p.title, cited.title
    ```
 
@@ -259,8 +261,8 @@ Error: Query execution failed: Out of memory
 1. **Reduce result size:**
    ```cypher
    MATCH (p:Paper)
-   RETURN p.title  -- Only needed columns
-   LIMIT 10000     -- Reasonable limit
+   RETURN p.title  // Only needed columns
+   LIMIT 10000     // Reasonable limit
    ```
 
 2. **Stream results:**
@@ -331,6 +333,7 @@ uni query "EXPLAIN MATCH (p:Paper) WHERE p.year > 2020 RETURN p" --path ./storag
 **Common Causes:**
 
 1. **Function on indexed column:**
+   <!-- doctest: skip -->
    ```cypher
    // Index NOT used (function applied to column)
    WHERE LOWER(p.venue) = 'neurips'
@@ -340,6 +343,7 @@ uni query "EXPLAIN MATCH (p:Paper) WHERE p.year > 2020 RETURN p" --path ./storag
    ```
 
 2. **OR conditions:**
+   <!-- doctest: skip -->
    ```cypher
    // May not use index efficiently
    WHERE p.year > 2020 OR p.venue = 'NeurIPS'
@@ -348,6 +352,7 @@ uni query "EXPLAIN MATCH (p:Paper) WHERE p.year > 2020 RETURN p" --path ./storag
    ```
 
 3. **Leading wildcard:**
+   <!-- doctest: skip -->
    ```cypher
    // Cannot use index
    WHERE p.title CONTAINS 'attention'
@@ -356,6 +361,7 @@ uni query "EXPLAIN MATCH (p:Paper) WHERE p.year > 2020 RETURN p" --path ./storag
    ```
 
 4. **Low selectivity:**
+   <!-- doctest: skip -->
    ```cypher
    // If 80% of data matches, full scan may be faster
    WHERE p.year > 2000
@@ -374,7 +380,7 @@ Error: Failed to build vector index: out of memory
    ```cypher
    CREATE VECTOR INDEX paper_embeddings
    FOR (p:Paper) ON p.embedding
-   OPTIONS { type: 'ivf_pq' }  -- Less memory
+   OPTIONS { type: 'ivf_pq' }  // Less memory
    ```
 
 2. **Build asynchronously after bulk load:**

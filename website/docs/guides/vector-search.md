@@ -192,7 +192,7 @@ The query vector's length must match the property's declared dimension — a mis
 When your vector index has an embedding configuration, you can pass text directly:
 
 ```cypher
--- The index auto-embeds the text query
+// The index auto-embeds the text query
 CALL uni.vector.query('Paper', 'embedding', 'attention mechanisms in transformers', 10)
 YIELD node, score
 RETURN node.title, score
@@ -664,23 +664,23 @@ For Cosine and L2, you can compare scores across queries without worrying about 
 DDL supports selecting the index type and tuning parameters directly:
 
 ```cypher
--- IVF-PQ with custom parameters (default algorithm)
+// IVF-PQ with custom parameters (default algorithm)
 CREATE VECTOR INDEX idx FOR (p:Paper) ON p.embedding
 OPTIONS { type: 'ivf_pq', partitions: '256', sub_vectors: '16' }
 
--- HNSW-SQ with custom parameters
+// HNSW-SQ with custom parameters
 CREATE VECTOR INDEX idx FOR (p:Paper) ON p.embedding
 OPTIONS { type: 'hnsw_sq', m: '32', ef_construction: '200' }
 
--- HNSW-Flat for exact graph search (no quantization loss)
+// HNSW-Flat for exact graph search (no quantization loss)
 CREATE VECTOR INDEX idx FOR (p:Paper) ON p.embedding
 OPTIONS { type: 'hnsw_flat', m: '16', ef_construction: '200' }
 
--- IVF-RQ (RaBitQ) for best accuracy/compression tradeoff
+// IVF-RQ (RaBitQ) for best accuracy/compression tradeoff
 CREATE VECTOR INDEX idx FOR (p:Paper) ON p.embedding
 OPTIONS { type: 'ivf_rq', partitions: '256' }
 
--- HNSW-SQ with IVF partitions for very large datasets (>1M vectors)
+// HNSW-SQ with IVF partitions for very large datasets (>1M vectors)
 CREATE VECTOR INDEX idx FOR (p:Paper) ON p.embedding
 OPTIONS { type: 'hnsw_sq', partitions: '32' }
 ```
@@ -729,13 +729,13 @@ OPTIONS { type: 'muvera', k_sim: 4, reps: 20, d_proj: 16 }
 **3. Query** — either re-rank a dense candidate set, or query the tokens directly:
 
 ```cypher
--- Direct multi-vector query: score is the exact MaxSim similarity
+// Direct multi-vector query: score is the exact MaxSim similarity
 CALL uni.vector.query('Document', 'tokens', [[0.1, 0.2], [0.3, 0.4]], 10)
 YIELD node, score
 RETURN node.title, score
 ORDER BY score DESC
 
--- Or: dense first stage, then MaxSim re-rank
+// Or: dense first stage, then MaxSim re-rank
 CALL uni.vector.query('Document', 'embedding', $dense_q, 50, null, null,
   { reranker: 'maxsim', reranker_property: 'tokens',
     maxsim_query: [[0.1, 0.2], [0.3, 0.4]] })
@@ -761,7 +761,7 @@ CALL uni.vector.query(
   'embedding',
   $query_vector,
   10,
-  'year >= 2020 AND venue = "NeurIPS"'  // Filter pushed to LanceDB
+  'year >= 2020 AND venue = "NeurIPS"'  // Filter pushed to Lance
 )
 YIELD node AS paper, distance
 RETURN paper.title, distance
@@ -787,7 +787,7 @@ LIMIT 10
 **When to use pre-filtering:**
 - Filter is selective (reduces search space significantly)
 - You need fewer results than the filtered set size
-- The filter column is indexed in LanceDB
+- The filter column is indexed in Lance
 
 **When to use post-filtering:**
 - Filter is not very selective
@@ -933,7 +933,7 @@ CALL uni.search(
     'Paper',
     {vector: 'embedding', fts: 'abstract'},
     'transformer attention mechanisms',
-    null,  -- auto-embed the text
+    null,  // auto-embed the text
     10
 )
 YIELD node, score, vector_score, fts_score

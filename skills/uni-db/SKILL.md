@@ -181,26 +181,26 @@ CRDT types: `GCounter`, `GSet`, `ORSet`, `LWWRegister`, `LWWMap`, `Rga`, `Vector
 ### CRUD
 
 ```cypher
--- Create node
+// Create node
 CREATE (n:Person {name: 'Alice', age: 30})
 
--- Create node with ext_id (for MERGE/lookup)
+// Create node with ext_id (for MERGE/lookup)
 CREATE (n:Person {ext_id: 'user-123', name: 'Alice'})
 
--- Create edge
+// Create edge
 MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'})
 CREATE (a)-[:KNOWS {since: 2023}]->(b)
 
--- Read
+// Read
 MATCH (p:Person) WHERE p.age > 25 RETURN p.name, p.age
 
--- Update
+// Update
 MATCH (n:Person {name: 'Alice'}) SET n.age = 31, n.updated = datetime()
 
--- Delete (must have no edges)
+// Delete (must have no edges)
 MATCH (n:Person {name: 'Alice'}) DELETE n
 
--- Detach delete (removes edges first)
+// Detach delete (removes edges first)
 MATCH (n:Person {name: 'Alice'}) DETACH DELETE n
 ```
 
@@ -214,7 +214,7 @@ result = session.query(
 )
 
 # Python — session-level params
-session.set("min_age", 25)
+session.params().set("min_age", 25)
 result = session.query("MATCH (p:Person) WHERE p.age > $min_age RETURN p")
 
 # Python — builder pattern
@@ -275,33 +275,33 @@ db.schema() \
 
 ```python
 session = db.session()
-session.set("company", "Acme")
+session.params().set("company", "Acme")
 result = session.query("MATCH (c:Company {name: $company}) RETURN c")
 ```
 
 ### Vector Search
 
 ```cypher
--- Basic vector search (top-K scan)
+// Basic vector search (top-K scan)
 CALL uni.vector.query('Document', 'embedding', $query_vector, 10)
 YIELD node, score
 RETURN node.title, score ORDER BY score DESC
 
--- ~= operator (shorthand for vector top-K scan, desugars to uni.vector.query)
+// ~= operator (shorthand for vector top-K scan, desugars to uni.vector.query)
 MATCH (d:Doc) WHERE d.embedding ~= $query_vector RETURN d.title LIMIT 10
 
--- Inline per-row similarity scoring (no CALL/YIELD needed)
+// Inline per-row similarity scoring (no CALL/YIELD needed)
 MATCH (d:Doc)
 RETURN d.title, similar_to(d.embedding, $query_vector) AS score
 ORDER BY score DESC
 
--- Hybrid search: vector + FTS with RRF fusion (correct way)
+// Hybrid search: vector + FTS with RRF fusion (correct way)
 MATCH (d:Doc)
 RETURN d.title,
   similar_to([d.embedding, d.content], [$query_vector, $query_text]) AS score
 ORDER BY score DESC
 
--- Hybrid search via procedure
+// Hybrid search via procedure
 CALL uni.search('Document', {vector: 'embedding', fts: 'content'},
     'graph databases', null, 10)
 YIELD node, score, vector_score, fts_score
@@ -316,7 +316,12 @@ RETURN node.title, score
 result = session.locy("""
     CREATE RULE reachable AS
         MATCH (a:Person)-[:KNOWS]->(b:Person)
-        WHERE a IS reachable OR a.name = 'Alice'
+        WHERE a.name = 'Alice'
+        YIELD KEY b
+
+    CREATE RULE reachable AS
+        MATCH (a:Person)-[:KNOWS]->(b:Person)
+        WHERE a IS reachable
         YIELD KEY b
 
     QUERY reachable

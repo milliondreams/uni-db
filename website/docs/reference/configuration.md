@@ -2,6 +2,16 @@
 
 This document provides a comprehensive reference for all Uni configuration options, environment variables, and tuning parameters.
 
+
+!!! warning "The Rust and Python builders are not the same API"
+    `hybrid(local, remote)` and `cloud_config(cfg)` exist **only on the Python
+    builder** (`bindings/uni-db/src/builders.rs`). The Rust builder has a single
+    `remote_storage(remote_url, CloudStorageConfig)` that does both. Two
+    same-named builders with divergent method sets across the FFI boundary is an
+    easy thing to mis-copy, so check which language a snippet is in before
+    reusing it.
+
+
 ## Configuration Overview
 
 **Status (2.2.1, 2026-06-16):** Configuration is currently applied **programmatically** via the Rust API (`UniConfig`) or the Python builder. Configuration files (`uni.toml`) and `UNI_*` environment overrides are **planned** but not wired into the CLI/server yet.
@@ -449,7 +459,7 @@ Hybrid mode stores bulk data in cloud storage while keeping WAL and metadata loc
 use uni_db::Uni;
 
 let db = Uni::open("./local_meta")
-    .hybrid("./local_meta", "s3://my-bucket/graph-data")
+    .remote_storage("s3://my-bucket/graph-data", CloudStorageConfig::default())
     .build()
     .await?;
 ```
@@ -480,8 +490,7 @@ let config = CloudStorageConfig::S3 {
 };
 
 let db = Uni::open("./local")
-    .hybrid("./local", "s3://my-bucket/data")
-    .cloud_config(config)
+    .remote_storage("s3://my-bucket/data", config)
     .build()
     .await?;
 ```
@@ -538,13 +547,13 @@ let config = CloudStorageConfig::Azure {
 BACKUP and COPY commands support cloud URLs:
 
 ```cypher
--- Backup to S3
+// Backup to S3
 BACKUP TO 's3://backup-bucket/uni-backup-2024'
 
--- Import from S3
+// Import from S3
 COPY Person FROM 's3://data-bucket/people.parquet'
 
--- Export to GCS
+// Export to GCS
 COPY Person TO 'gs://export-bucket/people.parquet'
 ```
 
@@ -777,8 +786,7 @@ let config = UniConfig {
 let cloud = CloudStorageConfig::s3_from_env("my-bucket");
 
 let db = Uni::open("./local-cache")
-    .hybrid("./local-cache", "s3://my-bucket/data")
-    .cloud_config(cloud)
+    .remote_storage("s3://my-bucket/data", cloud)
     .config(config)
     .build()
     .await?;

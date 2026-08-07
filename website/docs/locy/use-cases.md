@@ -74,8 +74,8 @@ Data bundle:
 
 Route support incidents to the best resolver by combining service-dependency graph traversal with semantic matching against runbooks and expertise profiles. Pure vector search finds similar runbooks but doesn't know which team owns them or which service is affected. Pure graph queries traverse service→team→runbook paths but can't score semantic relevance. Locy + `similar_to` does both: walk the dependency graph and score each candidate by how well their expertise matches the incident.
 
-```cypher
--- Find the best-matching runbook reachable through the affected service's dependency graph
+```locy
+// Find the best-matching runbook reachable through the affected service's dependency graph
 CREATE RULE best_resolver AS
 MATCH (incident:Incident)-[:AFFECTS]->(svc:Service)-[:DEPENDS_ON*]->(dep:Service)
       <-[:OWNS]-(team:Team)-[:HAS_RUNBOOK]->(rb:Runbook)

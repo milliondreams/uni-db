@@ -658,7 +658,7 @@ class ProfileOutput:
     operators: Any
 
 class LocyExplainOutput:
-    """Typed output from ``session.explain_locy()``."""
+    """Typed output from ``session.locy_with(program).explain()``."""
 
     plan_text: str
     strata_count: int
@@ -681,7 +681,7 @@ class LocyProfileOutput:
     peak_memory_bytes: int
     """Peak derived-fact memory, in bytes."""
     plan_text: str
-    """Compile-time plan text (identical to ``explain_locy()``)."""
+    """Compile-time plan text (identical to ``locy_with(...).explain()``)."""
     strata: list[dict[str, Any]]
     """Per-stratum / per-rule / per-iteration profile as nested dicts and lists
     (snake_case keys; operators carry ``operator``, ``actual_rows``, ``time_ms``)."""

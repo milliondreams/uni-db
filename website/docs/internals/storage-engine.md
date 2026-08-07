@@ -237,6 +237,13 @@ flowchart TB
 
 The L2 layer contains fully compacted, indexed data.
 
+!!! warning "Illustrative, not the real API"
+    The struct shown below is a **sketch**, not a type in the codebase.
+    `L2Layer`, `L0ManagerConfig`, `LanceFragment`, `FragmentStatistics`,
+    `ColumnStats`, `VectorIndexStorage` and `ScalarIndexStorage` do not exist
+    anywhere in the workspace. Read it as a shape description; consult
+    `crates/uni-store/src/` for the actual types.
+
 ```rust
 pub struct L2Layer {
     /// Main vertex dataset (per label)
@@ -337,6 +344,13 @@ data/
 ```
 
 ### Data Fragment Structure
+
+!!! warning "Illustrative, not the real API"
+    The struct shown below is a **sketch**, not a type in the codebase.
+    `L2Layer`, `L0ManagerConfig`, `LanceFragment`, `FragmentStatistics`,
+    `ColumnStats`, `VectorIndexStorage` and `ScalarIndexStorage` do not exist
+    anywhere in the workspace. Read it as a shape description; consult
+    `crates/uni-store/src/` for the actual types.
 
 ```rust
 pub struct LanceFragment {
@@ -505,27 +519,15 @@ storage/
 │                         ADJACENCY DATASET SCHEMA                             │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
-│   Chunked CSR Format (one row per chunk of vertices):                       │
+│   Adjacency table (one row per source vertex):                              │
 │   ┌─────────────┬──────────────┬────────────────────────────────────────┐  │
-│   │ Column      │ Type         │ Description                            │  │
-│   ├─────────────┼──────────────┼────────────────────────────────────────┤  │
-│   │ chunk_id    │ UInt64       │ Chunk identifier                       │  │
-│   │ vid_start   │ UInt64       │ First VID in chunk                     │  │
-│   │ vid_end     │ UInt64       │ Last VID in chunk (exclusive)          │  │
-│   │ offsets     │ List<UInt64> │ CSR offsets (chunk_size + 1 elements)  │  │
-│   │ neighbors   │ List<UInt64> │ Neighbor VIDs (flattened)              │  │
-│   │ edge_ids    │ List<UInt64> │ Edge IDs (parallel to neighbors)       │  │
+│   │ src_vid     │ UInt64       │ Source vertex                          │  │
+│   │ neighbors   │ List<UInt64> │ Destination VIDs                       │  │
+│   │ edge_ids    │ List<UInt64> │ Matching edge IDs                      │  │
 │   └─────────────┴──────────────┴────────────────────────────────────────┘  │
-│                                                                             │
-│   Example (chunk_size=1000):                                                │
-│   ┌────────────────────────────────────────────────────────────────────┐   │
-│   │ chunk_id: 0                                                         │   │
-│   │ vid_start: 0, vid_end: 1000                                         │   │
-│   │ offsets: [0, 3, 3, 7, 10, ...]  (1001 elements)                     │   │
-│   │ neighbors: [v5, v12, v99, v4, v6, v8, v42, ...]                     │   │
-│   │ edge_ids: [e1, e2, e3, e4, e5, e6, e7, ...]                         │   │
-│   └────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
+│                                                                            │
+│   Three columns, one row per vertex — see `storage/adjacency.rs`           │
+│   (`get_arrow_schema`). There is no chunk_id/offsets encoding.             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -607,12 +609,15 @@ Note: The label_id is encoded in the VID, but `labels` is carried explicitly so 
 
 ```rust
 impl Wal {
-    pub async fn recover(&self, l0: &mut L0Buffer) -> Result<()> {
+    // NOTE: the real type is `WriteAheadLog` (runtime/wal.rs) and the real
+    // entry point is `replay_since(high_water_mark)`. There is no `recover()`
+    // and no `WalReader` — this block is illustrative only.
+    pub async fn replay_since(&self, high_water_mark: u64) -> Result<Vec<Mutation>> {
         // Find all WAL segments
         let segments = self.list_segments()?;
 
         for segment in segments {
-            let reader = WalReader::open(&segment)?;
+            // (illustrative) segments are read through WriteAheadLog itself
 
             while let Some(entry) = reader.next_entry()? {
                 // Verify CRC
@@ -742,6 +747,13 @@ impl StorageManager {
 
 Vector indexes (HNSW, IVF_PQ) are stored within Lance datasets:
 
+!!! warning "Illustrative, not the real API"
+    The struct shown below is a **sketch**, not a type in the codebase.
+    `L2Layer`, `L0ManagerConfig`, `LanceFragment`, `FragmentStatistics`,
+    `ColumnStats`, `VectorIndexStorage` and `ScalarIndexStorage` do not exist
+    anywhere in the workspace. Read it as a shape description; consult
+    `crates/uni-store/src/` for the actual types.
+
 ```rust
 pub struct VectorIndexStorage {
     /// Lance dataset with index
@@ -786,6 +798,13 @@ impl VectorIndexStorage {
 ### Scalar Index Storage
 
 Scalar indexes use Lance's built-in index support:
+
+!!! warning "Illustrative, not the real API"
+    The struct shown below is a **sketch**, not a type in the codebase.
+    `L2Layer`, `L0ManagerConfig`, `LanceFragment`, `FragmentStatistics`,
+    `ColumnStats`, `VectorIndexStorage` and `ScalarIndexStorage` do not exist
+    anywhere in the workspace. Read it as a shape description; consult
+    `crates/uni-store/src/` for the actual types.
 
 ```rust
 pub struct ScalarIndexStorage {
@@ -870,10 +889,12 @@ RETURN p.name, json_get_string(p.overflow_json, 'age')
 ```
 
 **Supported JSON Functions:**
-- `json_get_string(overflow_json, key)` - Extract string value
-- `json_get_int(overflow_json, key)` - Extract integer value
-- `json_get_float(overflow_json, key)` - Extract float value
-- `json_get_bool(overflow_json, key)` - Extract boolean value
+!!! warning "`json_get_*` are not real functions"
+    No `json_get_string` / `json_get_int` / `json_get_float` / `json_get_bool`
+    function is registered anywhere. Overflow-property extraction is performed
+    **inline by the scan operator** (`df_graph/scan.rs`) when it sees a property
+    that is not a typed column — there is no user-callable JSON accessor to
+    write in a query. Write `p.city` and the scan resolves it.
 
 ### Rewriting Algorithm
 
@@ -901,10 +922,10 @@ Queries seamlessly mix both types:
 // Overflow: 'city' and 'verified' not in schema
 
 MATCH (p:Person)
-WHERE p.name = 'Alice'        -- Typed column (fast)
-  AND p.city = 'NYC'          -- overflow_json (rewritten)
-  AND p.verified = true       -- overflow_json (rewritten)
-RETURN p.name, p.city, p.age  -- Mixed access
+WHERE p.name = 'Alice'        // Typed column (fast)
+  AND p.city = 'NYC'          // overflow_json (rewritten)
+  AND p.verified = true       // overflow_json (rewritten)
+RETURN p.name, p.city, p.age  // Mixed access
 ```
 
 **Planner automatically:**
@@ -981,10 +1002,10 @@ let session = db.session();
 // Create with schema + overflow properties
 let tx = session.tx().await?;
 tx.execute("CREATE (:Person {
-    name: 'Bob',       -- Schema (typed column)
-    age: 25,           -- Schema (typed column)
-    city: 'NYC',       -- Overflow (overflow_json)
-    verified: true     -- Overflow (overflow_json)
+    name: 'Bob',       // Schema (typed column)
+    age: 25,           // Schema (typed column)
+    city: 'NYC',       // Overflow (overflow_json)
+    verified: true     // Overflow (overflow_json)
 })").await?;
 tx.commit().await?;
 
@@ -993,9 +1014,9 @@ db.flush().await?;
 // Query mixing both (transparent to user)
 let results = session.query("
     MATCH (p:Person)
-    WHERE p.name = 'Bob'      -- Fast: typed column
-      AND p.city = 'NYC'      -- Rewritten: json_get_string(...)
-    RETURN p.age, p.verified  -- Mixed: typed + overflow
+    WHERE p.name = 'Bob'      // Fast: typed column
+      AND p.city = 'NYC'      // Rewritten: json_get_string(...)
+    RETURN p.age, p.verified  // Mixed: typed + overflow
 ").await?;
 ```
 
@@ -1094,8 +1115,7 @@ use uni_common::CloudStorageConfig;
 let cloud = CloudStorageConfig::s3_from_env("my-bucket");
 
 let db = Uni::open("./local-cache")
-    .hybrid("./local-cache", "s3://my-bucket/graph-data")
-    .cloud_config(cloud)
+    .remote_storage("s3://my-bucket/graph-data", cloud)
     .build()
     .await?;
 ```

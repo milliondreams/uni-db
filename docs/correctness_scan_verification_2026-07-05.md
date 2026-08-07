@@ -1,5 +1,9 @@
 # Correctness Scan — Independent Verification & Repro Coverage (2026-07-05)
 
+> **Status: RESOLVED — historical snapshot as of 2026-07-05.**
+> Verification pass for `correctness_scan_2026-07-05.md`; see that file's
+> status header. Line-number citations refer to the 2026-07-05 tree.
+
 Companion to `docs/correctness_scan_2026-07-05.md`. Every finding in that scan was
 **independently re-verified from source** (original verdicts/classifications ignored),
 and a runnable repro test was created for every survivor.

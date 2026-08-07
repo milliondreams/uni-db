@@ -21,7 +21,7 @@ see [Reference](reference.md); for the per-loader details, see
 
 | Concern | Question | Mechanism | Configured on |
 | --- | --- | --- | --- |
-| **Trust** | Whether/whom to load | Signature policy, trust root, hash-pin | The host builder (`plugin_trust`) |
+| **Trust** | Whether/whom to load | Signature policy, trust root, artifact hash-pin | The host builder (`plugin_trust`) |
 | **Capabilities** | What a loaded plugin may do | Grant set (`effective = declared ∩ granted`), quotas | The load call (`grants=[...]`) |
 
 Trust is a per-instance, host-level decision: one signature policy and one trust
@@ -85,10 +85,36 @@ root.allow_with_key("ops@example.com", pubkey_bytes); // 32-byte Ed25519 key
 
 `allow_with_key(key_id, public_key)` binds a key id to its 32-byte Ed25519 public
 key; the related `allow(key_id)` adds a key id *without* key material, which is
-useful for shape-only verification and tests. Cryptographic verification of a
-signed manifest (`verify_signed_manifest` / `verify_ed25519`) happens under the
-default-on `ed25519` Cargo feature; with that feature disabled, the verifier
-falls back to checking signature shape and trust-root membership only.
+useful for shape-only verification and tests.
+
+Cryptographic verification of a signed manifest (`verify_signed_manifest` /
+`verify_ed25519`) is **always compiled** — there is no Cargo feature gating it
+and no degraded shape-only fallback. `ed25519-dalek` is an unconditional
+dependency of `uni-plugin`, whose only feature is `otel`. The verifier is also
+fail-closed: a `key_id` present in the trust root but carrying no public-key
+bytes (the `allow()` shape-only path) is **rejected**, not waved through.
+
+### Artifact hash-pinning
+
+`PluginTrustConfig::pinned_artifacts` is a set of Blake3 hex digests. Left empty
+(the default) pinning is off. When populated, every loader entry point that
+receives payload bytes — WASM component, Extism, Rhai, PyO3 — rejects a payload
+whose digest is not in the set, before it is instantiated and before any
+capability is granted.
+
+```rust
+let mut trust = PluginTrustConfig::default();
+trust.pinned_artifacts.insert(
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+);
+```
+
+The pin is deliberately **external** to the artifact. A digest carried inside a
+plugin's own manifest is self-certifying — anyone able to rewrite the payload can
+rewrite the digest beside it — so an embedded `hash` field is only meaningful
+when an Ed25519 signature covers the whole manifest (see
+`canonical_payload`, which is exactly why the signature spans every field rather
+than the hash alone).
 
 ### Why it is not in `UniConfig`
 

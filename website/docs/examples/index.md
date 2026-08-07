@@ -28,6 +28,13 @@ We provide examples in **Python**, **Python with Pydantic OGM**, and **Rust** to
 | **Semiconductor Yield Excursion Triage** | Real-data manufacturing triage using DERIVE, ASSUME, ABDUCE, and EXPLAIN | [Python](python/locy_semiconductor_yield_excursion.ipynb) | - |
 | **Pharma Batch Genealogy (Flagship #2)** | Batch-risk propagation and risk-first intervention optimization | [Python](python/locy_pharma_batch_genealogy.ipynb) | - |
 | **Cyber Exposure Twin (Flagship #3)** | Hybrid search + columnar analytics + Locy remediation decisioning | [Python](python/locy_cyber_exposure_twin.ipynb) | - |
+| **Adverse Drug Reaction** | Signal detection over drug/event/patient graphs with probabilistic rules | [Python](python/locy_adverse_drug_reaction.ipynb) | [Rust](rust/locy_adverse_drug_reaction.ipynb) |
+| **Drug-Drug Interaction** | Interaction inference across co-prescription and mechanism paths | [Python](python/locy_drug_drug_interaction.ipynb) | [Rust](rust/locy_drug_drug_interaction.ipynb) |
+| **Drug Repurposing** | Candidate discovery by multi-hop target/pathway reasoning | [Python](python/locy_drug_repurposing.ipynb) | - |
+| **Patent FTO** | Freedom-to-operate analysis over claim and citation graphs | [Python](python/locy_patent_fto.ipynb) | - |
+| **Predictive Maintenance** | Failure-propagation reasoning across asset dependency graphs | [Python](python/locy_predictive_maintenance.ipynb) | [Rust](rust/locy_predictive_maintenance.ipynb) |
+| **Probabilistic Risk Scoring** | PROB-weighted derivation with calibrated confidence | [Python](python/locy_probabilistic_risk_scoring.ipynb) | [Rust](rust/locy_probabilistic_risk_scoring.ipynb) |
+| **Regulatory Impact** | Rule-change impact propagation across obligations and controls | [Python](python/locy_regulatory_impact.ipynb) | - |
 
 ## Choosing an API
 

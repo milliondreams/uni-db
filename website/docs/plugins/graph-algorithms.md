@@ -91,13 +91,13 @@ No more generating the plugin once per arity, and no more padding unused slots w
     A GraphCompute `CALL` with **neither** `nodeLabels` nor `edgeTypes` no longer silently projects every declared label and edge type. It now **errors**. To project the whole graph you must opt in explicitly with `projectAll: true`:
 
     ```cypher
-    -- Was: implicitly the whole graph. Now: ERROR.
+    // Was: implicitly the whole graph. Now: ERROR.
     CALL myplugin.spread([1, 2, 3])
 
-    -- Whole graph, explicit:
+    // Whole graph, explicit:
     CALL myplugin.spread([1, 2, 3], {projectAll: true})
 
-    -- Scoped (recommended, unchanged):
+    // Scoped (recommended, unchanged):
     CALL myplugin.spread([1, 2, 3], {nodeLabels: ['N'], edgeTypes: ['E']})
     ```
 
@@ -116,7 +116,7 @@ Some algorithms need two views of the store at once — a detail graph and an ag
 
 ```cypher
 CALL myplugin.compare([], {
-    nodeLabels: ['Cell'], edgeTypes: ['ADJACENT'],     -- the primary projection
+    nodeLabels: ['Cell'], edgeTypes: ['ADJACENT'],     // the primary projection
     scopes: {
         agg:  {nodeLabels: ['Cell'], edgeTypes: ['AGGREGATES']},
         flow: {nodeQuery: 'MATCH (c:Cell) RETURN id(c) AS id',

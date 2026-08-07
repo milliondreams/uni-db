@@ -1,5 +1,10 @@
 # Sparse (#95) & Multi-vector (#96) Implementation Review
 
+> **Status: RESOLVED — historical snapshot as of 2026-06-27.**
+> The RC1 data-loss finding and RC2–RC6 are fixed (see the
+> `StorageBackend::lock_table_for_write` contract added for RC1). Line-number
+> citations refer to the 2026-06-27 tree. Retained for rationale.
+
 **Date:** 2026-06-27  
 **Scope:** Completeness, correctness, safety, reliability, concurrency, and test-coverage of the sparse-vector (issue #95) and multi-vector / ColBERT-MaxSim / MUVERA (issue #96) features.  
 **Method:** 12-reviewer dynamic workflow (2 features × 6 dimensions), each finding independently re-verified by an adversarial agent that re-read the cited code. 44 agents total.  

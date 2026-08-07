@@ -1,5 +1,17 @@
 # uni-db Fork Paths — Production-Readiness Review
 
+> **Status: RESOLVED — historical snapshot as of 2026-06-20.**
+> The verdict and severities below describe the tree *at that date* and are no
+> longer accurate. In particular the **CRITICAL primary-data-corruption**
+> finding is fixed: `StorageManager::at_fork_with_schema` now builds a
+> fork-scoped `SnapshotManager::new_for_fork(...)`
+> (`crates/uni-store/src/storage/manager.rs`) and deep-copies
+> `vid_labels_index` instead of sharing the parent's by `Arc`. Landed in
+> `13c00388e` ("fix(fork): production-readiness hardening (review P0+P1) + #99
+> + telemetry isolation"); the surviving fork invariants are recorded in
+> `CLAUDE.md`. Line-number citations below refer to the 2026-06-20 tree and
+> mostly no longer resolve. Retained for the reasoning behind the fixes.
+
 <!-- Generated 2026-06-20 by an 8-lane adversarial multi-agent review (56 agents): 47 findings raised, 41 confirmed after per-finding verification, 6 rejected as false positives. -->
 
 

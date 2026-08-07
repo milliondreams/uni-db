@@ -115,26 +115,24 @@ Same packed `u64` auto-increment as VID. Sentinel: `Eid::INVALID = u64::MAX`.
 ### Cypher DDL
 
 ```cypher
--- Create labels with typed properties
-CREATE LABEL Person {
-    name: STRING,
-    age: INTEGER,
-    email: STRING UNIQUE
-}
+// Create labels with typed properties
+CREATE LABEL Person (
+    name STRING,
+    age INTEGER,
+    email STRING UNIQUE
+)
 
-CREATE LABEL Document {
-    title: STRING,
-    content: STRING,
-    embedding: VECTOR(384)
-}
+CREATE LABEL Document (
+    title STRING,
+    content STRING,
+    embedding VECTOR(384)
+)
 
--- Create edge types with source/destination constraints
-CREATE EDGE TYPE KNOWS FROM [Person] TO [Person] {
-    since: DATE,
-    weight: FLOAT
-}
+// Create edge types with source/destination constraints
+CREATE EDGE TYPE KNOWS (since DATE,
+    weight FLOAT) FROM Person TO Person
 
-CREATE EDGE TYPE AUTHORED FROM [Person] TO [Document]
+CREATE EDGE TYPE AUTHORED FROM Person TO Document
 ```
 
 ### Rust API (SchemaBuilder)
@@ -228,9 +226,9 @@ All CRDTs implement `CrdtMerge` (commutative, associative, idempotent). Serializ
 | **LabelList** | List columns with containment queries | `array_contains_any`, `array_contains_all` | DDL: `"LABEL_LIST"`, Rust: `ScalarType::LabelList` |
 
 ```cypher
-CREATE INDEX idx_name ON Person (name)          -- Default: BTree
+CREATE INDEX idx_name FOR (p:Person) ON (p.name)          // Default: BTree
 
--- Via procedure API
+// Via procedure API
 CALL uni.schema.createIndex('Event', 'status', {"type": "BITMAP"})
 CALL uni.schema.createIndex('Doc', 'tags', {"type": "LABEL_LIST"})
 ```
@@ -258,24 +256,24 @@ db.schema().label("User")
 | **HNSW-PQ** | Product | Large datasets with graph speed + compression | `m`, `ef_construction`, `sub_vectors`, `partitions` |
 
 ```cypher
--- HNSW-SQ (default if no type specified)
-CREATE VECTOR INDEX idx_embed ON Document (embedding)
+// HNSW-SQ (default if no type specified)
+CREATE VECTOR INDEX idx_embed FOR (d:Document) ON (d.embedding)
   WITH { metric: 'cosine', type: 'hnsw_sq' }
 
--- HNSW-Flat (no quantization, exact graph search)
-CREATE VECTOR INDEX idx_embed ON Document (embedding)
+// HNSW-Flat (no quantization, exact graph search)
+CREATE VECTOR INDEX idx_embed FOR (d:Document) ON (d.embedding)
   WITH { metric: 'cosine', type: 'hnsw_flat' }
 
--- HNSW-SQ with IVF partitions for very large datasets
-CREATE VECTOR INDEX idx_embed ON Document (embedding)
+// HNSW-SQ with IVF partitions for very large datasets
+CREATE VECTOR INDEX idx_embed FOR (d:Document) ON (d.embedding)
   WITH { metric: 'cosine', type: 'hnsw_sq', partitions: 32 }
 
--- IVF-RQ (RaBitQ, 1-bit per dimension by default)
-CREATE VECTOR INDEX idx_embed ON Document (embedding)
+// IVF-RQ (RaBitQ, 1-bit per dimension by default)
+CREATE VECTOR INDEX idx_embed FOR (d:Document) ON (d.embedding)
   WITH { metric: 'cosine', type: 'ivf_rq', partitions: 256 }
 
--- IVF-PQ for memory-constrained large datasets
-CREATE VECTOR INDEX idx_embed ON Document (embedding)
+// IVF-PQ for memory-constrained large datasets
+CREATE VECTOR INDEX idx_embed FOR (d:Document) ON (d.embedding)
   WITH { metric: 'l2', type: 'ivf_pq', partitions: 256, sub_vectors: 16 }
 ```
 
@@ -290,7 +288,7 @@ CREATE VECTOR INDEX idx_embed ON Document (embedding)
 ### Full-Text Index (BM25)
 
 ```cypher
-CREATE FULLTEXT INDEX idx_content ON Article (content)
+CREATE FULLTEXT INDEX idx_content FOR (a:Article) ON EACH [a.content]
 
 CALL uni.fts.query('Article', 'content', 'graph database', 10)
 YIELD node, score
@@ -301,7 +299,7 @@ YIELD node, score
 Full-text search on nested JSON/JSONB properties:
 
 ```cypher
-CREATE JSON_FULLTEXT INDEX idx_meta ON Data (metadata)
+CREATE JSON FULLTEXT INDEX idx_meta FOR (d:Data) ON metadata
 ```
 
 ### Inverted Index
@@ -339,13 +337,14 @@ Resolution performance:
 
 Each label maps to a Lance table. Keep entities separate.
 
+<!-- doctest: skip -->
 ```cypher
--- GOOD
-CREATE LABEL Person { name: STRING, age: INTEGER }
-CREATE LABEL Company { name: STRING, founded: DATE }
+// GOOD
+CREATE LABEL Person ( name STRING, age INTEGER )
+CREATE LABEL Company ( name STRING, founded DATE )
 
--- BAD: mega-label mixing entity types
-CREATE LABEL Entity { type: STRING, name: STRING, age: INTEGER, founded: DATE }
+// BAD: mega-label mixing entity types
+CREATE LABEL Entity ( type STRING, name STRING, age INTEGER, founded DATE )
 ```
 
 ### Directional Edge Types
@@ -353,8 +352,8 @@ CREATE LABEL Entity { type: STRING, name: STRING, age: INTEGER, founded: DATE }
 Use verb phrases in UPPER_SNAKE_CASE that read naturally.
 
 ```cypher
-CREATE EDGE TYPE WORKS_AT FROM [Person] TO [Company] { since: DATE }
-CREATE EDGE TYPE PURCHASED FROM [Customer] TO [Product] { quantity: INTEGER }
+CREATE EDGE TYPE WORKS_AT (since DATE) FROM Person TO Company
+CREATE EDGE TYPE PURCHASED (quantity INTEGER) FROM Customer TO Product
 ```
 
 ### Property Type Selection Guide
@@ -378,8 +377,8 @@ Vertices can carry multiple labels. Each additional label stores the vertex in o
 
 ```cypher
 CREATE (n:Person:Employee {name: 'Alice', employee_id: 'E001'})
-MATCH (n:Employee) RETURN n.name  -- finds it
-MATCH (n:Person) RETURN n.name    -- also finds it
+MATCH (n:Employee) RETURN n.name  // finds it
+MATCH (n:Person) RETURN n.name    // also finds it
 ```
 
 Limit to 2-3 labels per vertex to avoid excessive storage duplication.
@@ -422,24 +421,24 @@ Limit to 2-3 labels per vertex to avoid excessive storage duplication.
 ## 9. ALTER Schema
 
 ```cypher
--- Add property (nullable, no data rewrite)
-ALTER LABEL Person ADD PROPERTY phone: STRING
+// Add property (nullable, no data rewrite)
+ALTER LABEL Person ADD PROPERTY phone STRING
 
--- Drop property (soft-delete)
+// Drop property (soft-delete)
 ALTER LABEL Person DROP PROPERTY age
 
--- Rename property
+// Rename property
 ALTER LABEL Person RENAME PROPERTY name TO full_name
 
--- Add edge property
-ALTER EDGE TYPE KNOWS ADD PROPERTY since: DATE
+// Add edge property
+ALTER EDGE TYPE KNOWS ADD PROPERTY since DATE
 
--- Drop label / edge type (soft-delete)
+// Drop label / edge type (soft-delete)
 DROP LABEL IF EXISTS TempData
 DROP EDGE TYPE IF EXISTS OLD_RELATION
 
--- Add / drop indexes
-CREATE INDEX idx_name ON Person (name)
+// Add / drop indexes
+CREATE INDEX idx_name FOR (p:Person) ON (p.name)
 DROP INDEX idx_name
 ```
 
@@ -474,9 +473,9 @@ YIELD name, type, enabled, properties, target
 ### SHOW Commands
 
 ```cypher
-SHOW INDEXES        -- All indexes with status
-SHOW CONSTRAINTS    -- All constraints
-SHOW DATABASE       -- Database metadata
+SHOW INDEXES        // All indexes with status
+SHOW CONSTRAINTS    // All constraints
+SHOW DATABASE       // Database metadata
 ```
 
 ### Python API
@@ -505,64 +504,64 @@ db.indexes().rebuild("Person", background=True)
 ### Social Network Schema
 
 ```cypher
-CREATE LABEL Person {
-    name: STRING,
-    email: STRING UNIQUE,
-    age: INTEGER,
-    embedding: VECTOR(384)
-}
+CREATE LABEL Person (
+    name STRING,
+    email STRING UNIQUE,
+    age INTEGER,
+    embedding VECTOR(384)
+)
 
-CREATE LABEL Company { name: STRING, founded: DATE }
+CREATE LABEL Company ( name STRING, founded DATE )
 
-CREATE EDGE TYPE KNOWS FROM [Person] TO [Person] { since: DATE, weight: FLOAT }
-CREATE EDGE TYPE WORKS_AT FROM [Person] TO [Company] { since: DATE }
+CREATE EDGE TYPE KNOWS (since DATE, weight FLOAT) FROM Person TO Person
+CREATE EDGE TYPE WORKS_AT (since DATE) FROM Person TO Company
 
-CREATE INDEX idx_person_name ON Person (name)
-CREATE VECTOR INDEX idx_person_embed ON Person (embedding) WITH { metric: 'cosine', type: 'hnsw' }
+CREATE INDEX idx_person_name FOR (p:Person) ON (p.name)
+CREATE VECTOR INDEX idx_person_embed FOR (p:Person) ON (p.embedding) OPTIONS { metric: 'cosine', type: 'hnsw' }
 ```
 
 ### Document / RAG Schema
 
 ```cypher
-CREATE LABEL Document {
-    title: STRING,
-    content: STRING,
-    embedding: VECTOR(768)
-}
+CREATE LABEL Document (
+    title STRING,
+    content STRING,
+    embedding VECTOR(768)
+)
 
-CREATE LABEL Chunk {
-    text: STRING,
-    embedding: VECTOR(768),
-    position: INTEGER
-}
+CREATE LABEL Chunk (
+    text STRING,
+    embedding VECTOR(768),
+    position INTEGER
+)
 
-CREATE EDGE TYPE CONTAINS FROM [Document] TO [Chunk]
-CREATE EDGE TYPE SIMILAR_TO FROM [Chunk] TO [Chunk] { score: FLOAT }
+CREATE EDGE TYPE CONTAINS FROM Document TO Chunk
+CREATE EDGE TYPE SIMILAR_TO (score FLOAT) FROM Chunk TO Chunk
 
-CREATE VECTOR INDEX idx_chunk_embed ON Chunk (embedding) WITH { metric: 'cosine', type: 'hnsw' }
-CREATE FULLTEXT INDEX idx_chunk_text ON Chunk (text)
+CREATE VECTOR INDEX idx_chunk_embed FOR (c:Chunk) ON (c.embedding) OPTIONS { metric: 'cosine', type: 'hnsw' }
+CREATE FULLTEXT INDEX idx_chunk_text FOR (c:Chunk) ON EACH [c.text]
 ```
 
 ### IoT Sensor Schema
 
 ```cypher
-CREATE LABEL Device {
-    ext_id: STRING,
-    name: STRING,
-    type: STRING
-}
+CREATE LABEL Device (
+    ext_id STRING,
+    name STRING,
+    type STRING
+)
 
-CREATE LABEL Reading {
-    timestamp: TIMESTAMP,
-    value: FLOAT,
-    unit: STRING
-}
+CREATE LABEL Reading (
+    timestamp TIMESTAMP,
+    value FLOAT,
+    unit STRING
+)
 
-CREATE LABEL Location { name: STRING, coordinates: STRING }
+CREATE LABEL Location ( name STRING, coordinates STRING )
 
-CREATE EDGE TYPE RECORDED FROM [Device] TO [Reading]
-CREATE EDGE TYPE LOCATED_AT FROM [Device] TO [Location]
+CREATE EDGE TYPE RECORDED FROM Device TO Reading
+CREATE EDGE TYPE LOCATED_AT FROM Device TO Location
 
-CREATE INDEX idx_reading_ts ON Reading (timestamp)
-CREATE INDEX idx_device_type ON Device (type)
+CREATE INDEX idx_reading_ts FOR (r:Reading) ON (r.timestamp)
+CREATE INDEX idx_device_type FOR (d:Device) ON (d.type)
 ```

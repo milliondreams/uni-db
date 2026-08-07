@@ -24,7 +24,7 @@ Or add it to your `Cargo.toml` directly:
 
 ```toml
 [dependencies]
-uni-db = "*"
+uni-db = "3"
 ```
 
 !!! tip "Enable mimalloc for ~3× throughput on mutation-heavy workloads"

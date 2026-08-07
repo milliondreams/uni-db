@@ -126,9 +126,9 @@ Bit-packed binary embeddings stored at full fidelity (`n` = byte count, so `BINA
 bits) — ideal for hash/fingerprint embeddings and set-overlap similarity.
 
 ```cypher
-CREATE LABEL Doc (bits BINARY_VECTOR(4));
-CREATE (:Doc {bits: [0, 255, 165, 60]});
-RETURN VECTOR_DISTANCE(a.bits, b.bits, 'hamming');   // or 'jaccard'
+CREATE LABEL Doc (bits BINARY_VECTOR(4))
+CREATE (:Doc {bits: [0, 255, 165, 60]})
+RETURN VECTOR_DISTANCE(a.bits, b.bits, 'hamming')   // or 'jaccard'
 ```
 
 Brute-force exact only (binary metrics have no ANN index; attempting to build one is rejected with

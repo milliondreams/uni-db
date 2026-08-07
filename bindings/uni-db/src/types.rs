@@ -629,7 +629,7 @@ impl PyProfileOutput {
     }
 }
 
-/// Typed output from `session.explain_locy()`.
+/// Typed output from `session.locy_with(program).explain()`.
 #[pyclass(get_all, name = "LocyExplainOutput", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyLocyExplainOutput {

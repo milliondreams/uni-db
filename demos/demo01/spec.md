@@ -193,7 +193,7 @@ The optimizer chooses execution order based on estimated selectivity:
 
 | Entity | Count | Storage |
 |--------|-------|---------|
-| Papers | 2.3M | ~4GB (with embeddings) |
+| Papers | 2.3M *(design target; the shipped generator makes 5,000)* | ~4GB (with embeddings) |
 | Authors | 1.8M | ~200MB |
 | Institutions | 45K | ~5MB |
 | CITES edges | 28M | ~1.2GB |
@@ -603,6 +603,16 @@ RETURN nodes(path), relationships(path), length(path)
 ---
 
 ## Appendix B: Performance Benchmarks
+
+!!! warning "Unattributed — target figures, not measurements"
+    The latency and cost tables in this appendix carry no run date, version,
+    hardware or dataset, and were never reconciled against a real run. They
+    describe the **design target** for a 2.3M-paper / 28M-edge corpus, whereas
+    `generate_data.py` (`NUM_PAPERS = 5000`) ships a 5,000-paper demo dataset —
+    three orders of magnitude smaller. Do not quote these as measured results.
+
+    Any table of measurements should carry:
+    `Run: <date> · uni <version> · <CPU>/<RAM> · <dataset>`.
 
 ### Query Latencies (p50/p95/p99)
 

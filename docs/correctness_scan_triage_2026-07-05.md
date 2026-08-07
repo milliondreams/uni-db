@@ -1,5 +1,9 @@
 # Correctness Scan — Triage, Prioritization & Solution-Region Grouping (2026-07-05)
 
+> **Status: RESOLVED — historical snapshot as of 2026-07-05.**
+> Triage input for `correctness_scan_2026-07-05.md`; see that file's status
+> header. Line-number citations refer to the 2026-07-05 tree.
+
 Companion to `docs/correctness_scan_2026-07-05.md` (the 171-finding audit) and
 `docs/correctness_scan_verification_2026-07-05.md` (independent re-verification: 167
 confirmed, 1 uncertain, 3 refuted, all repro'd).

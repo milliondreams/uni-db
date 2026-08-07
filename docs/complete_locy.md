@@ -59,7 +59,7 @@ Locy compiles rules into execution plans that run inside Uni's DataFusion-based 
 | **Datalog** | Locy adopts Datalog's recursive rules, stratified negation, and semi-naive fixpoint evaluation. Unlike pure Datalog, Locy operates over a typed property graph (not flat relations) and supports path accumulation, witness selection, and graph mutation. |
 | **ProbLog** | Locy's MNOR/MPROD with PROB annotations provide probabilistic reasoning similar to ProbLog's probabilistic facts, including BDD-based exact inference for shared proofs. |
 | **SQL Recursive CTEs** | Locy rules are like named recursive CTEs with stratified negation, priority-based overriding, and probabilistic aggregation — features absent from SQL. |
-| **Prolog** | Locy's QUERY command uses SLG resolution (tabled, top-down) similar to XSB Prolog. ABDUCE provides abductive reasoning. |
+| **Prolog** | Locy retains SLG resolution (tabled, top-down, XSB-style) for generator rules, and ABDUCE provides abductive reasoning. |
 | **OpenCypher** | Locy is a superset. All Cypher MATCH/CREATE/MERGE/RETURN queries work unchanged inside a Locy program. |
 
 ## 1.2 When to Use Locy vs Plain Cypher
@@ -997,7 +997,9 @@ graph TB
 QUERY rule_name [WHERE expr] [RETURN items [ORDER BY ...] [SKIP n] [LIMIT n]]
 ```
 
-Uses **SLG resolution** (Selective Linear Definite clause resolution — top-down with tabling) to evaluate a specific goal without computing the entire derived relation. Efficient for "find one specific fact" lookups.
+Answered from the **derived store** — the same semi-naive fixpoint result that `.derived` exposes — then filtered by WHERE and shaped by RETURN. Because both read the same rows, `QUERY` and `.derived` agree by construction.
+
+SLG resolution (top-down with tabling) is retained only as a fallback for rules containing a **generator**, which the columnar fixpoint has no row-explosion operator for.
 
 ```
 QUERY reachable WHERE a.name = 'Alice' RETURN b.name AS destination
@@ -1723,7 +1725,7 @@ session.locy_with(program) \
 ### Performance
 
 - **Add WHERE conditions** to filter early in MATCH patterns — enables predicate pushdown.
-- **Use QUERY for point lookups** instead of materializing entire relations.
+- **Use QUERY to shape and filter a rule's results.** It reads the already-materialized fixpoint output, so it does not avoid the derivation cost — it is a projection over it, not a cheaper alternative path.
 - **Monitor `stats.peak_memory_bytes`** and `stats.total_iterations` for tuning.
 - **Set appropriate `max_iterations`** based on your graph diameter.
 

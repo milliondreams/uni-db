@@ -582,8 +582,8 @@ A single catalog alias with task `EmbedHybrid` produces **dense + learned-sparse
 | `List<Vector>` | multivector / ColBERT |
 
 ```cypher
--- All three indexes share alias 'embed/bge-m3' + source ['content']
--- → one forward pass, head chosen by each property's column type.
+// All three indexes share alias 'embed/bge-m3' + source ['content']
+// → one forward pass, head chosen by each property's column type.
 CREATE VECTOR INDEX doc_dense  FOR (d:Document) ON (d.dense)
 OPTIONS { embedding: { alias: 'embed/bge-m3', source: ['content'] } }
 

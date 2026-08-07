@@ -4,6 +4,15 @@ Measured performance data for Uni across ingestion, querying, graph traversal, v
 
 **Last updated:** 2026-04-01
 
+!!! info "Provenance"
+    Numbers on this page are a point-in-time measurement, not a live contract.
+    Any table of measurements should carry:
+    `Run: <date> · uni <version> · <CPU>/<RAM> · <dataset>`.
+    The figures below were last regenerated **2026-04-01** against the then-current
+    `main`; hardware and dataset were not recorded at the time, so treat them as
+    indicative ordering, not absolute throughput. Re-run `cargo bench` locally
+    before quoting any of them.
+
 ## Executive Summary
 
 | Workload | Performance | Dataset | Notes |
@@ -316,7 +325,7 @@ The hybrid query is sensitive to both node count (more vector matches) and edge 
 | `mutation_benchmarks` | `crates/uni/benches/mutation_benchmarks.rs` | CREATE, SET, DELETE, MERGE |
 | `algo_benchmarks` | `crates/uni/benches/algo_benchmarks.rs` | Graph algorithms (PageRank, WCC, etc.) |
 | `micro_benchmarks` | `crates/uni/benches/micro_benchmarks.rs` | Low-level: storage, CSR, vector search |
-| `pushdown_performance` | `crates/uni/benches/pushdown_performance.rs` | Property pushdown (placeholder) |
+
 
 ### Running
 

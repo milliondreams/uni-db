@@ -303,10 +303,10 @@ Per-token vectors are large (N tokens × dim × 4 bytes/row). Mitigations, in pr
 ## 8. Surface / API sketch (subject to review)
 
 ```cypher
--- write (direct, pre-computed multivec)
-CREATE (d:Doc { title: "...", tok_emb: $multivec })   -- $multivec = [[...dim...], [...], ...]
+// write (direct, pre-computed multivec)
+CREATE (d:Doc { title: "...", tok_emb: $multivec })   // $multivec = [[...dim...], [...], ...]
 
--- Phase 1: dense ANN then MaxSim rerank
+// Phase 1: dense ANN then MaxSim rerank
 CALL uni.vector.query('Doc', 'dense_emb', $dense_q, 200,
      null, null,
      { reranker: 'maxsim', maxsim_property: 'tok_emb', maxsim_query: $multivec_q })

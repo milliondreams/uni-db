@@ -201,16 +201,16 @@ pub struct ExecutionContext {
 
 **With L0 access:**
 ```cypher
--- Sees both committed (Lance) and uncommitted (L0) data
+// Sees both committed (Lance) and uncommitted (L0) data
 CREATE (n:Paper {title: "New Paper"})
-MATCH (p:Paper) WHERE p.title = "New Paper"  -- Finds it immediately
+MATCH (p:Paper) WHERE p.title = "New Paper"  // Finds it immediately
 RETURN p
 ```
 
 **Without L0 access (snapshot-only):**
 ```cypher
--- Reader bound to v2, sees only committed data at v2
-MATCH (p:Paper) RETURN COUNT(p)  -- Consistent count at v2
+// Reader bound to v2, sees only committed data at v2
+MATCH (p:Paper) RETURN COUNT(p)  // Consistent count at v2
 ```
 
 ---

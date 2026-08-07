@@ -54,7 +54,7 @@ Uni's internals are organized into four major subsystems:
 
 ### Query Processing
 
-1. **Parser** — Cypher syntax to AST (based on sqlparser)
+1. **Parser** — Cypher syntax to AST (a pest PEG grammar: `crates/uni-cypher/src/grammar/cypher.pest`)
 2. **Rewriter** — Function-to-predicate transformations (compile-time)
 3. **Planner** — Logical plan with optimization passes
 4. **Executor** — Vectorized physical operators

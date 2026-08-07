@@ -34,7 +34,7 @@ P(defective) = 1 − (1 − 0.3)(1 − 0.2)(1 − 0.1)
 
 In Locy:
 
-```cypher
+```locy
 CREATE RULE component_failure_risk AS
 MATCH (c:Component)-[:HAS_SIGNAL]->(s:QualitySignal)
 FOLD risk = MNOR(1.0 - s.pass_rate)
@@ -70,7 +70,7 @@ P(all reliable) = 0.95 × 0.90 × 0.85
 
 In Locy:
 
-```cypher
+```locy
 CREATE RULE vendor_reliability AS
 MATCH (v:Vendor)-[:SUPPLIES]->(c:Component)
 WHERE c IS component_failure_risk
@@ -89,7 +89,7 @@ YIELD KEY v, reliability
     completeness guard: count the matched elements and the total elements and keep only
     groups where they are equal, or exclude incomplete groups with an `IS NOT` complement.
 
-    ```cypher
+    ```locy
     // total elements per claim
     CREATE RULE claim_size AS
       MATCH (c:Claim) WHERE c IS claim_elements TO ce
@@ -133,7 +133,7 @@ YIELD KEY v, reliability
 
 `PROB` marks one output column in a rule as the probability channel for that relation:
 
-```cypher
+```locy
 CREATE RULE supplier_risk AS
 MATCH (s:Supplier)-[:HAS_SIGNAL]->(sig:Signal)
 FOLD risk = MNOR(sig.risk)
@@ -148,7 +148,7 @@ Accepted forms:
 
 If `IS NOT` targets a rule with a `PROB` column, Locy uses probabilistic complement (`1 - p`) instead of Boolean anti-join:
 
-```cypher
+```locy
 CREATE RULE usable_supplier AS
 MATCH (s:Supplier)
 WHERE s IS NOT supplier_risk
@@ -189,14 +189,14 @@ Rows from approximate groups are marked with `_approximate = true`, and Rust `Lo
 
 `similar_to()` returns scores in [0, 1], making its output natural probability input for MNOR and MPROD:
 
-```cypher
--- Combine semantic relevance signals with noisy-OR
+```locy
+// Combine semantic relevance signals with noisy-OR
 CREATE RULE evidence_strength AS
 MATCH (claim:Claim)-[:SUPPORTED_BY]->(doc:Document)
 FOLD strength = MNOR(similar_to(doc.embedding, claim.text))
 YIELD KEY claim, strength
 
--- Joint confidence across required criteria
+// Joint confidence across required criteria
 CREATE RULE joint_match AS
 MATCH (job:Job)-[:REQUIRES]->(skill:Skill)<-[:HAS]-(candidate:Candidate)
 FOLD fit = MPROD(similar_to(skill.embedding, candidate.resume))

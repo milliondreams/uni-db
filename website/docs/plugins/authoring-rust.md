@@ -70,25 +70,34 @@ plugin whose manifest didn't declare it fails registration with `PluginError::Ca
 | Aggregate function | `AggregatePluginFn` | `aggregate_fn(qname, sig, f)` |
 | Window function | `WindowPluginFn` | `window_fn(qname, sig, f)` |
 | Procedure | `ProcedurePlugin` | `procedure(qname, sig, p)` |
-| Physical operator | `OperatorProvider` | `operator(qname, p)` |
 | Optimizer rule | `OptimizerRuleProvider` | `optimizer_rule(r)` |
 | Index kind | `IndexKindProvider` | `index_kind(kind, p)` |
-| Storage backend | `StorageBackend` | `storage_backend(scheme, b)` |
+| Label storage | `LabelStorageProvider` | `label_storage(label, s)` |
 | CRDT kind | `CrdtKindProvider` | `crdt_kind(kind, p)` |
 | Session / query hook | `SessionHook` | `hook(h)` |
 | Trigger | `TriggerPlugin` | `trigger(t)` |
 | Graph algorithm | `AlgorithmProvider` | `algorithm(qname, p)` |
-| Pregel program | `PregelProgramProvider` | `pregel(qname, p)` |
 | Locy aggregate | `LocyAggregate` | `locy_aggregate(qname, a)` |
 | Locy predicate | `LocyPredicate` | `locy_predicate(qname, sig, p)` |
+| Locy generator | `LocyGenerator` | `locy_generator(qname, sig, g)` |
 | Logical (Arrow extension) type | `LogicalTypeProvider` | `logical_type(t)` |
 | Authentication | `AuthProvider` | `auth_provider(p)` |
 | Authorization | `AuthzPolicy` | `authz_policy(p)` |
-| Connector / wire protocol | `Connector` | `connector(c)` |
 | Collation | `CollationProvider` | `collation(c)` |
 | CDC output sink | `CdcOutputProvider` | `cdc_output(c)` |
 | Catalog / virtual schema | `CatalogProvider` | `catalog(c)` |
+| Replacement scan | `ReplacementScanProvider` | `replacement_scan(s)` |
 | Background job | `BackgroundJobProvider` | `background_job(j)` |
+
+There are **22** registrable surfaces. The list is asserted against the code in
+`uni_plugin::surfaces` (`assert_eq!(kinds.len(), 22)`), so it cannot drift
+silently.
+
+!!! warning "Removed in 3.0"
+    `OperatorProvider`, `StorageBackend`, `PregelProgramProvider` and `Connector`
+    — and their registrar methods `operator()`, `pregel()`, `connector()` and
+    `storage_backend()` — were **deleted** in 3.0 as dead registrable surfaces.
+    Custom per-label storage now goes through `label_storage`.
 
 Registrar methods return `Result<&mut Self, PluginError>`, so registrations chain:
 

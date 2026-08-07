@@ -1,5 +1,10 @@
 # Deep Logical-Correctness Scan — All Crates
 
+> **Status: RESOLVED — historical snapshot as of 2026-07-05.**
+> Waves 1–4 of this scan are fixed. Findings deliberately not actioned are
+> tracked with per-finding resolutions in `docs/correctness-deferred.md`.
+> Line-number citations refer to the 2026-07-05 tree. Retained for rationale.
+
 **Date:** 2026-07-05  
 **Method:** 45 line-bounded shards (~12k lines each) across all 30 workspace crates. One correctness-only reviewer per shard read every file in full, then each raw finding was handed to an independent adversarial verifier prompted to *refute* it (default-refute on uncertainty). Only findings the verifier could not refute are listed as confirmed.
 

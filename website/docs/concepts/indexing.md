@@ -70,15 +70,15 @@ DDL supports all algorithm types via the `type` option: `flat`, `ivf_flat`, `ivf
 HNSW parameters are configurable via DDL or the Rust schema builder:
 
 ```cypher
--- HNSW-SQ with custom parameters
+// HNSW-SQ with custom parameters
 CREATE VECTOR INDEX paper_embeddings FOR (p:Paper) ON p.embedding
 OPTIONS { type: 'hnsw_sq', m: '32', ef_construction: '200' }
 
--- HNSW-Flat (no quantization, exact graph search)
+// HNSW-Flat (no quantization, exact graph search)
 CREATE VECTOR INDEX paper_embeddings FOR (p:Paper) ON p.embedding
 OPTIONS { type: 'hnsw_flat', m: '16', ef_construction: '200' }
 
--- HNSW-SQ with IVF partitions for very large datasets (>1M vectors)
+// HNSW-SQ with IVF partitions for very large datasets (>1M vectors)
 CREATE VECTOR INDEX paper_embeddings FOR (p:Paper) ON p.embedding
 OPTIONS { type: 'hnsw_sq', partitions: '32' }
 ```
@@ -101,15 +101,15 @@ db.schema()
 ### IVF Configuration
 
 ```cypher
--- IVF-PQ with tuned parameters
+// IVF-PQ with tuned parameters
 CREATE VECTOR INDEX product_embeddings FOR (p:Product) ON p.embedding
 OPTIONS { type: 'ivf_pq', partitions: '256', sub_vectors: '16' }
 
--- IVF-RQ (RaBitQ — 1 bit per dimension, best accuracy/compression)
+// IVF-RQ (RaBitQ — 1 bit per dimension, best accuracy/compression)
 CREATE VECTOR INDEX product_embeddings FOR (p:Product) ON p.embedding
 OPTIONS { type: 'ivf_rq', partitions: '256' }
 
--- IVF-RQ with higher fidelity (4 bits per dimension)
+// IVF-RQ with higher fidelity (4 bits per dimension)
 CREATE VECTOR INDEX product_embeddings FOR (p:Product) ON p.embedding
 OPTIONS { type: 'ivf_rq', partitions: '256', num_bits: '4' }
 ```
@@ -132,11 +132,11 @@ db.schema()
 MUVERA indexes accelerate **multi-vector** (ColBERT / late-interaction) columns — a `List<Vector(dim)>` property storing one vector per token. MUVERA encodes each row's variable set of token vectors into a single fixed-dimensional **FDE** (Fixed-Dimensional Encoding) vector, stored in a derived internal column (`__fde_<index_name>`), and indexes that with a standard single-vector ANN. At query time the FDE drives fast first-stage retrieval, then candidates are re-scored with **exact MaxSim**.
 
 ```cypher
--- Defaults: k_sim=4, reps=20, d_proj=16, inner=ivf_pq
+// Defaults: k_sim=4, reps=20, d_proj=16, inner=ivf_pq
 CREATE VECTOR INDEX doc_tokens FOR (d:Document) ON d.tokens
 OPTIONS { type: 'muvera' }
 
--- Tuned FDE parameters + explicit inner ANN
+// Tuned FDE parameters + explicit inner ANN
 CREATE VECTOR INDEX doc_tokens FOR (d:Document) ON d.tokens
 OPTIONS { type: 'muvera', k_sim: 4, reps: 20, d_proj: 16, inner: 'ivf_pq' }
 ```
@@ -345,6 +345,7 @@ LIMIT 10
 
 **Boolean Operators:**
 
+<!-- doctest: skip -->
 ```cypher
 // AND (default)
 'transformer attention'  // Both terms required
@@ -492,9 +493,9 @@ Inverted indexes enable efficient filtering on `List<String>` properties, ideal 
 **Via Cypher:**
 
 ```cypher
-CREATE INVERTED INDEX document_tags
+CREATE FULLTEXT INDEX document_tags
 FOR (d:Document)
-ON d.tags
+ON EACH [d.tags]
 OPTIONS { normalize: true, max_terms_per_doc: 10000 }
 ```
 

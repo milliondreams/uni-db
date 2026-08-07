@@ -575,7 +575,7 @@ result = session.locy_with("QUERY r WHERE x = $val") \
     .run()
 
 # Compilation-only introspection
-explain = session.explain_locy("CREATE RULE r AS ...")
+explain = session.locy_with("CREATE RULE r AS ...").explain()
 # explain.plan_text, explain.strata_count, explain.has_recursive_strata
 
 # Transaction-level

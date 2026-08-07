@@ -43,7 +43,7 @@ Traditional graph databases force you to choose:
 |---|---|---|
 | Embedded vs. Server | Server (Neo4j, TigerGraph) | Embedded (single process) |
 | OLTP vs. OLAP | Pick one | Both (Arrow columnar + graph traversal) |
-| Graph vs. Vector | Separate systems | Unified (LanceDB vector indexes) |
+| Graph vs. Vector | Separate systems | Unified (Lance vector indexes) |
 | Schema vs. Schemaless | Pick one | Both (schema-defined + overflow JSONB) |
 | Simple queries vs. Reasoning | Simple pattern matching | Cypher + Locy recursive rules |
 | Local vs. Cloud | Pick one | Both (local, S3/GCS/Azure, hybrid) |
@@ -106,7 +106,7 @@ graph LR
         API --> Query[Query Layer<br/>Cypher Parser + DataFusion]
         API --> Runtime[Graph Runtime<br/>WorkingGraph + L0Buffer + Writer]
         Query --> Runtime
-        Runtime --> Storage[Storage Layer<br/>LanceDB + Arrow + Object Store]
+        Runtime --> Storage[Storage Layer<br/>Lance + Arrow + Object Store]
         Storage --> Backend["Backend<br/>Local FS | S3 | GCS | Azure"]
     end
 ```
@@ -174,7 +174,7 @@ The runtime manages in-memory graph state and write coordination:
 
 ### Storage Layer (`uni-store`)
 
-Persistent storage using LanceDB (Arrow-native columnar format):
+Persistent storage using Lance (Arrow-native columnar format):
 
 - **VertexDataset**: Per-label Lance tables (`vertices_{label}`) with schema-defined columns plus JSONB overflow.
 - **EdgeDataset**: Per-type Lance tables (`edges_{type}`) with endpoint VIDs and properties.
@@ -772,28 +772,26 @@ db.schema()
 
 ```cypher
 // Create labels with properties
-CREATE LABEL Person {
-    name: STRING,
-    age: INTEGER,
-    email: STRING UNIQUE
-}
+CREATE LABEL Person (
+    name STRING,
+    age INTEGER,
+    email STRING UNIQUE
+)
 
-CREATE LABEL Document {
-    title: STRING,
-    content: STRING,
-    embedding: VECTOR(384)
-}
+CREATE LABEL Document (
+    title STRING,
+    content STRING,
+    embedding VECTOR(384)
+)
 
 // Create edge types with source/destination constraints
-CREATE EDGE TYPE KNOWS FROM [Person] TO [Person] {
-    since: DATE,
-    weight: FLOAT
-}
+CREATE EDGE TYPE KNOWS (since DATE,
+    weight FLOAT) FROM Person TO Person
 
-CREATE EDGE TYPE AUTHORED FROM [Person] TO [Document]
+CREATE EDGE TYPE AUTHORED FROM Person TO Document
 
 // Alter existing schema
-ALTER LABEL Person ADD PROPERTY phone: STRING
+ALTER LABEL Person ADD PROPERTY phone STRING
 ALTER LABEL Person DROP PROPERTY age
 ALTER LABEL Person RENAME PROPERTY name TO full_name
 
@@ -839,24 +837,26 @@ Previously, mismatched values were silently accepted at write time and nulled at
 
 **One label per entity type.** Each label maps to a Lance table. Labels are the primary unit of storage organization.
 
+<!-- doctest: skip -->
 ```cypher
 // GOOD: Clear entity separation
-CREATE LABEL Person { name: STRING, age: INTEGER }
-CREATE LABEL Company { name: STRING, founded: DATE }
+CREATE LABEL Person ( name STRING, age INTEGER )
+CREATE LABEL Company ( name STRING, founded DATE )
 
 // BAD: Mega-label mixing entity types
-CREATE LABEL Entity { type: STRING, name: STRING, age: INTEGER, founded: DATE }
+CREATE LABEL Entity ( type STRING, name STRING, age INTEGER, founded DATE )
 ```
 
 ### Edge Type Modeling
 
 **Use directional semantics** that read naturally in English. Specify source/destination label constraints when the relationship has clear domain semantics.
 
+<!-- doctest: skip -->
 ```cypher
 // GOOD: Clear directional semantics with constraints
-CREATE EDGE TYPE WORKS_AT FROM [Person] TO [Company] { since: DATE }
-CREATE EDGE TYPE MANAGES FROM [Person] TO [Person]
-CREATE EDGE TYPE PURCHASED FROM [Customer] TO [Product] { quantity: INTEGER }
+CREATE EDGE TYPE WORKS_AT (since DATE) FROM Person TO Company
+CREATE EDGE TYPE MANAGES FROM Person TO Person
+CREATE EDGE TYPE PURCHASED (quantity INTEGER) FROM Customer TO Product
 
 // BAD: Ambiguous direction
 CREATE EDGE TYPE RELATED_TO  // Which direction means what?
@@ -943,7 +943,7 @@ my-graph/                                   # Database root (the URI you pass to
     │   ├── 00000000000000000002_<uuid>.wal  # LSN zero-padded to 20 digits
     │   └── ...                              # Lexicographic ordering = LSN ordering
     │
-    ├── vertices_Person/                    # LanceDB table: per-label vertex data
+    ├── vertices_Person/                    # Lance table: per-label vertex data
     │   ├── _versions/                      # Lance versioning metadata
     │   ├── data/                           # Arrow IPC data files (*.lance)
     │   └── _indices/                       # Lance-managed indexes
@@ -951,22 +951,22 @@ my-graph/                                   # Database root (the URI you pass to
     ├── vertices_Document/                  # Another per-label table
     │   └── ...
     │
-    ├── vertices/                           # LanceDB table: unified main vertex table
+    ├── vertices/                           # Lance table: unified main vertex table
     │   └── ...                             # (all vertices regardless of label)
     │
-    ├── edges/                              # LanceDB table: unified main edge table
+    ├── edges/                              # Lance table: unified main edge table
     │   └── ...                             # (all edges regardless of type)
     │
-    ├── deltas_KNOWS_fwd/                   # LanceDB table: forward edge deltas
+    ├── deltas_KNOWS_fwd/                   # Lance table: forward edge deltas
     │   └── ...                             # (sorted by src_vid)
     │
-    ├── deltas_KNOWS_bwd/                   # LanceDB table: backward edge deltas
+    ├── deltas_KNOWS_bwd/                   # Lance table: backward edge deltas
     │   └── ...                             # (sorted by dst_vid)
     │
-    ├── adjacency_KNOWS_fwd/                # LanceDB table: forward CSR adjacency
+    ├── adjacency_KNOWS_fwd/                # Lance table: forward CSR adjacency
     │   └── ...                             # (row-per-vertex with neighbor lists)
     │
-    ├── adjacency_KNOWS_bwd/                # LanceDB table: backward CSR adjacency
+    ├── adjacency_KNOWS_bwd/                # Lance table: backward CSR adjacency
     │   └── ...
     │
     └── indexes/                            # Secondary indexes
@@ -1014,7 +1014,7 @@ In hybrid mode, the local path contains `wal/` and ID allocation state, while `s
 
 ## LSM-Style 3-Tier Architecture
 
-Uni's storage engine uses an **LSM-tree-inspired** design optimized for graph data. Writes go to an in-memory buffer (L0), flush to sorted runs in LanceDB (L1), and compact into base tables (L2).
+Uni's storage engine uses an **LSM-tree-inspired** design optimized for graph data. Writes go to an in-memory buffer (L0), flush to sorted runs in Lance (L1), and compact into base tables (L2).
 
 ```mermaid
 graph TB
@@ -1023,7 +1023,7 @@ graph TB
         WAL[Write-Ahead Log<br/>Durability before flush]
     end
 
-    subgraph "L1: LanceDB Sorted Runs"
+    subgraph "L1: Lance Sorted Runs"
         VT[Per-Label Vertex Tables<br/>vertices_Person, vertices_Document]
         DT[Per-Type Delta Tables<br/>deltas_KNOWS_fwd, deltas_KNOWS_bwd]
         MT[Main Tables<br/>vertices, edges<br/>Unified view]
@@ -1060,7 +1060,7 @@ The 3-tier design provides:
 
 ### Per-Label Vertex Tables (`vertices_{label}`)
 
-Each label gets its own LanceDB table with typed columns:
+Each label gets its own Lance table with typed columns:
 
 | Column | Arrow Type | Description |
 |---|---|---|
@@ -1226,7 +1226,7 @@ The bound is that narrow for a specific reason: `StorageManager::pinned()` and `
 
 ### AdjacencyDataset (Persistent CSR)
 
-Stored as a LanceDB table (`adjacency_{edge_type}_{direction}`) with row-per-vertex format:
+Stored as a Lance table (`adjacency_{edge_type}_{direction}`) with row-per-vertex format:
 
 | Column | Arrow Type |
 |---|---|
@@ -1234,7 +1234,7 @@ Stored as a LanceDB table (`adjacency_{edge_type}_{direction}`) with row-per-ver
 | `neighbors` | List\<UInt64\> |
 | `edge_ids` | List\<UInt64\> |
 
-## LanceDB Table Naming Conventions
+## Lance Table Naming Conventions
 
 | Entity | Table Name | Purpose |
 |---|---|---|
@@ -1290,7 +1290,7 @@ For large data loads, `BulkWriter` bypasses WAL for performance:
 
 - `insert_vertices(label, vertices)` — allocate VIDs, buffer by label, flush at `batch_size` (10k) or `max_buffer_size_bytes` (1GB)
 - `insert_edges(edge_type, edges)` — allocate EIDs, buffer, flush at thresholds
-- No WAL; rollback via LanceDB table versioning
+- No WAL; rollback via Lance table versioning
 - Deferred index rebuilds (sync or async) on `commit()`
 
 ## L0Buffer
@@ -1497,8 +1497,8 @@ Traditional database indexes on typed property columns:
 
 ```cypher
 // Create scalar indexes
-CREATE INDEX idx_name ON Person (name)           // Default: BTree
-CREATE INDEX idx_status ON Order (status)         // BTree
+CREATE INDEX idx_name FOR (p:Person) ON (p.name)           // Default: BTree
+CREATE INDEX idx_status FOR (o:Order) ON (o.status)         // BTree
 ```
 
 ### Vector Indexes (HNSW, IVF-PQ, Flat)
@@ -1513,11 +1513,11 @@ For approximate nearest neighbor (ANN) search on embedding vectors:
 
 ```cypher
 // Create vector index with HNSW
-CREATE VECTOR INDEX idx_embed ON Document (embedding)
+CREATE VECTOR INDEX idx_embed FOR (d:Document) ON (d.embedding)
   WITH { metric: 'cosine', type: 'hnsw' }
 
 // Create vector index with IVF-PQ for large datasets
-CREATE VECTOR INDEX idx_embed ON Document (embedding)
+CREATE VECTOR INDEX idx_embed FOR (d:Document) ON (d.embedding)
   WITH { metric: 'l2', type: 'ivf_pq', num_partitions: 256 }
 ```
 
@@ -1549,7 +1549,7 @@ Query it through `uni.sparse.query` (see Part VIII, [Sparse Vectors](#sparse-vec
 BM25-based full-text search on text properties:
 
 ```cypher
-CREATE FULLTEXT INDEX idx_content ON Article (content)
+CREATE FULLTEXT INDEX idx_content FOR (a:Article) ON EACH [a.content]
 
 // Query with BM25 scoring
 CALL uni.fts.query('Article', 'content', 'graph database', 10)
@@ -1561,7 +1561,7 @@ YIELD node, score
 Full-text search on nested JSON/JSONB properties:
 
 ```cypher
-CREATE JSON_FULLTEXT INDEX idx_meta ON Data (metadata)
+CREATE JSON FULLTEXT INDEX idx_meta FOR (d:Data) ON metadata
 ```
 
 ### Inverted Indexes
@@ -1731,6 +1731,7 @@ OPTIONAL MATCH (n:Person)-[r:MANAGES]->(m:Person) RETURN n, m
 
 ### Node Patterns
 
+<!-- doctest: skip -->
 ```cypher
 (n)                    // Any node, bound to variable n
 (n:Person)             // Node with label Person
@@ -1742,6 +1743,7 @@ OPTIONAL MATCH (n:Person)-[r:MANAGES]->(m:Person) RETURN n, m
 
 ### Edge Patterns
 
+<!-- doctest: skip -->
 ```cypher
 -[r]->                 // Outgoing edge
 <-[r]-                 // Incoming edge
@@ -1758,7 +1760,7 @@ OPTIONAL MATCH (n:Person)-[r:MANAGES]->(m:Person) RETURN n, m
 
 ```cypher
 // Named path
-p = (a)-[:KNOWS*]->(b)
+MATCH p = (a)-[:KNOWS*]->(b)
 RETURN nodes(p), relationships(p), length(p)
 
 // Shortest path
@@ -1836,6 +1838,7 @@ ORDER BY age DESC
 
 Recursive common table expressions:
 
+<!-- doctest: skip -->
 ```cypher
 WITH RECURSIVE reachable(vid, depth) AS (
     MATCH (n:Person {name: 'Alice'}) RETURN id(n) AS vid, 0 AS depth
@@ -1865,6 +1868,7 @@ RETURN count(*) AS total                // Aggregation
 
 Filtering conditions (applies to MATCH, WITH, RETURN):
 
+<!-- doctest: skip -->
 ```cypher
 WHERE n.age > 25
 WHERE n.name = 'Alice' AND n.active = true
@@ -1962,6 +1966,7 @@ MATCH (n:Person) RETURN n.name UNION ALL MATCH (n:Company) RETURN n.name
 
 ### CASE Expression
 
+<!-- doctest: skip -->
 ```cypher
 CASE n.status
     WHEN 'active' THEN 'Active'
@@ -1978,6 +1983,7 @@ END
 
 ### Quantifiers
 
+<!-- doctest: skip -->
 ```cypher
 ALL(x IN n.scores WHERE x > 50)       // All elements match
 ANY(x IN n.tags WHERE x = 'important') // At least one matches
@@ -1987,12 +1993,14 @@ NONE(x IN n.errors WHERE x IS NOT NULL) // No elements match
 
 ### REDUCE
 
+<!-- doctest: skip -->
 ```cypher
 REDUCE(total = 0, x IN n.scores | total + x) AS sum
 ```
 
 ### List Comprehension
 
+<!-- doctest: skip -->
 ```cypher
 [x IN range(1, 10) WHERE x % 2 = 0 | x * x] AS even_squares
 ```
@@ -2307,6 +2315,7 @@ graph TB
 
 ## Vector Search
 
+<!-- doctest: skip -->
 ```cypher
 CALL uni.vector.query(label, property, query_vector, k [, filter] [, threshold] [, options])
 YIELD node, score, distance, vector_score, rerank_score, vid
@@ -2367,6 +2376,7 @@ ORDER BY score DESC
 
 `similar_to()` is a unified similarity scoring expression that can be used directly in `RETURN`, `WHERE`, and `ORDER BY` clauses — no `CALL`/`YIELD` boilerplate required.
 
+<!-- doctest: skip -->
 ```cypher
 similar_to(source, query [, options]) → Float
 ```
@@ -2398,22 +2408,22 @@ The `~=` operator is **vector-only** and cannot do FTS or hybrid search. For hyb
 ### Single-Source Examples
 
 ```cypher
--- Vector-to-vector cosine similarity
+// Vector-to-vector cosine similarity
 MATCH (d:Doc)
 RETURN d.title, similar_to(d.embedding, $query_vector) AS score
 ORDER BY score DESC
 
--- Auto-embed: string query → embedded → cosine against stored vectors
+// Auto-embed: string query → embedded → cosine against stored vectors
 MATCH (d:Doc)
 RETURN d.title, similar_to(d.embedding, 'graph databases') AS score
 ORDER BY score DESC
 
--- FTS: BM25 scoring (requires FULLTEXT INDEX on d.content)
+// FTS: BM25 scoring (requires FULLTEXT INDEX on d.content)
 MATCH (d:Doc)
 RETURN d.title, similar_to(d.content, 'distributed systems') AS score
 ORDER BY score DESC
 
--- In WHERE clause for filtering
+// In WHERE clause for filtering
 MATCH (d:Doc)
 WHERE similar_to(d.embedding, $query_vector) > 0.8
 RETURN d.title
@@ -2424,13 +2434,13 @@ RETURN d.title
 Combine multiple scoring sources into a single fused score:
 
 ```cypher
--- Multi-source: vector + FTS fusion (RRF by default)
+// Multi-source: vector + FTS fusion (RRF by default)
 MATCH (d:Doc)
 RETURN d.title,
   similar_to([d.embedding, d.content], [$query_vector, 'search term']) AS score
 ORDER BY score DESC
 
--- Multi-source with weighted fusion
+// Multi-source with weighted fusion
 MATCH (d:Doc)
 RETURN d.title,
   similar_to(
@@ -2454,7 +2464,7 @@ This uses RRF fusion by default, with proper BM25 score normalization (saturatio
 
 **Incorrect — naive addition of two separate calls:**
 ```cypher
--- DON'T DO THIS: scores are on different scales, no normalization
+// DON'T DO THIS: scores are on different scales, no normalization
 MATCH (d:Doc)
 RETURN d.title,
   (similar_to(d.embedding, $qvec) + similar_to(d.content, $qtxt)) AS score
@@ -2546,7 +2556,7 @@ A sparse-vector property is declared with the Cypher type `sparse_vector(N)` (Ru
 ```cypher
 CREATE (:Doc {
   content: 'graph databases for beginners',
-  emb: sparse_vector(30522)        -- 30 522-term vocabulary (e.g. BERT WordPiece)
+  emb: sparse_vector(30522)        // 30 522-term vocabulary (e.g. BERT WordPiece)
 })
 ```
 
@@ -2566,7 +2576,7 @@ db.schema()
 A sparse-vector value is a `{indices, values}` map: `indices` is the list of non-zero term ids, `values` the parallel list of their weights. The two lists must be the same length; `indices` are term ids in `[0, N)`.
 
 ```cypher
--- Literal write of a 3-term sparse vector
+// Literal write of a 3-term sparse vector
 CREATE (:Doc {emb: {indices: [12, 884, 9001], values: [0.71, 0.33, 1.20]}})
 ```
 
@@ -2594,6 +2604,7 @@ Quantization defaults **on** (8-bit) for compactness; set `quantize: false` when
 
 ### `uni.sparse.query`
 
+<!-- doctest: skip -->
 ```cypher
 CALL uni.sparse.query(label, property, query, k [, filter] [, threshold] [, options])
 YIELD vid, score, rerank_score
@@ -2612,7 +2623,7 @@ YIELD vid, score, rerank_score
 The YIELD columns are exactly **`vid`, `score`, `rerank_score`** — there is no `sparse_score` or `distance` column here (those names belong to the hybrid `uni.search` YIELD). **`score` is the raw sparse dot product** of the query and stored vectors (not a normalized [0, 1] similarity), with larger meaning more relevant. `rerank_score` is populated only when a cross-encoder reranker is configured in `options`.
 
 ```cypher
--- Sparse retrieval over a SPLADE column, top 10
+// Sparse retrieval over a SPLADE column, top 10
 CALL uni.sparse.query('Doc', 'emb',
     {indices: [12, 884, 9001], values: [0.71, 0.33, 1.20]}, 10)
 YIELD vid, score
@@ -2636,6 +2647,7 @@ The query is **MVCC- and L0-aware**: candidates retrieved from the index are exa
 
 ## Full-Text Search
 
+<!-- doctest: skip -->
 ```cypher
 CALL uni.fts.query(label, property, search_term, k [, filter] [, threshold] [, options])
 YIELD node, score, fts_score, rerank_score, vid
@@ -2652,11 +2664,11 @@ RETURN node.title, score
 **Tokenizer / analyzer configuration (3.0.0).** Full-text indexes honor tokenizer, stemmer, and stop-word configuration set at index-create time — previously every FTS index used Lance's default "simple" tokenizer regardless of options, making CJK / multilingual text effectively unindexable:
 
 ```cypher
-CREATE FULLTEXT INDEX ON :Article(content) OPTIONS {
+CREATE FULLTEXT INDEX article_fts FOR (a:Article) ON EACH [a.content] OPTIONS {
   analyzer: 'standard', language: 'English', stemmer: 'english',
   stopwords: 'english', ascii_folding: true, lower_case: true,
   max_token_length: 40, ngram_min: 2, ngram_max: 3
-};
+}
 ```
 
 18-language stemming and stop-words plus ngram tokenization are supported (`TokenizerConfig::Analyzer`); CJK requires dictionary files under `LANCE_LANGUAGE_MODEL_HOME`.
@@ -2690,13 +2702,13 @@ The `properties` argument is a map `{vector, fts, sparse}` selecting which prope
 > ANN tuning knobs (`nprobes`, `refine_factor`, `ef_search`) are **not** plumbed through `uni.search`; tune them at index-create time or via `uni.vector.query`.
 
 ```cypher
--- Basic 2-way hybrid search with RRF
+// Basic 2-way hybrid search with RRF
 CALL uni.search('Document', {vector: 'embedding', fts: 'content'},
     'graph databases', null, 10, null, {})
 YIELD node, score
 RETURN node.title, score
 
--- 2-way hybrid with cross-encoder reranking
+// 2-way hybrid with cross-encoder reranking
 CALL uni.search('Document', {vector: 'embedding', fts: 'content'},
     'graph databases', null, 10, null,
     {method: 'rrf', reranker: 'rerank/minilm', reranker_property: 'content'})
@@ -2709,19 +2721,19 @@ RETURN node.title, score
 The sparse arm is **opt-in and requires two things together**: a `sparse:` key in the `properties` map **and** a `sparse_query` in `options`. Supplying only one of them is a **silent no-op** — the sparse arm simply does not run. When active, fuse all three arms with `method: 'weighted'` and a 3-element `weights: [vector, fts, sparse]`.
 
 ```cypher
--- 3-way fusion: dense + lexical + learned-sparse, optionally MaxSim-reranked
+// 3-way fusion: dense + lexical + learned-sparse, optionally MaxSim-reranked
 CALL uni.search(
     'Document',
     {vector: 'embedding', fts: 'content', sparse: 'emb'},
     'graph databases',
-    null,                         -- query_vector (auto-embedded from query_text)
+    null,                         // query_vector (auto-embedded from query_text)
     10,
-    null,                         -- filter
+    null,                         // filter
     {
       method: 'weighted',
-      weights: [0.5, 0.2, 0.3],   -- [vector, fts, sparse]
+      weights: [0.5, 0.2, 0.3],   // [vector, fts, sparse]
       sparse_query: {indices: [12, 884, 9001], values: [0.71, 0.33, 1.20]},
-      reranker: 'maxsim',         -- multi-vector / ColBERT late interaction
+      reranker: 'maxsim',         // multi-vector / ColBERT late interaction
       maxsim_query: $query_token_vectors
     })
 YIELD node, score, vector_score, fts_score, sparse_score, rerank_score, distance
@@ -2914,17 +2926,15 @@ Define new extensions from inside Cypher (Uni's `apoc.custom` analogue). The def
 // A scalar function whose body is Cypher:
 CALL uni.plugin.declareFunction(
   'myco.discount', '(price: float, pct: float) -> float',
-  'cypher', 'RETURN price * (1.0 - pct)');
-
+  'cypher', 'RETURN price * (1.0 - pct)')
 // A procedure (WRITE mode requires Capability::ProcedureWrites):
-CALL uni.plugin.declareProcedure('myco.reindex', '...', 'cypher', '...');
-CALL uni.plugin.declareAggregate('myco.wmean', ...);
+CALL uni.plugin.declareProcedure('myco.reindex', '...', 'cypher', '...')
+CALL uni.plugin.declareAggregate('myco.wmean', ...)
 // 3.0.0: declareTrigger installs a REAL firing TriggerPlugin (was a no-op procedure).
 // Event filter: CREATE|UPDATE|DELETE [ON :Label | -[:Type]-] [WHEN pred] [ASYNC]; binds $vid/$label/$event_kind.
-CALL uni.plugin.declareTrigger('myco.audit', 'Account', 'AfterCommit', ...);
-
-CALL uni.plugin.listDeclared();              // enumerate declared extensions
-CALL uni.plugin.dropDeclared('myco.discount');
+CALL uni.plugin.declareTrigger('myco.audit', 'Account', 'AfterCommit', ...)
+CALL uni.plugin.listDeclared()              // enumerate declared extensions
+CALL uni.plugin.dropDeclared('myco.discount')
 ```
 
 ### Background Job Procedures (`uni.periodic.*`)
@@ -2932,12 +2942,12 @@ CALL uni.plugin.dropDeclared('myco.discount');
 Schedule recurring or one-shot maintenance jobs against registered `BackgroundJobProvider`s (see [Part XVII](#part-xvii-plugin-framework)). Schedules and job state are durable (`_BackgroundJob` node + `background_jobs.json`).
 
 ```cypher
-CALL uni.periodic.schedule('uni.system.ttl_sweep', 'cron', '0 */5 * * * *');  // (qname, kind, schedule_arg)
-CALL uni.periodic.cancel('uni.system.ttl_sweep');                              // yields true if a job was removed
-CALL uni.periodic.list();                                                      // one row per known job
-CALL uni.periodic.submit('MATCH (n:Stale) DETACH DELETE n');                   // run one write-mode batch now
-CALL uni.periodic.iterate('MATCH (n:Big) RETURN n', 'DETACH DELETE n', '{}');  // (query, mutating_query, options_json)
-CALL uni.periodic.commit();                                                    // sync sentinel (v1 no-op)
+CALL uni.periodic.schedule('uni.system.ttl_sweep', 'cron', '0 */5 * * * *')  // (qname, kind, schedule_arg)
+CALL uni.periodic.cancel('uni.system.ttl_sweep')                              // yields true if a job was removed
+CALL uni.periodic.list()                                                      // one row per known job
+CALL uni.periodic.submit('MATCH (n:Stale) DETACH DELETE n')                   // run one write-mode batch now
+CALL uni.periodic.iterate('MATCH (n:Big) RETURN n', 'DETACH DELETE n', '{}')  // (query, mutating_query, options_json)
+CALL uni.periodic.commit()                                                    // sync sentinel (v1 no-op)
 ```
 
 Schedule kinds: `once` / `periodic` / `cron` / `manual`. Built-in jobs: `uni.system.ttl_sweep` and `uni.system.compaction` are wired to real host hooks; `uni.system.statistics_refresh` is a stub pending a planner statistics API. A `CircuitBreaker` opens a job after 10 consecutive failures (30 s cooldown). The Rust API exposes `Uni::periodic_schedule` / `periodic_cancel` / `periodic_list`.
@@ -2971,8 +2981,8 @@ YIELD name, type, enabled, properties, target
 ### Labels
 
 ```cypher
-CREATE LABEL Person { name: STRING, age: INTEGER, email: STRING UNIQUE }
-ALTER LABEL Person ADD PROPERTY phone: STRING
+CREATE LABEL Person ( name STRING, age INTEGER, email STRING UNIQUE )
+ALTER LABEL Person ADD PROPERTY phone STRING
 ALTER LABEL Person DROP PROPERTY age
 ALTER LABEL Person RENAME PROPERTY name TO full_name
 DROP LABEL IF EXISTS Person
@@ -2981,47 +2991,47 @@ DROP LABEL IF EXISTS Person
 ### Edge Types
 
 ```cypher
-CREATE EDGE TYPE KNOWS FROM [Person] TO [Person] { weight: FLOAT }
-ALTER EDGE TYPE KNOWS ADD PROPERTY since: DATE
+CREATE EDGE TYPE KNOWS (weight FLOAT) FROM Person TO Person
+ALTER EDGE TYPE KNOWS ADD PROPERTY since DATE
 DROP EDGE TYPE IF EXISTS KNOWS
 ```
 
 ### Indexes
 
 ```cypher
-CREATE INDEX idx_name ON Person (name)
-CREATE VECTOR INDEX idx_embed ON Document (embedding) WITH { metric: 'cosine' }
-CREATE FULLTEXT INDEX idx_content ON Article (content)
-CREATE JSON_FULLTEXT INDEX idx_meta ON Data (metadata)
+CREATE INDEX idx_name FOR (p:Person) ON (p.name)
+CREATE VECTOR INDEX idx_embed FOR (d:Document) ON (d.embedding) OPTIONS { metric: 'cosine' }
+CREATE FULLTEXT INDEX idx_content FOR (a:Article) ON EACH [a.content]
+CREATE JSON FULLTEXT INDEX idx_meta FOR (d:Data) ON metadata
 DROP INDEX idx_name
 ```
 
 ### Constraints
 
 ```cypher
-CREATE CONSTRAINT UNIQUE ON Person (email)
-CREATE CONSTRAINT PRIMARY KEY ON Product (sku)
+CREATE CONSTRAINT email_unique ON (p:Person) ASSERT p.email IS UNIQUE
+CREATE CONSTRAINT product_sku_key ON (p:Product) ASSERT p.sku IS KEY
 DROP CONSTRAINT constraint_name
 ```
 
 ### SHOW Commands
 
 ```cypher
-SHOW DATABASE       -- Database metadata
-SHOW INDEXES        -- All indexes with status
-SHOW CONSTRAINTS    -- All constraints
-SHOW CONFIG         -- Current configuration
-SHOW STATISTICS     -- Storage statistics
+SHOW DATABASE       // Database metadata
+SHOW INDEXES        // All indexes with status
+SHOW CONSTRAINTS    // All constraints
+SHOW CONFIG         // Current configuration
+SHOW STATISTICS     // Storage statistics
 ```
 
 ### Admin Commands
 
 ```cypher
-VACUUM              -- Reclaim space
-CHECKPOINT          -- Force flush
-BACKUP '/path/to/backup'
-COPY (Person) TO '/path/to/file' FORMAT csv
-COPY (Person) FROM '/path/to/file' FORMAT parquet
+VACUUM              // Reclaim space
+CHECKPOINT          // Force flush
+BACKUP TO '/path/to/backup'
+COPY Person TO '/path/to/file' WITH {format: 'csv'}
+COPY Person FROM '/path/to/file' WITH {format: 'parquet'}
 ```
 
 ## Time Travel
@@ -3045,7 +3055,7 @@ RETURN n.name, n.age
 EXPLAIN MATCH (n:Person)-[:KNOWS]->(m:Person) RETURN n, m
 
 // Execute and show timing per operator
-PROFILE MATCH (n:Person)-[:KNOWS]->(m:Person) RETURN n, m
+EXPLAIN MATCH (n:Person)-[:KNOWS]->(m:Person) RETURN n, m
 ```
 
 ---
@@ -3324,6 +3334,7 @@ CREATE RULE ruleName [PRIORITY n] AS
 
 Rules reference other rules using `IS`:
 
+<!-- doctest: skip -->
 ```cypher
 // 1-arg form: single subject
 WHERE x IS reachable
@@ -3342,7 +3353,7 @@ WHERE x IS NOT compromised
 
 Accumulate values along traversal paths:
 
-```cypher
+```locy
 CREATE RULE shortest_risk AS
     MATCH (a:Account)-[t:TRANSFER]->(b:Account)
     WHERE a IS flagged
@@ -3358,12 +3369,12 @@ CREATE RULE shortest_risk AS
 
 Aggregate across paths:
 
-```cypher
+```locy
 CREATE RULE total_exposure AS
     MATCH (a:Account)-[:TRANSFER*]->(b:Account)
     WHERE b IS suspicious
-    FOLD total = SUM(t.amount)
-    FOLD path_count = COUNT(*)
+    FOLD total = SUM(t.amount),
+         path_count = COUNT(*)
     YIELD KEY a, total, path_count
 ```
 
@@ -3397,7 +3408,7 @@ Two consequences inside `FixpointState`:
 
 A `WHERE` clause after `FOLD` filters aggregated groups — equivalent to SQL's `HAVING`:
 
-```cypher
+```locy
 CREATE RULE frequent_payer AS
     MATCH (p:Person)-[r:PAID]->(i:Invoice)
     FOLD n = COUNT(*), total = SUM(r.amount)
@@ -3418,14 +3429,14 @@ Two monotonic aggregators for combining probabilities in recursive rules:
 
 Both are monotonic (safe in recursive strata), clamp inputs to [0, 1], skip nulls, and are commutative.
 
-```cypher
--- Risk combination: any signal can flag the account
+```locy
+// Risk combination: any signal can flag the account
 CREATE RULE risk_combined AS
     MATCH (a:Component)-[s:SIGNAL]->(b:Flag)
     FOLD risk = MNOR(s.probability)
     YIELD KEY a, risk
 
--- Joint reliability: all parts must work
+// Joint reliability: all parts must work
 CREATE RULE joint_reliability AS
     MATCH (asm:Part)-[r:REQUIRES]->(sub:Part)
     FOLD availability = MPROD(sub.reliability)
@@ -3457,7 +3468,7 @@ MPROD uses log-space computation when the product drops below 1e-15 to prevent u
 
 Locy can mark one output column per rule as the rule's probability channel:
 
-```cypher
+```locy
 CREATE RULE supplier_risk AS
     MATCH (s:Supplier)-[:HAS_SIGNAL]->(sig:Signal)
     FOLD risk = MNOR(sig.risk)
@@ -3472,7 +3483,7 @@ Supported forms:
 
 When `IS NOT` targets a rule with a `PROB` column, negation becomes probabilistic complement instead of Boolean anti-join:
 
-```cypher
+```locy
 CREATE RULE usable_supplier AS
     MATCH (s:Supplier)
     WHERE s IS NOT supplier_risk
@@ -3498,7 +3509,7 @@ Derived rows from approximate groups are annotated with `_approximate = true`, a
 
 Select optimal results:
 
-```cypher
+```locy
 CREATE RULE best_route AS
     MATCH (a:City)-[r:ROAD]->(b:City)
     ALONG distance = prev.distance + r.length
@@ -3514,11 +3525,11 @@ Enables `LIMIT 1` optimization — the engine can prune suboptimal paths early d
 
 Control result grouping:
 
-```cypher
+```locy
 CREATE RULE risk_summary AS
     MATCH (a:Account)-[:TRANSFER]->(b:Account)
     WHERE b IS flagged
-    YIELD KEY a,       -- Group by source account
+    YIELD KEY a,       // Group by source account
           count(*) AS exposure_count,
           sum(t.amount) AS total_exposure
 ```
@@ -3530,8 +3541,8 @@ CREATE RULE risk_summary AS
 Control evaluation order within a stratum:
 
 ```cypher
-CREATE RULE high_priority_rule [PRIORITY 100] AS ...
-CREATE RULE normal_rule AS ...  -- Default priority: 0
+CREATE RULE high_priority_rule PRIORITY 100 AS ...
+CREATE RULE normal_rule AS ...  // Default priority: 0
 CREATE RULE low_priority_rule [PRIORITY -10] AS ...
 ```
 
@@ -3541,12 +3552,11 @@ Higher priority values execute first.
 
 Create new graph elements from reasoning results:
 
-```cypher
+```locy
 CREATE RULE infer_risk AS
     MATCH (a:Account)-[:TRANSFER]->(b:Account)
     WHERE a IS flagged
     DERIVE (b)-[:RISK_FROM]->(a)
-    DERIVE (b:FlaggedAccount)
 
 // MERGE combines paths
 CREATE RULE merge_paths AS
@@ -3558,10 +3568,11 @@ CREATE RULE merge_paths AS
 
 Access values from the previous fixpoint iteration:
 
-```cypher
+```locy
 CREATE RULE converging_score AS
     MATCH (n:Node)
     ALONG score = (prev.score + neighbor_avg) / 2.0
+    YIELD KEY n, score
 ```
 
 `prev.<field>` is rewritten to a bare column reference over the self-referential derived scan, so a clause carrying `ALONG` always reads the **`Contributions`** view — a per-KEY aggregate is not defined per path. See *What a self-reference reads* above.
@@ -3663,7 +3674,7 @@ Commands execute in **Phase 2** (row-level dispatch) after strata have converged
 
 ### QUERY (Goal Query)
 
-```cypher
+```locy
 QUERY reachable WHERE start.name = 'Alice' RETURN node, distance
 ```
 
@@ -3671,7 +3682,7 @@ Evaluates rules using SLG (Selective Linear Definite clause) resolution.
 
 ### DERIVE (Fact Derivation)
 
-```cypher
+```locy
 DERIVE risk_propagation WHERE threshold > 0.5 RETURN flagged_nodes
 ```
 
@@ -3681,7 +3692,7 @@ Iterates over converged facts from the named rule, applies the WHERE filter, and
 
 "What facts would need to be true for this conclusion to hold?"
 
-```cypher
+```locy
 ABDUCE compromised WHERE target.name = 'ServerA' RETURN assumptions
 ABDUCE NOT safe WHERE node.name = 'Gateway' RETURN required_conditions
 ```
@@ -3692,7 +3703,7 @@ Three-phase pipeline: (1) build derivation tree via EXPLAIN, (2) extract candida
 
 Show the inference chain:
 
-```cypher
+```locy
 EXPLAIN RULE risk_score WHERE account.id = 'ACC-001' RETURN derivation
 ```
 
@@ -3700,7 +3711,7 @@ EXPLAIN RULE risk_score WHERE account.id = 'ACC-001' RETURN derivation
 
 "What if we made these changes?"
 
-```cypher
+```locy
 ASSUME {
     CREATE (x:Account {name: 'Suspicious'})-[:TRANSFER]->(existing:Account)
 }
@@ -3715,7 +3726,7 @@ Executes within a savepoint: applies mutations, re-evaluates all strata in the m
 
 Locy programs can be organized into modules:
 
-```cypher
+```locy
 MODULE acme.compliance
 USE acme.common { reach, control }
 USE acme.security { threat_model }
@@ -3768,7 +3779,7 @@ LocyConfig {
 
 ### Fraud Risk Propagation
 
-```cypher
+```locy
 MODULE fraud.detection
 
 CREATE RULE flagged AS
@@ -3776,7 +3787,7 @@ CREATE RULE flagged AS
     WHERE a.fraud_score > 0.8
     YIELD KEY a
 
-CREATE RULE risk_chain [PRIORITY 10] AS
+CREATE RULE risk_chain PRIORITY 10 AS
     MATCH (a:Account)-[t:TRANSFER]->(b:Account)
     WHERE a IS flagged
     ALONG risk = prev.risk + t.amount * 0.01
@@ -3791,10 +3802,10 @@ ORDER BY propagated_risk DESC
 
 ### RBAC Permission Resolution
 
-```cypher
+```locy
 MODULE rbac.resolver
 
-CREATE RULE effective_permission [PRIORITY 100] AS
+CREATE RULE effective_permission PRIORITY 100 AS
     MATCH (u:User)-[:HAS_ROLE]->(r:Role)-[:GRANTS]->(p:Permission)
     YIELD KEY u, KEY p, r.priority AS grant_priority
 
@@ -3811,7 +3822,7 @@ RETURN p.resource, p.action, grant_priority
 
 ### Supply Chain Provenance
 
-```cypher
+```locy
 MODULE supply.chain
 
 CREATE RULE provenance AS
@@ -4300,9 +4311,10 @@ Query historical data without restoring a snapshot:
 ### By Snapshot ID
 
 ```cypher
-MATCH (n:Person) VERSION AS OF 'abc-123-snapshot-id'
+MATCH (n:Person)
 WHERE n.age > 25
 RETURN n.name, n.age
+VERSION AS OF 'abc-123-snapshot-id'
 ```
 
 ### By Timestamp
@@ -5798,7 +5810,7 @@ All five loaders converge on `PluginRegistrar`; the execution layer is loader-ag
 | Reload | full | epoch-fenced | epoch-fenced | full | session-scope unregister |
 | Parity test | (reference) | `m6_cross_abi_parity.rs` | (same) | `m7_rhai_cross_loader_parity.rs` | `m8_pyo3_cross_loader_parity.rs` |
 
-> **Note:** Only the Rust path can author all 26 extension surfaces. As of 3.0.0 the four non-Rust loaders author **scalar, aggregate, procedure, and graph algorithms** — the WASM Component Model now defines *four* WIT worlds (`scalar-plugin`, `aggregate-plugin`, `procedure-plugin`, and `algorithm-plugin` in `crates/uni-plugin-wasm/wit/world.wit`, the last importing both the `host-graph` interface and the typed `host-arena` interface); Extism, Rhai, and PyO3 carry the matching GraphCompute host surface (`graph_compute` + `adapter_algorithm`). Guest graph algorithms drive the coarse GraphCompute kernels over opaque handles, and may grow their own mutable structure through the `graph-arena@1` kernels (see [§GraphCompute — Guest-Authorable Graph Algorithms](#graphcompute--guest-authorable-graph-algorithms)). The remaining surfaces are compile-time-Rust-only. Vectorized scalar evaluation is implemented for PyO3 only; CM/Extism are IPC-batch, Rhai is row-mode.
+> **Note:** Only the Rust path can author all 22 extension surfaces. As of 3.0.0 the four non-Rust loaders author **scalar, aggregate, procedure, and graph algorithms** — the WASM Component Model now defines *four* WIT worlds (`scalar-plugin`, `aggregate-plugin`, `procedure-plugin`, and `algorithm-plugin` in `crates/uni-plugin-wasm/wit/world.wit`, the last importing both the `host-graph` interface and the typed `host-arena` interface); Extism, Rhai, and PyO3 carry the matching GraphCompute host surface (`graph_compute` + `adapter_algorithm`). Guest graph algorithms drive the coarse GraphCompute kernels over opaque handles, and may grow their own mutable structure through the `graph-arena@1` kernels (see [§GraphCompute — Guest-Authorable Graph Algorithms](#graphcompute--guest-authorable-graph-algorithms)). The remaining surfaces are compile-time-Rust-only. Vectorized scalar evaluation is implemented for PyO3 only; CM/Extism are IPC-batch, Rhai is row-mode.
 
 ## Loading a Plugin (Host API)
 
@@ -5979,13 +5991,12 @@ The meta-plugin path — Uni's analogue of `apoc.custom` — lets users define n
 ```cypher
 CALL uni.plugin.declareFunction(
   'myco.discount', '(price: float, pct: float) -> float',
-  'cypher', 'RETURN price * (1.0 - pct)');
-
-CALL uni.plugin.declareProcedure('myco.reindex', '...', 'cypher', '...');  -- WRITE mode needs Capability::ProcedureWrites
-CALL uni.plugin.declareAggregate('myco.wmean', ...);
-CALL uni.plugin.declareTrigger('myco.audit', 'Account', 'AfterCommit', ...);
-CALL uni.plugin.listDeclared();
-CALL uni.plugin.dropDeclared('myco.discount');
+  'cypher', 'RETURN price * (1.0 - pct)')
+CALL uni.plugin.declareProcedure('myco.reindex', '...', 'cypher', '...')  // WRITE mode needs Capability::ProcedureWrites
+CALL uni.plugin.declareAggregate('myco.wmean', ...)
+CALL uni.plugin.declareTrigger('myco.audit', 'Account', 'AfterCommit', ...)
+CALL uni.plugin.listDeclared()
+CALL uni.plugin.dropDeclared('myco.discount')
 ```
 
 - **Integrity.** `uni-plugin-custom` performs dependency-missing detection, cycle detection (`CustomError::DependencyCycle` raised on insert), and drop-with-dependents protection (cascade/leaves-first removal).
@@ -6268,7 +6279,7 @@ Quick reference of all anti-patterns from every chapter:
 
 | Term | Definition |
 |---|---|
-| **AdjacencyDataset** | Persistent chunked CSR format stored as LanceDB tables for fast graph traversal |
+| **AdjacencyDataset** | Persistent chunked CSR format stored as Lance tables for fast graph traversal |
 | **Arrow** | Apache Arrow columnar memory format used for in-memory data representation |
 | **BM25** | Best Matching 25 — probabilistic text relevance scoring algorithm used in full-text search |
 | **BulkWriter** | High-throughput write path bypassing WAL for initial data loading |
@@ -6281,7 +6292,7 @@ Quick reference of all anti-patterns from every chapter:
 | **DataFusion** | Apache DataFusion query engine used for physical plan execution |
 | **DeltaDataset** | L1 sorted runs storing edge mutations (inserts/deletes) with MVCC versions |
 | **DenseIdx** | 32-bit index for O(1) array access in graph algorithms (remapped from sparse VIDs) |
-| **EdgeDataset** | Per-type LanceDB tables storing edge data with properties |
+| **EdgeDataset** | Per-type Lance tables storing edge data with properties |
 | **EID** | Edge ID — 64-bit auto-increment identifier for edges |
 | **ext_id** | External ID — user-provided string primary key, unique per label |
 | **Declared Plugin** | An extension defined from Cypher via `uni.plugin.declare*`, persisted as a `_DeclaredPlugin` node + JSON sidecar |
@@ -6292,9 +6303,9 @@ Quick reference of all anti-patterns from every chapter:
 | **HNSW** | Hierarchical Navigable Small World — approximate nearest neighbor index for vectors |
 | **IVF-PQ** | Inverted File with Product Quantization — memory-efficient vector index for large datasets |
 | **L0** | Level 0 — in-memory write buffer (L0Buffer) backed by SimpleGraph |
-| **L1** | Level 1 — LanceDB sorted runs (delta tables) produced by L0 flushes |
+| **L1** | Level 1 — Lance sorted runs (delta tables) produced by L0 flushes |
 | **L2** | Level 2 — compacted base tables produced by background compaction |
-| **LanceDB** | Arrow-native columnar database used as Uni's storage engine |
+| **Lance** | Arrow-native columnar database used as Uni's storage engine |
 | **Loader (Plugin)** | One of five registration front-ends (Rust / WASM CM / Extism / Rhai / PyO3) converging on `PluginRegistry` |
 | **Locy** | Logic + Cypher — Datalog-inspired logic programming language extending Cypher |
 | **LSM** | Log-Structured Merge tree — write-optimized storage design pattern |
@@ -6320,7 +6331,7 @@ Quick reference of all anti-patterns from every chapter:
 | **UniId** | Content-addressed identifier — SHA3-256 hash of (label, ext_id, properties) |
 | **VCRegister** | Vector-Clock Register CRDT — causally consistent register |
 | **VectorClock** | Vector Clock CRDT — logical clocks for causal ordering |
-| **VertexDataset** | Per-label LanceDB tables storing vertex data with typed property columns |
+| **VertexDataset** | Per-label Lance tables storing vertex data with typed property columns |
 | **VID** | Vertex ID — 64-bit auto-increment identifier for vertices |
 | **VidLabelsIndex** | In-memory bidirectional index mapping VIDs to labels and labels to VIDs |
 | **WAL** | Write-Ahead Log — durability mechanism recording mutations before they're flushed |

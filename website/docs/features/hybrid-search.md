@@ -14,12 +14,12 @@ Uni provides hybrid search that combines vector similarity and full-text search 
 
 === "Cypher"
     ```cypher
-    -- Hybrid search with auto-embedding
+    // Hybrid search with auto-embedding
     CALL uni.search(
         'Document',
         {vector: 'embedding', fts: 'content'},
         'machine learning optimization',
-        null,  -- auto-embed the query text
+        null,  // auto-embed the query text
         10
     )
     YIELD node, score
@@ -75,6 +75,7 @@ Uni provides hybrid search that combines vector similarity and full-text search 
 
 ## Procedure Signature
 
+<!-- doctest: skip -->
 ```cypher
 CALL uni.search(label, properties, query_text [, query_vector] [, k] [, filter] [, options])
 YIELD vid, score, node [, vector_score] [, fts_score] [, sparse_score] [, distance]
@@ -185,14 +186,14 @@ RETURN node.title, score, vector_score, fts_score
 ```cypher
 CALL uni.search(
     'Document',
-    {vector: 'embedding', fts: 'content', sparse: 'emb'},   -- all three arms
+    {vector: 'embedding', fts: 'content', sparse: 'emb'},   // all three arms
     'machine learning optimization',
-    null,                                                    -- auto-embed dense
+    null,                                                    // auto-embed dense
     10,
     null,
     {
         method: 'weighted',
-        weights: [0.4, 0.2, 0.4],                            -- [vector, fts, sparse]
+        weights: [0.4, 0.2, 0.4],                            // [vector, fts, sparse]
         sparse_query: {indices: [42, 9001], values: [1.0, 0.5]}
     }
 )
@@ -216,14 +217,14 @@ For the headline end-to-end pattern — one BGE-M3 pass filling a dense, sparse,
 For scoring already-bound nodes (rather than top-K retrieval), use the `similar_to()` expression function. It works in `WHERE`, `RETURN`, `ORDER BY`, and Locy rule bodies:
 
 ```cypher
--- Hybrid scoring as an expression (correct way)
+// Hybrid scoring as an expression (correct way)
 MATCH (d:Document)
 RETURN d.title,
   similar_to([d.embedding, d.content], 'machine learning') AS relevance
 ORDER BY relevance DESC
 LIMIT 20
 
--- With weighted fusion
+// With weighted fusion
 MATCH (d:Document)
 WHERE similar_to([d.embedding, d.content], 'deep learning',
   {method: 'weighted', weights: [0.7, 0.3]}) > 0.5
@@ -240,13 +241,13 @@ RETURN d.title
 Always use a **single** `similar_to` call with multi-source arrays for hybrid search:
 
 ```cypher
--- ✅ CORRECT: single call with fusion and BM25 normalization
+// ✅ CORRECT: single call with fusion and BM25 normalization
 MATCH (d:Document)
 RETURN d.title,
   similar_to([d.embedding, d.content], [$qvec, $qtxt]) AS score
 ORDER BY score DESC
 
--- ❌ INCORRECT: naive addition mixes incompatible score scales
+// ❌ INCORRECT: naive addition mixes incompatible score scales
 MATCH (d:Document)
 RETURN d.title,
   (similar_to(d.embedding, $qvec) + similar_to(d.content, $qtxt)) AS score
@@ -314,16 +315,16 @@ It is fast (pure CPU over pre-stored embeddings) and requires no model runtime �
 ```cypher
 CALL uni.vector.query(
     'Document',
-    'embedding',                                   -- dense property for first-stage ANN
+    'embedding',                                   // dense property for first-stage ANN
     $dense_query_vector,
-    50,                                            -- over-fetch candidates to re-rank
+    50,                                            // over-fetch candidates to re-rank
     null,
     null,
     {
         reranker: 'maxsim',
-        reranker_property: 'tokens',               -- the LIST<VECTOR> property to score
-        maxsim_query: [[0.1, 0.2], [0.3, 0.4]],    -- per-token query embeddings
-        maxsim_metric: 'cosine'                    -- optional; default 'cosine'
+        reranker_property: 'tokens',               // the LIST<VECTOR> property to score
+        maxsim_query: [[0.1, 0.2], [0.3, 0.4]],    // per-token query embeddings
+        maxsim_metric: 'cosine'                    // optional; default 'cosine'
     }
 )
 YIELD node, score, rerank_score
@@ -360,15 +361,15 @@ Hybrid search requires both:
 2. A **fulltext index** on the text property
 
 ```cypher
--- Vector index with auto-embed
+// Vector index with auto-embed
 CREATE VECTOR INDEX doc_embed FOR (d:Document) ON (d.embedding)
 OPTIONS {
     metric: 'cosine',
     embedding: {provider: 'Candle', model: 'all-MiniLM-L6-v2', source: ['content']}
 }
 
--- Fulltext index
-CREATE FULLTEXT INDEX doc_fts FOR (d:Document) ON (d.content)
+// Fulltext index
+CREATE FULLTEXT INDEX doc_fts FOR (d:Document) ON EACH [d.content]
 ```
 
 See also: [Vector Search](vector-search.md) | [Full-Text Search](full-text-json-search.md)

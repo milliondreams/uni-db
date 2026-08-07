@@ -104,10 +104,10 @@ Use the `uni.sparse.query` procedure to retrieve the top-K documents by sparse d
 
 ```cypher
 CALL uni.sparse.query(
-    'Doc',                                              -- label
-    'emb',                                              -- sparse property
-    {indices: [42, 9001], values: [1.0, 0.5]},          -- query sparse vector
-    10                                                  -- k
+    'Doc',                                              // label
+    'emb',                                              // sparse property
+    {indices: [42, 9001], values: [1.0, 0.5]},          // query sparse vector
+    10                                                  // k
 )
 YIELD vid, score, rerank_score
 RETURN vid, score
@@ -150,8 +150,8 @@ CALL uni.sparse.query(
     'emb',
     {indices: [42, 9001], values: [1.0, 0.5]},
     50,
-    'lang = ''en''',     -- pre-filter
-    0.25                 -- minimum dot-product score
+    'lang = ''en''',     // pre-filter
+    0.25                 // minimum dot-product score
 )
 YIELD vid, score
 RETURN vid, score

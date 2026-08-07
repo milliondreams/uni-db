@@ -66,7 +66,7 @@ Ten of these algorithms are also callable as Locy feature expressions inside `CR
 | `max_neighbor(n, 'prop')` | Float64 |
 | `sum_neighbor(n, 'prop')` | Float64 |
 
-```cypher
+```locy
 CREATE MODEL risk_scorer AS
   INPUT (n)
   FEATURES degree_centrality(n), pagerank_score(n), avg_neighbor(n, 'risk')

@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
 
-//! Goal-directed QUERY evaluation via SLG resolution.
+//! QUERY evaluation.
+//!
+//! QUERY is answered from `derived_store` — the same semi-naive fixpoint result
+//! that `.derived` reads — so the two agree by construction. SLG resolution
+//! survives only as a fallback for rules containing a generator, which the
+//! columnar fixpoint has no row-explosion operator for.
 //!
 //! Ported from `uni-locy/src/orchestrator/query.rs`. Uses `DerivedFactSource`
 //! instead of `CypherExecutor`.
@@ -22,8 +27,9 @@ use super::locy_traits::DerivedFactSource;
 
 /// Entry point for goal-directed QUERY evaluation.
 ///
-/// Uses SLG resolution for all rules (recursive and non-recursive).
-/// SLG is goal-directed: it only computes facts relevant to the WHERE constraints.
+/// Reads the fixpoint's `derived_store` for every rule it produced, then
+/// applies the WHERE filter and RETURN clause. Falls back to SLG resolution
+/// only for generator rules, which the fixpoint cannot evaluate.
 pub async fn evaluate_query(
     query: &GoalQuery,
     program: &CompiledProgram,

@@ -4,7 +4,7 @@
 
 `ALONG` carries state through recursive expansion.
 
-```cypher
+```locy
 CREATE RULE shortest AS
 MATCH (a)-[e:EDGE]->(b)
 ALONG dist = prev.dist + e.weight
@@ -17,7 +17,7 @@ Use `prev.<field>` to reference prior recursive step values.
 
 `FOLD` aggregates rule outputs after derivation.
 
-```cypher
+```locy
 CREATE RULE totals AS
 MATCH (a)-[:EDGE]->(b)
 FOLD total = SUM(b.value)
@@ -30,7 +30,7 @@ A recursive `FOLD` rolls up **per KEY, one level at a time**: a self-reference
 binds one row per KEY of the target carrying that KEY's folded value, so a
 parent folds its children's values and each child has already folded its own.
 
-```cypher
+```locy
 CREATE RULE build AS
 MATCH (p:Part) WHERE p IS NOT assembly
 YIELD KEY p, 0.5 AS b
@@ -87,7 +87,7 @@ These six spellings are Locy's *declared lattice folds*. Writing one is an expli
 
 For probability domains, use `MNOR` (noisy-OR) and `MPROD` (product):
 
-```cypher
+```locy
 CREATE RULE failure_risk AS
 MATCH (c:Component)-[:HAS_SIGNAL]->(s:QualitySignal)
 FOLD risk = MNOR(1.0 - s.pass_rate)
@@ -100,12 +100,12 @@ See [Probabilistic Logic](probabilistic-logic.md) for full documentation.
 
 A rule can have multiple `FOLD` clauses to compute several aggregates simultaneously:
 
-```cypher
+```locy
 CREATE RULE exposure AS
 MATCH (a:Account)-[t:TRANSFER*]->(b:Account)
 WHERE b IS suspicious
-FOLD total = MSUM(t.amount)
-FOLD path_count = MCOUNT()
+FOLD total = MSUM(t.amount),
+     path_count = MCOUNT()
 YIELD KEY a, total, path_count
 ```
 
@@ -113,7 +113,7 @@ YIELD KEY a, total, path_count
 
 A `WHERE` clause after `FOLD` filters aggregated groups — equivalent to SQL's `HAVING`. Only rows where the condition holds are kept.
 
-```cypher
+```locy
 CREATE RULE frequent_payer AS
 MATCH (p:Person)-[r:PAID]->(i:Invoice)
 FOLD n = COUNT(*)
@@ -127,7 +127,7 @@ This yields only people who made 3 or more payments. The `WHERE n >= 3` runs *af
 
 Combine conditions with `AND`:
 
-```cypher
+```locy
 CREATE RULE big_spenders AS
 MATCH (p:Person)-[r:PAID]->(i:Invoice)
 FOLD n = COUNT(*), total = SUM(r.amount)
@@ -147,14 +147,14 @@ It **cannot** reference pre-aggregation columns that were consumed by FOLD.
 
 Post-FOLD `WHERE` filters during rule evaluation. `QUERY ... WHERE` filters after:
 
-```cypher
--- Filter inside the rule (during FOLD):
+```locy
+// Filter inside the rule (during FOLD):
 CREATE RULE counts AS
 MATCH (e:Ev) FOLD n = COUNT(*)
 WHERE n >= 3
 YIELD KEY e.action, n
 
--- Filter outside (at query time):
+// Filter outside (at query time):
 QUERY counts WHERE n >= 5 RETURN *
 ```
 
@@ -164,7 +164,7 @@ Both are valid. Use post-FOLD `WHERE` when the filter is intrinsic to the rule's
 
 `BEST BY` picks the best candidate row by ordering expression.
 
-```cypher
+```locy
 CREATE RULE cheapest AS
 MATCH (a)-[e:EDGE]->(b)
 ALONG cost = prev.cost + e.weight
@@ -186,7 +186,7 @@ The `similar_to()` expression function works in ALONG accumulators and BEST BY s
 
 ### Semantic Relevance Along Paths
 
-```cypher
+```locy
 CREATE RULE semantic_path AS
 MATCH (a:Document)-[:LINKS_TO]->(b:Document)
 ALONG relevance = prev.relevance * similar_to(b.embedding, $query)
@@ -195,7 +195,7 @@ YIELD KEY a, KEY b, relevance
 
 ### Best Semantically Similar Path
 
-```cypher
+```locy
 CREATE RULE best_match AS
 MATCH (a:Topic)-[:RELATED]->(b:Topic)
 ALONG score = prev.score + similar_to(b.embedding, $query)
@@ -205,7 +205,7 @@ YIELD KEY a, KEY b, score
 
 ### Hybrid Scoring in Rules
 
-```cypher
+```locy
 CREATE RULE hybrid_relevant AS
 MATCH (q:Query)-[:SEARCHES]->(d:Document)
 WHERE similar_to([d.embedding, d.content], q.text,

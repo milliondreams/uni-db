@@ -151,7 +151,7 @@ flowchart TB
     Input["MATCH (n:Person)-[:KNOWS]->(m)<br/>WHERE n.age > 30 RETURN m.name"]
 
     subgraph Parser["CypherParser"]
-        T[Tokenization via sqlparser]
+        T[Tokenization via pest]
         P[Pattern recognition]
         E[Expression parsing]
     end
@@ -508,7 +508,7 @@ flowchart TB
 | **Query Processing** | Custom vectorized engine | Morsel-driven batch execution |
 | **Graph Runtime** | SimpleGraph (custom) | In-memory graph algorithms |
 | **Object Store** | object_store | S3/GCS/Azure abstraction |
-| **Parsing** | sqlparser | SQL/Cypher tokenization |
+| **Parsing** | pest | Cypher/Locy grammar + tokenization |
 | **Concurrency** | DashMap, tokio | Thread-safe caching, async I/O |
 
 ---

@@ -74,7 +74,7 @@ Declared `VECTOR(dim)` dimensions are enforced (since 2.5.0): wrong-length write
 With an embedding configuration on your index, you can query with text directly:
 
 ```cypher
--- Create index with embedding config
+// Create index with embedding config
 CREATE VECTOR INDEX doc_embed FOR (d:Document) ON (d.embedding)
 OPTIONS {
     metric: 'cosine',
@@ -85,7 +85,7 @@ OPTIONS {
     }
 }
 
--- Query with text - Uni auto-embeds it
+// Query with text - Uni auto-embeds it
 CALL uni.vector.query('Document', 'embedding', 'machine learning tutorial', 10)
 YIELD node, score
 RETURN node.title, score
@@ -96,7 +96,7 @@ RETURN node.title, score
 The `~=` (approximate equality) operator is shorthand for a **top-K vector index scan** — it desugars to `uni.vector.query` under the hood:
 
 ```cypher
--- ~= operator: top-K scan against the vector index
+// ~= operator: top-K scan against the vector index
 MATCH (p:Paper) WHERE p.embedding ~= $query_vector
 RETURN p.title, p._score AS score
 ORDER BY score DESC LIMIT 10
@@ -120,7 +120,7 @@ RETURN b.title, similar_to(b.embedding, 'attention mechanisms') AS score
 For **hybrid search** (vector + FTS combined), use multi-source arrays with fusion:
 
 ```cypher
--- Correct hybrid: single similar_to with multi-source arrays
+// Correct hybrid: single similar_to with multi-source arrays
 MATCH (d:Doc)
 RETURN d.title,
   similar_to([d.embedding, d.content], [$query_vector, $query_text]) AS score
@@ -208,8 +208,8 @@ A multi-vector property is a `LIST<VECTOR(dim)>` — a variable-length list of f
     ```cypher
     CREATE LABEL Document (
         title  STRING,
-        embedding VECTOR(384),     -- dense vector for first-stage ANN
-        tokens LIST<VECTOR(96)>    -- per-token (ColBERT) vectors
+        embedding VECTOR(384),     // dense vector for first-stage ANN
+        tokens LIST<VECTOR(96)>    // per-token (ColBERT) vectors
     )
     ```
 
@@ -244,19 +244,20 @@ The Pydantic OGM maps a `list[Vector[96]]` field to the same `list:vector:96` ty
 
 Retrieve candidates with a fast first stage (dense ANN, or a MUVERA index over the tokens), then re-rank them by exact MaxSim. Pass the per-token query via `maxsim_query`:
 
+<!-- doctest: skip -->
 ```cypher
 CALL uni.vector.query(
     'Document',
-    'embedding',                                -- dense property for first-stage ANN
+    'embedding',                                // dense property for first-stage ANN
     $dense_query_vector,
-    50,                                         -- over-fetch candidates to re-rank
+    50,                                         // over-fetch candidates to re-rank
     null,
     null,
     {
         reranker: 'maxsim',
-        reranker_property: 'tokens',            -- the LIST<VECTOR> property
+        reranker_property: 'tokens',            // the LIST<VECTOR> property
         maxsim_query: [[0.1, 0.2], [0.3, 0.4]], -- per-token query embeddings
-        maxsim_metric: 'cosine'                 -- optional; default 'cosine'
+        maxsim_metric: 'cosine'                 // optional; default 'cosine'
     }
 )
 YIELD node, score, rerank_score

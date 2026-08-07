@@ -1,6 +1,6 @@
 # Python API Reference
 
-Complete reference for the `uni_db` Python bindings (v2.0.0). All operations go through the **Session** (reads, Locy) or **Transaction** (writes, bulk loading) obtained from a `Uni` instance.
+Complete reference for the `uni_db` Python bindings (v3.3.0). All operations go through the **Session** (reads, Locy) or **Transaction** (writes, bulk loading) obtained from a `Uni` instance.
 
 ## Installation
 
@@ -750,6 +750,99 @@ for row in result:
 
 ---
 
+## Forks
+
+Named, durable, isolated branches of the graph. A fork sees primary state plus
+its own writes; primary is unaffected until you explicitly promote.
+
+Every method below exists on both `Uni` and `AsyncUni` (await the async form).
+Fork builders return **synchronously** — only `.build()` / `.apply()` is
+awaitable — so the `await session.fork(name).ttl(td).build()` chain works as
+written.
+
+### Creating and using a fork
+
+```python
+from datetime import timedelta
+
+session = db.session()
+
+# Builders are synchronous; only .build() awaits.
+fork = session.fork("scenario_1").ttl(timedelta(hours=1)).build()
+
+tx = fork.tx()
+tx.execute("CREATE (:Person {name: 'fork-only'})")
+tx.commit()
+
+# The fork sees primary state + its own writes; primary is unchanged.
+fork.query("MATCH (p:Person) RETURN count(p) AS n")
+session.is_forked()      # False on the primary session
+```
+
+### Session methods
+
+| Method | Returns | Description |
+|---|---|---|
+| `session.fork(name)` | `ForkBuilder` | Open or create a fork. `.ttl()`, then `.build()` |
+| `session.fork_schema()` | `ForkSchemaBuilder` | Fork-local schema additions; `.apply()` |
+| `session.is_forked()` | `bool` | Whether this session is scoped to a fork |
+
+### Lifecycle and admin (on `Uni` / `AsyncUni`)
+
+| Method | Returns | Description |
+|---|---|---|
+| `list_forks()` | `list[ForkInfo]` | Every known fork |
+| `fork_info(name)` | `ForkInfo \| None` | One fork's metadata |
+| `drop_fork(name)` | `None` | Drop a leaf fork. **Refuses a fork with children** |
+| `drop_fork_cascade(name)` | `None` | Drop a fork and its whole subtree |
+
+### Tags
+
+Tags pin the fork branch's *current* version and survive the drop, which is what
+makes tag-then-drop safe for audit retention.
+
+| Method | Returns | Description |
+|---|---|---|
+| `tag_fork(fork_name, tag)` | `None` | Pin the fork's current version |
+| `untag_fork(fork_name, tag)` | `None` | Remove a tag |
+| `list_fork_tags(fork_name)` | `list[str]` | Tags for a fork |
+
+```python
+db.tag_fork("scenario_1", "audit-2026-q1")
+del fork
+db.drop_fork("scenario_1")
+db.list_fork_tags("scenario_1")   # the tag is still resolvable
+```
+
+### Diff and promote
+
+| Method | Returns | Description |
+|---|---|---|
+| `diff_fork_primary(fork_name)` | `ForkDiff` | Fork vs primary |
+| `diff_forks(a, b)` | `ForkDiff` | Two forks against each other |
+| `promote_from_fork(fork_name, patterns)` | `PromoteReport` | Apply fork changes to primary |
+| `promote_from_fork_with_options(fork_name, patterns, ...)` | `PromoteReport` | As above, with options |
+
+Diff identity is a **content-addressed UID**, not a VID, so sibling forks and
+entirely unrelated forks compare correctly even when their VIDs collide.
+
+Promote runs inside **one** primary transaction across every pattern, so a
+failure on pattern *N* rolls back patterns 1..*N*-1. Mix vertex and edge patterns
+in a single call when edges need their endpoints promoted alongside them —
+otherwise fork-only endpoints surface as `edges_skipped_no_endpoint`.
+
+```python
+report = db.promote_from_fork("scenario_1", [
+    PromotePattern.label("Person"),
+    PromotePattern.edge_type("KNOWS"),
+])
+```
+
+A fork-only label or edge type must exist on primary first; promote checks for
+it before opening the transaction and raises rather than half-committing.
+
+---
+
 ## Locy Reasoning
 
 Locy is Uni's built-in Datalog-based reasoning engine. Evaluate programs through a Session or Transaction.
@@ -759,9 +852,16 @@ Locy is Uni's built-in Datalog-based reasoning engine. Evaluate programs through
 ```python
 session = db.session()
 result = session.locy("""
-    reachable(x, y) :- MATCH (a)-[:KNOWS]->(b) WHERE a.name = x AND b.name = y.
-    reachable(x, z) :- reachable(x, y), reachable(y, z).
-    QUERY reachable(x, y) INTO result.
+    CREATE RULE reachable AS
+        MATCH (a:Person)-[:KNOWS]->(b:Person)
+        YIELD KEY b
+
+    CREATE RULE reachable AS
+        MATCH (a:Person)-[:KNOWS]->(b:Person)
+        WHERE a IS reachable
+        YIELD KEY b
+
+    QUERY reachable
 """)
 
 # Access command results (QUERY output)
@@ -875,13 +975,13 @@ if xervo.is_available():
     # Convenience wrapper -- single prompt string
     result = xervo.generate_text("llm/default", "Explain hybrid search in one sentence.")
 
-    # Rerank documents by relevance
-    scored = xervo.rerank(
-        "rerank/minilm",
-        "How do graph databases work?",
-        ["Graphs use edges for relationships.", "SQL uses tables and joins."],
-    )
-    # → list[ScoredDoc] with index, score, text
+    # NOTE: `Xervo` has no `rerank()` method. Cross-encoder reranking is a
+    # *query option*, applied by the retrieval procedure:
+    #
+    #   CALL uni.vector.query('Doc', 'embedding', $q, 10, null, null,
+    #        {reranker: 'rerank/minilm', reranker_property: 'content',
+    #         reranker_query: 'How do graph databases work?'})
+    #   YIELD node, score, rerank_score
 
     # Prefetch models at startup (best practice)
     xervo.prefetch(["embed/default", "llm/default"])   # specific aliases
@@ -912,7 +1012,6 @@ xervo = db.xervo()
 await xervo.prefetch(["embed/default"])  # async prefetch
 vectors = await xervo.embed("embed/default", ["hello"])
 result = await xervo.generate_text("llm/default", "Hello!")
-scored = await xervo.rerank("rerank/minilm", "query", ["doc1", "doc2"])
 ```
 
 ### Message Constructors
@@ -955,8 +1054,12 @@ print(prepared.query_text())
 
 ```python
 prepared = session.prepare_locy("""
-    reachable(x, y) :- MATCH (a)-[:KNOWS]->(b) WHERE a.name = x AND b.name = y.
-    QUERY reachable($start, y) INTO result.
+    CREATE RULE reachable AS
+        MATCH (a:Person)-[:KNOWS]->(b:Person)
+        WHERE a.name = $start
+        YIELD KEY b
+
+    QUERY reachable
 """)
 
 result = prepared.execute({"start": "Alice"})

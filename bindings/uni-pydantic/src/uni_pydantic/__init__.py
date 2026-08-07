@@ -31,38 +31,7 @@ Example:
     >>> adults = session.query(Person).filter(Person.age >= 18).all()
 """
 
-def _package_version() -> str:
-    """Read the version from installed package metadata.
-
-    Derived rather than hand-written: a literal here is a second source of
-    truth beside ``pyproject.toml`` and drifts silently, because only
-    ``pyproject.toml`` is checked at release time. It had drifted to ``2.5.0``
-    against a ``3.3.0`` package, which would have shipped a wrong
-    ``__version__`` to every consumer.
-
-    Falls back to reading ``pyproject.toml`` for a source checkout that has not
-    been installed, and finally to ``"0.0.0"`` so an import never fails over a
-    version string.
-    """
-    from importlib.metadata import PackageNotFoundError, version
-
-    try:
-        return version("uni-pydantic")
-    except PackageNotFoundError:
-        pass
-
-    try:
-        import tomllib
-        from pathlib import Path
-
-        pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
-        with pyproject.open("rb") as fh:
-            return str(tomllib.load(fh)["project"]["version"])
-    except Exception:  # noqa: BLE001 - a version string must never break import
-        return "0.0.0"
-
-
-__version__ = _package_version()
+from pathlib import Path
 
 # Base classes
 # Async support
@@ -159,6 +128,39 @@ from .types import (
     uni_to_python_type,
     unwrap_annotated,
 )
+
+
+def _package_version() -> str:
+    """Read the version from installed package metadata.
+
+    Derived rather than hand-written: a literal here is a second source of truth
+    beside ``pyproject.toml`` and drifts silently, because only ``pyproject.toml``
+    is checked at release time. It had drifted to ``2.5.0`` against a ``3.3.0``
+    package, which would have shipped a wrong ``__version__`` to every consumer.
+
+    Falls back to reading ``pyproject.toml`` for a source checkout that has not
+    been installed, and finally to ``"0.0.0"`` so an import never fails over a
+    version string.
+    """
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version("uni-pydantic")
+    except PackageNotFoundError:
+        pass
+
+    try:
+        import tomllib
+
+        pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+        with pyproject.open("rb") as fh:
+            return str(tomllib.load(fh)["project"]["version"])
+    except Exception:  # noqa: BLE001 - a version string must never break import
+        return "0.0.0"
+
+
+__version__ = _package_version()
+
 
 __all__ = [
     # Version

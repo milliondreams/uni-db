@@ -83,6 +83,43 @@ impl DerivedStore {
         self.relations.get(rule_name)
     }
 
+    /// Look up a rule's facts, tolerating the bare/qualified split that
+    /// `MODULE` introduces.
+    ///
+    /// Inside `MODULE m`, writing `adult` *is* how you name `m.adult`. The
+    /// compiler makes that work by offering every outer rule under both
+    /// spellings in the catalog rather than by qualifying the referring rule —
+    /// see the note in `uni-locy/src/compiler/mod.rs` explaining why handing
+    /// the body the outer module context would break unqualified lookups
+    /// elsewhere. The catalog is aliased, so the fact store has to resolve the
+    /// same way, or an IS-ref compiles cleanly and then silently matches
+    /// nothing at run time.
+    ///
+    /// An exact hit always wins. A bare name falls back to a unique qualified
+    /// rule with that suffix; **ambiguity is not guessed at** — if two modules
+    /// export the same bare name this returns `None` rather than picking one.
+    pub fn get_module_aware(&self, rule_name: &str) -> Option<&Vec<RecordBatch>> {
+        if let Some(facts) = self.relations.get(rule_name) {
+            return Some(facts);
+        }
+        if rule_name.contains('.') {
+            return None;
+        }
+        let mut matched: Option<&Vec<RecordBatch>> = None;
+        for (name, facts) in &self.relations {
+            if name
+                .rsplit_once('.')
+                .is_some_and(|(_, bare)| bare == rule_name)
+            {
+                if matched.is_some() {
+                    return None;
+                }
+                matched = Some(facts);
+            }
+        }
+        matched
+    }
+
     pub fn fact_count(&self, rule_name: &str) -> usize {
         self.relations
             .get(rule_name)
@@ -1281,10 +1318,18 @@ async fn run_program(
     }
 
     // Execute inline Cypher commands via execute_subplan.
-    // QUERY is deferred to the orchestrator: the DerivedStore uses inferred types
-    // (e.g. Float64 for property-derived columns) which don't preserve the actual
-    // property values. The orchestrator's SLG path re-derives with correct types.
-    // DERIVE/ASSUME/EXPLAIN/ABDUCE are also deferred (need L0 fork/restore, tree output, etc.).
+    //
+    // QUERY/DERIVE/ASSUME/EXPLAIN/ABDUCE are deferred to the orchestrator
+    // because they need orchestration the inline loop cannot provide: L0
+    // fork/restore, tree output, and a store that has been through
+    // `enrich_vids_with_nodes`.
+    //
+    // This comment used to give a different reason for QUERY specifically —
+    // that the DerivedStore carried inferred types which "don't preserve the
+    // actual property values", so the orchestrator's SLG path had to re-derive.
+    // `FixpointState::reconcile_schema` fixed that by adopting the physical
+    // plan's real output schema, and QUERY now answers from the derived store
+    // rather than re-deriving. Deferral is about orchestration, not types.
     //
     // Cypher commands that appear AFTER a DERIVE command are also deferred:
     // they need the ephemeral L0 overlay populated by DERIVE to see derived
@@ -1433,8 +1478,10 @@ fn write_cross_stratum_facts(
         for clause in &rule.clauses {
             for is_ref in &clause.is_refs {
                 // If this IS-ref points to a rule already in the derived store
-                // (i.e., from a previous stratum), write its facts into the registry
-                if let Some(facts) = derived_store.get(&is_ref.rule_name) {
+                // (i.e., from a previous stratum), write its facts into the
+                // registry. Module-aware: inside `MODULE m` the referring rule
+                // names `adult` while the store holds `m.adult`.
+                if let Some(facts) = derived_store.get_module_aware(&is_ref.rule_name) {
                     write_facts_to_registry(registry, &is_ref.rule_name, facts);
                 }
             }

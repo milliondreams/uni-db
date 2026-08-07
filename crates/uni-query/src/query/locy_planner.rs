@@ -359,6 +359,20 @@ fn infer_expr_type(expr: &Expr, node_vars: &HashSet<String>) -> DataType {
         Expr::Literal(CypherLiteral::String(_)) => DataType::LargeUtf8,
         Expr::Literal(CypherLiteral::Bool(_)) => DataType::Boolean,
         Expr::Literal(CypherLiteral::Null) => DataType::LargeUtf8,
+        // A duration accessor on a computed value — `duration.inDays(a, b).days`,
+        // `.months`, `.secondsOfMinute`, … — is integral. Every arm of
+        // `datetime::duration_component` returns `Value::Int`, so typing these
+        // `Float64` made `derived` report `20.0` where the value is `20`.
+        //
+        // Restricted to a non-`Variable` object on purpose: `n.days` is an
+        // ordinary node property whose type the schema decides, and a column
+        // that merely happens to be called `days` must not be forced to Int64.
+        Expr::Property(object, prop)
+            if !matches!(object.as_ref(), Expr::Variable(_))
+                && uni_query_functions::datetime::is_duration_accessor(prop) =>
+        {
+            DataType::Int64
+        }
         Expr::Property(_, _) => DataType::Float64,
         // Binary operations: infer from operator and operand types.
         Expr::BinaryOp { left, op, right } => {

@@ -429,8 +429,20 @@ async fn explain_rule_mode_b(
         .collect();
 
     // Re-evaluate the rule via SLG to obtain rows with full node objects and properties.
-    // The native fixpoint's orch_store has VID-only integers that fail property-based
-    // WHERE filters (e.g. a.name = 'A') — we need actual Value::Node values here.
+    //
+    // Top-level QUERY no longer does this — it answers from the derived store,
+    // so `QUERY r` and `.derived["r"]` are the same bytes (issue #160). Mode B
+    // EXPLAIN cannot follow yet, and the reason is narrower than the one this
+    // comment used to give: `enrich_vids_with_nodes` hydrates node VID columns
+    // into `Value::Node`, but there is **no equivalent for edge EIDs**. A rule
+    // with a KEY *edge* variable therefore yields `None` for that binding when
+    // read from the derived store, which `test_edge_binding_where_filter_works_via_mode_a`
+    // catches. Removing this block regresses exactly that test and nothing else.
+    //
+    // Closing the gap means hydrating edge columns the way node columns already
+    // are; until then EXPLAIN keeps its own re-derivation. Mode A
+    // (`explain_rule_mode_a`) reads the fixpoint's ProvenanceStore and is
+    // unaffected either way.
     {
         let mut fresh_store = RowStore::new();
         let slg_start = std::time::Instant::now();

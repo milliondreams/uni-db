@@ -74,11 +74,32 @@ pub async fn evaluate_assume(
     let mut assume_derived_store: RowStore = ctx.re_evaluate_strata(parent_program, config).await?;
     stats.queries_executed += 1; // rough accounting for the re-evaluation
 
-    // 4. Also evaluate body program's strata if any (merge into assume_derived_store)
+    // 4. Also evaluate the body program's strata, if any.
+    //
+    // The body's strata are evaluated **after the parent's, in one run**, not
+    // standalone. A body rule may IS-reference an outer rule
+    // (`CREATE RULE eligible AS MATCH (p:Person) WHERE p IS adult ...`), and a
+    // standalone evaluation of just the body's strata gives that reference no
+    // facts to resolve against, so the rule derives nothing.
+    //
+    // That gap used to be invisible: the body's QUERY went through the SLG
+    // resolver, which re-derives a goal's dependencies on demand and so
+    // recomputed `adult` for itself. Now that QUERY answers from the derived
+    // store, the store has to actually contain the answer.
     if !assume.body_program.strata.is_empty() {
-        // The body's own strata, planned against the merged catalog.
+        // The body's strata, planned against the merged catalog, appended to
+        // the parent's so cross-references resolve. Parent strata come first —
+        // stratification order is a dependency order, and a body rule may
+        // depend on a parent rule but not the reverse.
+        let combined_strata: Vec<_> = parent_program
+            .strata
+            .iter()
+            .cloned()
+            .chain(assume.body_program.strata.iter().cloned())
+            .collect();
         let body_program = CompiledProgram {
             rule_catalog: merged_rule_catalog.clone(),
+            strata: combined_strata,
             ..assume.body_program.clone()
         };
         let body_store = ctx.re_evaluate_strata(&body_program, config).await?;

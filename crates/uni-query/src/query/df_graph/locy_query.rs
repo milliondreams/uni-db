@@ -55,28 +55,40 @@ pub async fn evaluate_query(
         None => std::collections::HashMap::new(),
     };
 
-    // For FOLD rules (MNOR/MPROD/SUM), the SLG resolver does not apply
-    // post-fixpoint aggregation and would return raw pre-FOLD match rows.
-    // Use pre-computed facts from derived_store (which ran the full native
-    // fixpoint including FOLD aggregation and VID→Node enrichment).
-    let is_fold_rule = rule.clauses.iter().any(|c| !c.fold.is_empty());
-    if is_fold_rule && derived_store.contains_key(&rule_name) {
-        let rows = derived_store[&rule_name].rows.clone();
-        // Apply the QUERY WHERE filter here too — the FOLD path does not fall
-        // through to the shared filter below, so omitting this silently ignored
-        // the predicate for FOLD rules (returning rows that fail it).
+    // Answer from the facts the fixpoint already derived.
+    //
+    // This used to re-derive the rule from scratch through the SLG resolver,
+    // discarding `derived_store`, on the grounds that "the native fixpoint
+    // stores node columns as VIDs (UInt64), not full node objects, so
+    // orch_store rows would fail property-based WHERE/RETURN evaluation".
+    // That reason is stale twice over: `FixpointState::reconcile_schema`
+    // replaces the planner's inferred types with the physical plan's real
+    // output schema, and `enrich_vids_with_nodes` hydrates VID columns into
+    // node objects before commands are dispatched.
+    //
+    // The discard was the direct cause of issue #160: `.derived` read the
+    // fixpoint's answer while `QUERY` read an independent SLG re-derivation
+    // with weaker recursion and stratification, and the two disagreed. Reading
+    // the same store makes them the same bytes by construction, which is a
+    // stronger guarantee than any parity check could give.
+    //
+    // FOLD rules always took this path — the SLG resolver has no post-fixpoint
+    // aggregation and would return raw pre-FOLD match rows — so this is that
+    // branch generalized to every rule, not a new mechanism.
+    if let Some(relation) = derived_store.get(&rule_name) {
+        let rows = relation.rows.clone();
         let filtered = filter_where(rows, query.where_expr.as_ref(), &config.params);
         return apply_return_clause(filtered, &query.return_clause, &config.params);
     }
 
-    // Use a fresh store rather than the pre-computed orch_store.
-    // The native fixpoint stores node columns as VIDs (UInt64), not full node objects,
-    // so orch_store rows would fail property-based WHERE/RETURN evaluation (a.name etc.).
-    // SLG re-evaluation executes actual Cypher queries which return full node objects.
+    // Fallback: the fixpoint produced nothing for this rule.
     //
-    // However, FOLD rules (MNOR/MPROD/SUM) require fixpoint aggregation that the SLG
-    // resolver cannot perform. Seed the fresh store with pre-computed FOLD rule data
-    // so that downstream rules using IS NOT on FOLD rules can find their derived facts.
+    // In practice that means a rule containing a generator, which the planner
+    // skips when building strata because the columnar engine has no
+    // row-explosion operator (`locy_planner.rs`, `locy_slg::apply_generators`).
+    // Generators are the one capability the fixpoint genuinely lacks, so the
+    // SLG path survives for exactly that case. Seed the store with FOLD
+    // relations so an IS NOT across a FOLD boundary can still resolve.
     let mut fresh_store = RowStore::new();
     for (name, relation) in derived_store.iter() {
         if let Some(r) = program.rule_catalog.get(name)

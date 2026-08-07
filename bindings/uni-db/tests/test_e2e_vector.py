@@ -66,27 +66,27 @@ def test_vector_search_with_k(ecommerce_db_populated):
 
 
 def test_vector_search_with_threshold(ecommerce_db_populated):
-    """Test vector search with distance threshold filtering."""
+    """Test vector search with a minimum-similarity threshold."""
     session = ecommerce_db_populated.session()
 
     results_tight = session.query("""
-        CALL uni.vector.query('Product', 'embedding', [1.0, 0.0, 0.0, 0.0], 10, NULL, 0.5)
-        YIELD vid, distance
-        RETURN vid, distance
+        CALL uni.vector.query('Product', 'embedding', [1.0, 0.0, 0.0, 0.0], 10, NULL, 0.9)
+        YIELD vid, score
+        RETURN vid, score
     """)
 
-    assert all(r["distance"] <= 0.5 for r in results_tight), (
-        "All matches should be within threshold"
+    assert all(r["score"] >= 0.9 for r in results_tight), (
+        "threshold is a minimum similarity; every result must clear it"
     )
 
     results_wide = session.query("""
-        CALL uni.vector.query('Product', 'embedding', [1.0, 0.0, 0.0, 0.0], 10, NULL, 2.0)
-        YIELD vid, distance
-        RETURN vid, distance
+        CALL uni.vector.query('Product', 'embedding', [1.0, 0.0, 0.0, 0.0], 10, NULL, 0.1)
+        YIELD vid, score
+        RETURN vid, score
     """)
 
     assert len(results_wide) >= len(results_tight), (
-        "Larger threshold should return more results"
+        "a LOWER similarity floor admits more results"
     )
 
 
@@ -243,18 +243,18 @@ def test_vector_search_k_larger_than_dataset(ecommerce_db_populated):
 
 
 def test_vector_search_threshold_excludes_distant_results(ecommerce_db_populated):
-    """Test threshold properly excludes results beyond distance limit."""
+    """Test threshold properly excludes results below the similarity floor."""
     session = ecommerce_db_populated.session()
 
     results = session.query("""
-        CALL uni.vector.query('Product', 'embedding', [0.0, 0.0, 1.0, 0.0], 10, NULL, 0.1)
-        YIELD node, distance
-        RETURN node.name AS name, distance
+        CALL uni.vector.query('Product', 'embedding', [0.0, 0.0, 1.0, 0.0], 10, NULL, 0.99)
+        YIELD node, score
+        RETURN node.name AS name, score
     """)
 
     assert len(results) >= 1, "Should find at least the exact match"
     for row in results:
-        assert row["distance"] <= 0.1, "All results should be within threshold"
+        assert row["score"] >= 0.99, "threshold is a minimum similarity"
 
 
 def test_vector_search_chained_constraints(ecommerce_db_populated):

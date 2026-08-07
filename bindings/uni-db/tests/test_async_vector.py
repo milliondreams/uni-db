@@ -62,15 +62,18 @@ async def test_async_vector_search_with_k(vector_db):
 
 @pytest.mark.asyncio
 async def test_async_vector_search_with_threshold(vector_db):
-    """Test async vector search with distance threshold."""
+    """Test async vector search with a minimum-similarity threshold."""
     session = vector_db.session()
     results = await session.query("""
-        CALL uni.vector.query('Document', 'embedding', [1.0, 0.0, 0.0], 10, NULL, 0.1)
-        YIELD vid, distance
-        RETURN vid, distance
+        CALL uni.vector.query('Document', 'embedding', [1.0, 0.0, 0.0], 10, NULL, 0.99)
+        YIELD vid, score
+        RETURN vid, score
     """)
 
+    # `threshold` is a minimum similarity, so a 0.99 floor keeps only the
+    # (near-)exact match.
     assert len(results) <= 1
+    assert all(r["score"] >= 0.99 for r in results)
 
 
 @pytest.mark.asyncio

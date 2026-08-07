@@ -39,11 +39,23 @@ pub async fn evaluate_query(
     stats: &mut LocyStats,
     start: Instant,
 ) -> Result<Vec<FactRow>, LocyError> {
+    // `QUERY adult` inside `MODULE m` names the rule bare, but the catalog keys
+    // it as `m.adult`. The compiler validates the reference module-aware, so a
+    // plain lookup here accepts the program at compile time and then fails at
+    // run time. Resolve with the same policy the derived store uses.
     let rule_name = query.rule_name.to_string();
+    let catalog_key = uni_locy::names::resolve_unique(
+        program.rule_catalog.keys().map(String::as_str),
+        &rule_name,
+    )
+    .ok_or_else(|| LocyError::QueryResolutionError {
+        message: format!("rule '{}' not found", rule_name),
+    })?
+    .to_string();
     let rule =
         program
             .rule_catalog
-            .get(&rule_name)
+            .get(&catalog_key)
             .ok_or_else(|| LocyError::QueryResolutionError {
                 message: format!("rule '{}' not found", rule_name),
             })?;
@@ -81,7 +93,15 @@ pub async fn evaluate_query(
     // FOLD rules always took this path — the SLG resolver has no post-fixpoint
     // aggregation and would return raw pre-FOLD match rows — so this is that
     // branch generalized to every rule, not a new mechanism.
-    if let Some(relation) = derived_store.get(&rule_name) {
+    // Module-aware: inside `MODULE m`, `QUERY adult` names the rule bare while
+    // the store keys it `m.adult`. A plain lookup misses and falls through to
+    // the SLG path, which then reports the rule as not found even though the
+    // fixpoint derived it. `RowStore` is a bare map, so resolve the key with
+    // the shared policy rather than a method.
+    let store_key =
+        uni_locy::names::resolve_unique(derived_store.keys().map(String::as_str), &rule_name)
+            .map(str::to_string);
+    if let Some(relation) = store_key.and_then(|k| derived_store.get(&k)) {
         let rows = relation.rows.clone();
         let filtered = filter_where(rows, query.where_expr.as_ref(), &config.params);
         return apply_return_clause(filtered, &query.return_clause, &config.params);

@@ -46,8 +46,22 @@ pub struct LocyRuleRegistry {
 /// Merge a session's registered rules into a freshly compiled program.
 ///
 /// Registered rules fill any `rule_catalog` slot the program does not already
-/// define, and the program's own strata are rebased above the registry's so
-/// the registered strata run first and dependency ids stay consistent.
+/// define. Only the registered *strata* the program can actually reach are
+/// prepended, and the program's own strata are rebased above them so the
+/// registered ones run first and stratum ids stay dense.
+///
+/// The catalog is merged in full while the strata are filtered, because the two
+/// carry different risk. A catalog entry is inert metadata consulted during
+/// planning; a stratum is *evaluated*. Merging every stratum made each
+/// registered rule run in every program, so a single registered rule taking a
+/// parameter made that parameter mandatory for programs referencing no rule at
+/// all. Filtering the catalog instead would risk manufacturing spurious
+/// "unknown rule" errors, so it stays complete and every existing failure path
+/// behaves exactly as before.
+///
+/// Reachability is computed by [`uni_locy::prune`]; a reference to a rule that
+/// does not exist is already rejected at compile time, so pruning cannot turn a
+/// missing rule into a silently empty result.
 pub(crate) fn merge_registered_rules(compiled: &mut CompiledProgram, registry: &LocyRuleRegistry) {
     if registry.rules.is_empty() {
         return;
@@ -58,12 +72,35 @@ pub(crate) fn merge_registered_rules(compiled: &mut CompiledProgram, registry: &
             .entry(name.clone())
             .or_insert_with(|| rule.clone());
     }
-    let base_id = registry.strata.len();
+
+    let seeds = uni_locy::prune::collect_referenced_rule_names(compiled);
+    let keep = uni_locy::prune::reachable_pool_strata(&seeds, &registry.strata);
+
+    // Renumber the retained strata densely. `remap` is keyed on the original
+    // `id` rather than the pool index so it stays correct if a future registry
+    // path ever assigns non-dense ids. Edges to pruned strata are dropped
+    // rather than left dangling; nothing reads `depends_on` at run time, but a
+    // coherent graph keeps plan dumps readable.
+    let mut remap: HashMap<usize, usize> = HashMap::with_capacity(keep.len());
+    let mut merged_strata: Vec<uni_locy::types::Stratum> =
+        Vec::with_capacity(keep.len() + compiled.strata.len());
+    for (new_id, &index) in keep.iter().enumerate() {
+        let mut stratum = registry.strata[index].clone();
+        remap.insert(stratum.id, new_id);
+        stratum.id = new_id;
+        stratum.depends_on = stratum
+            .depends_on
+            .iter()
+            .filter_map(|d| remap.get(d).copied())
+            .collect();
+        merged_strata.push(stratum);
+    }
+
+    let base_id = merged_strata.len();
     for stratum in &mut compiled.strata {
         stratum.id += base_id;
         stratum.depends_on = stratum.depends_on.iter().map(|d| d + base_id).collect();
     }
-    let mut merged_strata = registry.strata.clone();
     merged_strata.append(&mut compiled.strata);
     compiled.strata = merged_strata;
 }

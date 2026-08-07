@@ -30,6 +30,7 @@ use crate::query::df_graph::procedure_call::{
 };
 use crate::query::df_graph::scan::resolve_property_type;
 use crate::query::executor::procedure_host::QueryProcedureHost;
+use uni_query_functions::similar_to::normalize_bm25;
 
 // Rust guideline compliant
 
@@ -752,7 +753,13 @@ pub(crate) async fn run_sparse_query(
         schema,
         rerank_ctx: Some(&rerank_ctx),
     };
-    build_search_result_batch(&results, &label, &metric, &batch_ctx).await
+    build_search_result_batch(
+        &results,
+        &label,
+        RetrievalScore::Distance(&metric),
+        &batch_ctx,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -988,20 +995,44 @@ fn build_node_yield_columns(
     Ok(columns)
 }
 
+/// How the raw retrieval number attached to each hit becomes the yielded `score`.
+///
+/// Vector-style retrieval returns a *distance* (smaller is better), which
+/// [`calculate_score`] inverts into a similarity. Full-text retrieval returns a
+/// *BM25 relevance* (larger is better), which must be squashed with
+/// [`normalize_bm25`] instead — pushing BM25 through the L2 arm of
+/// `calculate_score` yields `1/(1+bm25)`, which is strictly *decreasing* in
+/// relevance and silently inverts `ORDER BY score DESC`.
+#[derive(Clone, Copy)]
+pub(crate) enum RetrievalScore<'a> {
+    /// Raw value is a distance under `metric`; smaller is better.
+    Distance(&'a DistanceMetric),
+    /// Raw value is a BM25 relevance; larger is better.
+    Bm25 { k: f32 },
+}
+
+impl RetrievalScore<'_> {
+    /// Map one raw retrieval value onto the yielded `score` scale, where
+    /// larger always means "better match".
+    pub(crate) fn to_score(self, raw: f32) -> f32 {
+        match self {
+            RetrievalScore::Distance(metric) => calculate_score(raw, metric),
+            RetrievalScore::Bm25 { k } => normalize_bm25(raw, k),
+        }
+    }
+}
+
 async fn build_search_result_batch(
     results: &[(Vid, f32)],
     label: &str,
-    metric: &DistanceMetric,
+    scoring: RetrievalScore<'_>,
     batch_ctx: &BatchBuildCtx<'_>,
 ) -> DFResult<Option<RecordBatch>> {
     let num_rows = results.len();
     let vids: Vec<Vid> = results.iter().map(|(vid, _)| *vid).collect();
     let distances: Vec<f32> = results.iter().map(|(_, d)| *d).collect();
 
-    let retrieval_scores: Vec<f32> = distances
-        .iter()
-        .map(|dist| calculate_score(*dist, metric))
-        .collect();
+    let retrieval_scores: Vec<f32> = distances.iter().map(|raw| scoring.to_score(*raw)).collect();
 
     let uni_schema = batch_ctx.host.storage().schema_manager().schema();
     let label_props = uni_schema.properties.get(label);
@@ -1204,6 +1235,10 @@ async fn build_hybrid_search_batch(
 // ---------------------------------------------------------------------------
 
 /// `uni.vector.query(label, property, query, k, filter?, threshold?, options?)`.
+///
+/// `k` is required. `threshold`, when given, is a **minimum similarity** on the
+/// same scale as the yielded `score` (larger is a better match) — identical on
+/// the dense, auto-embedded and multi-vector paths.
 pub(crate) async fn run_vector_query(
     host: &QueryProcedureHost,
     args: &[Value],
@@ -1235,8 +1270,8 @@ pub(crate) async fn run_vector_query(
         let k = require_int_arg(args, 3, "uni.vector.query: fourth argument (k)")?;
         let filter = extract_optional_filter(args, 4);
         // The multi-vector `score` is an exact MaxSim *similarity* (higher is
-        // better), so `threshold` here is a minimum similarity (not a maximum
-        // distance, unlike the dense-vector path).
+        // better) and `threshold` is a minimum similarity — the same meaning
+        // the dense path below now uses.
         let threshold = extract_optional_threshold(args, 5);
         let options_map = args
             .get(6)
@@ -1304,7 +1339,13 @@ pub(crate) async fn run_vector_query(
             schema,
             rerank_ctx: Some(&rerank_ctx),
         };
-        return build_search_result_batch(&results, &label, &metric, &batch_ctx).await;
+        return build_search_result_batch(
+            &results,
+            &label,
+            RetrievalScore::Distance(&metric),
+            &batch_ctx,
+        )
+        .await;
     }
 
     let query_text_from_arg = query_val.as_str().map(String::from);
@@ -1358,20 +1399,26 @@ pub(crate) async fn run_vector_query(
         .await
         .map_err(exec_err)?;
 
-    if let Some(max_dist) = threshold {
-        results.retain(|(_, dist)| *dist <= max_dist as f32);
-    }
-
-    if results.is_empty() {
-        return Ok(Some(create_empty_batch(schema.clone())?));
-    }
-
     let schema_manager = storage.schema_manager();
     let uni_schema = schema_manager.schema();
     let metric = uni_schema
         .vector_index_for_property(&label, &property)
         .map(|config| config.metric.clone())
         .unwrap_or(DistanceMetric::L2);
+
+    // `threshold` is a **minimum similarity**, on the same scale as the yielded
+    // `score`, on every path of this procedure — dense, multi-vector and
+    // auto-embedded alike. It used to be a *maximum distance* here only, so the
+    // same argument meant opposite things depending on which branch the query
+    // took and moving a property to a `List<Vector>` column silently inverted
+    // the filter.
+    if let Some(min_sim) = threshold {
+        results.retain(|(_, dist)| calculate_score(*dist, &metric) >= min_sim as f32);
+    }
+
+    if results.is_empty() {
+        return Ok(Some(create_empty_batch(schema.clone())?));
+    }
 
     let (results, rerank_ctx) = apply_rerank(
         host,
@@ -1390,10 +1437,21 @@ pub(crate) async fn run_vector_query(
         schema,
         rerank_ctx: rerank_ctx.as_ref(),
     };
-    build_search_result_batch(&results, &label, &metric, &batch_ctx).await
+    build_search_result_batch(
+        &results,
+        &label,
+        RetrievalScore::Distance(&metric),
+        &batch_ctx,
+    )
+    .await
 }
 
 /// `uni.fts.query(label, property, search_term, k, filter?, threshold?, options?)`.
+///
+/// `k` is required. The yielded `score` is BM25 squashed to `[0, 1)` by
+/// `normalize_bm25` (larger is a better match), and `threshold` is a minimum on
+/// that same scale. `options.fts_k` tunes the saturation constant, matching
+/// `similar_to`.
 pub(crate) async fn run_fts_query(
     host: &QueryProcedureHost,
     args: &[Value],
@@ -1411,6 +1469,15 @@ pub(crate) async fn run_fts_query(
     let options_map = options_val.and_then(|v| if v.is_null() { None } else { v.as_object() });
     let reranker_config = parse_reranker_options(options_map, k, Some(&property));
 
+    // BM25 saturation constant, matching `similar_to`'s `fts_k` option so the
+    // two full-text entry points report scores on one scale.
+    let fts_k = options_map
+        .and_then(|m| m.get("fts_k"))
+        .and_then(|v| v.as_f64())
+        .map(|v| v as f32)
+        .filter(|v| *v > 0.0)
+        .unwrap_or(1.0);
+
     let retrieval_k = reranker_config.as_ref().map_or(k, |rc| rc.k);
     let storage = host.storage();
     let query_ctx = host.query_context();
@@ -1427,8 +1494,12 @@ pub(crate) async fn run_fts_query(
         .await
         .map_err(exec_err)?;
 
+    // `threshold` is a minimum on the *yielded* `score`, so it must be compared
+    // on the normalized scale the caller sees — not against the raw BM25 value,
+    // which has both a different range and (before the `RetrievalScore::Bm25`
+    // fix) the opposite direction.
     if let Some(min_score) = threshold {
-        results.retain(|(_, score)| *score as f64 >= min_score);
+        results.retain(|(_, score)| normalize_bm25(*score, fts_k) as f64 >= min_score);
     }
 
     if results.is_empty() {
@@ -1452,7 +1523,13 @@ pub(crate) async fn run_fts_query(
         schema,
         rerank_ctx: rerank_ctx.as_ref(),
     };
-    build_search_result_batch(&results, &label, &DistanceMetric::L2, &batch_ctx).await
+    build_search_result_batch(
+        &results,
+        &label,
+        RetrievalScore::Bm25 { k: fts_k },
+        &batch_ctx,
+    )
+    .await
 }
 
 /// Parse three-way fusion weights `[vector, fts, sparse]` from `options.weights`.

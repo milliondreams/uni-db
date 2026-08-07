@@ -99,26 +99,15 @@ impl DerivedStore {
     /// An exact hit always wins. A bare name falls back to a unique qualified
     /// rule with that suffix; **ambiguity is not guessed at** — if two modules
     /// export the same bare name this returns `None` rather than picking one.
+    /// The bare-vs-qualified policy itself lives in [`uni_locy::names`], shared
+    /// with the registry-stratum pruner so the two cannot drift apart.
     pub fn get_module_aware(&self, rule_name: &str) -> Option<&Vec<RecordBatch>> {
         if let Some(facts) = self.relations.get(rule_name) {
             return Some(facts);
         }
-        if rule_name.contains('.') {
-            return None;
-        }
-        let mut matched: Option<&Vec<RecordBatch>> = None;
-        for (name, facts) in &self.relations {
-            if name
-                .rsplit_once('.')
-                .is_some_and(|(_, bare)| bare == rule_name)
-            {
-                if matched.is_some() {
-                    return None;
-                }
-                matched = Some(facts);
-            }
-        }
-        matched
+        let key =
+            uni_locy::names::resolve_unique(self.relations.keys().map(String::as_str), rule_name)?;
+        self.relations.get(key)
     }
 
     pub fn fact_count(&self, rule_name: &str) -> usize {

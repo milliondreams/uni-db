@@ -2564,11 +2564,22 @@ fn build_show_constraints(pair: Pair<Rule>) -> Result<SchemaCommand, ParseError>
 
 fn build_constraint_target(pair: Pair<Rule>) -> Result<ConstraintTarget, ParseError> {
     let mut inner = pair.into_inner().peekable();
-    inner.next(); // FOR
+    inner.next(); // ON
 
     let is_edge = consume_if_present(&mut inner, Rule::EDGE);
-    inner.next(); // (
-    let name = normalize_identifier(inner.next().unwrap().as_str());
+    // NOTE: the parentheses in `constraint_target` (cypher.pest) are bare
+    // string literals, so pest does not surface them as inner pairs — only
+    // `ON`, `EDGE` and the identifier are captured. Do not try to consume a
+    // `(` here: doing so eats the identifier and leaves nothing to name the
+    // target, which used to panic on the valid `SHOW CONSTRAINTS ON (Label)`.
+    let name = inner
+        .next()
+        .map(|p| normalize_identifier(p.as_str()))
+        .ok_or_else(|| {
+            ParseError::new(
+                "UnexpectedSyntax: SHOW CONSTRAINTS target is missing a name".to_string(),
+            )
+        })?;
     Ok(if is_edge {
         ConstraintTarget::EdgeType(name)
     } else {
@@ -2776,5 +2787,48 @@ pub(crate) fn build_string_literal(pair: Pair<Rule>) -> Result<String, ParseErro
         unescape_string(content, quote_char)
     } else {
         Err(ParseError::new("Expected string literal".to_string()))
+    }
+}
+
+#[cfg(test)]
+mod show_constraints_tests {
+    //! Regression cover for the `SHOW CONSTRAINTS ON (...)` target walker.
+    //!
+    //! The parentheses in `constraint_target` are bare string literals, so pest
+    //! does not surface them as inner pairs. `build_constraint_target` used to
+    //! consume one anyway, which ate the identifier and made the following
+    //! `.unwrap()` panic on input the grammar accepts.
+
+    use crate::ast::{ConstraintTarget, Query, SchemaCommand};
+
+    fn show_constraints_target(q: &str) -> Option<ConstraintTarget> {
+        match crate::parse(q).expect("grammar accepts this") {
+            Query::Schema(cmd) => match *cmd {
+                SchemaCommand::ShowConstraints(sc) => sc.target,
+                other => panic!("not SHOW CONSTRAINTS: {other:?}"),
+            },
+            other => panic!("not a schema command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn show_constraints_on_label_does_not_panic() {
+        assert_eq!(
+            show_constraints_target("SHOW CONSTRAINTS ON (Paper)"),
+            Some(ConstraintTarget::Label("Paper".to_string()))
+        );
+    }
+
+    #[test]
+    fn show_constraints_on_edge_type() {
+        assert_eq!(
+            show_constraints_target("SHOW CONSTRAINTS ON EDGE (CITES)"),
+            Some(ConstraintTarget::EdgeType("CITES".to_string()))
+        );
+    }
+
+    #[test]
+    fn show_constraints_without_target() {
+        assert_eq!(show_constraints_target("SHOW CONSTRAINTS"), None);
     }
 }

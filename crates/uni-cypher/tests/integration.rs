@@ -2,6 +2,7 @@
 // binary to minimize compile/link time. See docs/test_layout.md.
 // Add new integration tests as a `mod` here, NOT as a new tests/*.rs file.
 
+mod docs_snippets;
 mod parse_depth_limit;
 mod parser_backtracking_regression;
 mod path_quantifier_range;

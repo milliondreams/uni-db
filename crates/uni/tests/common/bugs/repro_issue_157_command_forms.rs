@@ -147,14 +147,18 @@ async fn a_bare_reference_inside_its_module_retains_the_qualified_rule() {
 
     let result = db.session().locy_with("MODULE m\nQUERY adult").run().await;
 
+    let out = result.unwrap_or_else(|e| {
+        panic!("a bare reference inside MODULE m must resolve the registered `m.adult`: {e}")
+    });
+    // Assert the rows, not merely that the call succeeded: resolving to an empty
+    // relation would be just as wrong as erroring, and far quieter.
+    let facts = out
+        .derived
+        .get("m.adult")
+        .expect("the qualified rule must appear in `derived`");
+    assert_eq!(facts.len(), 2, "both seeded X nodes must be derived");
     assert!(
-        result.is_ok(),
-        "a bare reference inside MODULE m must resolve the registered `m.adult`, \
-         got: {:?}",
-        result.err()
-    );
-    assert!(
-        !result.unwrap().derived.contains_key("tripwire"),
+        !out.derived.contains_key("tripwire"),
         "the unreferenced registered rule must not be evaluated"
     );
 }
@@ -171,13 +175,14 @@ async fn a_fully_qualified_reference_retains_the_registered_rule() {
 
     let result = db.session().locy_with("QUERY m.adult").run().await;
 
+    let out = result.unwrap_or_else(|e| panic!("a fully qualified reference must resolve: {e}"));
+    let facts = out
+        .derived
+        .get("m.adult")
+        .expect("the qualified rule must appear in `derived`");
+    assert_eq!(facts.len(), 2, "both seeded X nodes must be derived");
     assert!(
-        result.is_ok(),
-        "a fully qualified reference must resolve the registered rule, got: {:?}",
-        result.err()
-    );
-    assert!(
-        !result.unwrap().derived.contains_key("tripwire"),
+        !out.derived.contains_key("tripwire"),
         "the unreferenced registered rule must not be evaluated"
     );
 }

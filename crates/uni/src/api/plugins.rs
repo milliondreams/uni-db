@@ -599,6 +599,13 @@ impl Uni {
         host_grants: &uni_plugin::CapabilitySet,
         registrar_caps: &uni_plugin::CapabilitySet,
     ) -> Result<uni_plugin_extism::loader::LoadOutcome> {
+        // Enforce the host artifact hash-pin allowlist before the payload is
+        // instantiated. Default (empty allowlist) is a no-op.
+        self.inner
+            .plugin_trust
+            .enforce_artifact_pin(bytes)
+            .map_err(plugin_err_to_uni)?;
+
         // The placeholder plugin id is rewritten by the loader with the
         // real id from the manifest into the returned LoadOutcome. We
         // need a non-empty placeholder because QName::namespace()
@@ -660,6 +667,12 @@ impl Uni {
         host_grants: &uni_plugin::CapabilitySet,
         registrar_caps: &uni_plugin::CapabilitySet,
     ) -> Result<uni_plugin_wasm::loader::LoadOutcome> {
+        // Enforce the host artifact hash-pin allowlist before the payload is
+        // instantiated. Default (empty allowlist) is a no-op.
+        self.inner
+            .plugin_trust
+            .enforce_artifact_pin(bytes)
+            .map_err(plugin_err_to_uni)?;
         with_loading_registrar(
             &self.inner.plugin_registry,
             "wasm.loading",
@@ -716,6 +729,12 @@ impl Uni {
         script: &str,
         registrar_caps: &uni_plugin::CapabilitySet,
     ) -> Result<uni_plugin_rhai::LoadOutcome> {
+        // Enforce the host artifact hash-pin allowlist before the payload is
+        // instantiated. Default (empty allowlist) is a no-op.
+        self.inner
+            .plugin_trust
+            .enforce_artifact_pin(script.as_bytes())
+            .map_err(plugin_err_to_uni)?;
         with_loading_registrar(
             &self.inner.plugin_registry,
             "rhai.loading",
@@ -777,6 +796,12 @@ impl Uni {
         module_name: &str,
         registrar_caps: &uni_plugin::CapabilitySet,
     ) -> Result<uni_plugin_pyo3::LoadOutcome> {
+        // Enforce the host artifact hash-pin allowlist before the payload is
+        // instantiated. Default (empty allowlist) is a no-op.
+        self.inner
+            .plugin_trust
+            .enforce_artifact_pin(module_src.as_bytes())
+            .map_err(plugin_err_to_uni)?;
         with_loading_registrar(
             &self.inner.plugin_registry,
             "pyo3.loading",

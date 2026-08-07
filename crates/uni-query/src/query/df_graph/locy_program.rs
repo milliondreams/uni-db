@@ -1574,6 +1574,33 @@ fn convert_to_fixpoint_plans(
                 yield_schema
             };
 
+            // Derivation-discriminator columns for a recursive FOLD / ALONG rule
+            // (issue #159), appended in the same order the planner projects them.
+            //
+            // This schema is what `FixpointState::new` consumes to build both
+            // `RowDedupState` and `all_column_indices`, so appending here is what
+            // actually puts the discriminators into the dedup key.
+            //
+            // Widening it is also what keeps provenance correct rather than
+            // merely safe: `record_provenance`, `detect_shared_lineage`,
+            // `apply_exact_wmc` and `find_clause_for_row` all derive their column
+            // indices from this schema, so the fact hash becomes
+            // discriminator-aware — the semantics we want. Were the batches
+            // widened but this schema left narrow, provenance would hash only the
+            // leading columns (siblings would collide again, defeating the fix)
+            // and `find_clause_for_row` would skip every candidate and silently
+            // report clause 0.
+            let deriv_cols = &rule.deriv_columns;
+            let yield_schema = if deriv_cols.is_empty() {
+                yield_schema
+            } else {
+                let mut fields: Vec<Arc<Field>> = yield_schema.fields().iter().cloned().collect();
+                for (name, dt) in deriv_cols {
+                    fields.push(Arc::new(Field::new(name, dt.clone(), true)));
+                }
+                ArrowSchema::new(fields)
+            };
+
             let prob_column_name = rule
                 .yield_schema
                 .iter()

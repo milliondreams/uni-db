@@ -489,12 +489,27 @@ YIELD KEY a, KEY b, cost
 ```
 
 KEY marks a column as a **grouping key**:
-- KEY columns define the **identity** of a derived fact. Rows with identical KEY values are deduplicated.
+- KEY columns define the **identity** of a derived fact.
 - In recursive evaluation, KEY columns determine when new facts stop being generated (fixpoint).
 - KEY columns are used as join keys for IS references from other rules.
 - In FOLD aggregation, KEY columns are the implicit GROUP BY.
 
-**Without KEY columns**, every row is considered unique — no deduplication occurs. This is usually an anti-pattern in recursive rules (see [Section 19](#19-best-practices--anti-patterns)).
+**Deduplication is on the whole row, not on KEY alone.** Two derived rows are
+the same fact only when *every* column matches, so a rule may legitimately
+produce several rows per KEY group — which is what ALONG and BEST BY rely on.
+Declaring no KEY columns does not disable deduplication; it only removes the
+grouping, and is usually an anti-pattern in recursive rules (see
+[Section 19](#19-best-practices--anti-patterns)).
+
+**A FOLD aggregates the bag of derivations, not the set of distinct row
+values.** N sibling derivations reaching the same KEY with numerically equal
+values contribute N times, not once — consistent with "FOLD aggregates across
+paths" ([Section 19](#19-best-practices--anti-patterns)) and with `MCOUNT`
+being defined as `acc + 1` per contributing row. Inside a recursive stratum the
+engine keeps such derivations distinct by their bindings, so a bill-of-materials
+rollup sums every path (issue #159). Deduplication still suppresses
+*re-derivations* of the same fact by the same bindings, which is what makes the
+fixpoint terminate.
 
 ## 6.3 PROB Annotation
 

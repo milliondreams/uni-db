@@ -4539,12 +4539,54 @@ fn apply_post_fold_projection(
     Ok(result)
 }
 
+/// Runs the post-fixpoint chain, then drops the hidden derivation
+/// discriminators (issue #159).
+///
+/// The strip is a wrapper rather than a step inside the chain because the chain
+/// has several exits — notably an early return for rules with no FOLD, BEST BY,
+/// PRIORITY or HAVING, which is precisely the `ALONG`-only case that needs it.
+/// A `FOLD` rule is already narrow by then (`FoldExec` emits KEY plus fold
+/// columns), so for those this is a no-op.
+///
+/// Placement is load-bearing: the discriminators must survive *dedup*, which is
+/// the whole point, but must not reach `write_facts_to_registry` or the derived
+/// store. Stripping columns does not re-dedup, so multiplicity is preserved.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors the inner chain's signature"
+)]
+pub(crate) async fn apply_post_fixpoint_chain(
+    facts: Vec<RecordBatch>,
+    rule: &FixpointRulePlan,
+    task_ctx: &Arc<TaskContext>,
+    strict_probability_domain: bool,
+    probability_epsilon: f64,
+    semiring_kind: SemiringKind,
+    provenance_tracker: Option<Arc<ProvenanceStore>>,
+    top_k_proofs_k: usize,
+    registry: Option<Arc<DerivedScanRegistry>>,
+) -> DFResult<Vec<RecordBatch>> {
+    let out = apply_post_fixpoint_chain_inner(
+        facts,
+        rule,
+        task_ctx,
+        strict_probability_domain,
+        probability_epsilon,
+        semiring_kind,
+        provenance_tracker,
+        top_k_proofs_k,
+        registry,
+    )
+    .await?;
+    super::locy_complement::strip_derivation_discriminator_columns(out)
+}
+
 /// Apply post-fixpoint operators (FOLD, HAVING, BEST BY, PRIORITY) to converged facts.
 #[expect(
     clippy::too_many_arguments,
     reason = "context bundle would be over-engineering for one call site"
 )]
-pub(crate) async fn apply_post_fixpoint_chain(
+async fn apply_post_fixpoint_chain_inner(
     facts: Vec<RecordBatch>,
     rule: &FixpointRulePlan,
     task_ctx: &Arc<TaskContext>,

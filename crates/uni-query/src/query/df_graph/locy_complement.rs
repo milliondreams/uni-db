@@ -164,6 +164,53 @@ pub fn strip_isnot_vid_columns(
     Ok(result)
 }
 
+/// Drops the hidden derivation-discriminator columns (issue #159).
+///
+/// Mirrors [`strip_isnot_vid_columns`], but runs at a different point: those
+/// exist only to survive the anti-join and are stripped *before* `merge_delta`,
+/// whereas these exist precisely to survive **dedup**, so they must not be
+/// removed until the fixpoint has converged.
+///
+/// Stripping columns does not re-dedup, so an ALONG rule's equal-valued sibling
+/// rows remain separate rows afterwards — they simply lose the hidden columns.
+/// That is what lets everything downstream (the derived store, cross-stratum
+/// IS-ref scans, the user-visible surface) keep its original narrow schema.
+///
+/// A `FOLD` rule never needs this: `FoldExec` emits KEY plus fold columns only,
+/// so the fold drops them for free. It is `ALONG`-without-`FOLD` rules that
+/// would otherwise leak wide batches into `write_facts_to_registry`, which
+/// falls back *silently* on a schema mismatch and then fails at scan time in
+/// `DerivedScanExec`, which re-stamps its declared schema.
+pub fn strip_derivation_discriminator_columns(
+    batches: Vec<RecordBatch>,
+) -> datafusion::error::Result<Vec<RecordBatch>> {
+    use crate::query::planner_locy_types::FOLD_DISCRIMINATOR_COL_PREFIX;
+
+    let mut result = Vec::with_capacity(batches.len());
+    for batch in batches {
+        let keep: Vec<usize> = batch
+            .schema()
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| !f.name().starts_with(FOLD_DISCRIMINATOR_COL_PREFIX))
+            .map(|(i, _)| i)
+            .collect();
+        if keep.len() == batch.num_columns() {
+            result.push(batch);
+            continue;
+        }
+        let fields: Vec<_> = keep
+            .iter()
+            .map(|&i| batch.schema().field(i).clone())
+            .collect();
+        let columns: Vec<_> = keep.iter().map(|&i| batch.column(i).clone()).collect();
+        let schema = Arc::new(arrow_schema::Schema::new(fields));
+        result.push(RecordBatch::try_new(schema, columns).map_err(arrow_err)?);
+    }
+    Ok(result)
+}
+
 /// Probabilistic complement for composite (multi-column) join keys.
 ///
 /// Builds a composite key from all `join_cols` right-side columns in

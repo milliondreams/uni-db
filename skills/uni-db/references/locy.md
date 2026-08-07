@@ -178,12 +178,20 @@ YIELD KEY a, KEY b, cost
 ```
 
 KEY marks a column as a grouping key:
-- Defines fact identity -- rows with identical KEY values are deduplicated
+- Defines fact identity
 - Determines fixpoint convergence in recursive evaluation
 - Used as join keys for IS references from other rules
 - Implicit GROUP BY for FOLD aggregation
 
-Without KEY columns, every row is unique -- usually an anti-pattern in recursive rules.
+Deduplication is on the **whole row**, not on KEY alone, so a rule may produce
+several rows per KEY group -- which is what ALONG and BEST BY rely on. Declaring
+no KEY columns removes the grouping, not the deduplication; usually an
+anti-pattern in recursive rules.
+
+A FOLD aggregates the **bag of derivations**, not the set of distinct row
+values: N sibling derivations with equal values contribute N times (issue #159).
+Deduplication still suppresses re-derivations of the same fact by the same
+bindings, which is what makes the fixpoint terminate.
 
 ### PROB Annotation
 

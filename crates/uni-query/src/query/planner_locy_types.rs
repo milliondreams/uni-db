@@ -57,6 +57,15 @@ pub struct LocyRulePlan {
     /// output. Empty for the common case (FoldExec output already matches the
     /// yield schema).
     pub yield_projection: Vec<(String, Expr)>,
+    /// Hidden derivation-discriminator columns `(name, type)`, in the order the
+    /// planner projects them onto every clause (issue #159).
+    ///
+    /// Recorded here so the fixpoint plan can widen its Arrow yield schema to
+    /// match, without re-deriving the analysis from the compiled rule — the
+    /// two must agree exactly or dedup, provenance and the clause union all
+    /// disagree about the row shape. Empty unless the rule is recursive and
+    /// carries FOLD or ALONG. See [`FOLD_DISCRIMINATOR_COL_PREFIX`].
+    pub deriv_columns: Vec<(String, DataType)>,
 }
 
 /// A single clause (body) of a Locy rule.
@@ -119,6 +128,53 @@ pub struct LocyIsRef {
 ///   `0..yield_schema.len()` scans in provenance recording stay aligned even if
 ///   a strip is ever missed.
 pub const ISNOT_VID_COL_PREFIX: &str = "__isnot_vid_";
+
+/// Prefix for the hidden derivation-discriminator columns that keep distinct
+/// derivations distinct inside a recursive `FOLD` / `ALONG` rule (issue #159).
+///
+/// # The problem
+///
+/// `MATCH (p)-[e:HAS]->(c) FOLD cost = MSUM(cost * e.q) YIELD KEY p, cost`
+/// projects the child `c` away, so a parent with N children of equal cost
+/// yields N *identical* `(p, cost)` rows. All-column dedup collapses them and
+/// the fold then aggregates one value — a bill-of-materials rollup returns 1.0
+/// instead of N. MNOR/MPROD are wrong the same way: two children at p=0.5 give
+/// 0.5 instead of 0.75.
+///
+/// The intended semantics are documented, if indirectly: "FOLD aggregates
+/// across **paths**" (`docs/complete_locy.md`), `MCOUNT = acc + 1` is
+/// meaningless over a value-set, the BDD proof model reasons per *derivation
+/// row*, and the TCK already requires two equal-valued rows to contribute twice
+/// in a *non*-recursive rule. The all-column dedup comment justifies itself
+/// solely by termination and was never a semantic commitment.
+///
+/// # Why a discriminator, and not something cheaper
+///
+/// Dedup is doing two jobs at once: suppressing *re-derivations* (which is what
+/// bounds the fixpoint) and collapsing *equal values* (the bug). Two simpler
+/// fixes were prototyped and both failed:
+///
+/// * Aggregating per iteration and replacing per KEY (as `BEST BY` does) breaks
+///   because a self-ref reads pre-fold contribution rows, so a parent joins a
+///   multi-contribution child more than once.
+/// * Skipping dedup entirely for FOLD rules hits the iteration limit **even on
+///   a DAG**, because a non-recursive base clause re-emits its rows every
+///   iteration and dedup is what suppresses them.
+///
+/// So the dedup key must separate "same derivation re-emitted" (drop) from
+/// "different derivation, equal values" (keep). These columns are that
+/// separation. They are vids, so the domain stays finite and termination is
+/// preserved; a genuinely divergent recursive aggregate (an unbounded sum
+/// around a cycle) exhausts the iteration limit and surfaces as
+/// `LocyIncomplete`, which is the documented backstop.
+///
+/// # Scope
+///
+/// **Only rules carrying `FOLD` or `ALONG`.** A key-only recursive rule such as
+/// a transitive closure depends on set semantics: applying this globally turns
+/// one test's 1350-fact closure into 58 050 and does not terminate on cyclic
+/// fixtures.
+pub const FOLD_DISCRIMINATOR_COL_PREFIX: &str = "__deriv_";
 
 /// A column in a rule's yield schema.
 #[derive(Debug, Clone)]

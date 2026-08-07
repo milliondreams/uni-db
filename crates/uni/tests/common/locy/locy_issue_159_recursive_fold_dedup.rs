@@ -1,47 +1,54 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
 
-//! Repro for <https://github.com/rustic-ai/uni-db/issues/159>
+//! Regression for <https://github.com/rustic-ai/uni-db/issues/159>
 //!
-//! Aggregation inside a **recursive** rule silently drops rows whose values are
-//! numerically equal. One parent with N children each contributing `1.0` sums to
-//! `1.0`, not `N`. The same fold is correct in a non-recursive rule.
+//! Aggregation inside a **recursive** rule dropped rows whose values were
+//! numerically equal: one parent with N children each contributing `1.0` summed
+//! to `1.0`, not `N`, so a bill-of-materials rollup was not expressible. The
+//! same fold was always correct in a non-recursive rule.
 //!
 //! ## Root cause
 //!
-//! Every dedup path in the semi-naive fixpoint keys on **all columns**:
-//! `dedup_batches_all_columns`, `RowDedupState::compute_delta`,
-//! `FixpointState::compute_delta_legacy` and `arrow_left_anti_dedup`
-//! (`uni-query/src/query/df_graph/locy_fixpoint.rs`). `round_float_columns`
-//! (`:926-960`) additionally rounds `Float64` to 1e-12 *before* dedup, so
-//! near-equal values are made bit-identical and then collapsed.
+//! Every dedup path in the semi-naive fixpoint keys on **all columns**
+//! (`dedup_batches_all_columns`, `RowDedupState::compute_delta`,
+//! `FixpointState::compute_delta_legacy`, `arrow_left_anti_dedup`), and the
+//! FOLD runs once after convergence via `apply_post_fixpoint_chain`, so it only
+//! ever observed the already-deduped fact set. A non-recursive rule bypasses
+//! `FixpointState` entirely, which is why the controls below always passed —
+//! and why the non-recursive control was effectively the specification: a fold
+//! aggregates the **bag of body rows**, and the recursive path disagreed.
 //!
-//! The FOLD runs once after convergence via `apply_post_fixpoint_chain`
-//! (`:1541`), so it only ever observes the already-deduped fact set. A
-//! non-recursive rule bypasses `FixpointState` entirely
-//! (`locy_program.rs:1153`), which is exactly why the controls below pass.
+//! This is the set-vs-bag tension in Datalog. Set semantics on derived facts is
+//! what makes semi-naive evaluation terminate; rows feeding an aggregate need
+//! bag semantics. One policy was serving both jobs.
 //!
-//! This is the set-vs-bag tension in Datalog: set semantics on derived facts is
-//! what makes semi-naive evaluation terminate (a transitive-closure rule
-//! re-derives `(a, b)` via every intermediate node — see the comment at
-//! `locy_fixpoint.rs:982`), but rows feeding an aggregate need bag semantics.
-//! One policy is currently serving both jobs.
+//! ## The fix
 //!
-//! ## Why there is no user-level workaround
+//! Split the two jobs rather than choosing between them. A recursive FOLD/ALONG
+//! rule now projects hidden derivation-discriminator columns
+//! (`__deriv_clause`, `__deriv_vid_{var}` — see `FOLD_DISCRIMINATOR_COL_PREFIX`)
+//! holding the clause index and the vids of MATCH-bound node variables the
+//! YIELD does not project. Those are exactly the bindings that distinguish one
+//! derivation from another, so the dedup key still suppresses *re-derivations*
+//! (preserving termination) while keeping *distinct derivations* apart. They
+//! are stripped after the fixpoint, so nothing downstream sees them.
 //!
-//! `SUM`/`AVG` are rejected in a recursive stratum (`NonMonotonicInRecursion`),
-//! leaving `MSUM` as the only additive fold; the fold projects to
-//! `(key, value)` before aggregating, so upstream keying cannot preserve the
-//! duplicates; and `BEST BY` selects one path rather than summing over all.
+//! Two simpler fixes were prototyped and refuted, recorded here so they are not
+//! retried: aggregating per iteration and replacing per KEY breaks because a
+//! self-ref reads pre-fold contribution rows; and skipping dedup entirely for
+//! FOLD rules hits the iteration limit **even on a DAG**, because a
+//! non-recursive base clause re-emits its rows every iteration and dedup is
+//! what suppresses them.
 //!
-//! ## Constraint on any fix
+//! ## Scope
 //!
-//! Three dedup paths must move in lockstep. `bugs::locy_is_not_complement_recursion`
-//! deliberately locks all-column dedup to be identical across
-//! `DEDUP_ANTI_JOIN_THRESHOLD`, and `locy_fixpoint.rs:5375-5451` asserts
-//! all-column semantics directly. Note also that naive key-only dedup is *not*
-//! the fix — it terminates sooner and drops even more rows, breaking ALONG and
-//! BEST BY, which rely on multiple value rows per KEY.
+//! Only rules carrying FOLD or ALONG in a recursive stratum. A key-only
+//! recursive rule genuinely wants set semantics —
+//! `bugs::locy_is_not_complement_recursion` derives 1350 facts and would derive
+//! 58 050 under a global bag switch, and cyclic fixtures would stop
+//! terminating. That test plus the `RowDedupState` unit tests are the tripwire
+//! that the scoping held.
 //!
 //! Run with:
 //!   cargo nextest run -p uni-db --test integration \
@@ -189,14 +196,13 @@ async fn issue_159_non_recursive_fold_over_equal_values_is_correct() -> Result<(
 }
 
 // ---------------------------------------------------------------------------
-// Red: the open bug.
+// The bug itself.
 // ---------------------------------------------------------------------------
 
-/// N children each contributing exactly `1.0` must sum to N. Currently returns
-/// `1.0` for every N, because the N identical `(TOP, 1.0)` rows are collapsed
-/// to one by all-column dedup before the fold runs.
+/// N children each contributing exactly `1.0` must sum to N. This returned
+/// `1.0` for every N, because the N identical `(TOP, 1.0)` rows were collapsed
+/// to one by all-column dedup before the fold ran.
 #[tokio::test]
-#[ignore = "open bug #159: recursive fold dedups equal values (all-column set semantics)"]
 async fn issue_159_recursive_fold_must_not_dedup_equal_values() -> Result<()> {
     for n in 2..=6usize {
         let mut costs = vec![("TOP".to_string(), 0.0)];
@@ -228,9 +234,11 @@ async fn issue_159_recursive_fold_must_not_dedup_equal_values() -> Result<()> {
 /// downstream sum under-counts.
 ///
 /// `T->M1->X (q=2)`, `T->M2->X (q=2)`, `T->M3->X (q=5)` must yield three
-/// `(T, X)` rows totalling 9.0; the two `2.0` paths currently merge, giving 7.0.
+/// `(T, X)` rows totalling 9.0; the two `2.0` paths used to merge, giving 7.0.
+///
+/// ALONG is the half of #159 that has no FOLD to drop the hidden columns, so
+/// this is also the regression test for the post-fixpoint strip.
 #[tokio::test]
-#[ignore = "open bug #159: ALONG accumulator participates in all-column dedup"]
 async fn issue_159_along_must_not_collapse_equal_valued_paths() -> Result<()> {
     let costs = [
         ("T", 0.0),

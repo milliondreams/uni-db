@@ -738,12 +738,16 @@ fn check_fold_in_recursive_path(
         warnings.push(CompilerWarning {
             code: WarningCode::FoldInRecursivePath,
             message: format!(
-                "rule '{}' aggregates inside a recursive stratum; results may \
-                 UNDER-COUNT. Derivations reaching the same KEY with numerically \
-                 equal values are deduplicated before the fold sees them, so N \
-                 siblings each contributing the same amount are counted once. \
-                 ALONG does not avoid this — its accumulator is deduplicated the \
-                 same way. See issue #159. (Stress Corpus B3)",
+                "rule '{}' aggregates inside a recursive stratum. The fold \
+                 aggregates across derivations, so N siblings contributing the \
+                 same amount are counted N times (issue #159 — this previously \
+                 under-counted). Two cautions remain: an unbounded aggregate \
+                 (MSUM, MCOUNT, COUNT, COLLECT) over CYCLIC data has no \
+                 fixpoint and will run to the iteration limit rather than \
+                 converge; and MNOR/MPROD assume derivations are independent, \
+                 which is false when they share base facts — enable \
+                 exact_probability for the BDD computation there. \
+                 (Stress Corpus B3)",
                 rule_name
             ),
             rule_name: rule_name.to_string(),

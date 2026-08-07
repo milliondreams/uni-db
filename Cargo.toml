@@ -79,6 +79,9 @@ resolver = "2"
 [workspace.package]
 version = "3.3.0"
 edition = "2024"
+# edition 2024 requires 1.85+; pin it so a stale toolchain fails fast and
+# cargo can report an actionable error instead of a parse failure.
+rust-version = "1.85"
 authors = ["Dragonscale Industries Inc. <dev@dragonscale.ai>"]
 license = "Apache-2.0"
 repository = "https://github.com/rustic-ai/uni-db"

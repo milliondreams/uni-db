@@ -175,6 +175,7 @@ To convert an unconverted crate:
 | `uni-plugin-host` | 1 (`integration`) | 6 `bug_*` repros consolidated |
 | `uni-locy` | 1 (`integration`) | 5 repros consolidated |
 | `uni-query-functions` | 1 (`integration`) | 4 repros consolidated |
+| `uni-tck` | 2 (`tck` + `integration`) | `tck` is the cucumber/openCypher runner and must stay standalone — it is `harness = false`, supplying its own `fn main()` via libtest-mimic, which cannot host ordinary `#[test]` functions |
 
 Every crate above is at or under the 3-binary cap. When adding a test to any
 of them, add a `mod` to its `tests/integration.rs` — do not create a new

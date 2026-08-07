@@ -2,6 +2,9 @@
 name = "uni-tck"
 version.workspace = true
 edition = "2021"
+# Integration tests are consolidated: `tck` is the cucumber runner, everything
+# else lives in the `integration` binary. See `docs/test_layout.md`.
+autotests = false
 
 [dependencies]
 uni-db = { path = "../uni" }
@@ -21,9 +24,19 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = { workspace = true }
 
+# The openCypher TCK runner. Stays a separate binary because `harness = false`
+# means it supplies its own `fn main()` (libtest-mimic over cucumber), which
+# cannot host ordinary `#[test]` functions — the same class of exception as
+# `uni-store`'s `occ_model` target.
 [[test]]
 name = "tck"
+path = "tests/tck.rs"
 harness = false
+
+# Everything else: one binary, one `mod` per repro file.
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
 
 [dev-dependencies]
 libtest-mimic = "0.8"

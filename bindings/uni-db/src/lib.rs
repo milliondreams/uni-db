@@ -218,6 +218,7 @@ fn _uni_db(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<types::PyPreparedQueryBinder>()?;
     m.add_class::<types::PyPreparedLocyBinder>()?;
     m.add_class::<types::PyWriteLease>()?;
+    m.add_class::<types::PyModelRuntime>()?;
 
     // Transaction bulk writer/appender builders
     m.add_class::<sync_api::TxBulkWriterBuilder>()?;

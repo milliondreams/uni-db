@@ -2834,6 +2834,21 @@ let quick = xervo
 - `raw_runtime()` exposes the underlying `ModelRuntime` for advanced orchestration
 - `GenerationOptions` supports `max_tokens`, `temperature`, `top_p` fields
 
+**Sharing a runtime across databases.** A `ModelRuntime` owns its providers, its
+catalog, and its cache of loaded models, so a database built from a catalog holds
+its own copy of every model's weights. `UniBuilder::xervo_runtime(Arc<ModelRuntime>)`
+takes an already-built runtime instead, and `UniXervo::raw_runtime()` hands one
+back out — N databases then share one resident copy. `uni_db::xervo::build_model_runtime`
+is the single definition of the provider registration `cfg` chain; both
+`UniBuilder::build` and the Python `ModelRuntime` constructor route through it so
+the enabled-provider set cannot drift between them.
+
+The prebuilt path validates only that each alias the persisted schema references
+is *present* in the runtime's catalog. The per-alias head-capability check
+(`embed_caps::text_embedding_heads`) requires `spec.task`, which uni-xervo does not
+expose publicly, so a task mismatch on a shared runtime surfaces at first inference
+rather than at open. The catalog path checks both.
+
 **Best practice — prefetch at startup:**
 
 ```rust

@@ -1262,6 +1262,21 @@ impl Xervo {
         self.inner.xervo().is_available()
     }
 
+    /// Return this database's Xervo runtime handle for sharing, if configured.
+    ///
+    /// Pass the result to another builder's ``xervo_runtime()`` to open a second
+    /// database over the same loaded models instead of a second copy of the
+    /// weights. Returns ``None`` exactly when :meth:`is_available` is ``False``.
+    fn raw_runtime(&self) -> Option<crate::types::PyModelRuntime> {
+        // `xervo()` returns a temporary and `raw_runtime()` borrows from it, so
+        // the facade must outlive the borrow (E0716).
+        let xervo = self.inner.xervo();
+        xervo
+            .raw_runtime()
+            .cloned()
+            .map(|inner| crate::types::PyModelRuntime { inner })
+    }
+
     /// Embed texts using a configured model alias. Returns a list of float vectors.
     fn embed(&self, py: Python<'_>, alias: &str, texts: Vec<String>) -> PyResult<Vec<Vec<f32>>> {
         py.detach(|| {

@@ -8,7 +8,7 @@ Complete symbol surface of the `uni_db` Python bindings, **generated from `bindi
 
 This page is exhaustive and always in sync with the type stubs — it is regenerated in CI. For narrative documentation, worked examples and the recommended patterns, start at the [Python API guide](python-api.md).
 
-**190 classes.**
+**191 classes.**
 
 ---
 
@@ -571,6 +571,7 @@ Async builder for creating and configuring an AsyncUni instance.
 | `schema_file(path: str) -> AsyncUniBuilder` | — |
 | `xervo_catalog_from_str(json: str) -> AsyncUniBuilder` | — |
 | `xervo_catalog_from_file(path: str) -> AsyncUniBuilder` | — |
+| `xervo_runtime(runtime: ModelRuntime) -> AsyncUniBuilder` | — |
 | `cloud_config(config: dict[str, Any]) -> AsyncUniBuilder` | — |
 | `config(config: dict[str, Any]) -> AsyncUniBuilder` | — |
 | `batch_size(size: int) -> AsyncUniBuilder` | — |
@@ -594,6 +595,7 @@ Async facade for embedding and text generation.
 | Signature | Description |
 |---|---|
 | `is_available() -> bool` | — |
+| `raw_runtime() -> ModelRuntime | None` | — |
 | `async prefetch(aliases: list[str]) -> None` | — |
 | `async prefetch_all() -> None` | — |
 | `async embed(alias: str, texts: list[str]) -> list[list[float]]` | — |
@@ -1467,6 +1469,20 @@ A message in a conversation (role + text content).
 
 ---
 
+## `ModelRuntime`
+
+An opaque handle to a Xervo model runtime.
+
+| Signature | Description |
+|---|---|
+| `from_catalog_str(json: str) -> ModelRuntime` *(static)* | — |
+| `from_catalog_file(path: str) -> ModelRuntime` *(static)* | — |
+| `async from_catalog_str_async(json: str) -> ModelRuntime` *(static)* | — |
+| `async from_catalog_file_async(path: str) -> ModelRuntime` *(static)* | — |
+| `contains_alias(alias: str) -> bool` | — |
+
+---
+
 ## `Node`
 
 A graph node returned from a Cypher query.
@@ -2247,6 +2263,7 @@ Builder for creating or opening a Uni database.
 | `schema_file(path: str) -> UniBuilder` | — |
 | `xervo_catalog_from_str(json: str) -> UniBuilder` | — |
 | `xervo_catalog_from_file(path: str) -> UniBuilder` | — |
+| `xervo_runtime(runtime: ModelRuntime) -> UniBuilder` | — |
 | `cloud_config(config: dict[str, Any]) -> UniBuilder` | — |
 | `config(config: dict[str, Any]) -> UniBuilder` | — |
 | `batch_size(size: int) -> UniBuilder` | — |
@@ -2730,6 +2747,7 @@ Synchronous facade for embedding and text generation.
 | Signature | Description |
 |---|---|
 | `is_available() -> bool` | — |
+| `raw_runtime() -> ModelRuntime | None` | — |
 | `prefetch(aliases: list[str]) -> None` | — |
 | `prefetch_all() -> None` | — |
 | `embed(alias: str, texts: list[str]) -> list[list[float]]` | — |

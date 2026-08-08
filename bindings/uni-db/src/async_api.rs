@@ -781,6 +781,21 @@ impl AsyncXervo {
         self.inner.xervo().is_available()
     }
 
+    /// Return this database's Xervo runtime handle for sharing, if configured.
+    ///
+    /// Pass the result to another builder's ``xervo_runtime()`` to open a second
+    /// database over the same loaded models instead of a second copy of the
+    /// weights. Returns ``None`` exactly when :meth:`is_available` is ``False``.
+    fn raw_runtime(&self) -> Option<crate::types::PyModelRuntime> {
+        // `xervo()` returns a temporary and `raw_runtime()` borrows from it, so
+        // the facade must outlive the borrow (E0716).
+        let xervo = self.inner.xervo();
+        xervo
+            .raw_runtime()
+            .cloned()
+            .map(|inner| crate::types::PyModelRuntime { inner })
+    }
+
     /// Embed texts using a configured model alias (async).
     fn embed<'py>(
         &self,
@@ -986,6 +1001,7 @@ pub struct AsyncDatabaseBuilder {
     schema_file: Option<String>,
     xervo_catalog_json: Option<String>,
     xervo_catalog_file: Option<String>,
+    xervo_runtime: Option<crate::types::PyModelRuntime>,
     cloud_config: Option<uni_common::CloudStorageConfig>,
     uni_config: Option<uni_common::UniConfig>,
     read_only: bool,
@@ -1005,6 +1021,7 @@ impl Default for AsyncDatabaseBuilder {
             schema_file: None,
             xervo_catalog_json: None,
             xervo_catalog_file: None,
+            xervo_runtime: None,
             cloud_config: None,
             uni_config: None,
             read_only: false,
@@ -1091,6 +1108,7 @@ impl AsyncDatabaseBuilder {
     fn xervo_catalog_from_str(mut slf: PyRefMut<'_, Self>, json: String) -> PyRefMut<'_, Self> {
         slf.xervo_catalog_json = Some(json);
         slf.xervo_catalog_file = None;
+        slf.xervo_runtime = None;
         slf
     }
 
@@ -1098,6 +1116,22 @@ impl AsyncDatabaseBuilder {
     fn xervo_catalog_from_file(mut slf: PyRefMut<'_, Self>, path: String) -> PyRefMut<'_, Self> {
         slf.xervo_catalog_file = Some(path);
         slf.xervo_catalog_json = None;
+        slf.xervo_runtime = None;
+        slf
+    }
+
+    /// Reuse an already-built Xervo runtime instead of building one from a catalog.
+    ///
+    /// Databases sharing one runtime share its loaded models, so the second and
+    /// later ones cost no additional model memory. Supersedes any catalog set
+    /// on this builder.
+    fn xervo_runtime(
+        mut slf: PyRefMut<'_, Self>,
+        runtime: crate::types::PyModelRuntime,
+    ) -> PyRefMut<'_, Self> {
+        slf.xervo_runtime = Some(runtime);
+        slf.xervo_catalog_json = None;
+        slf.xervo_catalog_file = None;
         slf
     }
 
@@ -1229,6 +1263,7 @@ impl AsyncDatabaseBuilder {
         let uni_config = self.uni_config.clone();
         let read_only = self.read_only;
         let skip_invalid_locy_rules = self.skip_invalid_locy_rules;
+        let xervo_runtime = self.xervo_runtime.as_ref().map(|rt| rt.inner.clone());
         let rust_write_lease = self.write_lease.as_ref().map(|wl| match &wl.variant {
             crate::types::WriteLeaseVariant::Local => ::uni_db::api::multi_agent::WriteLease::Local,
             crate::types::WriteLeaseVariant::DynamoDB { table } => {
@@ -1254,6 +1289,7 @@ impl AsyncDatabaseBuilder {
                 read_only,
                 rust_write_lease,
                 skip_invalid_locy_rules,
+                xervo_runtime,
             )
             .await
             .map_err(crate::exceptions::uni_error_to_pyerr)?;

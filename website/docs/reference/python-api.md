@@ -172,6 +172,7 @@ Fluent builder for advanced database configuration. Exposed as `uni_db.UniBuilde
 | `.schema_file(path)` | Load schema from JSON on init |
 | `.xervo_catalog_from_file(path)` | Configure Xervo models from a JSON file |
 | `.xervo_catalog_from_str(json)` | Configure Xervo models from a JSON string |
+| `.xervo_runtime(runtime)` | Reuse an existing `ModelRuntime` instead of building one ([sharing models](#sharing-models-across-databases)) |
 | `.cloud_config(config_dict)` | Cloud storage credentials (`s3`, `gcs`, `azure`) |
 | `.config(config_dict)` | Database options (`query_timeout`, `max_query_memory`, etc.) |
 | `.batch_size(n)` | I/O batch size (default 1024) |
@@ -999,6 +1000,58 @@ xervo.prefetch(["embed/default", "llm/default"])  # blocks until loaded
 ```
 
 Both methods are **blocking/awaitable** and **fail-fast** — they return when all models are loaded, or raise on the first failure. Models already loaded are skipped.
+
+### Sharing models across databases
+
+Each database built from a catalog gets its **own** model runtime, and a runtime
+holds its own copy of the loaded weights. Opening N databases on the same catalog
+therefore costs N copies of every model.
+
+Build the runtime once and pass the handle to each builder to share one resident
+copy:
+
+```python
+runtime = uni_db.ModelRuntime.from_catalog_str(catalog_json)
+# or: uni_db.ModelRuntime.from_catalog_file("./models.json")
+
+tenants = {
+    name: uni_db.UniBuilder.open(f"./kb/{name}").xervo_runtime(runtime).build()
+    for name in ("alice", "bob", "carol")
+}
+```
+
+Measured with `all-MiniLM-L6-v2` (22M parameters — the *smallest* useful
+embedder), four databases in one process:
+
+| | first instance | each additional |
+|---|---|---|
+| `xervo_catalog_from_str` | 205 MiB | **+107 MiB** |
+| `xervo_runtime` | 194 MiB | **+5 MiB** |
+
+The residual 5 MiB is the database itself; the model is no longer duplicated.
+With a larger embedder, a reranker, or a generator, the saving scales with the
+model rather than staying flat.
+
+A runtime can also come from a database that already has one, which is useful
+when a bootstrap database owns the catalog:
+
+```python
+runtime = bootstrap.xervo().raw_runtime()   # None if no Xervo is configured
+db = uni_db.UniBuilder.open("./graph").xervo_runtime(runtime).build()
+```
+
+`xervo_runtime()` and the two `xervo_catalog_*` methods are mutually exclusive —
+the last one called wins. The same handle works with `AsyncUniBuilder`; use
+`ModelRuntime.from_catalog_str_async(...)` to build it without blocking an event
+loop, which matters when the catalog uses `"warmup": "eager"`.
+
+!!! note "Alias checking on a shared runtime"
+
+    Opening a database whose schema binds a vector index to an embedding alias
+    verifies that the alias exists in the runtime's catalog. It cannot yet verify
+    that the alias's *task* produces the embedding heads those columns need — that
+    check runs only on the `xervo_catalog_*` path, so a task mismatch on a shared
+    runtime surfaces at first inference rather than at open.
 
 ### Async Xervo
 

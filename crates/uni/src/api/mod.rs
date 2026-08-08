@@ -1681,6 +1681,21 @@ impl UniBuilder {
         }
 
         let xervo_runtime = if let Some(runtime) = self.prebuilt_xervo_runtime {
+            // A prebuilt runtime carries its own catalog, so the alias set can be
+            // verified but the per-alias capability check below cannot: that needs
+            // `spec.task`, and uni-xervo keeps `lookup_spec` private. An alias bound
+            // to the wrong task therefore still surfaces at first embed rather than
+            // here. Presence is the half that is reachable, and it catches the likely
+            // misuse — sharing a runtime into a database whose schema needs an alias
+            // the runtime's catalog never had.
+            for alias in required_embed_heads.keys() {
+                if !runtime.contains_alias(alias).await {
+                    return Err(UniError::Internal(anyhow::anyhow!(
+                        "Missing Uni-Xervo alias '{}' referenced by vector index embedding config",
+                        alias
+                    )));
+                }
+            }
             Some(runtime)
         } else if let Some(catalog) = self.xervo_catalog {
             // Capability check (#129/#130): each alias's task must produce — from a text

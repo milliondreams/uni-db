@@ -1716,72 +1716,7 @@ impl UniBuilder {
                 }
             }
 
-            // `mut` is conditional on at least one provider-* feature being
-            // enabled; a slim build with no providers leaves it unused.
-            #[allow(unused_mut)]
-            let mut runtime_builder = ModelRuntime::builder().catalog(catalog);
-            #[cfg(feature = "provider-candle")]
-            {
-                runtime_builder = runtime_builder
-                    .register_provider(uni_xervo::provider::LocalCandleProvider::new());
-            }
-            #[cfg(feature = "provider-openai")]
-            {
-                runtime_builder = runtime_builder
-                    .register_provider(uni_xervo::provider::RemoteOpenAIProvider::new());
-            }
-            #[cfg(feature = "provider-gemini")]
-            {
-                runtime_builder = runtime_builder
-                    .register_provider(uni_xervo::provider::RemoteGeminiProvider::new());
-            }
-            #[cfg(feature = "provider-vertexai")]
-            {
-                runtime_builder = runtime_builder
-                    .register_provider(uni_xervo::provider::RemoteVertexAIProvider::new());
-            }
-            #[cfg(feature = "provider-mistral")]
-            {
-                runtime_builder = runtime_builder
-                    .register_provider(uni_xervo::provider::RemoteMistralProvider::new());
-            }
-            #[cfg(feature = "provider-anthropic")]
-            {
-                runtime_builder = runtime_builder
-                    .register_provider(uni_xervo::provider::RemoteAnthropicProvider::new());
-            }
-            #[cfg(feature = "provider-voyageai")]
-            {
-                runtime_builder = runtime_builder
-                    .register_provider(uni_xervo::provider::RemoteVoyageAIProvider::new());
-            }
-            #[cfg(feature = "provider-cohere")]
-            {
-                runtime_builder = runtime_builder
-                    .register_provider(uni_xervo::provider::RemoteCohereProvider::new());
-            }
-            #[cfg(feature = "provider-azure-openai")]
-            {
-                runtime_builder = runtime_builder
-                    .register_provider(uni_xervo::provider::RemoteAzureOpenAIProvider::new());
-            }
-            #[cfg(feature = "provider-mistralrs")]
-            {
-                runtime_builder = runtime_builder
-                    .register_provider(uni_xervo::provider::LocalMistralRsProvider::new());
-            }
-            #[cfg(feature = "provider-onnx")]
-            {
-                runtime_builder = runtime_builder
-                    .register_provider(uni_xervo::provider::LocalOnnxProvider::new());
-            }
-
-            Some(
-                runtime_builder
-                    .build()
-                    .await
-                    .map_err(|e| UniError::Internal(anyhow::anyhow!(e.to_string())))?,
-            )
+            Some(crate::api::xervo::build_model_runtime(catalog).await?)
         } else {
             None
         };

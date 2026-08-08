@@ -13,16 +13,27 @@ files of it — got an actual parser: every documented Cypher and Locy snippet i
 the real pest grammar on every run, including snippets embedded in Rust and Python string literals,
 where a mistake is a *runtime* failure rather than a rendering one.
 
-This release covers everything since **3.2.0**: **21 commits**, 249 files changed,
-+20,790 / −15,308. The version was bumped to **3.3.0** at `d8f6f3abc` but never tagged, so
+Two more themes join them. A registered Locy rule used to execute in **every** program, so one
+rule taking a parameter made that parameter mandatory for unrelated queries — work done eagerly
+that should have been demand-driven. And a Xervo model runtime could not be shared from Python,
+so N databases meant N resident copies of the same weights, with no workaround available in the
+binding.
+
+This release covers everything since **3.2.0**: **30 commits**, 263 files changed,
++22,836 / −15,377. The version was bumped to **3.3.0** at `d8f6f3abc` but never tagged, so
 everything after that bump is folded in here.
 
-Gates at the release commit — the full CI matrix, replicated locally: the **6,268-test workspace
-suite** green, plus `fmt`, `clippy -D warnings` and `rustdoc -D warnings`. openCypher TCK
-**3925/3925** in both schemaless and sidecar modes; Locy TCK **519/519** in both. Python:
-`uni-db` **923 passed**, `uni-pydantic` **269 passed**, pyo3 loader **35**, WASM/Extism lane **39**.
-Reranker ONNX **29** bundled + **26** load-dynamic, LocalStack cloud **18**, loom **4**,
-metamorphic oracles **12**, and all six flagship notebooks executed against a built wheel.
+The full CI matrix was replicated locally at `639eeab24`: the **6,268-test workspace suite** green,
+plus `fmt`, `clippy -D warnings` and `rustdoc -D warnings`. openCypher TCK **3925/3925** in both
+schemaless and sidecar modes; Locy TCK **519/519** in both. Python: `uni-pydantic` **269 passed**,
+pyo3 loader **35**, WASM/Extism lane **39**. Reranker ONNX **29** bundled + **26** load-dynamic,
+LocalStack cloud **18**, loom **4**, metamorphic oracles **12**, and all six flagship notebooks
+executed against a built wheel.
+
+The seven commits after that point were gated on the suites covering their blast radius rather than
+the whole matrix: `uni-db` **2,408 integration tests**, `uni-locy` + `uni-query` **926**, Locy TCK
+**519/519** in both lanes, Python `uni-db` **934 passed**, the documentation-snippet harness, and
+`fmt` + `clippy -D warnings` on the touched crates. Re-run the full matrix before tagging.
 
 ---
 
@@ -101,6 +112,108 @@ case: rules containing a generator, which the columnar fixpoint has no row-explo
 
 Note this inverts the old performance guidance. `QUERY` is a projection over already-materialised
 output, not a cheaper path that avoids materialising it.
+
+### 🔹 Locy — a registered rule runs only when a program references it
+
+`1071ce7e9`, with `4303b8e8a` extracting the name predicate it needs. Closes **#157**.
+
+`merge_registered_rules` prepended **every** registered stratum to every compiled program. A
+`Stratum` owns its rules and the runtime evaluates the vector end to end, so every registered rule
+*executed* in every program. One rule taking a parameter therefore made that parameter mandatory
+everywhere — including in programs that name no rule at all:
+
+```
+LocyRuntimeError: Execution error: Sub-plan error: Unresolved parameter: $needed
+```
+
+The reporter's mitigation — bind the union of every registered rule's parameters at every call
+site — does not compose: two independently authored rules each break the other's queries. In
+practice, registering one parameterized rule cost you ad-hoc Locy for the life of the database.
+
+The registry is now filtered to the strata a program can transitively reach, seeded from every
+construct that names a rule: `QUERY`, `DERIVE`, `EXPLAIN RULE`, `ABDUCE`, `VALIDATE`, `IS` and
+`IS NOT` references, an `ASSUME` body, and a model's `path_context`. Two properties make pruning
+safe rather than merely smaller: unknown names already fail at *compile* time against the
+registry, so pruning cannot turn a missing rule into a silently empty result; and a retained
+stratum is expanded whole, since its rules form one SCC and a co-member's own references have to
+resolve too.
+
+Negated references seed retention exactly like positive ones. An anti-join against a dropped
+relation admits every row, which is the one way this change could have produced *more* results.
+
+**Behaviour change:** `LocyResult.derived` no longer carries registered rules the program never
+referenced, and `profile()` lists only the retained strata. Both were previously polluted by
+unrelated registered rules. A program that wants a rule's facts names it; there is no opt-out flag.
+
+### 🔹 Locy — `QUERY` resolves a rule name module-aware
+
+`1593ab701`. Inside `MODULE m`, `QUERY adult` names the rule bare while the catalog and the derived
+store key it `m.adult`. The compiler validated the reference module-aware, so the program compiled
+and then failed at run time with `rule 'adult' not found` — a plain lookup missed, fell through to
+the SLG path, and that path reported the rule as absent even though the fixpoint had derived it.
+
+Both the catalog and the store lookup now resolve through the shared name policy. Ambiguity is
+refused rather than guessed: a bare name matching two modules errors instead of silently picking
+one. That refusal is a known limitation, not the target behaviour — the compiler *can* resolve it
+from the enclosing `MODULE`, but `GoalQuery::rule_name` keeps the bare spelling, so the runtime has
+only suffix matching to work with. Threading the compiler-resolved name through to `evaluate_query`
+is tracked separately.
+
+Found while writing the coverage the #157 fix depended on: `DERIVE`, `EXPLAIN RULE` and `ABDUCE`
+against a *registered* rule, `MODULE` resolution, and the `PreparedLocy` call site had no
+end-to-end tests at all. `c0c76aa7b` strengthens two of them — they asserted only `is_ok()`, so a
+resolution to an empty relation would have passed.
+
+### 🔹 Xervo — one model runtime, many databases
+
+`ea6cc8fed`, with `1028fae86` extracting the machinery. Closes **#155**.
+
+A `ModelRuntime` owns its cache of loaded models, so each database built from a catalog held its
+own copy of the weights. Python had neither half of the Rust round trip — no `raw_runtime()`
+accessor, no `xervo_runtime()` setter — so N databases on the same catalog meant N resident copies
+with no workaround available in the binding. Measured with `all-MiniLM-L6-v2` (22M parameters, the
+*smallest* useful embedder), four databases in one process:
+
+| | first instance | each additional |
+|---|---|---|
+| `xervo_catalog_from_str` | 205 MiB | **+107 MiB** |
+| `xervo_runtime` | 194 MiB | **+5 MiB** |
+
+526 MiB total drops to 210 MiB. The residual 5 MiB is the database itself; the model is no longer
+duplicated. The saving scales with the model, so a reranker or a generator turns this from wasteful
+into OOM-avoiding at small N.
+
+```python
+runtime = uni_db.ModelRuntime.from_catalog_str(catalog_json)
+a = uni_db.UniBuilder.open("./kb/a").xervo_runtime(runtime).build()
+b = uni_db.UniBuilder.open("./kb/b").xervo_runtime(runtime).build()
+```
+
+The handle is opaque and compares by pointer identity, so "these databases really do share a
+runtime" is directly assertable. One handle type serves both the sync and async builders — the
+object is an inert `Arc` with no sync/async character — with `_async` constructors for callers that
+must not block an event loop, which matters when the catalog warms eagerly. The three Xervo sources
+are mutually exclusive: each setter clears the other two, rather than exposing the Rust builder's
+silent runtime-beats-catalog precedence.
+
+Underneath, the 11-provider `#[cfg]` chain moved out of `UniBuilder::build` into
+`uni_db::xervo::build_model_runtime`. Being inline was the reason *Rust* had no standalone runtime
+constructor either; it now has exactly one definition, so the enabled-provider set cannot drift
+between a runtime a database builds for itself and one built to be shared.
+
+### 🔹 Xervo — a prebuilt runtime is checked against the schema
+
+`79f335170`. Opening a database whose schema binds a vector index to an embedding alias validated
+that alias — but the check sat inside the catalog branch, so injecting a runtime via
+`xervo_runtime()` skipped it and the runtime was accepted unexamined. A runtime whose catalog
+lacked the alias opened fine and failed much later, as an `AliasNotFound` from inside the writer on
+the first auto-embedded write. Pre-existing, and made to matter more by the API above.
+
+Alias *presence* is now verified on both paths, with the same message. The per-alias
+head-capability check still runs only on the catalog path: it needs `spec.task`, and uni-xervo
+keeps `lookup_spec` private, so a task mismatch on a shared runtime still surfaces at first
+inference. Documented at the check site and in the black book; closing it needs a public catalog
+accessor upstream.
 
 ### 🔹 A parser for the documentation
 
@@ -184,6 +297,10 @@ prose review. Beyond the snippet fixes above:
 * Status headers on six dated review reports still leading with fixed CRITICAL findings, and
   provenance on unattributed benchmark tables — including a demo spec citing a 2.3M-paper corpus
   its own generator sets to 5,000.
+
+`ea6cc8fed` adds a **Sharing models across databases** section to the Python API reference, with the
+measured figures above and a note on what the shared-runtime path does and does not validate. The
+generated `python-api-symbols.md` grows to **191 classes**.
 
 `97d2a0b05` restores `docs/migrations/0.9.0-wheel-matrix-collapse.md`, linked from all five variant
 wheel READMEs and rendered on their PyPI pages. It was added by the commit that performed the

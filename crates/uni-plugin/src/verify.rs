@@ -33,15 +33,72 @@ pub fn verify_hash_pin(manifest: &PluginManifest, payload: &[u8]) -> Result<(), 
     let Some(expected_hex) = manifest.hash.as_ref() else {
         return Ok(());
     };
-    let actual = blake3::hash(payload);
-    let actual_hex = actual.to_hex().to_string();
+    verify_payload_hash(expected_hex, payload)
+}
+
+/// Verify raw payload bytes against an externally-supplied Blake3 hex digest.
+///
+/// This is the primitive behind [`verify_hash_pin`], exposed separately because
+/// the security-meaningful case is a pin that arrives from *outside* the
+/// artifact — a host allowlist or an install record. A digest read out of the
+/// artifact's own embedded manifest is self-certifying: an attacker who can
+/// rewrite the payload can rewrite the digest beside it. Only an Ed25519
+/// signature over the manifest (see [`verify_manifest_with_policy`]) makes an
+/// embedded pin trustworthy.
+///
+/// # Errors
+///
+/// Returns [`PluginError::HashMismatch`] when `blake3(payload)` differs from
+/// `expected_hex`.
+pub fn verify_payload_hash(expected_hex: &str, payload: &[u8]) -> Result<(), PluginError> {
+    let actual_hex = blake3::hash(payload).to_hex().to_string();
     if !constant_time_eq(expected_hex, &actual_hex) {
         return Err(PluginError::HashMismatch {
-            expected: expected_hex.clone(),
+            expected: expected_hex.to_string(),
             actual: actual_hex,
         });
     }
     Ok(())
+}
+
+/// Verify payload bytes against a host-configured allowlist of Blake3 digests.
+///
+/// An empty allowlist means "pinning disabled" and accepts everything. A
+/// non-empty one accepts only payloads whose digest it contains, which lets an
+/// operator restrict an instance to a known-good set of plugin binaries
+/// independent of anything the artifacts assert about themselves.
+///
+/// # Errors
+///
+/// Returns [`PluginError::HashMismatch`] when the allowlist is non-empty and
+/// the payload's digest is absent from it. `expected` carries the
+/// lexicographically first configured pin so the operator sees a concrete
+/// value to diff against.
+pub fn verify_payload_in_allowlist<S>(
+    allowlist: &std::collections::BTreeSet<S>,
+    payload: &[u8],
+) -> Result<(), PluginError>
+where
+    S: AsRef<str> + Ord,
+{
+    if allowlist.is_empty() {
+        return Ok(());
+    }
+    let actual = blake3::hash(payload).to_hex().to_string();
+    if allowlist
+        .iter()
+        .any(|p| constant_time_eq(p.as_ref(), &actual))
+    {
+        return Ok(());
+    }
+    Err(PluginError::HashMismatch {
+        expected: allowlist
+            .iter()
+            .next()
+            .map(|s| s.as_ref().to_string())
+            .unwrap_or_default(),
+        actual,
+    })
 }
 
 /// Verify a manifest's Ed25519 signature against the trust root.
@@ -572,5 +629,51 @@ mod tests {
         let mut tr = TrustRoot::new();
         tr.allow_with_key("ops@example.com", public_key_bytes);
         assert_eq!(tr.public_key("ops@example.com"), Some(&public_key_bytes));
+    }
+}
+
+#[cfg(test)]
+mod allowlist_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn digest(bytes: &[u8]) -> String {
+        blake3::hash(bytes).to_hex().to_string()
+    }
+
+    #[test]
+    fn empty_allowlist_disables_pinning() {
+        let empty: BTreeSet<String> = BTreeSet::new();
+        assert!(verify_payload_in_allowlist(&empty, b"anything").is_ok());
+    }
+
+    #[test]
+    fn listed_payload_passes() {
+        let mut allow = BTreeSet::new();
+        allow.insert(digest(b"plugin-bytes"));
+        assert!(verify_payload_in_allowlist(&allow, b"plugin-bytes").is_ok());
+    }
+
+    #[test]
+    fn unlisted_payload_is_rejected() {
+        let mut allow = BTreeSet::new();
+        allow.insert(digest(b"good"));
+        match verify_payload_in_allowlist(&allow, b"tampered") {
+            Err(PluginError::HashMismatch { expected, actual }) => {
+                assert_eq!(expected, digest(b"good"));
+                assert_eq!(actual, digest(b"tampered"));
+            }
+            other => panic!("expected HashMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn allowlist_admits_several_pins() {
+        let mut allow = BTreeSet::new();
+        allow.insert(digest(b"v1"));
+        allow.insert(digest(b"v2"));
+        assert!(verify_payload_in_allowlist(&allow, b"v1").is_ok());
+        assert!(verify_payload_in_allowlist(&allow, b"v2").is_ok());
+        assert!(verify_payload_in_allowlist(&allow, b"v3").is_err());
     }
 }

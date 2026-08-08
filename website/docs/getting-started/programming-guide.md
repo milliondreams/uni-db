@@ -152,8 +152,7 @@ For optimal write performance with cloud durability, use hybrid mode:
 
     // Local cache with S3 backend
     let db = Uni::open("./local-cache")
-        .hybrid("./local-cache", "s3://my-bucket/graph-data")
-        .cloud_config(CloudStorageConfig::S3 {
+        .remote_storage("s3://my-bucket/graph-data", CloudStorageConfig::S3 {
             bucket: "my-bucket".to_string(),
             region: Some("us-east-1".to_string()),
             endpoint: None,
@@ -172,7 +171,7 @@ For optimal write performance with cloud durability, use hybrid mode:
     # Local cache with S3 backend
     db = (
         uni_db.UniBuilder.open("./local-cache")
-        .hybrid("./local-cache", "s3://my-bucket/graph-data")
+        .remote_storage("s3://my-bucket/graph-data", CloudStorageConfig::default())
         .build()
     )
     ```
@@ -1019,8 +1018,8 @@ Sessions provide scoped context for multi-tenant queries and are the primary sco
     ```rust
     // Create session and set tenant context
     let session = db.session();
-    session.set("tenant_id", "acme-corp");
-    session.set("user_id", "user-123");
+    session.params().set("tenant_id", "acme-corp");
+    session.params().set("user_id", "user-123");
 
     // All queries have access to session parameters
     let results = session.query(r#"
@@ -1041,7 +1040,7 @@ Sessions provide scoped context for multi-tenant queries and are the primary sco
         .await?;
 
     // Read session variable
-    let tenant = session.get("tenant_id");
+    let tenant = session.params().get("tenant_id");
     ```
 
 === "Python"
@@ -1049,8 +1048,8 @@ Sessions provide scoped context for multi-tenant queries and are the primary sco
     ```python
     # Create session and set tenant context
     session = db.session()
-    session.set("tenant_id", "acme-corp")
-    session.set("user_id", "user-123")
+    session.params().set("tenant_id", "acme-corp")
+    session.params().set("user_id", "user-123")
 
     # Execute queries with session context
     results = session.query("""
@@ -1060,7 +1059,7 @@ Sessions provide scoped context for multi-tenant queries and are the primary sco
     """)
 
     # Read session variable
-    tenant = session.get("tenant_id")
+    tenant = session.params().get("tenant_id")
     print(f"Tenant: {tenant}")
     ```
 
@@ -1076,12 +1075,12 @@ Analyze query execution plans.
     let session = db.session();
 
     // Get query plan without executing
-    let plan = session.explain("MATCH (p:Person) WHERE p.age > 25 RETURN p.name").await?;
+    let plan = session.query_with("MATCH (p:Person) WHERE p.age > 25 RETURN p.name").explain().await?;
     println!("Plan:\n{}", plan.plan_text);
     println!("Estimated cost: {}", plan.cost_estimates.estimated_cost);
 
     // Execute with profiling
-    let (results, profile) = session.profile("MATCH (p:Person) WHERE p.age > 25 RETURN p.name").await?;
+    let (results, profile) = session.query_with("MATCH (p:Person) WHERE p.age > 25 RETURN p.name").profile().await?;
     println!("Total time: {}ms", profile.total_time_ms);
     println!("Peak memory: {} bytes", profile.peak_memory_bytes);
     ```
@@ -1092,12 +1091,12 @@ Analyze query execution plans.
     session = db.session()
 
     # Get query plan without executing
-    plan = session.explain("MATCH (p:Person) WHERE p.age > 25 RETURN p.name AS name")
+    plan = session.query_with("MATCH (p:Person) WHERE p.age > 25 RETURN p.name AS name").explain()
     print(f"Plan:\n{plan['plan_text']}")
     print(f"Estimated cost: {plan['cost_estimates']}")
 
     # Execute with profiling
-    results, profile = session.profile("MATCH (p:Person) WHERE p.age > 25 RETURN p.name AS name")
+    results, profile = session.query_with("MATCH (p:Person) WHERE p.age > 25 RETURN p.name AS name").profile()
     print(f"Total time: {profile['total_time_ms']}ms")
     print(f"Peak memory: {profile['peak_memory_bytes']} bytes")
     ```

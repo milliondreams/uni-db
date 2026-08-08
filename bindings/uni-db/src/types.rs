@@ -629,7 +629,7 @@ impl PyProfileOutput {
     }
 }
 
-/// Typed output from `session.explain_locy()`.
+/// Typed output from `session.locy_with(program).explain()`.
 #[pyclass(get_all, name = "LocyExplainOutput", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyLocyExplainOutput {
@@ -2283,6 +2283,157 @@ impl PyWatchBuilder {
         Ok(crate::async_api::AsyncCommitStream {
             inner: std::sync::Arc::new(tokio::sync::Mutex::new(Some(builder.build()))),
         })
+    }
+}
+
+// ============================================================================
+// ModelRuntime (shared Xervo runtime handle)
+// ============================================================================
+
+/// An opaque handle to a Xervo model runtime.
+///
+/// A runtime owns its provider set, its model catalog, and — importantly — its
+/// cache of loaded models. Passing one handle to several ``UniBuilder``s makes
+/// those databases share a single resident copy of the weights instead of each
+/// deserializing its own, which is the difference between one model footprint
+/// and N of them.
+///
+/// Obtain one either standalone via :meth:`from_catalog_str` /
+/// :meth:`from_catalog_file`, or from an existing database via
+/// ``db.xervo().raw_runtime()``.
+///
+/// Equality and hashing are *identity*, not catalog contents: two handles are
+/// equal exactly when they wrap the same underlying runtime. Two runtimes built
+/// separately from the same catalog JSON compare unequal, because they hold
+/// separate model caches.
+///
+/// Example::
+///
+///     rt = uni_db.ModelRuntime.from_catalog_str(catalog_json)
+///     a = uni_db.Uni.builder().open("/data/a").xervo_runtime(rt).build()
+///     b = uni_db.Uni.builder().open("/data/b").xervo_runtime(rt).build()
+///     assert a.xervo().raw_runtime() == b.xervo().raw_runtime()
+#[pyclass(name = "ModelRuntime", frozen, eq, hash, from_py_object)]
+#[derive(Clone)]
+pub struct PyModelRuntime {
+    pub(crate) inner: std::sync::Arc<::uni_db::ModelRuntime>,
+}
+
+// `uni_xervo::runtime::ModelRuntime` carries no derives, so `Debug` cannot be
+// derived through the `Arc`. The builders that hold this handle do derive
+// `Debug`, so it is supplied here once rather than hand-writing `Debug` for two
+// fourteen-field builder structs.
+impl std::fmt::Debug for PyModelRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelRuntime")
+            .field("ptr", &std::sync::Arc::as_ptr(&self.inner))
+            .finish()
+    }
+}
+
+// Identity comparison: this is what lets a caller assert that two databases
+// really do share one runtime, without loading a model to observe it.
+impl PartialEq for PyModelRuntime {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+impl Eq for PyModelRuntime {}
+impl std::hash::Hash for PyModelRuntime {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::ptr::hash(std::sync::Arc::as_ptr(&self.inner), state);
+    }
+}
+
+impl PyModelRuntime {
+    /// Parses a catalog JSON string into specs, mapping errors for Python.
+    fn parse_str(json: &str) -> PyResult<Vec<::uni_db::ModelAliasSpec>> {
+        ::uni_db::xervo_catalog_from_str(json)
+            .map_err(|e| ::uni_db::UniError::Internal(anyhow::anyhow!(e.to_string())))
+            .map_err(crate::exceptions::uni_error_to_pyerr)
+    }
+
+    /// Parses a catalog JSON file into specs, mapping errors for Python.
+    fn parse_file(path: &str) -> PyResult<Vec<::uni_db::ModelAliasSpec>> {
+        ::uni_db::xervo_catalog_from_file(path)
+            .map_err(|e| ::uni_db::UniError::Internal(anyhow::anyhow!(e.to_string())))
+            .map_err(crate::exceptions::uni_error_to_pyerr)
+    }
+}
+
+#[pymethods]
+impl PyModelRuntime {
+    /// Build a runtime from a catalog JSON string.
+    ///
+    /// Blocks until the runtime is ready. With ``"warmup": "eager"`` on any
+    /// alias that includes loading the model, so prefer
+    /// :meth:`from_catalog_str_async` from an event loop.
+    #[staticmethod]
+    fn from_catalog_str(py: Python<'_>, json: &str) -> PyResult<Self> {
+        let catalog = Self::parse_str(json)?;
+        let inner = py
+            .detach(|| {
+                pyo3_async_runtimes::tokio::get_runtime()
+                    .block_on(::uni_db::xervo::build_model_runtime(catalog))
+            })
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
+        Ok(Self { inner })
+    }
+
+    /// Build a runtime from a catalog JSON file path.
+    ///
+    /// Blocks; see :meth:`from_catalog_file_async`.
+    #[staticmethod]
+    fn from_catalog_file(py: Python<'_>, path: &str) -> PyResult<Self> {
+        let catalog = Self::parse_file(path)?;
+        let inner = py
+            .detach(|| {
+                pyo3_async_runtimes::tokio::get_runtime()
+                    .block_on(::uni_db::xervo::build_model_runtime(catalog))
+            })
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
+        Ok(Self { inner })
+    }
+
+    /// Build a runtime from a catalog JSON string, awaitable.
+    #[staticmethod]
+    fn from_catalog_str_async<'py>(py: Python<'py>, json: &str) -> PyResult<Bound<'py, PyAny>> {
+        let catalog = Self::parse_str(json)?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let inner = ::uni_db::xervo::build_model_runtime(catalog)
+                .await
+                .map_err(crate::exceptions::uni_error_to_pyerr)?;
+            Ok(Self { inner })
+        })
+    }
+
+    /// Build a runtime from a catalog JSON file path, awaitable.
+    #[staticmethod]
+    fn from_catalog_file_async<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyAny>> {
+        let catalog = Self::parse_file(path)?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let inner = ::uni_db::xervo::build_model_runtime(catalog)
+                .await
+                .map_err(crate::exceptions::uni_error_to_pyerr)?;
+            Ok(Self { inner })
+        })
+    }
+
+    /// Whether the given alias is present in this runtime's catalog.
+    fn contains_alias(&self, py: Python<'_>, alias: &str) -> bool {
+        let inner = self.inner.clone();
+        let alias = alias.to_string();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime()
+                .block_on(async move { inner.contains_alias(&alias).await })
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "ModelRuntime(0x{:x})",
+            std::sync::Arc::as_ptr(&self.inner) as usize
+        )
     }
 }
 

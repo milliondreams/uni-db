@@ -43,7 +43,7 @@ Locy has two warning channels. **Runtime warnings** (`RuntimeWarningCode`) surfa
 - `UncalibratedNeuralPredicate`: a rule invokes a PROB model declaring no `CALIBRATION` (or `CALIBRATION none`); the uncalibrated probability compounds miscalibration downstream.
 - `UncalibratedLLMLogprobs`: an uncalibrated `CREATE MODEL` whose `xervo_alias` looks like an LLM provider — raw logprobs are not calibrated probabilities.
 - `ProbabilityDomainViolation`: a probability input fell outside `[0, 1]` (clamped, or rejected under `strict_probability_domain`).
-- `FoldInRecursivePath`: a clause has a recursive IS-ref and a FOLD aggregate but no ALONG — almost always a semantic mistake.
+- `FoldInRecursivePath`: a clause has a recursive IS-ref and a FOLD aggregate but no ALONG. The rule rolls up per KEY, composing level by level; use `ALONG` if you meant to accumulate along each path.
 - `EceBinningBias`: `VALIDATE METRICS ece` was requested; equal-width-binned ECE is biased in the small-sample regime. Prefer `debiased_ece`.
 
 ## Recommended Profiles

@@ -5,13 +5,13 @@
 ```cypher
 CREATE RULE name [PRIORITY n] AS
 MATCH ...
-[WHERE ...]                         -- pre-aggregation filter
+[WHERE ...]                         // pre-aggregation filter
 [ALONG x = expr]
 [FOLD agg = aggregate(expr)]
-[WHERE agg_condition]               -- post-FOLD filter (HAVING)
+[WHERE agg_condition]               // post-FOLD filter (HAVING)
 [BEST BY expr ASC|DESC]
 YIELD KEY a, value AS alias, prob_expr AS PROB
--- OR, for graph mutation rules (edge/node props are inline maps, no SET):
+// OR, for graph mutation rules (edge/node props are inline maps, no SET):
 DERIVE (src)-[:TYPE {prop: expr}]->(dst)
 ```
 
@@ -58,6 +58,7 @@ EXPLAIN RULE name [WHERE ...]
 
 ## Assume
 
+<!-- doctest: skip -->
 ```cypher
 ASSUME { <cypher mutations> } THEN { <locy/cypher body> }
 ```
@@ -70,6 +71,7 @@ ABDUCE [NOT] name [WHERE ...] [RETURN ...]
 
 ## Neural Predicates
 
+<!-- doctest: skip -->
 ```cypher
 CREATE MODEL name AS
   INPUT (binding [: Label])
@@ -88,6 +90,7 @@ VALIDATE  model_name ON MATCH pattern [WHERE expr] TARGET expr METRICS metric (,
 
 ## Modules
 
+<!-- doctest: skip -->
 ```cypher
 MODULE my.module
 USE shared.rules

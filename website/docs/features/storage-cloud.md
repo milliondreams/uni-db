@@ -1,6 +1,6 @@
 # Storage & Cloud Durability
 
-Uni stores data in LanceDB tables and can persist to local disk or object storage (S3, GCS, Azure). You can use hybrid mode to keep metadata local while storing bulk data remotely.
+Uni stores data in Lance tables and can persist to local disk or object storage (S3, GCS, Azure). You can use hybrid mode to keep metadata local while storing bulk data remotely.
 
 ## What It Provides
 
@@ -16,7 +16,7 @@ Uni stores data in LanceDB tables and can persist to local disk or object storag
 
     # async fn demo() -> Result<(), uni_db::UniError> {
     let db = Uni::open("./local_meta")
-        .hybrid("./local_meta", "s3://my-bucket/graph-data")
+        .remote_storage("s3://my-bucket/graph-data", CloudStorageConfig::default())
         .build()
         .await?;
     let session = db.session();

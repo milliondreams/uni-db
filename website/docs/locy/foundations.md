@@ -20,7 +20,7 @@ Locy groups rules into strata using dependency analysis:
 
 ### Rule Anatomy
 
-```cypher
+```locy
 CREATE RULE reachable AS
 MATCH (a:Node)-[:EDGE]->(b:Node)
 YIELD KEY a, KEY b

@@ -121,6 +121,7 @@ pub struct DatabaseBuilder {
     pub(crate) schema_file: Option<String>,
     pub(crate) xervo_catalog_json: Option<String>,
     pub(crate) xervo_catalog_file: Option<String>,
+    pub(crate) xervo_runtime: Option<crate::types::PyModelRuntime>,
     pub(crate) cloud_config: Option<uni_common::CloudStorageConfig>,
     pub(crate) uni_config: Option<uni_common::UniConfig>,
     pub(crate) read_only: bool,
@@ -143,6 +144,7 @@ impl DatabaseBuilder {
             schema_file: None,
             xervo_catalog_json: None,
             xervo_catalog_file: None,
+            xervo_runtime: None,
             cloud_config: None,
             uni_config: None,
             read_only: false,
@@ -164,6 +166,7 @@ impl DatabaseBuilder {
             schema_file: None,
             xervo_catalog_json: None,
             xervo_catalog_file: None,
+            xervo_runtime: None,
             cloud_config: None,
             uni_config: None,
             read_only: false,
@@ -185,6 +188,7 @@ impl DatabaseBuilder {
             schema_file: None,
             xervo_catalog_json: None,
             xervo_catalog_file: None,
+            xervo_runtime: None,
             cloud_config: None,
             uni_config: None,
             read_only: false,
@@ -206,6 +210,7 @@ impl DatabaseBuilder {
             schema_file: None,
             xervo_catalog_json: None,
             xervo_catalog_file: None,
+            xervo_runtime: None,
             cloud_config: None,
             uni_config: None,
             read_only: false,
@@ -253,6 +258,7 @@ impl DatabaseBuilder {
     fn xervo_catalog_from_str(mut slf: PyRefMut<'_, Self>, json: String) -> PyRefMut<'_, Self> {
         slf.xervo_catalog_json = Some(json);
         slf.xervo_catalog_file = None;
+        slf.xervo_runtime = None;
         slf
     }
 
@@ -260,6 +266,22 @@ impl DatabaseBuilder {
     fn xervo_catalog_from_file(mut slf: PyRefMut<'_, Self>, path: String) -> PyRefMut<'_, Self> {
         slf.xervo_catalog_file = Some(path);
         slf.xervo_catalog_json = None;
+        slf.xervo_runtime = None;
+        slf
+    }
+
+    /// Reuse an already-built Xervo runtime instead of building one from a catalog.
+    ///
+    /// Databases sharing one runtime share its loaded models, so the second and
+    /// later ones cost no additional model memory. Supersedes any catalog set
+    /// on this builder.
+    fn xervo_runtime(
+        mut slf: PyRefMut<'_, Self>,
+        runtime: crate::types::PyModelRuntime,
+    ) -> PyRefMut<'_, Self> {
+        slf.xervo_runtime = Some(runtime);
+        slf.xervo_catalog_json = None;
+        slf.xervo_catalog_file = None;
         slf
     }
 
@@ -408,6 +430,7 @@ impl DatabaseBuilder {
                     self.read_only,
                     rust_write_lease,
                     self.skip_invalid_locy_rules,
+                    self.xervo_runtime.as_ref().map(|rt| rt.inner.clone()),
                 ))
             })
             .map_err(crate::exceptions::uni_error_to_pyerr)?;

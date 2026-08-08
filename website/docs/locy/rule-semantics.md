@@ -41,6 +41,11 @@ Iteration 2: delta₂ = evaluate(rules, delta₁) − known_facts
 Iteration n: deltaₙ = ∅ → fixpoint reached
 ```
 
+One exception: a rule whose folded value is read by a self-reference in the same
+stratum publishes a full per-KEY snapshot rather than a delta, because an
+aggregate is a whole-relation quantity — see *What a self-reference reads* below.
+
+
 ## Overloaded Rules
 
 Multiple `CREATE RULE` clauses sharing one name define one logical relation. Clauses can be prioritized where supported.
@@ -58,6 +63,46 @@ Recursive aggregation requires monotonic operators. Non-monotonic recursive shap
 Monotonicity is decided by the aggregate registry: the compiler reads the aggregate's `monotone_join` semilattice flag, falling back to the six built-in `M*` names (`MSUM`, `MMAX`, `MMIN`, `MCOUNT`, `MNOR`, `MPROD`) only when the registry has no entry for the name. So `MIN`, `MAX`, `COUNT`, `COUNT(*)` and `COLLECT` are legal inside recursive strata too; `SUM` and `AVG` are non-monotone and rejected.
 
 Monotone does not imply convergent. `COUNT`, `COLLECT`, `MSUM` and `MCOUNT` are monotone but unbounded — they have no top element. For the ones the fixpoint loop tracks row by row (`COUNT`, `MSUM`, `MCOUNT`) that means a recursive fold can run to `max_iterations` instead of reaching a fixed point; the iteration cap is the backstop. `COLLECT` is the exception: it has no row-level accumulator and is assembled after the fixpoint, so it does not itself keep the loop iterating.
+
+### What a self-reference reads
+
+A rule inside a recursive stratum can reference itself. What that reference
+binds depends on whether the rule aggregates:
+
+- **The rule carries `FOLD`** — the reference sees **one row per KEY, carrying
+  that KEY's folded value** as of the previous iteration. A rollup therefore
+  composes one level at a time: a parent folds its children's values, and each
+  child has already folded its own.
+- **The referencing clause carries `ALONG`** — it sees the pre-fold rows, one
+  per derivation. `prev.x` accumulates a value along a single *path*, and a
+  per-KEY aggregate is not defined per path. This is decided per clause, so a
+  sibling clause of the same rule that folds an inherited value still reads the
+  folded view.
+- **A reference to a lower stratum** always reads that rule's published, folded
+  facts. It always has.
+
+```
+CREATE RULE build AS
+  MATCH (p:Part) WHERE p IS NOT assembly
+  YIELD KEY p, 0.5 AS b
+
+CREATE RULE build AS
+  MATCH (p:Part)-[:CONTAINS]->(c:Part)
+  WHERE c IS build
+  FOLD b = MPROD(b)
+  YIELD KEY p, b
+```
+
+For `TOP → MID → {L1, L2}` with both leaves at 0.5: `MID = 0.5 × 0.5 = 0.25`,
+and `TOP` folds `MID`'s single value, so `TOP = 0.25` too.
+
+The distinction is invisible for an associative aggregate over a bare inherited
+column — folding a child's rows and folding its folded value agree for `MPROD`
+and `MSUM`. It is visible for `MCOUNT`, which counts a node's **children**, not
+its leaves, and for any fold whose argument is a computed expression.
+
+Convergence follows the value, not just the row count: for these rules the
+fixpoint has settled when no KEY has been added *and* no value has moved.
 
 `MNOR` and `MPROD` are monotonic and bounded, therefore legal inside recursive strata. They assume independent derivations unless `exact_probability` is enabled.
 

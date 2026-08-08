@@ -164,3 +164,39 @@ Feature: FOLD Aggregation
       """
     Then evaluation should succeed
     And the derived relation 'weighted_costs' should have 1 facts
+
+  # ── The two views, side by side (issue #162) ────────────────────────────
+  #
+  # "A FOLD aggregates the bag of derivations" still holds for a NON-recursive
+  # fold: the rows a clause emits are the bag, and equal values contribute
+  # once each. What changed is only what a SELF-reference inside a recursive
+  # stratum observes — there it reads the target's folded value per KEY. A
+  # consumer in a LATER stratum has always read published, folded facts, and
+  # still does.
+
+  Scenario: A later-stratum consumer folds the published folded value
+    Given having executed:
+      """
+      CREATE (t:Asm {name: 'TOP'}),
+             (t)-[:PART]->(:Asm {name: 'L1'}),
+             (t)-[:PART]->(:Asm {name: 'L2'})
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE leafy AS
+        MATCH (p:Asm)-[:PART]->(c:Asm)
+        FOLD b = MPROD(0.5)
+        YIELD KEY p, b
+      CREATE RULE report AS
+        MATCH (p:Asm)
+        WHERE p IS leafy
+        FOLD z = MPROD(b)
+        YIELD KEY p, z
+      """
+    Then evaluation should succeed
+    # `leafy` folds two contribution rows (one per PART edge), both 0.5, giving
+    # 0.25 — the bag-of-derivations rule, unchanged. `report` is a separate
+    # stratum, so it consumes the single published fact 0.25, not the two rows
+    # behind it, giving 0.25 rather than 0.0625.
+    And the derived relation 'leafy' should contain a fact where b = 0.25
+    And the derived relation 'report' should contain a fact where z = 0.25

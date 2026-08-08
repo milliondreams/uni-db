@@ -143,14 +143,14 @@ db.flush().await?;
 ```cypher
 CALL uni.search(
     'Doc',
-    {vector: 'embedding', fts: 'content', sparse: 'emb'},   -- all three arms
-    'semantic retrieval over graphs',                       -- text → FTS + auto-embed dense
-    null,                                                   -- query_vector (auto-embed)
-    10,                                                     -- k
-    null,                                                   -- filter
+    {vector: 'embedding', fts: 'content', sparse: 'emb'},   // all three arms
+    'semantic retrieval over graphs',                       // text → FTS + auto-embed dense
+    null,                                                   // query_vector (auto-embed)
+    10,                                                     // k
+    null,                                                   // filter
     {
         method: 'weighted',
-        weights: [0.4, 0.2, 0.4],                           -- [vector, fts, sparse]
+        weights: [0.4, 0.2, 0.4],                           // [vector, fts, sparse]
         sparse_query: {indices: [42, 9001], values: [1.0, 0.5]}
     }
 )

@@ -16,24 +16,29 @@ pip install uni-db
 ## Quick Start
 
 ```python
-import uni_db
+from uni_db import Uni
 
-# Open or create a database
-db = uni_db.Database("./my_graph")
+# Open or create a database (`Uni.in_memory()` for an ephemeral one)
+db = Uni.open("./my_graph")
 
 # Define schema
-db.create_label("Person")
-db.add_property("Person", "name", "string", False)
-db.add_property("Person", "age", "int64", True)
-db.create_scalar_index("Person", "name", "btree")
+db.schema() \
+    .label("Person") \
+        .property("name", "string") \
+        .property_nullable("age", "int64") \
+        .index("name", "btree") \
+    .apply()
 
-# Write data
-db.execute("CREATE (p:Person {name: 'Alice', age: 30})")
-db.execute("CREATE (p:Person {name: 'Bob', age: 25})")
-db.flush()
+# Write data. `Uni` is lifecycle and admin only: reads go through a Session,
+# writes through a transaction on one.
+session = db.session()
+tx = session.tx()
+tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+tx.execute("CREATE (p:Person {name: 'Bob', age: 25})")
+tx.commit()
 
-# Query
-results = db.query(
+# Query (read-only)
+results = session.query(
     "MATCH (p:Person) WHERE p.age > $min RETURN p.name",
     {"min": 28},
 )
@@ -43,93 +48,108 @@ print(results)  # [{'p.name': 'Alice'}]
 ## Schema Operations
 
 ```python
-# Labels and edge types
-db.create_label("Person")
-db.create_edge_type("KNOWS", ["Person"], ["Person"])
-db.add_property("Person", "name", "string", False)   # nullable=False
-db.add_property("Person", "age",  "int64",  True)    # nullable=True
-
-# Indexes
-db.create_scalar_index("Person", "name", "btree")
-db.create_vector_index("Person", "embedding", "cosine")  # or "l2"
+# Labels, edge types, properties and indexes are all declared through the
+# schema builder and committed together by a single `.apply()`.
+db.schema() \
+    .label("Person") \
+        .property("name", "string") \
+        .property_nullable("age", "int64") \
+        .vector("embedding", 384) \
+        .index("name", "btree") \
+        .index("embedding", {"type": "vector", "metric": "cosine"}) \
+        .done() \
+    .edge_type("KNOWS", ["Person"], ["Person"]) \
+        .property_nullable("since", "date") \
+    .apply()
 
 # Introspection
-db.list_labels()         # ['Person', ...]
-db.list_edge_types()     # ['KNOWS', ...]
-db.get_label_info("Person")
-db.get_schema()
+db.schema().current()        # dict view of the whole schema
+db.schema().current_typed()  # typed `Schema` object
 ```
 
 ## Transactions
 
 ```python
-txn = db.begin()
-txn.execute("CREATE (p:Person {name: 'Charlie'})")
-txn.commit()   # or txn.rollback()
+tx = db.session().tx()
+tx.execute("CREATE (p:Person {name: 'Charlie'})")
+tx.commit()   # or tx.rollback()
 ```
 
 ## Bulk Loading
 
+The bulk writer is built from a transaction.
+
 ```python
-writer = db.bulk_writer()
-writer.insert_vertices("Person", [
+tx = db.session().tx()
+writer = tx.bulk_writer().build()
+vids = writer.insert_vertices("Person", [
     {"name": "Alice", "age": 30},
     {"name": "Bob",   "age": 25},
 ])
 writer.insert_edges("KNOWS", [
-    (person_vids[0], person_vids[1], {}),   # (src_vid, dst_vid, properties)
+    (vids[0], vids[1], {}),   # (src_vid, dst_vid, properties)
 ])
 writer.commit()
+tx.commit()
 ```
 
 ## Vector Search
 
 ```python
-# Create a vector index
-db.create_label("Document")
-db.add_property("Document", "text",      "string",     False)
-db.add_property("Document", "embedding", "vector[128]", True)
-db.create_vector_index("Document", "embedding", "cosine")
+# Declare the vector column and its index
+db.schema() \
+    .label("Document") \
+        .property("text", "string") \
+        .vector("embedding", 128) \
+        .index("embedding", {"type": "vector", "metric": "cosine"}) \
+    .apply()
 
-db.execute("CREATE (d:Document {text: 'hello world', embedding: [0.1, 0.2, 0.3]})")
+session = db.session()
+tx = session.tx()
+tx.execute("CREATE (d:Document {text: 'hello world', embedding: $v})", {"v": my_embedding})
+tx.commit()
 db.flush()
 
-# K-NN search
-results = db.query("""
+# K-NN search. `k` is required.
+results = session.query('''
     CALL uni.vector.query('Document', 'embedding', $vec, 10)
-    YIELD vid, distance
-    RETURN vid, distance
-    ORDER BY distance
-""", {"vec": my_embedding})
+    YIELD node, score
+    RETURN node.text AS text, score
+    ORDER BY score DESC
+''', {"vec": my_embedding})
 
 # K-NN with pre-filter (SQL WHERE expression)
-results = db.query("""
+results = session.query('''
     CALL uni.vector.query('Document', 'embedding', $vec, 10, 'category = "tech"')
-    YIELD vid, distance
-    RETURN vid, distance
-""", {"vec": my_embedding})
+    YIELD node, score
+    RETURN node.text AS text, score
+''', {"vec": my_embedding})
 
-# K-NN with distance threshold
-results = db.query("""
-    CALL uni.vector.query('Document', 'embedding', $vec, 10, NULL, 0.5)
-    YIELD vid, distance
-    RETURN vid, distance
-""", {"vec": my_embedding})
+# K-NN with a similarity floor. `threshold` is a MINIMUM SIMILARITY on the
+# same scale as `score` (larger is a better match), not a maximum distance.
+results = session.query('''
+    CALL uni.vector.query('Document', 'embedding', $vec, 10, NULL, 0.8)
+    YIELD node, score
+    RETURN node.text AS text, score
+''', {"vec": my_embedding})
 ```
 
-`YIELD` columns: `vid` (integer vertex ID), `distance` (float).
+`YIELD` columns: `node` (the matched vertex), `score` (similarity, larger is better) and `distance` (the raw metric distance).
 
 ## Async API
 
 ```python
-import uni_db
+from uni_db import AsyncUni
 
-# Open
-db = await uni_db.AsyncDatabase.open("./my_graph")
-# or: db = await uni_db.AsyncDatabase.temporary()
+db = await AsyncUni.open("./my_graph")
+# or: db = await AsyncUni.temporary()
 
-await db.execute("CREATE (p:Person {name: 'Alice', age: 30})")
-results = await db.query("MATCH (p:Person) RETURN p.name")
+session = db.session()
+tx = await session.tx()
+await tx.execute("CREATE (p:Person {name: 'Alice', age: 30})")
+await tx.commit()
+
+results = await session.query("MATCH (p:Person) RETURN p.name")
 await db.flush()
 ```
 

@@ -1681,6 +1681,21 @@ impl UniBuilder {
         }
 
         let xervo_runtime = if let Some(runtime) = self.prebuilt_xervo_runtime {
+            // A prebuilt runtime carries its own catalog, so the alias set can be
+            // verified but the per-alias capability check below cannot: that needs
+            // `spec.task`, and uni-xervo keeps `lookup_spec` private. An alias bound
+            // to the wrong task therefore still surfaces at first embed rather than
+            // here. Presence is the half that is reachable, and it catches the likely
+            // misuse — sharing a runtime into a database whose schema needs an alias
+            // the runtime's catalog never had.
+            for alias in required_embed_heads.keys() {
+                if !runtime.contains_alias(alias).await {
+                    return Err(UniError::Internal(anyhow::anyhow!(
+                        "Missing Uni-Xervo alias '{}' referenced by vector index embedding config",
+                        alias
+                    )));
+                }
+            }
             Some(runtime)
         } else if let Some(catalog) = self.xervo_catalog {
             // Capability check (#129/#130): each alias's task must produce — from a text
@@ -1716,72 +1731,7 @@ impl UniBuilder {
                 }
             }
 
-            // `mut` is conditional on at least one provider-* feature being
-            // enabled; a slim build with no providers leaves it unused.
-            #[allow(unused_mut)]
-            let mut runtime_builder = ModelRuntime::builder().catalog(catalog);
-            #[cfg(feature = "provider-candle")]
-            {
-                runtime_builder = runtime_builder
-                    .register_provider(uni_xervo::provider::LocalCandleProvider::new());
-            }
-            #[cfg(feature = "provider-openai")]
-            {
-                runtime_builder = runtime_builder
-                    .register_provider(uni_xervo::provider::RemoteOpenAIProvider::new());
-            }
-            #[cfg(feature = "provider-gemini")]
-            {
-                runtime_builder = runtime_builder
-                    .register_provider(uni_xervo::provider::RemoteGeminiProvider::new());
-            }
-            #[cfg(feature = "provider-vertexai")]
-            {
-                runtime_builder = runtime_builder
-                    .register_provider(uni_xervo::provider::RemoteVertexAIProvider::new());
-            }
-            #[cfg(feature = "provider-mistral")]
-            {
-                runtime_builder = runtime_builder
-                    .register_provider(uni_xervo::provider::RemoteMistralProvider::new());
-            }
-            #[cfg(feature = "provider-anthropic")]
-            {
-                runtime_builder = runtime_builder
-                    .register_provider(uni_xervo::provider::RemoteAnthropicProvider::new());
-            }
-            #[cfg(feature = "provider-voyageai")]
-            {
-                runtime_builder = runtime_builder
-                    .register_provider(uni_xervo::provider::RemoteVoyageAIProvider::new());
-            }
-            #[cfg(feature = "provider-cohere")]
-            {
-                runtime_builder = runtime_builder
-                    .register_provider(uni_xervo::provider::RemoteCohereProvider::new());
-            }
-            #[cfg(feature = "provider-azure-openai")]
-            {
-                runtime_builder = runtime_builder
-                    .register_provider(uni_xervo::provider::RemoteAzureOpenAIProvider::new());
-            }
-            #[cfg(feature = "provider-mistralrs")]
-            {
-                runtime_builder = runtime_builder
-                    .register_provider(uni_xervo::provider::LocalMistralRsProvider::new());
-            }
-            #[cfg(feature = "provider-onnx")]
-            {
-                runtime_builder = runtime_builder
-                    .register_provider(uni_xervo::provider::LocalOnnxProvider::new());
-            }
-
-            Some(
-                runtime_builder
-                    .build()
-                    .await
-                    .map_err(|e| UniError::Internal(anyhow::anyhow!(e.to_string())))?,
-            )
+            Some(crate::api::xervo::build_model_runtime(catalog).await?)
         } else {
             None
         };

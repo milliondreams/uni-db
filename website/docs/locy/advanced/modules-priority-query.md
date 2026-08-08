@@ -4,6 +4,7 @@
 
 Modules package reusable rule libraries.
 
+<!-- doctest: skip -->
 ```cypher
 MODULE acme.compliance
 USE acme.common
@@ -19,7 +20,7 @@ Benefits:
 
 Priority resolves competing clauses for the same rule relation.
 
-```cypher
+```locy
 CREATE RULE classify PRIORITY 1 AS MATCH (n) WHERE n.risk > 0.8 YIELD KEY n, 'high' AS level
 CREATE RULE classify PRIORITY 2 AS MATCH (n) YIELD KEY n, 'normal' AS level
 ```
@@ -28,7 +29,7 @@ CREATE RULE classify PRIORITY 2 AS MATCH (n) YIELD KEY n, 'normal' AS level
 
 `QUERY` asks for targeted answers rather than full materialization-first workflows.
 
-```cypher
+```locy
 QUERY classify WHERE n.name = 'service-a' RETURN level
 ```
 

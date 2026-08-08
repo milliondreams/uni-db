@@ -88,10 +88,10 @@ RETURN p.title, p.abstract, p.embedding  // embedding loaded but unused
 Ensure indexes exist for filter properties:
 
 ```cypher
--- Check if index is used
+// Check if index is used
 EXPLAIN MATCH (p:Paper) WHERE p.year = 2023 RETURN p.title
 
--- Create index if missing
+// Create index if missing
 CREATE INDEX paper_year FOR (p:Paper) ON (p.year)
 ```
 
@@ -181,10 +181,10 @@ The storage layer currently builds BTree scalar indexes only.
 Create composite indexes for common filter combinations:
 
 ```cypher
--- Composite index for common query pattern
+// Composite index for common query pattern
 CREATE INDEX paper_venue_year FOR (p:Paper) ON (p.venue, p.year)
 
--- Query uses the composite index
+// Query uses the composite index
 MATCH (p:Paper)
 WHERE p.venue = 'NeurIPS' AND p.year > 2020
 RETURN p.title
@@ -201,7 +201,7 @@ Tune batch sizes for your workload:
 ```rust
 // BulkWriter with larger batches (more memory, faster)
 let session = db.session();
-let tx = session.tx();
+let tx = session.tx().await?;
 let bulk = tx.bulk_writer().batch_size(50_000).build()?;
 
 // BulkWriter with smaller batches (less memory)
@@ -559,8 +559,7 @@ let cfg = CloudStorageConfig::S3 {
 };
 
 let db = Uni::open("./local-meta")
-    .hybrid("./local-meta", "s3://my-bucket/graph-data")
-    .cloud_config(cfg)
+    .remote_storage("s3://my-bucket/graph-data", cfg)
     .build()
     .await?;
 
@@ -572,8 +571,7 @@ let cfg = CloudStorageConfig::Gcs {
 };
 
 let db = Uni::open("./local-meta")
-    .hybrid("./local-meta", "gs://my-gcs-bucket/graph-data")
-    .cloud_config(cfg)
+    .remote_storage("gs://my-gcs-bucket/graph-data", cfg)
     .build()
     .await?;
 
@@ -589,8 +587,7 @@ let cfg = CloudStorageConfig::S3 {
 };
 
 let db = Uni::open("./local-meta")
-    .hybrid("./local-meta", "s3://my-bucket/graph-data")
-    .cloud_config(cfg)
+    .remote_storage("s3://my-bucket/graph-data", cfg)
     .build()
     .await?;
 ```
@@ -641,7 +638,7 @@ config.auto_flush_interval = Some(Duration::from_secs(30));
 config.auto_flush_min_mutations = 100;
 
 let db = Uni::open("./local-meta")
-    .hybrid("./local-meta", "s3://my-bucket/data")
+    .remote_storage("s3://my-bucket/data", CloudStorageConfig::default())
     .config(config)
     .build()
     .await?;

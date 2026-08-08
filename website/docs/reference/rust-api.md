@@ -148,6 +148,27 @@ let db = Uni::open("./my-graph")
 | `xervo_catalog(catalog)` | Set Uni-Xervo model catalog. |
 | `xervo_runtime(runtime)` | Set pre-built Xervo `ModelRuntime` directly (for testing or advanced use). |
 | `remote_storage(url, config)` | Configure hybrid local+remote storage. |
+
+!!! note "`remote_storage` is the Rust spelling"
+    The Python builder exposes this as `.hybrid(local, remote)` +
+    `.cloud_config(cfg)`. The Rust builder has neither — `remote_storage` takes
+    both in one call.
+
+**Concurrency control — `UniConfig::ssi_enabled`**
+
+`ssi_enabled` defaults to **`true`**: Uni runs Serializable Snapshot Isolation,
+so two concurrent writers that would produce a lost update cause one to **abort
+and retry** rather than silently last-writer-wins.
+
+```rust
+// Opt out only when writes never conflict, or the caller guards
+// read-modify-write externally. Silent lost updates are the trade.
+let db = Uni::open("./my_db")
+    .config(UniConfig { ssi_enabled: false, ..Default::default() })
+    .build()
+    .await?;
+```
+
 | `build()` | `async` -- Open the database. Returns `Result<Uni>`. |
 
 ---

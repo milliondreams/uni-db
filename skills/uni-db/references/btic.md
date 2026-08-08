@@ -19,48 +19,53 @@ Construct BTIC values in Cypher with `btic('literal')`:
 
 ### Single Expressions (one granularity)
 
+<!-- doctest: skip -->
 ```cypher
-btic('1985')                     -- year
-btic('1985-03')                  -- month
-btic('1985-03-15')               -- day
-btic('1985-03-15T14')            -- hour
-btic('1985-03-15T14:30')         -- minute
-btic('1985-03-15T14:30:00')      -- second
-btic('1985-03-15T14:30:00.123')  -- millisecond
+btic('1985')                     // year
+btic('1985-03')                  // month
+btic('1985-03-15')               // day
+btic('1985-03-15T14')            // hour
+btic('1985-03-15T14:30')         // minute
+btic('1985-03-15T14:30:00')      // second
+btic('1985-03-15T14:30:00.123')  // millisecond
 ```
 
 ### Range Intervals (solidus `/`)
 
+<!-- doctest: skip -->
 ```cypher
-btic('1985-03/2024-06')    -- bounded range (mixed granularities OK)
-btic('2020-03/')            -- right-unbounded (ongoing)
-btic('/2024-06')            -- left-unbounded (from beginning of time)
-btic('/')                   -- fully unbounded (all time)
+btic('1985-03/2024-06')    // bounded range (mixed granularities OK)
+btic('2020-03/')            // right-unbounded (ongoing)
+btic('/2024-06')            // left-unbounded (from beginning of time)
+btic('/')                   // fully unbounded (all time)
 ```
 
 ### Certainty Prefixes
 
+<!-- doctest: skip -->
 ```cypher
-btic('~1985')               -- approximate: true value ±1 unit of granularity
-btic('?1985-03')             -- uncertain: true value may differ significantly
-btic('??1985')               -- unknown: stored value is best guess
-btic('~1985/?2024-06')       -- independent certainty per bound
+btic('~1985')               // approximate: true value ±1 unit of granularity
+btic('?1985-03')             // uncertain: true value may differ significantly
+btic('??1985')               // unknown: stored value is best guess
+btic('~1985/?2024-06')       // independent certainty per bound
 ```
 
 ### BCE Dates
 
+<!-- doctest: skip -->
 ```cypher
-btic('500 BCE')              -- 500 BCE (astronomical year -499)
-btic('~500BCE/44BCE')        -- approximate range in antiquity
+btic('500 BCE')              // 500 BCE (astronomical year -499)
+btic('~500BCE/44BCE')        // approximate range in antiquity
 ```
 
 ### Timezone Handling
 
 Timezones are normalized to UTC milliseconds:
 
+<!-- doctest: skip -->
 ```cypher
-btic('1985-03-15T14:30:00Z')       -- UTC
-btic('1985-03-15T14:30:00+05:30')  -- offset, stored as UTC
+btic('1985-03-15T14:30:00Z')       // UTC
+btic('1985-03-15T14:30:00+05:30')  // offset, stored as UTC
 ```
 
 ---
@@ -164,13 +169,14 @@ All predicates: `(Btic, Btic) -> Bool | Null`. Returns Null if either argument i
 
 BTIC values support standard comparison operators using packed byte ordering:
 
+<!-- doctest: skip -->
 ```cypher
-WHERE n.period < btic('2000')     -- periods before 2000
-WHERE n.period > btic('1985')     -- periods after 1985
-WHERE n.period = btic('1990')     -- exact match
-WHERE n.period <> btic('1990')    -- not equal
-WHERE n.period <= btic('2000')    -- less than or equal
-WHERE n.period >= btic('1985')    -- greater than or equal
+WHERE n.period < btic('2000')     // periods before 2000
+WHERE n.period > btic('1985')     // periods after 1985
+WHERE n.period = btic('1990')     // exact match
+WHERE n.period <> btic('1990')    // not equal
+WHERE n.period <= btic('2000')    // less than or equal
+WHERE n.period >= btic('1985')    // greater than or equal
 ```
 
 ---
@@ -300,17 +306,17 @@ let result = session.query(
 ### Temporal Filtering
 
 ```cypher
--- Events during a specific period
+// Events during a specific period
 MATCH (e:Event)
 WHERE btic_during(e.when, btic('1980/1990'))
 RETURN e.name
 
--- Events overlapping a query window
+// Events overlapping a query window
 MATCH (e:Event)
 WHERE btic_overlaps(e.when, btic('2024-Q1'))
 RETURN e.name, btic_lo(e.when) AS start
 
--- Events before a cutoff
+// Events before a cutoff
 MATCH (e:Event)
 WHERE btic_before(e.when, btic('2000'))
 RETURN e.name ORDER BY e.when
@@ -319,12 +325,12 @@ RETURN e.name ORDER BY e.when
 ### Timeline Analysis
 
 ```cypher
--- Duration of each event
+// Duration of each event
 MATCH (e:Event)
 RETURN e.name, btic_duration(e.when) AS ms,
        btic_granularity(e.when) AS precision
 
--- Find the span covering all events
+// Find the span covering all events
 MATCH (e1:Event), (e2:Event)
 WHERE e1 <> e2
 RETURN btic_span(e1.when, e2.when) AS combined
@@ -333,12 +339,12 @@ RETURN btic_span(e1.when, e2.when) AS combined
 ### Certainty-Aware Queries
 
 ```cypher
--- Find approximate or uncertain dates
+// Find approximate or uncertain dates
 MATCH (e:Event)
 WHERE btic_certainty(e.when) <> 'definite'
 RETURN e.name, btic_certainty(e.when) AS certainty
 
--- Per-bound certainty inspection
+// Per-bound certainty inspection
 MATCH (e:Event)
 RETURN e.name,
        btic_lo_certainty(e.when) AS start_certainty,
@@ -348,17 +354,17 @@ RETURN e.name,
 ### Allen Interval Relations
 
 ```cypher
--- Find events that start together
+// Find events that start together
 MATCH (a:Event), (b:Event)
 WHERE a <> b AND btic_starts(a.when, b.when)
 RETURN a.name AS shorter, b.name AS longer
 
--- Find sequential (meeting) events
+// Find sequential (meeting) events
 MATCH (a:Event), (b:Event)
 WHERE btic_meets(a.when, b.when)
 RETURN a.name AS first, b.name AS next
 
--- Find gaps between events
+// Find gaps between events
 MATCH (a:Event), (b:Event)
 WHERE btic_disjoint(a.when, b.when)
 RETURN a.name, b.name, btic_gap(a.when, b.when) AS gap_interval

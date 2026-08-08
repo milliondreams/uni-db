@@ -103,44 +103,19 @@ cargo test -p uni-tck --test cucumber -- "Return a boolean true"
    - Tracing setup
    - Libtest-compatible output
 
-### 🚧 TODO (Phase 2+)
+### ✅ Status
 
-1. **Complete Step Implementations**
-   - Parse Gherkin tables in `then` steps
-   - Implement actual result comparison using matcher
-   - Implement error matching using error matcher
-   - Parse and apply query parameters in `when` steps
-   - Parse and verify side effects table
+The suite is complete and green. The most recent run
+(`compliance_reports/schemaless/last_run_report.md`) is **3925 / 3926 scenarios,
+100.0% pass rate, 0 failures**; `src/` contains **zero** `todo!()`.
 
-2. **Enhance Value Parser**
-   - Complete path syntax parsing (`<n0-[r1]->n1-[r2]->n2>`)
-   - Handle all TCK edge cases
-   - Support temporal types (if needed)
+Step implementations, the value parser (including path syntax and temporal
+types), named graph fixtures, error mapping and side-effect table parsing are
+all implemented — the "Phase 2" work items that used to be listed here are done.
 
-3. **Implement Named Fixtures**
-   - Discover all fixture types from feature files
-   - Implement each named graph fixture properly
-   - Match exact TCK requirements
-
-4. **Improve Error Handling**
-   - Map all UniError variants to TCK error types
-   - Handle error detail codes precisely
-   - Test error scenarios thoroughly
-
-5. **Optimization**
-   - Parallel scenario execution
-   - Caching for common fixtures
-   - Performance profiling
-
-## Current Limitations
-
-Many step implementations use `todo!()` for:
-- Table parsing and comparison (in `then` steps)
-- Parameter handling (in `when` steps)
-- Named graph fixtures (only stubs exist)
-- Side effects table parsing
-
-These will cause tests to panic when reached, which is expected for Phase 1.
+Run the suite with `scripts/run_tck_with_report.sh`, or a filtered subset with
+`scripts/run_tck_with_report.sh "~Match1"`. Artifacts land under
+`target/cucumber/` and are synced into `compliance_reports/` by mode.
 
 ## Example TCK Scenario
 

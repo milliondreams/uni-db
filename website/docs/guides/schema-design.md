@@ -276,7 +276,7 @@ For late-interaction retrieval, store **many vectors per row** (one per token) i
 ```cypher
 CREATE LABEL Document (
   title  STRING,
-  tokens LIST<VECTOR(96)>   -- per-token (ColBERT) vectors
+  tokens LIST<VECTOR(96)>   // per-token (ColBERT) vectors
 )
 ```
 
@@ -288,9 +288,9 @@ Beyond vectors, properties can declare typed collections — `List<T>` and strin
 
 ```cypher
 CREATE LABEL Document (
-  tags     LIST<STRING>,             -- typed list
-  scores   MAP<STRING, FLOAT>,       -- typed map
-  sections MAP<STRING, LIST<INT>>    -- nested
+  tags     LIST<STRING>,             // typed list
+  scores   MAP<STRING, FLOAT>,       // typed map
+  sections MAP<STRING, LIST<INT>>    // nested
 )
 ```
 
@@ -345,7 +345,7 @@ db.schema().label("Document").apply().await?;
 
 // Create with arbitrary properties
 let session = db.session();
-let tx = session.tx();
+let tx = session.tx().await?;
 tx.execute("CREATE (:Document {
     title: 'Research Paper',
     author: 'Alice',
@@ -375,13 +375,13 @@ db.schema()
 
 // Create with schema + overflow properties
 let session = db.session();
-let tx = session.tx();
+let tx = session.tx().await?;
 tx.execute("CREATE (:Person {
-    name: 'Bob',           -- Schema (typed column)
-    email: 'bob@x.com',    -- Schema (typed column)
-    city: 'NYC',           -- Overflow (overflow_json)
-    github: 'bob123',      -- Overflow (overflow_json)
-    verified: true         -- Overflow (overflow_json)
+    name: 'Bob',           // Schema (typed column)
+    email: 'bob@x.com',    // Schema (typed column)
+    city: 'NYC',           // Overflow (overflow_json)
+    github: 'bob123',      // Overflow (overflow_json)
+    verified: true         // Overflow (overflow_json)
 })").await?;
 tx.commit().await?;
 ```
@@ -440,10 +440,10 @@ tx.commit().await?;
 Queries on overflow properties are automatically rewritten to use JSONB functions:
 
 ```cypher
--- Original query
+// Original query
 MATCH (p:Person) WHERE p.city = 'NYC' RETURN p.github
 
--- Automatically rewritten to (transparent to user):
+// Automatically rewritten to (transparent to user):
 MATCH (p:Person)
 WHERE json_get_string(p.overflow_json, 'city') = 'NYC'
 RETURN json_get_string(p.overflow_json, 'github')
@@ -494,7 +494,7 @@ db.schema()
 
 // Create with overflow for optional metadata
 let session = db.session();
-let tx = session.tx();
+let tx = session.tx().await?;
 tx.execute("CREATE (:Product {
     name: 'Widget',
     price: 19.99,
@@ -515,11 +515,11 @@ db.schema().label("Product").apply().await?;  // No properties
 
 // All properties in overflow (slow queries!)
 let session = db.session();
-let tx = session.tx();
+let tx = session.tx().await?;
 tx.execute("CREATE (:Product {
-    name: 'Widget',     -- Should be schema property!
-    price: 19.99,       -- Should be schema property!
-    category: 'electronics'  -- Should be schema property!
+    name: 'Widget',     // Should be schema property!
+    price: 19.99,       // Should be schema property!
+    category: 'electronics'  // Should be schema property!
 })").await?;
 tx.commit().await?;
 
@@ -527,6 +527,7 @@ tx.commit().await?;
 session.query("
     MATCH (p:Product)
     WHERE p.price < 50 AND p.category = 'electronics'
+    RETURN p
     ORDER BY p.price
 ").await?;
 ```
@@ -543,7 +544,7 @@ db.schema()
     .apply().await?;
 
 // Step 2: Backfill existing data (one-time operation)
-let tx = session.tx();
+let tx = session.tx().await?;
 tx.execute("
     MATCH (p:Product)
     WHERE p.manufacturer IS NOT NULL
@@ -572,12 +573,12 @@ db.schema()
 
 // Create with overflow edge properties
 let session = db.session();
-let tx = session.tx();
+let tx = session.tx().await?;
 tx.execute("CREATE
     (a:Person {name: 'Alice'})-[:KNOWS {
-        since: 2020,         -- Schema property
-        context: 'work',     -- Overflow property
-        strength: 0.9        -- Overflow property
+        since: 2020,         // Schema property
+        context: 'work',     // Overflow property
+        strength: 0.9        // Overflow property
     }]->(b:Person {name: 'Bob'})
 ").await?;
 tx.commit().await?;
@@ -588,13 +589,13 @@ tx.commit().await?;
 Overflow properties handle nulls gracefully:
 
 ```cypher
--- Explicit null
+// Explicit null
 CREATE (:Person {name: 'Alice', city: null})
 
--- Missing property (implicit null)
+// Missing property (implicit null)
 CREATE (:Person {name: 'Bob'})
 
--- Both return null for city
+// Both return null for city
 MATCH (p:Person) RETURN p.city
 ```
 

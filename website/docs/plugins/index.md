@@ -16,7 +16,7 @@ This section explains the model and routes you to the right page. If you just wa
 
 Extending Uni is a choice along two independent axes.
 
-**Surface — *what* you extend.** The capability model defines 23 extension surfaces: scalar / aggregate / window functions, Locy aggregates and predicates, procedures, index kinds, storage backends, algorithms (including Pregel programs), CRDTs, hooks, triggers, background jobs, logical types, collations, auth and authz providers, connectors, CDC outputs, catalog providers, and operators / optimizer rules. A plugin declares which surfaces it touches, and the registrar gates each registration against that declaration.
+**Surface — *what* you extend.** The capability model defines 22 extension surfaces: scalar / aggregate / window functions, Locy aggregates and predicates, procedures, index kinds, storage backends, algorithms (including Pregel programs), CRDTs, hooks, triggers, background jobs, logical types, collations, auth and authz providers, connectors, CDC outputs, catalog providers, and operators / optimizer rules. A plugin declares which surfaces it touches, and the registrar gates each registration against that declaration.
 
 **Loader — *how* you author and sandbox.** The same registry is reached by five loaders: compile-time **Rust** (native, trusted), the **WASM Component Model** (wasmtime + WIT) and **Extism** (host-fn ABI) for sandboxed polyglot code, **PyO3** for in-process Python, and **Rhai** for sandboxed pure-Rust scripting. The execution layer is loader-agnostic — a registered scalar function looks identical to the executor whether it arrived as native Rust or as a sandboxed `.wasm`.
 
@@ -26,7 +26,7 @@ The two axes are orthogonal: you pick a surface (what) and a loader (how) indepe
 
 ## Surface × loader matrix
 
-Today, only the Rust path can author all 23 surfaces. The four non-Rust loaders author the **scalar / aggregate / procedure** trio in v1; the remaining surfaces are compile-time-Rust-only (see [Status & scope](#status-scope)).
+Today, only the Rust path can author all 22 surfaces. The four non-Rust loaders author the **scalar / aggregate / procedure** trio in v1; the remaining surfaces are compile-time-Rust-only (see [Status & scope](#status-scope)).
 
 | Loader | Scalar / aggregate / procedure | Locy aggregates & predicates | Index / storage / algorithms | CRDTs / hooks / triggers / jobs | Types / collations / auth / connectors / CDC / catalog / operators |
 |---|:---:|:---:|:---:|:---:|:---:|
@@ -66,7 +66,7 @@ Note the distinction: **trust** (whether to load a plugin at all — signature v
 | [Concepts](concepts.md) | The `Plugin` / `PluginManifest` / `PluginRegistrar` / `PluginRegistry` model and lifecycle. |
 | [Loaders](loaders/index.md) | The five loaders compared, with per-loader authoring guides and the loader matrix. |
 | [Authoring](authoring.md) | Writing a plugin against the surface traits, with the `geo.haversine` reference across loaders. |
-| [Graph Algorithms](graph-algorithms.md) | Authoring graph algorithms in any loader: the 59-kernel catalogue, the mutable arena, and a worked guest-authored MCTS. |
+| [Graph Algorithms](graph-algorithms.md) | Authoring graph algorithms in any loader: the 72-kernel catalogue, the mutable arena, and a worked guest-authored MCTS. |
 | [Trust & Capabilities](trust-and-capabilities.md) | The capability model, `effective = declared ∩ granted`, and signing. |
 | [Reference](reference.md) | The full surface-trait, manifest, and host-API reference. |
 
@@ -79,7 +79,7 @@ The plugin framework is shipped and test-verified, with an honestly bounded v1 s
 **Shipped:**
 
 - Scalar, aggregate, and procedure authoring across **all five loaders** (Rust, Component Model, Extism, PyO3, Rhai), with cross-loader byte-identical (or ≤ 4 ULP) parity tests.
-- All 23 extension surfaces authorable from **Rust**, including the built-ins Uni ships on the same path.
+- All 22 extension surfaces authorable from **Rust**, including the built-ins Uni ships on the same path.
 - The **trust-policy foundation**: the `declared ∩ granted` capability model, host-configurable grants, and opt-in Ed25519 signature verification on the in-process `add_plugin` path (enforcement defaults to off).
 
 **Deferred (Phase-D / pending need):**
@@ -87,7 +87,7 @@ The plugin framework is shipped and test-verified, with an honestly bounded v1 s
 - A full **plugin CLI** (`uni plugin {install,list,grant,remove,info,reload,verify}`) — only `uni plugin install foo.rhai` ships today.
 - **OCI** (`oci://…`) and **Extism Hub** (`extism://hub/…`) distribution.
 - **Signature enforcement on sandboxed loads** — today only the in-process `add_plugin` path checks signatures; sandboxed loads (WASM, Extism, Rhai, Python) carry no signature or hash-integrity check yet.
-- **Non-Rust authoring beyond scalar / aggregate / procedure** — the other 20 surfaces are Rust-only in v1; some WIT worlds (e.g. CRDT, connector) are tractable but deferred, while in-process surfaces like operators and storage are infeasible across the Component Model boundary.
+- **Non-Rust authoring beyond scalar / aggregate / procedure** — the other 19 surfaces are Rust-only in v1; some WIT worlds (e.g. CRDT, connector) are tractable but deferred, while in-process surfaces like operators and storage are infeasible across the Component Model boundary.
 
 !!! note "Honest by design"
     This scope mirrors the plugin-framework implementation gap analysis. Where a capability is in place but not yet end-to-end, the documentation says so rather than implying completeness.

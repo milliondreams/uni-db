@@ -424,3 +424,108 @@ async fn test_fts_query_sees_l0_writes() -> Result<()> {
 
     Ok(())
 }
+
+/// `uni.fts.query` must yield a `score` that *increases* with relevance, and
+/// must honour `threshold` on that same scale.
+///
+/// Regression cover for the pair of defects where FTS results were pushed
+/// through the L2 arm of `calculate_score`, producing `1/(1+bm25)` — strictly
+/// *decreasing* in BM25. The documented `ORDER BY score DESC` therefore
+/// returned the worst matches first, with no error to signal it. `threshold`
+/// compounded it by filtering the raw BM25 value, a different range *and*
+/// direction from the score the caller actually saw.
+///
+/// The assertions are about ordering and bounds rather than exact values: BM25
+/// magnitudes depend on corpus statistics, but "a document that repeats the
+/// term outranks one that mentions it once" is stable.
+#[tokio::test]
+async fn test_fts_query_score_increases_with_relevance() -> Result<()> {
+    use uni_db::Uni;
+
+    let tmp = tempdir()?;
+    let db = Uni::open(tmp.path().to_str().unwrap()).build().await?;
+    db.schema()
+        .label("Doc")
+        .property("name", DataType::String)
+        .property("body", DataType::String)
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE FULLTEXT INDEX doc_body_fts FOR (d:Doc) ON EACH [d.body]")
+        .await?;
+    tx.commit().await?;
+
+    // `high` repeats the term, `low` mentions it once -> BM25(high) > BM25(low).
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Doc {name: 'high', body: 'graph graph graph databases'})")
+        .await?;
+    tx.execute("CREATE (:Doc {name: 'low', body: 'graph theory and unrelated filler text'})")
+        .await?;
+    tx.execute("CREATE (:Doc {name: 'none', body: 'completely unrelated content here'})")
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+    db.indexes().rebuild("Doc", false).await?;
+
+    let ranked: Vec<(String, f64)> = db
+        .session()
+        .query(
+            "CALL uni.fts.query('Doc', 'body', 'graph', 10) \
+             YIELD node, score \
+             RETURN node.name AS name, score \
+             ORDER BY score DESC",
+        )
+        .await?
+        .rows()
+        .iter()
+        .map(|r| {
+            (
+                r.get::<String>("name").expect("name column"),
+                r.get::<f64>("score").expect("score column"),
+            )
+        })
+        .collect();
+
+    assert!(
+        ranked.len() >= 2,
+        "expected both matching docs, got {ranked:?}"
+    );
+    assert_eq!(
+        ranked[0].0, "high",
+        "ORDER BY score DESC must rank the most relevant document first, got {ranked:?}"
+    );
+    assert!(
+        ranked[0].1 > ranked[1].1,
+        "score must increase with relevance: {ranked:?}"
+    );
+    for (name, score) in &ranked {
+        assert!(
+            (0.0..1.0).contains(score),
+            "normalized BM25 score for {name} outside [0,1): {score}"
+        );
+    }
+
+    // `threshold` filters on the same scale as the yielded score, so a bound
+    // between the two scores keeps exactly the stronger match.
+    let cutoff = (ranked[0].1 + ranked[1].1) / 2.0;
+    let names: Vec<String> = db
+        .session()
+        .query(&format!(
+            "CALL uni.fts.query('Doc', 'body', 'graph', 10, null, {cutoff}) \
+             YIELD node, score RETURN node.name AS name"
+        ))
+        .await?
+        .rows()
+        .iter()
+        .map(|r| r.get::<String>("name").expect("name column"))
+        .collect();
+
+    assert_eq!(
+        names,
+        vec!["high".to_string()],
+        "threshold must keep scores >= the cutoff on the yielded scale, got {names:?}"
+    );
+
+    Ok(())
+}

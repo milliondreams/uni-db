@@ -55,6 +55,27 @@ Optimization strategies for queries, indexes, and storage.
 
 </div>
 
+<div class="feature-card">
+
+### [Sparse Vectors](sparse-vectors.md)
+Learned-sparse (SPLADE) retrieval: schema, indexing, and `uni.sparse.query`.
+
+</div>
+
+<div class="feature-card">
+
+### [BGE-M3 Hybrid Retrieval](bge-m3-hybrid-retrieval.md)
+Dense + lexical + learned-sparse fusion end to end with BGE-M3.
+
+</div>
+
+<div class="feature-card">
+
+### [AI Skill](ai-skill.md)
+Using the packaged `uni-db` skill to drive coding agents against this API.
+
+</div>
+
 ## Common Tasks
 
 ### Query Your Graph

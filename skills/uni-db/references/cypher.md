@@ -8,6 +8,7 @@ Condensed syntax reference for the OpenCypher dialect supported by Uni DB.
 
 ### MATCH
 
+<!-- doctest: skip -->
 ```cypher
 MATCH (n:Label {prop: value})-[r:TYPE]->(m:Label)
 WHERE <predicate>
@@ -69,6 +70,7 @@ RETURN a.name, paper_count
 
 ### WITH RECURSIVE
 
+<!-- doctest: skip -->
 ```cypher
 WITH RECURSIVE reachable(vid, depth) AS (
     MATCH (n:Person {name: 'Alice'}) RETURN id(n) AS vid, 0 AS depth
@@ -83,20 +85,21 @@ RETURN DISTINCT vid, min(depth) AS min_depth
 ### RETURN
 
 ```cypher
-RETURN n.name, n.age                    -- Columns
-RETURN n.name AS person_name            -- Aliases
-RETURN DISTINCT n.city                  -- Deduplicate
-RETURN n ORDER BY n.age DESC            -- Ordering
-RETURN n SKIP 20 LIMIT 10              -- Pagination
-RETURN count(*) AS total                -- Aggregation
+RETURN n.name, n.age                    // Columns
+RETURN n.name AS person_name            // Aliases
+RETURN DISTINCT n.city                  // Deduplicate
+RETURN n ORDER BY n.age DESC            // Ordering
+RETURN n SKIP 20 LIMIT 10              // Pagination
+RETURN count(*) AS total                // Aggregation
 ```
 
 ### WHERE
 
+<!-- doctest: skip -->
 ```cypher
 WHERE n.age > 25 AND n.active = true
-WHERE n.name STARTS WITH 'A'           -- also: CONTAINS, ENDS WITH
-WHERE n.name =~ '.*lice.*'             -- Regex (Rust regex engine)
+WHERE n.name STARTS WITH 'A'           // also: CONTAINS, ENDS WITH
+WHERE n.name =~ '.*lice.*'             // Regex (Rust regex engine)
 WHERE n.name IN ['Alice', 'Bob']
 WHERE n.email IS NOT NULL
 WHERE EXISTS { MATCH (n)-[:KNOWS]->() }
@@ -114,19 +117,19 @@ MATCH (n:Person {name: name}) RETURN n
 ### DELETE / DETACH DELETE
 
 ```cypher
-MATCH (n:Person {name: 'Alice'}) DELETE n              -- Must have no edges
-MATCH (n:Person {name: 'Alice'}) DETACH DELETE n       -- Removes all edges first
+MATCH (n:Person {name: 'Alice'}) DELETE n              // Must have no edges
+MATCH (n:Person {name: 'Alice'}) DETACH DELETE n       // Removes all edges first
 ```
 
 ### SET / REMOVE
 
 ```cypher
-SET n.age = 31, n.updated = datetime()   -- Set properties
-SET n = {name: 'Alice', age: 30}          -- Replace ALL properties
-SET n += {city: 'NY', verified: true}     -- Merge properties (upsert keys)
-SET n:Employee                             -- Add label
-REMOVE n.temporary_field                   -- Remove property (sets to null)
-REMOVE n:Employee                          -- Remove label
+SET n.age = 31, n.updated = datetime()   // Set properties
+SET n = {name: 'Alice', age: 30}          // Replace ALL properties
+SET n += {city: 'NY', verified: true}     // Merge properties (upsert keys)
+SET n:Employee                             // Add label
+REMOVE n.temporary_field                   // Remove property (sets to null)
+REMOVE n:Employee                          // Remove label
 ```
 
 ### CALL ... YIELD
@@ -141,11 +144,11 @@ RETURN node.title, score
 
 ```cypher
 MATCH (n:Person) RETURN n.name AS name
-UNION                                   -- Removes duplicates
+UNION                                   // Removes duplicates
 MATCH (n:Company) RETURN n.name AS name
 
 MATCH (n:Person) RETURN n.name
-UNION ALL                               -- Keeps duplicates
+UNION ALL                               // Keeps duplicates
 MATCH (n:Company) RETURN n.name
 ```
 
@@ -155,21 +158,23 @@ MATCH (n:Company) RETURN n.name
 
 ### Node Patterns
 
+<!-- doctest: skip -->
 ```cypher
-(n)                    -- Any node, bound to variable n
-(n:Person)             -- Node with label
-(n:Person:Employee)    -- Multiple labels
-(n {name: 'Alice'})    -- Property filter
-()                     -- Anonymous node
+(n)                    // Any node, bound to variable n
+(n:Person)             // Node with label
+(n:Person:Employee)    // Multiple labels
+(n {name: 'Alice'})    // Property filter
+()                     // Anonymous node
 ```
 
 ### Edge Patterns
 
+<!-- doctest: skip -->
 ```cypher
--[r]->                 -- Outgoing
-<-[r]-                 -- Incoming
--[r]-                  -- Undirected
--[r:KNOWS]->           -- Typed
+-[r]->                 // Outgoing
+<-[r]-                 // Incoming
+-[r]-                  // Undirected
+-[r:KNOWS]->           // Typed
 -[r:KNOWS|FRIEND_OF]-> -- Multiple types (OR)
 -[r:KNOWS {since: 2020}]-> -- With properties
 ```
@@ -188,16 +193,16 @@ MATCH (n:Company) RETURN n.name
 ### Path Patterns
 
 ```cypher
--- Named path
-p = (a)-[:KNOWS*]->(b)
+// Named path
+MATCH p = (a)-[:KNOWS*]->(b)
 RETURN nodes(p), relationships(p), length(p)
 
--- Shortest path
+// Shortest path
 MATCH p = shortestPath((a:Person)-[:KNOWS*]-(b:Person))
 WHERE a.name = 'Alice' AND b.name = 'Bob'
 RETURN p
 
--- All shortest paths
+// All shortest paths
 MATCH p = allShortestPaths((a:Person)-[:KNOWS*]-(b:Person))
 RETURN p
 ```
@@ -205,11 +210,11 @@ RETURN p
 ### Comprehensions & Projections
 
 ```cypher
--- Pattern comprehension
+// Pattern comprehension
 RETURN [(a)-[:KNOWS]->(b) WHERE b.age > 25 | b.name] AS friends_over_25
--- List comprehension
+// List comprehension
 RETURN [x IN range(1, 10) WHERE x % 2 = 0 | x * x] AS even_squares
--- Map projection
+// Map projection
 RETURN n{.name, .age, city: n.address.city} AS person_data
 ```
 
@@ -228,11 +233,12 @@ RETURN n{.name, .age, city: n.address.city} AS person_data
 
 ### CASE Expression
 
+<!-- doctest: skip -->
 ```cypher
--- Simple form
+// Simple form
 CASE n.status WHEN 'active' THEN 'Active' WHEN 'inactive' THEN 'Inactive' ELSE 'Unknown' END
 
--- Searched form
+// Searched form
 CASE WHEN n.age < 18 THEN 'Minor' WHEN n.age < 65 THEN 'Adult' ELSE 'Senior' END
 ```
 
@@ -242,6 +248,7 @@ CASE WHEN n.age < 18 THEN 'Minor' WHEN n.age < 65 THEN 'Adult' ELSE 'Senior' END
 
 ### REDUCE
 
+<!-- doctest: skip -->
 ```cypher
 REDUCE(total = 0, x IN n.scores | total + x) AS sum
 ```
@@ -347,10 +354,11 @@ Non-aggregated columns in RETURN become implicit GROUP BY keys.
 
 ### Temporal Validity
 
+<!-- doctest: skip -->
 ```cypher
-WHERE uni.temporal.validAt(e, 'valid_from', 'valid_to', datetime($time))  -- half-open interval
-WHERE e VALID_AT datetime('2024-06-15T12:00:00Z')                          -- macro shorthand
-WHERE c VALID_AT(datetime($t), 'start_date', 'end_date')                   -- custom props
+WHERE uni.temporal.validAt(e, 'valid_from', 'valid_to', datetime($time))  // half-open interval
+WHERE e VALID_AT datetime('2024-06-15T12:00:00Z')                          // macro shorthand
+WHERE c VALID_AT(datetime($t), 'start_date', 'end_date')                   // custom props
 ```
 
 ### BTIC Temporal Intervals
@@ -370,11 +378,11 @@ BTIC encodes half-open time intervals `[lo, hi)` as a single 24-byte property wi
 **Comparison operators:** `<`, `>`, `<=`, `>=`, `=`, `<>` work on BTIC values (lexicographic on `lo`, `hi`, `meta`).
 
 ```cypher
--- Store and query fuzzy historical dates
+// Store and query fuzzy historical dates
 CREATE (e:Event {name: 'WW2', period: btic('1939/1945')})
 MATCH (e:Event) WHERE btic_overlaps(e.period, btic('1940')) RETURN e.name
-MATCH (e:Event) WHERE e.period < btic('1950') RETURN e.name             -- comparison operators
-MATCH (e:Event) RETURN btic_span_agg(e.period) AS total                 -- aggregation
+MATCH (e:Event) WHERE e.period < btic('1950') RETURN e.name             // comparison operators
+MATCH (e:Event) RETURN btic_span_agg(e.period) AS total                 // aggregation
 ```
 
 **When to use BTIC vs `uni.temporal.validAt`:** Use `validAt` for exact date ranges stored as two columns (`start_date`/`end_date`). Use BTIC for single-column fuzzy intervals with granularity metadata (historical dates, uncertain periods).
@@ -439,8 +447,8 @@ RETURN n.name, n.salary, n.department,
 ### Labels
 
 ```cypher
-CREATE LABEL Person { name: STRING, age: INTEGER, email: STRING UNIQUE }
-ALTER LABEL Person ADD PROPERTY phone: STRING
+CREATE LABEL Person ( name STRING, age INTEGER, email STRING UNIQUE )
+ALTER LABEL Person ADD PROPERTY phone STRING
 ALTER LABEL Person DROP PROPERTY age
 ALTER LABEL Person RENAME PROPERTY name TO full_name
 DROP LABEL IF EXISTS Person
@@ -449,18 +457,18 @@ DROP LABEL IF EXISTS Person
 ### Edge Types
 
 ```cypher
-CREATE EDGE TYPE KNOWS FROM [Person] TO [Person] { weight: FLOAT }
-ALTER EDGE TYPE KNOWS ADD PROPERTY since: DATE
+CREATE EDGE TYPE KNOWS (weight FLOAT) FROM Person TO Person
+ALTER EDGE TYPE KNOWS ADD PROPERTY since DATE
 DROP EDGE TYPE IF EXISTS KNOWS
 ```
 
 ### Indexes
 
 ```cypher
-CREATE INDEX idx_name ON Person (name)
-CREATE VECTOR INDEX idx_embed ON Document (embedding) WITH { metric: 'cosine' }
-CREATE FULLTEXT INDEX idx_content ON Article (content)
-CREATE JSON_FULLTEXT INDEX idx_meta ON Data (metadata)
+CREATE INDEX idx_name FOR (p:Person) ON (p.name)
+CREATE VECTOR INDEX idx_embed FOR (d:Document) ON (d.embedding) OPTIONS { metric: 'cosine' }
+CREATE FULLTEXT INDEX idx_content FOR (a:Article) ON EACH [a.content]
+CREATE JSON FULLTEXT INDEX idx_meta FOR (d:Data) ON metadata
 DROP INDEX idx_name
 ```
 
@@ -470,7 +478,7 @@ DROP INDEX idx_name
 CREATE CONSTRAINT uniq_email ON (p:Person) ASSERT p.email IS UNIQUE
 CREATE CONSTRAINT pk_sku ON (p:Product) ASSERT p.sku IS KEY
 CREATE CONSTRAINT has_since ON ()-[r:KNOWS]->() ASSERT EXISTS(r.since)
-CREATE CONSTRAINT score_chk ON (p:Person) ASSERT p.score >= 0    -- CHECK
+CREATE CONSTRAINT score_chk ON (p:Person) ASSERT p.score >= 0    // CHECK
 DROP CONSTRAINT constraint_name
 ```
 
@@ -502,6 +510,7 @@ CALL uni.schema.constraints() YIELD name, type, enabled, properties, target
 
 ### Vector Search
 
+<!-- doctest: skip -->
 ```cypher
 CALL uni.vector.query(label, property, query_vector, k [, filter] [, threshold])
 YIELD node, score, distance, vector_score, vid
@@ -511,6 +520,7 @@ YIELD node, score, distance, vector_score, vid
 
 ### Full-Text Search
 
+<!-- doctest: skip -->
 ```cypher
 CALL uni.fts.query(label, property, search_term, k [, threshold])
 YIELD node, score, fts_score, vid
@@ -520,6 +530,7 @@ BM25-based. Scores normalized to 0-1 relative to top match.
 
 ### Hybrid Search
 
+<!-- doctest: skip -->
 ```cypher
 CALL uni.search(label, properties, query_text [, query_vector] [, k] [, filter] [, options])
 YIELD node, score, vector_score, fts_score, vid
@@ -549,11 +560,11 @@ CALL uni.admin.compactionStatus() YIELD l1_runs, l1_size_bytes, in_progress, pen
 Query historical data without restoring a snapshot.
 
 ```cypher
--- By snapshot ID
+// By snapshot ID
 MATCH (n:Person) VERSION AS OF 'snapshot-abc123'
 RETURN n.name, n.age
 
--- By timestamp
+// By timestamp
 MATCH (n:Person) TIMESTAMP AS OF '2025-01-15T12:00:00Z'
 RETURN n.name, n.age
 ```
@@ -582,7 +593,7 @@ Output: scan operations, filter/join/aggregation steps, index usage, estimated r
 Executes the query and returns per-operator runtime statistics.
 
 ```cypher
-PROFILE MATCH (n:Person)-[:KNOWS]->(m:Person) RETURN n, m
+EXPLAIN MATCH (n:Person)-[:KNOWS]->(m:Person) RETURN n, m
 ```
 
 Output: `total_time_ms`, `rows_scanned`, `peak_memory_bytes`, per-operator `time_ms` and `rows_produced`.

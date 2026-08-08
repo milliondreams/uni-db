@@ -19,11 +19,12 @@ Part of [The Rustic Initiative](https://www.rustic.ai) by [Dragonscale Industrie
 
 ## Installation
 
-Add `uni` to your `Cargo.toml`:
+Add `uni-db` to your `Cargo.toml`. The crate is published as `uni-db`; the
+library is imported as `uni_db`.
 
 ```toml
 [dependencies]
-uni = "0.1.0"
+uni-db = "3"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -45,7 +46,7 @@ async fn main() -> Result<(), uni_db::UniError> {
     db.schema()
         .label("Person")
             .property("name", uni_db::DataType::String)
-            .property("age", uni_db::DataType::Integer)
+            .property("age", uni_db::DataType::Int64)
             .vector("embedding", 384) // Vector index
         .apply()
         .await?;
@@ -58,36 +59,45 @@ async fn main() -> Result<(), uni_db::UniError> {
 
 You can insert data using Cypher queries or the builder API.
 
-```rust
-// Using Cypher
-db.query("CREATE (p:Person {name: 'Alice', age: 30})").await?;
+Writes go through a transaction on a session; `Session::query` is read-only.
 
-// Using Builder (faster for bulk)
-use uni_db::PropertiesBuilder;
-// ... (Bulk API usage if available or via loops)
+```rust
+let session = db.session();
+let tx = session.tx().await?;
+tx.execute("CREATE (p:Person {name: 'Alice', age: 30})").await?;
+tx.commit().await?;
 ```
 
 ### 3. Query Data
 
 ```rust
-let results = db.query("MATCH (p:Person) WHERE p.age > 25 RETURN p.name, p.age").await?;
+let results = db
+    .session()
+    .query("MATCH (p:Person) WHERE p.age > 25 RETURN p.name, p.age")
+    .await?;
 
-for row in results {
+for row in results.rows() {
     let name: String = row.get("p.name")?;
     let age: i64 = row.get("p.age")?;
-    println!("Found: {} ({})", name, age);
+    println!("Found: {name} ({age})");
 }
 ```
 
 ### 4. Vector Search
 
+Vector search is a procedure call in Cypher — `uni.vector.query(label,
+property, query, k)`. `k` is required, and the yielded `score` increases with
+similarity.
+
 ```rust
-// Find similar nodes
-let query_vec = vec![0.1, 0.2, ...]; // 384 dims
-let results = db.query_builder()
-    .knn("Person", "embedding", query_vec)
-    .k(5)
-    .execute()
+let results = db
+    .session()
+    .query(
+        "CALL uni.vector.query('Person', 'embedding', $q, 5) \
+         YIELD node, score \
+         RETURN node.name AS name, score ORDER BY score DESC",
+    )
+    .bind("q", query_vec)
     .await?;
 ```
 
@@ -100,11 +110,17 @@ Uni supports local filesystem and object storage (S3, GCS, Azure).
 Keep WAL and ID allocation on fast local disk (SSD), while storing bulk data and catalog metadata in S3.
 
 ```rust
+use uni_db::CloudStorageConfig;
+
 let db = Uni::open("./local_meta")
-    .hybrid("./local_meta", "s3://my-bucket/graph-data")
+    .remote_storage("s3://my-bucket/graph-data", CloudStorageConfig::default())
     .build()
     .await?;
 ```
+
+!!! note
+    `hybrid(...)` and `cloud_config(...)` exist only on the **Python**
+    builder. The Rust builder's equivalent is `remote_storage`.
 
 ## Performance
 

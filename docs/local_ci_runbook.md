@@ -265,9 +265,17 @@ sys.exit('feature build did not take effect; missing: %r' % missing) if missing 
 ### Release Guards
 ```bash
 python3 scripts/ci/check_wheel_variant_features.py
+python3 scripts/ci/check_version_consistency.py   # pyproject == workspace; no hardcoded __version__
+python3 scripts/ci/check_documented_counts.py     # docs match `assert_eq!(kinds.len(), 22)`
+python3 scripts/gen_python_api_reference.py --check  # generated symbol page is current
+python3 scripts/ci/check_doc_symbols.py           # documented Python methods exist in __init__.pyi
 python3 scripts/ci/check_publish_list.py
 cargo check -p uni-python-onnx          # slim default-features=false wheel compile guard
 ```
+
+If `gen_python_api_reference.py --check` fails, regenerate rather than hand-editing:
+`python3 scripts/gen_python_api_reference.py`. The page is generated from
+`bindings/uni-db/uni_db/__init__.pyi` and must never be edited directly.
 
 ### CUDA wheel-graph smoke
 ```bash
@@ -287,6 +295,12 @@ cargo metadata --format-version=1 --manifest-path bindings/uni-db-cuda/Cargo.tom
 ## 5. Local-only gotchas
 
 - **`RUSTC_WRAPPER=""`** — see §0. Unset any global wrapper for cargo/maturin.
+- **Wheel size: use `--profile dist`, not `--release`.** `maturin build --release` produces a
+  wheel ~1.4x the published size (measured: 115.8 MiB vs 83.6 MiB; `lib_uni_db.so` 317.3 vs
+  223.5 MiB). `release` uses `codegen-units = 16` for build speed; `dist` uses `1`, which lets
+  LLVM dead-strip across crate boundaries — and ~94% of `.text` here is dependencies.
+  `release-wheels.yml` passes `--profile dist` in every build job, so a `--release` wheel is not
+  comparable to a published one. Profiles live in `.cargo/config.toml`, not `Cargo.toml`.
 - **loom timeout** — always pass `LOOM_MAX_PREEMPTIONS=2`; without it the exhaustive model runs past
   the nextest `terminate-after` and reports a false TIMEOUT.
 - **A version bump does not reach the editable install.** `bindings/uni-db` declares

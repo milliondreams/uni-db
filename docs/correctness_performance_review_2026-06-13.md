@@ -1,5 +1,12 @@
 # Correctness & Performance Review — 2026-06-13
 
+> **Status: RESOLVED — historical snapshot as of 2026-06-13.**
+> The Critical tier (C1–C5) and 14 of 16 High findings are fixed; C1's
+> fail-closed Lance scan is in `crates/uni-store/src/backend/lance.rs`, which
+> carries a comment naming this review. Deliberately deferred items are tracked
+> with per-finding resolutions in `docs/correctness-deferred.md`. Line-number
+> citations refer to the 2026-06-13 tree. Retained for rationale.
+
 Workspace-wide review by 10 parallel specialist agents covering ~330K LoC across 27 crates.
 Each finding was verified against source; agent-reported false alarms are listed at the end of each
 section and excluded from the ranking. Two "critical" leads were disproven by **running the

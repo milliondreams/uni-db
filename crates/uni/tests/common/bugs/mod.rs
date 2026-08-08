@@ -98,4 +98,6 @@ pub mod repro_edge_type_info_count;
 // had drifted, so bulk and tx disagreed on the same row.
 pub mod repro_tx_check_int_float;
 // Tier 1.5: the compile-time monotonicity oracle never consulted the registry.
+pub mod repro_issue_157_command_forms;
+pub mod repro_issue_157_registry_rule_leak;
 pub mod repro_registry_monotonicity_oracle;

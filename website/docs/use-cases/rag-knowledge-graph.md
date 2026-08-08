@@ -98,7 +98,7 @@ let db = Uni::open("./rag_data")
 With Uni-Xervo auto-embedding, you don't need to pre-compute embeddings externally. Configure an embedding alias in your vector index and Uni generates embeddings automatically on insert:
 
 ```cypher
--- Create index with auto-embedding
+// Create index with auto-embedding
 CREATE VECTOR INDEX chunk_embed FOR (c:Chunk) ON (c.embedding)
 OPTIONS {
     metric: 'cosine',
@@ -109,7 +109,7 @@ OPTIONS {
     }
 }
 
--- Insert text — embedding generated automatically
+// Insert text — embedding generated automatically
 CREATE (c:Chunk {id: 'c1', text: 'Function verify() checks signatures.'})
 ```
 

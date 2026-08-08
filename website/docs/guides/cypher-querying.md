@@ -143,6 +143,7 @@ The `WHERE` clause filters matched patterns.
 
 ### Comparison Operators
 
+<!-- doctest: skip -->
 ```cypher
 // Equality
 WHERE p.year = 2023
@@ -160,6 +161,7 @@ WHERE p.year <= 2025
 
 ### Boolean Logic
 
+<!-- doctest: skip -->
 ```cypher
 // AND
 WHERE p.year > 2020 AND p.venue = 'NeurIPS'
@@ -176,6 +178,7 @@ WHERE (p.year > 2020 AND p.venue = 'NeurIPS') OR p.citations > 1000
 
 ### NULL Handling
 
+<!-- doctest: skip -->
 ```cypher
 // Check for NULL
 WHERE p.doi IS NULL
@@ -187,6 +190,7 @@ RETURN COALESCE(p.nickname, p.name) AS display_name
 
 ### String Operations
 
+<!-- doctest: skip -->
 ```cypher
 // Starts with
 WHERE p.title STARTS WITH 'Attention'
@@ -222,6 +226,7 @@ WHERE p.email =~ '^[\\w.-]+@[\\w.-]+\\.\\w+$'
 
 ### List Operations
 
+<!-- doctest: skip -->
 ```cypher
 // IN list
 WHERE p.venue IN ['NeurIPS', 'ICML', 'ICLR']
@@ -232,6 +237,7 @@ WHERE p.venue NOT IN ['Workshop', 'Demo']
 
 ### Property Existence
 
+<!-- doctest: skip -->
 ```cypher
 // Check if property exists
 WHERE p.abstract IS NOT NULL
@@ -248,6 +254,7 @@ The `RETURN` clause specifies output columns.
 
 ### Basic Projections
 
+<!-- doctest: skip -->
 ```cypher
 // Single property
 RETURN p.title
@@ -467,10 +474,10 @@ Every vertex and edge automatically carries creation and modification timestamps
 | `updated_at(n)` / `updated_at(r)` | Most-recent write-touch timestamp. Bumps on any CREATE/SET/MERGE that targets the row, including same-value writes. | `RETURN n ORDER BY updated_at(n) DESC` |
 
 ```cypher
--- Find recently created people
+// Find recently created people
 MATCH (n:Person) WHERE created_at(n) > datetime("2026-05-01") RETURN n
 
--- Edges work the same way
+// Edges work the same way
 MATCH (a)-[r:KNOWS]->(b) RETURN r, created_at(r), updated_at(r)
 ```
 
@@ -496,16 +503,16 @@ The bulk loader can supply explicit per-row values; otherwise the engine assigns
 `similar_to` is an expression function — it works in `WHERE`, `RETURN`, `WITH`, `ORDER BY`, and Locy rule bodies. Unlike `CALL uni.search(...)`, it scores one already-bound node (point computation), not a top-K scan.
 
 ```cypher
--- Single vector source with auto-embedding
+// Single vector source with auto-embedding
 MATCH (d:Document) WHERE similar_to(d.embedding, 'search query') > 0.6
 RETURN d.title, similar_to(d.embedding, 'search query') AS score
 
--- Multi-source hybrid (vector + FTS)
+// Multi-source hybrid (vector + FTS)
 MATCH (d:Document)
 RETURN d.title, similar_to([d.embedding, d.content], 'query') AS relevance
 ORDER BY relevance DESC
 
--- Weighted fusion
+// Weighted fusion
 MATCH (d:Document)
 RETURN d.title, similar_to([d.embedding, d.content], 'query',
   {method: 'weighted', weights: [0.7, 0.3]}) AS score
@@ -549,6 +556,7 @@ RETURN p.title
 
 ### Sorting
 
+<!-- doctest: skip -->
 ```cypher
 // Ascending (default)
 ORDER BY p.year
@@ -566,6 +574,7 @@ ORDER BY cites DESC
 
 ### Pagination
 
+<!-- doctest: skip -->
 ```cypher
 // First 10 results
 LIMIT 10
@@ -723,7 +732,7 @@ RETURN *
 
 ```cypher
 // Scalar index
-CREATE INDEX ON :Paper(year)
+CREATE INDEX paper_year_idx FOR (p:Paper) ON (p.year)
 
 // Named index
 CREATE INDEX paper_year FOR (p:Paper) ON (p.year)
@@ -1170,13 +1179,13 @@ WITH RECURSIVE enables Common Table Expressions (CTEs) for complex recursive que
 ```cypher
 // Find all transitive citations (papers cited by papers cited by...)
 WITH RECURSIVE citation_chain AS (
-    -- Base case: direct citations
+    // Base case: direct citations
     MATCH (start:Paper {title: 'Original Paper'})-[:CITES]->(cited:Paper)
     RETURN cited, 1 AS depth
 
     UNION
 
-    -- Recursive case: citations of citations
+    // Recursive case: citations of citations
     MATCH (prev)-[:CITES]->(cited:Paper)
     WHERE prev IN citation_chain AND depth < 5
     RETURN cited, depth + 1
@@ -1547,11 +1556,11 @@ Property types can be parameterized, including nested forms:
 ```cypher
 CREATE LABEL Document (
   title    STRING,
-  embedding VECTOR(384),            -- fixed-dimension dense vector
-  tags     LIST<STRING>,            -- typed list
-  tokens   LIST<VECTOR(96)>,        -- multi-vector (ColBERT / late-interaction)
-  scores   MAP<STRING, FLOAT>,      -- typed map (string keys)
-  sections MAP<STRING, LIST<INT>>   -- nested: map of lists
+  embedding VECTOR(384),            // fixed-dimension dense vector
+  tags     LIST<STRING>,            // typed list
+  tokens   LIST<VECTOR(96)>,        // multi-vector (ColBERT / late-interaction)
+  scores   MAP<STRING, FLOAT>,      // typed map (string keys)
+  sections MAP<STRING, LIST<INT>>   // nested: map of lists
 )
 ```
 
@@ -1561,28 +1570,28 @@ CREATE LABEL Document (
 
 ```cypher
 // Create edge type with source/destination constraints
-CREATE EDGE TYPE AUTHORED FROM Author TO Paper (
+CREATE EDGE TYPE AUTHORED (
   position INT32,
   corresponding BOOLEAN DEFAULT false
-)
+) FROM Author TO Paper
 
 // Edge type between multiple label types
-CREATE EDGE TYPE COLLABORATES FROM Author TO Author (
+CREATE EDGE TYPE COLLABORATES (
   papers_count INT32
-)
+) FROM Author TO Author
 ```
 
 ### Alter Schema
 
 ```cypher
 // Add a property to an existing label
-ALTER LABEL Paper ADD abstract STRING
+ALTER LABEL Paper ADD PROPERTY abstract STRING
 
 // Drop a property
-ALTER LABEL Paper DROP deprecated_field
+ALTER LABEL Paper DROP PROPERTY deprecated_field
 
 // Rename a property
-ALTER LABEL Paper RENAME old_name TO new_name
+ALTER LABEL Paper RENAME PROPERTY old_name TO new_name
 ```
 
 ### Drop Schema Elements
@@ -1606,15 +1615,15 @@ Define and manage data integrity constraints.
 ```cypher
 // Unique constraint
 CREATE CONSTRAINT paper_doi_unique
-FOR (p:Paper) REQUIRE p.doi IS UNIQUE
+ON (p:Paper) ASSERT p.doi IS UNIQUE
 
 // Existence constraint (property must be present)
 CREATE CONSTRAINT author_name_exists
-FOR (a:Author) REQUIRE a.name IS NOT NULL
+ON (a:Author) ASSERT EXISTS(a.name)
 
 // Check constraint (custom validation)
 CREATE CONSTRAINT paper_year_valid
-FOR (p:Paper) REQUIRE p.year >= 1900
+ON (p:Paper) ASSERT p.year >= 1900
 ```
 
 CHECK enforcement covers a single `property <op> literal` comparison, where `<op>` is one of `=`, `!=`/`<>`, `>`, `<`, `>=`, `<=` and the literal is a single whitespace-free token. An expression that does not reduce to those three tokens — one joined with `AND`/`OR`, for instance — is still accepted and listed by `SHOW CONSTRAINTS`, but it logs a warning and permits the write rather than rejecting it, so do not rely on it to enforce a compound rule. Split it into one constraint per comparison instead. Do not point the right-hand side at a second property either: `REQUIRE p.year >= p.min_year` reduces to three tokens but compares against the *string* `p.min_year`, and the operands cannot be ordered, so the write fails with a comparison error rather than either passing or reporting a constraint violation. Numeric comparisons, including `=` and `!=`, coerce across `Int` and `Float`, so `REQUIRE p.score = 5` holds for a stored `5.0`. A missing property passes; use `IS NOT NULL` to require presence.
@@ -1626,7 +1635,7 @@ CHECK enforcement covers a single `property <op> literal` comparison, where `<op
 SHOW CONSTRAINTS
 
 // Filter by label
-SHOW CONSTRAINTS FOR :Paper
+SHOW CONSTRAINTS ON (Paper)
 ```
 
 ### Drop Constraints
@@ -1819,48 +1828,34 @@ RETURN p.view_count, p.tags
 
 ### Updating CRDT Properties
 
-CRDT updates use special syntax to ensure conflict-free merging:
+!!! warning "No `crdt.*` Cypher functions exist"
+    Earlier revisions of this page documented a `crdt.increment()` /
+    `crdt.orset_add()` / `crdt.map_put()` family plus an 18-function table.
+    **None of those functions is registered anywhere in the codebase** and none
+    ever was. They are removed here rather than reworded.
 
-```cypher
-// Increment a GCounter
-MATCH (p:Paper {id: 'paper_001'})
-SET p.view_count = crdt.increment(p.view_count, 1)
+CRDTs are a **plugin surface**, not a set of query-language functions. A provider
+implements `CrdtKindProvider` and registers a named kind on the registrar; merge
+semantics then apply automatically when concurrent writes to that property are
+reconciled.
 
-// Add to an ORSet
-MATCH (p:Paper {id: 'paper_001'})
-SET p.tags = crdt.orset_add(p.tags, 'machine-learning')
+The built-in kinds (`crates/uni-plugin-builtin/src/crdts.rs`) are:
 
-// Remove from an ORSet
-MATCH (p:Paper {id: 'paper_001'})
-SET p.tags = crdt.orset_remove(p.tags, 'deprecated-tag')
+| Kind id | Semantics |
+|---|---|
+| `lww-register` | Last-writer-wins single value |
+| `or-set` | Observed-remove set (add wins over concurrent remove) |
+| `g-counter` | Grow-only counter |
+| `mv-register` | Multi-value register (keeps concurrent siblings) |
+| `rga` | Replicated growable array (ordered sequence) |
 
-// Update LWWMap
-MATCH (p:Paper {id: 'paper_001'})
-SET p.metadata = crdt.map_put(p.metadata, 'reviewed', true)
+```rust
+// Registration is the extension point; there is no Cypher-level CRDT call.
+r.crdt_kind(CrdtKind::new("g-counter"), Arc::new(GCounterProvider))?;
 ```
 
-### CRDT Functions
-
-| Function | CRDT Types | Description |
-|----------|------------|-------------|
-| `crdt.gcounter()` | GCounter | Create new counter |
-| `crdt.increment(counter, n)` | GCounter | Increment by n |
-| `crdt.value(counter)` | GCounter | Get current value |
-| `crdt.gset()` | GSet | Create new grow-only set |
-| `crdt.gset_add(set, elem)` | GSet | Add element |
-| `crdt.orset()` | ORSet | Create new add-wins set |
-| `crdt.orset_add(set, elem)` | ORSet | Add element |
-| `crdt.orset_remove(set, elem)` | ORSet | Remove element |
-| `crdt.contains(set, elem)` | GSet, ORSet | Check membership |
-| `crdt.elements(set)` | GSet, ORSet | Get all elements |
-| `crdt.lww()` | LWWRegister | Create new register |
-| `crdt.lww_set(register, value)` | LWWRegister | Set value |
-| `crdt.lww_get(register)` | LWWRegister | Get current value |
-| `crdt.lww_map()` | LWWMap | Create new map |
-| `crdt.map_put(map, key, value)` | LWWMap | Put key-value |
-| `crdt.map_get(map, key)` | LWWMap | Get value by key |
-| `crdt.rga()` | Rga | Create new sequence |
-| `crdt.rga_to_list(rga)` | Rga | Convert to list |
+Declare a CRDT-typed property through the schema (`DataType::Crdt(..)`) and write
+it with ordinary `SET`; the registered provider merges concurrent updates.
 
 ### Distributed Sync
 

@@ -20,7 +20,7 @@ Uni supports full-text search over string properties and JSON documents, plus JS
     let session = db.session();
 
     let tx = session.tx().await?;
-    tx.execute("CREATE FULLTEXT INDEX doc_fts FOR (d:Doc) ON (d.title, d.body)")
+    tx.execute("CREATE FULLTEXT INDEX doc_fts FOR (d:Doc) ON EACH [d.title, d.body]")
         .await?;
     tx.commit().await?;
 
@@ -41,7 +41,7 @@ Uni supports full-text search over string properties and JSON documents, plus JS
     session = db.session()
 
     tx = session.tx()
-    tx.execute("CREATE FULLTEXT INDEX doc_fts FOR (d:Doc) ON (d.title, d.body)")
+    tx.execute("CREATE FULLTEXT INDEX doc_fts FOR (d:Doc) ON EACH [d.title, d.body]")
     tx.commit()
 
     rows = session.query(
@@ -55,10 +55,10 @@ Uni supports full-text search over string properties and JSON documents, plus JS
 For BM25-scored search with normalized relevance scores:
 
 ```cypher
--- Create a fulltext index
-CREATE FULLTEXT INDEX article_content FOR (a:Article) ON (a.content)
+// Create a fulltext index
+CREATE FULLTEXT INDEX article_content FOR (a:Article) ON EACH [a.content]
 
--- Query with relevance scoring
+// Query with relevance scoring
 CALL uni.fts.query('Article', 'content', 'database optimization', 20)
 YIELD node, score
 RETURN node.title, score
@@ -86,8 +86,8 @@ ORDER BY score DESC
 When you run `CREATE FULLTEXT INDEX`, Uni automatically builds the FTS index over existing data. There is no need to call `rebuild_indexes()` manually — the index is ready to query immediately after creation.
 
 ```cypher
--- This both creates AND builds the index in one step
-CREATE FULLTEXT INDEX article_content FOR (a:Article) ON (a.content)
+// This both creates AND builds the index in one step
+CREATE FULLTEXT INDEX article_content FOR (a:Article) ON EACH [a.content]
 ```
 
 ### Immediate Write Visibility (L0 Buffer)
@@ -95,10 +95,10 @@ CREATE FULLTEXT INDEX article_content FOR (a:Article) ON (a.content)
 FTS queries see unflushed writes from the in-memory L0 buffer. This means data is searchable immediately after a write, without waiting for a flush to persistent storage. The query engine merges L0 buffer results with on-disk index results transparently.
 
 ```cypher
--- Write and search in the same session — no flush needed
+// Write and search in the same session — no flush needed
 CREATE (a:Article {title: 'New Article', content: 'graph database optimization'})
 
--- This will find the article even before flush
+// This will find the article even before flush
 CALL uni.fts.query('Article', 'content', 'optimization', 10)
 YIELD node, score
 RETURN node.title, score

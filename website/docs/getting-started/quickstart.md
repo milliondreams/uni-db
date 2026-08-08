@@ -128,8 +128,8 @@ QUERY non_compliant WHERE s.name = s.name RETURN s.name AS service
 out = session.locy(program)
 
 for cmd in out.command_results:
-    if cmd.get("type") == "query":
-        for row in cmd["rows"]:
+    if cmd.command_type == "query":
+        for row in cmd.rows:
             print(row["service"])
 ```
 
@@ -221,7 +221,8 @@ The `ASSUME` block creates a hypothetical world where `api.cve_score = 3.0`, eva
 
     out = session.locy(program)
     for cmd in out.command_results:
-        print(cmd.get("type"), cmd.get("rows", []))
+        rows = cmd.rows if cmd.command_type == "query" else []
+        print(cmd.command_type, rows)
     ```
 
 ---
@@ -239,8 +240,8 @@ EXPLAIN RULE non_compliant WHERE s.name = 'db'
 
 out = session.locy(program)
 
-explain_cmd = next(cmd for cmd in out.command_results if cmd.get("type") == "explain")
-tree = explain_cmd["tree"]
+explain_cmd = next(c for c in out.command_results if c.command_type == "explain")
+tree = explain_cmd.tree
 ```
 
 The engine returns a derivation tree showing the complete chain of reasoning:
@@ -295,8 +296,8 @@ This isn't a log or a confidence score — it's a formal proof trace. Every step
     '''
 
     out = session.locy(program)
-    explain_cmd = next(cmd for cmd in out.command_results if cmd.get("type") == "explain")
-    print(json.dumps(explain_cmd["tree"], indent=2))
+    explain_cmd = next(c for c in out.command_results if c.command_type == "explain")
+    print(json.dumps(explain_cmd.tree, indent=2))
     ```
 
 ---
@@ -314,8 +315,8 @@ ABDUCE NOT non_compliant WHERE s.name = 'db' RETURN s
 
 out = session.locy(program)
 
-abduce_cmd = next(cmd for cmd in out.command_results if cmd.get("type") == "abduce")
-modifications = abduce_cmd.get("modifications", [])
+abduce_cmd = next(c for c in out.command_results if c.command_type == "abduce")
+modifications = abduce_cmd.modifications
 ```
 
 The engine searches backward from the goal (`NOT non_compliant`) and returns the minimal set of graph modifications that would achieve it — for example, lowering `db.cve_score` below 7.0 or removing the exposure path. This turns "what went wrong" into "what should we change."
@@ -363,8 +364,8 @@ The engine searches backward from the goal (`NOT non_compliant`) and returns the
     '''
 
     out = session.locy(program)
-    abduce_cmd = next(cmd for cmd in out.command_results if cmd.get("type") == "abduce")
-    for mod in abduce_cmd.get("modifications", []):
+    abduce_cmd = next(c for c in out.command_results if c.command_type == "abduce")
+    for mod in abduce_cmd.modifications:
         print(mod)
     ```
 

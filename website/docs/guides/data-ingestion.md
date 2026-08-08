@@ -206,7 +206,7 @@ use uni_db::api::bulk::EdgeData;
 async fn main() -> Result<()> {
     let db = Uni::open("./my-graph").build().await?;
     let session = db.session();
-    let tx = session.tx();
+    let tx = session.tx().await?;
 
     // Create a bulk writer with deferred indexing
     let mut bulk = tx.bulk_writer()

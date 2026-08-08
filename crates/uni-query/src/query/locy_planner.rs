@@ -437,7 +437,7 @@ fn infer_expr_type(expr: &Expr, node_vars: &HashSet<String>) -> DataType {
     }
 }
 
-use super::df_graph::locy_fixpoint::{DerivedScanEntry, DerivedScanRegistry};
+use super::df_graph::locy_fixpoint::{DerivedScanEntry, DerivedScanRegistry, DerivedScanView};
 use super::planner::{LogicalPlan, QueryPlanner};
 use super::planner_locy_types::{
     FOLD_DISCRIMINATOR_COL_PREFIX, ISNOT_VID_COL_PREFIX, LocyClausePlan, LocyCommand, LocyIsRef,
@@ -459,6 +459,8 @@ struct DerivedScanHandle {
     rule_name: String,
     scan_index: usize,
     is_self_ref: bool,
+    /// Which view of the target rule's relation this scan reads (issue #162).
+    view: DerivedScanView,
     data: Arc<RwLock<Vec<RecordBatch>>>,
     schema: SchemaRef,
 }
@@ -1245,12 +1247,34 @@ impl<'a> LocyPlanBuilder<'a> {
                 // declare the TARGET rule's discriminators — which in a
                 // mutually-recursive stratum need not match this rule's.
                 let target_deriv = derivation_discriminator_columns(target_rule, ctx.is_recursive);
+                // Issue #162: a positive same-stratum reference to a rule that
+                // carries FOLD reads the folded view, so this clause folds one
+                // value per child rather than one per child *derivation*.
+                //
+                // ALONG opts the whole clause out. `prev.x` is rewritten to a
+                // bare column reference over this same scan
+                // (`rewrite_prev_refs`), so there is no way to give the fold a
+                // folded value and `prev` a per-path one through one handle —
+                // and a path accumulator that read a KEY's aggregate would stop
+                // being a path accumulator. An ALONG clause therefore keeps
+                // contributions; a sibling clause of the same rule that folds
+                // an inherited value still gets the folded view, which is why
+                // the two views are keyed separately.
+                let target_has_fold = target_rule.clauses.iter().any(|c| !c.fold.is_empty());
+                let view =
+                    if is_self_ref && !is_ref.negated && target_has_fold && clause.along.is_empty()
+                    {
+                        DerivedScanView::Folded
+                    } else {
+                        DerivedScanView::Contributions
+                    };
                 let handle = self.get_or_create_derived_scan_handle_with_deriv(
                     &target_rule_name,
                     target_rule,
                     is_self_ref,
                     rule_catalog,
                     &target_deriv,
+                    view,
                 );
 
                 // Look up target rule's PROB column (if any)
@@ -1819,9 +1843,12 @@ impl<'a> LocyPlanBuilder<'a> {
 
     /// Get or create a derived scan handle for a rule.
     ///
-    /// Handles are keyed by `(rule_name, is_self_ref)` — a self-referential
+    /// Handles are keyed by `(rule_name, is_self_ref, view)` — a self-referential
     /// scan (receives delta data) and a cross-stratum scan (receives full facts)
-    /// for the same rule need separate handles.
+    /// for the same rule need separate handles, as do the two
+    /// [`DerivedScanView`]s. This convenience wrapper asks for the
+    /// contributions view; callers that may need the folded one go through
+    /// `get_or_create_derived_scan_handle_with_deriv` directly.
     fn get_or_create_derived_scan_handle(
         &self,
         rule_name: &str,
@@ -1835,6 +1862,7 @@ impl<'a> LocyPlanBuilder<'a> {
             is_self_ref,
             rule_catalog,
             &[],
+            DerivedScanView::Contributions,
         )
     }
 
@@ -1854,13 +1882,16 @@ impl<'a> LocyPlanBuilder<'a> {
         is_self_ref: bool,
         rule_catalog: &HashMap<String, CompiledRule>,
         deriv_columns: &[(String, DataType)],
+        view: DerivedScanView,
     ) -> DerivedScanHandle {
         let mut handles = self.derived_scan_handles.borrow_mut();
 
-        // Reuse existing handle with same (rule_name, is_self_ref)
+        // Reuse existing handle with same (rule_name, is_self_ref, view). The
+        // view is part of the key because both views of one rule can be live
+        // at once — see `DerivedScanView`.
         if let Some(handle) = handles
             .iter()
-            .find(|h| h.rule_name == rule_name && h.is_self_ref == is_self_ref)
+            .find(|h| h.rule_name == rule_name && h.is_self_ref == is_self_ref && h.view == view)
         {
             return handle.clone();
         }
@@ -1882,6 +1913,7 @@ impl<'a> LocyPlanBuilder<'a> {
             rule_name: rule_name.to_string(),
             scan_index,
             is_self_ref,
+            view,
             data,
             schema,
         };
@@ -1898,6 +1930,7 @@ impl<'a> LocyPlanBuilder<'a> {
                 scan_index: handle.scan_index,
                 rule_name: handle.rule_name.clone(),
                 is_self_ref: handle.is_self_ref,
+                view: handle.view,
                 data: handle.data.clone(),
                 schema: handle.schema.clone(),
             });

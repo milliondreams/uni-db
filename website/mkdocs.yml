@@ -192,6 +192,7 @@ nav:
       - Overview: reference/index.md
       - Rust API: reference/rust-api.md
       - Python API: reference/python-api.md
+      - Python API — Symbols (generated): reference/python-api-symbols.md
       - Pydantic OGM: reference/pydantic-ogm.md
       - Configuration: reference/configuration.md
       - Troubleshooting: reference/troubleshooting.md

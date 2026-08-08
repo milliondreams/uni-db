@@ -188,10 +188,19 @@ several rows per KEY group -- which is what ALONG and BEST BY rely on. Declaring
 no KEY columns removes the grouping, not the deduplication; usually an
 anti-pattern in recursive rules.
 
-A FOLD aggregates the **bag of derivations**, not the set of distinct row
-values: N sibling derivations with equal values contribute N times (issue #159).
+A FOLD aggregates the **bag of rows its clause emits**, not the set of distinct
+row values: N derivations with equal values contribute N times (issue #159).
 Deduplication still suppresses re-derivations of the same fact by the same
 bindings, which is what makes the fixpoint terminate.
+
+Inside a recursive stratum, what a **self-reference** contributes is the
+target's *folded value per KEY*, not the rows behind it (issue #162). A rollup
+therefore composes one level at a time: a parent folds its children's values,
+and each child has already folded its own. A clause carrying `ALONG` is the
+exception — it reads the pre-fold rows, because `prev.x` accumulates along a
+single path. The distinction is invisible for an associative fold over a bare
+inherited column (`MPROD(b)`, `MSUM(cost)`) and visible for `MCOUNT`, which
+counts a node's children rather than its leaves.
 
 ### PROB Annotation
 
@@ -566,7 +575,7 @@ result = session.locy_with("QUERY r WHERE x = $val") \
     .run()
 
 # Compilation-only introspection
-explain = session.explain_locy("CREATE RULE r AS ...")
+explain = session.locy_with("CREATE RULE r AS ...").explain()
 # explain.plan_text, explain.strata_count, explain.has_recursive_strata
 
 # Transaction-level
@@ -858,6 +867,7 @@ RETURN modifications
 | `prev.field` in base case | `PrevInBaseCase` | Use literal values in base case ALONG |
 | Cyclic negation (A IS NOT B, B IS NOT A) | `CyclicNegation` | Ensure negation flows in one direction |
 | BEST BY + `M*` lattice fold (MSUM/MMAX/MMIN/MCOUNT/MNOR/MPROD) | `BestByWithMonotonicFold` | Use BEST BY with ALONG, or FOLD without BEST BY |
+| Recursive rollup disagrees with its own children | Pre-#162 releases: a node with ≥2 equal-valued children lost all but one, optimistically, and the error propagated to every ancestor | Upgrade. Invariant to check: an assembly's value must equal the fold of its children's values |
 | Ignoring `SharedProbabilisticDependency` warning | Silently wrong probabilities | Enable `exact_probability` or review rule logic |
 | ALONG without BEST BY in recursive rules | All path variants retained (exponential) | Add BEST BY to prune dominated paths |
 | Command WHERE using DataFusion-only functions | Silent eval failure or limited behavior | Move complex filters into rule MATCH/WHERE |

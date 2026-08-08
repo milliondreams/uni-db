@@ -34,58 +34,45 @@ Every entity in Uni has two primary identifiers:
 
 ## Vertex ID (VID)
 
-The Vertex ID is a 64-bit packed integer optimized for O(1) array indexing.
+The Vertex ID is a **dense, sequential 64-bit auto-increment** integer assigned
+at vertex creation.
+
+!!! warning "VIDs do not encode the label"
+    Earlier revisions of this page described a packed layout of a 16-bit
+    `label_id` plus a 48-bit `local_offset`, with `label_id()` /
+    `local_offset()` accessors and a two-argument `Vid::new(label, offset)`.
+    That design was **removed**. `crates/uni-common/src/core/id.rs` states it
+    directly: VIDs "no longer embed label information (label lookups go via the
+    `VidLabelsIndex`)". `Vid::new` takes a single `u64`, and there are no
+    `label_id()` / `local_offset()` accessors.
 
 ### Encoding
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────┐
 │                              VID (64 bits)                                  │
-├──────────────────┬─────────────────────────────────────────────────────────┤
-│   label_id (16)  │                  local_offset (48)                       │
-├──────────────────┴─────────────────────────────────────────────────────────┤
-│                                                                            │
-│   Example: 0x0001_0000_0000_002A                                           │
-│            ────── ──────────────                                           │
-│            label    offset                                                 │
-│            (Paper)  (42)                                                   │
-│                                                                            │
-└────────────────────────────────────────────────────────────────────────────┘
+├───┬────────────────────────────────────────────────────────────────────────┤
+│ E │                    auto-increment id (63 bits)                          │
+└───┴────────────────────────────────────────────────────────────────────────┘
+  │
+  └── EPHEMERAL_BIT (1 << 63): set for transient in-query identities minted
+      by the engine; clear for persisted vertices.
 ```
 
-| Component | Bits | Range | Purpose |
-|-----------|------|-------|---------|
-| `label_id` | 16 | 0 - 65,535 | Identifies vertex type (label) |
-| `local_offset` | 48 | 0 - 281 trillion | Per-label sequential offset |
+Resolving a VID to its label goes through the `VidLabelsIndex`, not through bit
+manipulation. For O(1) array indexing during query execution, remap a VID to a
+`DenseIdx` via `VidRemapper`.
 
-### Usage in Code
+### Usage
 
 ```rust
 use uni_db::core::Vid;
 
-// Create a VID
-let vid = Vid::new(1, 42);  // label_id=1 (Paper), offset=42
-
-// Access components
-assert_eq!(vid.label_id(), 1);
-assert_eq!(vid.local_offset(), 42);
-assert_eq!(vid.as_u64(), 0x0001_0000_0000_002A);
-
-// Parse from u64
-let vid = Vid::from(0x0001_0000_0000_002A_u64);
+let vid = Vid::new(42);       // a single u64 id
+assert_eq!(vid.as_u64(), 42);
 ```
 
-### Why This Design?
-
-1. **O(1) Array Indexing**: The offset directly indexes into per-label property arrays
-2. **Label Partitioning**: Queries on a single label only scan that label's data
-3. **Dense Storage**: Offsets are sequential, enabling compact columnar storage
-4. **Type Safety**: Label ID embedded in VID prevents cross-label confusion
-
-### Capacity
-
-| Component | Maximum | Practical Limit |
-|-----------|---------|-----------------|
+-----------|---------|-----------------|
 | Labels | 65,535 | Typically 10-100 |
 | Vertices per label | 281 trillion | Limited by storage |
 | Total vertices | 18 quintillion | Theoretical max |
@@ -94,34 +81,17 @@ let vid = Vid::from(0x0001_0000_0000_002A_u64);
 
 ## Edge ID (EID)
 
-Edge IDs follow the same packed 64-bit structure as VIDs.
-
-### Encoding
-
-```
-┌────────────────────────────────────────────────────────────────────────────┐
-│                              EID (64 bits)                                  │
-├──────────────────┬─────────────────────────────────────────────────────────┤
-│   type_id (16)   │                  local_offset (48)                       │
-├──────────────────┴─────────────────────────────────────────────────────────┤
-│                                                                            │
-│   Example: 0x0002_0000_0000_0015                                           │
-│            ────── ──────────────                                           │
-│            type     offset                                                 │
-│            (CITES)  (21)                                                   │
-│                                                                            │
-└────────────────────────────────────────────────────────────────────────────┘
-```
+Edge IDs follow the same shape as VIDs: a dense 64-bit auto-increment id. They
+do **not** pack a `type_id` — the edge type is resolved from the edge's own
+storage, not from bits of the id.
 
 ### Usage
 
 ```rust
 use uni_db::core::Eid;
 
-let eid = Eid::new(2, 21);  // type_id=2 (CITES), offset=21
-
-assert_eq!(eid.type_id(), 2);
-assert_eq!(eid.local_offset(), 21);
+let eid = Eid::new(21);
+assert_eq!(eid.as_u64(), 21);
 ```
 
 ---

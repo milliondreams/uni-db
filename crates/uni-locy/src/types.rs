@@ -226,8 +226,11 @@ pub enum WarningCode {
     MsumNonNegativity,
     ProbabilityDomainViolation,
     /// Phase B F1: a clause has a recursive IS-ref and a FOLD aggregate
-    /// but no ALONG clause. Almost always a semantic mistake — FOLD groups
-    /// by KEY columns, not by path. (Stress Corpus B3.)
+    /// but no ALONG clause. Not an error — a recursive FOLD rolls up per KEY,
+    /// composing one level at a time (a self-reference reads the folded value,
+    /// issue #162). The warning flags the choice because authors who wanted a
+    /// value accumulated along each *path* want ALONG instead.
+    /// (Stress Corpus B3.)
     FoldInRecursivePath,
     /// Phase C C4: `VALIDATE METRICS ece` was requested; the equal-width
     /// binning ECE is biased in the small-sample regime (Kumar et al.

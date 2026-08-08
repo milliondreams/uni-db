@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use crate::api::Uni;
 use uni_common::{Result, UniError};
-use uni_xervo::runtime::ModelRuntime;
+use uni_xervo::api::ModelAliasSpec;
+pub use uni_xervo::runtime::ModelRuntime;
 pub use uni_xervo::traits::{
     AudioOutput, ContentBlock, GeneratedImage, GenerationOptions, GenerationResult, ImageInput,
     Message, MessageRole, RerankerModel, ScoredDoc, TokenUsage,
@@ -195,4 +196,104 @@ impl Uni {
             runtime: self.inner.xervo_runtime.clone(),
         }
     }
+}
+
+/// Builds a Xervo runtime with every compiled-in provider registered.
+///
+/// This is the single definition of which providers Uni registers. Both
+/// [`UniBuilder::build`](crate::api::UniBuilder::build) and any standalone
+/// caller route through it, so the enabled-provider set cannot drift between
+/// a runtime that a database built for itself and one built to be shared.
+///
+/// The resulting runtime owns its catalog and providers, so the returned
+/// `Arc` is self-contained: hand the same one to several
+/// [`UniBuilder::xervo_runtime`](crate::api::UniBuilder::xervo_runtime) calls
+/// and the databases share one set of loaded models rather than each
+/// deserializing its own copy of the weights.
+///
+/// # Examples
+///
+/// ```no_run
+/// # async fn example() -> uni_common::Result<()> {
+/// let catalog = uni_db::xervo_catalog_from_str(r#"[{
+///     "alias": "embed/default", "task": "embed",
+///     "provider_id": "local/onnx", "model_id": "AllMiniLML6V2"
+/// }]"#).unwrap();
+/// let runtime = uni_db::xervo::build_model_runtime(catalog).await?;
+///
+/// let a = uni_db::Uni::open("/tmp/a").xervo_runtime(runtime.clone()).build().await?;
+/// let b = uni_db::Uni::open("/tmp/b").xervo_runtime(runtime).build().await?;
+/// # let _ = (a, b);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// # Errors
+///
+/// Returns [`UniError::Internal`] when the catalog is invalid — a duplicate
+/// alias, or a `provider_id` with no matching provider compiled in. A build
+/// with no `provider-*` features enabled registers nothing, so any non-empty
+/// catalog fails.
+pub async fn build_model_runtime(catalog: Vec<ModelAliasSpec>) -> Result<Arc<ModelRuntime>> {
+    // `mut` is conditional on at least one provider-* feature being
+    // enabled; a slim build with no providers leaves it unused.
+    #[allow(unused_mut)]
+    let mut runtime_builder = ModelRuntime::builder().catalog(catalog);
+    #[cfg(feature = "provider-candle")]
+    {
+        runtime_builder =
+            runtime_builder.register_provider(uni_xervo::provider::LocalCandleProvider::new());
+    }
+    #[cfg(feature = "provider-openai")]
+    {
+        runtime_builder =
+            runtime_builder.register_provider(uni_xervo::provider::RemoteOpenAIProvider::new());
+    }
+    #[cfg(feature = "provider-gemini")]
+    {
+        runtime_builder =
+            runtime_builder.register_provider(uni_xervo::provider::RemoteGeminiProvider::new());
+    }
+    #[cfg(feature = "provider-vertexai")]
+    {
+        runtime_builder =
+            runtime_builder.register_provider(uni_xervo::provider::RemoteVertexAIProvider::new());
+    }
+    #[cfg(feature = "provider-mistral")]
+    {
+        runtime_builder =
+            runtime_builder.register_provider(uni_xervo::provider::RemoteMistralProvider::new());
+    }
+    #[cfg(feature = "provider-anthropic")]
+    {
+        runtime_builder =
+            runtime_builder.register_provider(uni_xervo::provider::RemoteAnthropicProvider::new());
+    }
+    #[cfg(feature = "provider-voyageai")]
+    {
+        runtime_builder =
+            runtime_builder.register_provider(uni_xervo::provider::RemoteVoyageAIProvider::new());
+    }
+    #[cfg(feature = "provider-cohere")]
+    {
+        runtime_builder =
+            runtime_builder.register_provider(uni_xervo::provider::RemoteCohereProvider::new());
+    }
+    #[cfg(feature = "provider-azure-openai")]
+    {
+        runtime_builder = runtime_builder
+            .register_provider(uni_xervo::provider::RemoteAzureOpenAIProvider::new());
+    }
+    #[cfg(feature = "provider-mistralrs")]
+    {
+        runtime_builder =
+            runtime_builder.register_provider(uni_xervo::provider::LocalMistralRsProvider::new());
+    }
+    #[cfg(feature = "provider-onnx")]
+    {
+        runtime_builder =
+            runtime_builder.register_provider(uni_xervo::provider::LocalOnnxProvider::new());
+    }
+
+    runtime_builder.build().await.map_err(into_uni_error)
 }

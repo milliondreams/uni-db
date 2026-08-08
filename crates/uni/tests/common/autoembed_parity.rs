@@ -701,3 +701,154 @@ async fn sparse_autoembed_multi_source() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// ───────────────────── SHARED RUNTIME (issue #155) ─────────────────────
+//
+// One `Arc<ModelRuntime>` handed to several databases must load each model
+// once, not once per database — the property the Python `ModelRuntime` handle
+// exists to expose. These also pin the alias-presence check that guards the
+// prebuilt-runtime path, which used to accept any runtime without inspection.
+
+/// Dense provider that counts `load()` calls rather than embed calls, so a
+/// second deserialization of the same weights is observable.
+struct LoadCountingProvider {
+    loads: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl ModelProvider for LoadCountingProvider {
+    fn provider_id(&self) -> &'static str {
+        "mock/dense"
+    }
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            supported_tasks: vec![ModelTask::Embed],
+        }
+    }
+    async fn load(&self, _spec: &ModelAliasSpec) -> uni_xervo::error::Result<LoadedModelHandle> {
+        self.loads.fetch_add(1, Ordering::SeqCst);
+        let h: Arc<dyn EmbeddingModel> = Arc::new(DenseMock {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        Ok(Arc::new(h) as LoadedModelHandle)
+    }
+    async fn health(&self) -> ProviderHealth {
+        ProviderHealth::Healthy
+    }
+}
+
+/// Two databases sharing one runtime deserialize the model once.
+///
+/// This already holds at the Rust level — it is the property the Python
+/// binding is being built to expose — so it is a characterization test, not a
+/// regression repro. Its job is to fail if `build_model_runtime`'s extraction
+/// ever changes provider registration or the per-runtime model cache.
+#[tokio::test]
+async fn one_runtime_shared_by_two_databases_loads_the_model_once() -> anyhow::Result<()> {
+    let loads = Arc::new(AtomicUsize::new(0));
+    let runtime = ModelRuntime::builder()
+        .register_provider(LoadCountingProvider {
+            loads: loads.clone(),
+        })
+        .catalog(vec![spec(
+            "d/mock",
+            ModelTask::Embed,
+            "mock/dense",
+            "mock-dense",
+        )])
+        .build()
+        .await
+        .unwrap();
+
+    for _ in 0..2 {
+        let db = Uni::in_memory()
+            .xervo_runtime(runtime.clone())
+            .build()
+            .await?;
+        dense_schema(&db, Some(emb_cfg("d/mock", &["content"], None))).await?;
+        let tx = db.session().tx().await?;
+        tx.execute("CREATE (:Doc {title: 't', content: 'a b c'})")
+            .await?;
+        tx.commit().await?;
+        db.flush().await?;
+        assert_eq!(read_dense(&db, "t").await?, vec![3.0; DIM]);
+    }
+
+    assert_eq!(
+        loads.load(Ordering::SeqCst),
+        1,
+        "a shared runtime must deserialize the model once, not once per database"
+    );
+    Ok(())
+}
+
+/// Reopening with a runtime whose catalog lacks a schema-required alias fails
+/// at open.
+///
+/// Before the fix the prebuilt-runtime arm returned the runtime unexamined, so
+/// `build()` returned `Ok` and the mismatch surfaced much later as an
+/// `AliasNotFound` from inside the writer on the first auto-embedded write.
+#[tokio::test]
+async fn prebuilt_runtime_missing_a_required_alias_is_rejected_at_open() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let path = dir.path().to_str().unwrap().to_string();
+    {
+        let db = Uni::open(&path)
+            .xervo_runtime(dense_runtime(Arc::new(AtomicUsize::new(0))).await)
+            .build()
+            .await?;
+        dense_schema(&db, Some(emb_cfg("d/mock", &["content"], None))).await?;
+        db.flush().await?;
+    }
+
+    // Same provider, same task — only the alias differs from the one the
+    // persisted schema binds its vector index to.
+    let wrong = ModelRuntime::builder()
+        .register_provider(DenseProvider {
+            calls: Arc::new(AtomicUsize::new(0)),
+        })
+        .catalog(vec![spec(
+            "d/other",
+            ModelTask::Embed,
+            "mock/dense",
+            "mock-dense",
+        )])
+        .build()
+        .await
+        .unwrap();
+
+    let Err(err) = Uni::open(&path).xervo_runtime(wrong).build().await else {
+        panic!("a runtime lacking the schema's embedding alias must be refused at open");
+    };
+    assert!(
+        err.to_string().contains("Missing Uni-Xervo alias 'd/mock'"),
+        "expected the same message the catalog path produces, got: {err}"
+    );
+    Ok(())
+}
+
+/// The presence check must not reject a runtime that does carry the alias.
+#[tokio::test]
+async fn prebuilt_runtime_carrying_the_required_alias_opens() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let path = dir.path().to_str().unwrap().to_string();
+    {
+        let db = Uni::open(&path)
+            .xervo_runtime(dense_runtime(Arc::new(AtomicUsize::new(0))).await)
+            .build()
+            .await?;
+        dense_schema(&db, Some(emb_cfg("d/mock", &["content"], None))).await?;
+        db.flush().await?;
+    }
+
+    let db = Uni::open(&path)
+        .xervo_runtime(dense_runtime(Arc::new(AtomicUsize::new(0))).await)
+        .build()
+        .await?;
+    assert!(db.xervo().is_available());
+    assert!(
+        db.xervo().raw_runtime().is_some(),
+        "the injected runtime must be handed back out for sharing"
+    );
+    Ok(())
+}

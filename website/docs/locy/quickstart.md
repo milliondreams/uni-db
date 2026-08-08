@@ -59,8 +59,8 @@ print(out.stats)
 
 ## Explain a Derivation
 
-```cypher
-EXPLAIN RULE reachable WHERE a.name = 'A', b.name = 'C'
+```locy
+EXPLAIN RULE reachable WHERE a.name = 'A' AND b.name = 'C'
 ```
 
 Use this when you need proof-style traceability for compliance or debugging.

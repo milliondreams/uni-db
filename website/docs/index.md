@@ -42,8 +42,8 @@ A network-ops team needs to answer three questions about their service dependenc
 
 **Domain Physics — define the rules once:**
 
-```cypher
--- Transitive reachability over service dependencies
+```locy
+// Transitive reachability over service dependencies
 CREATE RULE reachable AS
 MATCH (a:Service)-[:DEPENDS_ON]->(b:Service)
 YIELD KEY a, KEY b
@@ -56,7 +56,7 @@ YIELD KEY a, KEY b
 
 **Mental Simulation — what breaks if auth goes down?**
 
-```cypher
+```locy
 ASSUME {
   MATCH (s:Service {name: 'auth-service'})
   SET s.status = 'DOWN'
@@ -69,14 +69,14 @@ ASSUME {
 
 **Explainability — why is payment-service reachable from auth-service?**
 
-```cypher
+```locy
 EXPLAIN RULE reachable
-WHERE a.name = 'auth-service', b.name = 'payment-service'
+WHERE a.name = 'auth-service' AND b.name = 'payment-service'
 ```
 
 **Abductive Reasoning — what would need to change so auth-service can't reach a service?**
 
-```cypher
+```locy
 ABDUCE NOT reachable
 WHERE a.name = 'auth-service'
 RETURN b

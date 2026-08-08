@@ -92,9 +92,9 @@ All projection-based algorithms share a common first two arguments:
 
 ```cypher
 CALL uni.algo.<name>(
-    ['NodeLabel1', 'NodeLabel2'],   -- nodeLabels: List (required)
-    ['REL_TYPE1', 'REL_TYPE2'],     -- relationshipTypes: List (required)
-    <algorithm-specific args...>     -- optional, with defaults
+    ['NodeLabel1', 'NodeLabel2'],   // nodeLabels: List (required)
+    ['REL_TYPE1', 'REL_TYPE2'],     // relationshipTypes: List (required)
+    <algorithm-specific args...>     // optional, with defaults
 )
 YIELD col1, col2, ...
 RETURN col1, col2
@@ -546,9 +546,9 @@ RETURN source, target AS criticalLink
 ```cypher
 // Topological ordering for safe deployment
 CALL uni.algo.topoSort(['Service'], ['DEPENDS_ON'])
-YIELD nodeId, order
-RETURN nodeId, order
-ORDER BY order ASC
+YIELD nodeId, `order`
+RETURN nodeId, `order`
+ORDER BY `order` ASC
 ```
 
 ---

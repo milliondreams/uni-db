@@ -2,24 +2,24 @@
 
 ## DERIVE
 
-`DERIVE` has two forms with different semantics:
+`DERIVE` has two forms with different semantics.
+
+`DERIVE` writes **edges** — `(a)-[:TYPE]->(b)` or `(a)<-[:TYPE]-(b)` — or merges
+nodes with `DERIVE MERGE`. There is no bare-node form: to mark a node, derive an
+edge to a marker node, or yield the node from the rule and set the label in a
+follow-up Cypher write.
 
 ### DERIVE in a rule body (inline mutation)
 
 Replaces `YIELD` when a rule should write graph mutations rather than produce queryable derived facts:
 
-```cypher
--- Infer a new edge
+```locy
+// Infer a new edge
 CREATE RULE infer_friend AS
 MATCH (a)-[:KNOWS]->(b)
 DERIVE (a)-[:FRIEND]->(b)
 
--- Add a label
-CREATE RULE flag_risky AS
-MATCH (a:Account) WHERE a.fraud_score > 0.8
-DERIVE (a:FlaggedAccount)
-
--- MERGE: combine matching paths into one node
+// MERGE: combine matching paths into one node
 CREATE RULE merge_paths AS
 MATCH (a)-[r]->(b)
 DERIVE MERGE a, b
@@ -31,7 +31,7 @@ These run during Phase 2 command dispatch on converged derived facts.
 
 Iterates over converged facts from a named rule, applies an optional WHERE filter, and executes the mutations:
 
-```cypher
+```locy
 DERIVE risk_propagation WHERE threshold > 0.5
 ```
 
@@ -39,7 +39,7 @@ DERIVE risk_propagation WHERE threshold > 0.5
 
 `ASSUME` executes a hypothetical mutation block and evaluates a body against that temporary state.
 
-```cypher
+```locy
 ASSUME {
   CREATE (:Node {name: 'X'})-[:EDGE]->(:Node {name: 'Y'})
 } THEN {
@@ -53,7 +53,7 @@ Think of this as savepoint-scoped what-if execution.
 
 `ABDUCE` asks: "what minimal changes would make (or prevent) this conclusion hold?"
 
-```cypher
+```locy
 ABDUCE compromised WHERE target.name = 'ServerA' RETURN assumptions
 ABDUCE NOT reachable WHERE a.name = 'Alice' RETURN b
 ```

@@ -6,6 +6,7 @@ Quick reference for Uni DB's vector similarity, full-text, and hybrid search cap
 
 ## 1. Vector Search -- `uni.vector.query`
 
+<!-- doctest: skip -->
 ```cypher
 CALL uni.vector.query(label, property, query_vector, k [, filter] [, threshold] [, options])
 YIELD node, score, distance, vector_score, rerank_score, vid
@@ -68,11 +69,11 @@ Sparse vectors (SPLADE / learned-sparse, BM25-style term weights) are stored as 
 ### Sparse Index DDL
 
 ```cypher
--- Sparse index (8-bit weight quantization by default)
+// Sparse index (8-bit weight quantization by default)
 CREATE VECTOR INDEX idx_sparse FOR (d:Document) ON (d.sparse_embedding)
 OPTIONS { type: 'sparse' }
 
--- Lossless f32 weights (quantize: false)
+// Lossless f32 weights (quantize: false)
 CREATE VECTOR INDEX idx_sparse FOR (d:Document) ON (d.sparse_embedding)
 OPTIONS { type: 'sparse', quantize: false }
 ```
@@ -87,6 +88,7 @@ CALL uni.schema.createIndex('Document', 'sparse_embedding',
 
 ### Query Procedure
 
+<!-- doctest: skip -->
 ```cypher
 CALL uni.sparse.query(label, property, query, k [, filter] [, threshold] [, options])
 YIELD vid, score, rerank_score
@@ -113,7 +115,7 @@ YIELD vid, score, rerank_score
 ### Example
 
 ```cypher
--- query is a {indices, values} map over the term space
+// query is a {indices, values} map over the term space
 CALL uni.sparse.query('Document', 'sparse_embedding',
     {indices: [3, 17, 482], values: [0.7, 0.4, 0.9]}, 10)
 YIELD vid, score
@@ -125,6 +127,7 @@ ORDER BY score DESC
 
 ## 3. `similar_to()` Expression Function
 
+<!-- doctest: skip -->
 ```cypher
 similar_to(source, query [, options]) -> Float
 ```
@@ -156,16 +159,16 @@ Metric is resolved from the vector index at compile time. Defaults to cosine if 
 ### Single-Source Examples
 
 ```cypher
--- Vector-to-vector
+// Vector-to-vector
 MATCH (d:Doc)
 RETURN d.title, similar_to(d.embedding, $query_vector) AS score
 
--- Auto-embed text
+// Auto-embed text
 MATCH (d:Doc)
 WHERE similar_to(d.embedding, 'attention mechanisms') > 0.6
 RETURN d.title
 
--- FTS (BM25)
+// FTS (BM25)
 MATCH (d:Doc)
 RETURN d.title, similar_to(d.content, 'distributed systems') AS score
 ```
@@ -173,12 +176,12 @@ RETURN d.title, similar_to(d.content, 'distributed systems') AS score
 ### Multi-Source Fusion
 
 ```cypher
--- Broadcast: same query applied to vector + FTS sources
+// Broadcast: same query applied to vector + FTS sources
 MATCH (d:Doc)
 RETURN d.title,
   similar_to([d.embedding, d.content], 'machine learning') AS score
 
--- Per-source queries with weighted fusion
+// Per-source queries with weighted fusion
 MATCH (p:Product)
 RETURN p.name, similar_to(
   [p.image_embedding, p.desc_embedding, p.description],
@@ -202,7 +205,7 @@ RETURN p.name, similar_to(
 
 **Correct — single `similar_to` with multi-source arrays:**
 ```cypher
--- RRF fusion (default), proper BM25 normalization
+// RRF fusion (default), proper BM25 normalization
 MATCH (d:Doc)
 RETURN d.title,
   similar_to([d.embedding, d.content], [$qvec, $qtxt]) AS score
@@ -211,7 +214,7 @@ ORDER BY score DESC
 
 **Incorrect — naive addition of two separate calls:**
 ```cypher
--- DON'T: mixes incompatible scales (cosine [0,1] vs unbounded BM25)
+// DON'T: mixes incompatible scales (cosine [0,1] vs unbounded BM25)
 MATCH (d:Doc)
 RETURN d.title,
   (similar_to(d.embedding, $qvec) + similar_to(d.content, $qtxt)) AS score
@@ -239,6 +242,7 @@ The multi-source form normalizes BM25 via `score / (score + fts_k)` before fusio
 
 ## 4. Full-Text Search -- `uni.fts.query`
 
+<!-- doctest: skip -->
 ```cypher
 CALL uni.fts.query(label, property, search_term, k [, filter] [, threshold] [, options])
 YIELD node, score, fts_score, rerank_score, vid
@@ -336,13 +340,13 @@ The sparse arm is **opt-in** and requires **both** halves — either alone is a 
 | `0.3` | Favor keyword matching |
 
 ```cypher
--- RRF (default)
+// RRF (default)
 CALL uni.search('Document', {vector: 'embedding', fts: 'content'},
     'graph databases', null, 10)
 YIELD node, score
 RETURN node.title, score
 
--- Weighted fusion favoring semantics, with pre-filter
+// Weighted fusion favoring semantics, with pre-filter
 CALL uni.search('Document', {vector: 'embedding', fts: 'content'},
     'deep learning', null, 10,
     'category = "technology" AND year >= 2023',
@@ -350,8 +354,8 @@ CALL uni.search('Document', {vector: 'embedding', fts: 'content'},
 YIELD node, score, vector_score, fts_score
 RETURN node.title, score, vector_score, fts_score
 
--- 3-way: dense + FTS + sparse (sparse needs BOTH the `sparse:` key
--- AND options.sparse_query — either alone is a silent no-op)
+// 3-way: dense + FTS + sparse (sparse needs BOTH the `sparse:` key
+// AND options.sparse_query — either alone is a silent no-op)
 CALL uni.search('Document',
     {vector: 'embedding', fts: 'content', sparse: 'sparse_embedding'},
     'graph databases', null, 10, null,
@@ -435,47 +439,47 @@ Score conversion is **metric-aware** and shared across `uni.vector.query`, `uni.
 ### Cypher DDL
 
 ```cypher
--- HNSW-SQ (recommended for 10k–1M; must be requested explicitly)
+// HNSW-SQ (recommended for 10k–1M; must be requested explicitly)
 CREATE VECTOR INDEX idx_embed FOR (d:Document) ON (d.embedding)
 OPTIONS { type: 'hnsw_sq', metric: 'cosine' }
 
--- HNSW-PQ for large datasets needing graph speed + compression
+// HNSW-PQ for large datasets needing graph speed + compression
 CREATE VECTOR INDEX idx_embed FOR (d:Document) ON (d.embedding)
 OPTIONS { type: 'hnsw_pq', metric: 'cosine', m: 16, ef_construction: 200, sub_vectors: 8 }
 
--- IVF-PQ for very large datasets, minimum memory
+// IVF-PQ for very large datasets, minimum memory
 CREATE VECTOR INDEX idx_embed FOR (d:Document) ON (d.embedding)
 OPTIONS { type: 'ivf_pq', metric: 'l2', partitions: 256, sub_vectors: 16 }
 
--- IVF-SQ for large datasets, better recall than PQ
+// IVF-SQ for large datasets, better recall than PQ
 CREATE VECTOR INDEX idx_embed FOR (d:Document) ON (d.embedding)
 OPTIONS { type: 'ivf_sq', metric: 'cosine', partitions: 256 }
 
--- IVF-RQ (RaBitQ quantization — 1 bit per dimension by default)
+// IVF-RQ (RaBitQ quantization — 1 bit per dimension by default)
 CREATE VECTOR INDEX idx_embed FOR (d:Document) ON (d.embedding)
 OPTIONS { type: 'ivf_rq', metric: 'cosine', partitions: 256 }
 
--- IVF-RQ with higher fidelity (4 bits per dimension)
+// IVF-RQ with higher fidelity (4 bits per dimension)
 CREATE VECTOR INDEX idx_embed FOR (d:Document) ON (d.embedding)
 OPTIONS { type: 'ivf_rq', metric: 'cosine', partitions: 256, num_bits: '4' }
 
--- HNSW-Flat (graph search, no quantization — exact results)
+// HNSW-Flat (graph search, no quantization — exact results)
 CREATE VECTOR INDEX idx_embed FOR (d:Document) ON (d.embedding)
 OPTIONS { type: 'hnsw_flat', metric: 'cosine', m: 16, ef_construction: 200 }
 
--- HNSW-SQ with IVF partitions (for very large datasets >1M)
+// HNSW-SQ with IVF partitions (for very large datasets >1M)
 CREATE VECTOR INDEX idx_embed FOR (d:Document) ON (d.embedding)
 OPTIONS { type: 'hnsw_sq', metric: 'cosine', m: 16, ef_construction: 200, partitions: '32' }
 
--- IVF-Flat (no quantization, exact within partitions)
+// IVF-Flat (no quantization, exact within partitions)
 CREATE VECTOR INDEX idx_embed FOR (d:Document) ON (d.embedding)
 OPTIONS { type: 'ivf_flat', metric: 'cosine', partitions: 128 }
 
--- Flat (brute-force, exact)
+// Flat (brute-force, exact)
 CREATE VECTOR INDEX idx_embed FOR (d:Document) ON (d.embedding)
 OPTIONS { type: 'flat', metric: 'cosine' }
 
--- With auto-embedding config (works with any algorithm)
+// With auto-embedding config (works with any algorithm)
 CREATE VECTOR INDEX doc_embed FOR (d:Document) ON (d.embedding)
 OPTIONS {
     metric: 'cosine',
@@ -486,12 +490,12 @@ OPTIONS {
     }
 }
 
--- No type given → IVF-PQ (256 partitions / 16 sub_vectors / 8 bits)
+// No type given → IVF-PQ (256 partitions / 16 sub_vectors / 8 bits)
 CREATE VECTOR INDEX idx_embed FOR (d:Document) ON (d.embedding)
 OPTIONS { metric: 'cosine' }
 
--- Short form also defaults to IVF-PQ
-CREATE VECTOR INDEX idx_embed ON Document (embedding) WITH { metric: 'cosine' }
+// Short form also defaults to IVF-PQ
+CREATE VECTOR INDEX idx_embed FOR (d:Document) ON (d.embedding) OPTIONS { metric: 'cosine' }
 ```
 
 ### Rust API
@@ -542,10 +546,10 @@ db.schema() \
 ### BM25 Fulltext Index
 
 ```cypher
-CREATE FULLTEXT INDEX idx_content FOR (a:Article) ON (a.content)
+CREATE FULLTEXT INDEX idx_content FOR (a:Article) ON EACH [a.content]
 
--- Multi-property
-CREATE FULLTEXT INDEX doc_fts FOR (d:Doc) ON (d.title, d.body)
+// Multi-property
+CREATE FULLTEXT INDEX doc_fts FOR (d:Doc) ON EACH [d.title, d.body]
 ```
 
 Index is built automatically on creation over existing data. No manual `rebuild_indexes()` needed.
@@ -553,7 +557,7 @@ Index is built automatically on creation over existing data. No manual `rebuild_
 ### JSON FTS Index
 
 ```cypher
-CREATE JSON_FULLTEXT INDEX idx_meta ON Data (metadata)
+CREATE JSON FULLTEXT INDEX idx_meta FOR (d:Data) ON metadata
 ```
 
 Enables full-text search on nested JSON/JSONB property values.
@@ -645,7 +649,7 @@ vectors = xervo.embed("embed/default", ["graph databases", "neural search"])
 - `over_fetch: 2.0` is usually sufficient; increase for highly selective pre-filters.
 
 ### Pre-Filtering vs Post-Filtering
-- **Pre-filter** (`filter` param in `uni.vector.query`): Pushed to LanceDB, searches only the filtered subset. Use when filter is selective.
+- **Pre-filter** (`filter` param in `uni.vector.query`): Pushed to Lance, searches only the filtered subset. Use when filter is selective.
 - **Post-filter** (`WHERE` after `YIELD`): Searches all nodes, then filters. Use for complex Cypher expressions not expressible in SQL, or non-selective filters.
 - Pre-filtering is more efficient when it significantly reduces the search space.
 
@@ -665,18 +669,19 @@ vectors = xervo.embed("embed/default", ["graph databases", "neural search"])
 ### RAG Pipeline End-to-End
 
 ```cypher
--- 1. Setup: schema + indexes
+// 1. Setup: schema + indexes
 CREATE VECTOR INDEX doc_embed FOR (d:Document) ON (d.embedding)
 OPTIONS {
     metric: 'cosine',
     embedding: { alias: 'embed/default', source: ['content'], batch_size: 32 }
 }
-CREATE FULLTEXT INDEX doc_fts FOR (d:Document) ON (d.content)
 
--- 2. Ingest (auto-embeds on write)
+CREATE FULLTEXT INDEX doc_fts FOR (d:Document) ON EACH [d.content]
+
+// 2. Ingest (auto-embeds on write)
 CREATE (d:Document {title: 'Graph DBs 101', content: 'Graph databases store...'})
 
--- 3. Retrieve (auto-embeds the query text)
+// 3. Retrieve (auto-embeds the query text)
 CALL uni.vector.query('Document', 'embedding', 'how do graph databases work', 5)
 YIELD node, score
 RETURN node.title, node.content, score
@@ -686,7 +691,7 @@ ORDER BY score DESC
 ### Semantic Search with Graph Context
 
 ```cypher
--- Find similar papers, then expand citations
+// Find similar papers, then expand citations
 CALL uni.vector.query('Paper', 'embedding', $query_vector, 10)
 YIELD node AS seed, score
 
@@ -709,15 +714,16 @@ LIMIT 20
 ### Hybrid Search Setup
 
 ```cypher
--- Prerequisites: both index types
+// Prerequisites: both index types
 CREATE VECTOR INDEX doc_embed FOR (d:Document) ON (d.embedding)
 OPTIONS {
     metric: 'cosine',
     embedding: { alias: 'embed/default', source: ['content'] }
 }
-CREATE FULLTEXT INDEX doc_fts FOR (d:Document) ON (d.content)
 
--- Hybrid query with score transparency
+CREATE FULLTEXT INDEX doc_fts FOR (d:Document) ON EACH [d.content]
+
+// Hybrid query with score transparency
 CALL uni.search('Document', {vector: 'embedding', fts: 'content'},
     'transformer attention mechanisms', null, 10)
 YIELD node, score, vector_score, fts_score
@@ -813,7 +819,7 @@ RETURN node.title, score, vector_score, fts_score
 
 **Controlling over-fetch:**
 ```cypher
--- Reranker sees 30 candidates, returns top 10
+// Reranker sees 30 candidates, returns top 10
 CALL uni.vector.query('Document', 'embedding', 'search query', 10,
     null, null,
     {reranker: 'rerank/minilm', reranker_property: 'content', reranker_k: 30})

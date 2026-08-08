@@ -107,6 +107,15 @@ pub use uni_xervo::api::{
     ModelAliasSpec, ModelTask, WarmupPolicy, catalog_from_file as xervo_catalog_from_file,
     catalog_from_str as xervo_catalog_from_str,
 };
+/// The Xervo model runtime, re-exported so downstream crates can name the type
+/// that [`UniBuilder::xervo_runtime`](api::UniBuilder::xervo_runtime) and
+/// [`UniXervo::raw_runtime`](api::xervo::UniXervo::raw_runtime) traffic in
+/// without taking a direct `uni-xervo` dependency.
+///
+/// Deliberately unconditional: the Python binding names it as
+/// `::uni_db::ModelRuntime` in every wheel variant, including the slim builds
+/// that enable only a subset of the `provider-*` features.
+pub use uni_xervo::runtime::ModelRuntime;
 
 // Re-exports from internal crates
 pub use uni_common::{

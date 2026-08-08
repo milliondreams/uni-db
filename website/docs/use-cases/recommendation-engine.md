@@ -37,6 +37,13 @@ db.schema()
             metric: VectorMetric::Cosine,
         }))
         .done()
+    // `IN_CATEGORY` points at `Category`, so the label must be declared here.
+    // `add_edge_type` does NOT validate that the destination label exists, so
+    // omitting it lets `apply()` succeed and surfaces the failure much later,
+    // at query time.
+    .label("Category")
+        .property("name", DataType::String)
+        .done()
     .edge_type("VIEWED", &["User"], &["Product"])
         .done()
     .edge_type("PURCHASED", &["User"], &["Product"])

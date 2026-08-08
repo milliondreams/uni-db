@@ -15,7 +15,8 @@ use crate::query::df_graph::common::{
 use crate::query::df_graph::locy_best_by::SortCriterion;
 use crate::query::df_graph::locy_explain::ProvenanceStore;
 use crate::query::df_graph::locy_fixpoint::{
-    DerivedScanRegistry, FixpointClausePlan, FixpointExec, FixpointRulePlan, IsRefBinding,
+    DerivedScanRegistry, DerivedScanView, FixpointClausePlan, FixpointExec, FixpointRulePlan,
+    IsRefBinding,
 };
 use crate::query::df_graph::locy_fold::{FoldBinding, resolve_locy_aggregate};
 use crate::query::df_graph::locy_profile::{
@@ -98,26 +99,15 @@ impl DerivedStore {
     /// An exact hit always wins. A bare name falls back to a unique qualified
     /// rule with that suffix; **ambiguity is not guessed at** — if two modules
     /// export the same bare name this returns `None` rather than picking one.
+    /// The bare-vs-qualified policy itself lives in [`uni_locy::names`], shared
+    /// with the registry-stratum pruner so the two cannot drift apart.
     pub fn get_module_aware(&self, rule_name: &str) -> Option<&Vec<RecordBatch>> {
         if let Some(facts) = self.relations.get(rule_name) {
             return Some(facts);
         }
-        if rule_name.contains('.') {
-            return None;
-        }
-        let mut matched: Option<&Vec<RecordBatch>> = None;
-        for (name, facts) in &self.relations {
-            if name
-                .rsplit_once('.')
-                .is_some_and(|(_, bare)| bare == rule_name)
-            {
-                if matched.is_some() {
-                    return None;
-                }
-                matched = Some(facts);
-            }
-        }
-        matched
+        let key =
+            uni_locy::names::resolve_unique(self.relations.keys().map(String::as_str), rule_name)?;
+        self.relations.get(key)
     }
 
     pub fn fact_count(&self, rule_name: &str) -> usize {
@@ -1665,9 +1655,18 @@ fn convert_is_refs(
             // semi-naive evaluation; cross-stratum targets (including every IS NOT
             // against a lower-stratum recursive rule) use the converged-facts handle.
             let want_self_ref = stratum_rule_names.contains(is_ref.rule_name.as_str());
+            // Always the contributions view (issue #162). This index drives the
+            // IS NOT anti-join / probabilistic complement and the provenance
+            // `base_fact_id` hashes, both of which are defined over pre-fold
+            // rows: the folded snapshot has one row per KEY, so anti-joining
+            // against it would under-filter and its row hashes would never
+            // match the ones `record_provenance` stores.
             let entry = entries
                 .iter()
-                .find(|e| e.is_self_ref == want_self_ref)
+                .find(|e| {
+                    e.is_self_ref == want_self_ref && e.view == DerivedScanView::Contributions
+                })
+                .or_else(|| entries.iter().find(|e| e.is_self_ref == want_self_ref))
                 .or_else(|| entries.first())
                 .ok_or_else(|| {
                     datafusion::error::DataFusionError::Plan(format!(

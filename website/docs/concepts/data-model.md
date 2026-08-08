@@ -90,21 +90,20 @@ Strongly-typed properties defined in the schema provide optimal performance:
 Properties not in the schema are automatically stored in `overflow_json` (JSONB binary format):
 
 ```cypher
--- Label with NO properties defined
-CREATE LABEL Document;
+// Minimal schema: one typed property; everything else goes to overflow
+CREATE LABEL Document (title STRING)
 
--- Create with arbitrary properties
+// Create with arbitrary properties
 CREATE (:Document {
     title: 'Article',
     author: 'Alice',
     tags: ['tech', 'ai'],
     year: 2024
-});
-
--- Query works normally (automatic rewriting)
+})
+// Query works normally (automatic rewriting)
 MATCH (d:Document)
 WHERE d.author = 'Alice'
-RETURN d.title, d.year;
+RETURN d.title, d.year
 ```
 
 **Benefits:**
@@ -134,10 +133,10 @@ db.schema()
 let session = db.session();
 let tx = session.tx().await?;
 tx.execute("CREATE (:Person {
-    name: 'Bob',           -- Schema property (typed column)
-    email: 'bob@x.com',    -- Schema property (typed column)
-    city: 'NYC',           -- Overflow property (overflow_json)
-    verified: true         -- Overflow property (overflow_json)
+    name: 'Bob',           // Schema property (typed column)
+    email: 'bob@x.com',    // Schema property (typed column)
+    city: 'NYC',           // Overflow property (overflow_json)
+    verified: true         // Overflow property (overflow_json)
 })").await?;
 tx.commit().await?;
 ```
@@ -162,6 +161,7 @@ Edges connect vertices with typed, directed relationships.
 
 Edges are always directed (source → destination):
 
+<!-- doctest: skip -->
 ```cypher
 // Paper cites another Paper
 (paper1:Paper)-[:CITES]->(paper2:Paper)
@@ -277,9 +277,9 @@ A `List<Vector>` property holds **many vectors per row** (per-token / ColBERT) f
 ```cypher
 CREATE LABEL Document (
   tags     LIST<STRING>,
-  tokens   LIST<VECTOR(96)>,       -- multi-vector (ColBERT)
+  tokens   LIST<VECTOR(96)>,       // multi-vector (ColBERT)
   scores   MAP<STRING, FLOAT>,
-  sections MAP<STRING, LIST<INT>>  -- nested
+  sections MAP<STRING, LIST<INT>>  // nested
 )
 ```
 
@@ -456,6 +456,7 @@ MATCH (p1:Paper)-[:CITES]->(p2:Paper)-[:CITES]->(p3:Paper)
 
 ### Filtering
 
+<!-- doctest: skip -->
 ```cypher
 // Property comparisons
 WHERE p.year > 2020 AND p.year < 2025

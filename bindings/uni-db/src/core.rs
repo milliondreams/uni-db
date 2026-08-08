@@ -490,6 +490,7 @@ pub async fn build_database_core(
     read_only: bool,
     write_lease: Option<::uni_db::api::multi_agent::WriteLease>,
     skip_invalid_locy_rules: bool,
+    xervo_runtime: Option<std::sync::Arc<::uni_db::ModelRuntime>>,
 ) -> Result<Uni, UniError> {
     let mut builder = match mode {
         OpenMode::Open => Uni::open(uri),
@@ -515,7 +516,12 @@ pub async fn build_database_core(
         builder = builder.schema_file(path);
     }
 
-    if let Some(json) = xervo_catalog_json {
+    // The three Xervo sources are mutually exclusive by construction: each
+    // Python setter clears the other two, so at most one is ever `Some` and
+    // this branch never has to arbitrate a precedence the caller can't see.
+    if let Some(runtime) = xervo_runtime {
+        builder = builder.xervo_runtime(runtime);
+    } else if let Some(json) = xervo_catalog_json {
         let catalog = ::uni_db::xervo_catalog_from_str(json)
             .map_err(|e| UniError::Internal(anyhow::anyhow!(e.to_string())))?;
         builder = builder.xervo_catalog(catalog);

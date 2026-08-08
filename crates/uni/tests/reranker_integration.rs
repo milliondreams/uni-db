@@ -671,18 +671,39 @@ async fn test_reranker_with_threshold() -> anyhow::Result<()> {
     let result = db
         .session()
         .query(
-            "CALL uni.vector.query('Doc', 'embedding', [1.0, 0.0], 5, null, 1.0, \
+            "CALL uni.vector.query('Doc', 'embedding', [1.0, 0.0], 5, null, 0.9, \
          {reranker: 'rerank/mock', reranker_property: 'content', reranker_query: 'test'}) \
          YIELD node, rerank_score, distance \
          RETURN node.title AS title, rerank_score, distance",
         )
         .await?;
 
-    // All returned docs should have distance <= 1.0 (threshold applied before reranking)
-    for i in 0..result.len() {
-        let dist = get_f64(&result, i, "distance").unwrap();
-        assert!(dist <= 1.0, "distance {dist} should be <= threshold 1.0");
-    }
+    // `threshold` is a MINIMUM SIMILARITY on the yielded `score` scale and is
+    // applied to the retrieval candidates *before* reranking, so a tight bound
+    // must shrink the candidate set. Note the `distance` column carries the
+    // rerank score once a reranker is configured, so it cannot be asserted on
+    // as a distance here — `test_vector_query_threshold_is_minimum_similarity`
+    // pins the semantics on the un-reranked path instead.
+    let unfiltered = db
+        .session()
+        .query(
+            "CALL uni.vector.query('Doc', 'embedding', [1.0, 0.0], 5, null, null, \
+         {reranker: 'rerank/mock', reranker_property: 'content', reranker_query: 'test'}) \
+         YIELD node RETURN node.title AS title",
+        )
+        .await?;
+
+    assert!(
+        !result.is_empty(),
+        "threshold 0.9 must still admit the exact match"
+    );
+    assert!(
+        result.len() < unfiltered.len(),
+        "threshold 0.9 should filter candidates before reranking: \
+         {} kept of {}",
+        result.len(),
+        unfiltered.len()
+    );
 
     Ok(())
 }
@@ -1383,6 +1404,70 @@ async fn test_real_onnx_qwen3_reranker_reranks_by_relevance() -> anyhow::Result<
         "Top 2 should be both Rust articles, got: {:?}",
         top_2
     );
+
+    Ok(())
+}
+
+/// `threshold` on `uni.vector.query` is a **minimum similarity**, on the same
+/// scale as the yielded `score` — not a maximum distance.
+///
+/// Regression cover for the defect where the dense branch filtered
+/// `distance <= threshold` while the multi-vector branch of the *same*
+/// procedure filtered `similarity >= threshold`. One argument meant opposite
+/// things depending on which branch a query took, so moving a property to a
+/// `List<Vector>` column silently inverted the filter with no error.
+///
+/// The discriminating assertion is *monotonicity*: raising the threshold must
+/// never admit more rows. Under the old max-distance reading the relationship
+/// inverts — a larger bound admits more — so this fails against that behavior.
+/// Asserted without a reranker, since a configured reranker replaces the
+/// `distance` column with the rerank score.
+#[tokio::test]
+async fn test_vector_query_threshold_is_minimum_similarity() -> anyhow::Result<()> {
+    let db = setup_db().await?;
+
+    async fn kept(db: &Uni, threshold: &str) -> anyhow::Result<usize> {
+        Ok(db
+            .session()
+            .query(&format!(
+                "CALL uni.vector.query('Doc', 'embedding', [1.0, 0.0], 10, null, {threshold}) \
+                 YIELD node, score RETURN node.title AS title, score"
+            ))
+            .await?
+            .len())
+    }
+
+    let all = kept(&db, "null").await?;
+    assert!(all >= 2, "need several docs to bound a threshold");
+
+    let permissive = kept(&db, "0.01").await?;
+    let strict = kept(&db, "0.99").await?;
+
+    assert!(
+        strict < permissive,
+        "raising `threshold` must admit FEWER rows (minimum similarity), got \
+         {strict} at 0.99 vs {permissive} at 0.01 — this is the max-distance inversion"
+    );
+    assert!(
+        strict >= 1,
+        "the exact match must survive even a 0.99 similarity floor"
+    );
+
+    // Every surviving row must clear the floor on the yielded score scale.
+    let rows = db
+        .session()
+        .query(
+            "CALL uni.vector.query('Doc', 'embedding', [1.0, 0.0], 10, null, 0.6) \
+             YIELD node, score RETURN node.title AS title, score",
+        )
+        .await?;
+    for i in 0..rows.len() {
+        let score = get_f64(&rows, i, "score").unwrap();
+        assert!(
+            score >= 0.6,
+            "threshold is a minimum on the yielded score: kept {score} < 0.6"
+        );
+    }
 
     Ok(())
 }

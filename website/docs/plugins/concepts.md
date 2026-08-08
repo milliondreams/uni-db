@@ -26,12 +26,11 @@ A **surface** is a single extension point — one trait in `crates/uni-plugin/sr
 | | Procedure (`CALL`) | `ProcedurePlugin` + `ProcedureHost` | 38 APOC + schema/algo/search |
 | | Locy aggregate | `LocyAggregate` + `LocyAggState` | **10** (see below) |
 | | Locy predicate | `LocyPredicate` | — |
-| **Engine** | Operator / plan node | `OperatorProvider` | — |
+| | Locy generator | `LocyGenerator` | — |
 | | Optimizer rule | `OptimizerRuleProvider` | pushdown negotiation |
 | | Index kind | `IndexKindProvider` | vector index |
-| | Storage backend | `StorageBackend` + `Storage` | Lance backend |
+| **Engine** | Label storage | `LabelStorageProvider` | Lance backend |
 | | Algorithm | `AlgorithmProvider` + `AlgorithmHost` | label propagation + 36 via adapter |
-| | Pregel program | `PregelProgramProvider` | — |
 | | CRDT kind | `CrdtKindProvider` + `CrdtState` | 5 (LWW / OR-Set / G-Counter / MV-Register / RGA) |
 | | Logical type | `LogicalTypeProvider` | 5 (uri / geo.point / email / ipv4 / ipv6) |
 | | Collation | `CollationProvider` | 5 (ascii ×2, unicode ×2, natural) |
@@ -39,14 +38,17 @@ A **surface** is a single extension point — one trait in `crates/uni-plugin/sr
 | | Trigger | `TriggerPlugin` | — |
 | | Background job | `BackgroundJobProvider` + `JobHost` | ttl_sweep / compaction / statistics_refresh |
 | | CDC output | `CdcOutputProvider` + `CdcStream` | — |
-| | Connector | `Connector` | — |
 | | Catalog | `CatalogProvider` + `CatalogTable` | — |
+| | Replacement scan | `ReplacementScanProvider` | — |
 | | Auth | `AuthProvider` | — |
 | | Authz | `AuthzPolicy` | — |
 
-The authoritative count is the 23 *extension variants* of the `Capability` enum — registering a surface requires holding its capability. (Neural predicates register through the `LocyPredicate` surface; rerankers are *not* a plugin surface — they are a separate subsystem.)
+The authoritative count is the **22** registrable surfaces asserted in
+`uni_plugin::surfaces` (`assert_eq!(kinds.len(), 22)`). `OperatorProvider`,
+`StorageBackend`, `PregelProgramProvider` and `Connector` were removed in 3.0.
+Registering a surface requires holding its capability — registering a surface requires holding its capability. (Neural predicates register through the `LocyPredicate` surface; rerankers are *not* a plugin surface — they are a separate subsystem.)
 
-**Rust-only vs. loader-portable.** Only the native Rust loader can author all 23 surfaces today. The sandboxed and scripted loaders (WASM Component Model, Extism, Rhai, PyO3) author exactly three: **scalar function, aggregate, and procedure**. The remaining twenty surfaces are deep in-process contracts — `&Expr` trees, async streams, trait objects — that are Rust-only in v1. So "what can a Python plugin do?" has a crisp answer: scalar fns, aggregates, and procedures.
+**Rust-only vs. loader-portable.** Only the native Rust loader can author all 22 surfaces today. The sandboxed and scripted loaders (WASM Component Model, Extism, Rhai, PyO3) author exactly three: **scalar function, aggregate, and procedure**. The remaining nineteen surfaces are deep in-process contracts — `&Expr` trees, async streams, trait objects — that are Rust-only in v1. So "what can a Python plugin do?" has a crisp answer: scalar fns, aggregates, and procedures.
 
 ### Locy aggregates
 

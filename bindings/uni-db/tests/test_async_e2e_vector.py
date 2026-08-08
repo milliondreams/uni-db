@@ -152,30 +152,30 @@ async def test_vector_search_with_k(async_ecommerce_db_populated):
 
 @pytest.mark.asyncio
 async def test_vector_search_with_threshold(async_ecommerce_db_populated):
-    """Test vector search with distance threshold filtering."""
+    """Test vector search with a minimum-similarity threshold."""
 
     session = async_ecommerce_db_populated.session()
 
     # Small threshold: only very close matches
     results_tight = await session.query("""
-        CALL uni.vector.query('Product', 'embedding', [1.0, 0.0, 0.0, 0.0], 10, NULL, 0.5)
-        YIELD vid, distance
-        RETURN vid, distance
+        CALL uni.vector.query('Product', 'embedding', [1.0, 0.0, 0.0, 0.0], 10, NULL, 0.9)
+        YIELD vid, score
+        RETURN vid, score
     """)
 
-    assert all(r["distance"] <= 0.5 for r in results_tight), (
-        "All matches should be within threshold"
+    assert all(r["score"] >= 0.9 for r in results_tight), (
+        "threshold is a minimum similarity; every result must clear it"
     )
 
     # Larger threshold: more results
     results_wide = await session.query("""
-        CALL uni.vector.query('Product', 'embedding', [1.0, 0.0, 0.0, 0.0], 10, NULL, 2.0)
-        YIELD vid, distance
-        RETURN vid, distance
+        CALL uni.vector.query('Product', 'embedding', [1.0, 0.0, 0.0, 0.0], 10, NULL, 0.1)
+        YIELD vid, score
+        RETURN vid, score
     """)
 
     assert len(results_wide) >= len(results_tight), (
-        "Larger threshold should return more results"
+        "a LOWER similarity floor admits more results"
     )
 
 
@@ -360,20 +360,20 @@ async def test_vector_search_k_larger_than_dataset(async_ecommerce_db_populated)
 async def test_vector_search_threshold_excludes_distant_results(
     async_ecommerce_db_populated,
 ):
-    """Test threshold properly excludes results beyond distance limit."""
+    """Test threshold properly excludes results below the similarity floor."""
 
     session = async_ecommerce_db_populated.session()
 
     # Search for Book [0,0,1,0] with very tight threshold
     results = await session.query("""
-        CALL uni.vector.query('Product', 'embedding', [0.0, 0.0, 1.0, 0.0], 10, NULL, 0.1)
-        YIELD node, distance
-        RETURN node.name AS name, distance
+        CALL uni.vector.query('Product', 'embedding', [0.0, 0.0, 1.0, 0.0], 10, NULL, 0.99)
+        YIELD node, score
+        RETURN node.name AS name, score
     """)
 
     assert len(results) >= 1, "Should find at least the exact match"
     for row in results:
-        assert row["distance"] <= 0.1, "All results should be within threshold"
+        assert row["score"] >= 0.99, "threshold is a minimum similarity"
 
 
 @pytest.mark.asyncio

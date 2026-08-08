@@ -82,7 +82,14 @@ async def test_operations_on_committed_bulk_writer_raise_error(async_empty_db):
 
 @pytest.mark.asyncio
 async def test_operations_on_aborted_bulk_writer_raise_error(async_empty_db):
-    """Test that operations on an aborted async bulk writer raise RuntimeError."""
+    """Test that operations on an aborted async bulk writer raise RuntimeError.
+
+    `abort()` must be awaited. It returns an awaitable that clears the writer on
+    a blocking-pool task; discarding it schedules the abort without waiting for
+    it, so the assertions below race the abort they depend on. Under CPU
+    pressure the insert wins often enough to fail roughly 1 run in 20 — see the
+    `await`-vs-fire-and-forget measurement in the commit that added this note.
+    """
 
     await async_empty_db.schema().label("Person").property("name", "string").apply()
 
@@ -90,7 +97,7 @@ async def test_operations_on_aborted_bulk_writer_raise_error(async_empty_db):
     tx = await session.tx()
     writer = await tx.bulk_writer().build()
     await writer.insert_vertices("Person", [{"name": "Alice"}])
-    writer.abort()
+    await writer.abort()
     await tx.rollback()
 
     with pytest.raises(RuntimeError):

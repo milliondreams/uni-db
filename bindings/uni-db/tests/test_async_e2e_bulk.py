@@ -14,7 +14,7 @@ async def test_create_bulk_writer_with_builder(async_social_db):
     writer = await tx.bulk_writer().build()
     assert writer is not None
 
-    writer.abort()
+    await writer.abort()
     await tx.rollback()
 
 
@@ -134,7 +134,7 @@ async def test_bulk_writer_abort(async_social_db):
         "Person", [{"name": "Iris", "age": 27, "email": "iris@example.com"}]
     )
 
-    writer.abort()
+    await writer.abort()
     await tx.rollback()
 
     result = await session.query("MATCH (p:Person {name: 'Iris'}) RETURN p.name")
@@ -147,7 +147,7 @@ async def test_ops_after_abort_raise_error(async_social_db):
     session = async_social_db.session()
     tx = await session.tx()
     writer = await tx.bulk_writer().build()
-    writer.abort()
+    await writer.abort()
     await tx.rollback()
 
     with pytest.raises(

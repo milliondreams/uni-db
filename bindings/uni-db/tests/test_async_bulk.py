@@ -107,7 +107,7 @@ async def test_async_bulk_writer_abort(bulk_db):
         [{"name": "BeforeAbort", "age": 99}],
     )
 
-    writer.abort()
+    await writer.abort()
     await tx.rollback()
 
     with pytest.raises(RuntimeError):

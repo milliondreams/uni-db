@@ -35,8 +35,8 @@ use std::sync::Arc;
 use uni_common::Value;
 use uni_common::core::schema::{DistanceMetric, IndexDefinition, Schema as UniSchema};
 use uni_cypher::ast::{
-    BinaryOp, Clause, CypherLiteral, Expr, MatchClause, Query, ReturnClause, ReturnItem, SortItem,
-    Statement, UnaryOp, UnwindClause, WithClause,
+    BinaryOp, Clause, CypherLiteral, Expr, MapProjectionItem, MatchClause, Query, ReturnClause,
+    ReturnItem, SortItem, Statement, UnaryOp, UnwindClause, WithClause,
 };
 use uni_store::storage::manager::StorageManager;
 
@@ -3317,8 +3317,74 @@ fn free_variables(expr: &Expr) -> Option<HashSet<String>> {
             union(&mut out, left)?;
             union(&mut out, right)?;
         }
-        Expr::UnaryOp { expr, .. } | Expr::IsNull(expr) | Expr::IsNotNull(expr) => {
+        Expr::UnaryOp { expr, .. }
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::IsUnique(expr)
+        | Expr::LabelCheck { expr, .. } => {
             union(&mut out, expr)?;
+        }
+        Expr::ValidAt {
+            entity, timestamp, ..
+        } => {
+            union(&mut out, entity)?;
+            union(&mut out, timestamp)?;
+        }
+        Expr::MapProjection { base, items } => {
+            union(&mut out, base)?;
+            for item in items {
+                match item {
+                    MapProjectionItem::LiteralEntry(_, e) => union(&mut out, e)?,
+                    MapProjectionItem::Variable(v) => {
+                        out.insert(v.clone());
+                    }
+                    // A key name, not a reference.
+                    MapProjectionItem::Property(_) | MapProjectionItem::AllProperties => {}
+                }
+            }
+        }
+        // The binding forms. Each names a variable of its own, so what its body
+        // reads is free only after that name is removed — counting the bound
+        // name as a reference to the outer row is what made these decline
+        // before, which is a false negative rather than an unsafe answer.
+        Expr::Quantifier {
+            variable,
+            list,
+            predicate,
+            ..
+        } => {
+            union(&mut out, list)?;
+            let mut inner = free_variables(predicate)?;
+            inner.remove(variable);
+            out.extend(inner);
+        }
+        Expr::Reduce {
+            accumulator,
+            init,
+            variable,
+            list,
+            expr,
+        } => {
+            union(&mut out, init)?;
+            union(&mut out, list)?;
+            let mut inner = free_variables(expr)?;
+            inner.remove(accumulator);
+            inner.remove(variable);
+            out.extend(inner);
+        }
+        Expr::ListComprehension {
+            variable,
+            list,
+            where_clause,
+            map_expr,
+        } => {
+            union(&mut out, list)?;
+            let mut inner = free_variables(map_expr)?;
+            if let Some(w) = where_clause {
+                inner.extend(free_variables(w)?);
+            }
+            inner.remove(variable);
+            out.extend(inner);
         }
         Expr::Case {
             expr,
@@ -3353,7 +3419,14 @@ fn free_variables(expr: &Expr) -> Option<HashSet<String>> {
                 union(&mut out, e)?;
             }
         }
-        // Binding forms, subqueries and everything else: not modelled.
+        // Still declined, and deliberately.
+        //
+        // `Exists`, `CountSubquery` and `CollectSubquery` hide a whole `Query`,
+        // which needs a clause walker rather than an expression one. A nested
+        // `PatternComprehension` binds pattern variables that may equally be
+        // fresh names or references to the outer row, and nothing here can tell
+        // those apart — so it would have to treat them all as free, which is
+        // the same answer as declining but harder to read.
         _ => return None,
     }
     Some(out)

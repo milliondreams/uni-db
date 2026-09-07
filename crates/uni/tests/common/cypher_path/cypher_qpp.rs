@@ -270,3 +270,66 @@ async fn test_qpp_zero_iterations() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// Reversing an anonymous quantified path does not change its answer (#224).
+///
+/// A QPP written from its unbound end is now reversed to anchor on the bound
+/// one, which flips each inner step's direction. Reversal is sound for a plain
+/// hop because `source_variable` names the traversal start rather than the
+/// arrow's tail; a quantified segment additionally drives an NFA, so this
+/// asserts the answer rather than trusting that argument to carry over.
+///
+/// Metamorphic on purpose: the two spellings must agree, which is a stronger
+/// claim than either being individually plausible.
+#[tokio::test]
+async fn a_reversed_anonymous_qpp_agrees_with_the_forward_spelling() {
+    let db = uni_db::Uni::in_memory().build().await.unwrap();
+    let tx = db.session().tx().await.unwrap();
+    tx.execute("CREATE LABEL Forum (name STRING)")
+        .await
+        .unwrap();
+    tx.execute("CREATE LABEL Post (name STRING)").await.unwrap();
+    tx.execute("CREATE EDGE TYPE CONTAINER_OF FROM Forum TO Post")
+        .await
+        .unwrap();
+    tx.execute("CREATE (:Forum {name:'f'}), (:Post {name:'p'}), (:Post {name:'q'})")
+        .await
+        .unwrap();
+    tx.execute("MATCH (f:Forum {name:'f'}), (p:Post) CREATE (f)-[:CONTAINER_OF]->(p)")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    // Written from the unbound end: `post` is unbound, `forum` is not, so the
+    // path is reversed and the quantified segment reversed with it.
+    let reversed = db
+        .session()
+        .query(
+            "MATCH (f:Forum) WITH DISTINCT f AS forum \
+             MATCH (post)(()<-[:CONTAINER_OF]-()){1,1}(forum) \
+             RETURN post.name AS n ORDER BY n",
+        )
+        .await
+        .unwrap();
+
+    // The same pattern written from the bound end, which needs no rewrite.
+    let forward = db
+        .session()
+        .query(
+            "MATCH (f:Forum) WITH DISTINCT f AS forum \
+             MATCH (forum)(()-[:CONTAINER_OF]->()){1,1}(post) \
+             RETURN post.name AS n ORDER BY n",
+        )
+        .await
+        .unwrap();
+
+    let names = |r: &uni_db::QueryResult| -> Vec<uni_db::Value> {
+        r.rows().iter().map(|x| x.values()[0].clone()).collect()
+    };
+    assert_eq!(
+        names(&reversed),
+        names(&forward),
+        "the reversed spelling disagreed with the forward one"
+    );
+    assert_eq!(names(&forward).len(), 2, "fixture must match both posts");
+}

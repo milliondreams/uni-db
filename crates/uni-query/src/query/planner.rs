@@ -4396,7 +4396,24 @@ impl QueryPlanner {
         // Track variables introduced by this OPTIONAL MATCH
         let vars_before_pattern = vars_in_scope.len();
 
-        for path in &match_clause.pattern.paths {
+        // Plan a path that anchors before one that has to scan, where the
+        // pattern allows it; see `ordered_path_indices`. Declined for OPTIONAL
+        // MATCH, whose null-extension is defined over the pattern as a whole
+        // and is not worth reasoning about alongside a reorder.
+        let reordered = if match_clause.optional {
+            None
+        } else {
+            Self::ordered_path_indices(&match_clause.pattern.paths, vars_in_scope)
+        };
+        let paths: Vec<&PathPattern> = match &reordered {
+            Some(order) => order
+                .iter()
+                .map(|&i| &match_clause.pattern.paths[i])
+                .collect(),
+            None => match_clause.pattern.paths.iter().collect(),
+        };
+
+        for path in paths {
             if let Some(mode) = &path.shortest_path_mode {
                 plan =
                     self.plan_shortest_path(path, plan, vars_in_scope, mode, vars_before_pattern)?;
@@ -4693,12 +4710,11 @@ impl QueryPlanner {
         if path.elements.len() < 3 {
             return None;
         }
-        // Quantified segments carry per-step directions of their own.
-        if path
-            .elements
-            .iter()
-            .any(|e| matches!(e, PatternElement::Parenthesized { .. }))
-        {
+        // A quantified segment reverses with the rest, but only when it names
+        // nothing inside: its inner variables are group variables bound in
+        // traversal order, and reversing would reverse the lists a user reads
+        // back (#224).
+        if !Self::quantified_segments_are_anonymous(&path.elements) {
             return None;
         }
 
@@ -4716,22 +4732,220 @@ impl QueryPlanner {
             return None;
         }
 
-        let mut elements: Vec<PatternElement> = path.elements.iter().rev().cloned().collect();
-        for element in &mut elements {
-            if let PatternElement::Relationship(rel) = element {
-                rel.direction = match rel.direction {
-                    Direction::Outgoing => Direction::Incoming,
-                    Direction::Incoming => Direction::Outgoing,
-                    Direction::Both => Direction::Both,
-                };
-            }
-        }
-
         Some(PathPattern {
             variable: None,
-            elements,
+            elements: Self::reversed_elements(&path.elements),
             shortest_path_mode: None,
         })
+    }
+
+    /// Reverse a run of pattern elements, flipping every relationship.
+    ///
+    /// Sound as a plan rewrite because `source_variable` names the traversal
+    /// *start*, not the arrow's tail: `endpoints_for_direction` resolves
+    /// `(source = a, Incoming)` and `(source = b, Outgoing)` to the same pair,
+    /// so `startNode`/`endNode` and the relationship value are unaffected.
+    ///
+    /// A quantified segment is reversed in place by the same rule. That is only
+    /// sound when it binds no group variables — see
+    /// [`Self::quantified_segments_are_anonymous`].
+    fn reversed_elements(elements: &[PatternElement]) -> Vec<PatternElement> {
+        let flip = |d: &Direction| match d {
+            Direction::Outgoing => Direction::Incoming,
+            Direction::Incoming => Direction::Outgoing,
+            Direction::Both => Direction::Both,
+        };
+        let mut out: Vec<PatternElement> = elements.iter().rev().cloned().collect();
+        for element in &mut out {
+            match element {
+                PatternElement::Relationship(rel) => rel.direction = flip(&rel.direction),
+                PatternElement::Parenthesized { pattern, .. } => {
+                    pattern.elements = Self::reversed_elements(&pattern.elements);
+                }
+                PatternElement::Node(_) => {}
+            }
+        }
+        out
+    }
+
+    /// Whether every quantified segment in `elements` names nothing inside.
+    ///
+    /// A quantified pattern binds its inner nodes and relationships as GQL
+    /// *group variables* — a list with one entry per iteration, in traversal
+    /// order. Reversing the walk would reverse those lists, which is a change a
+    /// user can see, so reversal is only semantics-preserving when there are no
+    /// such variables to reverse. Mirrors the `inner_is_anonymous` test the QPP
+    /// planner already applies for its own delegation decision.
+    fn quantified_segments_are_anonymous(elements: &[PatternElement]) -> bool {
+        let unnamed = |v: Option<&String>| v.is_none_or(|v| v.is_empty());
+        elements.iter().all(|element| match element {
+            PatternElement::Parenthesized { pattern, .. } => {
+                pattern.elements.iter().all(|inner| match inner {
+                    PatternElement::Node(n) => unnamed(n.variable.as_ref()),
+                    PatternElement::Relationship(r) => unnamed(r.variable.as_ref()),
+                    // A nested quantifier is rejected by the QPP planner; do not
+                    // reverse something this cannot reason about.
+                    PatternElement::Parenthesized { .. } => false,
+                })
+            }
+            _ => true,
+        })
+    }
+
+    /// Every variable a path binds, for deciding which paths anchor which.
+    fn path_variables(path: &PathPattern) -> HashSet<String> {
+        let mut out = HashSet::new();
+        if let Some(v) = &path.variable {
+            out.insert(v.clone());
+        }
+        for element in &path.elements {
+            let named = match element {
+                PatternElement::Node(n) => n.variable.as_ref(),
+                PatternElement::Relationship(r) => r.variable.as_ref(),
+                // A quantified segment scopes its own interior; its endpoints
+                // are ordinary nodes at this level and are seen above.
+                PatternElement::Parenthesized { .. } => None,
+            };
+            if let Some(v) = named.filter(|v| !v.is_empty()) {
+                out.insert(v.clone());
+            }
+        }
+        out
+    }
+
+    /// Comma-separated paths reordered so each one anchors on an earlier one.
+    ///
+    /// `MATCH (a)-[:R]->(b), (forum)-[:S]->(a)` is planned left to right, so the
+    /// first path scans every `a` and cross-joins before the second — which is
+    /// bound, and shares `a` — ever runs. Planning the bound path first leaves
+    /// `a` in scope, and the other becomes an anchored traversal (#224).
+    ///
+    /// Greedy and statistics-free: repeatedly take the first path sharing a
+    /// variable with something already in scope, falling back to the first
+    /// unplanned path when the pattern is genuinely disconnected. Choosing
+    /// *between* several connected candidates is where cardinality would be
+    /// needed, and this does not attempt it — it takes the leftmost, so a
+    /// pattern that was already well ordered is left exactly as written.
+    ///
+    /// Reordering is sound because comma-separated paths are a conjunction: the
+    /// result set does not depend on the order they are matched in, only the
+    /// plan shape does. Returns `None` when the order would not change, so the
+    /// common case allocates nothing and the plan is untouched.
+    fn ordered_path_indices(
+        paths: &[PathPattern],
+        vars_in_scope: &[VariableInfo],
+    ) -> Option<Vec<usize>> {
+        if paths.len() < 2 {
+            return None;
+        }
+        // `plan_shortest_path` has its own source/target contract; leave any
+        // clause containing one alone rather than reason about both at once.
+        if paths.iter().any(|p| p.shortest_path_mode.is_some()) {
+            return None;
+        }
+
+        let per_path: Vec<HashSet<String>> = paths.iter().map(Self::path_variables).collect();
+        let mut connected: HashSet<String> = vars_in_scope.iter().map(|v| v.name.clone()).collect();
+        let mut taken = vec![false; paths.len()];
+        let mut order = Vec::with_capacity(paths.len());
+
+        for _ in 0..paths.len() {
+            let next = (0..paths.len())
+                .find(|&i| !taken[i] && per_path[i].iter().any(|v| connected.contains(v)))
+                .or_else(|| (0..paths.len()).find(|&i| !taken[i]))?;
+            taken[next] = true;
+            connected.extend(per_path[next].iter().cloned());
+            order.push(next);
+        }
+
+        if order.iter().copied().eq(0..paths.len()) {
+            None
+        } else {
+            Some(order)
+        }
+    }
+
+    /// A middle-bound path split into two walks that both start at the anchor.
+    ///
+    /// [`Self::reversed_for_bound_anchor`] handles a bound node at one *end* by
+    /// walking the other way. When the only bound node is in the middle, no
+    /// single direction helps: whichever end the walk starts from is unbound, so
+    /// it scans everything and cross-joins. Anchoring in the middle and
+    /// expanding both ways is the plan that works, and it needs no statistics —
+    /// only which variables are already in scope, which `plan_path` has (#224).
+    ///
+    /// The split returns `(toward_start, toward_end)`, both beginning at the
+    /// anchor. The first is the left side reversed, with each relationship's
+    /// direction flipped, which is sound for the reason reversal is sound at an
+    /// end: `source_variable` names the traversal start rather than the arrow's
+    /// tail, so `endpoints_for_direction` resolves the same pair either way.
+    ///
+    /// The anchor appears as the first element of both halves. That is what
+    /// makes each half plan as a traversal from a bound node rather than a scan,
+    /// and it is why planning them in sequence joins them on the anchor instead
+    /// of cross-joining.
+    ///
+    /// Deliberately narrow, matching its sibling: no path variable, no
+    /// shortestPath, no quantified segment. Returns `None` when either end is
+    /// bound, because those cases are already handled — left-to-right when the
+    /// first is bound, reversal when the last is.
+    fn split_at_bound_anchor(
+        path: &PathPattern,
+        vars_in_scope: &[VariableInfo],
+    ) -> Option<(PathPattern, PathPattern)> {
+        // A path variable binds nodes and edges in traversal order; two walks
+        // out of the middle do not produce that order.
+        if path.variable.is_some() || path.shortest_path_mode.is_some() {
+            return None;
+        }
+        // Needs a node, a relationship, the anchor, a relationship and a node
+        // before there is a middle to anchor on.
+        if path.elements.len() < 5 {
+            return None;
+        }
+        // Quantified segments carry per-step directions of their own.
+        if path
+            .elements
+            .iter()
+            .any(|e| matches!(e, PatternElement::Parenthesized { .. }))
+        {
+            return None;
+        }
+
+        let bound_node = |element: &PatternElement| match element {
+            PatternElement::Node(n) => n
+                .variable
+                .as_deref()
+                .is_some_and(|v| !v.is_empty() && is_var_in_scope(vars_in_scope, v)),
+            _ => false,
+        };
+
+        // Either end bound is someone else's case.
+        if bound_node(path.elements.first()?) || bound_node(path.elements.last()?) {
+            return None;
+        }
+
+        // Nodes sit at even indices; the interior ones are the candidates. The
+        // first bound one is as good as any without cardinality to choose by,
+        // which is the part of #224 this increment does not attempt.
+        let anchor = (2..path.elements.len() - 2)
+            .step_by(2)
+            .find(|&i| bound_node(&path.elements[i]))?;
+
+        let toward_start = Self::reversed_elements(&path.elements[..=anchor]);
+
+        Some((
+            PathPattern {
+                variable: None,
+                elements: toward_start,
+                shortest_path_mode: None,
+            },
+            PathPattern {
+                variable: None,
+                elements: path.elements[anchor..].to_vec(),
+                shortest_path_mode: None,
+            },
+        ))
     }
 
     /// Plan a regular MATCH path (not shortestPath).
@@ -4743,6 +4957,28 @@ impl QueryPlanner {
         optional: bool,
         vars_before_pattern: usize,
     ) -> Result<LogicalPlan> {
+        // A bound node in the middle becomes two walks out of it, neither of
+        // which begins with an unbound scan; see `split_at_bound_anchor`.
+        //
+        // Each half starts at the anchor, which is in scope, so neither half
+        // splits or reverses again and the recursion is one level deep.
+        if let Some((toward_start, toward_end)) = Self::split_at_bound_anchor(path, vars_in_scope) {
+            let plan = self.plan_path(
+                &toward_start,
+                plan,
+                vars_in_scope,
+                optional,
+                vars_before_pattern,
+            )?;
+            return self.plan_path(
+                &toward_end,
+                plan,
+                vars_in_scope,
+                optional,
+                vars_before_pattern,
+            );
+        }
+
         // Start the walk at the bound end when the pattern was written from the
         // unbound one; see `reversed_for_bound_anchor`.
         let reversed_storage;

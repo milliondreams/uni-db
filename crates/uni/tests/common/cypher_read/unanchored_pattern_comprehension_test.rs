@@ -254,3 +254,59 @@ async fn correlates_through_an_outer_variable() {
         ]
     );
 }
+
+/// An uncorrelated comprehension is evaluated once, not once per row (#206).
+///
+/// Asserted as a *count* rather than a duration. The defect's shape is "N
+/// executions where one would do", and a count states that exactly: it is
+/// exact under load, needs no fixture large enough for a stopwatch to resolve,
+/// and expresses the issue's own acceptance criterion ("the ratio stops growing
+/// with N") without a clock. Timing was a poor instrument here — the wall-clock
+/// probe for this shape does not finish at N=50 in fifteen minutes.
+///
+/// This test previously asserted `executions == rows`, pinning the cost with a
+/// note to invert it when the hoist landed. This is that inversion.
+#[tokio::test]
+async fn an_uncorrelated_comprehension_is_evaluated_once() {
+    let db = fixture().await;
+    let r = db
+        .session()
+        .query("MATCH (n:P) RETURN [(a:P)-[:KNOWS]->(b:P) | a.name] AS l")
+        .await
+        .unwrap();
+    let rows = r.rows().len();
+    let executions = r.metrics().subquery_executions;
+
+    assert_eq!(rows, 3, "one row per :P node");
+    assert!(
+        executions > 0,
+        "no sub-plan execution was counted, so this test measured nothing and \
+         would pass with the fallback removed entirely"
+    );
+    assert_eq!(
+        executions, 1,
+        "an uncorrelated comprehension must be evaluated once and broadcast, \
+         not re-evaluated per outer row"
+    );
+}
+
+/// A correlated comprehension genuinely needs one execution per outer row.
+///
+/// The control for the test above: it is the *uncorrelated* case where the
+/// repeated work is redundant. Keeping both means a hoist that fired too
+/// eagerly — collapsing a correlated comprehension to one evaluation — fails
+/// here rather than silently returning one row's answer for every row.
+#[tokio::test]
+async fn a_correlated_comprehension_runs_once_per_row_by_necessity() {
+    let db = fixture().await;
+    let r = db
+        .session()
+        .query("MATCH (n:P) RETURN [(a:P)-[:KNOWS]->(b:P) WHERE a.name > n.name | a.name] AS l")
+        .await
+        .unwrap();
+    assert_eq!(
+        r.metrics().subquery_executions,
+        r.rows().len() as u64,
+        "a correlated comprehension must keep its per-row execution"
+    );
+}

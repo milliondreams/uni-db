@@ -16,6 +16,11 @@ use uni_db::Uni;
 
 const SIZES: &[usize] = &[50, 100, 200, 400];
 
+/// Smaller than [`SIZES`]: the uncorrelated shape builds a list of every edge
+/// on every row, so it grows faster than the correlated one and 400 does not
+/// finish in a useful time.
+const UNCORRELATED_SIZES: &[usize] = &[25, 50, 100];
+
 async fn build_chain(n: usize) -> anyhow::Result<uni_db::Uni> {
     let db = Uni::in_memory().build().await?;
     let tx = db.session().tx().await?;
@@ -42,6 +47,13 @@ const FALLBACK: &str = "MATCH (n:P) \
 
 // Same question anchored on the outer variable: vectorized path.
 const ANCHORED: &str = "MATCH (n:P) RETURN n.idx AS i, size([(n)-[:KNOWS]->(b) | 1]) AS s";
+
+// Fresh pattern variables and *no* reference to the outer row. Unanchorable
+// for the same reason as FALLBACK -- `analyze_pattern` needs a pattern variable
+// whose `_vid` column already exists in the outer schema -- but its value is
+// identical on every row, so one evaluation would answer all of them. This is
+// the case the subquery expression's own doc calls out as payable once.
+const UNCORRELATED: &str = "MATCH (n:P) RETURN n.idx AS i, size([(a:P)-[:KNOWS]->(b:P) | 1]) AS s";
 
 // The IC14 shape: reduce over relationships(p) with the correlated
 // comprehension inside — the fallback fires per path element per row.
@@ -75,6 +87,31 @@ async fn main() -> anyhow::Result<()> {
             ms_f / ms_a,
             ms_f * 1e3 / n as f64
         );
+    }
+
+    // The uncorrelated shape, at its own sizes. It is *slower* than the
+    // correlated one, not milder: `FALLBACK`'s predicate shrinks each row's
+    // inner result, while this one materialises every `KNOWS` edge for every
+    // row. Every one of those evaluations returns the same list.
+    println!("\n### Uncorrelated fallback (no outer reference; identical on every row)\n");
+    println!(
+        "{:>6} {:>14} {:>18} {:>8}",
+        "N", "anchored ms", "uncorrelated ms", "ratio"
+    );
+    for &n in UNCORRELATED_SIZES {
+        let db = build_chain(n).await?;
+        let (rows_a, ms_a) = timed(&db, ANCHORED).await?;
+        let (rows_u, ms_u) = timed(&db, UNCORRELATED).await?;
+        anyhow::ensure!(rows_a == n && rows_u == n, "row count mismatch");
+        println!(
+            "{:>6} {:>14.1} {:>18.1} {:>7.1}x",
+            n,
+            ms_a,
+            ms_u,
+            ms_u / ms_a
+        );
+        use std::io::Write;
+        std::io::stdout().flush().ok();
     }
 
     let db = build_chain(*SIZES.last().unwrap()).await?;

@@ -61,6 +61,7 @@ pub struct QueryCounters {
     vector_index_scans: AtomicU64,
     fts_index_scans: AtomicU64,
     searches_reported: AtomicU64,
+    subquery_executions: AtomicU64,
 }
 
 /// Which kind of index a search consulted.
@@ -246,6 +247,22 @@ impl QueryCounters {
         self.scans_reported.load(Ordering::Relaxed)
     }
 
+    /// Records one execution of a correlated sub-plan.
+    ///
+    /// Raised by the per-row pattern-comprehension fallback, which plans once
+    /// and then executes per outer row. The count is the shape of that cost:
+    /// for a comprehension whose value does not depend on the outer row, every
+    /// execution after the first recomputes an identical answer, so a count
+    /// that grows with the row count *is* the defect (#206).
+    pub fn add_subquery_execution(&self) {
+        self.subquery_executions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Sub-plan executions performed by per-row expression fallbacks.
+    pub fn subquery_executions(&self) -> u64 {
+        self.subquery_executions.load(Ordering::Relaxed)
+    }
+
     /// Folds another counter set into this one.
     ///
     /// Used where a query fans out into sub-executions that each carry their own
@@ -266,6 +283,8 @@ impl QueryCounters {
             .fetch_add(other.lance_iops(), Ordering::Relaxed);
         self.scans_reported
             .fetch_add(other.scans_reported(), Ordering::Relaxed);
+        self.subquery_executions
+            .fetch_add(other.subquery_executions(), Ordering::Relaxed);
         self.vector_index_scans
             .fetch_add(other.vector_index_scans(), Ordering::Relaxed);
         self.fts_index_scans
@@ -288,6 +307,7 @@ impl QueryCounters {
         self.vector_index_scans.store(0, Ordering::Relaxed);
         self.fts_index_scans.store(0, Ordering::Relaxed);
         self.searches_reported.store(0, Ordering::Relaxed);
+        self.subquery_executions.store(0, Ordering::Relaxed);
     }
 
     /// A by-value copy of every counter, for handing across a crate boundary.
@@ -312,6 +332,7 @@ impl QueryCounters {
             vector_index_scans: self.vector_index_scans(),
             fts_index_scans: self.fts_index_scans(),
             searches_reported: self.searches_reported(),
+            subquery_executions: self.subquery_executions(),
         }
     }
 }
@@ -344,6 +365,8 @@ pub struct CounterSnapshot {
     pub fts_index_scans: u64,
     /// Vector and full-text searches that reported at all.
     pub searches_reported: u64,
+    /// Sub-plan executions performed by per-row expression fallbacks (#206).
+    pub subquery_executions: u64,
 }
 
 #[cfg(test)]
@@ -434,6 +457,7 @@ mod tests {
         b.add_lance_scan(true, 4, 2);
         b.add_search(SearchKind::Vector, true);
         b.add_search(SearchKind::FullText, true);
+        b.add_subquery_execution();
         a.merge_from(&b);
 
         let m = a.snapshot();
@@ -452,6 +476,7 @@ mod tests {
                 vector_index_scans: 1,
                 fts_index_scans: 1,
                 searches_reported: 2,
+                subquery_executions: 1,
             },
             "a counter is missing from merge_from"
         );

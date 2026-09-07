@@ -115,6 +115,13 @@ pub struct QueryMetrics {
     /// wired — and this field is what separates those. Check it is nonzero
     /// whenever you rely on `index_scans` being zero.
     pub scans_reported: u64,
+    /// Sub-plan executions performed by per-row expression fallbacks.
+    ///
+    /// An unanchored pattern comprehension plans once and then executes per
+    /// outer row. When its value does not depend on the outer row, every
+    /// execution after the first recomputes the same answer, so this growing
+    /// with the row count is the defect rather than a symptom of it (#206).
+    pub subquery_executions: u64,
     /// Vector searches that consulted a vector index.
     ///
     /// Nonzero proves an ANN index was searched. Zero, with
@@ -419,6 +426,7 @@ impl QueryResult {
         self.metrics.index_comparisons = counters.index_comparisons;
         self.metrics.lance_iops = counters.lance_iops;
         self.metrics.scans_reported = counters.scans_reported;
+        self.metrics.subquery_executions = counters.subquery_executions;
         self.metrics.vector_index_scans = counters.vector_index_scans;
         self.metrics.fts_index_scans = counters.fts_index_scans;
         self.metrics.searches_reported = counters.searches_reported;

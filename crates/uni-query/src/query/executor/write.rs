@@ -2617,11 +2617,6 @@ impl Executor {
             let matches = self
                 .execute_merge_match(pattern, &row, prop_manager, params, ctx)
                 .await?;
-            eprintln!(
-                "MERGEPROBE matches={} row_keys={:?}",
-                matches.len(),
-                row.keys().collect::<Vec<_>>()
-            );
             let writer: &uni_store::Writer = writer_lock.as_ref();
 
             let result: Result<Vec<HashMap<String, Value>>> = async {

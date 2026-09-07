@@ -1525,7 +1525,8 @@ fn map_to_schemaless_output_schema(
                     props_arr,
                     prop,
                     l0_ctx,
-                );
+                )
+                .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
                 columns.push(col);
             } else {
                 // Decode CypherValue to the expected type via build_property_column_static.
@@ -1535,19 +1536,24 @@ fn map_to_schemaless_output_schema(
                     // A corrupt overflow blob used to make the property simply
                     // absent, which downstream reads as NULL — indistinguishable
                     // from a property this row genuinely lacks (#233 class).
-                    let resolved = match resolve_l0_property(&vid, prop, l0_ctx).flatten() {
-                        Some(v) => Some(v),
-                        None => match extract_from_overflow_blob(props_arr, i, prop) {
-                            Some(bytes) => Some(
-                                uni_common::cypher_value_codec::decode(&bytes).map_err(|e| {
-                                    datafusion::error::DataFusionError::Execution(format!(
-                                        "overflow property `{prop}` failed to decode: {e}"
-                                    ))
-                                })?,
-                            ),
-                            None => None,
-                        },
-                    };
+                    let resolved =
+                        match resolve_l0_property(&vid, prop, l0_ctx).flatten() {
+                            Some(v) => Some(v),
+                            None => match extract_from_overflow_blob(props_arr, i, prop).map_err(
+                                |e| datafusion::error::DataFusionError::Execution(e.to_string()),
+                            )? {
+                                Some(bytes) => {
+                                    Some(uni_common::cypher_value_codec::decode(&bytes).map_err(
+                                        |e| {
+                                            datafusion::error::DataFusionError::Execution(format!(
+                                                "overflow property `{prop}` failed to decode: {e}"
+                                            ))
+                                        },
+                                    )?)
+                                }
+                                None => None,
+                            },
+                        };
                     if let Some(val) = resolved {
                         prop_values.insert(vid, HashMap::from([(prop.to_string(), val)]));
                     }

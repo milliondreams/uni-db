@@ -517,8 +517,33 @@ impl ExecutionPlan for GraphScanExec {
 enum GraphScanState {
     /// Initial state, ready to start scanning.
     Init,
+    /// Scan a vid-filtered result one chunk of vids at a time.
+    ///
+    /// Holds the vids not yet scanned. Slicing alone did not bound what the
+    /// scan *builds* — `RecordBatch::slice` is zero-copy, so every slice pins
+    /// the parent's buffers and the whole result is resident before the first
+    /// one is handed out. Scanning a chunk at a time gives each output batch
+    /// its own storage, so the peak is one chunk rather than the whole result
+    /// (#214). The traversal reached the same conclusion for the same reason;
+    /// see `TraverseStreamState::Chunking`.
+    ///
+    /// Chunking is safe here precisely because the unit is a *vid* range. Every
+    /// version of a vid falls inside one chunk, so the MVCC dedup that keeps
+    /// the highest `_version` per vid still sees all the candidates, and the L0
+    /// overlay is scoped to the same vid set it was asked for. Chunking by
+    /// arriving storage batch would break both.
+    ///
+    /// Only reached for a vid set larger than one output batch; see `Init`.
+    Chunking { vids: Arc<Vec<u64>>, cursor: usize },
     /// Executing the async scan.
-    Executing(Pin<Box<dyn std::future::Future<Output = DFResult<Option<RecordBatch>>> + Send>>),
+    ///
+    /// `resume` carries where to continue when this call finishes, and is
+    /// `None` for an unchunked scan — which is what makes "the scan is done"
+    /// and "this chunk is done" distinguishable.
+    Executing {
+        fut: Pin<Box<dyn std::future::Future<Output = DFResult<Option<RecordBatch>>> + Send>>,
+        resume: Option<(Arc<Vec<u64>>, usize)>,
+    },
     /// The scan finished; hand its rows out in `batch_size` slices.
     ///
     /// The scan builds one `RecordBatch` for the whole result. Emitting it whole
@@ -530,9 +555,14 @@ enum GraphScanState {
     /// spill path engage. See issue #202.
     ///
     /// `RecordBatch::slice` is zero-copy, so this does not reduce what the scan
-    /// itself holds — the whole result is still built before the first slice is
-    /// emitted. Making the scan produce batches incrementally is the follow-up.
-    Slicing { batch: RecordBatch, offset: usize },
+    /// itself holds. For a vid-filtered scan `Chunking` bounds that; for a
+    /// full-label scan the whole result is still built first, which is the
+    /// remainder of #214.
+    Slicing {
+        batch: RecordBatch,
+        offset: usize,
+        resume: Option<(Arc<Vec<u64>>, usize)>,
+    },
     /// Stream is done.
     Done,
 }
@@ -637,6 +667,61 @@ impl GraphScanStream {
             slice_size: slice_size.max(1),
             reservation: MemoryConsumer::new("GraphScanExec").register(pool),
         }
+    }
+
+    /// One scan call, restricted to `vid_list_filter`.
+    ///
+    /// Factored out so a chunk and a whole-result scan go through the same
+    /// code. They differ only in the vid list handed down: `None` and the
+    /// stream's own filter are the unchunked cases, a slice of it is a chunk.
+    fn scan_future(
+        &self,
+        vid_list_filter: Option<Vec<u64>>,
+    ) -> Pin<Box<dyn std::future::Future<Output = DFResult<Option<RecordBatch>>> + Send>> {
+        let graph_ctx = self.graph_ctx.clone();
+        let label = self.label.clone();
+        let variable = self.variable.clone();
+        let properties = self.properties.clone();
+        let is_schemaless = self.is_schemaless;
+        let filter = self.filter.clone();
+        let extra_lance_filter = self.extra_lance_filter.clone();
+        let extra_runtime_filter = self.extra_runtime_filter.clone();
+        let schema = self.schema.clone();
+        let index_consulted = self.index_consulted.clone();
+
+        Box::pin(async move {
+            graph_ctx.check_timeout().map_err(exec_err)?;
+
+            let batch = if is_schemaless {
+                columnar_scan_schemaless_vertex_batch_static(
+                    &graph_ctx,
+                    &label,
+                    &variable,
+                    &properties,
+                    &schema,
+                    &filter,
+                    vid_list_filter.as_deref(),
+                    extra_lance_filter.as_deref(),
+                    extra_runtime_filter.as_ref(),
+                )
+                .await?
+            } else {
+                columnar_scan_vertex_batch_static(
+                    &graph_ctx,
+                    &label,
+                    &variable,
+                    &properties,
+                    &schema,
+                    &filter,
+                    vid_list_filter.as_deref(),
+                    extra_lance_filter.as_deref(),
+                    extra_runtime_filter.as_ref(),
+                    Some(&index_consulted),
+                )
+                .await?
+            };
+            Ok(Some(batch))
+        })
     }
 }
 
@@ -1493,57 +1578,48 @@ impl Stream for GraphScanStream {
 
             match state {
                 GraphScanState::Init => {
-                    // Create the future with cloned data for ownership
-                    let graph_ctx = self.graph_ctx.clone();
-                    let label = self.label.clone();
-                    let variable = self.variable.clone();
-                    let properties = self.properties.clone();
-                    let is_schemaless = self.is_schemaless;
-                    let filter = self.filter.clone();
-                    let vid_list_filter = self.vid_list_filter.clone();
-                    let extra_lance_filter = self.extra_lance_filter.clone();
-                    let extra_runtime_filter = self.extra_runtime_filter.clone();
-                    let schema = self.schema.clone();
-                    let index_consulted = self.index_consulted.clone();
-
-                    let fut = async move {
-                        graph_ctx.check_timeout().map_err(exec_err)?;
-
-                        let batch = if is_schemaless {
-                            columnar_scan_schemaless_vertex_batch_static(
-                                &graph_ctx,
-                                &label,
-                                &variable,
-                                &properties,
-                                &schema,
-                                &filter,
-                                vid_list_filter.as_deref(),
-                                extra_lance_filter.as_deref(),
-                                extra_runtime_filter.as_ref(),
-                            )
-                            .await?
-                        } else {
-                            columnar_scan_vertex_batch_static(
-                                &graph_ctx,
-                                &label,
-                                &variable,
-                                &properties,
-                                &schema,
-                                &filter,
-                                vid_list_filter.as_deref(),
-                                extra_lance_filter.as_deref(),
-                                extra_runtime_filter.as_ref(),
-                                Some(&index_consulted),
-                            )
-                            .await?
-                        };
-                        Ok(Some(batch))
-                    };
-
-                    self.state = GraphScanState::Executing(Box::pin(fut));
-                    // Continue loop to poll the future
+                    // Chunk only when the vid set is larger than one output
+                    // batch. Below that the whole result already fits the bound
+                    // chunking exists to impose, and the extra round trips
+                    // would be pure cost — the traversal measured ~6% for
+                    // chunking unconditionally, which is why it gates too.
+                    //
+                    // Sorted so chunk k holds only vids below chunk k+1's. The
+                    // scan sorts by `(_vid ASC, _version DESC)` internally, so
+                    // sorting here makes the concatenation of the chunks
+                    // identical to the unchunked result, order included, rather
+                    // than merely equal as a set.
+                    match self.vid_list_filter.clone() {
+                        Some(mut vids) if vids.len() > self.slice_size => {
+                            vids.sort_unstable();
+                            vids.dedup();
+                            self.state = GraphScanState::Chunking {
+                                vids: Arc::new(vids),
+                                cursor: 0,
+                            };
+                        }
+                        whole => {
+                            self.state = GraphScanState::Executing {
+                                fut: self.scan_future(whole),
+                                resume: None,
+                            };
+                        }
+                    }
                 }
-                GraphScanState::Executing(mut fut) => match fut.as_mut().poll(cx) {
+                GraphScanState::Chunking { vids, cursor } => {
+                    if cursor >= vids.len() {
+                        self.reservation.free();
+                        self.state = GraphScanState::Done;
+                        return Poll::Ready(None);
+                    }
+                    let end = (cursor + self.slice_size).min(vids.len());
+                    let chunk = vids[cursor..end].to_vec();
+                    self.state = GraphScanState::Executing {
+                        fut: self.scan_future(Some(chunk)),
+                        resume: Some((vids, end)),
+                    };
+                }
+                GraphScanState::Executing { mut fut, resume } => match fut.as_mut().poll(cx) {
                     Poll::Ready(Ok(batch)) => {
                         self.metrics
                             .record_output(batch.as_ref().map(|b| b.num_rows()).unwrap_or(0));
@@ -1551,15 +1627,20 @@ impl Stream for GraphScanStream {
                             // Hand the result out in `batch_size` slices rather
                             // than as one batch — see `GraphScanState::Slicing`.
                             Some(b) if b.num_rows() > 0 => {
-                                // Reserve before slicing begins. The batch is
-                                // already built by this point -- the scan is one
-                                // async call that returns the whole result -- so
-                                // this bounds how long an over-budget result
-                                // survives rather than preventing its
-                                // construction. Making the scan itself
-                                // incremental is #214/#240; until then this is
-                                // the earliest point the size is known.
-                                if let Err(e) = self.reservation.try_grow(b.get_array_memory_size())
+                                // `try_resize`, not `try_grow`: for a chunked
+                                // scan this is the *replacement* of the previous
+                                // chunk's reservation, which was freed when its
+                                // last slice went out. Growing would accumulate
+                                // every chunk and report a peak the scan never
+                                // holds.
+                                //
+                                // For an unchunked scan the batch is already
+                                // built by this point, so the reservation bounds
+                                // how long an over-budget result survives rather
+                                // than preventing its construction. That half is
+                                // the full-label remainder of #214.
+                                if let Err(e) =
+                                    self.reservation.try_resize(b.get_array_memory_size())
                                 {
                                     self.state = GraphScanState::Done;
                                     return Poll::Ready(Some(Err(e)));
@@ -1567,34 +1648,66 @@ impl Stream for GraphScanStream {
                                 self.state = GraphScanState::Slicing {
                                     batch: b,
                                     offset: 0,
+                                    resume,
                                 };
                             }
-                            other => {
-                                self.state = GraphScanState::Done;
-                                return Poll::Ready(other.map(Ok));
-                            }
+                            other => match resume {
+                                // An empty chunk does not end a chunked scan:
+                                // one vid range can hold no live row — every
+                                // candidate deleted or superseded — while later
+                                // ranges do. Ending here would silently truncate
+                                // the result at the first such range.
+                                Some((vids, cursor)) => {
+                                    self.state = GraphScanState::Chunking { vids, cursor };
+                                }
+                                None => {
+                                    self.reservation.free();
+                                    self.state = GraphScanState::Done;
+                                    return Poll::Ready(other.map(Ok));
+                                }
+                            },
                         }
                     }
                     Poll::Ready(Err(e)) => {
+                        self.reservation.free();
                         self.state = GraphScanState::Done;
                         return Poll::Ready(Some(Err(e)));
                     }
                     Poll::Pending => {
-                        self.state = GraphScanState::Executing(fut);
+                        self.state = GraphScanState::Executing { fut, resume };
                         return Poll::Pending;
                     }
                 },
-                GraphScanState::Slicing { batch, offset } => {
+                GraphScanState::Slicing {
+                    batch,
+                    offset,
+                    resume,
+                } => {
                     let remaining = batch.num_rows() - offset;
                     if remaining == 0 {
-                        self.state = GraphScanState::Done;
-                        return Poll::Ready(None);
+                        // Release this chunk before the next is built, so the
+                        // peak is one chunk and not their sum. A consumer may
+                        // still hold the last slice, which pins these buffers —
+                        // the same brief under-count the traversal accepts at
+                        // its own chunk boundary.
+                        self.reservation.free();
+                        match resume {
+                            Some((vids, cursor)) => {
+                                self.state = GraphScanState::Chunking { vids, cursor };
+                            }
+                            None => {
+                                self.state = GraphScanState::Done;
+                                return Poll::Ready(None);
+                            }
+                        }
+                        continue;
                     }
                     let take = self.slice_size.min(remaining);
                     let slice = batch.slice(offset, take);
                     self.state = GraphScanState::Slicing {
                         batch,
                         offset: offset + take,
+                        resume,
                     };
                     return Poll::Ready(Some(Ok(slice)));
                 }

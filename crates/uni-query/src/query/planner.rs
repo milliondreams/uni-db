@@ -4333,6 +4333,24 @@ impl QueryPlanner {
                 op,
                 expr: Box::new(Self::rewrite_id_to_vid(*inner, vars_in_scope)),
             },
+            // `IN` recurses for the same reason `=` does, and its absence was
+            // load-bearing: `extract_vid_from_cypher_filter`'s `Expr::In` arm
+            // matches `Property(Variable, "_vid")`, so while `id(n) IN [...]`
+            // stayed a function call the multi-VID Lance pushdown (#55) could
+            // not fire from any Cypher a user would write. `id(n) = 5` reached
+            // it only because `=` is a `BinaryOp` and was already rewritten.
+            Expr::In { expr: inner, list } => Expr::In {
+                expr: Box::new(Self::rewrite_id_to_vid(*inner, vars_in_scope)),
+                list: Box::new(Self::rewrite_id_to_vid(*list, vars_in_scope)),
+            },
+            // Reached through the arm above, so a list holding `id(m)` is
+            // rewritten consistently with the value it is compared against.
+            Expr::List(items) => Expr::List(
+                items
+                    .into_iter()
+                    .map(|item| Self::rewrite_id_to_vid(item, vars_in_scope))
+                    .collect(),
+            ),
             other => other,
         }
     }

@@ -64,10 +64,30 @@ const RULE_C: (&str, &str) = (
 /// and the `UNI_DUMP_PHYSICAL` facility, which is the budget inflation this
 /// file exists to avoid.
 const RULE_D: (&str, &str) = (
-    "codec::decode(",
+    // A label, not a needle: the needles live in `DECODERS`, because this rule
+    // spans several of them.
+    "a stored-blob decode",
     "a decode failure must not become a default value; propagate it, or log \
      through tracing and record at the site why the signature cannot",
 );
+
+/// The decoders Rule D watches: every entry point that turns a *stored blob*
+/// back into a value.
+///
+/// Scoped to stored blobs on purpose. An earlier revision keyed only on
+/// `codec::decode(`, drawn around the sites that had just been fixed rather
+/// than around the class — and three more survived it, one of them in the very
+/// file the fix had converted (`arrow_convert.rs`'s CRDT arm, a
+/// `Crdt::from_msgpack(..).ok()` that landed on `Value::Null`).
+///
+/// `serde_json::from_str` is deliberately *not* here, and that is a scope
+/// decision rather than an oversight: its ~11 workspace uses are config
+/// parsing and format probes, where a parse failure legitimately means "not
+/// this format, try the next" and no stored value is being reconstructed.
+/// Adding it would force eleven budget entries that say nothing, diluting the
+/// signal this ratchet exists to carry. If a `from_str` ever decodes a stored
+/// blob, add it here rather than budgeting it there.
+const DECODERS: [&str; 3] = ["codec::decode(", "from_msgpack(", "rmp_serde::from_"];
 
 /// Files permitted to break a rule, with the count and the reason. Audited;
 /// none is a leftover. Lower a number only by removing a use.
@@ -81,7 +101,7 @@ fn budget(rule: &str) -> Vec<(&'static str, usize)> {
         // Erroring there breaks every such plugin at the CALL site; the
         // contract is pinned by
         // `undecodable_bytes_fall_back_instead_of_erroring`.
-        "codec::decode(" => vec![
+        "a stored-blob decode" => vec![
             ("crates/uni-query/src/query/executor/procedure.rs", 1),
             // Same ambiguity, one layer down. A `LargeBinary` column carries
             // either a CypherValue or raw `Bytes`, and only the field's
@@ -135,10 +155,24 @@ fn source_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// default sits further still. Over-counting is the safe direction — a false
 /// hit is answered by reading the site and either fixing it or budgeting it.
 fn defaults_a_decode(text: &str) -> usize {
-    let lines: Vec<&str> = text.lines().collect();
+    // Comment-only lines are blanked rather than dropped, so the three-line
+    // window keeps its alignment with the source. Without this the rule counts
+    // its own documentation: `cypher_value_codec.rs` explains the #233 fix by
+    // quoting the shape it removed (`rmp_serde::from_slice(..).ok()`), and a
+    // raw scan reads that prose as a live violation.
+    let lines: Vec<&str> = text
+        .lines()
+        .map(|l| {
+            if l.trim_start().starts_with("//") {
+                ""
+            } else {
+                l
+            }
+        })
+        .collect();
     let mut hits = 0;
     for (i, line) in lines.iter().enumerate() {
-        if !line.contains("codec::decode(") {
+        if !DECODERS.iter().any(|d| line.contains(d)) {
             continue;
         }
         let window = lines[i..(i + 3).min(lines.len())].join(" ");

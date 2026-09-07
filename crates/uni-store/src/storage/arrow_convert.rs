@@ -784,11 +784,15 @@ pub fn arrow_to_value(
     // Binary (CRDT MessagePack) - decode to Value via serde_json boundary
     if let Some(b) = col.as_any().downcast_ref::<BinaryArray>() {
         let bytes = b.value(row);
-        return Ok(Crdt::from_msgpack(bytes)
-            .ok()
-            .and_then(|crdt| serde_json::to_value(&crdt).ok())
-            .map(Value::from)
-            .unwrap_or(Value::Null));
+        // A corrupt CRDT blob is unreadable, not null. `Value::Null` is a legal
+        // property value, so collapsing to it made the two indistinguishable
+        // (#233 class). Unlike the untyped `LargeBinary` arm below — where only
+        // the field's `uni_raw_bytes` marker separates a CypherValue from raw
+        // bytes, so the arm can merely sniff — a `BinaryArray` reaching here is
+        // unambiguously CRDT MessagePack, so the failure is a real error.
+        let crdt = Crdt::from_msgpack(bytes)
+            .map_err(|e| anyhow::anyhow!("CRDT MessagePack decode failed: {e}"))?;
+        return Ok(Value::from(serde_json::to_value(&crdt)?));
     }
 
     // Arrow's Null type carries no values by construction, so `Value::Null` is

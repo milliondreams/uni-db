@@ -271,10 +271,11 @@ fn value_from_column_inner(
                 .ok_or_else(|| anyhow!("Invalid struct array inner for map"))?;
             let mut map = serde_json::Map::with_capacity(uni_map.len());
             for (k, v) in uni_map {
-                map.insert(
-                    k,
-                    serde_json::to_value(&v).unwrap_or(serde_json::Value::Null),
-                );
+                // A map entry that will not serialise is corrupt, not null:
+                // `Value::Null` is a legal entry value, so substituting it made
+                // the two indistinguishable (#233 class). The enclosing fn
+                // already returns `Result`.
+                map.insert(k, serde_json::to_value(&v)?);
             }
             Ok(Value::Object(map))
         }

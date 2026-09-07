@@ -4349,6 +4349,21 @@ impl HybridPhysicalPlanner {
             )> = Vec::with_capacity(cls.equi_pairs.len());
 
             for (l_expr, r_expr) in &cls.equi_pairs {
+                // Join two entities on identity, not on their whole structs.
+                //
+                // `compile_binary_op_dispatch` performs this rewrite for a
+                // comparison it sees whole, but an equi-join splits `a = b`
+                // into a key per side and compiles each against a context
+                // holding only its own variable — so neither compiler can see
+                // that both sides are entities, and each asks for a bare `a` /
+                // `b` column. That forces the property collector to widen both
+                // operands to the full schema purely to satisfy a join key
+                // (#215), and joins on a struct where a u64 would do.
+                let rewritten = identity_join_key(l_expr, r_expr, &left_ctx, &right_ctx);
+                let (l_expr, r_expr) = match &rewritten {
+                    Some((l, r)) => (l, r),
+                    None => (l_expr, r_expr),
+                };
                 let l_phys = left_compiler.compile(l_expr, &left_schema)?;
                 let r_phys = right_compiler.compile(r_expr, &right_schema)?;
                 let Some((l_key, r_key)) =
@@ -7183,7 +7198,44 @@ fn collect_endpoint_relationships(expr: &Expr, out: &mut Vec<String>) {
     expr.for_each_child(&mut |child| collect_endpoint_relationships(child, out));
 }
 
-fn collect_variable_kinds(plan: &LogicalPlan, kinds: &mut HashMap<String, VariableKind>) {
+/// Rewrite an entity-to-entity equi-join key pair to their identity columns.
+///
+/// Returns `None` when the pair is anything else — a property, a literal, a
+/// non-entity variable, or two entities of different kinds — leaving the
+/// caller's original expressions untouched. Node/node joins on `_vid` and
+/// edge/edge on `_eid`, mirroring `compile_binary_op_dispatch`, which does the
+/// same rewrite for a comparison it can see whole.
+///
+/// The kinds come from each side's own context because that is all an equi-join
+/// has: the pair is split before compilation, so the left compiler never learns
+/// what the right side is.
+fn identity_join_key(
+    left: &Expr,
+    right: &Expr,
+    left_ctx: &TranslationContext,
+    right_ctx: &TranslationContext,
+) -> Option<(Expr, Expr)> {
+    let (Expr::Variable(lv), Expr::Variable(rv)) = (left, right) else {
+        return None;
+    };
+    let id_prop = match (
+        left_ctx.variable_kinds.get(lv)?,
+        right_ctx.variable_kinds.get(rv)?,
+    ) {
+        (VariableKind::Node, VariableKind::Node) => "_vid",
+        (VariableKind::Edge, VariableKind::Edge) => "_eid",
+        _ => return None,
+    };
+    Some((
+        Expr::Property(Box::new(left.clone()), id_prop.to_string()),
+        Expr::Property(Box::new(right.clone()), id_prop.to_string()),
+    ))
+}
+
+pub(crate) fn collect_variable_kinds(
+    plan: &LogicalPlan,
+    kinds: &mut HashMap<String, VariableKind>,
+) {
     match plan {
         // Phase 5b followup: recurse into the wrapped node so the
         // wrapped operator's variable still gets collected.

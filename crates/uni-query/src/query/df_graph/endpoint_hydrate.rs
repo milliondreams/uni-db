@@ -217,10 +217,12 @@ impl EndpointHydrateStream {
             return Ok(vec![Vec::new(); batch.num_rows()]);
         };
         let column = batch.column(idx);
+        let hint =
+            uni_store::storage::arrow_convert::type_hint_for_field(batch.schema().field(idx));
         let mut out = Vec::with_capacity(batch.num_rows());
         for row in 0..batch.num_rows() {
             let value =
-                uni_store::storage::arrow_convert::arrow_to_value(column.as_ref(), row, None)
+                uni_store::storage::arrow_convert::arrow_to_value(column.as_ref(), row, hint)
                     .map_err(|e| DataFusionError::Execution(e.to_string()))?
                     .canonical_entity();
             out.push(match &value {

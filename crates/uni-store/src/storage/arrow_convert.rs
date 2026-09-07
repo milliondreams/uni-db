@@ -184,6 +184,21 @@ fn array_to_value_list(arr: &ArrayRef, elem_type: Option<&DataType>) -> anyhow::
         .collect()
 }
 
+/// The decode hint carried by an Arrow field's own metadata.
+///
+/// A `LargeBinary` column is how both a CypherValue blob and a raw `Bytes`
+/// value are transported, and only the field's `uni_raw_bytes` marker tells
+/// them apart. A caller that has the `Field` and passes `None` throws that
+/// away, leaving [`arrow_to_value`] to sniff — which it can only do by trying
+/// the codec and degrading when it fails.
+///
+/// Pass this wherever a `Field` is in scope, so the ambiguity is confined to
+/// callers that genuinely have only an `ArrayRef` (#233 class).
+#[must_use]
+pub fn type_hint_for_field(field: &arrow_schema::Field) -> Option<&'static DataType> {
+    raw_bytes_hint(field.metadata())
+}
+
 /// Returns `Some(&DataType::Bytes)` when Arrow field metadata marks the field as a
 /// raw `Bytes` value (`uni_raw_bytes=true`), else `None`. Used to discriminate raw
 /// `Bytes` container children from CV-encoded `LargeBinary` without array sniffing.

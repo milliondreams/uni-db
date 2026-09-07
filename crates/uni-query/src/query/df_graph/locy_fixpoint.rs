@@ -3276,7 +3276,8 @@ fn batch_row_to_value_map(
             let col = batch.column(col_idx);
             // Documented exception (#233 class): this builds a plain
             // `HashMap` and has no error channel. Logged, then degraded.
-            let val = match arrow_to_value(col.as_ref(), row_idx, None) {
+            let hint = uni_store::storage::arrow_convert::type_hint_for_field(field);
+            let val = match arrow_to_value(col.as_ref(), row_idx, hint) {
                 Ok(v) => v.canonical_entity(),
                 Err(e) => {
                     tracing::error!(

@@ -83,12 +83,19 @@ fn budget(rule: &str) -> Vec<(&'static str, usize)> {
         // `undecodable_bytes_fall_back_instead_of_erroring`.
         "codec::decode(" => vec![
             ("crates/uni-query/src/query/executor/procedure.rs", 1),
-            // Same ambiguity, one layer down: no `DataType` says "this column
-            // holds a CypherValue", so an unhinted LargeBinary may legitimately
-            // be opaque bytes. The arm degrades to `Value::Bytes` — which
-            // carries the payload — rather than to `Value::Null`, which was a
-            // legal value and the actual defect. The arms that do know their
-            // type (BTIC, the shape mismatches, the terminal fallback) error.
+            // Same ambiguity, one layer down. A `LargeBinary` column carries
+            // either a CypherValue or raw `Bytes`, and only the field's
+            // `uni_raw_bytes` marker separates them — so this arm can only
+            // sniff, and it degrades to `Value::Bytes`, which carries the
+            // payload, rather than to `Value::Null`, which was a legal value
+            // and the actual defect. The arms that do know their type (BTIC,
+            // the shape mismatches, the terminal fallback) error.
+            //
+            // The reach of that sniff is bounded by callers passing the hint:
+            // `type_hint_for_field` exists for exactly that, and every caller
+            // with a `Field` in scope now uses it. What remains is callers that
+            // genuinely hold only an `ArrayRef` — a UDF handed one column, a
+            // Locy output tuple — where nothing has recorded which kind it is.
             ("crates/uni-store/src/storage/arrow_convert.rs", 1),
         ],
         "contains(\"not found\")" => vec![

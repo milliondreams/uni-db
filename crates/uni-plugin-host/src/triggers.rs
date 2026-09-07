@@ -1183,12 +1183,18 @@ impl PreExistingProbe {
                     let mut props = Properties::new();
                     for (col_idx, col_name) in &property_cols {
                         let col = batch.column(*col_idx);
+                        // The field carries the `uni_raw_bytes` marker that
+                        // says whether this LargeBinary is a CypherValue or
+                        // opaque bytes; passing `None` would discard it.
+                        let hint = uni_store::storage::arrow_convert::type_hint_for_field(
+                            batch.schema().field(*col_idx),
+                        );
                         // Documented exception (#233 class): `extend_with_l1`
                         // returns `()` and its contract is to degrade rather
                         // than fail the commit, so a decode failure has no
                         // channel here. Logged and the property omitted — the
                         // pre-image is already best-effort by design.
-                        let value = match arrow_to_value(col.as_ref(), row, None) {
+                        let value = match arrow_to_value(col.as_ref(), row, hint) {
                             Ok(v) => v,
                             Err(e) => {
                                 tracing::error!(

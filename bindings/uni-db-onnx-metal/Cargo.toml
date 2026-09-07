@@ -41,6 +41,7 @@ uni-db = { workspace = true, default-features = false, features = [
     "provider-voyageai",
     "provider-cohere",
     "provider-azure-openai",
+    "provider-llamacpp",
 ] }
 uni-locy = { workspace = true }
 uni-common = { workspace = true }

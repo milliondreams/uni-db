@@ -196,3 +196,5 @@ mod sparse_scoring;
 mod value_fidelity;
 #[path = "common/vector_recall.rs"]
 mod vector_recall;
+#[path = "common/xervo_provider_registration.rs"]
+mod xervo_provider_registration;

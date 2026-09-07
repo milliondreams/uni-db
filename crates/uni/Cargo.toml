@@ -260,6 +260,7 @@ default = [
     "provider-voyageai",
     "provider-cohere",
     "provider-azure-openai",
+    "provider-llamacpp",
 ]
 lance-backend = ["uni-store/lance-backend"]
 # APOC-equivalent built-in procedures and scalar functions implemented in
@@ -299,6 +300,11 @@ provider-anthropic = ["uni-xervo/provider-anthropic"]
 provider-voyageai = ["uni-xervo/provider-voyageai"]
 provider-cohere = ["uni-xervo/provider-cohere"]
 provider-azure-openai = ["uni-xervo/provider-azure-openai"]
+# Embeddings served by a llama.cpp server. Distinct from `provider-openai`
+# even where the HTTP shape looks similar: this one truncates against
+# llama.cpp's own `/tokenize`, and llama.cpp rejects embedding input longer
+# than the model's context window rather than truncating it itself.
+provider-llamacpp = ["uni-xervo/provider-llamacpp"]
 # ONNX + GPU surface — mirrors uni-xervo's 0.9.0 three-axis model
 # (provider × linking × acceleration). See
 # `../../../uni-xervo/docs/migrations/0.9.0-feature-surface.md`. The

@@ -1195,7 +1195,7 @@ impl Executor {
                         None
                     };
                     let mut value =
-                        arrow_convert::arrow_to_value(column.as_ref(), row_idx, data_type)
+                        arrow_convert::arrow_to_value(column.as_ref(), row_idx, data_type)?
                             .canonical_entity();
 
                     // Check if this field contains JSON-encoded values (e.g., from UNWIND)
@@ -1777,8 +1777,8 @@ impl Executor {
     /// decoder this delegates to is shared with `uni-store`, which has its own
     /// contract, so the conversion belongs here on the query side rather than
     /// down there (#234).
-    pub(crate) fn arrow_to_value(col: &dyn Array, row: usize) -> Value {
-        arrow_convert::arrow_to_value(col, row, None).canonical_entity()
+    pub(crate) fn arrow_to_value(col: &dyn Array, row: usize) -> Result<Value> {
+        Ok(arrow_convert::arrow_to_value(col, row, None)?.canonical_entity())
     }
 
     pub(crate) fn evaluate_expr<'a>(
@@ -5021,7 +5021,7 @@ impl Executor {
                                 // Look up Uni DataType from schema for proper DateTime/Time decoding
                                 let data_type = target_props.get(name).map(|pm| &pm.r#type);
                                 let val =
-                                    arrow_convert::arrow_to_value(col.as_ref(), row, data_type)
+                                    arrow_convert::arrow_to_value(col.as_ref(), row, data_type)?
                                         .canonical_entity();
                                 props.insert(name.clone(), val);
                             }
@@ -5067,15 +5067,15 @@ impl Executor {
                         }
 
                         if name == src_col {
-                            let val = Self::arrow_to_value(col.as_ref(), row);
+                            let val = Self::arrow_to_value(col.as_ref(), row)?;
                             src_vid = Some(Self::vid_from_value(&val)?);
                         } else if name == dst_col {
-                            let val = Self::arrow_to_value(col.as_ref(), row);
+                            let val = Self::arrow_to_value(col.as_ref(), row)?;
                             dst_vid = Some(Self::vid_from_value(&val)?);
                         } else if let Some(pm) = target_props.get(name) {
                             // Look up Uni DataType from schema for proper DateTime/Time decoding
                             let val =
-                                arrow_convert::arrow_to_value(col.as_ref(), row, Some(&pm.r#type))
+                                arrow_convert::arrow_to_value(col.as_ref(), row, Some(&pm.r#type))?
                                     .canonical_entity();
                             props.insert(name.clone(), val);
                         }

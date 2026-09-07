@@ -108,16 +108,16 @@ impl ScalarPluginFn for ValueRowFn {
 fn columnar_to_values(c: &ColumnarValue, rows: usize) -> Result<Vec<Value>, FnError> {
     match c {
         ColumnarValue::Scalar(s) => {
-            let v = scalar_to_value(s);
+            let v = scalar_to_value(s)?;
             Ok(vec![v; rows])
         }
         ColumnarValue::Array(arr) => array_to_values(arr.as_ref()),
     }
 }
 
-fn scalar_to_value(s: &datafusion::scalar::ScalarValue) -> Value {
+fn scalar_to_value(s: &datafusion::scalar::ScalarValue) -> Result<Value, FnError> {
     use datafusion::scalar::ScalarValue;
-    match s {
+    Ok(match s {
         ScalarValue::Null => Value::Null,
         ScalarValue::Boolean(Some(b)) => Value::Bool(*b),
         ScalarValue::Boolean(None) => Value::Null,
@@ -127,13 +127,13 @@ fn scalar_to_value(s: &datafusion::scalar::ScalarValue) -> Value {
         ScalarValue::Float64(None) => Value::Null,
         ScalarValue::Utf8(Some(s)) => Value::String(s.clone()),
         ScalarValue::Utf8(None) => Value::Null,
-        ScalarValue::LargeBinary(Some(bytes)) => decode_cypher_value(bytes).unwrap_or(Value::Null),
+        ScalarValue::LargeBinary(Some(bytes)) => return decode_cypher_value(bytes),
         ScalarValue::LargeBinary(None) => Value::Null,
         // Other types: fall back to displaying as a String so the closure
         // sees something coherent. A future commit narrows this once the
         // legacy adapter is purely a transitional code path.
         _ => Value::String(s.to_string()),
-    }
+    })
 }
 
 fn array_to_values(arr: &dyn Array) -> Result<Vec<Value>, FnError> {
@@ -202,7 +202,7 @@ fn array_to_values(arr: &dyn Array) -> Result<Vec<Value>, FnError> {
                 out.push(if a.is_null(i) {
                     Value::Null
                 } else {
-                    decode_cypher_value(a.value(i)).unwrap_or(Value::Null)
+                    decode_cypher_value(a.value(i))?
                 });
             }
         }
@@ -242,8 +242,18 @@ fn encode_cypher_value(v: &Value) -> Result<Vec<u8>, FnError> {
     Ok(uni_common::cypher_value_codec::encode(v))
 }
 
-fn decode_cypher_value(bytes: &[u8]) -> Option<Value> {
-    uni_common::cypher_value_codec::decode(bytes).ok()
+/// Decode a CypherValue blob, reporting a corrupt payload rather than hiding it.
+///
+/// This returned `Option` and both callers turned `None` into `Value::Null` —
+/// which is a legal value, so a plugin received "absent" for a payload that
+/// could not be read (#233 class).
+fn decode_cypher_value(bytes: &[u8]) -> Result<Value, FnError> {
+    uni_common::cypher_value_codec::decode(bytes).map_err(|e| {
+        FnError::new(
+            FnError::CODE_TYPE_COERCION,
+            format!("CypherValue decode failed: {e}"),
+        )
+    })
 }
 
 #[cfg(test)]

@@ -12470,6 +12470,7 @@ dependencies = [
  "pest_derive",
  "serde",
  "thiserror 2.0.18",
+ "tracing",
  "uni-common",
 ]
 

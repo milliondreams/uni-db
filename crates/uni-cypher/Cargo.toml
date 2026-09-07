@@ -18,6 +18,9 @@ pest = "2.8"
 pest_derive = "2.8"
 serde = { workspace = true }
 thiserror = { workspace = true }
+# One call site: a `Bytes` literal that fails to decode is a parser/codec bug,
+# and `to_value` is infallible, so the alternative to logging it is silence.
+tracing = { workspace = true }
 uni-common = { workspace = true }
 
 [[test]]

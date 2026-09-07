@@ -1532,14 +1532,22 @@ fn map_to_schemaless_output_schema(
                 let mut prop_values: HashMap<Vid, Properties> = HashMap::new();
                 for i in 0..batch.num_rows() {
                     let vid = Vid::from(vid_arr.value(i));
-                    let resolved =
-                        resolve_l0_property(&vid, prop, l0_ctx)
-                            .flatten()
-                            .or_else(|| {
-                                extract_from_overflow_blob(props_arr, i, prop).and_then(|bytes| {
-                                    uni_common::cypher_value_codec::decode(&bytes).ok()
-                                })
-                            });
+                    // A corrupt overflow blob used to make the property simply
+                    // absent, which downstream reads as NULL — indistinguishable
+                    // from a property this row genuinely lacks (#233 class).
+                    let resolved = match resolve_l0_property(&vid, prop, l0_ctx).flatten() {
+                        Some(v) => Some(v),
+                        None => match extract_from_overflow_blob(props_arr, i, prop) {
+                            Some(bytes) => Some(
+                                uni_common::cypher_value_codec::decode(&bytes).map_err(|e| {
+                                    datafusion::error::DataFusionError::Execution(format!(
+                                        "overflow property `{prop}` failed to decode: {e}"
+                                    ))
+                                })?,
+                            ),
+                            None => None,
+                        },
+                    };
                     if let Some(val) = resolved {
                         prop_values.insert(vid, HashMap::from([(prop.to_string(), val)]));
                     }

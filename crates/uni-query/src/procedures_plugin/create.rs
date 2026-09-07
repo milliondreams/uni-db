@@ -73,12 +73,16 @@ fn require_host<'a>(ctx: &ProcedureContext<'a>) -> Result<&'a QueryProcedureHost
 /// Decode a positional arg as JSON (LargeBinary-encoded by the
 /// dispatcher) or string/scalar fallback. Mirrors
 /// `graph.rs::arg_to_json`.
-fn arg_to_json(cv: &ColumnarValue) -> serde_json::Value {
-    match cv {
+/// A malformed argument is an error, not a JSON `null`: running the
+/// procedure on `null` reports success for a request that was never
+/// understood (#233 class).
+fn arg_to_json(cv: &ColumnarValue) -> Result<serde_json::Value, FnError> {
+    Ok(match cv {
         ColumnarValue::Scalar(ScalarValue::LargeBinary(Some(b)))
-        | ColumnarValue::Scalar(ScalarValue::Binary(Some(b))) => {
-            serde_json::from_slice::<serde_json::Value>(b).unwrap_or(serde_json::Value::Null)
-        }
+        | ColumnarValue::Scalar(ScalarValue::Binary(Some(b))) => serde_json::from_slice::<
+            serde_json::Value,
+        >(b)
+        .map_err(|e| FnError::new(0x820, format!("procedure argument is not valid JSON: {e}")))?,
         ColumnarValue::Scalar(ScalarValue::Utf8(Some(s)))
         | ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(s))) => {
             serde_json::Value::String(s.clone())
@@ -88,7 +92,7 @@ fn arg_to_json(cv: &ColumnarValue) -> serde_json::Value {
             serde_json::Value::Number((*i).into())
         }
         _ => serde_json::Value::Null,
-    }
+    })
 }
 
 fn arg_as_i64(cv: &ColumnarValue) -> Option<i64> {
@@ -204,10 +208,12 @@ impl ProcedurePlugin for VNodeProcedure {
         let labels_json = args
             .first()
             .map(arg_to_json)
+            .transpose()?
             .unwrap_or(serde_json::Value::Null);
         let props_json = args
             .get(1)
             .map(arg_to_json)
+            .transpose()?
             .unwrap_or(serde_json::Value::Null);
         let labels = labels_from_json(&labels_json);
         let props = properties_from_json(&props_json);
@@ -407,6 +413,7 @@ impl ProcedurePlugin for VEdgeProcedure {
         let props_json = args
             .get(2)
             .map(arg_to_json)
+            .transpose()?
             .unwrap_or(serde_json::Value::Null);
         let dst = args
             .get(3)

@@ -647,9 +647,13 @@ fn invoke_locy_generator(
     for i in 0..emitted {
         let mut tuple = Vec::with_capacity(out.columns.len());
         for col in &out.columns {
-            tuple.push(
-                uni_store::storage::arrow_convert::arrow_to_value(col, i, None).canonical_entity(),
-            );
+            let decoded =
+                uni_store::storage::arrow_convert::arrow_to_value(col, i, None).map_err(|e| {
+                    LocyError::EvaluationError {
+                        message: e.to_string(),
+                    }
+                })?;
+            tuple.push(decoded.canonical_entity());
         }
         tuples.push(tuple);
     }
@@ -896,12 +900,26 @@ pub fn record_batches_to_locy_rows(batches: &[RecordBatch]) -> Vec<FactRow> {
                 } else {
                     None
                 };
-                let value = uni_store::storage::arrow_convert::arrow_to_value(
+                // Documented exception (#233 class): `record_batches_to_locy_rows`
+                // is infallible by signature with 9+ callers across the Locy
+                // evaluation stack, so a failure cannot be reported from here.
+                // Logged, then degraded — the honest cost of not rippling the
+                // signature through that stack in this change.
+                let value = match uni_store::storage::arrow_convert::arrow_to_value(
                     column.as_ref(),
                     row_idx,
                     data_type,
-                )
-                .canonical_entity();
+                ) {
+                    Ok(v) => v.canonical_entity(),
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            column = %field.name(),
+                            "Locy fact row: column failed to decode"
+                        );
+                        uni_common::Value::Null
+                    }
+                };
                 row.insert(field.name().clone(), value);
             }
             normalize_graph_row(&mut row);

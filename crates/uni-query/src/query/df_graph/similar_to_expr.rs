@@ -146,7 +146,15 @@ fn arrow_to_value_at(col: &dyn Array, row: usize) -> Value {
             if bytes.is_empty() {
                 Value::Null
             } else {
-                uni_common::cypher_value_codec::decode(bytes).unwrap_or(Value::Null)
+                // Documented exception (#233 class): `arrow_to_value_at` is
+                // infallible and recursive inside a `PhysicalExpr`.
+                match uni_common::cypher_value_codec::decode(bytes) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::error!(error = %e, "similar_to: CypherValue failed to decode");
+                        Value::Null
+                    }
+                }
             }
         }
         DataType::Float64 => Value::Float(
@@ -224,7 +232,18 @@ fn arrow_to_value_at(col: &dyn Array, row: usize) -> Value {
         }
         // Same boundary as the other query-side decoders: an entity struct
         // decodes to its native form rather than a second encoding of it.
-        _ => uni_store::storage::arrow_convert::arrow_to_value(col, row, None).canonical_entity(),
+        // Documented exception (#233 class). `arrow_to_value_at` is infallible
+        // and recursive, and it sits inside a `PhysicalExpr` whose surrounding
+        // evaluation is `Value`-typed, so a failure has nowhere to go from
+        // here. Logged rather than swallowed; the value still degrades to
+        // Null, which is why this is an exception and not a fix.
+        _ => match uni_store::storage::arrow_convert::arrow_to_value(col, row, None) {
+            Ok(v) => v.canonical_entity(),
+            Err(e) => {
+                tracing::error!(error = %e, "similar_to: column value failed to decode");
+                Value::Null
+            }
+        },
     }
 }
 

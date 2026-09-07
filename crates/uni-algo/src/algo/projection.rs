@@ -887,10 +887,9 @@ impl ProjectionBuilder {
                     let Some(&slot) = slot_of.get(&vid_col.value(row)) else {
                         continue;
                     };
-                    if let Some(v) =
-                        uni_store::storage::arrow_convert::arrow_to_value(arr.as_ref(), row, None)
-                            .as_f64()
-                    {
+                    let decoded =
+                        uni_store::storage::arrow_convert::arrow_to_value(arr.as_ref(), row, None)?;
+                    if let Some(v) = decoded.as_f64() {
                         out[slot] = v;
                     }
                 }

@@ -221,6 +221,7 @@ impl EndpointHydrateStream {
         for row in 0..batch.num_rows() {
             let value =
                 uni_store::storage::arrow_convert::arrow_to_value(column.as_ref(), row, None)
+                    .map_err(|e| DataFusionError::Execution(e.to_string()))?
                     .canonical_entity();
             out.push(match &value {
                 Value::List(items) => items
@@ -238,6 +239,11 @@ impl EndpointHydrateStream {
         let Ok(idx) = batch.schema().index_of(&self.rel_column) else {
             return false;
         };
+        // Documented exception (#233 class): this is a *shape probe* choosing
+        // between two code paths, not a read whose value reaches an answer. A
+        // cell that fails to decode is not known to be a list, so it does not
+        // select the list path — and the real read that follows propagates the
+        // same failure, which is where it is reportable.
         (0..batch.num_rows()).any(|row| {
             matches!(
                 uni_store::storage::arrow_convert::arrow_to_value(
@@ -245,7 +251,7 @@ impl EndpointHydrateStream {
                     row,
                     None
                 ),
-                Value::List(_)
+                Ok(Value::List(_))
             )
         })
     }

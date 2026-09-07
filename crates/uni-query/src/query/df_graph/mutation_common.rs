@@ -346,7 +346,7 @@ pub fn batches_to_rows(batches: &[RecordBatch]) -> Result<Vec<HashMap<String, Va
                 } else {
                     None
                 };
-                let mut value = arrow_convert::arrow_to_value(column.as_ref(), row_idx, data_type)
+                let mut value = arrow_convert::arrow_to_value(column.as_ref(), row_idx, data_type)?
                     .canonical_entity();
 
                 // Check if this field contains JSON-encoded values (e.g., from UNWIND)

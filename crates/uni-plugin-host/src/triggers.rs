@@ -1183,7 +1183,22 @@ impl PreExistingProbe {
                     let mut props = Properties::new();
                     for (col_idx, col_name) in &property_cols {
                         let col = batch.column(*col_idx);
-                        let value = arrow_to_value(col.as_ref(), row, None);
+                        // Documented exception (#233 class): `extend_with_l1`
+                        // returns `()` and its contract is to degrade rather
+                        // than fail the commit, so a decode failure has no
+                        // channel here. Logged and the property omitted — the
+                        // pre-image is already best-effort by design.
+                        let value = match arrow_to_value(col.as_ref(), row, None) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
+                                    column = %col_name,
+                                    "trigger pre-image: column failed to decode"
+                                );
+                                continue;
+                            }
+                        };
                         if !matches!(value, uni_common::Value::Null) {
                             props.insert(col_name.clone(), value);
                         }

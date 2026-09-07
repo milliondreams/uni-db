@@ -1072,11 +1072,7 @@ impl Executor {
             // lists, decimals, ...) formerly fell through a StringArray downcast
             // that failed and returned Null — so COPY FROM silently dropped those
             // columns. Delegate to the shared, exhaustive arrow->Value decoder.
-            _ => Ok(uni_store::storage::arrow_convert::arrow_to_value(
-                column.as_ref(),
-                row_idx,
-                None,
-            )),
+            _ => uni_store::storage::arrow_convert::arrow_to_value(column.as_ref(), row_idx, None),
         }
     }
 
@@ -1982,10 +1978,10 @@ impl Executor {
                             col.as_ref(),
                             row,
                             None,
-                        );
-                        (k.clone(), Self::canonical_key_value(&v))
+                        )?;
+                        Ok((k.clone(), Self::canonical_key_value(&v)))
                     })
-                    .collect();
+                    .collect::<Result<MergeKey>>()?;
                 if keys.contains(&tuple) {
                     out.entry(tuple).or_default().push(vid);
                 }

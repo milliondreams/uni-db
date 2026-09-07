@@ -3274,7 +3274,19 @@ fn batch_row_to_value_map(
         .enumerate()
         .map(|(col_idx, field)| {
             let col = batch.column(col_idx);
-            let val = arrow_to_value(col.as_ref(), row_idx, None).canonical_entity();
+            // Documented exception (#233 class): this builds a plain
+            // `HashMap` and has no error channel. Logged, then degraded.
+            let val = match arrow_to_value(col.as_ref(), row_idx, None) {
+                Ok(v) => v.canonical_entity(),
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        column = %field.name(),
+                        "fixpoint row: column failed to decode"
+                    );
+                    uni_common::Value::Null
+                }
+            };
             (field.name().clone(), val)
         })
         .collect()
@@ -4629,7 +4641,16 @@ fn extract_common_value(col: &dyn arrow_array::Array, row_idx: usize) -> uni_com
         if bytes.is_empty() {
             return uni_common::Value::Null;
         }
-        return uni_common::cypher_value_codec::decode(bytes).unwrap_or(uni_common::Value::Null);
+        // Documented exception (#233 class): `extract_common_value` is
+        // infallible with several callers inside the fixpoint loop, so a
+        // corrupt cell has no error channel here. Logged, then degraded.
+        return match uni_common::cypher_value_codec::decode(bytes) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(error = %e, "Locy value: CypherValue failed to decode");
+                uni_common::Value::Null
+            }
+        };
     }
     uni_common::Value::Null
 }
@@ -4662,7 +4683,15 @@ fn extract_feature_value(col: &dyn arrow_array::Array, row_idx: usize) -> uni_lo
         if bytes.is_empty() {
             return uni_locy::FeatureValue::Null;
         }
-        let v = uni_common::cypher_value_codec::decode(bytes).unwrap_or(uni_common::Value::Null);
+        // Documented exception (#233 class), as `extract_common_value` above:
+        // `extract_feature_value` is infallible by signature.
+        let v = match uni_common::cypher_value_codec::decode(bytes) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(error = %e, "Locy feature: CypherValue failed to decode");
+                uni_common::Value::Null
+            }
+        };
         return match v {
             uni_common::Value::Float(f) => uni_locy::FeatureValue::Float(f),
             uni_common::Value::Int(i) => uni_locy::FeatureValue::Int(i),

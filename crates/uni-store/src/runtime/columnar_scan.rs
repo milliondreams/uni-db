@@ -198,7 +198,7 @@ pub fn build_all_props_column_for_schema_scan(
     overflow_arr: Option<&arrow_array::LargeBinaryArray>,
     projected_properties: &[String],
     l0_ctx: &L0Context,
-) -> ArrayRef {
+) -> anyhow::Result<ArrayRef> {
     // Collect schema-defined property column names (non-internal, non-overflow, non-_all_props)
     let schema_props: Vec<&str> = projected_properties
         .iter()
@@ -217,7 +217,7 @@ pub fn build_all_props_column_for_schema_scan(
         // 1. Schema-defined columns
         for &prop in &schema_props {
             if let Some(col) = batch.column_by_name(prop) {
-                let val = arrow_convert::arrow_to_value(col.as_ref(), i, None);
+                let val = arrow_convert::arrow_to_value(col.as_ref(), i, None)?;
                 if !val.is_null() {
                     merged_props.insert(prop.to_string(), val);
                 }
@@ -251,7 +251,7 @@ pub fn build_all_props_column_for_schema_scan(
             )));
         }
     }
-    Arc::new(builder.finish())
+    Ok(Arc::new(builder.finish()))
 }
 
 /// Get the property value for a VID, returning None if not found.
@@ -2004,7 +2004,7 @@ pub fn map_to_output_schema(
                     overflow_arr,
                     projected_properties,
                     l0_ctx,
-                );
+                )?;
                 columns.push(col);
             }
         } else {
@@ -2419,7 +2419,8 @@ mod tests {
             Some(&overflow_arr),
             &["score".to_string()],
             &L0Context::empty(),
-        );
+        )
+        .expect("schema-scan props column must build");
 
         let out = out
             .as_any()

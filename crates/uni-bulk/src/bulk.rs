@@ -121,22 +121,23 @@ pub fn record_batch_to_property_maps(
         let mut props = HashMap::with_capacity(schema.fields().len());
         for (col_idx, field) in schema.fields().iter().enumerate() {
             let col = batch.column(col_idx);
-            let value =
-                uni_store::storage::arrow_convert::arrow_to_value(col.as_ref(), row_idx, None);
-            // #233 Tier 1: `arrow_to_value` answers `Null` both for a genuine
-            // null AND for a type it has no decoder arm for. Dropping every
-            // null therefore dropped the whole column for an unsupported type
-            // while `BulkStats` still reported a full ingest. Comparing
-            // against the Arrow null bitmap separates the two.
-            if value.is_null() && !col.is_null(row_idx) {
-                return Err(anyhow::anyhow!(
-                    "bulk ingest: column `{}` of type {} could not be decoded at row {row_idx}; \
-                     silently dropping it would report a full ingest with the property missing \
-                     from every row",
+            // `arrow_to_value` used to answer `Null` both for a genuine null and
+            // for a type it had no decoder arm for, so this compared against the
+            // Arrow null bitmap to tell them apart — reconstructing by hand a
+            // distinction the return type could not carry. It carries it now.
+            let value = uni_store::storage::arrow_convert::arrow_to_value(
+                col.as_ref(),
+                row_idx,
+                None,
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "bulk ingest: column `{}` of type {} could not be decoded at row {row_idx}: \
+                     {e}",
                     field.name(),
                     col.data_type()
-                ));
-            }
+                )
+            })?;
             if !value.is_null() {
                 props.insert(field.name().clone(), value);
             }

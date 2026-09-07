@@ -157,7 +157,7 @@ pub fn splice_fde_batch(
     let mut flat: Vec<f32> = Vec::with_capacity(nrows * fde_dim);
     if let Some(src) = batch.column_by_name(&spec.source_prop) {
         for row in 0..nrows {
-            let val = arrow_to_value(src.as_ref(), row, source_dt);
+            let val = arrow_to_value(src.as_ref(), row, source_dt)?;
             let tokens = value_to_multivec(&val);
             let fde = encoder.encode_doc(&tokens)?;
             debug_assert_eq!(fde.len(), fde_dim);

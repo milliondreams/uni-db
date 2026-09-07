@@ -461,9 +461,19 @@ fn coerce_plugin_scalar_arg(
         ))
     };
 
-    let decoded = |row: usize| {
-        uni_store::storage::arrow_convert::arrow_to_value(array.as_ref(), row, None)
-            .canonical_entity()
+    // Documented exception (#233 class): this closure feeds several arms of the
+    // `match target` below that build `ArrayRef`s from infallible iterators, so
+    // a `Result` here would restructure each of them. Logged, then degraded.
+    let decoded = |row: usize| match uni_store::storage::arrow_convert::arrow_to_value(
+        array.as_ref(),
+        row,
+        None,
+    ) {
+        Ok(v) => v.canonical_entity(),
+        Err(e) => {
+            tracing::error!(error = %e, "plugin UDF argument failed to decode");
+            uni_common::Value::Null
+        }
     };
 
     let out: ArrayRef = match target {

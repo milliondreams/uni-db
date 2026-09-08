@@ -78,12 +78,16 @@ fn require_host<'a>(ctx: &ProcedureContext<'a>) -> Result<&'a QueryProcedureHost
 /// Decode a positional arg into a `serde_json::Value`. Mirrors the
 /// algo adapter's decoder (LargeBinary → JSON for Map / List; scalars
 /// pass through).
-fn arg_to_json(cv: &ColumnarValue) -> serde_json::Value {
-    match cv {
+/// A malformed argument is an error, not a JSON `null`: running the
+/// procedure on `null` reports success for a request that was never
+/// understood (#233 class).
+fn arg_to_json(cv: &ColumnarValue) -> Result<serde_json::Value, FnError> {
+    Ok(match cv {
         ColumnarValue::Scalar(ScalarValue::LargeBinary(Some(b)))
-        | ColumnarValue::Scalar(ScalarValue::Binary(Some(b))) => {
-            serde_json::from_slice::<serde_json::Value>(b).unwrap_or(serde_json::Value::Null)
-        }
+        | ColumnarValue::Scalar(ScalarValue::Binary(Some(b))) => serde_json::from_slice::<
+            serde_json::Value,
+        >(b)
+        .map_err(|e| FnError::new(0x820, format!("procedure argument is not valid JSON: {e}")))?,
         ColumnarValue::Scalar(ScalarValue::Utf8(Some(s)))
         | ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(s))) => {
             serde_json::Value::String(s.clone())
@@ -93,7 +97,7 @@ fn arg_to_json(cv: &ColumnarValue) -> serde_json::Value {
             serde_json::Value::Number((*i).into())
         }
         _ => serde_json::Value::Null,
-    }
+    })
 }
 
 fn arg_as_string(cv: &ColumnarValue) -> Option<String> {
@@ -185,6 +189,7 @@ impl ProcedurePlugin for ProjectProcedure {
         let graph_ref = args
             .get(1)
             .map(arg_to_json)
+            .transpose()?
             .ok_or_else(|| FnError::new(0x824, "uni.graph.project: graphRef (Map) required"))?;
         let projection_input = parse_graph_ref(&graph_ref)
             .map_err(|e| FnError::new(0x820, format!("graphRef parse: {e}")))?;

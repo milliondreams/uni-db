@@ -50,6 +50,45 @@ const RULE_C: (&str, &str) = (
      or ask the schema, rather than matching error text",
 );
 
+/// Rule D — a decode failure substituted with a default.
+///
+/// `Value::Null` is a legal property value everywhere in this codebase, so a
+/// decoder that answers `Null` when it cannot read the bytes reports "absent"
+/// for "unreadable" and the caller persists the difference. Propagate; where an
+/// infallible signature makes that impossible, log through `tracing` and say at
+/// the site why it cannot.
+///
+/// Deliberately keyed on the decode call rather than on `eprintln!`: the
+/// announcement is incidental — most of this class says nothing at all — and an
+/// `eprintln!` needle would flag CLI output, `#[cfg(test)]` blocks under `src/`
+/// and the `UNI_DUMP_PHYSICAL` facility, which is the budget inflation this
+/// file exists to avoid.
+const RULE_D: (&str, &str) = (
+    // A label, not a needle: the needles live in `DECODERS`, because this rule
+    // spans several of them.
+    "a stored-blob decode",
+    "a decode failure must not become a default value; propagate it, or log \
+     through tracing and record at the site why the signature cannot",
+);
+
+/// The decoders Rule D watches: every entry point that turns a *stored blob*
+/// back into a value.
+///
+/// Scoped to stored blobs on purpose. An earlier revision keyed only on
+/// `codec::decode(`, drawn around the sites that had just been fixed rather
+/// than around the class — and three more survived it, one of them in the very
+/// file the fix had converted (`arrow_convert.rs`'s CRDT arm, a
+/// `Crdt::from_msgpack(..).ok()` that landed on `Value::Null`).
+///
+/// `serde_json::from_str` is deliberately *not* here, and that is a scope
+/// decision rather than an oversight: its ~11 workspace uses are config
+/// parsing and format probes, where a parse failure legitimately means "not
+/// this format, try the next" and no stored value is being reconstructed.
+/// Adding it would force eleven budget entries that say nothing, diluting the
+/// signal this ratchet exists to carry. If a `from_str` ever decodes a stored
+/// blob, add it here rather than budgeting it there.
+const DECODERS: [&str; 3] = ["codec::decode(", "from_msgpack(", "rmp_serde::from_"];
+
 /// Files permitted to break a rule, with the count and the reason. Audited;
 /// none is a leftover. Lower a number only by removing a use.
 fn budget(rule: &str) -> Vec<(&'static str, usize)> {
@@ -57,6 +96,28 @@ fn budget(rule: &str) -> Vec<(&'static str, usize)> {
         // `store_utils` IS the typed classifier, and `resilient_store` documents
         // in a comment why the string form was wrong. Both are tests//docs of
         // the rule rather than violations of it.
+        // A plugin yielding opaque bytes produces an unmarked LargeBinary
+        // column, because no loader stamps `uni_raw_bytes` on a yield field.
+        // Erroring there breaks every such plugin at the CALL site; the
+        // contract is pinned by
+        // `undecodable_bytes_fall_back_instead_of_erroring`.
+        "a stored-blob decode" => vec![
+            ("crates/uni-query/src/query/executor/procedure.rs", 1),
+            // Same ambiguity, one layer down. A `LargeBinary` column carries
+            // either a CypherValue or raw `Bytes`, and only the field's
+            // `uni_raw_bytes` marker separates them — so this arm can only
+            // sniff, and it degrades to `Value::Bytes`, which carries the
+            // payload, rather than to `Value::Null`, which was a legal value
+            // and the actual defect. The arms that do know their type (BTIC,
+            // the shape mismatches, the terminal fallback) error.
+            //
+            // The reach of that sniff is bounded by callers passing the hint:
+            // `type_hint_for_field` exists for exactly that, and every caller
+            // with a `Field` in scope now uses it. What remains is callers that
+            // genuinely hold only an `ArrayRef` — a UDF handed one column, a
+            // Locy output tuple — where nothing has recorded which kind it is.
+            ("crates/uni-store/src/storage/arrow_convert.rs", 1),
+        ],
         "contains(\"not found\")" => vec![
             ("crates/uni-store/src/store_utils.rs", 1),
             ("crates/uni-store/src/storage/resilient_store.rs", 2),
@@ -85,6 +146,45 @@ fn source_files(dir: &Path, out: &mut Vec<PathBuf>) {
             out.push(path);
         }
     }
+}
+
+/// Count decode calls whose failure is turned into a default.
+///
+/// A three-line window rather than one: rustfmt routinely wraps
+/// `.unwrap_or(..)` onto the following line, and a `match` arm that yields a
+/// default sits further still. Over-counting is the safe direction — a false
+/// hit is answered by reading the site and either fixing it or budgeting it.
+fn defaults_a_decode(text: &str) -> usize {
+    // Comment-only lines are blanked rather than dropped, so the three-line
+    // window keeps its alignment with the source. Without this the rule counts
+    // its own documentation: `cypher_value_codec.rs` explains the #233 fix by
+    // quoting the shape it removed (`rmp_serde::from_slice(..).ok()`), and a
+    // raw scan reads that prose as a live violation.
+    let lines: Vec<&str> = text
+        .lines()
+        .map(|l| {
+            if l.trim_start().starts_with("//") {
+                ""
+            } else {
+                l
+            }
+        })
+        .collect();
+    let mut hits = 0;
+    for (i, line) in lines.iter().enumerate() {
+        if !DECODERS.iter().any(|d| line.contains(d)) {
+            continue;
+        }
+        let window = lines[i..(i + 3).min(lines.len())].join(" ");
+        if window.contains("unwrap_or")
+            || window.contains("unwrap_or_else")
+            || window.contains("unwrap_or_default")
+            || window.contains(").ok()")
+        {
+            hits += 1;
+        }
+    }
+    hits
 }
 
 /// True when `line` both mentions `needle` and swallows its result.
@@ -116,7 +216,7 @@ fn no_new_site_reopens_a_settled_fail_open_decision() {
 
     let mut problems = Vec::new();
 
-    for (needle, remedy) in [RULE_A, RULE_B, RULE_C] {
+    for (needle, remedy) in [RULE_A, RULE_B, RULE_C, RULE_D] {
         let allowed = budget(needle);
         let mut actual: Vec<(String, usize)> = Vec::new();
 
@@ -137,6 +237,11 @@ fn no_new_site_reopens_a_settled_fail_open_decision() {
                 // Rule C is about the classification itself, not about
                 // discarding a Result, so it is a plain substring rule.
                 text.matches(needle).count()
+            } else if needle == RULE_D.0 {
+                // Rule D needs a window: the substitution is often on the line
+                // after the decode (`.unwrap_or(..)` wrapped by rustfmt, or a
+                // `match` arm), so a line-scoped test would miss it.
+                defaults_a_decode(&text)
             } else {
                 text.lines().filter(|l| swallows(l, needle)).count()
             };

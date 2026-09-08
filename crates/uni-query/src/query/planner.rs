@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
 
+use crate::query::df_expr::VariableKind;
 use crate::query::pushdown::{PredicateAnalyzer, try_label_or_to_union, try_type_or_to_union};
 use anyhow::{Result, anyhow};
 use arrow_array::RecordBatch;
@@ -4333,6 +4334,24 @@ impl QueryPlanner {
                 op,
                 expr: Box::new(Self::rewrite_id_to_vid(*inner, vars_in_scope)),
             },
+            // `IN` recurses for the same reason `=` does, and its absence was
+            // load-bearing: `extract_vid_from_cypher_filter`'s `Expr::In` arm
+            // matches `Property(Variable, "_vid")`, so while `id(n) IN [...]`
+            // stayed a function call the multi-VID Lance pushdown (#55) could
+            // not fire from any Cypher a user would write. `id(n) = 5` reached
+            // it only because `=` is a `BinaryOp` and was already rewritten.
+            Expr::In { expr: inner, list } => Expr::In {
+                expr: Box::new(Self::rewrite_id_to_vid(*inner, vars_in_scope)),
+                list: Box::new(Self::rewrite_id_to_vid(*list, vars_in_scope)),
+            },
+            // Reached through the arm above, so a list holding `id(m)` is
+            // rewritten consistently with the value it is compared against.
+            Expr::List(items) => Expr::List(
+                items
+                    .into_iter()
+                    .map(|item| Self::rewrite_id_to_vid(item, vars_in_scope))
+                    .collect(),
+            ),
             other => other,
         }
     }
@@ -4378,7 +4397,24 @@ impl QueryPlanner {
         // Track variables introduced by this OPTIONAL MATCH
         let vars_before_pattern = vars_in_scope.len();
 
-        for path in &match_clause.pattern.paths {
+        // Plan a path that anchors before one that has to scan, where the
+        // pattern allows it; see `ordered_path_indices`. Declined for OPTIONAL
+        // MATCH, whose null-extension is defined over the pattern as a whole
+        // and is not worth reasoning about alongside a reorder.
+        let reordered = if match_clause.optional {
+            None
+        } else {
+            Self::ordered_path_indices(&match_clause.pattern.paths, vars_in_scope)
+        };
+        let paths: Vec<&PathPattern> = match &reordered {
+            Some(order) => order
+                .iter()
+                .map(|&i| &match_clause.pattern.paths[i])
+                .collect(),
+            None => match_clause.pattern.paths.iter().collect(),
+        };
+
+        for path in paths {
             if let Some(mode) = &path.shortest_path_mode {
                 plan =
                     self.plan_shortest_path(path, plan, vars_in_scope, mode, vars_before_pattern)?;
@@ -4675,12 +4711,11 @@ impl QueryPlanner {
         if path.elements.len() < 3 {
             return None;
         }
-        // Quantified segments carry per-step directions of their own.
-        if path
-            .elements
-            .iter()
-            .any(|e| matches!(e, PatternElement::Parenthesized { .. }))
-        {
+        // A quantified segment reverses with the rest, but only when it names
+        // nothing inside: its inner variables are group variables bound in
+        // traversal order, and reversing would reverse the lists a user reads
+        // back (#224).
+        if !Self::quantified_segments_are_anonymous(&path.elements) {
             return None;
         }
 
@@ -4698,22 +4733,220 @@ impl QueryPlanner {
             return None;
         }
 
-        let mut elements: Vec<PatternElement> = path.elements.iter().rev().cloned().collect();
-        for element in &mut elements {
-            if let PatternElement::Relationship(rel) = element {
-                rel.direction = match rel.direction {
-                    Direction::Outgoing => Direction::Incoming,
-                    Direction::Incoming => Direction::Outgoing,
-                    Direction::Both => Direction::Both,
-                };
-            }
-        }
-
         Some(PathPattern {
             variable: None,
-            elements,
+            elements: Self::reversed_elements(&path.elements),
             shortest_path_mode: None,
         })
+    }
+
+    /// Reverse a run of pattern elements, flipping every relationship.
+    ///
+    /// Sound as a plan rewrite because `source_variable` names the traversal
+    /// *start*, not the arrow's tail: `endpoints_for_direction` resolves
+    /// `(source = a, Incoming)` and `(source = b, Outgoing)` to the same pair,
+    /// so `startNode`/`endNode` and the relationship value are unaffected.
+    ///
+    /// A quantified segment is reversed in place by the same rule. That is only
+    /// sound when it binds no group variables — see
+    /// [`Self::quantified_segments_are_anonymous`].
+    fn reversed_elements(elements: &[PatternElement]) -> Vec<PatternElement> {
+        let flip = |d: &Direction| match d {
+            Direction::Outgoing => Direction::Incoming,
+            Direction::Incoming => Direction::Outgoing,
+            Direction::Both => Direction::Both,
+        };
+        let mut out: Vec<PatternElement> = elements.iter().rev().cloned().collect();
+        for element in &mut out {
+            match element {
+                PatternElement::Relationship(rel) => rel.direction = flip(&rel.direction),
+                PatternElement::Parenthesized { pattern, .. } => {
+                    pattern.elements = Self::reversed_elements(&pattern.elements);
+                }
+                PatternElement::Node(_) => {}
+            }
+        }
+        out
+    }
+
+    /// Whether every quantified segment in `elements` names nothing inside.
+    ///
+    /// A quantified pattern binds its inner nodes and relationships as GQL
+    /// *group variables* — a list with one entry per iteration, in traversal
+    /// order. Reversing the walk would reverse those lists, which is a change a
+    /// user can see, so reversal is only semantics-preserving when there are no
+    /// such variables to reverse. Mirrors the `inner_is_anonymous` test the QPP
+    /// planner already applies for its own delegation decision.
+    fn quantified_segments_are_anonymous(elements: &[PatternElement]) -> bool {
+        let unnamed = |v: Option<&String>| v.is_none_or(|v| v.is_empty());
+        elements.iter().all(|element| match element {
+            PatternElement::Parenthesized { pattern, .. } => {
+                pattern.elements.iter().all(|inner| match inner {
+                    PatternElement::Node(n) => unnamed(n.variable.as_ref()),
+                    PatternElement::Relationship(r) => unnamed(r.variable.as_ref()),
+                    // A nested quantifier is rejected by the QPP planner; do not
+                    // reverse something this cannot reason about.
+                    PatternElement::Parenthesized { .. } => false,
+                })
+            }
+            _ => true,
+        })
+    }
+
+    /// Every variable a path binds, for deciding which paths anchor which.
+    fn path_variables(path: &PathPattern) -> HashSet<String> {
+        let mut out = HashSet::new();
+        if let Some(v) = &path.variable {
+            out.insert(v.clone());
+        }
+        for element in &path.elements {
+            let named = match element {
+                PatternElement::Node(n) => n.variable.as_ref(),
+                PatternElement::Relationship(r) => r.variable.as_ref(),
+                // A quantified segment scopes its own interior; its endpoints
+                // are ordinary nodes at this level and are seen above.
+                PatternElement::Parenthesized { .. } => None,
+            };
+            if let Some(v) = named.filter(|v| !v.is_empty()) {
+                out.insert(v.clone());
+            }
+        }
+        out
+    }
+
+    /// Comma-separated paths reordered so each one anchors on an earlier one.
+    ///
+    /// `MATCH (a)-[:R]->(b), (forum)-[:S]->(a)` is planned left to right, so the
+    /// first path scans every `a` and cross-joins before the second — which is
+    /// bound, and shares `a` — ever runs. Planning the bound path first leaves
+    /// `a` in scope, and the other becomes an anchored traversal (#224).
+    ///
+    /// Greedy and statistics-free: repeatedly take the first path sharing a
+    /// variable with something already in scope, falling back to the first
+    /// unplanned path when the pattern is genuinely disconnected. Choosing
+    /// *between* several connected candidates is where cardinality would be
+    /// needed, and this does not attempt it — it takes the leftmost, so a
+    /// pattern that was already well ordered is left exactly as written.
+    ///
+    /// Reordering is sound because comma-separated paths are a conjunction: the
+    /// result set does not depend on the order they are matched in, only the
+    /// plan shape does. Returns `None` when the order would not change, so the
+    /// common case allocates nothing and the plan is untouched.
+    fn ordered_path_indices(
+        paths: &[PathPattern],
+        vars_in_scope: &[VariableInfo],
+    ) -> Option<Vec<usize>> {
+        if paths.len() < 2 {
+            return None;
+        }
+        // `plan_shortest_path` has its own source/target contract; leave any
+        // clause containing one alone rather than reason about both at once.
+        if paths.iter().any(|p| p.shortest_path_mode.is_some()) {
+            return None;
+        }
+
+        let per_path: Vec<HashSet<String>> = paths.iter().map(Self::path_variables).collect();
+        let mut connected: HashSet<String> = vars_in_scope.iter().map(|v| v.name.clone()).collect();
+        let mut taken = vec![false; paths.len()];
+        let mut order = Vec::with_capacity(paths.len());
+
+        for _ in 0..paths.len() {
+            let next = (0..paths.len())
+                .find(|&i| !taken[i] && per_path[i].iter().any(|v| connected.contains(v)))
+                .or_else(|| (0..paths.len()).find(|&i| !taken[i]))?;
+            taken[next] = true;
+            connected.extend(per_path[next].iter().cloned());
+            order.push(next);
+        }
+
+        if order.iter().copied().eq(0..paths.len()) {
+            None
+        } else {
+            Some(order)
+        }
+    }
+
+    /// A middle-bound path split into two walks that both start at the anchor.
+    ///
+    /// [`Self::reversed_for_bound_anchor`] handles a bound node at one *end* by
+    /// walking the other way. When the only bound node is in the middle, no
+    /// single direction helps: whichever end the walk starts from is unbound, so
+    /// it scans everything and cross-joins. Anchoring in the middle and
+    /// expanding both ways is the plan that works, and it needs no statistics —
+    /// only which variables are already in scope, which `plan_path` has (#224).
+    ///
+    /// The split returns `(toward_start, toward_end)`, both beginning at the
+    /// anchor. The first is the left side reversed, with each relationship's
+    /// direction flipped, which is sound for the reason reversal is sound at an
+    /// end: `source_variable` names the traversal start rather than the arrow's
+    /// tail, so `endpoints_for_direction` resolves the same pair either way.
+    ///
+    /// The anchor appears as the first element of both halves. That is what
+    /// makes each half plan as a traversal from a bound node rather than a scan,
+    /// and it is why planning them in sequence joins them on the anchor instead
+    /// of cross-joining.
+    ///
+    /// Deliberately narrow, matching its sibling: no path variable, no
+    /// shortestPath, no quantified segment. Returns `None` when either end is
+    /// bound, because those cases are already handled — left-to-right when the
+    /// first is bound, reversal when the last is.
+    fn split_at_bound_anchor(
+        path: &PathPattern,
+        vars_in_scope: &[VariableInfo],
+    ) -> Option<(PathPattern, PathPattern)> {
+        // A path variable binds nodes and edges in traversal order; two walks
+        // out of the middle do not produce that order.
+        if path.variable.is_some() || path.shortest_path_mode.is_some() {
+            return None;
+        }
+        // Needs a node, a relationship, the anchor, a relationship and a node
+        // before there is a middle to anchor on.
+        if path.elements.len() < 5 {
+            return None;
+        }
+        // Quantified segments carry per-step directions of their own.
+        if path
+            .elements
+            .iter()
+            .any(|e| matches!(e, PatternElement::Parenthesized { .. }))
+        {
+            return None;
+        }
+
+        let bound_node = |element: &PatternElement| match element {
+            PatternElement::Node(n) => n
+                .variable
+                .as_deref()
+                .is_some_and(|v| !v.is_empty() && is_var_in_scope(vars_in_scope, v)),
+            _ => false,
+        };
+
+        // Either end bound is someone else's case.
+        if bound_node(path.elements.first()?) || bound_node(path.elements.last()?) {
+            return None;
+        }
+
+        // Nodes sit at even indices; the interior ones are the candidates. The
+        // first bound one is as good as any without cardinality to choose by,
+        // which is the part of #224 this increment does not attempt.
+        let anchor = (2..path.elements.len() - 2)
+            .step_by(2)
+            .find(|&i| bound_node(&path.elements[i]))?;
+
+        let toward_start = Self::reversed_elements(&path.elements[..=anchor]);
+
+        Some((
+            PathPattern {
+                variable: None,
+                elements: toward_start,
+                shortest_path_mode: None,
+            },
+            PathPattern {
+                variable: None,
+                elements: path.elements[anchor..].to_vec(),
+                shortest_path_mode: None,
+            },
+        ))
     }
 
     /// Plan a regular MATCH path (not shortestPath).
@@ -4725,6 +4958,28 @@ impl QueryPlanner {
         optional: bool,
         vars_before_pattern: usize,
     ) -> Result<LogicalPlan> {
+        // A bound node in the middle becomes two walks out of it, neither of
+        // which begins with an unbound scan; see `split_at_bound_anchor`.
+        //
+        // Each half starts at the anchor, which is in scope, so neither half
+        // splits or reverses again and the recursion is one level deep.
+        if let Some((toward_start, toward_end)) = Self::split_at_bound_anchor(path, vars_in_scope) {
+            let plan = self.plan_path(
+                &toward_start,
+                plan,
+                vars_in_scope,
+                optional,
+                vars_before_pattern,
+            )?;
+            return self.plan_path(
+                &toward_end,
+                plan,
+                vars_in_scope,
+                optional,
+                vars_before_pattern,
+            );
+        }
+
         // Start the walk at the bound end when the pattern was written from the
         // unbound one; see `reversed_for_bound_anchor`.
         let reversed_storage;
@@ -9552,7 +9807,14 @@ impl QueryPlanner {
 /// Returns a mapping of variable name → property names (e.g., "e" → {"dept", "salary"}).
 pub fn collect_properties_from_plan(plan: &LogicalPlan) -> HashMap<String, HashSet<String>> {
     let mut properties: HashMap<String, HashSet<String>> = HashMap::new();
-    collect_properties_recursive(plan, &mut properties);
+    // Which variables are entities, read from the same plan and by the same
+    // function the physical planner uses to decide whether a comparison lowers
+    // to an identity test. Sharing the source is what keeps the two from
+    // disagreeing: a variable this pass believes is a node, and therefore
+    // declines to widen, is the variable that side will rewrite to `_vid`.
+    let mut kinds: HashMap<String, VariableKind> = HashMap::new();
+    crate::query::df_planner::collect_variable_kinds(plan, &mut kinds);
+    collect_properties_recursive(plan, &mut properties, &kinds);
     properties
 }
 
@@ -9870,6 +10132,7 @@ fn blank_unwind_sources(plan: LogicalPlan) -> LogicalPlan {
 fn collect_properties_recursive(
     plan: &LogicalPlan,
     properties: &mut HashMap<String, HashSet<String>>,
+    kinds: &HashMap<String, VariableKind>,
 ) {
     match plan {
         LogicalPlan::Window {
@@ -9878,9 +10141,9 @@ fn collect_properties_recursive(
         } => {
             // Collect from window expressions
             for expr in window_exprs {
-                collect_properties_from_expr_into(expr, properties);
+                collect_properties_from_expr_into(expr, properties, kinds);
             }
-            collect_properties_recursive(input, properties);
+            collect_properties_recursive(input, properties, kinds);
         }
         LogicalPlan::Project { input, projections } => {
             for (expr, alias) in projections {
@@ -9910,22 +10173,22 @@ fn collect_properties_recursive(
                             .insert(format!("{ALIAS_OF_PREFIX}{src}"));
                     }
                 } else {
-                    collect_properties_from_expr_into(expr, properties);
+                    collect_properties_from_expr_into(expr, properties, kinds);
                 }
             }
-            collect_properties_recursive(input, properties);
+            collect_properties_recursive(input, properties, kinds);
         }
         LogicalPlan::Sort { input, order_by } => {
             for sort_item in order_by {
-                collect_properties_from_expr_into(&sort_item.expr, properties);
+                collect_properties_from_expr_into(&sort_item.expr, properties, kinds);
             }
-            collect_properties_recursive(input, properties);
+            collect_properties_recursive(input, properties, kinds);
         }
         LogicalPlan::Filter {
             input, predicate, ..
         } => {
-            collect_properties_from_expr_into(predicate, properties);
-            collect_properties_recursive(input, properties);
+            collect_properties_from_expr_into(predicate, properties, kinds);
+            collect_properties_recursive(input, properties, kinds);
         }
         LogicalPlan::Aggregate {
             input,
@@ -9959,39 +10222,39 @@ fn collect_properties_recursive(
                         .or_default()
                         .insert(WITH_PASSTHROUGH_SENTINEL.to_string());
                 } else {
-                    collect_properties_from_expr_into(expr, properties);
+                    collect_properties_from_expr_into(expr, properties, kinds);
                 }
             }
             for expr in aggregates {
                 // Aggregate *arguments* are unchanged: `collect(n)` really does
                 // return the entity whole, and narrowing it would be a wrong
                 // answer rather than a smaller one.
-                collect_properties_from_expr_into(expr, properties);
+                collect_properties_from_expr_into(expr, properties, kinds);
             }
-            collect_properties_recursive(input, properties);
+            collect_properties_recursive(input, properties, kinds);
         }
         LogicalPlan::Scan {
             filter: Some(expr), ..
         } => {
-            collect_properties_from_expr_into(expr, properties);
+            collect_properties_from_expr_into(expr, properties, kinds);
         }
         LogicalPlan::Scan { filter: None, .. } => {}
         LogicalPlan::ExtIdLookup {
             filter: Some(expr), ..
         } => {
-            collect_properties_from_expr_into(expr, properties);
+            collect_properties_from_expr_into(expr, properties, kinds);
         }
         LogicalPlan::ExtIdLookup { filter: None, .. } => {}
         LogicalPlan::ScanAll {
             filter: Some(expr), ..
         } => {
-            collect_properties_from_expr_into(expr, properties);
+            collect_properties_from_expr_into(expr, properties, kinds);
         }
         LogicalPlan::ScanAll { filter: None, .. } => {}
         LogicalPlan::ScanMainByLabels {
             filter: Some(expr), ..
         } => {
-            collect_properties_from_expr_into(expr, properties);
+            collect_properties_from_expr_into(expr, properties, kinds);
         }
         LogicalPlan::ScanMainByLabels { filter: None, .. } => {}
         LogicalPlan::TraverseMainByType {
@@ -10000,9 +10263,9 @@ fn collect_properties_recursive(
             ..
         } => {
             if let Some(expr) = target_filter {
-                collect_properties_from_expr_into(expr, properties);
+                collect_properties_from_expr_into(expr, properties, kinds);
             }
-            collect_properties_recursive(input, properties);
+            collect_properties_recursive(input, properties, kinds);
         }
         LogicalPlan::Traverse {
             input,
@@ -10010,30 +10273,30 @@ fn collect_properties_recursive(
             ..
         } => {
             if let Some(expr) = target_filter {
-                collect_properties_from_expr_into(expr, properties);
+                collect_properties_from_expr_into(expr, properties, kinds);
             }
             // Note: Edge properties (step_variable) will be collected from expressions
             // that reference them. The edge_properties field in LogicalPlan is populated
             // later during physical planning based on this collected map.
-            collect_properties_recursive(input, properties);
+            collect_properties_recursive(input, properties, kinds);
         }
         LogicalPlan::Unwind { input, expr, .. } => {
-            collect_properties_from_expr_into(expr, properties);
-            collect_properties_recursive(input, properties);
+            collect_properties_from_expr_into(expr, properties, kinds);
+            collect_properties_recursive(input, properties, kinds);
         }
         LogicalPlan::Create { input, pattern } => {
             // Mark variables referenced in CREATE patterns with "*" so plan_scan
             // adds structural projections (bare entity columns). Without this,
             // execute_create_pattern() can't find bound variables and creates
             // spurious new nodes instead of using existing MATCH'd ones.
-            mark_pattern_variables(pattern, properties);
-            collect_properties_recursive(input, properties);
+            mark_pattern_variables(pattern, properties, kinds);
+            collect_properties_recursive(input, properties, kinds);
         }
         LogicalPlan::CreateBatch { input, patterns } => {
             for pattern in patterns {
-                mark_pattern_variables(pattern, properties);
+                mark_pattern_variables(pattern, properties, kinds);
             }
-            collect_properties_recursive(input, properties);
+            collect_properties_recursive(input, properties, kinds);
         }
         LogicalPlan::Merge {
             input,
@@ -10041,18 +10304,18 @@ fn collect_properties_recursive(
             on_match,
             on_create,
         } => {
-            mark_pattern_variables(pattern, properties);
+            mark_pattern_variables(pattern, properties, kinds);
             if let Some(set_clause) = on_match {
-                mark_set_item_variables(&set_clause.items, properties);
+                mark_set_item_variables(&set_clause.items, properties, kinds);
             }
             if let Some(set_clause) = on_create {
-                mark_set_item_variables(&set_clause.items, properties);
+                mark_set_item_variables(&set_clause.items, properties, kinds);
             }
-            collect_properties_recursive(input, properties);
+            collect_properties_recursive(input, properties, kinds);
         }
         LogicalPlan::Set { input, items } => {
-            mark_set_item_variables(items, properties);
-            collect_properties_recursive(input, properties);
+            mark_set_item_variables(items, properties, kinds);
+            collect_properties_recursive(input, properties, kinds);
         }
         LogicalPlan::Remove { input, items } => {
             for item in items {
@@ -10060,7 +10323,7 @@ fn collect_properties_recursive(
                     RemoveItem::Property(expr) => {
                         // REMOVE n.prop — collect the property and mark the variable
                         // with "*" so full structural projection is applied.
-                        collect_properties_from_expr_into(expr, properties);
+                        collect_properties_from_expr_into(expr, properties, kinds);
                         if let Expr::Property(base, _) = expr
                             && let Expr::Variable(var) = base.as_ref()
                         {
@@ -10079,29 +10342,29 @@ fn collect_properties_recursive(
                     }
                 }
             }
-            collect_properties_recursive(input, properties);
+            collect_properties_recursive(input, properties, kinds);
         }
         LogicalPlan::Delete { input, items, .. } => {
             for expr in items {
-                collect_properties_from_expr_into(expr, properties);
+                collect_properties_from_expr_into(expr, properties, kinds);
             }
-            collect_properties_recursive(input, properties);
+            collect_properties_recursive(input, properties, kinds);
         }
         LogicalPlan::Foreach {
             input, list, body, ..
         } => {
-            collect_properties_from_expr_into(list, properties);
+            collect_properties_from_expr_into(list, properties, kinds);
             for plan in body {
-                collect_properties_recursive(plan, properties);
+                collect_properties_recursive(plan, properties, kinds);
             }
-            collect_properties_recursive(input, properties);
+            collect_properties_recursive(input, properties, kinds);
         }
         LogicalPlan::Limit { input, .. } => {
-            collect_properties_recursive(input, properties);
+            collect_properties_recursive(input, properties, kinds);
         }
         LogicalPlan::CrossJoin { left, right } => {
-            collect_properties_recursive(left, properties);
-            collect_properties_recursive(right, properties);
+            collect_properties_recursive(left, properties, kinds);
+            collect_properties_recursive(right, properties, kinds);
         }
         LogicalPlan::Apply {
             input,
@@ -10109,58 +10372,58 @@ fn collect_properties_recursive(
             input_filter,
         } => {
             if let Some(expr) = input_filter {
-                collect_properties_from_expr_into(expr, properties);
+                collect_properties_from_expr_into(expr, properties, kinds);
             }
-            collect_properties_recursive(input, properties);
-            collect_properties_recursive(subquery, properties);
+            collect_properties_recursive(input, properties, kinds);
+            collect_properties_recursive(subquery, properties, kinds);
         }
         LogicalPlan::Union { left, right, .. } => {
-            collect_properties_recursive(left, properties);
-            collect_properties_recursive(right, properties);
+            collect_properties_recursive(left, properties, kinds);
+            collect_properties_recursive(right, properties, kinds);
         }
         LogicalPlan::RecursiveCTE {
             initial, recursive, ..
         } => {
-            collect_properties_recursive(initial, properties);
-            collect_properties_recursive(recursive, properties);
+            collect_properties_recursive(initial, properties, kinds);
+            collect_properties_recursive(recursive, properties, kinds);
         }
         LogicalPlan::ProcedureCall { arguments, .. } => {
             for arg in arguments {
-                collect_properties_from_expr_into(arg, properties);
+                collect_properties_from_expr_into(arg, properties, kinds);
             }
         }
         LogicalPlan::VectorKnn { query, .. } => {
-            collect_properties_from_expr_into(query, properties);
+            collect_properties_from_expr_into(query, properties, kinds);
         }
         LogicalPlan::InvertedIndexLookup { terms, .. } => {
-            collect_properties_from_expr_into(terms, properties);
+            collect_properties_from_expr_into(terms, properties, kinds);
         }
         LogicalPlan::ShortestPath { input, .. } => {
-            collect_properties_recursive(input, properties);
+            collect_properties_recursive(input, properties, kinds);
         }
         LogicalPlan::AllShortestPaths { input, .. } => {
-            collect_properties_recursive(input, properties);
+            collect_properties_recursive(input, properties, kinds);
         }
         LogicalPlan::Distinct { input } => {
-            collect_properties_recursive(input, properties);
+            collect_properties_recursive(input, properties, kinds);
         }
         LogicalPlan::QuantifiedPattern {
             input,
             pattern_plan,
             ..
         } => {
-            collect_properties_recursive(input, properties);
-            collect_properties_recursive(pattern_plan, properties);
+            collect_properties_recursive(input, properties, kinds);
+            collect_properties_recursive(pattern_plan, properties, kinds);
         }
         LogicalPlan::BindZeroLengthPath { input, .. } => {
-            collect_properties_recursive(input, properties);
+            collect_properties_recursive(input, properties, kinds);
         }
         LogicalPlan::BindPath { input, .. } => {
-            collect_properties_recursive(input, properties);
+            collect_properties_recursive(input, properties, kinds);
         }
         LogicalPlan::SubqueryCall { input, subquery } => {
-            collect_properties_recursive(input, properties);
-            collect_properties_recursive(subquery, properties);
+            collect_properties_recursive(input, properties, kinds);
+            collect_properties_recursive(subquery, properties, kinds);
         }
         LogicalPlan::LocyProject {
             input, projections, ..
@@ -10176,10 +10439,10 @@ fn collect_properties_recursive(
                             .or_default()
                             .insert("_vid".to_string());
                     }
-                    _ => collect_properties_from_expr_into(expr, properties),
+                    _ => collect_properties_from_expr_into(expr, properties, kinds),
                 }
             }
-            collect_properties_recursive(input, properties);
+            collect_properties_recursive(input, properties, kinds);
         }
         LogicalPlan::LocyFold {
             input,
@@ -10187,20 +10450,20 @@ fn collect_properties_recursive(
             ..
         } => {
             for (_name, expr) in fold_bindings {
-                collect_properties_from_expr_into(expr, properties);
+                collect_properties_from_expr_into(expr, properties, kinds);
             }
-            collect_properties_recursive(input, properties);
+            collect_properties_recursive(input, properties, kinds);
         }
         LogicalPlan::LocyBestBy {
             input, criteria, ..
         } => {
             for (expr, _asc) in criteria {
-                collect_properties_from_expr_into(expr, properties);
+                collect_properties_from_expr_into(expr, properties, kinds);
             }
-            collect_properties_recursive(input, properties);
+            collect_properties_recursive(input, properties, kinds);
         }
         LogicalPlan::LocyPriority { input, .. } => {
-            collect_properties_recursive(input, properties);
+            collect_properties_recursive(input, properties, kinds);
         }
         LogicalPlan::LocyModelInvoke { input, .. } => {
             // Model invocations don't introduce new property accesses
@@ -10208,7 +10471,7 @@ fn collect_properties_recursive(
             // by `extract_model_invocations` (uni-locy typecheck) and
             // their property refs are already collected via the
             // wrapped LocyProject's projection walk.
-            collect_properties_recursive(input, properties);
+            collect_properties_recursive(input, properties, kinds);
         }
         // A fork-fused scan carries the same equality filter as the plain
         // `Scan` it replaced; collect its properties so the filtered column is
@@ -10218,14 +10481,14 @@ fn collect_properties_recursive(
         LogicalPlan::FusedIndexScan {
             filter: Some(expr), ..
         } => {
-            collect_properties_from_expr_into(expr, properties);
+            collect_properties_from_expr_into(expr, properties, kinds);
         }
         LogicalPlan::FusedIndexScan { filter: None, .. } => {}
         LogicalPlan::FusedIndexScanWrapped { inner, .. } => {
-            collect_properties_recursive(inner, properties);
+            collect_properties_recursive(inner, properties, kinds);
         }
         LogicalPlan::Explain { plan } => {
-            collect_properties_recursive(plan, properties);
+            collect_properties_recursive(plan, properties, kinds);
         }
         // Nodes that reference no node properties: the Locy program node, Locy
         // derived scans (read materialized derived columns, not graph
@@ -10263,7 +10526,11 @@ fn collect_properties_recursive(
 }
 
 /// Mark target variables from SET items with "*" and collect value expressions.
-fn mark_set_item_variables(items: &[SetItem], properties: &mut HashMap<String, HashSet<String>>) {
+fn mark_set_item_variables(
+    items: &[SetItem],
+    properties: &mut HashMap<String, HashSet<String>>,
+    kinds: &HashMap<String, VariableKind>,
+) {
     for item in items {
         match item {
             SetItem::Property { expr, value } => {
@@ -10278,8 +10545,8 @@ fn mark_set_item_variables(items: &[SetItem], properties: &mut HashMap<String, H
                 // inserts "*" through the bare-Variable path; "*" dominates
                 // the sentinel in `resolve_properties`, so the full schema
                 // is still pulled when actually required.
-                collect_properties_from_expr_into(expr, properties);
-                collect_properties_from_expr_into(value, properties);
+                collect_properties_from_expr_into(expr, properties, kinds);
+                collect_properties_from_expr_into(value, properties, kinds);
                 if let Expr::Property(base, _) = expr
                     && let Expr::Variable(var) = base.as_ref()
                 {
@@ -10302,7 +10569,7 @@ fn mark_set_item_variables(items: &[SetItem], properties: &mut HashMap<String, H
                     .entry(variable.clone())
                     .or_default()
                     .insert("*".to_string());
-                collect_properties_from_expr_into(value, properties);
+                collect_properties_from_expr_into(value, properties, kinds);
             }
         }
     }
@@ -10312,7 +10579,11 @@ fn mark_set_item_variables(items: &[SetItem], properties: &mut HashMap<String, H
 /// adds structural projections (bare entity Struct columns) for them.
 /// This is needed so that execute_create_pattern() can find bound variables
 /// in the row HashMap and reuse existing nodes instead of creating new ones.
-fn mark_pattern_variables(pattern: &Pattern, properties: &mut HashMap<String, HashSet<String>>) {
+fn mark_pattern_variables(
+    pattern: &Pattern,
+    properties: &mut HashMap<String, HashSet<String>>,
+    kinds: &HashMap<String, VariableKind>,
+) {
     for path in &pattern.paths {
         if let Some(ref v) = path.variable {
             properties
@@ -10331,7 +10602,7 @@ fn mark_pattern_variables(pattern: &Pattern, properties: &mut HashMap<String, Ha
                     }
                     // Also collect properties from inline property expressions
                     if let Some(ref props) = n.properties {
-                        collect_properties_from_expr_into(props, properties);
+                        collect_properties_from_expr_into(props, properties, kinds);
                     }
                 }
                 PatternElement::Relationship(r) => {
@@ -10342,14 +10613,14 @@ fn mark_pattern_variables(pattern: &Pattern, properties: &mut HashMap<String, Ha
                             .insert("*".to_string());
                     }
                     if let Some(ref props) = r.properties {
-                        collect_properties_from_expr_into(props, properties);
+                        collect_properties_from_expr_into(props, properties, kinds);
                     }
                 }
                 PatternElement::Parenthesized { pattern, .. } => {
                     let sub = Pattern {
                         paths: vec![pattern.as_ref().clone()],
                     };
-                    mark_pattern_variables(&sub, properties);
+                    mark_pattern_variables(&sub, properties, kinds);
                 }
             }
         }
@@ -10360,6 +10631,7 @@ fn mark_pattern_variables(pattern: &Pattern, properties: &mut HashMap<String, Ha
 fn collect_properties_from_expr_into(
     expr: &Expr,
     properties: &mut HashMap<String, HashSet<String>>,
+    kinds: &HashMap<String, VariableKind>,
 ) {
     match expr {
         Expr::PatternComprehension {
@@ -10372,11 +10644,11 @@ fn collect_properties_from_expr_into(
             // collected. Its inline property maps and element-level WHERE
             // clauses are a different matter — they read outer scope, and
             // missing them let a live UNWIND source be pruned (#197).
-            collect_properties_from_pattern(pattern, properties);
+            collect_properties_from_pattern(pattern, properties, kinds);
             if let Some(where_expr) = where_clause {
-                collect_properties_from_expr_into(where_expr, properties);
+                collect_properties_from_expr_into(where_expr, properties, kinds);
             }
-            collect_properties_from_expr_into(map_expr, properties);
+            collect_properties_from_expr_into(map_expr, properties, kinds);
         }
         Expr::Variable(name) => {
             // Handle transformed property expressions like "e.dept" (after transform_window_expr_properties)
@@ -10404,12 +10676,45 @@ fn collect_properties_from_expr_into(
                 // variable reference (adding "*") when it's just a property base.
             } else {
                 // Recurse for complex base expressions (nested property, function call, etc.)
-                collect_properties_from_expr_into(base, properties);
+                collect_properties_from_expr_into(base, properties, kinds);
             }
         }
-        Expr::BinaryOp { left, right, .. } => {
-            collect_properties_from_expr_into(left, properties);
-            collect_properties_from_expr_into(right, properties);
+        Expr::BinaryOp { left, op, right } => {
+            // `a = b` between two bare variables never reads a property, so
+            // widening either side to "*" materialises a whole schema the plan
+            // does not touch (issue #215; the same shape as #134's
+            // `count(DISTINCT n)` handled in the `FunctionCall` arm below).
+            //
+            // Two independent reasons, and the skip needs only the second:
+            //
+            // - `compile_binary_op_dispatch` rewrites `a = b` to
+            //   `a._vid = b._vid` (or `_eid`) when both sides are known
+            //   entities of the same kind, so the comparison is over base
+            //   columns.
+            // - When that rewrite declines — a node against an edge, or
+            //   against something that is not an entity at all — the generic
+            //   path compares `Value`s, and `Value`'s `PartialEq` resolves
+            //   entities through `entity_ref`: identity for entity/entity,
+            //   `false` for entity/non-entity (#234). Neither branch consults
+            //   a property.
+            //
+            // Deliberately narrow, for the reason `collect(DISTINCT n)` is
+            // still widened in the arm below: this skips only the operands of
+            // an equality, not the variable everywhere else. A query that also
+            // returns `a` collects "*" from that use, as it must.
+            if matches!(op, BinaryOp::Eq | BinaryOp::NotEq)
+                && let (Expr::Variable(lv), Expr::Variable(rv)) = (left.as_ref(), right.as_ref())
+                && let (Some(lk), Some(rk)) = (kinds.get(lv), kinds.get(rv))
+                && matches!(
+                    (lk, rk),
+                    (VariableKind::Node, VariableKind::Node)
+                        | (VariableKind::Edge, VariableKind::Edge)
+                )
+            {
+                return;
+            }
+            collect_properties_from_expr_into(left, properties, kinds);
+            collect_properties_from_expr_into(right, properties, kinds);
         }
         Expr::FunctionCall {
             name,
@@ -10439,30 +10744,30 @@ fn collect_properties_from_expr_into(
                 {
                     continue;
                 }
-                collect_properties_from_expr_into(arg, properties);
+                collect_properties_from_expr_into(arg, properties, kinds);
             }
 
             // Collect from window spec (PARTITION BY, ORDER BY)
             if let Some(spec) = window_spec {
                 for part_expr in &spec.partition_by {
-                    collect_properties_from_expr_into(part_expr, properties);
+                    collect_properties_from_expr_into(part_expr, properties, kinds);
                 }
                 for sort_item in &spec.order_by {
-                    collect_properties_from_expr_into(&sort_item.expr, properties);
+                    collect_properties_from_expr_into(&sort_item.expr, properties, kinds);
                 }
             }
         }
         Expr::UnaryOp { expr, .. } => {
-            collect_properties_from_expr_into(expr, properties);
+            collect_properties_from_expr_into(expr, properties, kinds);
         }
         Expr::List(items) => {
             for item in items {
-                collect_properties_from_expr_into(item, properties);
+                collect_properties_from_expr_into(item, properties, kinds);
             }
         }
         Expr::Map(entries) => {
             for (_key, value) in entries {
-                collect_properties_from_expr_into(value, properties);
+                collect_properties_from_expr_into(value, properties, kinds);
             }
         }
         Expr::ListComprehension {
@@ -10471,11 +10776,11 @@ fn collect_properties_from_expr_into(
             map_expr,
             ..
         } => {
-            collect_properties_from_expr_into(list, properties);
+            collect_properties_from_expr_into(list, properties, kinds);
             if let Some(where_expr) = where_clause {
-                collect_properties_from_expr_into(where_expr, properties);
+                collect_properties_from_expr_into(where_expr, properties, kinds);
             }
-            collect_properties_from_expr_into(map_expr, properties);
+            collect_properties_from_expr_into(map_expr, properties, kinds);
         }
         Expr::Case {
             expr,
@@ -10483,45 +10788,45 @@ fn collect_properties_from_expr_into(
             else_expr,
         } => {
             if let Some(scrutinee_expr) = expr {
-                collect_properties_from_expr_into(scrutinee_expr, properties);
+                collect_properties_from_expr_into(scrutinee_expr, properties, kinds);
             }
             for (when, then) in when_then {
-                collect_properties_from_expr_into(when, properties);
-                collect_properties_from_expr_into(then, properties);
+                collect_properties_from_expr_into(when, properties, kinds);
+                collect_properties_from_expr_into(then, properties, kinds);
             }
             if let Some(default_expr) = else_expr {
-                collect_properties_from_expr_into(default_expr, properties);
+                collect_properties_from_expr_into(default_expr, properties, kinds);
             }
         }
         Expr::Quantifier {
             list, predicate, ..
         } => {
-            collect_properties_from_expr_into(list, properties);
-            collect_properties_from_expr_into(predicate, properties);
+            collect_properties_from_expr_into(list, properties, kinds);
+            collect_properties_from_expr_into(predicate, properties, kinds);
         }
         Expr::Reduce {
             init, list, expr, ..
         } => {
-            collect_properties_from_expr_into(init, properties);
-            collect_properties_from_expr_into(list, properties);
-            collect_properties_from_expr_into(expr, properties);
+            collect_properties_from_expr_into(init, properties, kinds);
+            collect_properties_from_expr_into(list, properties, kinds);
+            collect_properties_from_expr_into(expr, properties, kinds);
         }
         Expr::Exists { query, .. } => {
             // Walk into EXISTS body to collect property references for outer-scope variables.
             // This ensures correlated properties (e.g., a.city inside EXISTS where a is outer)
             // are included in the outer scan's property list. Extra properties collected for
             // inner-only variables are harmless — the outer scan ignores unknown variable names.
-            collect_properties_from_subquery(query, properties);
+            collect_properties_from_subquery(query, properties, kinds);
         }
         Expr::CountSubquery(query) | Expr::CollectSubquery(query) => {
-            collect_properties_from_subquery(query, properties);
+            collect_properties_from_subquery(query, properties, kinds);
         }
         Expr::IsNull(expr) | Expr::IsNotNull(expr) | Expr::IsUnique(expr) => {
-            collect_properties_from_expr_into(expr, properties);
+            collect_properties_from_expr_into(expr, properties, kinds);
         }
         Expr::In { expr, list } => {
-            collect_properties_from_expr_into(expr, properties);
-            collect_properties_from_expr_into(list, properties);
+            collect_properties_from_expr_into(expr, properties, kinds);
+            collect_properties_from_expr_into(list, properties, kinds);
         }
         Expr::ArrayIndex { array, index } => {
             if let Expr::Variable(var) = array.as_ref() {
@@ -10539,16 +10844,16 @@ fn collect_properties_from_expr_into(
                         .insert("*".to_string());
                 }
             }
-            collect_properties_from_expr_into(array, properties);
-            collect_properties_from_expr_into(index, properties);
+            collect_properties_from_expr_into(array, properties, kinds);
+            collect_properties_from_expr_into(index, properties, kinds);
         }
         Expr::ArraySlice { array, start, end } => {
-            collect_properties_from_expr_into(array, properties);
+            collect_properties_from_expr_into(array, properties, kinds);
             if let Some(start_expr) = start {
-                collect_properties_from_expr_into(start_expr, properties);
+                collect_properties_from_expr_into(start_expr, properties, kinds);
             }
             if let Some(end_expr) = end {
-                collect_properties_from_expr_into(end_expr, properties);
+                collect_properties_from_expr_into(end_expr, properties, kinds);
             }
         }
         Expr::ValidAt {
@@ -10572,11 +10877,11 @@ fn collect_properties_from_expr_into(
                         .insert(prop.clone());
                 }
             }
-            collect_properties_from_expr_into(entity, properties);
-            collect_properties_from_expr_into(timestamp, properties);
+            collect_properties_from_expr_into(entity, properties, kinds);
+            collect_properties_from_expr_into(timestamp, properties, kinds);
         }
         Expr::MapProjection { base, items } => {
-            collect_properties_from_expr_into(base, properties);
+            collect_properties_from_expr_into(base, properties, kinds);
             for item in items {
                 match item {
                     uni_cypher::ast::MapProjectionItem::Property(prop) => {
@@ -10596,14 +10901,14 @@ fn collect_properties_from_expr_into(
                         }
                     }
                     uni_cypher::ast::MapProjectionItem::LiteralEntry(_, expr) => {
-                        collect_properties_from_expr_into(expr, properties);
+                        collect_properties_from_expr_into(expr, properties, kinds);
                     }
                     uni_cypher::ast::MapProjectionItem::Variable(_) => {}
                 }
             }
         }
         Expr::LabelCheck { expr, .. } => {
-            collect_properties_from_expr_into(expr, properties);
+            collect_properties_from_expr_into(expr, properties, kinds);
         }
         // Parameters reference outer-scope variables (e.g., $p in correlated subqueries).
         // Mark them with "*" so the outer scan produces structural projections that
@@ -10634,9 +10939,10 @@ fn collect_properties_from_expr_into(
 fn collect_properties_from_pattern(
     pattern: &Pattern,
     properties: &mut HashMap<String, HashSet<String>>,
+    kinds: &HashMap<String, VariableKind>,
 ) {
     for path in &pattern.paths {
-        collect_properties_from_path_pattern(path, properties);
+        collect_properties_from_path_pattern(path, properties, kinds);
     }
 }
 
@@ -10644,6 +10950,7 @@ fn collect_properties_from_pattern(
 fn collect_properties_from_path_pattern(
     path: &PathPattern,
     properties: &mut HashMap<String, HashSet<String>>,
+    kinds: &HashMap<String, VariableKind>,
 ) {
     for element in &path.elements {
         match element {
@@ -10658,14 +10965,14 @@ fn collect_properties_from_path_pattern(
                 ..
             }) => {
                 if let Some(props) = props {
-                    collect_properties_from_expr_into(props, properties);
+                    collect_properties_from_expr_into(props, properties, kinds);
                 }
                 if let Some(where_clause) = where_clause {
-                    collect_properties_from_expr_into(where_clause, properties);
+                    collect_properties_from_expr_into(where_clause, properties, kinds);
                 }
             }
             PatternElement::Parenthesized { pattern, .. } => {
-                collect_properties_from_path_pattern(pattern, properties);
+                collect_properties_from_path_pattern(pattern, properties, kinds);
             }
         }
     }
@@ -10675,15 +10982,16 @@ fn collect_properties_from_path_pattern(
 fn collect_properties_from_set_items(
     items: &[SetItem],
     properties: &mut HashMap<String, HashSet<String>>,
+    kinds: &HashMap<String, VariableKind>,
 ) {
     for item in items {
         match item {
             SetItem::Property { expr, value } => {
-                collect_properties_from_expr_into(expr, properties);
-                collect_properties_from_expr_into(value, properties);
+                collect_properties_from_expr_into(expr, properties, kinds);
+                collect_properties_from_expr_into(value, properties, kinds);
             }
             SetItem::Variable { value, .. } | SetItem::VariablePlus { value, .. } => {
-                collect_properties_from_expr_into(value, properties);
+                collect_properties_from_expr_into(value, properties, kinds);
             }
             // Label mutation names a variable and literal labels, no expression.
             SetItem::Labels { .. } => {}
@@ -10699,10 +11007,13 @@ fn collect_properties_from_return_items(
     skip: Option<&Expr>,
     limit: Option<&Expr>,
     properties: &mut HashMap<String, HashSet<String>>,
+    kinds: &HashMap<String, VariableKind>,
 ) {
     for item in items {
         match item {
-            ReturnItem::Expr { expr, .. } => collect_properties_from_expr_into(expr, properties),
+            ReturnItem::Expr { expr, .. } => {
+                collect_properties_from_expr_into(expr, properties, kinds)
+            }
             // `RETURN *` names nothing, so it cannot be recorded as a read of
             // anything — and that is exactly why it is dangerous to an analysis
             // that reasons from absence. Flag it and let
@@ -10716,10 +11027,10 @@ fn collect_properties_from_return_items(
         }
     }
     for sort in order_by.into_iter().flatten() {
-        collect_properties_from_expr_into(&sort.expr, properties);
+        collect_properties_from_expr_into(&sort.expr, properties, kinds);
     }
     for expr in skip.into_iter().chain(limit) {
-        collect_properties_from_expr_into(expr, properties);
+        collect_properties_from_expr_into(expr, properties, kinds);
     }
 }
 
@@ -10738,19 +11049,22 @@ fn collect_properties_from_return_items(
 fn collect_properties_from_subquery(
     query: &Query,
     properties: &mut HashMap<String, HashSet<String>>,
+    kinds: &HashMap<String, VariableKind>,
 ) {
     match query {
         Query::Single(stmt) => {
             for clause in &stmt.clauses {
-                collect_properties_from_subquery_clause(clause, properties);
+                collect_properties_from_subquery_clause(clause, properties, kinds);
             }
         }
         Query::Union { left, right, .. } => {
-            collect_properties_from_subquery(left, properties);
-            collect_properties_from_subquery(right, properties);
+            collect_properties_from_subquery(left, properties, kinds);
+            collect_properties_from_subquery(right, properties, kinds);
         }
-        Query::Explain(inner) => collect_properties_from_subquery(inner, properties),
-        Query::TimeTravel { query, .. } => collect_properties_from_subquery(query, properties),
+        Query::Explain(inner) => collect_properties_from_subquery(inner, properties, kinds),
+        Query::TimeTravel { query, .. } => {
+            collect_properties_from_subquery(query, properties, kinds)
+        }
         // DDL and admin commands read no query variables.
         Query::Schema(_) => {}
     }
@@ -10762,12 +11076,13 @@ fn collect_properties_from_subquery(
 fn collect_properties_from_subquery_clause(
     clause: &Clause,
     properties: &mut HashMap<String, HashSet<String>>,
+    kinds: &HashMap<String, VariableKind>,
 ) {
     match clause {
         Clause::Match(m) => {
-            collect_properties_from_pattern(&m.pattern, properties);
+            collect_properties_from_pattern(&m.pattern, properties, kinds);
             if let Some(ref wc) = m.where_clause {
-                collect_properties_from_expr_into(wc, properties);
+                collect_properties_from_expr_into(wc, properties, kinds);
             }
         }
         Clause::With(w) => {
@@ -10777,9 +11092,10 @@ fn collect_properties_from_subquery_clause(
                 w.skip.as_ref(),
                 w.limit.as_ref(),
                 properties,
+                kinds,
             );
             if let Some(ref wc) = w.where_clause {
-                collect_properties_from_expr_into(wc, properties);
+                collect_properties_from_expr_into(wc, properties, kinds);
             }
         }
         Clause::Return(r) => collect_properties_from_return_items(
@@ -10788,40 +11104,43 @@ fn collect_properties_from_subquery_clause(
             r.skip.as_ref(),
             r.limit.as_ref(),
             properties,
+            kinds,
         ),
         Clause::WithRecursive(wr) => {
-            collect_properties_from_subquery(&wr.query, properties);
-            collect_properties_from_return_items(&wr.items, None, None, None, properties);
+            collect_properties_from_subquery(&wr.query, properties, kinds);
+            collect_properties_from_return_items(&wr.items, None, None, None, properties, kinds);
         }
-        Clause::Unwind(u) => collect_properties_from_expr_into(&u.expr, properties),
+        Clause::Unwind(u) => collect_properties_from_expr_into(&u.expr, properties, kinds),
         Clause::Call(c) => {
             match &c.kind {
                 CallKind::Procedure { arguments, .. } => {
                     for arg in arguments {
-                        collect_properties_from_expr_into(arg, properties);
+                        collect_properties_from_expr_into(arg, properties, kinds);
                     }
                 }
-                CallKind::Subquery(inner) => collect_properties_from_subquery(inner, properties),
+                CallKind::Subquery(inner) => {
+                    collect_properties_from_subquery(inner, properties, kinds)
+                }
             }
             if let Some(ref wc) = c.where_clause {
-                collect_properties_from_expr_into(wc, properties);
+                collect_properties_from_expr_into(wc, properties, kinds);
             }
         }
         // Mutation clauses cannot appear in an EXISTS/COUNT/COLLECT body today,
         // but they are cheap to handle and must not become a silent gap if the
         // grammar ever admits them.
-        Clause::Create(c) => collect_properties_from_pattern(&c.pattern, properties),
+        Clause::Create(c) => collect_properties_from_pattern(&c.pattern, properties, kinds),
         Clause::Merge(m) => {
-            collect_properties_from_pattern(&m.pattern, properties);
-            collect_properties_from_set_items(&m.on_match, properties);
-            collect_properties_from_set_items(&m.on_create, properties);
+            collect_properties_from_pattern(&m.pattern, properties, kinds);
+            collect_properties_from_set_items(&m.on_match, properties, kinds);
+            collect_properties_from_set_items(&m.on_create, properties, kinds);
         }
-        Clause::Set(s) => collect_properties_from_set_items(&s.items, properties),
+        Clause::Set(s) => collect_properties_from_set_items(&s.items, properties, kinds),
         Clause::Remove(r) => {
             for item in &r.items {
                 match item {
                     RemoveItem::Property(expr) => {
-                        collect_properties_from_expr_into(expr, properties)
+                        collect_properties_from_expr_into(expr, properties, kinds)
                     }
                     RemoveItem::Labels { .. } => {}
                 }
@@ -10829,7 +11148,7 @@ fn collect_properties_from_subquery_clause(
         }
         Clause::Delete(d) => {
             for expr in &d.items {
-                collect_properties_from_expr_into(expr, properties);
+                collect_properties_from_expr_into(expr, properties, kinds);
             }
         }
     }
@@ -12471,7 +12790,7 @@ mod pushdown_tests {
             end_prop: Some("valid_to".to_string()),
         };
 
-        collect_properties_from_expr_into(&validat_expr, &mut properties);
+        collect_properties_from_expr_into(&validat_expr, &mut properties, &no_kinds());
 
         assert!(properties.contains_key("e"));
         assert!(properties.get("e").unwrap().contains("valid_from"));
@@ -12488,7 +12807,7 @@ mod pushdown_tests {
             index: Box::new(Expr::Variable("prop".to_string())),
         };
 
-        collect_properties_from_expr_into(&array_index_expr, &mut properties);
+        collect_properties_from_expr_into(&array_index_expr, &mut properties, &no_kinds());
 
         assert!(properties.contains_key("e"));
         assert!(properties.get("e").unwrap().contains("*"));
@@ -12504,7 +12823,7 @@ mod pushdown_tests {
             "name".to_string(),
         );
 
-        collect_properties_from_expr_into(&prop_access, &mut properties);
+        collect_properties_from_expr_into(&prop_access, &mut properties, &no_kinds());
 
         assert!(properties.contains_key("e"));
         assert!(properties.get("e").unwrap().contains("name"));
@@ -12522,9 +12841,31 @@ mod pushdown_tests {
         }
     }
 
+    /// No variable is known to be an entity.
+    ///
+    /// The conservative input: with no kinds the identity skip cannot fire, so
+    /// a bare variable widens. Most of these tests do not care, and the ones
+    /// that do say so by calling [`collect_with_nodes`] instead — which is the
+    /// point, because the skip's whole safety argument is that it only applies
+    /// where both operands are known entities of the same kind.
+    fn no_kinds() -> HashMap<String, VariableKind> {
+        HashMap::new()
+    }
+
     fn collect(expr: &Expr) -> HashMap<String, HashSet<String>> {
         let mut properties = HashMap::new();
-        collect_properties_from_expr_into(expr, &mut properties);
+        collect_properties_from_expr_into(expr, &mut properties, &no_kinds());
+        properties
+    }
+
+    /// Collect with `vars` declared as nodes, as a scan in the plan would.
+    fn collect_with_nodes(expr: &Expr, vars: &[&str]) -> HashMap<String, HashSet<String>> {
+        let kinds: HashMap<String, VariableKind> = vars
+            .iter()
+            .map(|v| ((*v).to_string(), VariableKind::Node))
+            .collect();
+        let mut properties = HashMap::new();
+        collect_properties_from_expr_into(expr, &mut properties, &kinds);
         properties
     }
 
@@ -12599,6 +12940,153 @@ mod pushdown_tests {
             !widened(&properties, "r"),
             "count(DISTINCT r) must not widen r to '*'"
         );
+    }
+
+    #[test]
+    fn test_entity_equality_does_not_widen() {
+        // `friend = root` is lowered to `friend._vid = root._vid`, so neither
+        // side's properties are read and neither must widen to '*' (issue
+        // #215). IC9's root scan pulled `_all_props` and `overflow_json` for a
+        // query that reads nothing off `root`.
+        let eq = Expr::BinaryOp {
+            left: Box::new(Expr::Variable("friend".to_string())),
+            op: BinaryOp::Eq,
+            right: Box::new(Expr::Variable("root".to_string())),
+        };
+        let properties = collect_with_nodes(&eq, &["friend", "root"]);
+        assert!(
+            !widened(&properties, "root"),
+            "a = b must not widen the right operand to '*'"
+        );
+        assert!(
+            !widened(&properties, "friend"),
+            "a = b must not widen the left operand to '*'"
+        );
+    }
+
+    #[test]
+    fn test_entity_inequality_does_not_widen() {
+        // `<>` takes the same identity rewrite as `=`.
+        let ne = Expr::BinaryOp {
+            left: Box::new(Expr::Variable("a".to_string())),
+            op: BinaryOp::NotEq,
+            right: Box::new(Expr::Variable("b".to_string())),
+        };
+        let properties = collect_with_nodes(&ne, &["a", "b"]);
+        assert!(!widened(&properties, "a") && !widened(&properties, "b"));
+    }
+
+    #[test]
+    fn test_a_comparison_operand_still_widens_for_its_other_uses() {
+        // The skip applies to the operands of an equality, not to the variable
+        // wherever else it appears. `collect(a)` returns whole nodes and must
+        // still widen — the boundary `collect(DISTINCT n)` marks in the
+        // `FunctionCall` arm, checked here so the skip cannot leak past it.
+        let eq = Expr::BinaryOp {
+            left: Box::new(Expr::Variable("a".to_string())),
+            op: BinaryOp::Eq,
+            right: Box::new(Expr::Variable("b".to_string())),
+        };
+        let kinds: HashMap<String, VariableKind> = [
+            ("a".to_string(), VariableKind::Node),
+            ("b".to_string(), VariableKind::Node),
+        ]
+        .into_iter()
+        .collect();
+        let mut properties = HashMap::new();
+        collect_properties_from_expr_into(&eq, &mut properties, &kinds);
+        collect_properties_from_expr_into(
+            &func("collect", vec![Expr::Variable("a".to_string())]),
+            &mut properties,
+            &kinds,
+        );
+        assert!(
+            widened(&properties, "a"),
+            "a use that returns whole nodes must still widen a"
+        );
+        assert!(
+            !widened(&properties, "b"),
+            "b appears only as a comparison operand and must stay narrow"
+        );
+    }
+
+    #[test]
+    fn test_equality_without_known_kinds_still_widens() {
+        // The skip requires knowing both operands are entities of the same
+        // kind — the precondition `compile_binary_op_dispatch` applies before
+        // it rewrites the comparison to `_vid`. With no kinds it must not
+        // fire: a node compared to a relationship, or to a non-entity, keeps
+        // its whole-entity column, and removing it there breaks the query
+        // outright rather than merely slowing it (#215).
+        let eq = Expr::BinaryOp {
+            left: Box::new(Expr::Variable("a".to_string())),
+            op: BinaryOp::Eq,
+            right: Box::new(Expr::Variable("r".to_string())),
+        };
+        let properties = collect(&eq);
+        assert!(
+            widened(&properties, "a") && widened(&properties, "r"),
+            "without known kinds the identity skip must not fire"
+        );
+    }
+
+    #[test]
+    fn test_mixed_entity_kinds_still_widen() {
+        // Node against edge: the rewrite declines, so the widening stays.
+        let eq = Expr::BinaryOp {
+            left: Box::new(Expr::Variable("a".to_string())),
+            op: BinaryOp::Eq,
+            right: Box::new(Expr::Variable("r".to_string())),
+        };
+        let kinds: HashMap<String, VariableKind> = [
+            ("a".to_string(), VariableKind::Node),
+            ("r".to_string(), VariableKind::Edge),
+        ]
+        .into_iter()
+        .collect();
+        let mut properties = HashMap::new();
+        collect_properties_from_expr_into(&eq, &mut properties, &kinds);
+        assert!(
+            widened(&properties, "a") && widened(&properties, "r"),
+            "a node compared to an edge must keep both operands materialised"
+        );
+    }
+
+    #[test]
+    fn test_ordering_comparison_still_widens() {
+        // Only `=` and `<>` get the identity rewrite. `<` on two bare
+        // variables compares values, so the operands are still needed.
+        let lt = Expr::BinaryOp {
+            left: Box::new(Expr::Variable("a".to_string())),
+            op: BinaryOp::Lt,
+            right: Box::new(Expr::Variable("b".to_string())),
+        };
+        let properties = collect_with_nodes(&lt, &["a", "b"]);
+        assert!(
+            widened(&properties, "a") && widened(&properties, "b"),
+            "an ordering comparison must not take the identity skip"
+        );
+    }
+
+    #[test]
+    fn test_property_comparison_collects_the_property() {
+        // The skip is for *bare* variables. `a.name = b.name` reads two
+        // properties and must still collect them.
+        let eq = Expr::BinaryOp {
+            left: Box::new(Expr::Property(
+                Box::new(Expr::Variable("a".to_string())),
+                "name".to_string(),
+            )),
+            op: BinaryOp::Eq,
+            right: Box::new(Expr::Property(
+                Box::new(Expr::Variable("b".to_string())),
+                "name".to_string(),
+            )),
+        };
+        let properties = collect_with_nodes(&eq, &["a", "b"]);
+        assert!(!widened(&properties, "a"), "a.name must not widen a");
+        assert!(properties.get("a").unwrap().contains("name"));
+        assert!(properties.get("b").unwrap().contains("name"));
     }
 
     #[test]
@@ -12863,6 +13351,7 @@ mod pushdown_tests {
         collect_properties_from_expr_into(
             &func("id", vec![Expr::Variable("n".to_string())]),
             &mut properties,
+            &no_kinds(),
         );
         collect_properties_from_expr_into(
             &func(
@@ -12876,6 +13365,7 @@ mod pushdown_tests {
                 ],
             ),
             &mut properties,
+            &no_kinds(),
         );
 
         assert!(!widened(&properties, "n"), "n must not be widened to '*'");

@@ -477,8 +477,17 @@ impl ScalarUDFImpl for IdUdf {
                         if blobs.is_null(i) {
                             return None;
                         }
-                        let value = uni_common::cypher_value_codec::decode(blobs.value(i)).ok()?;
-                        entity_identity(&value)
+                        // Documented exception (#233 class): this closure feeds
+                        // an infallible `collect()` into a `UInt64Array`. A blob
+                        // that will not decode yields no id, which reads as "not
+                        // an entity" — logged so it is not silent.
+                        match uni_common::cypher_value_codec::decode(blobs.value(i)) {
+                            Ok(value) => entity_identity(&value),
+                            Err(e) => {
+                                tracing::error!(error = %e, "id(): value failed to decode");
+                                None
+                            }
+                        }
                     })
                     .collect();
                 Ok(ColumnarValue::Array(Arc::new(ids)))
@@ -2371,9 +2380,10 @@ fn get_value_from_array(
         // (e.g. a raw-`Bytes` list literal) is honored from the array's own type. The
         // `ScalarValue::try_from_array` fallback strips child-field metadata, which
         // would mis-decode raw-`Bytes` elements through the tagged codec.
-        DataType::List(_) | DataType::LargeList(_) => Ok(
-            uni_store::storage::arrow_convert::arrow_to_value(arr.as_ref(), row, None),
-        ),
+        DataType::List(_) | DataType::LargeList(_) => {
+            uni_store::storage::arrow_convert::arrow_to_value(arr.as_ref(), row, None)
+                .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))
+        }
         // Fallback: use existing ScalarValue path for Struct, FixedSizeList,
         // Timestamp, Date32, and other complex types
         _ => {
@@ -2536,9 +2546,8 @@ fn scalar_arr_to_value(arr: &dyn arrow::array::Array) -> DFResult<Value> {
         Ok(Value::Null)
     } else {
         // UDF outputs are CypherValue-encoded, no schema context needed
-        Ok(uni_store::storage::arrow_convert::arrow_to_value(
-            arr, 0, None,
-        ))
+        uni_store::storage::arrow_convert::arrow_to_value(arr, 0, None)
+            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))
     }
 }
 

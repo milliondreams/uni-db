@@ -4,7 +4,8 @@
 use futures::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use uni_common::{Result, UniConfig, UniError};
 use uni_query::{
     ExplainOutput, LogicalPlan, ProfileOutput, QueryCursor, QueryMetrics, QueryResult,
@@ -758,15 +759,47 @@ impl crate::api::UniInner {
         // without ever returning `Pending`, so the timer never gets a chance to
         // fire and only the elapsed-time comparison catches the overrun.
         let query_timeout = config.query_timeout;
-        let exec_deadline = Instant::now() + query_timeout;
 
         let stream = executor.execute_stream(logical_plan, self.properties.clone(), params);
 
+        // Time spent inside the executor, accumulated across polls — not wall
+        // clock from cursor creation.
+        //
+        // A cursor is lazy and `execute_stream` is now genuinely incremental
+        // (#240), so the query runs interleaved with its consumer. An absolute
+        // deadline would charge the consumer's own think-time to the query's
+        // budget, and a caller paging a large result with any work between
+        // batches would hit `query_timeout` — 30 s by default — through no
+        // fault of the query. That is not what the timeout means on the
+        // materializing path, and it must not become what it means here.
+        //
+        // Charging only the time spent awaiting the executor keeps the two
+        // paths saying the same thing. Wall clock was exact before this became
+        // a real stream only because every batch arrived in the first poll.
+        let executed_micros = Arc::new(AtomicU64::new(0));
+        let stream = {
+            let executed_micros = Arc::clone(&executed_micros);
+            futures::stream::unfold(stream, move |mut inner| {
+                let executed_micros = Arc::clone(&executed_micros);
+                async move {
+                    let started = Instant::now();
+                    let item = inner.next().await;
+                    let spent = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                    executed_micros.fetch_add(spent, Ordering::Relaxed);
+                    item.map(|item| (item, inner))
+                }
+            })
+        };
+        let executed_for_rows = Arc::clone(&executed_micros);
+
         // Running total across batches, mirroring how the materializing path
-        // measures the whole result set at once. `execute_stream` currently
-        // yields a single batch, so the two agree exactly; accumulating keeps
-        // that true if it ever becomes genuinely incremental.
+        // measures the whole result set at once. Now that batches genuinely
+        // arrive one at a time, this fires while the result is still growing
+        // instead of reporting an allocation already paid for.
         let mut streamed_bytes: usize = 0;
+
+        // The result's column names, fixed by the first batch that has rows.
+        let mut named_columns: Option<Arc<Vec<String>>> = None;
 
         // Convert raw hash-map batches to Row batches, chunked by batch_size.
         let row_stream = stream
@@ -776,7 +809,8 @@ impl crate::api::UniInner {
                 // Applied to the executor's own output, not to the re-chunked
                 // pieces below, so a slow consumer paging an already-computed
                 // result is not charged against the query's execution budget.
-                if Instant::now() > exec_deadline {
+                if Duration::from_micros(executed_for_rows.load(Ordering::Relaxed)) > query_timeout
+                {
                     return Err(query_timed_out_error(query_timeout));
                 }
                 if max_mem > 0 {
@@ -792,7 +826,24 @@ impl crate::api::UniInner {
                 if results.is_empty() {
                     return Ok(vec![]);
                 }
-                let columns = columns_for_results(&results, projection_order_for_rows.clone())?;
+                // Named once, from the first batch that has rows, and reused.
+                //
+                // With no projection order to go on, `columns_for_results`
+                // derives the names from `results[0]` — and a row is a
+                // `HashMap`, so its key set is whatever that batch happened to
+                // hold. Deriving per batch would let two batches of one result
+                // disagree about their own columns, and a `Row` carries the
+                // column list it was built with. One item per query hid this;
+                // a real stream does not.
+                let columns = match &named_columns {
+                    Some(columns) => Arc::clone(columns),
+                    None => {
+                        let columns =
+                            columns_for_results(&results, projection_order_for_rows.clone())?;
+                        named_columns = Some(Arc::clone(&columns));
+                        columns
+                    }
+                };
                 Ok(rows_for_results(results, &columns, false))
             })
             // Re-chunk into batch_size-sized pieces
@@ -820,25 +871,28 @@ impl crate::api::UniInner {
         // plan reaches one — which is why the executor token set above needs
         // this outer guard to have any observable effect.
         //
-        // The deadline is absolute from cursor creation, matching the
-        // materializing path's ceiling on execution. That is exact while
-        // `execute_stream` yields a single batch (all work happens in the first
-        // poll and later polls resolve immediately from the materialized
-        // vector). If it ever streams incrementally, revisit whether a slow
-        // consumer should be charged against the query's own budget.
-        let deadline = tokio::time::Instant::now() + query_timeout;
+        // The ceiling is the query's *remaining execution budget*, not a wall
+        // clock from cursor creation. The two were the same number while
+        // `execute_stream` yielded a single batch — all the work happened in
+        // the first poll and later polls resolved from a materialized vector.
+        // Now that batches arrive as they are produced (#240) they are not, and
+        // an absolute ceiling would fail a cursor for being read slowly.
         let guarded = futures::stream::unfold(Some(row_stream.boxed()), move |state| {
             let cancel = cancel.clone();
+            let executed_micros = Arc::clone(&executed_micros);
             async move {
                 let stream = state?;
                 let next = stream.into_future();
+                let remaining = query_timeout.saturating_sub(Duration::from_micros(
+                    executed_micros.load(Ordering::Relaxed),
+                ));
                 // `biased` so an already-cancelled scope wins deterministically
                 // rather than racing the first poll. An empty scope pends
                 // forever, so the branch is safe to take unconditionally.
                 let outcome = tokio::select! {
                     biased;
                     () = cancel.cancelled() => None,
-                    res = tokio::time::timeout_at(deadline, next) => Some(res),
+                    res = tokio::time::timeout(remaining, next) => Some(res),
                 };
                 match outcome {
                     // Emit the failure once, then end the stream — re-polling a

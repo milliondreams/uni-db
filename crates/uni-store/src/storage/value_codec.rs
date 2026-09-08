@@ -271,10 +271,11 @@ fn value_from_column_inner(
                 .ok_or_else(|| anyhow!("Invalid struct array inner for map"))?;
             let mut map = serde_json::Map::with_capacity(uni_map.len());
             for (k, v) in uni_map {
-                map.insert(
-                    k,
-                    serde_json::to_value(&v).unwrap_or(serde_json::Value::Null),
-                );
+                // A map entry that will not serialise is corrupt, not null:
+                // `Value::Null` is a legal entry value, so substituting it made
+                // the two indistinguishable (#233 class). The enclosing fn
+                // already returns `Result`.
+                map.insert(k, serde_json::to_value(&v)?);
             }
             Ok(Value::Object(map))
         }
@@ -420,8 +421,11 @@ fn value_from_column_inner(
         // `delta.rs`) does not silently read `Null`. The rich
         // `decode_column_value` path reconstructs a native `Value::Map` instead.
         DataType::Point(_) => {
-            let v = super::arrow_convert::arrow_to_value(col, row, Some(data_type));
-            Ok(serde_json::to_value(&v).unwrap_or(Value::Null))
+            let v = super::arrow_convert::arrow_to_value(col, row, Some(data_type))?;
+            // A Point that cannot be re-serialised is a corrupt value, not a
+            // null one: `Value::Null` here would be indistinguishable from a
+            // legitimately absent point (#233 class).
+            Ok(serde_json::to_value(&v)?)
         }
         _ => Ok(Value::Null),
     }
@@ -461,11 +465,7 @@ pub fn decode_column_value(
         // `try_reconstruct_map` path inside `arrow_to_value`, which handles typed scalar
         // value children, raw-`Bytes` (uni_raw_bytes-marked) children, and CV-encoded
         // nested-value fallback children uniformly by runtime Arrow type.
-        | DataType::Map(_, _) => Ok(super::arrow_convert::arrow_to_value(
-            col,
-            row,
-            Some(data_type),
-        )),
+        | DataType::Map(_, _) => super::arrow_convert::arrow_to_value(col, row, Some(data_type)),
         _ => value_from_column(col, data_type, row, crdt_mode).map(uni_common::Value::from),
     }
 }

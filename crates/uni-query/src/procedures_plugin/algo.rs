@@ -113,15 +113,22 @@ impl ProcedurePlugin for AlgorithmProcedureAdapter {
             .map(|cv| match cv {
                 ColumnarValue::Scalar(ScalarValue::LargeBinary(Some(b)))
                 | ColumnarValue::Scalar(ScalarValue::Binary(Some(b))) => {
-                    serde_json::from_slice::<serde_json::Value>(b)
-                        .unwrap_or(serde_json::Value::Null)
+                    // An argument that will not decode is malformed, not null.
+                    // JSON `null` is a legal argument value, so substituting it
+                    // let the procedure run on an argument the caller never
+                    // passed (#233 class) — `graphRef` in particular would fall
+                    // through to `V2Plan::Direct` and report a signature error
+                    // naming the wrong cause.
+                    serde_json::from_slice::<serde_json::Value>(b).map_err(|e| {
+                        FnError::new(0x821, format!("procedure argument decode failed: {e}"))
+                    })
                 }
-                ColumnarValue::Scalar(s) => {
-                    serde_json::Value::from(scalar_value_to_uni_value(s.clone()))
-                }
-                ColumnarValue::Array(_) => serde_json::Value::Null,
+                ColumnarValue::Scalar(s) => Ok(serde_json::Value::from(scalar_value_to_uni_value(
+                    s.clone(),
+                ))),
+                ColumnarValue::Array(_) => Ok(serde_json::Value::Null),
             })
-            .collect();
+            .collect::<Result<_, FnError>>()?;
 
         // M5c.5: only the V2 `(graphRef, config)` shape is accepted at
         // the public Cypher entry. A JSON-Object first arg is parsed as

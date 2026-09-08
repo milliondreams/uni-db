@@ -94,8 +94,9 @@ pub mod vid_lookup_join;
 
 use crate::query::executor::procedure::ProcedureRegistry;
 use parking_lot::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use uni_algo::algo::AlgorithmRegistry;
 use uni_common::core::id::{Eid, Vid};
 use uni_store::runtime::context::QueryContext;
@@ -184,6 +185,21 @@ pub struct GraphExecutionContext {
 
     /// Query timeout deadline.
     deadline: Option<Instant>,
+
+    /// Consumer idle time excused from `deadline`, in nanoseconds.
+    ///
+    /// A cursor is lazy: the executor yields a batch and then waits to be asked
+    /// for the next one. That waiting is not the query running, and
+    /// `query_timeout` bounds the query. Without this credit, a caller paging a
+    /// large result with any work between batches would be failed for the time
+    /// it spent thinking — 30 s by default (#240).
+    ///
+    /// Zero for every path that drains without pausing, which is every path
+    /// other than a cursor, so their behavior is unchanged.
+    ///
+    /// Shared by `Arc` because the drain loop above the operators accumulates
+    /// the credit while the operators read it through their own clone.
+    deadline_credit: Arc<AtomicU64>,
 
     /// Algorithm registry for `uni.algo.*` procedure dispatch.
     algo_registry: Option<Arc<AlgorithmRegistry>>,
@@ -276,6 +292,7 @@ impl GraphExecutionContext {
             l0_context,
             property_manager,
             deadline,
+            deadline_credit: Arc::new(AtomicU64::new(0)),
             algo_registry: None,
             procedure_registry: None,
             plugin_registry: None,
@@ -476,7 +493,31 @@ impl GraphExecutionContext {
     ///
     /// Returns an error if the deadline has passed.
     pub fn check_timeout(&self) -> anyhow::Result<()> {
-        common::check_deadline(self.cancellation_token.as_ref(), self.deadline)
+        common::check_deadline(self.cancellation_token.as_ref(), self.effective_deadline())
+    }
+
+    /// The deadline with credited consumer idle time added back.
+    ///
+    /// Returns `None` — no deadline — when the credit is large enough to
+    /// overflow the instant, which means the consumer has idled longer than any
+    /// representable budget and there is nothing left to enforce.
+    fn effective_deadline(&self) -> Option<Instant> {
+        let credit = Duration::from_nanos(self.deadline_credit.load(Ordering::Relaxed));
+        match self.deadline {
+            Some(deadline) if credit.is_zero() => Some(deadline),
+            Some(deadline) => deadline.checked_add(credit),
+            None => None,
+        }
+    }
+
+    /// Excuse `idle` from this query's deadline.
+    ///
+    /// Called by the streaming drain loop with the time that elapsed between
+    /// handing a batch to the consumer and the consumer asking for the next
+    /// one. See [`Self::deadline_credit`].
+    pub fn credit_idle_time(&self, idle: Duration) {
+        let nanos = u64::try_from(idle.as_nanos()).unwrap_or(u64::MAX);
+        self.deadline_credit.fetch_add(nanos, Ordering::Relaxed);
     }
 
     /// Get a reference to the storage manager.
@@ -538,7 +579,7 @@ impl GraphExecutionContext {
     /// `check_timeout` without holding a borrow on this context.
     #[must_use]
     pub fn deadline_for_host(&self) -> Option<Instant> {
-        self.deadline
+        self.effective_deadline()
     }
 
     /// Cancellation token clone for the surrounding query, if any.
@@ -565,7 +606,7 @@ impl GraphExecutionContext {
             self.l0_context.transaction_l0.clone(),
             self.l0_context.pending_flush_l0s.clone(),
         );
-        if let Some(deadline) = self.deadline {
+        if let Some(deadline) = self.effective_deadline() {
             ctx.set_deadline(deadline);
         }
         // Carry the counters through. The scan path does not need this — it

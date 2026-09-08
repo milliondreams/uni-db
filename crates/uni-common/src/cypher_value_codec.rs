@@ -580,17 +580,33 @@ pub fn encode_null() -> Vec<u8> {
 /// This is useful for extracting a single property from overflow JSON
 /// without paying the cost of decoding all other properties.
 ///
-/// Returns `None` if:
-/// - The blob is not a TAG_MAP
-/// - The key doesn't exist in the map
-/// - Deserialization fails
-pub fn extract_map_entry_raw(blob: &[u8], key: &str) -> Option<Vec<u8>> {
+/// `Ok(None)` means the entry is not there; `Err` means the blob is corrupt.
+///
+/// This returned a bare `Option` and documented that `None` covered all three
+/// of "not a map", "key absent" and "deserialization failed" — so a caller
+/// reading a property out of a corrupt overflow blob was told the property was
+/// absent, which is a legal answer and a wrong one (#233 class). Splitting the
+/// two is the same shape D2 gave the fast-decode quartet: `Ok(None)` for a
+/// case the caller handles, `Err` for a payload that will not parse.
+///
+/// A blob that is not `TAG_MAP` stays `Ok(None)`: overflow columns hold a map
+/// or nothing, and a non-map blob is the caller's "nothing" rather than damage.
+///
+/// # Errors
+///
+/// Returns [`UniError::Storage`] when the payload is tagged as a map but does
+/// not deserialize as one.
+pub fn extract_map_entry_raw(blob: &[u8], key: &str) -> Result<Option<Vec<u8>>, UniError> {
     if blob.first().copied() != Some(TAG_MAP) {
-        return None;
+        return Ok(None);
     }
     let payload = &blob[1..];
-    let blob_map: HashMap<String, Vec<u8>> = rmp_serde::from_slice(payload).ok()?;
-    blob_map.get(key).cloned()
+    let blob_map: HashMap<String, Vec<u8>> =
+        rmp_serde::from_slice(payload).map_err(|e| UniError::Storage {
+            message: format!("overflow map payload failed to deserialize: {e}"),
+            source: None,
+        })?;
+    Ok(blob_map.get(key).cloned())
 }
 
 // ---------------------------------------------------------------------------
@@ -1346,5 +1362,66 @@ mod handle_tests {
             materialize(&encode_handle(id)).unwrap().into_owned()
         };
         assert_eq!(decode(&bytes).unwrap(), v);
+    }
+}
+
+#[cfg(test)]
+mod extract_map_entry_raw_tells_absent_from_corrupt {
+    //! `Ok(None)` is "not there"; `Err` is "will not parse".
+    //!
+    //! This returned a bare `Option` whose rustdoc listed "deserialization
+    //! fails" alongside "key doesn't exist", so a caller reading a property out
+    //! of a corrupt overflow blob was told the property was absent — a legal
+    //! answer, and the wrong one (#233 class). Being documented did not make it
+    //! correct; it made the defect easy to read past.
+
+    use super::*;
+
+    fn map_blob(entries: &[(&str, Value)]) -> Vec<u8> {
+        let map: std::collections::HashMap<String, Value> = entries
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.clone()))
+            .collect();
+        encode(&Value::Map(map))
+    }
+
+    #[test]
+    fn a_present_key_returns_its_bytes() {
+        let blob = map_blob(&[("a", Value::Int(1))]);
+        let got = extract_map_entry_raw(&blob, "a").expect("well-formed map");
+        let bytes = got.expect("key `a` is present");
+        assert_eq!(decode(&bytes).unwrap(), Value::Int(1));
+    }
+
+    #[test]
+    fn an_absent_key_is_ok_none() {
+        let blob = map_blob(&[("a", Value::Int(1))]);
+        assert_eq!(
+            extract_map_entry_raw(&blob, "missing").expect("well-formed map"),
+            None,
+            "a key that is not in the map is absent, not an error"
+        );
+    }
+
+    #[test]
+    fn a_non_map_blob_is_ok_none() {
+        // An overflow column holds a map or nothing; a non-map blob is the
+        // caller's "nothing" rather than damage.
+        let blob = encode(&Value::Int(7));
+        assert_eq!(extract_map_entry_raw(&blob, "a").expect("not a map"), None);
+    }
+
+    /// The case this change exists for.
+    #[test]
+    fn a_corrupt_map_payload_is_an_error() {
+        // Tagged as a map, but the payload is not a msgpack map.
+        let mut blob = vec![TAG_MAP];
+        blob.extend_from_slice(&[0xC1, 0xC1, 0xC1, 0xC1]);
+        let err = extract_map_entry_raw(&blob, "a")
+            .expect_err("a corrupt map payload must not read as an absent key");
+        assert!(
+            err.to_string().contains("failed to deserialize"),
+            "unexpected error: {err}"
+        );
     }
 }

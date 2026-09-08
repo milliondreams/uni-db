@@ -53,13 +53,24 @@ use super::support::{
 /// The two are unambiguous at the first byte — every codec tag is < 22, while
 /// every byte JSON can start a document with is >= `b'"'` (34) — so trying the
 /// codec first and falling back to JSON cannot mis-route a payload.
-fn decode_cypher_envelope(bytes: &[u8]) -> Option<Value> {
+fn decode_cypher_envelope(bytes: &[u8]) -> Result<Value, FnError> {
     if let Ok(v) = uni_common::cypher_value_codec::decode(bytes) {
-        return Some(v);
+        return Ok(v);
     }
+    // The codec probe failing is routing, not an error — that is the whole
+    // point of the two-encoder sniff above. Both failing is different: the
+    // envelope came from one of our own encoders, so an undecodable one is
+    // internal corruption. Returning `None` here rendered it as NULL, which is
+    // exactly what a genuine NULL renders as, leaving the caller unable to tell
+    // an unreadable value from an absent one (#233 class).
     serde_json::from_slice::<serde_json::Value>(bytes)
-        .ok()
         .map(Value::from)
+        .map_err(|e| {
+            FnError::new(
+                FnError::CODE_TYPE_COERCION,
+                format!("convert: argument envelope decodes as neither CypherValue nor JSON: {e}"),
+            )
+        })
 }
 
 /// Render a decoded Cypher value the way Neo4j's `apoc.convert.toString` does.
@@ -211,9 +222,9 @@ impl ProcedurePlugin for ConvertProc {
                     // Non-primitives (list, map, node, …) transport as an
                     // opaque `LargeBinary` envelope. Decode and render rather
                     // than falling through to NULL.
-                    ScalarValue::LargeBinary(Some(bytes)) => decode_cypher_envelope(&bytes)
-                        .as_ref()
-                        .and_then(render_cypher_value),
+                    ScalarValue::LargeBinary(Some(bytes)) => {
+                        render_cypher_value(&decode_cypher_envelope(&bytes)?)
+                    }
                     _ => None,
                 };
                 nullable_string_result(result)

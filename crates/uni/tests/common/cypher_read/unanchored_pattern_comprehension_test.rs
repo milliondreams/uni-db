@@ -254,3 +254,148 @@ async fn correlates_through_an_outer_variable() {
         ]
     );
 }
+
+/// An uncorrelated comprehension is evaluated once, not once per row (#206).
+///
+/// Asserted as a *count* rather than a duration. The defect's shape is "N
+/// executions where one would do", and a count states that exactly: it is
+/// exact under load, needs no fixture large enough for a stopwatch to resolve,
+/// and expresses the issue's own acceptance criterion ("the ratio stops growing
+/// with N") without a clock. Timing was a poor instrument here — the wall-clock
+/// probe for this shape does not finish at N=50 in fifteen minutes.
+///
+/// This test previously asserted `executions == rows`, pinning the cost with a
+/// note to invert it when the hoist landed. This is that inversion.
+#[tokio::test]
+async fn an_uncorrelated_comprehension_is_evaluated_once() {
+    let db = fixture().await;
+    let r = db
+        .session()
+        .query("MATCH (n:P) RETURN [(a:P)-[:KNOWS]->(b:P) | a.name] AS l")
+        .await
+        .unwrap();
+    let rows = r.rows().len();
+    let executions = r.metrics().subquery_executions;
+
+    assert_eq!(rows, 3, "one row per :P node");
+    assert!(
+        executions > 0,
+        "no sub-plan execution was counted, so this test measured nothing and \
+         would pass with the fallback removed entirely"
+    );
+    assert_eq!(
+        executions, 1,
+        "an uncorrelated comprehension must be evaluated once and broadcast, \
+         not re-evaluated per outer row"
+    );
+}
+
+/// A correlated comprehension genuinely needs one execution per outer row.
+///
+/// The control for the test above: it is the *uncorrelated* case where the
+/// repeated work is redundant. Keeping both means a hoist that fired too
+/// eagerly — collapsing a correlated comprehension to one evaluation — fails
+/// here rather than silently returning one row's answer for every row.
+#[tokio::test]
+async fn a_correlated_comprehension_runs_once_per_row_by_necessity() {
+    let db = fixture().await;
+    let r = db
+        .session()
+        .query("MATCH (n:P) RETURN [(a:P)-[:KNOWS]->(b:P) WHERE a.name > n.name | a.name] AS l")
+        .await
+        .unwrap();
+    assert_eq!(
+        r.metrics().subquery_executions,
+        r.rows().len() as u64,
+        "a correlated comprehension must keep its per-row execution"
+    );
+}
+
+/// A binding form in the body does not by itself make a comprehension correlated.
+///
+/// `reduce` names an accumulator and an element variable of its own. Counting
+/// those as references to the outer row made every comprehension containing one
+/// fall to the per-row path, which is a false negative: the body here reads
+/// nothing but its own bindings and the pattern's.
+#[tokio::test]
+async fn a_reduce_over_its_own_bindings_is_still_uncorrelated() {
+    let db = fixture().await;
+    let r = db
+        .session()
+        .query(
+            "MATCH (n:P) RETURN [(a:P)-[:KNOWS]->(b:P) | \
+             reduce(s = 0, x IN [1, 2, 3] | s + x)] AS l",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        r.metrics().subquery_executions,
+        1,
+        "a `reduce` over its own bindings must not force the per-row path"
+    );
+    for row in r.rows() {
+        assert_eq!(as_list(&row.values()[0]), vec![Value::Int(6)]);
+    }
+}
+
+/// A list comprehension in the body, likewise.
+#[tokio::test]
+async fn a_list_comprehension_over_its_own_binding_is_still_uncorrelated() {
+    let db = fixture().await;
+    let r = db
+        .session()
+        .query("MATCH (n:P) RETURN [(a:P)-[:KNOWS]->(b:P) | [x IN [1, 2] | x + 1]] AS l")
+        .await
+        .unwrap();
+    assert_eq!(r.metrics().subquery_executions, 1);
+}
+
+/// The safety case: a binding form whose body *does* reach the outer row.
+///
+/// The whole risk of teaching `free_variables` about binding forms is removing
+/// one name too many and calling a correlated comprehension uncorrelated —
+/// which would broadcast one row's answer over every row, silently. Here the
+/// `reduce` body reads `n`, so subtracting its own bindings must still leave
+/// `n` free and the comprehension must stay per-row.
+#[tokio::test]
+async fn a_reduce_that_reads_the_outer_row_stays_correlated() {
+    let db = fixture().await;
+    let r = db
+        .session()
+        .query(
+            "MATCH (n:P) RETURN [(a:P)-[:KNOWS]->(b:P) | \
+             reduce(s = 0, x IN [1] | s + size(n.name))] AS l",
+        )
+        .await
+        .unwrap();
+    let rows = r.rows().len();
+    assert_eq!(rows, 3);
+    assert_eq!(
+        r.metrics().subquery_executions,
+        rows as u64,
+        "a body that reads the outer row must keep its per-row execution"
+    );
+}
+
+/// A subquery in the body is still declined.
+///
+/// `Exists` hides a whole `Query`, which the expression walker does not model.
+/// Declining costs a per-row evaluation that was already being paid; guessing
+/// would not be recoverable. Pinned so the decline stays deliberate.
+#[tokio::test]
+async fn a_subquery_in_the_body_still_takes_the_per_row_path() {
+    let db = fixture().await;
+    let r = db
+        .session()
+        .query(
+            "MATCH (n:P) RETURN [(a:P)-[:KNOWS]->(b:P) \
+             WHERE EXISTS { MATCH (z:P) RETURN z } | a.name] AS l",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        r.metrics().subquery_executions,
+        r.rows().len() as u64,
+        "a body containing a subquery must not be hoisted on a guess"
+    );
+}

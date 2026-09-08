@@ -1006,3 +1006,151 @@ async fn a_graph_scan_reserves_the_batch_it_builds() -> Result<()> {
     }
     Ok(())
 }
+
+/// Vertices enough to span more than one scan chunk.
+///
+/// The chunk is the session's `batch_size`, 8192 by default, so this is three
+/// chunks and a remainder. At or below one chunk nothing chunks and the test
+/// could not tell the two apart.
+const CHUNKED_SCAN_ROWS: i64 = 25_000;
+
+/// Build a store of [`CHUNKED_SCAN_ROWS`] vertices and the literal id list that
+/// selects all of them.
+async fn store_and_id_list() -> Result<(Uni, String)> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("CH")
+        .property("k", uni_db::DataType::String)
+        .apply()
+        .await?;
+    let tx = db.session().tx().await?;
+    tx.execute(&format!(
+        "UNWIND range(0, {}) AS i CREATE (:CH {{k: \
+         'a-string-long-enough-to-add-up-across-twenty-five-thousand-rows-' + toString(i)}})",
+        CHUNKED_SCAN_ROWS - 1
+    ))
+    .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    let ids = db.session().query("MATCH (n:CH) RETURN id(n) AS v").await?;
+    let list = ids
+        .rows()
+        .iter()
+        .map(|r| match &r.values()[0] {
+            uni_db::Value::Int(i) => i.to_string(),
+            other => panic!("id() returned {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok((db, list))
+}
+
+/// A vid-filtered scan builds one chunk at a time, not the whole result (#214).
+///
+/// `GraphScanExec` built one `RecordBatch` for the entire result and then
+/// handed it out in zero-copy slices, so slicing bounded what went downstream
+/// at once but not what the scan held — every slice pins the parent's buffers.
+/// Scanning a chunk of vids at a time gives each output batch its own storage.
+///
+/// Chunking by *vid* is what makes this safe: every version of a vid falls in
+/// one chunk, so the MVCC dedup still sees all the candidates it must choose
+/// between, and the L0 overlay is scoped to the same vid set. Chunking by
+/// arriving storage batch would break both and return stale rows.
+///
+/// Discriminating, and measured: the scan needs 2.2 MB for this result whole.
+/// With chunking disabled the query fails at this ceiling with
+/// `Failed to allocate additional 2.2 MB for GraphScanExec`; chunked it
+/// succeeds, because a chunk is a third of that. The count is asserted exactly
+/// so a boundary that dropped or repeated a row fails too — `min(cursor +
+/// slice, len)` and the resume offset are otherwise unexercised.
+#[tokio::test]
+async fn a_vid_filtered_scan_is_bounded_by_one_chunk() -> Result<()> {
+    // Below the 2.2 MB the unchunked scan reserves, above one chunk's share.
+    const CEILING: usize = 1 << 20;
+
+    let (db, id_list) = store_and_id_list().await?;
+
+    // Aggregated on purpose: returning the rows themselves would trip the
+    // cursor's result-size check at this ceiling first, and an assertion that
+    // accepts any memory-shaped failure passes with the chunking removed.
+    let rows = db
+        .session()
+        .query_with(&format!(
+            "MATCH (n:CH) WHERE id(n) IN [{id_list}] RETURN count(n.k) AS c"
+        ))
+        .max_memory(CEILING)
+        .fetch_all()
+        .await?;
+
+    assert_eq!(
+        rows.rows()[0].values()[0],
+        uni_db::Value::Int(CHUNKED_SCAN_ROWS),
+        "chunked scan lost or repeated rows at a chunk boundary"
+    );
+    Ok(())
+}
+
+/// `id(n) IN [...]` selects exactly those nodes.
+///
+/// A guard on the rewrite that makes the case above reachable at all:
+/// `rewrite_id_to_vid` did not recurse into `Expr::In`, so `id(n) IN [...]`
+/// stayed a function call and the multi-VID Lance pushdown could never match
+/// it — while `id(n) = x` reached it, `=` being a `BinaryOp`. Teaching the
+/// rewrite a new shape is what risks wrong rows, so the answer is pinned here
+/// rather than only the memory behavior above.
+#[tokio::test]
+async fn id_in_a_literal_list_selects_exactly_those_nodes() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Pick")
+        .property("k", uni_db::DataType::Int)
+        .apply()
+        .await?;
+    let tx = db.session().tx().await?;
+    tx.execute("UNWIND range(0, 9) AS i CREATE (:Pick {k: i})")
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    let all = db
+        .session()
+        .query("MATCH (n:Pick) WHERE n.k IN [2, 5, 7] RETURN id(n) AS v ORDER BY v")
+        .await?;
+    let wanted: Vec<i64> = all
+        .rows()
+        .iter()
+        .map(|r| match &r.values()[0] {
+            uni_db::Value::Int(i) => *i,
+            other => panic!("id() returned {other:?}"),
+        })
+        .collect();
+    assert_eq!(wanted.len(), 3, "fixture must select three nodes");
+
+    let list = wanted
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let picked = db
+        .session()
+        .query(&format!(
+            "MATCH (n:Pick) WHERE id(n) IN [{list}] RETURN n.k AS k ORDER BY k"
+        ))
+        .await?;
+    let got: Vec<uni_db::Value> = picked
+        .rows()
+        .iter()
+        .map(|r| r.values()[0].clone())
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            uni_db::Value::Int(2),
+            uni_db::Value::Int(5),
+            uni_db::Value::Int(7)
+        ],
+        "id() IN a literal list returned the wrong nodes"
+    );
+    Ok(())
+}

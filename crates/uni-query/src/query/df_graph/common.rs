@@ -324,10 +324,17 @@ fn vids_from_large_binary(arr: &arrow_array::LargeBinaryArray) -> arrow_array::U
             if arr.is_null(i) {
                 return None;
             }
-            cypher_value_codec::decode(arr.value(i))
-                .ok()
-                .as_ref()
-                .and_then(extract_vid_from_value)
+            // Documented exception (#233 class): this builds a `UInt64Array`
+            // and has no error channel. A blob that will not decode yields no
+            // vid, which the caller reads as "no entity here" — logged so the
+            // corruption is at least visible.
+            match cypher_value_codec::decode(arr.value(i)) {
+                Ok(v) => extract_vid_from_value(&v),
+                Err(e) => {
+                    tracing::error!(error = %e, "vid column: CypherValue failed to decode");
+                    None
+                }
+            }
         })
         .collect()
 }
@@ -1057,10 +1064,13 @@ pub fn large_list_of_cv_to_cv_array(
                 items.push(uni_common::Value::Null);
             } else {
                 let blob = binary_values.value(elem_idx);
-                match uni_common::cypher_value_codec::decode(blob) {
-                    Ok(uni_val) => items.push(uni_val),
-                    Err(_) => items.push(uni_common::Value::Null),
-                }
+                // A corrupt element is not a null element: pushing Null here
+                // made a list silently shorter in content than it looks (#233).
+                items.push(uni_common::cypher_value_codec::decode(blob).map_err(|e| {
+                    datafusion::error::DataFusionError::Execution(format!(
+                        "list element {elem_idx} failed to decode: {e}"
+                    ))
+                })?);
             }
         }
 
@@ -1100,9 +1110,18 @@ fn arrow_element_to_json(
     } else if let Some(arr) = col.as_any().downcast_ref::<BooleanArray>() {
         serde_json::Value::Bool(arr.value(idx))
     } else if let Some(arr) = col.as_any().downcast_ref::<arrow_array::LargeBinaryArray>() {
-        uni_common::cypher_value_codec::decode(arr.value(idx))
-            .map(|v| v.into())
-            .unwrap_or(serde_json::Value::Null)
+        // Documented exception (#233 class): `arrow_element_to_json` is
+        // infallible and is handed to a boxed `Fn(usize) -> Value` closure at
+        // its call site, so a failure has no channel. Logged, then degraded —
+        // note the surrounding arms also yield Null, so the two are
+        // indistinguishable to the caller and only the log separates them.
+        match uni_common::cypher_value_codec::decode(arr.value(idx)) {
+            Ok(v) => v.into(),
+            Err(e) => {
+                tracing::error!(error = %e, "JSON element: CypherValue failed to decode");
+                serde_json::Value::Null
+            }
+        }
     } else {
         serde_json::Value::Null
     }

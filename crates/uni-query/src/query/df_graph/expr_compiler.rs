@@ -35,8 +35,8 @@ use std::sync::Arc;
 use uni_common::Value;
 use uni_common::core::schema::{DistanceMetric, IndexDefinition, Schema as UniSchema};
 use uni_cypher::ast::{
-    BinaryOp, Clause, CypherLiteral, Expr, MatchClause, Query, ReturnClause, ReturnItem, SortItem,
-    Statement, UnaryOp, UnwindClause, WithClause,
+    BinaryOp, Clause, CypherLiteral, Expr, MapProjectionItem, MatchClause, Query, ReturnClause,
+    ReturnItem, SortItem, Statement, UnaryOp, UnwindClause, WithClause,
 };
 use uni_store::storage::manager::StorageManager;
 
@@ -956,8 +956,21 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
             }
         }
 
+        // Uncorrelated iff nothing the body reads comes from outside the
+        // pattern. `free_variables` returns `None` for any form it does not
+        // model, and that collapses to "correlated" here — the safe direction.
+        let uncorrelated = [where_clause, Some(map_expr)]
+            .into_iter()
+            .flatten()
+            .try_fold(HashSet::new(), |mut acc: HashSet<String>, e| {
+                acc.extend(free_variables(e)?);
+                Some(acc)
+            })
+            .is_some_and(|read| read.is_subset(&pattern_vars));
+
         Ok(Arc::new(PatternComprehensionSubqueryExpr {
             query,
+            uncorrelated,
             pattern_vars,
             graph_ctx: self
                 .graph_ctx
@@ -3203,6 +3216,14 @@ impl PhysicalExpr for ExistsExecExpr {
 /// baseline to be measured against.
 struct PatternComprehensionSubqueryExpr {
     query: Query,
+    /// Whether the body reads nothing from the outer row.
+    ///
+    /// When true, the sub-plan's answer is the same for every outer row, so the
+    /// first execution answers all of them and the rest are skipped (#206).
+    /// Computed conservatively by [`free_variables`]: anything it cannot read
+    /// is treated as correlated, which costs the old per-row behaviour rather
+    /// than risking one row's answer being broadcast over the others.
+    uncorrelated: bool,
     /// Names the pattern itself binds. An outer column of the same name must not
     /// be declared in scope, or the planner would treat the pattern's fresh
     /// binding as a reference to the outer one and silently change the query.
@@ -3240,6 +3261,175 @@ impl Hash for PatternComprehensionSubqueryExpr {
     fn hash<H: Hasher>(&self, state: &mut H) {
         format!("{:?}", self.query).hash(state);
     }
+}
+
+/// Variables an expression reads, or `None` if that cannot be determined.
+///
+/// `None` is not "no variables" — it means the expression contains a form this
+/// walker does not model, and the caller must assume the worst. Every variant
+/// that introduces a binding of its own (`Reduce`, `ListComprehension`, a
+/// nested `PatternComprehension`, a quantifier) or hides a whole subquery
+/// (`Exists`, `CountSubquery`, `CollectSubquery`) is deliberately in that
+/// bucket: modelling their scoping correctly is not needed for the one
+/// question asked here, and getting it subtly wrong would under-report a
+/// reference to the outer row.
+///
+/// That asymmetry is the point. Over-reporting costs a per-row evaluation that
+/// was already being paid; under-reporting would let a correlated comprehension
+/// be answered once and broadcast, which is a wrong answer with no error.
+fn free_variables(expr: &Expr) -> Option<HashSet<String>> {
+    fn union(into: &mut HashSet<String>, expr: &Expr) -> Option<()> {
+        into.extend(free_variables(expr)?);
+        Some(())
+    }
+
+    let mut out = HashSet::new();
+    match expr {
+        Expr::Literal(_) | Expr::Parameter(_) | Expr::Wildcard => {}
+        Expr::Variable(v) => {
+            out.insert(v.clone());
+        }
+        // The base is what names a variable; the key is a literal field name.
+        Expr::Property(base, _) => union(&mut out, base)?,
+        Expr::List(items) => {
+            for item in items {
+                union(&mut out, item)?;
+            }
+        }
+        Expr::Map(pairs) => {
+            for (_, v) in pairs {
+                union(&mut out, v)?;
+            }
+        }
+        Expr::FunctionCall {
+            args, window_spec, ..
+        } => {
+            // A window spec carries partition/order expressions of its own;
+            // not modelled, so decline rather than miss them.
+            if window_spec.is_some() {
+                return None;
+            }
+            for arg in args {
+                union(&mut out, arg)?;
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            union(&mut out, left)?;
+            union(&mut out, right)?;
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::IsUnique(expr)
+        | Expr::LabelCheck { expr, .. } => {
+            union(&mut out, expr)?;
+        }
+        Expr::ValidAt {
+            entity, timestamp, ..
+        } => {
+            union(&mut out, entity)?;
+            union(&mut out, timestamp)?;
+        }
+        Expr::MapProjection { base, items } => {
+            union(&mut out, base)?;
+            for item in items {
+                match item {
+                    MapProjectionItem::LiteralEntry(_, e) => union(&mut out, e)?,
+                    MapProjectionItem::Variable(v) => {
+                        out.insert(v.clone());
+                    }
+                    // A key name, not a reference.
+                    MapProjectionItem::Property(_) | MapProjectionItem::AllProperties => {}
+                }
+            }
+        }
+        // The binding forms. Each names a variable of its own, so what its body
+        // reads is free only after that name is removed — counting the bound
+        // name as a reference to the outer row is what made these decline
+        // before, which is a false negative rather than an unsafe answer.
+        Expr::Quantifier {
+            variable,
+            list,
+            predicate,
+            ..
+        } => {
+            union(&mut out, list)?;
+            let mut inner = free_variables(predicate)?;
+            inner.remove(variable);
+            out.extend(inner);
+        }
+        Expr::Reduce {
+            accumulator,
+            init,
+            variable,
+            list,
+            expr,
+        } => {
+            union(&mut out, init)?;
+            union(&mut out, list)?;
+            let mut inner = free_variables(expr)?;
+            inner.remove(accumulator);
+            inner.remove(variable);
+            out.extend(inner);
+        }
+        Expr::ListComprehension {
+            variable,
+            list,
+            where_clause,
+            map_expr,
+        } => {
+            union(&mut out, list)?;
+            let mut inner = free_variables(map_expr)?;
+            if let Some(w) = where_clause {
+                inner.extend(free_variables(w)?);
+            }
+            inner.remove(variable);
+            out.extend(inner);
+        }
+        Expr::Case {
+            expr,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(e) = expr {
+                union(&mut out, e)?;
+            }
+            for (when, then) in when_then {
+                union(&mut out, when)?;
+                union(&mut out, then)?;
+            }
+            if let Some(e) = else_expr {
+                union(&mut out, e)?;
+            }
+        }
+        Expr::In { expr, list } => {
+            union(&mut out, expr)?;
+            union(&mut out, list)?;
+        }
+        Expr::ArrayIndex { array, index } => {
+            union(&mut out, array)?;
+            union(&mut out, index)?;
+        }
+        Expr::ArraySlice { array, start, end } => {
+            union(&mut out, array)?;
+            if let Some(e) = start {
+                union(&mut out, e)?;
+            }
+            if let Some(e) = end {
+                union(&mut out, e)?;
+            }
+        }
+        // Still declined, and deliberately.
+        //
+        // `Exists`, `CountSubquery` and `CollectSubquery` hide a whole `Query`,
+        // which needs a clause walker rather than an expression one. A nested
+        // `PatternComprehension` binds pattern variables that may equally be
+        // fresh names or references to the outer row, and nothing here can tell
+        // those apart — so it would have to treat them all as free, which is
+        // the same answer as declining but harder to read.
+        _ => return None,
+    }
+    Some(out)
 }
 
 /// The values of the single column a `COLLECT { … }` body returns.
@@ -3365,6 +3555,7 @@ impl PhysicalExpr for PatternComprehensionSubqueryExpr {
         let storage = self.storage.clone();
         let uni_schema = self.uni_schema.clone();
         let base_params = self.params.clone();
+        let uncorrelated = self.uncorrelated;
 
         // One list per outer row, flattened into `values` with `offsets` marking
         // the boundaries — the LargeListArray layout.
@@ -3386,6 +3577,13 @@ impl PhysicalExpr for PatternComprehensionSubqueryExpr {
                 let mut combined_entity_vars = self.outer_entity_vars.clone();
                 combined_entity_vars.extend(correlated_vars.iter().cloned());
 
+                // The first row's answer, kept only when the body reads nothing
+                // from the outer row. Holding the encoded values rather than the
+                // finished Arrow list keeps the offsets built exactly as the
+                // per-row path builds them, so the two cannot disagree about
+                // where one row's list ends and the next begins.
+                let mut hoisted: Option<Vec<Option<Vec<u8>>>> = None;
+
                 for row_idx in 0..num_rows {
                     // Same shape as `ExistsExecExpr` above: a whole sub-plan per
                     // outer row inside one `poll_next`. This is the site #207
@@ -3393,6 +3591,14 @@ impl PhysicalExpr for PatternComprehensionSubqueryExpr {
                     graph_ctx.check_timeout().map_err(|e| {
                         datafusion::error::DataFusionError::Execution(e.to_string())
                     })?;
+
+                    // An uncorrelated comprehension's value does not depend on
+                    // the outer row, so one execution answers all of them (#206).
+                    if let Some(cached) = &hoisted {
+                        values.extend(cached.iter().cloned());
+                        offsets.push(values.len() as i64);
+                        continue;
+                    }
 
                     let row_params = extract_row_params(batch, row_idx);
                     let mut sub_params = base_params.clone();
@@ -3402,6 +3608,14 @@ impl PhysicalExpr for PatternComprehensionSubqueryExpr {
                         if let Some(vid_val) = sub_params.get(&vid_key).cloned() {
                             sub_params.insert(var.clone(), vid_val);
                         }
+                    }
+
+                    // Counted here rather than once per `evaluate`: the cost
+                    // this path carries is one sub-plan execution per outer
+                    // row, so the count has to have the same shape as the cost
+                    // to be worth asserting on (#206).
+                    if let Some(counters) = graph_ctx.counters() {
+                        counters.add_subquery_execution();
                     }
 
                     let (batches, _plan) = rt.block_on(execute_subplan_with_outer_vars(
@@ -3418,6 +3632,7 @@ impl PhysicalExpr for PatternComprehensionSubqueryExpr {
 
                     // The synthesized query returns exactly one column — the
                     // comprehension's map expression.
+                    let mut row_values: Vec<Option<Vec<u8>>> = Vec::new();
                     for b in &batches {
                         if b.num_columns() == 0 {
                             continue;
@@ -3425,9 +3640,13 @@ impl PhysicalExpr for PatternComprehensionSubqueryExpr {
                         let col = b.column(0);
                         for i in 0..b.num_rows() {
                             let v = arrow_to_json_value(col.as_ref(), i);
-                            values.push(Some(uni_common::cypher_value_codec::encode(&v)));
+                            row_values.push(Some(uni_common::cypher_value_codec::encode(&v)));
                         }
                     }
+                    if uncorrelated {
+                        hoisted = Some(row_values.clone());
+                    }
+                    values.extend(row_values);
                     offsets.push(values.len() as i64);
                 }
 

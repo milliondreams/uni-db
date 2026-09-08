@@ -783,6 +783,139 @@ impl Executor {
         })
     }
 
+    /// Drive a physical plan as a stream, yielding each batch as it is produced.
+    ///
+    /// The streaming sibling of [`Self::drain_plan`]. The two differ in exactly
+    /// one thing: what happens to a batch once it arrives. `drain_plan` pushes
+    /// it into a `Vec`; this hands it to the caller.
+    ///
+    /// That accumulation was the whole of #240. DataFusion's execution is
+    /// already incremental and `GraphScanExec` already slices its output to
+    /// `batch_size`, so the plan below genuinely yields many batches. Collecting
+    /// them is what made the query layer single-shot, and with it the cursor's
+    /// per-item memory check, which could only fire once the whole result was
+    /// resident in its most expensive form.
+    ///
+    /// Partitions are drained in order rather than concurrently, matching
+    /// `drain_plan`, so row order is identical between the two.
+    ///
+    /// # Errors
+    ///
+    /// Yields the failure and then ends. A failed partition ends the whole
+    /// stream: a caller that has seen an error must not go on to receive rows
+    /// from a later partition as though the query had succeeded.
+    fn stream_plan(
+        session_ctx: &Arc<SyncRwLock<SessionContext>>,
+        execution_plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        graph_ctx: Arc<crate::query::df_graph::GraphExecutionContext>,
+    ) -> BoxStream<'static, Result<RecordBatch>> {
+        let task_ctx = session_ctx.read().task_ctx();
+        if *DUMP_PHYSICAL_PLAN {
+            eprintln!(
+                "{}",
+                datafusion::physical_plan::displayable(execution_plan.as_ref()).indent(true)
+            );
+        }
+        let partition_count = execution_plan.output_partitioning().partition_count();
+
+        struct DrainState {
+            plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+            task_ctx: Arc<datafusion::execution::TaskContext>,
+            graph_ctx: Arc<crate::query::df_graph::GraphExecutionContext>,
+            next_partition: usize,
+            partition_count: usize,
+            current: Option<datafusion::execution::SendableRecordBatchStream>,
+            /// When the last batch was handed out, if one has been.
+            ///
+            /// The gap between that moment and the next poll is the consumer
+            /// thinking, not the query running, so it is credited back to the
+            /// deadline rather than spent against it.
+            yielded_at: Option<Instant>,
+        }
+
+        /// End the stream after the item about to be yielded.
+        ///
+        /// Spelled once so no error path can leave a later partition reachable.
+        fn halt(state: &mut DrainState) {
+            state.current = None;
+            state.next_partition = state.partition_count;
+        }
+
+        let state = DrainState {
+            plan: execution_plan,
+            task_ctx,
+            graph_ctx,
+            next_partition: 0,
+            partition_count,
+            current: None,
+            yielded_at: None,
+        };
+
+        stream::unfold(state, |mut state| async move {
+            // Everything since the previous batch left this loop was the
+            // consumer's time. Credit it before any deadline is consulted.
+            //
+            // This over-credits slightly: row conversion above this operator
+            // also happens in that window and is genuinely the query's work.
+            // Erring toward the consumer is the right direction — the failure
+            // it prevents is a correct query killed for being read slowly,
+            // while the failure it admits is a runaway query living a little
+            // longer than its budget, which the per-poll ceiling in the cursor
+            // still bounds.
+            if let Some(handed_out) = state.yielded_at.take() {
+                state.graph_ctx.credit_idle_time(handed_out.elapsed());
+            }
+            loop {
+                if state.current.is_none() {
+                    if state.next_partition >= state.partition_count {
+                        return None;
+                    }
+                    match state
+                        .plan
+                        .execute(state.next_partition, state.task_ctx.clone())
+                    {
+                        Ok(partition_stream) => {
+                            state.next_partition += 1;
+                            state.current = Some(partition_stream);
+                        }
+                        Err(e) => {
+                            halt(&mut state);
+                            return Some((Err(e.into()), state));
+                        }
+                    }
+                }
+
+                // Before awaiting the next batch, so a query already over
+                // budget does not start more work. Mirrors `drain_plan`.
+                if let Err(e) = state.graph_ctx.check_timeout() {
+                    halt(&mut state);
+                    return Some((Err(e), state));
+                }
+
+                let Some(partition_stream) = state.current.as_mut() else {
+                    // Unreachable: the block above either set `current` or
+                    // returned. End the stream rather than assume.
+                    halt(&mut state);
+                    return None;
+                };
+
+                match partition_stream.next().await {
+                    Some(Ok(batch)) => {
+                        state.yielded_at = Some(Instant::now());
+                        return Some((Ok(batch), state));
+                    }
+                    Some(Err(e)) => {
+                        halt(&mut state);
+                        return Some((Err(e.into()), state));
+                    }
+                    // Partition exhausted; fall through to the next one.
+                    None => state.current = None,
+                }
+            }
+        })
+        .boxed()
+    }
+
     /// Executes a query using the DataFusion-based engine.
     ///
     /// Uses `HybridPhysicalPlanner` which produces DataFusion `ExecutionPlan`
@@ -799,26 +932,35 @@ impl Executor {
         Ok(batches)
     }
 
-    /// Executes a query using the DataFusion-based engine, returning both
-    /// result batches and the physical execution plan.
+    /// Build the physical plan for `plan`, ready to execute.
     ///
-    /// The returned `Arc<dyn ExecutionPlan>` can be walked to extract per-operator
-    /// metrics (e.g., `output_rows`, `elapsed_compute`) that DataFusion's
-    /// `BaselineMetrics` recorded during execution.
-    pub async fn execute_datafusion_with_plan(
+    /// Shared by the collecting and the streaming execution paths so the two
+    /// cannot drift. Everything up to and including physical planning is
+    /// identical between them; only what becomes of the batches differs.
+    ///
+    /// The planner is returned rather than dropped because it owns the
+    /// interning scope that handles in the result batches point into. A caller
+    /// must keep it alive until those handles have been materialized.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session context cannot be built, when the plan
+    /// writes but no `Writer` is configured, or when physical planning fails.
+    async fn prepare_datafusion_execution(
         &self,
-        plan: LogicalPlan,
+        plan: &LogicalPlan,
         prop_manager: &PropertyManager,
         params: &HashMap<String, Value>,
     ) -> Result<(
-        Vec<RecordBatch>,
+        Arc<SyncRwLock<SessionContext>>,
         Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        HybridPhysicalPlanner,
     )> {
         let (session_ctx, mut planner, prop_manager_arc) =
             self.create_datafusion_planner(prop_manager, params).await?;
 
         // Build MutationContext when the plan contains write operations
-        if Self::contains_write_operations(&plan) {
+        if Self::contains_write_operations(plan) {
             let writer = self
                 .writer
                 .as_ref()
@@ -841,12 +983,94 @@ impl Executor {
             });
             planner = planner.with_mutation_context(mutation_ctx);
             tracing::debug!(
-                plan_type = Self::get_plan_type(&plan),
+                plan_type = Self::get_plan_type(plan),
                 "Mutation routed to DataFusion engine"
             );
         }
 
-        let execution_plan = planner.plan(&plan)?;
+        let execution_plan = planner.plan(plan)?;
+        Ok((session_ctx, execution_plan, planner))
+    }
+
+    /// Execute a query through DataFusion, yielding batches as they are produced.
+    ///
+    /// The streaming counterpart of [`Self::execute_datafusion`]. Handles are
+    /// materialized per batch and warnings are harvested when the stream ends,
+    /// which is the same order the collecting path uses — that path simply has
+    /// only one moment at which "the end" happens.
+    ///
+    /// The planner rides in the stream's state because it owns the interning
+    /// scope the batches' handles point into. Dropping it when this function
+    /// returns would leave the first batch pointing into a dead scope.
+    ///
+    /// A consumer that drops the stream early forfeits the warnings, which is
+    /// the same bargain it makes with the rest of the unread result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if planning fails. An execution failure is yielded by
+    /// the returned stream, which then ends.
+    pub(crate) async fn execute_datafusion_stream(
+        &self,
+        plan: LogicalPlan,
+        prop_manager: Arc<PropertyManager>,
+        params: HashMap<String, Value>,
+    ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+        let (session_ctx, execution_plan, planner) = self
+            .prepare_datafusion_execution(&plan, &prop_manager, &params)
+            .await?;
+        let graph_ctx = Arc::clone(planner.graph_ctx());
+
+        // Materialize per batch, before it is handed out — the collecting path
+        // does the same thing to the whole vector at once.
+        let materialized = Self::stream_plan(&session_ctx, execution_plan, graph_ctx)
+            .map(|batch| {
+                let mut one = [batch?];
+                crate::query::df_graph::common::materialize_handles_in_batches(&mut one)?;
+                let [batch] = one;
+                Ok(batch)
+            })
+            .boxed();
+
+        Ok(stream::unfold(
+            (materialized, Some(planner), Arc::clone(&self.warnings)),
+            |(mut inner, mut planner, warnings)| async move {
+                if let Some(item) = inner.next().await {
+                    return Some((item, (inner, planner, warnings)));
+                }
+                // End of stream: harvest before the planner is dropped.
+                if let Some(planner) = planner.take() {
+                    let graph_warnings = planner.graph_ctx().take_warnings();
+                    if !graph_warnings.is_empty()
+                        && let Ok(mut w) = warnings.lock()
+                    {
+                        w.extend(graph_warnings);
+                    }
+                }
+                None
+            },
+        )
+        .boxed())
+    }
+
+    /// Executes a query using the DataFusion-based engine, returning both
+    /// result batches and the physical execution plan.
+    ///
+    /// The returned `Arc<dyn ExecutionPlan>` can be walked to extract per-operator
+    /// metrics (e.g., `output_rows`, `elapsed_compute`) that DataFusion's
+    /// `BaselineMetrics` recorded during execution.
+    pub async fn execute_datafusion_with_plan(
+        &self,
+        plan: LogicalPlan,
+        prop_manager: &PropertyManager,
+        params: &HashMap<String, Value>,
+    ) -> Result<(
+        Vec<RecordBatch>,
+        Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    )> {
+        let (session_ctx, execution_plan, planner) = self
+            .prepare_datafusion_execution(&plan, prop_manager, params)
+            .await?;
         let plan_clone = Arc::clone(&execution_plan);
         let result =
             Self::collect_batches_checked(&session_ctx, execution_plan, planner.graph_ctx()).await;
@@ -971,7 +1195,7 @@ impl Executor {
                         None
                     };
                     let mut value =
-                        arrow_convert::arrow_to_value(column.as_ref(), row_idx, data_type)
+                        arrow_convert::arrow_to_value(column.as_ref(), row_idx, data_type)?
                             .canonical_entity();
 
                     // Check if this field contains JSON-encoded values (e.g., from UNWIND)
@@ -1494,6 +1718,16 @@ impl Executor {
     ///
     /// Routes DDL/Admin through the fallback executor and everything else
     /// through DataFusion.
+    ///
+    /// Genuinely incremental for DataFusion plans: one item per physical batch,
+    /// so a per-item guard above it — the cursor's memory ceiling in
+    /// `uni::api::impl_query` — watches the result grow rather than meeting it
+    /// whole. This was `stream::once` over a fully collected `Vec`, which made
+    /// every such guard a post-hoc report of an allocation already paid for
+    /// (#240).
+    ///
+    /// DDL and admin plans stay single-item. They materialize by nature and
+    /// there is nothing to stream.
     pub fn execute_stream(
         self,
         plan: LogicalPlan,
@@ -1512,18 +1746,25 @@ impl Executor {
                 let prop_manager = prop_manager.clone();
                 let params = params.clone();
 
-                let fut = async move {
-                    if this.is_ddl_or_admin(&plan) {
+                if this.is_ddl_or_admin(&plan) {
+                    let fut = async move {
                         this.execute_subplan(plan, &prop_manager, &params, ctx.as_ref())
                             .await
-                    } else {
-                        let batches = this
-                            .execute_datafusion(plan, &prop_manager, &params)
-                            .await?;
-                        this.record_batches_to_rows(batches)
-                    }
-                };
-                stream::once(fut).boxed()
+                    };
+                    return stream::once(fut).boxed();
+                }
+
+                let rows_from = this.clone();
+                stream::once(async move {
+                    this.execute_datafusion_stream(plan, prop_manager, params)
+                        .await
+                })
+                .flat_map(|opened| match opened {
+                    Ok(batches) => batches,
+                    Err(e) => stream::once(async move { Err(e) }).boxed(),
+                })
+                .map(move |batch| rows_from.record_batches_to_rows(vec![batch?]))
+                .boxed()
             })
             .boxed()
     }
@@ -1536,8 +1777,8 @@ impl Executor {
     /// decoder this delegates to is shared with `uni-store`, which has its own
     /// contract, so the conversion belongs here on the query side rather than
     /// down there (#234).
-    pub(crate) fn arrow_to_value(col: &dyn Array, row: usize) -> Value {
-        arrow_convert::arrow_to_value(col, row, None).canonical_entity()
+    pub(crate) fn arrow_to_value(col: &dyn Array, row: usize) -> Result<Value> {
+        Ok(arrow_convert::arrow_to_value(col, row, None)?.canonical_entity())
     }
 
     pub(crate) fn evaluate_expr<'a>(
@@ -4780,7 +5021,7 @@ impl Executor {
                                 // Look up Uni DataType from schema for proper DateTime/Time decoding
                                 let data_type = target_props.get(name).map(|pm| &pm.r#type);
                                 let val =
-                                    arrow_convert::arrow_to_value(col.as_ref(), row, data_type)
+                                    arrow_convert::arrow_to_value(col.as_ref(), row, data_type)?
                                         .canonical_entity();
                                 props.insert(name.clone(), val);
                             }
@@ -4826,15 +5067,15 @@ impl Executor {
                         }
 
                         if name == src_col {
-                            let val = Self::arrow_to_value(col.as_ref(), row);
+                            let val = Self::arrow_to_value(col.as_ref(), row)?;
                             src_vid = Some(Self::vid_from_value(&val)?);
                         } else if name == dst_col {
-                            let val = Self::arrow_to_value(col.as_ref(), row);
+                            let val = Self::arrow_to_value(col.as_ref(), row)?;
                             dst_vid = Some(Self::vid_from_value(&val)?);
                         } else if let Some(pm) = target_props.get(name) {
                             // Look up Uni DataType from schema for proper DateTime/Time decoding
                             let val =
-                                arrow_convert::arrow_to_value(col.as_ref(), row, Some(&pm.r#type))
+                                arrow_convert::arrow_to_value(col.as_ref(), row, Some(&pm.r#type))?
                                     .canonical_entity();
                             props.insert(name.clone(), val);
                         }

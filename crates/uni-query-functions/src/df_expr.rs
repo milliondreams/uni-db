@@ -468,6 +468,21 @@ pub fn cypher_expr_to_df(expr: &Expr, context: Option<&TranslationContext>) -> R
         Expr::In { expr, list } => translate_in_expression(expr, list, context),
 
         Expr::BinaryOp { left, op, right } => {
+            // Two entities compare by identity, so compare their identity
+            // columns rather than the whole entity.
+            //
+            // `compile_binary_op_dispatch` in `uni-query`'s physical expression
+            // compiler performs the same rewrite. Both translators reach the
+            // same predicates — this one plans `OPTIONAL MATCH ... WHERE a <> b`
+            // — and only that one had learned it, so a plan routed here asked
+            // for a whole-entity column that a narrowed scan need not project
+            // (#215). Keeping the two in step is the point; they disagreeing is
+            // what the openCypher TCK caught.
+            if let Some((left, right)) = entity_identity_operands(left, op, right, context) {
+                let left_expr = cypher_expr_to_df(&left, context)?;
+                let right_expr = cypher_expr_to_df(&right, context)?;
+                return translate_binary_op(left_expr, op, right_expr);
+            }
             let left_expr = cypher_expr_to_df(left, context)?;
             let right_expr = cypher_expr_to_df(right, context)?;
             translate_binary_op(left_expr, op, right_expr)
@@ -1359,6 +1374,40 @@ fn value_to_scalar(value: &Value) -> Result<ScalarValue> {
 }
 
 /// Translate a binary operator expression.
+/// Rewrite `a = b` between two entities to a comparison of identity columns.
+///
+/// Returns `None` for anything else — a different operator, a non-variable
+/// operand, an unknown variable, or two entities of different kinds — leaving
+/// the caller to translate the operands as written. A node against an edge is
+/// deliberately in that set: the answer is always false, but saying so here
+/// would lose the NULL an absent optional match must produce.
+///
+/// Mirrors `compile_binary_op_dispatch` in `uni-query`. The pair exists because
+/// there are two expression translators and predicates reach both.
+fn entity_identity_operands(
+    left: &Expr,
+    op: &BinaryOp,
+    right: &Expr,
+    context: Option<&TranslationContext>,
+) -> Option<(Expr, Expr)> {
+    if !matches!(op, BinaryOp::Eq | BinaryOp::NotEq) {
+        return None;
+    }
+    let (Expr::Variable(lv), Expr::Variable(rv)) = (left, right) else {
+        return None;
+    };
+    let ctx = context?;
+    let id_prop = match (ctx.variable_kinds.get(lv)?, ctx.variable_kinds.get(rv)?) {
+        (VariableKind::Node, VariableKind::Node) => COL_VID,
+        (VariableKind::Edge, VariableKind::Edge) => COL_EID,
+        _ => return None,
+    };
+    Some((
+        Expr::Property(Box::new(left.clone()), id_prop.to_string()),
+        Expr::Property(Box::new(right.clone()), id_prop.to_string()),
+    ))
+}
+
 fn translate_binary_op(left: DfExpr, op: &BinaryOp, right: DfExpr) -> Result<DfExpr> {
     match op {
         // Comparison operators — native DF for vectorized Arrow performance.

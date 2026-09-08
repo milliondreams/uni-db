@@ -91,18 +91,28 @@ pub fn push_column_if_absent(columns: &mut Vec<String>, col_name: &str) {
 
 /// Extract a property value from an overflow_json CypherValue blob.
 ///
-/// Returns the raw CypherValue bytes for `prop` if found in the blob,
-/// or `None` if the blob is null or the key is absent.
+/// Returns the raw CypherValue bytes for `prop` if found in the blob, or
+/// `Ok(None)` if there is no overflow column, the blob is null, or the key is
+/// absent. A blob that will not deserialize is an error, not an absent key.
+///
+/// # Errors
+///
+/// Propagates a corrupt overflow payload.
 pub fn extract_from_overflow_blob(
     overflow_arr: Option<&arrow_array::LargeBinaryArray>,
     row: usize,
     prop: &str,
-) -> Option<Vec<u8>> {
-    let arr = overflow_arr?;
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let Some(arr) = overflow_arr else {
+        return Ok(None);
+    };
     if arr.is_null(row) {
-        return None;
+        return Ok(None);
     }
-    uni_common::cypher_value_codec::extract_map_entry_raw(arr.value(row), prop)
+    Ok(uni_common::cypher_value_codec::extract_map_entry_raw(
+        arr.value(row),
+        prop,
+    )?)
 }
 
 /// Build a `LargeBinary` column by extracting a property from overflow_json
@@ -117,7 +127,7 @@ pub fn build_overflow_property_column(
     overflow_arr: Option<&arrow_array::LargeBinaryArray>,
     prop: &str,
     l0_ctx: &L0Context,
-) -> ArrayRef {
+) -> anyhow::Result<ArrayRef> {
     let mut builder = arrow_array::builder::LargeBinaryBuilder::new();
     for i in 0..num_rows {
         let vid = Vid::from(vid_arr.value(i));
@@ -127,13 +137,13 @@ pub fn build_overflow_property_column(
 
         if let Some(val_opt) = l0_val {
             append_value_as_cypher_binary(&mut builder, val_opt.as_ref());
-        } else if let Some(bytes) = extract_from_overflow_blob(overflow_arr, i, prop) {
+        } else if let Some(bytes) = extract_from_overflow_blob(overflow_arr, i, prop)? {
             builder.append_value(&bytes);
         } else {
             builder.append_null();
         }
     }
-    Arc::new(builder.finish())
+    Ok(Arc::new(builder.finish()))
 }
 
 /// Resolve a property value from the L0 visibility chain.
@@ -198,7 +208,7 @@ pub fn build_all_props_column_for_schema_scan(
     overflow_arr: Option<&arrow_array::LargeBinaryArray>,
     projected_properties: &[String],
     l0_ctx: &L0Context,
-) -> ArrayRef {
+) -> anyhow::Result<ArrayRef> {
     // Collect schema-defined property column names (non-internal, non-overflow, non-_all_props)
     let schema_props: Vec<&str> = projected_properties
         .iter()
@@ -217,7 +227,7 @@ pub fn build_all_props_column_for_schema_scan(
         // 1. Schema-defined columns
         for &prop in &schema_props {
             if let Some(col) = batch.column_by_name(prop) {
-                let val = arrow_convert::arrow_to_value(col.as_ref(), i, None);
+                let val = arrow_convert::arrow_to_value(col.as_ref(), i, None)?;
                 if !val.is_null() {
                     merged_props.insert(prop.to_string(), val);
                 }
@@ -251,7 +261,7 @@ pub fn build_all_props_column_for_schema_scan(
             )));
         }
     }
-    Arc::new(builder.finish())
+    Ok(Arc::new(builder.finish()))
 }
 
 /// Get the property value for a VID, returning None if not found.
@@ -2004,7 +2014,7 @@ pub fn map_to_output_schema(
                     overflow_arr,
                     projected_properties,
                     l0_ctx,
-                );
+                )?;
                 columns.push(col);
             }
         } else {
@@ -2019,7 +2029,7 @@ pub fn map_to_output_schema(
                         overflow_arr,
                         prop,
                         l0_ctx,
-                    );
+                    )?;
                     columns.push(col);
                 }
             }
@@ -2419,7 +2429,8 @@ mod tests {
             Some(&overflow_arr),
             &["score".to_string()],
             &L0Context::empty(),
-        );
+        )
+        .expect("schema-scan props column must build");
 
         let out = out
             .as_any()

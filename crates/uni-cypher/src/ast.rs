@@ -592,9 +592,17 @@ impl CypherLiteral {
             CypherLiteral::Integer(i) => Value::Int(*i),
             CypherLiteral::Float(f) => Value::Float(*f),
             CypherLiteral::String(s) => Value::String(s.clone()),
-            CypherLiteral::Bytes(b) => {
-                uni_common::cypher_value_codec::decode(b).unwrap_or(Value::Null)
-            }
+            // Documented exception (#233 class): `to_value` is infallible and
+            // is called from many expression-lowering sites. A literal that
+            // fails to decode is a parser/codec bug, not a NULL literal, so it
+            // is logged rather than passed off as one.
+            CypherLiteral::Bytes(b) => match uni_common::cypher_value_codec::decode(b) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(error = %e, "Bytes literal failed to decode");
+                    Value::Null
+                }
+            },
         }
     }
 }

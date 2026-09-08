@@ -1245,3 +1245,80 @@ async fn id_of_an_unmatched_optional_endpoint_is_null() {
         );
     }
 }
+
+/// A middle-anchored pattern keeps each relationship's own orientation (#224).
+///
+/// Anchoring on a bound node in the middle plans the pattern as two walks out
+/// of it, and the half walking toward the start is reversed with its directions
+/// flipped. That is the same rewrite #219 applied at an end — and the one that
+/// introduced a silent wrong answer there, because a fourth derivation of edge
+/// orientation read traversal order instead of `direction` (#243).
+///
+/// So this asserts the endpoints of both halves, not the row count. The
+/// reversed half is `(post)<-[:CONTAINER_OF]-(forum)`: `startNode` must be the
+/// forum whichever way the planner chose to walk it.
+#[tokio::test]
+async fn a_middle_anchored_pattern_keeps_both_halves_oriented() {
+    let db = Uni::in_memory().build().await.unwrap();
+    let tx = db.session().tx().await.unwrap();
+    tx.execute("CREATE LABEL Forum (name STRING)")
+        .await
+        .unwrap();
+    tx.execute("CREATE LABEL Post (name STRING)").await.unwrap();
+    tx.execute("CREATE LABEL Person (name STRING)")
+        .await
+        .unwrap();
+    tx.execute("CREATE EDGE TYPE CONTAINER_OF FROM Forum TO Post")
+        .await
+        .unwrap();
+    tx.execute("CREATE EDGE TYPE HAS_MEMBER FROM Forum TO Person")
+        .await
+        .unwrap();
+    tx.execute("CREATE (:Forum {name:'f'}), (:Post {name:'p'}), (:Person {name:'m'})")
+        .await
+        .unwrap();
+    tx.execute("MATCH (f:Forum {name:'f'}), (p:Post {name:'p'}) CREATE (f)-[:CONTAINER_OF]->(p)")
+        .await
+        .unwrap();
+    tx.execute("MATCH (f:Forum {name:'f'}), (m:Person {name:'m'}) CREATE (f)-[:HAS_MEMBER]->(m)")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    // `forum` is bound by the WITH and sits in the middle of the pattern, so
+    // neither end anchors the walk and the split is what plans it.
+    let r = db
+        .session()
+        .query(
+            "MATCH (f:Forum) WITH DISTINCT f AS forum \
+             MATCH (post)<-[:CONTAINER_OF]-(forum)-[:HAS_MEMBER]->(person) \
+             RETURN post.name AS p, person.name AS m",
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.rows().len(), 1, "middle-anchored pattern lost its row");
+    assert_eq!(r.rows()[0].values()[0], Value::String("p".to_string()));
+    assert_eq!(r.rows()[0].values()[1], Value::String("m".to_string()));
+
+    // The reversed half's relationship, asked for by value. `CONTAINER_OF`
+    // runs Forum -> Post regardless of which way the planner walked it.
+    let oriented = db
+        .session()
+        .query(
+            "MATCH (f:Forum) WITH DISTINCT f AS forum \
+             MATCH (post)<-[c:CONTAINER_OF]-(forum)-[h:HAS_MEMBER]->(person) \
+             RETURN startNode(c).name AS cs, endNode(c).name AS ce, \
+             startNode(h).name AS hs, endNode(h).name AS he",
+        )
+        .await
+        .unwrap();
+    let row = &oriented.rows()[0];
+    assert_eq!(
+        row.values()[0],
+        Value::String("f".to_string()),
+        "the reversed half reported the wrong start node"
+    );
+    assert_eq!(row.values()[1], Value::String("p".to_string()));
+    assert_eq!(row.values()[2], Value::String("f".to_string()));
+    assert_eq!(row.values()[3], Value::String("m".to_string()));
+}

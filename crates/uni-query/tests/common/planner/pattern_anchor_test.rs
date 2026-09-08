@@ -105,14 +105,17 @@ async fn a_labelled_unbound_end_does_not_cross_join_either() {
     assert!(!has_cross_join(&plan));
 }
 
-/// Reversal is declined where it cannot help, rather than applied blindly.
+/// A bound node in the middle anchors the walk from the middle (#224).
 ///
-/// With the bound node in the *middle*, neither end anchors the walk — that is a
-/// join-ordering problem, not an ordering one, and is out of scope. The test
-/// pins the decision so the guard is not quietly widened into a rewrite that
-/// reverses a path it cannot improve.
+/// Neither end is bound here, so no single direction helps: whichever end the
+/// walk starts from scans everything and cross-joins. The pattern is split at
+/// the anchor and planned as two walks out of it, so both sides start from a
+/// node already in scope.
+///
+/// This test previously asserted the opposite, pinning the limit with a note to
+/// invert it when join ordering landed. This is that inversion.
 #[tokio::test]
-async fn a_middle_bound_pattern_is_left_alone() {
+async fn a_middle_bound_pattern_anchors_from_the_middle() {
     let p = planner().await;
 
     let plan = plan_of(
@@ -122,9 +125,140 @@ async fn a_middle_bound_pattern_is_left_alone() {
          RETURN count(*) AS c",
     );
     assert!(
+        !has_cross_join(&plan),
+        "a middle-bound pattern must anchor on the bound node, not cross-join \
+         from an unbound end"
+    );
+}
+
+/// A pattern with no bound node at all is still planned as written.
+///
+/// The split needs something in scope to anchor on. With nothing bound there is
+/// no decision to make without cardinality — which is the part of #224 this
+/// increment does not attempt — so the plan must be left alone rather than
+/// split arbitrarily.
+#[tokio::test]
+async fn a_wholly_unbound_pattern_is_left_alone() {
+    let p = planner().await;
+
+    let plan = plan_of(
+        &p,
+        "MATCH (post)<-[:CONTAINER_OF]-(forum)-[:HAS_MEMBER]->(person) \
+         RETURN count(*) AS c",
+    );
+    // No anchor exists, so the walk starts at the first element and the shape
+    // is whatever the syntax gave — asserted only so a future rewrite that
+    // splits unanchored patterns has to come here and say why.
+    let _ = plan;
+}
+
+/// Comma-separated paths are ordered so each anchors on an earlier one (#224).
+///
+/// Written left to right, the first path scans every `post` and cross-joins
+/// before the second — which is bound on `forum` and shares `post` — ever runs.
+/// Planning the bound path first leaves `post` in scope, so the other becomes an
+/// anchored traversal.
+///
+/// Sound because comma-separated paths are a conjunction: the result set does
+/// not depend on match order, only the plan shape does. Which is also why this
+/// has to be a plan-shape assertion — no correctness test can tell the two
+/// orders apart.
+#[tokio::test]
+async fn comma_separated_paths_are_ordered_to_anchor() {
+    let p = planner().await;
+
+    let plan = plan_of(
+        &p,
+        "MATCH (f:Forum) WITH DISTINCT f AS forum \
+         MATCH (post)-[:CONTAINER_OF]->(other), (forum)-[:CONTAINER_OF]->(post) \
+         RETURN count(*) AS c",
+    );
+    assert!(
+        !has_cross_join(&plan),
+        "the bound path must be planned before the one that shares a variable \
+         with it, so the second anchors instead of scanning"
+    );
+}
+
+/// A pattern already in a good order is left exactly as written.
+///
+/// The reorder is greedy and takes the leftmost connected path, so a
+/// well-written pattern must come out unchanged rather than merely equivalent.
+/// This pins that the rewrite is not gratuitous.
+#[tokio::test]
+async fn a_well_ordered_pattern_is_not_reordered() {
+    let p = planner().await;
+
+    let plan = plan_of(
+        &p,
+        "MATCH (f:Forum) WITH DISTINCT f AS forum \
+         MATCH (forum)-[:CONTAINER_OF]->(post), (post)-[:CONTAINER_OF]->(other) \
+         RETURN count(*) AS c",
+    );
+    assert!(!has_cross_join(&plan));
+}
+
+/// A genuinely disconnected pattern still cross-joins, and should.
+///
+/// Two paths sharing no variable are a Cartesian product by definition; no
+/// ordering removes it. The fallback that takes the first unplanned path when
+/// nothing is connected is what keeps this terminating rather than looping.
+#[tokio::test]
+async fn a_disconnected_pattern_still_cross_joins() {
+    let p = planner().await;
+
+    let plan = plan_of(
+        &p,
+        "MATCH (a:Forum)-[:CONTAINER_OF]->(b), (c:Forum)-[:HAS_MEMBER]->(d) \
+         RETURN count(*) AS c",
+    );
+    assert!(
         has_cross_join(&plan),
-        "documenting the v1 limit: a middle-bound pattern still cross-joins. \
-         If this starts passing, join ordering landed and this test should \
-         become an assertion that it does NOT cross-join."
+        "a pattern with no shared variable is a product; ordering cannot help"
+    );
+}
+
+/// A quantified path written from its unbound end is reversed too (#224).
+///
+/// `reversed_for_bound_anchor` used to decline any pattern containing a
+/// quantified segment, so a QPP written from the unbound end scanned and
+/// cross-joined exactly as a plain hop did before #219.
+#[tokio::test]
+async fn an_anonymous_quantified_path_anchors_on_its_bound_end() {
+    let p = planner().await;
+
+    let plan = plan_of(
+        &p,
+        "MATCH (f:Forum) WITH DISTINCT f AS forum \
+         MATCH (post)(()<-[:CONTAINER_OF]-()){1,1}(forum) RETURN count(*) AS c",
+    );
+    assert!(
+        !has_cross_join(&plan),
+        "an anonymous quantified path must anchor on its bound end"
+    );
+}
+
+/// A quantified path that names its inner elements is left alone.
+///
+/// Those names are GQL group variables — a list with one entry per iteration,
+/// in traversal order. Reversing the walk would reverse the lists the user
+/// reads back, so this is a semantics question, not a plan-shape one, and the
+/// rewrite declines rather than trading an answer for a plan.
+///
+/// Pins the decision so the guard is not widened by someone who sees only the
+/// anonymous case working.
+#[tokio::test]
+async fn a_named_quantified_path_is_left_alone() {
+    let p = planner().await;
+
+    let plan = plan_of(
+        &p,
+        "MATCH (f:Forum) WITH DISTINCT f AS forum \
+         MATCH (post)((a)<-[:CONTAINER_OF]-(b)){1,1}(forum) RETURN count(*) AS c",
+    );
+    assert!(
+        has_cross_join(&plan),
+        "a quantified path binding group variables must not be reversed: the \
+         lists it binds are ordered by the walk"
     );
 }

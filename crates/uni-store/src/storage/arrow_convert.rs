@@ -162,9 +162,14 @@ pub(crate) fn try_reconstruct_map(arr: &ArrayRef) -> Option<HashMap<String, Valu
     let val_col = structs.column(1);
     let mut map = HashMap::new();
     for i in 0..structs.len() {
-        if let Value::String(k) = arrow_to_value(key_col.as_ref(), i, None) {
-            map.insert(k, arrow_to_value(val_col.as_ref(), i, value_hint));
-        }
+        // A key or value that fails to decode abandons the reconstruction
+        // rather than silently dropping an entry: a map missing one pair is
+        // a wrong answer, and the caller's fallback path can still try.
+        let Ok(Value::String(k)) = arrow_to_value(key_col.as_ref(), i, None) else {
+            return None;
+        };
+        let v = arrow_to_value(val_col.as_ref(), i, value_hint).ok()?;
+        map.insert(k, v);
     }
     Some(map)
 }
@@ -173,10 +178,25 @@ pub(crate) fn try_reconstruct_map(arr: &ArrayRef) -> Option<HashMap<String, Valu
 ///
 /// `elem_type` is the schema hint for each element — `Some(DataType::Bytes)` when the
 /// list child field is marked `uni_raw_bytes`, so raw `Bytes` elements decode verbatim.
-fn array_to_value_list(arr: &ArrayRef, elem_type: Option<&DataType>) -> Vec<Value> {
+fn array_to_value_list(arr: &ArrayRef, elem_type: Option<&DataType>) -> anyhow::Result<Vec<Value>> {
     (0..arr.len())
         .map(|i| arrow_to_value(arr.as_ref(), i, elem_type))
         .collect()
+}
+
+/// The decode hint carried by an Arrow field's own metadata.
+///
+/// A `LargeBinary` column is how both a CypherValue blob and a raw `Bytes`
+/// value are transported, and only the field's `uni_raw_bytes` marker tells
+/// them apart. A caller that has the `Field` and passes `None` throws that
+/// away, leaving [`arrow_to_value`] to sniff — which it can only do by trying
+/// the codec and degrading when it fails.
+///
+/// Pass this wherever a `Field` is in scope, so the ambiguity is confined to
+/// callers that genuinely have only an `ArrayRef` (#233 class).
+#[must_use]
+pub fn type_hint_for_field(field: &arrow_schema::Field) -> Option<&'static DataType> {
+    raw_bytes_hint(field.metadata())
 }
 
 /// Returns `Some(&DataType::Bytes)` when Arrow field metadata marks the field as a
@@ -206,9 +226,13 @@ fn list_child_bytes_hint(dt: &ArrowDataType) -> Option<&'static DataType> {
 /// like Lists and Structs. The optional `data_type` parameter provides schema
 /// context for decoding DateTime and Time struct arrays; when provided, it
 /// takes precedence over runtime type detection.
-pub fn arrow_to_value(col: &dyn Array, row: usize, data_type: Option<&DataType>) -> Value {
+pub fn arrow_to_value(
+    col: &dyn Array,
+    row: usize,
+    data_type: Option<&DataType>,
+) -> anyhow::Result<Value> {
     if col.is_null(row) {
-        return Value::Null;
+        return Ok(Value::Null);
     }
 
     // Schema-driven decode for DateTime and Time structs
@@ -231,32 +255,32 @@ pub fn arrow_to_value(col: &dyn Array, row: usize, data_type: Option<&DataType>)
                     )
                 {
                     if nanos_arr.is_null(row) {
-                        return Value::Null;
+                        return Ok(Value::Null);
                     }
                     let nanos = nanos_arr.value(row);
                     if offset_arr.is_null(row) {
                         // No offset → LocalDateTime
-                        return Value::Temporal(uni_common::TemporalValue::LocalDateTime {
+                        return Ok(Value::Temporal(uni_common::TemporalValue::LocalDateTime {
                             nanos_since_epoch: nanos,
-                        });
+                        }));
                     }
                     let offset = offset_arr.value(row);
                     let tz_name = (!tz_arr.is_null(row)).then(|| tz_arr.value(row).to_string());
-                    return Value::Temporal(uni_common::TemporalValue::DateTime {
+                    return Ok(Value::Temporal(uni_common::TemporalValue::DateTime {
                         nanos_since_epoch: nanos,
                         offset_seconds: offset,
                         timezone_name: tz_name,
-                    });
+                    }));
                 }
                 // Fall back to old schema migration: TimestampNanosecond → DateTime with offset=0
                 if let Some(ts) = col.as_any().downcast_ref::<TimestampNanosecondArray>() {
                     let nanos = ts.value(row);
                     let tz_name = ts.timezone().map(|s| s.to_string());
-                    return Value::Temporal(uni_common::TemporalValue::DateTime {
+                    return Ok(Value::Temporal(uni_common::TemporalValue::DateTime {
                         nanos_since_epoch: nanos,
                         offset_seconds: 0,
                         timezone_name: tz_name,
-                    });
+                    }));
                 }
             }
             DataType::Time => {
@@ -273,22 +297,22 @@ pub fn arrow_to_value(col: &dyn Array, row: usize, data_type: Option<&DataType>)
                 {
                     // Check field-level nulls before calling .value()
                     if nanos_arr.is_null(row) || offset_arr.is_null(row) {
-                        return Value::Null;
+                        return Ok(Value::Null);
                     }
                     let nanos = nanos_arr.value(row);
                     let offset = offset_arr.value(row);
-                    return Value::Temporal(uni_common::TemporalValue::Time {
+                    return Ok(Value::Temporal(uni_common::TemporalValue::Time {
                         nanos_since_midnight: nanos,
                         offset_seconds: offset,
-                    });
+                    }));
                 }
                 // Fall back to old schema: Time64Nanosecond → Time with offset=0
                 if let Some(t) = col.as_any().downcast_ref::<Time64NanosecondArray>() {
                     let nanos = t.value(row);
-                    return Value::Temporal(uni_common::TemporalValue::Time {
+                    return Ok(Value::Temporal(uni_common::TemporalValue::Time {
                         nanos_since_midnight: nanos,
                         offset_seconds: 0,
-                    });
+                    }));
                 }
             }
             DataType::Point(pt) => {
@@ -317,7 +341,7 @@ pub fn arrow_to_value(col: &dyn Array, row: usize, data_type: Option<&DataType>)
                             if let (Some(lat), Some(lon)) =
                                 (f64_at("latitude"), f64_at("longitude"))
                             {
-                                return Value::Map(HashMap::from([
+                                return Ok(Value::Map(HashMap::from([
                                     ("type".to_string(), Value::String("Point".into())),
                                     (
                                         "crs".to_string(),
@@ -325,12 +349,12 @@ pub fn arrow_to_value(col: &dyn Array, row: usize, data_type: Option<&DataType>)
                                     ),
                                     ("latitude".to_string(), Value::Float(lat)),
                                     ("longitude".to_string(), Value::Float(lon)),
-                                ]));
+                                ])));
                             }
                         }
                         PointType::Cartesian2D => {
                             if let (Some(x), Some(y)) = (f64_at("x"), f64_at("y")) {
-                                return Value::Map(HashMap::from([
+                                return Ok(Value::Map(HashMap::from([
                                     ("type".to_string(), Value::String("Point".into())),
                                     (
                                         "crs".to_string(),
@@ -338,14 +362,14 @@ pub fn arrow_to_value(col: &dyn Array, row: usize, data_type: Option<&DataType>)
                                     ),
                                     ("x".to_string(), Value::Float(x)),
                                     ("y".to_string(), Value::Float(y)),
-                                ]));
+                                ])));
                             }
                         }
                         PointType::Cartesian3D => {
                             if let (Some(x), Some(y), Some(z)) =
                                 (f64_at("x"), f64_at("y"), f64_at("z"))
                             {
-                                return Value::Map(HashMap::from([
+                                return Ok(Value::Map(HashMap::from([
                                     ("type".to_string(), Value::String("Point".into())),
                                     (
                                         "crs".to_string(),
@@ -354,49 +378,42 @@ pub fn arrow_to_value(col: &dyn Array, row: usize, data_type: Option<&DataType>)
                                     ("x".to_string(), Value::Float(x)),
                                     ("y".to_string(), Value::Float(y)),
                                     ("z".to_string(), Value::Float(z)),
-                                ]));
+                                ])));
                             }
                         }
                     }
                 }
                 // Point-typed but not a reconstructable point → Null.
-                return Value::Null;
+                return Ok(Value::Null);
             }
             DataType::Bytes => {
                 let Some(arr) = col.as_any().downcast_ref::<LargeBinaryArray>() else {
-                    log::warn!("Bytes column is not LargeBinaryArray");
-                    return Value::Null;
+                    return Err(anyhow::anyhow!("Bytes column is not LargeBinaryArray"));
                 };
                 if arr.is_null(row) {
-                    return Value::Null;
+                    return Ok(Value::Null);
                 }
-                return Value::Bytes(arr.value(row).to_vec());
+                return Ok(Value::Bytes(arr.value(row).to_vec()));
             }
             DataType::Btic => {
                 let Some(fsb) = col.as_any().downcast_ref::<FixedSizeBinaryArray>() else {
-                    log::warn!("BTIC column is not FixedSizeBinaryArray");
-                    return Value::Null;
+                    return Err(anyhow::anyhow!("BTIC column is not FixedSizeBinaryArray"));
                 };
                 let bytes = fsb.value(row);
-                return match uni_btic::encode::decode_slice(bytes) {
-                    Ok(btic) => Value::Temporal(uni_common::TemporalValue::Btic {
-                        lo: btic.lo(),
-                        hi: btic.hi(),
-                        meta: btic.meta(),
-                    }),
-                    Err(e) => {
-                        log::warn!("BTIC decode error: {}", e);
-                        Value::Null
-                    }
-                };
+                let btic = uni_btic::encode::decode_slice(bytes)
+                    .map_err(|e| anyhow::anyhow!("BTIC decode failed: {e}"))?;
+                return Ok(Value::Temporal(uni_common::TemporalValue::Btic {
+                    lo: btic.lo(),
+                    hi: btic.hi(),
+                    meta: btic.meta(),
+                }));
             }
             DataType::SparseVector { .. } => {
                 let Some(struct_arr) = col.as_any().downcast_ref::<StructArray>() else {
-                    log::warn!("SparseVector column is not StructArray");
-                    return Value::Null;
+                    return Err(anyhow::anyhow!("SparseVector column is not StructArray"));
                 };
                 if struct_arr.is_null(row) {
-                    return Value::Null;
+                    return Ok(Value::Null);
                 }
                 let (Some(indices_list), Some(values_list)) = (
                     struct_arr
@@ -406,22 +423,21 @@ pub fn arrow_to_value(col: &dyn Array, row: usize, data_type: Option<&DataType>)
                         .column_by_name("values")
                         .and_then(|c| c.as_any().downcast_ref::<ListArray>()),
                 ) else {
-                    log::warn!("SparseVector struct missing indices/values list columns");
-                    return Value::Null;
+                    return Err(anyhow::anyhow!(
+                        "SparseVector struct missing indices/values list columns"
+                    ));
                 };
                 let idx_vals = indices_list.value(row);
                 let Some(idx_arr) = idx_vals.as_any().downcast_ref::<UInt32Array>() else {
-                    log::warn!("SparseVector 'indices' inner not UInt32");
-                    return Value::Null;
+                    return Err(anyhow::anyhow!("SparseVector 'indices' inner not UInt32"));
                 };
                 let w_vals = values_list.value(row);
                 let Some(w_arr) = w_vals.as_any().downcast_ref::<Float32Array>() else {
-                    log::warn!("SparseVector 'values' inner not Float32");
-                    return Value::Null;
+                    return Err(anyhow::anyhow!("SparseVector 'values' inner not Float32"));
                 };
                 let indices: Vec<u32> = (0..idx_arr.len()).map(|i| idx_arr.value(i)).collect();
                 let values: Vec<f32> = (0..w_arr.len()).map(|i| w_arr.value(i)).collect();
-                return Value::SparseVector { indices, values };
+                return Ok(Value::SparseVector { indices, values });
             }
             _ => {}
         }
@@ -429,7 +445,7 @@ pub fn arrow_to_value(col: &dyn Array, row: usize, data_type: Option<&DataType>)
 
     // String types
     if let Some(s) = col.as_any().downcast_ref::<StringArray>() {
-        return Value::String(s.value(row).to_string());
+        return Ok(Value::String(s.value(row).to_string()));
     }
     // `LargeUtf8`. Distinct from `Utf8` at the Arrow level, so it needs its own
     // downcast — a `StringArray` downcast does not match a `LargeStringArray`.
@@ -440,31 +456,31 @@ pub fn arrow_to_value(col: &dyn Array, row: usize, data_type: Option<&DataType>)
     // so `derived` reported NULL while `QUERY` (which evaluates natively, never
     // touching Arrow) reported the real value.
     if let Some(s) = col.as_any().downcast_ref::<LargeStringArray>() {
-        return Value::String(s.value(row).to_string());
+        return Ok(Value::String(s.value(row).to_string()));
     }
 
     // Integer types
     if let Some(u) = col.as_any().downcast_ref::<UInt64Array>() {
-        return Value::Int(u.value(row) as i64);
+        return Ok(Value::Int(u.value(row) as i64));
     }
     if let Some(i) = col.as_any().downcast_ref::<Int64Array>() {
-        return Value::Int(i.value(row));
+        return Ok(Value::Int(i.value(row)));
     }
     if let Some(i) = col.as_any().downcast_ref::<Int32Array>() {
-        return Value::Int(i.value(row) as i64);
+        return Ok(Value::Int(i.value(row) as i64));
     }
 
     // Float types
     if let Some(f) = col.as_any().downcast_ref::<Float64Array>() {
-        return Value::Float(f.value(row));
+        return Ok(Value::Float(f.value(row)));
     }
     if let Some(f) = col.as_any().downcast_ref::<Float32Array>() {
-        return Value::Float(f.value(row) as f64);
+        return Ok(Value::Float(f.value(row) as f64));
     }
 
     // Boolean type
     if let Some(b) = col.as_any().downcast_ref::<BooleanArray>() {
-        return Value::Bool(b.value(row));
+        return Ok(Value::Bool(b.value(row)));
     }
 
     // Fixed-size list: a `Float32` child is a dense vector and round-trips as
@@ -476,15 +492,19 @@ pub fn arrow_to_value(col: &dyn Array, row: usize, data_type: Option<&DataType>)
     if let Some(list) = col.as_any().downcast_ref::<FixedSizeListArray>() {
         let inner = list.value(row);
         if let Some(floats) = inner.as_any().downcast_ref::<Float32Array>() {
-            return Value::Vector((0..floats.len()).map(|i| floats.value(i)).collect());
+            return Ok(Value::Vector(
+                (0..floats.len()).map(|i| floats.value(i)).collect(),
+            ));
         }
         // A `UInt8` child is a binary vector — round-trip as `Value::BinaryVector`
         // to preserve type identity (parity with the `Float32` dense-vector arm).
         if let Some(bytes) = inner.as_any().downcast_ref::<UInt8Array>() {
-            return Value::BinaryVector((0..bytes.len()).map(|i| bytes.value(i)).collect());
+            return Ok(Value::BinaryVector(
+                (0..bytes.len()).map(|i| bytes.value(i)).collect(),
+            ));
         }
         let elem_hint = list_child_bytes_hint(list.data_type());
-        return Value::List(array_to_value_list(&inner, elem_hint));
+        return Ok(Value::List(array_to_value_list(&inner, elem_hint)?));
     }
 
     // Variable-size list
@@ -493,17 +513,20 @@ pub fn arrow_to_value(col: &dyn Array, row: usize, data_type: Option<&DataType>)
 
         // Map types are stored as List(Struct(key, value)); reconstruct as map
         if let Some(obj) = try_reconstruct_map(&arr) {
-            return Value::Map(obj);
+            return Ok(Value::Map(obj));
         }
 
         let elem_hint = list_child_bytes_hint(list.data_type());
-        return Value::List(array_to_value_list(&arr, elem_hint));
+        return Ok(Value::List(array_to_value_list(&arr, elem_hint)?));
     }
 
     // Large list (variable-size list with i64 offsets)
     if let Some(list) = col.as_any().downcast_ref::<arrow_array::LargeListArray>() {
         let elem_hint = list_child_bytes_hint(list.data_type());
-        return Value::List(array_to_value_list(&list.value(row), elem_hint));
+        return Ok(Value::List(array_to_value_list(
+            &list.value(row),
+            elem_hint,
+        )?));
     }
 
     // Struct type — detect temporal structs by field names before generic handler
@@ -513,7 +536,7 @@ pub fn arrow_to_value(col: &dyn Array, row: usize, data_type: Option<&DataType>)
         // handler below reads the `List<UInt32>` indices child as null).
         if schema::is_sparse_vector_struct(col.data_type()) {
             if s.is_null(row) {
-                return Value::Null;
+                return Ok(Value::Null);
             }
             if let (Some(idx_list), Some(val_list)) = (
                 s.column_by_name("indices")
@@ -529,7 +552,7 @@ pub fn arrow_to_value(col: &dyn Array, row: usize, data_type: Option<&DataType>)
                 ) {
                     let indices = (0..ia.len()).map(|i| ia.value(i)).collect();
                     let values = (0..va.len()).map(|i| va.value(i)).collect();
-                    return Value::SparseVector { indices, values };
+                    return Ok(Value::SparseVector { indices, values });
                 }
             }
         }
@@ -584,17 +607,17 @@ pub fn arrow_to_value(col: &dyn Array, row: usize, data_type: Option<&DataType>)
                                 Some(a.value(row).to_string())
                             }
                         });
-                        return Value::Temporal(uni_common::TemporalValue::DateTime {
+                        return Ok(Value::Temporal(uni_common::TemporalValue::DateTime {
                             nanos_since_epoch: nanos,
                             offset_seconds: offset,
                             timezone_name: tz_name,
-                        });
+                        }));
                     }
                     _ => {
                         // No offset → LocalDateTime
-                        return Value::Temporal(uni_common::TemporalValue::LocalDateTime {
+                        return Ok(Value::Temporal(uni_common::TemporalValue::LocalDateTime {
                             nanos_since_epoch: nanos,
-                        });
+                        }));
                     }
                 }
             }
@@ -637,10 +660,10 @@ pub fn arrow_to_value(col: &dyn Array, row: usize, data_type: Option<&DataType>)
             });
 
             if let (Some(Some(nanos)), Some(Some(offset))) = (nanos_opt, offset_opt) {
-                return Value::Temporal(uni_common::TemporalValue::Time {
+                return Ok(Value::Temporal(uni_common::TemporalValue::Time {
                     nanos_since_midnight: nanos,
                     offset_seconds: offset,
-                });
+                }));
             }
         }
 
@@ -649,24 +672,24 @@ pub fn arrow_to_value(col: &dyn Array, row: usize, data_type: Option<&DataType>)
         for (field, child) in s.fields().iter().zip(s.columns()) {
             map.insert(
                 field.name().clone(),
-                arrow_to_value(child.as_ref(), row, None),
+                arrow_to_value(child.as_ref(), row, None)?,
             );
         }
-        return Value::Map(map);
+        return Ok(Value::Map(map));
     }
 
     // Date32 type (days since epoch) - return as Value::Temporal
     if let Some(d) = col.as_any().downcast_ref::<Date32Array>() {
         let days = d.value(row);
-        return Value::Temporal(uni_common::TemporalValue::Date {
+        return Ok(Value::Temporal(uni_common::TemporalValue::Date {
             days_since_epoch: days,
-        });
+        }));
     }
 
     // Timestamp (nanoseconds since epoch) - timezone presence determines DateTime vs LocalDateTime
     if let Some(ts) = col.as_any().downcast_ref::<TimestampNanosecondArray>() {
         let nanos = ts.value(row);
-        return match ts.timezone() {
+        return Ok(match ts.timezone() {
             Some(tz) => Value::Temporal(uni_common::TemporalValue::DateTime {
                 nanos_since_epoch: nanos,
                 offset_seconds: 0,
@@ -675,15 +698,15 @@ pub fn arrow_to_value(col: &dyn Array, row: usize, data_type: Option<&DataType>)
             None => Value::Temporal(uni_common::TemporalValue::LocalDateTime {
                 nanos_since_epoch: nanos,
             }),
-        };
+        });
     }
 
     // Time64 (nanoseconds since midnight) - return as Value::Temporal
     if let Some(t) = col.as_any().downcast_ref::<Time64NanosecondArray>() {
         let nanos = t.value(row);
-        return Value::Temporal(uni_common::TemporalValue::LocalTime {
+        return Ok(Value::Temporal(uni_common::TemporalValue::LocalTime {
             nanos_since_midnight: nanos,
-        });
+        }));
     }
 
     // Time64 (microseconds since midnight) - convert to nanoseconds
@@ -692,9 +715,9 @@ pub fn arrow_to_value(col: &dyn Array, row: usize, data_type: Option<&DataType>)
         .downcast_ref::<arrow_array::Time64MicrosecondArray>()
     {
         let micros = t.value(row);
-        return Value::Temporal(uni_common::TemporalValue::LocalTime {
+        return Ok(Value::Temporal(uni_common::TemporalValue::LocalTime {
             nanos_since_midnight: micros * 1000,
-        });
+        }));
     }
 
     // DurationMicrosecond - convert to Duration with nanoseconds
@@ -706,33 +729,42 @@ pub fn arrow_to_value(col: &dyn Array, row: usize, data_type: Option<&DataType>)
         let total_nanos = micros * 1000;
         let seconds = total_nanos / 1_000_000_000;
         let remaining_nanos = total_nanos % 1_000_000_000;
-        return Value::Temporal(uni_common::TemporalValue::Duration {
+        return Ok(Value::Temporal(uni_common::TemporalValue::Duration {
             months: 0,
             days: 0,
             nanos: seconds * 1_000_000_000 + remaining_nanos,
-        });
+        }));
     }
 
     // IntervalMonthDayNano - return as Value::Temporal(Duration)
     if let Some(interval) = col.as_any().downcast_ref::<IntervalMonthDayNanoArray>() {
         let val = interval.value(row);
-        return Value::Temporal(uni_common::TemporalValue::Duration {
+        return Ok(Value::Temporal(uni_common::TemporalValue::Duration {
             months: val.months as i64,
             days: val.days as i64,
             nanos: val.nanoseconds,
-        });
+        }));
     }
 
     // LargeBinary (CypherValue MessagePack-tagged encoding)
     if let Some(b) = col.as_any().downcast_ref::<LargeBinaryArray>() {
         let bytes = b.value(row);
         if bytes.is_empty() {
-            return Value::Null;
+            return Ok(Value::Null);
         }
-        return uni_common::cypher_value_codec::decode(bytes).unwrap_or_else(|e| {
-            eprintln!("CypherValue decode error: {}", e);
-            Value::Null
-        });
+        // No `data_type` hint means nothing has said this column holds a
+        // CypherValue rather than opaque bytes, and both are legitimate here:
+        // no writer stamps `uni_raw_bytes` on every such column. So an
+        // undecodable payload degrades to the bytes themselves, which is the
+        // contract `procedure.rs` already documents and pins
+        // (`undecodable_bytes_fall_back_instead_of_erroring`).
+        //
+        // This is *not* the #233 shape it replaced: `Value::Bytes` carries the
+        // payload, where the previous `Value::Null` was a legal value that made
+        // an unreadable property indistinguishable from an absent one. The
+        // typed path below — where `data_type` does say CypherValue — errors.
+        return Ok(uni_common::cypher_value_codec::decode(bytes)
+            .unwrap_or_else(|_| Value::Bytes(bytes.to_vec())));
     }
 
     // FixedSizeBinary(24) — BTIC temporal interval
@@ -740,34 +772,34 @@ pub fn arrow_to_value(col: &dyn Array, row: usize, data_type: Option<&DataType>)
         && fsb.value_length() == 24
     {
         let bytes = fsb.value(row);
-        return match uni_btic::encode::decode_slice(bytes) {
-            Ok(btic) => Value::Temporal(uni_common::TemporalValue::Btic {
-                lo: btic.lo(),
-                hi: btic.hi(),
-                meta: btic.meta(),
-            }),
-            Err(e) => {
-                log::warn!("BTIC decode error: {}", e);
-                Value::Null
-            }
-        };
+        let btic = uni_btic::encode::decode_slice(bytes)
+            .map_err(|e| anyhow::anyhow!("BTIC decode failed: {e}"))?;
+        return Ok(Value::Temporal(uni_common::TemporalValue::Btic {
+            lo: btic.lo(),
+            hi: btic.hi(),
+            meta: btic.meta(),
+        }));
     }
 
     // Binary (CRDT MessagePack) - decode to Value via serde_json boundary
     if let Some(b) = col.as_any().downcast_ref::<BinaryArray>() {
         let bytes = b.value(row);
-        return Crdt::from_msgpack(bytes)
-            .ok()
-            .and_then(|crdt| serde_json::to_value(&crdt).ok())
-            .map(Value::from)
-            .unwrap_or(Value::Null);
+        // A corrupt CRDT blob is unreadable, not null. `Value::Null` is a legal
+        // property value, so collapsing to it made the two indistinguishable
+        // (#233 class). Unlike the untyped `LargeBinary` arm below — where only
+        // the field's `uni_raw_bytes` marker separates a CypherValue from raw
+        // bytes, so the arm can merely sniff — a `BinaryArray` reaching here is
+        // unambiguously CRDT MessagePack, so the failure is a real error.
+        let crdt = Crdt::from_msgpack(bytes)
+            .map_err(|e| anyhow::anyhow!("CRDT MessagePack decode failed: {e}"))?;
+        return Ok(Value::from(serde_json::to_value(&crdt)?));
     }
 
     // Arrow's Null type carries no values by construction, so `Value::Null` is
     // the correct decode, not a gap. Listed explicitly so it does not reach the
     // diagnostic below.
     if *col.data_type() == ArrowDataType::Null {
-        return Value::Null;
+        return Ok(Value::Null);
     }
 
     // `_uid` — the 32-byte content hash on vertex/index datasets
@@ -777,7 +809,7 @@ pub fn arrow_to_value(col: &dyn Array, row: usize, data_type: Option<&DataType>)
     // every cell. The `FixedSizeBinary(24)` arm above claims BTIC; every other
     // width is this.
     if matches!(col.data_type(), ArrowDataType::FixedSizeBinary(_)) {
-        return Value::Null;
+        return Ok(Value::Null);
     }
 
     // Fallback: an Arrow type no arm above handles. Decoding to `Null` silently
@@ -790,13 +822,13 @@ pub fn arrow_to_value(col: &dyn Array, row: usize, data_type: Option<&DataType>)
     // path and not every caller has been audited for types that legitimately
     // land here. The two high-volume benign cases are handled above, so
     // reaching this point is genuinely unexpected and worth a line in the log.
-    log::warn!(
-        "arrow_to_value: no decoder for Arrow type {:?}; returning Null. \
-         This is a silent wrong answer if the column holds real data — \
-         add a downcast arm for it.",
+    Err(anyhow::anyhow!(
+        "arrow_to_value: no decoder for Arrow type {:?}. This used to return \
+         Null, which is a legal value, so a column this decoder cannot read \
+         was indistinguishable from one genuinely absent — the shape that hid \
+         a missing LargeUtf8 arm. Add a downcast arm for it.",
         col.data_type()
-    );
-    Value::Null
+    ))
 }
 
 /// Shared body of the primitive `values_to_*_array` helpers: build a nullable
@@ -2572,12 +2604,12 @@ mod tests {
     fn test_arrow_to_value_string() {
         let arr = StringArray::from(vec![Some("hello"), None, Some("world")]);
         assert_eq!(
-            arrow_to_value(&arr, 0, None),
+            arrow_to_value(&arr, 0, None).unwrap(),
             Value::String("hello".to_string())
         );
-        assert_eq!(arrow_to_value(&arr, 1, None), Value::Null);
+        assert_eq!(arrow_to_value(&arr, 1, None).unwrap(), Value::Null);
         assert_eq!(
-            arrow_to_value(&arr, 2, None),
+            arrow_to_value(&arr, 2, None).unwrap(),
             Value::String("world".to_string())
         );
     }
@@ -2595,12 +2627,12 @@ mod tests {
     fn test_arrow_to_value_large_string() {
         let arr = LargeStringArray::from(vec![Some("hello"), None, Some("world")]);
         assert_eq!(
-            arrow_to_value(&arr, 0, None),
+            arrow_to_value(&arr, 0, None).unwrap(),
             Value::String("hello".to_string())
         );
-        assert_eq!(arrow_to_value(&arr, 1, None), Value::Null);
+        assert_eq!(arrow_to_value(&arr, 1, None).unwrap(), Value::Null);
         assert_eq!(
-            arrow_to_value(&arr, 2, None),
+            arrow_to_value(&arr, 2, None).unwrap(),
             Value::String("world".to_string())
         );
     }
@@ -2608,25 +2640,25 @@ mod tests {
     #[test]
     fn test_arrow_to_value_int64() {
         let arr = Int64Array::from(vec![Some(42), None, Some(-10)]);
-        assert_eq!(arrow_to_value(&arr, 0, None), Value::Int(42));
-        assert_eq!(arrow_to_value(&arr, 1, None), Value::Null);
-        assert_eq!(arrow_to_value(&arr, 2, None), Value::Int(-10));
+        assert_eq!(arrow_to_value(&arr, 0, None).unwrap(), Value::Int(42));
+        assert_eq!(arrow_to_value(&arr, 1, None).unwrap(), Value::Null);
+        assert_eq!(arrow_to_value(&arr, 2, None).unwrap(), Value::Int(-10));
     }
 
     #[test]
     #[allow(clippy::approx_constant)]
     fn test_arrow_to_value_float64() {
         let arr = Float64Array::from(vec![Some(3.14), None]);
-        assert_eq!(arrow_to_value(&arr, 0, None), Value::Float(3.14));
-        assert_eq!(arrow_to_value(&arr, 1, None), Value::Null);
+        assert_eq!(arrow_to_value(&arr, 0, None).unwrap(), Value::Float(3.14));
+        assert_eq!(arrow_to_value(&arr, 1, None).unwrap(), Value::Null);
     }
 
     #[test]
     fn test_arrow_to_value_bool() {
         let arr = BooleanArray::from(vec![Some(true), Some(false), None]);
-        assert_eq!(arrow_to_value(&arr, 0, None), Value::Bool(true));
-        assert_eq!(arrow_to_value(&arr, 1, None), Value::Bool(false));
-        assert_eq!(arrow_to_value(&arr, 2, None), Value::Null);
+        assert_eq!(arrow_to_value(&arr, 0, None).unwrap(), Value::Bool(true));
+        assert_eq!(arrow_to_value(&arr, 1, None).unwrap(), Value::Bool(false));
+        assert_eq!(arrow_to_value(&arr, 2, None).unwrap(), Value::Null);
     }
 
     #[test]
@@ -2723,16 +2755,16 @@ mod tests {
 
         // Decode each row through arrow_to_value with Bytes hint.
         assert_eq!(
-            arrow_to_value(arr.as_ref(), 0, Some(&DataType::Bytes)),
+            arrow_to_value(arr.as_ref(), 0, Some(&DataType::Bytes)).unwrap(),
             Value::Bytes(blob)
         );
         assert_eq!(
-            arrow_to_value(arr.as_ref(), 1, Some(&DataType::Bytes)),
+            arrow_to_value(arr.as_ref(), 1, Some(&DataType::Bytes)).unwrap(),
             Value::Bytes(Vec::new())
         );
         // Missing property → null in the Arrow array.
         assert_eq!(
-            arrow_to_value(arr.as_ref(), 2, Some(&DataType::Bytes)),
+            arrow_to_value(arr.as_ref(), 2, Some(&DataType::Bytes)).unwrap(),
             Value::Null
         );
     }
@@ -2754,7 +2786,7 @@ mod tests {
             .unwrap();
         // With schema hint: raw bytes returned.
         assert_eq!(
-            arrow_to_value(arr.as_ref(), 0, Some(&DataType::Bytes)),
+            arrow_to_value(arr.as_ref(), 0, Some(&DataType::Bytes)).unwrap(),
             Value::Bytes(raw)
         );
     }
@@ -2778,10 +2810,16 @@ mod tests {
 
         let arr = builder.finish();
         // Arrow→Value returns Value::Temporal(LocalTime) with nanos (micros * 1000)
-        assert_eq!(arrow_to_value(&arr, 0, None).to_string(), "10:30:45");
-        assert_eq!(arrow_to_value(&arr, 1, None).to_string(), "00:00");
-        assert_eq!(arrow_to_value(&arr, 2, None).to_string(), "23:59:59.123456");
-        assert_eq!(arrow_to_value(&arr, 3, None), Value::Null);
+        assert_eq!(
+            arrow_to_value(&arr, 0, None).unwrap().to_string(),
+            "10:30:45"
+        );
+        assert_eq!(arrow_to_value(&arr, 1, None).unwrap().to_string(), "00:00");
+        assert_eq!(
+            arrow_to_value(&arr, 2, None).unwrap().to_string(),
+            "23:59:59.123456"
+        );
+        assert_eq!(arrow_to_value(&arr, 3, None).unwrap(), Value::Null);
     }
 
     #[test]
@@ -2795,10 +2833,10 @@ mod tests {
             None,
         ]);
 
-        assert_eq!(arrow_to_value(&arr, 0, None).to_string(), "PT1S");
-        assert_eq!(arrow_to_value(&arr, 1, None).to_string(), "PT1H");
-        assert_eq!(arrow_to_value(&arr, 2, None).to_string(), "PT24H");
-        assert_eq!(arrow_to_value(&arr, 3, None), Value::Null);
+        assert_eq!(arrow_to_value(&arr, 0, None).unwrap().to_string(), "PT1S");
+        assert_eq!(arrow_to_value(&arr, 1, None).unwrap().to_string(), "PT1H");
+        assert_eq!(arrow_to_value(&arr, 2, None).unwrap().to_string(), "PT24H");
+        assert_eq!(arrow_to_value(&arr, 3, None).unwrap(), Value::Null);
     }
 
     #[test]
@@ -2819,14 +2857,14 @@ mod tests {
         let arr = builder.finish();
 
         // The first value should deserialize back to a map
-        let result = arrow_to_value(&arr, 0, None);
+        let result = arrow_to_value(&arr, 0, None).unwrap();
         assert!(result.as_object().is_some());
         let obj = result.as_object().unwrap();
         // GCounter serializes with tag "t": "gc"
         assert_eq!(obj.get("t"), Some(&Value::String("gc".to_string())));
 
         // Null value should return null
-        assert_eq!(arrow_to_value(&arr, 1, None), Value::Null);
+        assert_eq!(arrow_to_value(&arr, 1, None).unwrap(), Value::Null);
     }
 
     #[test]
@@ -2856,9 +2894,9 @@ mod tests {
         assert_eq!(arr.len(), 3);
 
         // Decode back to Value
-        let decoded_0 = arrow_to_value(arr_ref.as_ref(), 0, Some(&DataType::DateTime));
-        let decoded_1 = arrow_to_value(arr_ref.as_ref(), 1, Some(&DataType::DateTime));
-        let decoded_2 = arrow_to_value(arr_ref.as_ref(), 2, Some(&DataType::DateTime));
+        let decoded_0 = arrow_to_value(arr_ref.as_ref(), 0, Some(&DataType::DateTime)).unwrap();
+        let decoded_1 = arrow_to_value(arr_ref.as_ref(), 1, Some(&DataType::DateTime)).unwrap();
+        let decoded_2 = arrow_to_value(arr_ref.as_ref(), 2, Some(&DataType::DateTime)).unwrap();
 
         // Verify round-trip preserves all fields
         assert_eq!(decoded_0, values[0]);
@@ -2902,16 +2940,16 @@ mod tests {
         assert_eq!(arr.len(), 3);
 
         // Check first value is valid
-        let decoded_0 = arrow_to_value(arr_ref.as_ref(), 0, Some(&DataType::DateTime));
+        let decoded_0 = arrow_to_value(arr_ref.as_ref(), 0, Some(&DataType::DateTime)).unwrap();
         assert_eq!(decoded_0, values[0]);
 
         // Check second value is null
         assert!(arr.is_null(1));
-        let decoded_1 = arrow_to_value(arr_ref.as_ref(), 1, Some(&DataType::DateTime));
+        let decoded_1 = arrow_to_value(arr_ref.as_ref(), 1, Some(&DataType::DateTime)).unwrap();
         assert_eq!(decoded_1, Value::Null);
 
         // Check third value is valid
-        let decoded_2 = arrow_to_value(arr_ref.as_ref(), 2, Some(&DataType::DateTime));
+        let decoded_2 = arrow_to_value(arr_ref.as_ref(), 2, Some(&DataType::DateTime)).unwrap();
         assert_eq!(decoded_2, values[2]);
     }
 
@@ -2942,7 +2980,7 @@ mod tests {
 
         // Verify round-trip for all boundary values
         for (i, expected) in values.iter().enumerate() {
-            let decoded = arrow_to_value(arr_ref.as_ref(), i, Some(&DataType::DateTime));
+            let decoded = arrow_to_value(arr_ref.as_ref(), i, Some(&DataType::DateTime)).unwrap();
             assert_eq!(&decoded, expected);
         }
     }
@@ -2958,9 +2996,9 @@ mod tests {
         let arr = builder.finish();
 
         // Decode with DataType::DateTime hint should migrate old schema
-        let decoded_0 = arrow_to_value(&arr, 0, Some(&DataType::DateTime));
-        let _decoded_1 = arrow_to_value(&arr, 1, Some(&DataType::DateTime));
-        let decoded_2 = arrow_to_value(&arr, 2, Some(&DataType::DateTime));
+        let decoded_0 = arrow_to_value(&arr, 0, Some(&DataType::DateTime)).unwrap();
+        let _decoded_1 = arrow_to_value(&arr, 1, Some(&DataType::DateTime)).unwrap();
+        let decoded_2 = arrow_to_value(&arr, 2, Some(&DataType::DateTime)).unwrap();
 
         // Old schema should default to offset=0, preserve timezone
         if let Value::Temporal(TemporalValue::DateTime {
@@ -3004,9 +3042,9 @@ mod tests {
         assert_eq!(arr.len(), 3);
 
         // Decode back to Value
-        let decoded_0 = arrow_to_value(arr_ref.as_ref(), 0, Some(&DataType::Time));
-        let decoded_1 = arrow_to_value(arr_ref.as_ref(), 1, Some(&DataType::Time));
-        let decoded_2 = arrow_to_value(arr_ref.as_ref(), 2, Some(&DataType::Time));
+        let decoded_0 = arrow_to_value(arr_ref.as_ref(), 0, Some(&DataType::Time)).unwrap();
+        let decoded_1 = arrow_to_value(arr_ref.as_ref(), 1, Some(&DataType::Time)).unwrap();
+        let decoded_2 = arrow_to_value(arr_ref.as_ref(), 2, Some(&DataType::Time)).unwrap();
 
         // Verify round-trip preserves all fields
         assert_eq!(decoded_0, values[0]);
@@ -3046,16 +3084,16 @@ mod tests {
         assert_eq!(arr.len(), 3);
 
         // Check first value is valid
-        let decoded_0 = arrow_to_value(arr_ref.as_ref(), 0, Some(&DataType::Time));
+        let decoded_0 = arrow_to_value(arr_ref.as_ref(), 0, Some(&DataType::Time)).unwrap();
         assert_eq!(decoded_0, values[0]);
 
         // Check second value is null
         assert!(arr.is_null(1));
-        let decoded_1 = arrow_to_value(arr_ref.as_ref(), 1, Some(&DataType::Time));
+        let decoded_1 = arrow_to_value(arr_ref.as_ref(), 1, Some(&DataType::Time)).unwrap();
         assert_eq!(decoded_1, Value::Null);
 
         // Check third value is valid
-        let decoded_2 = arrow_to_value(arr_ref.as_ref(), 2, Some(&DataType::Time));
+        let decoded_2 = arrow_to_value(arr_ref.as_ref(), 2, Some(&DataType::Time)).unwrap();
         assert_eq!(decoded_2, values[2]);
     }
 
@@ -3452,14 +3490,17 @@ mod tests {
 
         // Read-back preserves type identity.
         assert_eq!(
-            arrow_to_value(&arr_ref, 0, Some(&data_type)),
+            arrow_to_value(&arr_ref, 0, Some(&data_type)).unwrap(),
             Value::BinaryVector(vec![0x00, 0xFF, 0xA5])
         );
         assert_eq!(
-            arrow_to_value(&arr_ref, 1, Some(&data_type)),
+            arrow_to_value(&arr_ref, 1, Some(&data_type)).unwrap(),
             Value::BinaryVector(vec![1, 2, 255])
         );
-        assert_eq!(arrow_to_value(&arr_ref, 3, Some(&data_type)), Value::Null);
+        assert_eq!(
+            arrow_to_value(&arr_ref, 3, Some(&data_type)).unwrap(),
+            Value::Null
+        );
     }
 
     #[test]
@@ -3525,7 +3566,7 @@ mod tests {
 
         // Read back through the generic decoder; each token round-trips with type
         // fidelity as a `Value::Vector`.
-        let row0 = arrow_to_value(arr_ref.as_ref(), 0, Some(&data_type));
+        let row0 = arrow_to_value(arr_ref.as_ref(), 0, Some(&data_type)).unwrap();
         assert_eq!(
             row0,
             Value::List(vec![
@@ -3534,7 +3575,7 @@ mod tests {
             ])
         );
 
-        let row1 = arrow_to_value(arr_ref.as_ref(), 1, Some(&data_type));
+        let row1 = arrow_to_value(arr_ref.as_ref(), 1, Some(&data_type)).unwrap();
         let Value::List(tokens) = row1 else {
             panic!("row1 should decode to a list of tokens");
         };
@@ -3721,5 +3762,89 @@ mod tests {
             "out-of-range day count must be NULL in a date32 column, not wrapped"
         );
         assert_eq!(arr.value(1), 42);
+    }
+}
+
+#[cfg(test)]
+mod decode_failure_is_not_null {
+    //! A blob that cannot be decoded must not read as `Value::Null`.
+    //!
+    //! `Value::Null` is a legal property value, so substituting it for a
+    //! failed decode told the caller "this property is absent" when the truth
+    //! was "this property could not be read". Every arm that can fail now
+    //! returns `Err`; these pin that, because the failure mode is a wrong
+    //! answer rather than a loud one and nothing else would catch a
+    //! regression (#233 class, #215's sibling).
+
+    use super::*;
+    use arrow_array::{FixedSizeBinaryArray, LargeBinaryArray};
+
+    /// An undecodable LargeBinary payload keeps its bytes; it does not become Null.
+    ///
+    /// There is no `DataType` that says "this column holds a CypherValue", so
+    /// an unhinted LargeBinary column may legitimately hold opaque bytes — the
+    /// contract `procedure.rs` documents and pins. Erroring would break every
+    /// plugin yielding raw bytes.
+    ///
+    /// The fix at this arm is therefore `Null` → `Bytes`, not `Null` → `Err`:
+    /// `Value::Null` is a legal value that made an unreadable property
+    /// indistinguishable from an absent one, while `Value::Bytes` carries the
+    /// payload the caller can still inspect. The arms that *do* know their type
+    /// — BTIC, the shape mismatches, the terminal fallback — return `Err`.
+    #[test]
+    fn an_undecodable_blob_keeps_its_bytes_rather_than_becoming_null() {
+        // 0xFF is not a valid CypherValue tag.
+        let junk = vec![0xFFu8, 0x00, 0x01];
+        let arr = LargeBinaryArray::from(vec![Some(junk.as_slice())]);
+        let got = arrow_to_value(&arr, 0, None).expect("an opaque payload must not fail the read");
+        assert_eq!(
+            got,
+            Value::Bytes(junk),
+            "an undecodable payload must keep its bytes, not read as a legal Null"
+        );
+    }
+
+    /// An empty blob is still a genuine null — the control.
+    ///
+    /// Without this the test above would pass for a decoder that errored on
+    /// everything, which would be a different defect.
+    #[test]
+    fn an_empty_blob_is_still_null() {
+        let arr = LargeBinaryArray::from(vec![Some(&[][..])]);
+        assert_eq!(arrow_to_value(&arr, 0, None).unwrap(), Value::Null);
+    }
+
+    /// A real value still decodes — the second control.
+    #[test]
+    fn a_valid_blob_still_decodes() {
+        let encoded = uni_common::cypher_value_codec::encode(&Value::Int(7));
+        let arr = LargeBinaryArray::from(vec![Some(encoded.as_slice())]);
+        assert_eq!(arrow_to_value(&arr, 0, None).unwrap(), Value::Int(7));
+    }
+
+    /// A 24-byte BTIC interval that is not a valid encoding is an error.
+    #[test]
+    fn a_corrupt_btic_interval_is_an_error() {
+        let arr = FixedSizeBinaryArray::try_from_iter([[0xFFu8; 24]].into_iter())
+            .expect("fixed size binary");
+        let err = arrow_to_value(&arr, 0, None)
+            .expect_err("a corrupt BTIC interval must not decode to Null");
+        assert!(
+            err.to_string().contains("BTIC decode failed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// An Arrow type with no decoder arm is an error, not a null.
+    ///
+    /// This is the arm whose own comment recorded that it had hidden a missing
+    /// `LargeUtf8` decoder — "a silent wrong answer if the column holds real
+    /// data" — and shipped anyway.
+    #[test]
+    fn an_undecodable_arrow_type_is_an_error() {
+        let arr = arrow_array::DurationSecondArray::from(vec![Some(5i64)]);
+        let err = arrow_to_value(&arr, 0, None)
+            .expect_err("an Arrow type with no decoder arm must not read as Null");
+        assert!(err.to_string().contains("no decoder for Arrow type"));
     }
 }

@@ -336,6 +336,12 @@ fn arrow_scalar_to_value(
             {
                 return Ok(Value::Bytes(bytes.to_vec()));
             }
+            // Budgeted against the decode-default rule, not a violation of it:
+            // no plugin loader stamps `uni_raw_bytes` on a yield field, so an
+            // unmarked column is the only shape a plugin yielding opaque bytes
+            // can produce. Erroring here breaks every such plugin at the CALL
+            // site — see `undecodable_bytes_fall_back_instead_of_erroring`,
+            // which pins this contract.
             Ok(uni_common::cypher_value_codec::decode(bytes)
                 .unwrap_or_else(|_| Value::Bytes(bytes.to_vec())))
         }

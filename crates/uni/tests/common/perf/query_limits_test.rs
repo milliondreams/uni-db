@@ -1398,3 +1398,92 @@ async fn a_variable_length_expansion_is_bounded_by_one_row_chunk() -> Result<()>
     );
     Ok(())
 }
+
+/// The schemaless variable-length expansion is both accounted and bounded
+/// (#241, second arm).
+///
+/// `GraphVariableLengthTraverseMainExec` reserved only its adjacency map, so
+/// the expansion set — a node path and an edge path per enumerated path, and
+/// this operator's dominant allocation — was invisible to the query pool.
+/// Measured before the change: 106 MB of expansions passed an 8 MB ceiling
+/// without the pool noticing, because nothing ever asked it.
+///
+/// Two assertions, because the two halves fail differently and a single
+/// ceiling cannot catch both:
+///
+/// * **accounted** — a 1 MB ceiling must now be *refused*. Before, no ceiling
+///   could refuse this query at all: unaccounted memory cannot be rejected, so
+///   the test that catches missing accounting is one that demands a failure.
+/// * **bounded** — an 8 MB ceiling must *pass*. One row-chunk asks 1697 KB;
+///   the whole 10-row batch asks ~15 MB. Given accounting, this fails unless
+///   the expansion is chunked.
+///
+/// Verified discriminating in both directions: dropping the reservation makes
+/// the first assertion fail, and restoring `rows_per_chunk` to `slice_size`
+/// makes the second fail.
+#[tokio::test]
+async fn a_schemaless_variable_length_expansion_is_accounted_and_bounded() -> Result<()> {
+    const WIDTH: i64 = 10;
+    const LAYERS: i64 = 7;
+    const EXPECTED_PATHS: i64 = 111_100;
+    const QUERY: &str = "MATCH p = (a:N {layer: 0})-[:E*1..4]->(b:N) RETURN count(p) AS c";
+
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("N")
+        .property("layer", uni_db::DataType::Int)
+        .apply()
+        .await?;
+    // `E` is deliberately NOT declared: an undeclared edge type is what routes
+    // the pattern through `GraphVariableLengthTraverseMainExec` rather than its
+    // schema'd twin.
+    let tx = db.session().tx().await?;
+    for layer in 0..LAYERS {
+        tx.query_with("UNWIND range(0, $w - 1) AS i CREATE (:N {layer: $l})")
+            .param("w", uni_db::Value::Int(WIDTH))
+            .param("l", uni_db::Value::Int(layer))
+            .fetch_all()
+            .await?;
+    }
+    for layer in 0..LAYERS - 1 {
+        tx.query_with("MATCH (a:N {layer: $l}), (b:N {layer: $n}) CREATE (a)-[:E]->(b)")
+            .param("l", uni_db::Value::Int(layer))
+            .param("n", uni_db::Value::Int(layer + 1))
+            .fetch_all()
+            .await?;
+    }
+    tx.commit().await?;
+    db.flush().await?;
+
+    // Accounted: a ceiling below one row-chunk must be refused, naming this
+    // operator. An unaccounted expansion would sail past any ceiling.
+    let refused = db
+        .session()
+        .query_with(QUERY)
+        .max_memory(1024 * 1024)
+        .fetch_all()
+        .await;
+    let err = refused
+        .err()
+        .expect("a 1 MB ceiling must refuse a 111k-path expansion")
+        .to_string();
+    assert!(
+        err.contains("GraphVariableLengthTraverseMainExec"),
+        "the refusal must come from the schemaless VLP operator, so the \
+         expansion set is what the pool saw; got: {err}"
+    );
+
+    // Bounded: above one row-chunk but below the whole batch.
+    let rows = db
+        .session()
+        .query_with(QUERY)
+        .max_memory(8 * 1024 * 1024)
+        .fetch_all()
+        .await?;
+    assert_eq!(
+        rows.rows()[0].values()[0],
+        uni_db::Value::Int(EXPECTED_PATHS),
+        "the row-chunked expansion lost or repeated paths"
+    );
+    Ok(())
+}

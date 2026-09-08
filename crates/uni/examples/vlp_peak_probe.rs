@@ -75,7 +75,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .property("idx", DataType::Int)
         .apply()
         .await?;
-    db.schema().edge_type("E", &["N"], &["N"]).apply().await?;
+    // Declaring the edge type selects `GraphVariableLengthTraverseExec`; leaving
+    // it undeclared routes the same pattern through
+    // `GraphVariableLengthTraverseMainExec`, the schemaless twin that reads the
+    // main edges table. Same fixture, same query, different state machine —
+    // which is what makes the two arms comparable.
+    let schemaless = std::env::var("VLP_SCHEMALESS").is_ok();
+    if !schemaless {
+        db.schema().edge_type("E", &["N"], &["N"]).apply().await?;
+    }
 
     // A layered mesh: every node in layer i points at every node in layer i+1.
     // Node and edge counts are identical for every depth measured, so a peak
@@ -146,8 +154,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let peak = peak_rss_kb();
     println!(
-        "mode={mode} depth={depth:>2}  counted={paths:>9}  rows_returned=1  \
+        "{}mode={mode} depth={depth:>2}  counted={paths:>9}  rows_returned=1  \
          peak_rss={:>7} MB  (delta_after_fixture={:>6} MB)  took={:?}",
+        if schemaless {
+            "schemaless "
+        } else {
+            "schema'd   "
+        },
         peak / 1024,
         (peak.saturating_sub(baseline)) / 1024,
         elapsed

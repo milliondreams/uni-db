@@ -5372,6 +5372,8 @@ impl ExecutionPlan for GraphVariableLengthTraverseMainExec {
         let reservation =
             MemoryConsumer::new(format!("GraphVariableLengthTraverseMainExec[{partition}]"))
                 .register(context.memory_pool());
+        // Read before `context` is moved into the input's `execute`.
+        let slice_size = context.session_config().batch_size().max(1);
         let input_stream = self.input.execute(partition, context)?;
         let metrics = BaselineMetrics::new(&self.metrics, partition);
 
@@ -5385,6 +5387,12 @@ impl ExecutionPlan for GraphVariableLengthTraverseMainExec {
         };
 
         Ok(Box::pin(GraphVariableLengthTraverseMainStream {
+            slice_size,
+            // One row, for the reason given on the schema'd twin: retuning only
+            // reacts to a pass that already happened, so a wide first chunk is
+            // unbounded by construction.
+            rows_per_chunk: 1,
+            pending_rows: None,
             reservation,
             input: input_stream,
             source_column: self.source_column.clone(),
@@ -5435,6 +5443,14 @@ enum VarLengthMainStreamState {
         adjacency: EdgeAdjacencyMap,
         fut: Pin<Box<dyn std::future::Future<Output = DFResult<RecordBatch>> + Send>>,
     },
+    /// Expanding one row-chunk of the input batch held in `pending_rows`.
+    ///
+    /// The schemaless twin of [`VarLengthStreamState::RowChunking`], and for
+    /// the same reason: the expansion set is the peak and it exists in full
+    /// before materialization begins, so only chunking the *input rows* bounds
+    /// construction (#241). Carries the adjacency because this stream keeps it
+    /// in the state rather than on the stream.
+    RowChunking(EdgeAdjacencyMap),
     /// Stream is done.
     Done,
 }
@@ -5442,6 +5458,14 @@ enum VarLengthMainStreamState {
 /// Stream for variable-length traversal on schemaless edges.
 #[expect(dead_code, reason = "VLP fields used in Phase 3")]
 struct GraphVariableLengthTraverseMainStream {
+    /// Target rows per output batch, and the expansion budget per pass.
+    slice_size: usize,
+    /// Input rows expanded per pass, retuned from the fan-out actually seen.
+    /// See [`retune_rows_per_chunk`].
+    rows_per_chunk: usize,
+    /// The input batch being consumed a row-chunk at a time, and where to
+    /// resume in it.
+    pending_rows: Option<(RecordBatch, usize)>,
     input: SendableRecordBatchStream,
     source_column: String,
     type_names: Vec<String>,
@@ -5645,13 +5669,25 @@ impl GraphVariableLengthTraverseMainStream {
 
     /// Emit the base batch directly, or move into target-property hydration.
     /// See the schema'd exec's twin.
+    /// Where to go once a chunk's output has been handed downstream.
+    ///
+    /// Same role as the schema'd twin's `resume_state`; carries the adjacency
+    /// because this stream keeps it in the state.
+    fn resume_state(&self, adjacency: EdgeAdjacencyMap) -> VarLengthMainStreamState {
+        if self.pending_rows.is_some() {
+            VarLengthMainStreamState::RowChunking(adjacency)
+        } else {
+            VarLengthMainStreamState::Processing(adjacency)
+        }
+    }
+
     fn dispatch_base_batch(
         &mut self,
         adjacency: EdgeAdjacencyMap,
         base_batch: RecordBatch,
     ) -> Option<RecordBatch> {
         if self.target_properties.is_empty() {
-            self.state = VarLengthMainStreamState::Processing(adjacency);
+            self.state = self.resume_state(adjacency);
             return Some(base_batch);
         }
 
@@ -5884,13 +5920,74 @@ impl Stream for GraphVariableLengthTraverseMainStream {
                 VarLengthMainStreamState::Processing(adjacency) => {
                     match self.input.poll_next_unpin(cx) {
                         Poll::Ready(Some(Ok(batch))) => {
-                            let (input, expansions) = match self.expand_batch(batch, &adjacency) {
+                            // Expansion happens a row-chunk at a time (#241).
+                            self.pending_rows = Some((batch, 0));
+                            self.state = VarLengthMainStreamState::RowChunking(adjacency);
+                            continue;
+                        }
+                        Poll::Ready(Some(Err(e))) => {
+                            self.state = VarLengthMainStreamState::Done;
+                            return Poll::Ready(Some(Err(e)));
+                        }
+                        Poll::Ready(None) => {
+                            self.state = VarLengthMainStreamState::Done;
+                            return Poll::Ready(None);
+                        }
+                        Poll::Pending => {
+                            self.state = VarLengthMainStreamState::Processing(adjacency);
+                            return Poll::Pending;
+                        }
+                    }
+                }
+                VarLengthMainStreamState::RowChunking(adjacency) => {
+                    let Some((held, offset)) = self.pending_rows.take() else {
+                        self.state = VarLengthMainStreamState::Processing(adjacency);
+                        continue;
+                    };
+                    if offset >= held.num_rows() {
+                        self.state = VarLengthMainStreamState::Processing(adjacency);
+                        continue;
+                    }
+                    let take_rows = self.rows_per_chunk.min(held.num_rows() - offset);
+                    let chunk = held.slice(offset, take_rows);
+                    self.pending_rows = Some((held, offset + take_rows));
+
+                    {
+                        {
+                            let (input, expansions) = match self.expand_batch(chunk, &adjacency) {
                                 Ok(pair) => pair,
                                 Err(e) => {
                                     self.state = VarLengthMainStreamState::Processing(adjacency);
                                     return Poll::Ready(Some(Err(e)));
                                 }
                             };
+
+                            self.rows_per_chunk =
+                                retune_rows_per_chunk(take_rows, expansions.len(), self.slice_size);
+
+                            // The expansion set was invisible to the pool here:
+                            // this stream reserved only its adjacency map, so
+                            // its dominant allocation — a node path and an edge
+                            // path per enumerated path — was never accounted at
+                            // all. Measured before this: 106 MB of expansions
+                            // passed an 8 MB ceiling without the pool noticing.
+                            const EXPANSION: usize = std::mem::size_of::<ExpansionRecord>();
+                            let expansion_bytes: usize = expansions
+                                .iter()
+                                .map(|(_, _, _, nodes, edges)| {
+                                    EXPANSION
+                                        + nodes.capacity() * std::mem::size_of::<Vid>()
+                                        + edges.capacity() * std::mem::size_of::<Eid>()
+                                })
+                                .sum();
+                            if let Err(e) = self.reservation.try_resize(
+                                expansion_bytes
+                                    + estimate_adjacency_bytes(&adjacency)
+                                    + input.get_array_memory_size(),
+                            ) {
+                                self.state = VarLengthMainStreamState::Done;
+                                return Poll::Ready(Some(Err(e)));
+                            }
 
                             if self.materializes_entity_structs() && !expansions.is_empty() {
                                 let (vids, eids) = path_entities(&expansions);
@@ -5924,18 +6021,6 @@ impl Stream for GraphVariableLengthTraverseMainStream {
                                 return Poll::Ready(Some(Ok(batch)));
                             }
                             // Continue loop to poll the hydration future
-                        }
-                        Poll::Ready(Some(Err(e))) => {
-                            self.state = VarLengthMainStreamState::Done;
-                            return Poll::Ready(Some(Err(e)));
-                        }
-                        Poll::Ready(None) => {
-                            self.state = VarLengthMainStreamState::Done;
-                            return Poll::Ready(None);
-                        }
-                        Poll::Pending => {
-                            self.state = VarLengthMainStreamState::Processing(adjacency);
-                            return Poll::Pending;
                         }
                     }
                 }
@@ -5976,7 +6061,7 @@ impl Stream for GraphVariableLengthTraverseMainStream {
                 VarLengthMainStreamState::Materializing { adjacency, mut fut } => {
                     match fut.as_mut().poll(cx) {
                         Poll::Ready(Ok(batch)) => {
-                            self.state = VarLengthMainStreamState::Processing(adjacency);
+                            self.state = self.resume_state(adjacency);
                             return Poll::Ready(Some(Ok(batch)));
                         }
                         Poll::Ready(Err(e)) => {

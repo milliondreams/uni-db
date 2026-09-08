@@ -693,18 +693,17 @@ struct GraphScanStream {
     /// `OperatorStats::index_hits`.
     index_consulted: Count,
 
-    /// The query pool's accounting for the whole-result batch below.
+    /// The query pool's accounting for the batch being sliced below.
     ///
-    /// The scan builds one `RecordBatch` for the entire result and holds it for
-    /// as long as it is slicing, so the reservation lives on the stream rather
-    /// than inside the scan future — the memory is resident across every poll
-    /// that follows, not just while it is being built. It is released when the
-    /// stream is dropped.
+    /// That batch is the whole result for an unchunked scan and one chunk for a
+    /// chunked one; either way the scan holds it for as long as it is slicing,
+    /// so the reservation lives on the stream rather than inside the scan
+    /// future — the memory is resident across every poll that follows, not just
+    /// while it is being built. It is released when the stream is dropped.
     ///
-    /// The slices handed downstream are zero-copy views onto this batch, so the
-    /// buffers stay alive while any consumer holds one. Accounting for the
-    /// batch once, here, is what makes the pool see the largest single
-    /// allocation this system makes (#242).
+    /// The slices handed downstream are zero-copy views onto that batch, so the
+    /// buffers stay alive while any consumer holds one. Accounting for it once,
+    /// here, is what lets the pool see the scan at all (#242).
     reservation: MemoryReservation,
 }
 
@@ -1814,11 +1813,13 @@ impl Stream for GraphScanStream {
                                 // every chunk and report a peak the scan never
                                 // holds.
                                 //
-                                // For an unchunked scan the batch is already
-                                // built by this point, so the reservation bounds
-                                // how long an over-budget result survives rather
-                                // than preventing its construction. That half is
-                                // the full-label remainder of #214.
+                                // For a scan that is still unchunked — a
+                                // schemaless one, or a forked session where the
+                                // row count cannot be had cheaply — the batch is
+                                // already built by this point, so the
+                                // reservation bounds how long an over-budget
+                                // result survives rather than preventing its
+                                // construction.
                                 if let Err(e) =
                                     self.reservation.try_resize(b.get_array_memory_size())
                                 {

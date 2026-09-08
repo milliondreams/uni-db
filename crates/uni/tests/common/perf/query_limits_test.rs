@@ -1487,3 +1487,89 @@ async fn a_schemaless_variable_length_expansion_is_accounted_and_bounded() -> Re
     );
     Ok(())
 }
+
+/// A schemaless single-hop traversal accounts for the batch it expands, not
+/// just the input it expanded from (#242).
+///
+/// `GraphTraverseMainExec` reserved `buffered_bytes + adjacency` on entering
+/// `Processing` and then returned `expand_batch(...)` directly, so its largest
+/// allocation — the expanded fan-out batch — never reached the pool. It looked
+/// accounted: it registers a `MemoryConsumer`, holds a `MemoryReservation`, and
+/// refuses a small enough ceiling. It simply refused on the wrong quantity.
+///
+/// Measured on a 500x400 fixture (200 000 edges): the pool saw 11.7 MB of
+/// adjacency and input while the expansion added a further **9.9 MB** it never
+/// saw, so a 13 MB ceiling passed a query whose true peak was 21.6 MB.
+///
+/// # Why the assertion is a required *failure*
+///
+/// An unaccounted allocation passes every ceiling, so no passing query can
+/// witness it. The only assertion that catches this is one that demands a
+/// refusal at a ceiling above what the operator used to reserve — and names the
+/// operator, so the refusal is attributable rather than incidental.
+///
+/// Verified discriminating: dropping the output term from the reservation makes
+/// the first assertion fail, because the query then succeeds.
+#[tokio::test]
+async fn a_schemaless_traversal_accounts_for_the_batch_it_expands() -> Result<()> {
+    const SOURCES: i64 = 200;
+    const TARGETS: i64 = 100;
+    const EDGES: i64 = SOURCES * TARGETS;
+    const QUERY: &str = "MATCH (a:Src)-[:E]->(b:Dst) RETURN count(*) AS c";
+
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Src")
+        .property("k", uni_db::DataType::Int)
+        .label("Dst")
+        .property("k", uni_db::DataType::Int)
+        .apply()
+        .await?;
+    // `E` is never declared: that is what routes a single hop through
+    // `GraphTraverseMainExec` rather than its schema'd twin.
+    let tx = db.session().tx().await?;
+    tx.query_with("UNWIND range(0, $n - 1) AS i CREATE (:Src {k: i})")
+        .param("n", uni_db::Value::Int(SOURCES))
+        .fetch_all()
+        .await?;
+    tx.query_with("UNWIND range(0, $n - 1) AS i CREATE (:Dst {k: i})")
+        .param("n", uni_db::Value::Int(TARGETS))
+        .fetch_all()
+        .await?;
+    tx.query("MATCH (a:Src), (b:Dst) CREATE (a)-[:E]->(b)")
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    // Above what the operator used to reserve, below its true peak. Before the
+    // fix this ceiling passed; now the expansion is part of the ask.
+    let refused = db
+        .session()
+        .query_with(QUERY)
+        .max_memory(2 * 1024 * 1024)
+        .fetch_all()
+        .await;
+    let err = refused
+        .err()
+        .expect("the expanded batch must be part of the reservation")
+        .to_string();
+    assert!(
+        err.contains("GraphTraverseMainExec"),
+        "the refusal must name the traversal, so it is the expansion that was \
+         refused rather than something incidental; got: {err}"
+    );
+
+    // With room for both, the answer is unchanged.
+    let rows = db
+        .session()
+        .query_with(QUERY)
+        .max_memory(64 * 1024 * 1024)
+        .fetch_all()
+        .await?;
+    assert_eq!(
+        rows.rows()[0].values()[0],
+        uni_db::Value::Int(EDGES),
+        "accounting must not change the result"
+    );
+    Ok(())
+}

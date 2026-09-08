@@ -2342,6 +2342,11 @@ enum GraphTraverseMainState {
 
 /// Stream that executes schemaless edge traversal.
 struct GraphTraverseMainStream {
+    /// Bytes of buffered input held while expanding, carried from `Loading` so
+    /// each expanded batch's reservation stays honest about everything the
+    /// operator holds at once (#242).
+    buffered_bytes: usize,
+
     /// Source column name.
     source_column: String,
 
@@ -2421,6 +2426,7 @@ impl GraphTraverseMainStream {
         // The input is drained first (CollectingInput) so the edge load can
         // push the bounded source-vid set into the scan.
         Self {
+            buffered_bytes: 0,
             reservation,
             source_column,
             target_variable,
@@ -3288,6 +3294,7 @@ impl Stream for GraphTraverseMainStream {
                         // the sum keeps one reservation honest about both.
                         let buffered_bytes: usize =
                             buffered.iter().map(|b| b.get_array_memory_size()).sum();
+                        self.buffered_bytes = buffered_bytes;
                         if let Err(e) = self
                             .reservation
                             .try_resize(buffered_bytes + estimate_adjacency_bytes(&adjacency))
@@ -3326,6 +3333,28 @@ impl Stream for GraphTraverseMainStream {
                         Some(batch) => {
                             // Expand batch using adjacency map
                             let result = self.expand_batch(&batch, &adjacency, &target_props);
+
+                            // The expanded batch is this operator's peak and was
+                            // outside the reservation, which covered only the
+                            // buffered input and the adjacency map (#242). A
+                            // fan-out expansion is larger than the input it came
+                            // from — measured at a 13 MB ceiling, 200 000
+                            // expanded rows passed while the pool saw 11.7 MB of
+                            // adjacency and nothing else.
+                            //
+                            // `try_resize`, not `try_grow`: this replaces the
+                            // previous batch's share, which went out with it.
+                            // Growing would charge the operator for every batch
+                            // it has ever emitted.
+                            if let Ok(ref r) = result {
+                                let held = self.buffered_bytes
+                                    + estimate_adjacency_bytes(&adjacency)
+                                    + r.get_array_memory_size();
+                                if let Err(e) = self.reservation.try_resize(held) {
+                                    self.state = GraphTraverseMainState::Done;
+                                    return Poll::Ready(Some(Err(e)));
+                                }
+                            }
 
                             self.state = GraphTraverseMainState::Processing {
                                 adjacency,

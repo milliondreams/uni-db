@@ -1317,3 +1317,84 @@ async fn the_range_walk_is_skipped_for_a_label_that_fits_one_batch() -> Result<(
     );
     Ok(())
 }
+
+/// A variable-length expansion is bounded by one row-chunk, not by the input
+/// batch (#241).
+///
+/// `VarLengthStreamState` accumulates a `Vec<VarLengthExpansion>` carrying a
+/// node path and an edge path *per enumerated path*, so its size is paths times
+/// path length and is bounded by neither the input nor any table. It used to
+/// build that set for a whole input batch at once.
+///
+/// Chunking the *materialization*, which is what the single-hop sibling does,
+/// would not have helped: the whole set exists before materialization begins.
+/// The input rows are what had to be chunked.
+///
+/// # The ceiling is chosen from measurement, not guessed
+///
+/// On this fixture the query enumerates 111 100 paths from 10 source rows.
+/// Measured by tightening the pool until it refuses:
+///
+/// * one row-chunk asks for **1697 KB**;
+/// * the whole 10-row batch asks for **15.2 MB**.
+///
+/// 8 MB sits between them, so this passes only while the expansion is chunked.
+/// Verified discriminating: restoring `rows_per_chunk` to `slice_size` fails it
+/// with `Failed to allocate additional 15.2 MB`.
+///
+/// The same contrast at depth 6 is 184.8 MB against 1846.3 MB — a ratio of
+/// 9.99 on 10 rows, which is the bound moving from per-batch to per-row. Depth
+/// 4 is used here because it shows the same thing in two seconds.
+#[tokio::test]
+async fn a_variable_length_expansion_is_bounded_by_one_row_chunk() -> Result<()> {
+    /// Above one row-chunk's 1697 KB, below the whole batch's ~17 MB.
+    const CEILING: usize = 8 * 1024 * 1024;
+    const WIDTH: i64 = 10;
+    const LAYERS: i64 = 7;
+    const EXPECTED_PATHS: i64 = 111_100;
+
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("N")
+        .property("layer", uni_db::DataType::Int)
+        .apply()
+        .await?;
+    db.schema().edge_type("E", &["N"], &["N"]).apply().await?;
+
+    // A layered mesh, every node in layer i pointing at every node in i+1, so
+    // path count is multiplicative in depth while the graph stays at 70 nodes.
+    let tx = db.session().tx().await?;
+    for layer in 0..LAYERS {
+        tx.query_with("UNWIND range(0, $w - 1) AS i CREATE (:N {layer: $l})")
+            .param("w", uni_db::Value::Int(WIDTH))
+            .param("l", uni_db::Value::Int(layer))
+            .fetch_all()
+            .await?;
+    }
+    for layer in 0..LAYERS - 1 {
+        tx.query_with("MATCH (a:N {layer: $l}), (b:N {layer: $n}) CREATE (a)-[:E]->(b)")
+            .param("l", uni_db::Value::Int(layer))
+            .param("n", uni_db::Value::Int(layer + 1))
+            .fetch_all()
+            .await?;
+    }
+    tx.commit().await?;
+    db.flush().await?;
+
+    // `p` is bound, which is what selects full path enumeration over the
+    // endpoint-only BFS. Without it the traversal never builds the expansion
+    // set at all and this would pass with the chunking deleted.
+    let rows = db
+        .session()
+        .query_with("MATCH p = (a:N {layer: 0})-[:E*1..4]->(b:N) RETURN count(p) AS c")
+        .max_memory(CEILING)
+        .fetch_all()
+        .await?;
+
+    assert_eq!(
+        rows.rows()[0].values()[0],
+        uni_db::Value::Int(EXPECTED_PATHS),
+        "the row-chunked expansion lost or repeated paths"
+    );
+    Ok(())
+}

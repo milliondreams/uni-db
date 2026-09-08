@@ -514,7 +514,8 @@ impl GraphExecutionContext {
     ///
     /// Called by the streaming drain loop with the time that elapsed between
     /// handing a batch to the consumer and the consumer asking for the next
-    /// one. See [`Self::deadline_credit`].
+    /// one. Accumulates into the private `deadline_credit` counter, which
+    /// `effective_deadline` adds back to the configured deadline.
     pub fn credit_idle_time(&self, idle: Duration) {
         let nanos = u64::try_from(idle.as_nanos()).unwrap_or(u64::MAX);
         self.deadline_credit.fetch_add(nanos, Ordering::Relaxed);

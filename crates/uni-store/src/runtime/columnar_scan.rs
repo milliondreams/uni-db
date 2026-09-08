@@ -25,7 +25,7 @@ use arrow_schema::{DataType, Field, Fields, IntervalUnit, Schema, SchemaRef, Tim
 use uni_common::core::id::Vid;
 use uni_common::{Properties, Value};
 
-use crate::backend::types::{FilterExpr, Scalar};
+use crate::backend::types::{CmpOp, FilterExpr, Scalar};
 use crate::runtime::l0_visibility::L0Context;
 use crate::storage::arrow_convert;
 use crate::storage::manager::StorageManager;
@@ -1647,22 +1647,39 @@ pub fn filter_l0_label_overwrites(
     arrow::compute::filter_record_batch(batch, &mask).map_err(anyhow::Error::from)
 }
 
+/// Which of a label's L0 rows one scan call wants.
+///
+/// Replaces an `Option<&[u64]>`, where `None` meant "the whole label". A range
+/// has no enumeration source to hand in — the caller knows bounds, not members
+/// — so it cannot be expressed as a vid list, and collapsing it to `None` would
+/// make every range of a chunked scan re-emit the label's entire L0 set. Making
+/// the three cases distinct is what keeps that unrepresentable.
+#[derive(Debug, Clone, Copy)]
+pub enum L0VertexTargets<'a> {
+    /// Exactly these vids, from an `id(x) = ?` or `id(x) IN [...]` pushdown.
+    Vids(&'a [u64]),
+    /// Every vid of the label in the half-open range `[lo, hi)` (#214).
+    Range(u64, u64),
+    /// Every vid of the label.
+    All,
+}
+
 /// Build a RecordBatch from L0 buffer data for a given label, matching the
 /// Lance query's column set.
 ///
 /// Merges L0 buffers in visibility order (pending_flush → current → transaction),
 /// with later buffers overwriting earlier ones for the same VID.
 ///
-/// When `target_vids` is `Some`, only those VIDs are collected (direct HashMap
-/// lookups instead of iterating all VIDs for the label). This must mirror the
-/// Lance-side VID pushdown — otherwise L0-only (unflushed) rows bypass the
-/// filter and the scan emits the full label table. See issue #72 item 1.
+/// `targets` must mirror whatever restriction the Lance side of the same scan
+/// applies — a vid pushdown or a `_vid` range — otherwise L0-only (unflushed)
+/// rows bypass it and the scan emits the full label table. See issue #72 item 1
+/// for the vid-list case and #214 for the range one.
 pub fn build_l0_vertex_batch(
     l0_ctx: &L0Context,
     label: &str,
     lance_schema: &SchemaRef,
     label_props: Option<&HashMap<String, uni_common::core::schema::PropertyMeta>>,
-    target_vids: Option<&[u64]>,
+    targets: L0VertexTargets<'_>,
 ) -> anyhow::Result<RecordBatch> {
     // Collect all L0 vertex data, merging in visibility order
     let mut vid_data: HashMap<u64, (Properties, u64)> = HashMap::new(); // vid -> (props, version)
@@ -1686,23 +1703,35 @@ pub fn build_l0_vertex_batch(
         // vertices for the label. See issue #72 item 1: without this filter,
         // freshly-inserted L0 rows bypass the IN-list pushdown that Lance
         // already honors, defeating the optimization.
-        let candidate_vids: Vec<Vid> = if let Some(tvs) = target_vids {
-            let mut out = Vec::with_capacity(tvs.len());
-            for &tv in tvs {
-                let vid = Vid::from(tv);
-                if guard.vertex_properties.contains_key(&vid)
-                    && (label.is_empty()
-                        || guard
-                            .label_to_vids
-                            .get(label)
-                            .is_some_and(|s| s.contains(&vid)))
-                {
-                    out.push(vid);
+        let candidate_vids: Vec<Vid> = match targets {
+            L0VertexTargets::Vids(tvs) => {
+                let mut out = Vec::with_capacity(tvs.len());
+                for &tv in tvs {
+                    let vid = Vid::from(tv);
+                    if guard.vertex_properties.contains_key(&vid)
+                        && (label.is_empty()
+                            || guard
+                                .label_to_vids
+                                .get(label)
+                                .is_some_and(|s| s.contains(&vid)))
+                    {
+                        out.push(vid);
+                    }
                 }
+                out
             }
-            out
-        } else {
-            guard.vids_for_label(label)
+            // No list to probe against, so this filters the label's set rather
+            // than doing point lookups. That is the same work the `All` arm
+            // already does, plus a comparison per vid.
+            L0VertexTargets::Range(lo, hi) => {
+                let mut out = guard.vids_for_label(label);
+                out.retain(|vid| {
+                    let raw = vid.as_u64();
+                    raw >= lo && raw < hi
+                });
+                out
+            }
+            L0VertexTargets::All => guard.vids_for_label(label),
         };
         for vid in candidate_vids {
             let vid_u64 = vid.as_u64();
@@ -2060,6 +2089,15 @@ pub struct ColumnarVertexScanRequest<'a> {
     pub target_vid: Option<u64>,
     /// Multi-vid restriction (`_vid IN (…)`).
     pub vid_list_filter: Option<&'a [u64]>,
+    /// Half-open `_vid` range `[lo, hi)` this call is restricted to.
+    ///
+    /// Set when a caller is walking a label in bounded vid ranges rather than
+    /// reading it whole (#214). `_vid` is the MVCC dedup key, so a range
+    /// partitions the row space along the same axis the dedup groups on: every
+    /// version of a vid falls in exactly one range, and the highest-`_version`
+    /// choice still sees all its candidates. No other partitioning of this scan
+    /// has that property.
+    pub vid_range: Option<(u64, u64)>,
     /// Rendered SQL from the planner's hash-index pushdown; passed through
     /// verbatim, nothing here parses it.
     pub extra_lance_filter: Option<&'a str>,
@@ -2094,6 +2132,7 @@ pub async fn columnar_scan_vertex_batch(
         output_schema,
         target_vid,
         vid_list_filter,
+        vid_range,
         extra_lance_filter,
     } = req;
     let uni_schema = storage.schema_manager().schema();
@@ -2174,7 +2213,16 @@ pub async fn columnar_scan_vertex_batch(
             vs.iter().map(|v| Scalar::UInt(*v)),
         )),
         (_, Some(v)) => Some(FilterExpr::equals("_vid", Scalar::UInt(v))),
-        _ => None,
+        // A range is a `_vid >= lo AND _vid < hi` pair rather than an IN list:
+        // the whole point of walking a label in ranges is that the predicate
+        // stays two comparisons however wide the range is, where an IN list
+        // would grow with it.
+        _ => vid_range.map(|(lo, hi)| {
+            FilterExpr::all([
+                FilterExpr::compare("_vid", CmpOp::GtEq, Scalar::UInt(lo)),
+                FilterExpr::compare("_vid", CmpOp::Lt, Scalar::UInt(hi)),
+            ])
+        }),
     };
     // `extra_lance_filter` arrives as rendered SQL from the planner's
     // hash-index pushdown, so it stays `Raw` — nothing in the engine parses it.
@@ -2313,16 +2361,21 @@ pub async fn columnar_scan_vertex_batch(
     // (`id(x) = $literal` short-circuit). One-element buffer keeps the
     // borrowed slice alive for the single-VID case.
     let single_vid_buf: [u64; 1];
-    let l0_target_vids: Option<&[u64]> = match (vid_list_filter, target_vid) {
-        (Some(vs), _) if !vs.is_empty() => Some(vs),
+    let l0_targets: L0VertexTargets<'_> = match (vid_list_filter, target_vid) {
+        (Some(vs), _) if !vs.is_empty() => L0VertexTargets::Vids(vs),
         (_, Some(v)) => {
             single_vid_buf = [v];
-            Some(&single_vid_buf)
+            L0VertexTargets::Vids(&single_vid_buf)
         }
-        _ => None,
+        // Same restriction Lance was given. Without it every range would
+        // re-emit the label's whole L0 set and the chunks would duplicate
+        // rather than partition.
+        _ => match vid_range {
+            Some((lo, hi)) => L0VertexTargets::Range(lo, hi),
+            None => L0VertexTargets::All,
+        },
     };
-    let l0_batch =
-        build_l0_vertex_batch(l0_ctx, label, &internal_schema, label_props, l0_target_vids)?;
+    let l0_batch = build_l0_vertex_batch(l0_ctx, label, &internal_schema, label_props, l0_targets)?;
 
     // Merge Lance + L0
     let Some(merged) =

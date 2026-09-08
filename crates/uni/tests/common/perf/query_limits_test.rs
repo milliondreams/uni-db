@@ -1154,3 +1154,166 @@ async fn id_in_a_literal_list_selects_exactly_those_nodes() -> Result<()> {
     );
     Ok(())
 }
+
+/// A full-label scan is bounded by one `_vid` range, not by the result (#214).
+///
+/// Phase 2 bounded a scan restricted to a vid list. A plain `MATCH (n:L)` has
+/// no list to chunk, so it read the label whole; this walks it in `_vid`
+/// ranges instead. The range is the unit because `_vid` is the MVCC dedup key:
+/// every version of a vid lands in exactly one range, so the highest-`_version`
+/// choice still sees all its candidates. Chunking on anything else — arriving
+/// storage batch, row offset — would serve superseded rows.
+///
+/// Discriminating, and measured: whole, this scan reserves 2.2 MB and fails at
+/// this ceiling with `Failed to allocate additional 2.2 MB for GraphScanExec`.
+/// Walked, each range reserves 751 KB and it succeeds. The count is asserted
+/// exactly, so a range walk that skipped or repeated a stretch fails too.
+#[tokio::test]
+async fn a_full_label_scan_is_bounded_by_one_range() -> Result<()> {
+    // Above one range's 751 KB, below the 2.2 MB the whole result needs.
+    const CEILING: usize = 1 << 20;
+
+    let (db, _ids) = store_and_id_list().await?;
+
+    // Aggregated so the scan's own reservation is the binding constraint;
+    // returning the rows would trip the cursor's result-size check first, and
+    // an assertion that accepts any memory-shaped failure passes with the walk
+    // removed.
+    let rows = db
+        .session()
+        .query_with("MATCH (n:CH) RETURN count(n.k) AS c")
+        .max_memory(CEILING)
+        .fetch_all()
+        .await?;
+
+    assert_eq!(
+        rows.rows()[0].values()[0],
+        uni_db::Value::Int(CHUNKED_SCAN_ROWS),
+        "the range walk lost or repeated rows"
+    );
+    Ok(())
+}
+
+/// A label whose vids begin past the start of the range walk is still read.
+///
+/// Vids are global, so one label's rows can sit anywhere in the space and a
+/// walk from zero meets empty ranges before reaching them. Emptiness is
+/// ambiguous — past the end, or a gap — and a walk that guesses "end" returns
+/// a silently truncated result rather than failing.
+///
+/// Discriminating on exactly that: with the gap case treated as the end this
+/// returns **0 rows**, not an error. `Target`'s 12 000 rows are also above the
+/// 8 192 gate, which is what puts this fixture on the range walk at all — at
+/// 5 000 it took the ordinary unchunked path and passed with the gap handling
+/// deleted.
+#[tokio::test]
+async fn a_label_whose_vids_start_late_is_walked_past_the_gap() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    for label in ["Other", "Target"] {
+        db.schema()
+            .label(label)
+            .property("k", uni_db::DataType::Int)
+            .apply()
+            .await?;
+    }
+    let tx = db.session().tx().await?;
+    // `Other` first, so every `Target` vid is above the walk's first ranges.
+    tx.execute("UNWIND range(0, 19999) AS i CREATE (:Other {k: i})")
+        .await?;
+    tx.execute("UNWIND range(0, 11999) AS i CREATE (:Target {k: i})")
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    let rows = db
+        .session()
+        .query("MATCH (n:Target) RETURN count(n) AS c")
+        .await?;
+    assert_eq!(
+        rows.rows()[0].values()[0],
+        uni_db::Value::Int(12_000),
+        "the walk stopped at an empty range instead of crossing the gap"
+    );
+    Ok(())
+}
+
+/// The range walk is gated: a label that fits in one output batch is still read
+/// in a single scan (#214).
+///
+/// Chunking unconditionally is not free — the traversal measured ~6% against a
+/// control when it chunked a result that did not need it, which is why #214
+/// asks for the gate and not just the walk. A skipped gate is invisible in the
+/// results, so this asserts the observable that separates the two strategies:
+/// `scans_reported`, which counts completed Lance scans.
+///
+/// The sizing call itself does not pollute that count — `count_rows` answers
+/// from fragment metadata and never builds a `ScanRequest`, so it never reaches
+/// the scan-stats callback.
+///
+/// Discriminating in both directions, which is why both sizes are measured in
+/// one test: delete the gate and the small label's count rises to the large
+/// one's shape; delete the walk and the large label's falls to the small one's.
+/// A single-size assertion would pass for one of those.
+#[tokio::test]
+async fn the_range_walk_is_skipped_for_a_label_that_fits_one_batch() -> Result<()> {
+    // Well under the 8 192 default batch size, so the gate must decline.
+    const SMALL_ROWS: i64 = 500;
+
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Small")
+        .property("k", uni_db::DataType::Int)
+        .apply()
+        .await?;
+    let tx = db.session().tx().await?;
+    tx.execute(&format!(
+        "UNWIND range(0, {}) AS i CREATE (:Small {{k: i}})",
+        SMALL_ROWS - 1
+    ))
+    .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    let small = db
+        .session()
+        .query("MATCH (n:Small) RETURN count(n) AS c")
+        .await?;
+    assert_eq!(small.rows()[0].values()[0], uni_db::Value::Int(SMALL_ROWS));
+    let small_scans = small.metrics().scans_reported;
+
+    // The same query over a label well above the gate, as the contrast.
+    let (big_db, _ids) = store_and_id_list().await?;
+    let big = big_db
+        .session()
+        .query("MATCH (n:CH) RETURN count(n) AS c")
+        .await?;
+    assert_eq!(
+        big.rows()[0].values()[0],
+        uni_db::Value::Int(CHUNKED_SCAN_ROWS)
+    );
+    let big_scans = big.metrics().scans_reported;
+
+    eprintln!(
+        "#214 gate: {SMALL_ROWS} rows -> {small_scans} scans, \
+         {CHUNKED_SCAN_ROWS} rows -> {big_scans} scans"
+    );
+
+    // Exactly one, not merely "fewer than the large label". Measured: with the
+    // gate removed this is 2 — the walk reads its first range and then pays the
+    // `ConfirmingEnd` probe to learn there is nothing above it. A `>` comparison
+    // against the large label passes either way, because the large label needs
+    // more ranges whether or not the small one was gated. The exact count is
+    // what makes this fail when the gate goes.
+    assert_eq!(
+        small_scans, 1,
+        "a label that fits one output batch must be read in a single scan; \
+         {small_scans} means the range walk engaged and paid for ranges the \
+         result did not need"
+    );
+    assert!(
+        big_scans > small_scans,
+        "the large label reported {big_scans} scans against the small label's \
+         {small_scans}: the walk did not engage at all"
+    );
+    Ok(())
+}

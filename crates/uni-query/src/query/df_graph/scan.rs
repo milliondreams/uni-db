@@ -211,6 +211,7 @@ impl GraphScanExec {
                 &self.schema,
                 &self.filter,
                 Some(vids),
+                None,
                 self.extra_lance_filter.as_deref(),
                 self.extra_runtime_filter.as_ref(),
                 // No per-node metric: this is the probe side of
@@ -513,6 +514,53 @@ impl ExecutionPlan for GraphScanExec {
     }
 }
 
+/// Widest `_vid` range a single scan call will ask for.
+///
+/// The walk doubles its range whenever one comes back under-full, which is how
+/// it crosses a sparse label's gaps without a scan per empty stretch. The cap
+/// stops that doubling from turning into a whole-table read the moment it lands
+/// on a dense region again.
+const RANGE_WIDTH_MAX: u64 = 1 << 22;
+
+/// Pick the next `_vid` range width from what the last one actually returned.
+///
+/// A range yields at most one live row per vid, so `rows <= width` always and
+/// the width is an upper bound the label's density pulls down. Aiming each
+/// range at `target` rows keeps the peak near one output batch whether the
+/// label's vids are packed or scattered — a fixed width would read one row per
+/// scan on a sparse label and a whole batch's worth on a dense one.
+fn retune_range_width(width: u64, rows: usize, target: usize) -> u64 {
+    let rows = rows as u64;
+    let target = target.max(1) as u64;
+    if rows == 0 || rows.saturating_mul(2) < target {
+        // Under-full: the vids here are sparser than the width assumed.
+        width.saturating_mul(2).min(RANGE_WIDTH_MAX)
+    } else if rows > target {
+        // Over-full: scale down by the ratio actually observed rather than
+        // halving, which would take several ranges to converge.
+        (width.saturating_mul(target) / rows).max(1)
+    } else {
+        width
+    }
+}
+
+/// What a scan does after the batch in flight has been handed out.
+///
+/// The scan walks a label three ways — whole, by vid list (#55 pushdown), or by
+/// `_vid` range (#214) — and they differ only in what "next" means. Naming that
+/// explicitly is what keeps "this batch is the last" and "this chunk is the
+/// last" from collapsing into the same `None`, which is the bug an
+/// `Option<(vids, cursor)>` invited once a second walk existed.
+#[derive(Clone)]
+enum ScanResume {
+    /// Nothing follows: the scan was unchunked, or the walk is finished.
+    Finished,
+    /// Continue the vid-list walk at `cursor`.
+    Vids { vids: Arc<Vec<u64>>, cursor: usize },
+    /// Continue the range walk at `[lo, lo + width)`.
+    Range { lo: u64, width: u64 },
+}
+
 /// State machine for graph scan stream execution.
 enum GraphScanState {
     /// Initial state, ready to start scanning.
@@ -535,33 +583,62 @@ enum GraphScanState {
     ///
     /// Only reached for a vid set larger than one output batch; see `Init`.
     Chunking { vids: Arc<Vec<u64>>, cursor: usize },
+    /// Deciding whether a full-label scan is big enough to walk in ranges.
+    ///
+    /// One metadata-only row count. Below one output batch the whole result is
+    /// already within the bound chunking exists to impose, and the extra round
+    /// trips would be pure cost on the most common query in the system.
+    /// `None` from the count means the storage layer declined to answer
+    /// cheaply — on a fork it would have scanned — so the walk is skipped and
+    /// the scan reads whole, exactly as it did before #214.
+    Sizing(Pin<Box<dyn std::future::Future<Output = DFResult<Option<usize>>> + Send>>),
+    /// Walk a full-label scan in `_vid` ranges, `[lo, lo + width)` at a time.
+    ///
+    /// Sound for the same reason `Chunking` is: `_vid` is the MVCC dedup key,
+    /// so a range partitions the row space along the axis the dedup groups on.
+    /// Every version of a vid lands in exactly one range.
+    RangeChunking { lo: u64, width: u64 },
+    /// An empty range came back; asking whether anything remains above it.
+    ///
+    /// A range walk has no upper bound to stop at — the id allocator lives on
+    /// the `Writer`, which a read path does not hold, and `ScanRequest` has no
+    /// ordering to read a maximum from. So emptiness is ambiguous between "past
+    /// the end" and "a gap", and this resolves it exactly. Paid only when a
+    /// range is empty: normally once, just past the end.
+    ConfirmingEnd {
+        fut: Pin<Box<dyn std::future::Future<Output = DFResult<bool>> + Send>>,
+        lo: u64,
+        width: u64,
+    },
     /// Executing the async scan.
     ///
     /// `resume` carries where to continue when this call finishes, and is
-    /// `None` for an unchunked scan — which is what makes "the scan is done"
-    /// and "this chunk is done" distinguishable.
+    /// [`ScanResume::Finished`] for an unchunked scan — which is what makes
+    /// "the scan is done" and "this chunk is done" distinguishable.
     Executing {
         fut: Pin<Box<dyn std::future::Future<Output = DFResult<Option<RecordBatch>>> + Send>>,
-        resume: Option<(Arc<Vec<u64>>, usize)>,
+        resume: ScanResume,
     },
-    /// The scan finished; hand its rows out in `batch_size` slices.
+    /// A scan call finished; hand its rows out in `batch_size` slices.
     ///
-    /// The scan builds one `RecordBatch` for the whole result. Emitting it whole
-    /// gives every downstream operator a single indivisible input, and an
-    /// operator that buffers — sort, hash aggregate, join — then has nothing to
-    /// spill *between*: `ExternalSorter` asked for 5.1 GB in one reservation on
-    /// LDBC IC9 and failed, with a disk manager available the whole time
-    /// (`DiskManagerMode` defaults to `OsTmpDirectory`). Slicing is what lets the
-    /// spill path engage. See issue #202.
+    /// Emitting a batch whole gives every downstream operator a single
+    /// indivisible input, and an operator that buffers — sort, hash aggregate,
+    /// join — then has nothing to spill *between*: `ExternalSorter` asked for
+    /// 5.1 GB in one reservation on LDBC IC9 and failed, with a disk manager
+    /// available the whole time (`DiskManagerMode` defaults to
+    /// `OsTmpDirectory`). Slicing is what lets the spill path engage. See
+    /// issue #202.
     ///
-    /// `RecordBatch::slice` is zero-copy, so this does not reduce what the scan
-    /// itself holds. For a vid-filtered scan `Chunking` bounds that; for a
-    /// full-label scan the whole result is still built first, which is the
-    /// remainder of #214.
+    /// Slicing bounds what the scan *emits*, never what it *builds*:
+    /// `RecordBatch::slice` is zero-copy, so each slice pins the parent's
+    /// buffers. Bounding construction is the chunked states' job — `Chunking`
+    /// for a vid-filtered scan, `RangeChunking` for a full-label one (#214) —
+    /// and this state is reached from all three, so the batch it holds is a
+    /// whole result or one chunk depending on which fed it.
     Slicing {
         batch: RecordBatch,
         offset: usize,
-        resume: Option<(Arc<Vec<u64>>, usize)>,
+        resume: ScanResume,
     },
     /// Stream is done.
     Done,
@@ -677,6 +754,7 @@ impl GraphScanStream {
     fn scan_future(
         &self,
         vid_list_filter: Option<Vec<u64>>,
+        vid_range: Option<(u64, u64)>,
     ) -> Pin<Box<dyn std::future::Future<Output = DFResult<Option<RecordBatch>>> + Send>> {
         let graph_ctx = self.graph_ctx.clone();
         let label = self.label.clone();
@@ -714,6 +792,7 @@ impl GraphScanStream {
                     &schema,
                     &filter,
                     vid_list_filter.as_deref(),
+                    vid_range,
                     extra_lance_filter.as_deref(),
                     extra_runtime_filter.as_ref(),
                     Some(&index_consulted),
@@ -927,6 +1006,7 @@ pub(crate) async fn hydrate_vids_columnar(
                 None,
                 None,
                 None,
+                None,
             )
             .await?,
         );
@@ -984,6 +1064,9 @@ pub(crate) async fn columnar_scan_vertex_batch_static(
     output_schema: &SchemaRef,
     filter: &Option<Arc<dyn PhysicalExpr>>,
     vid_list_filter: Option<&[u64]>,
+    // Half-open `_vid` range this call is restricted to, when the caller walks
+    // the label in bounded ranges instead of reading it whole (#214).
+    vid_range: Option<(u64, u64)>,
     extra_lance_filter: Option<&str>,
     extra_runtime_filter: Option<&Arc<dyn PhysicalExpr>>,
     // Per-node sink for `index_hits`. Separate from the query-level counters
@@ -1014,6 +1097,7 @@ pub(crate) async fn columnar_scan_vertex_batch_static(
             output_schema,
             target_vid,
             vid_list_filter,
+            vid_range,
             extra_lance_filter,
         },
         Some(&mut index_hits),
@@ -1613,13 +1697,95 @@ impl Stream for GraphScanStream {
                             };
                         }
                         whole => {
-                            self.state = GraphScanState::Executing {
-                                fut: self.scan_future(whole),
-                                resume: None,
-                            };
+                            // A full-label scan is the one shape that can be
+                            // walked by `_vid` range, and the one that has no
+                            // bound at all today. A single-vid short circuit
+                            // (`self.filter`) returns one row, and the
+                            // schemaless path takes a different scan function
+                            // that carries no range — neither is worth a walk.
+                            if whole.is_none() && self.filter.is_none() && !self.is_schemaless {
+                                let storage = Arc::clone(self.graph_ctx.storage());
+                                let label = self.label.clone();
+                                self.state = GraphScanState::Sizing(Box::pin(async move {
+                                    storage.vertex_row_count(&label).await.map_err(exec_err)
+                                }));
+                            } else {
+                                self.state = GraphScanState::Executing {
+                                    fut: self.scan_future(whole, None),
+                                    resume: ScanResume::Finished,
+                                };
+                            }
                         }
                     }
                 }
+                GraphScanState::Sizing(mut fut) => match fut.as_mut().poll(cx) {
+                    Poll::Ready(Ok(rows)) => {
+                        // `None` = no cheap count available (a forked session,
+                        // where counting scans the branch). Reading whole is
+                        // the unbounded path, but it is the one this query
+                        // already had; paying a full materialization to decide
+                        // whether to avoid one is strictly worse.
+                        let rows = rows.unwrap_or(0);
+                        if rows > self.slice_size {
+                            self.state = GraphScanState::RangeChunking {
+                                lo: 0,
+                                width: self.slice_size as u64,
+                            };
+                        } else {
+                            self.state = GraphScanState::Executing {
+                                fut: self.scan_future(None, None),
+                                resume: ScanResume::Finished,
+                            };
+                        }
+                    }
+                    Poll::Ready(Err(e)) => {
+                        self.state = GraphScanState::Done;
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                    Poll::Pending => {
+                        self.state = GraphScanState::Sizing(fut);
+                        return Poll::Pending;
+                    }
+                },
+                GraphScanState::RangeChunking { lo, width } => {
+                    let hi = lo.saturating_add(width);
+                    if hi == lo {
+                        // `lo` is already `u64::MAX`; there is no range left to
+                        // ask for and no vid above it.
+                        self.reservation.free();
+                        self.state = GraphScanState::Done;
+                        return Poll::Ready(None);
+                    }
+                    self.state = GraphScanState::Executing {
+                        fut: self.scan_future(None, Some((lo, hi))),
+                        resume: ScanResume::Range { lo, width },
+                    };
+                }
+                GraphScanState::ConfirmingEnd { mut fut, lo, width } => match fut.as_mut().poll(cx)
+                {
+                    Poll::Ready(Ok(true)) => {
+                        // A gap, not the end. Widen so a sparse label costs a
+                        // scan per gap rather than a scan per empty range.
+                        self.state = GraphScanState::RangeChunking {
+                            lo,
+                            width: width.saturating_mul(2).min(RANGE_WIDTH_MAX),
+                        };
+                    }
+                    Poll::Ready(Ok(false)) => {
+                        self.reservation.free();
+                        self.state = GraphScanState::Done;
+                        return Poll::Ready(None);
+                    }
+                    Poll::Ready(Err(e)) => {
+                        self.reservation.free();
+                        self.state = GraphScanState::Done;
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                    Poll::Pending => {
+                        self.state = GraphScanState::ConfirmingEnd { fut, lo, width };
+                        return Poll::Pending;
+                    }
+                },
                 GraphScanState::Chunking { vids, cursor } => {
                     if cursor >= vids.len() {
                         self.reservation.free();
@@ -1629,8 +1795,8 @@ impl Stream for GraphScanStream {
                     let end = (cursor + self.slice_size).min(vids.len());
                     let chunk = vids[cursor..end].to_vec();
                     self.state = GraphScanState::Executing {
-                        fut: self.scan_future(Some(chunk)),
-                        resume: Some((vids, end)),
+                        fut: self.scan_future(Some(chunk), None),
+                        resume: ScanResume::Vids { vids, cursor: end },
                     };
                 }
                 GraphScanState::Executing { mut fut, resume } => match fut.as_mut().poll(cx) {
@@ -1659,6 +1825,20 @@ impl Stream for GraphScanStream {
                                     self.state = GraphScanState::Done;
                                     return Poll::Ready(Some(Err(e)));
                                 }
+                                // Advance a range walk before the batch goes
+                                // out, retuning the width from what this range
+                                // actually held.
+                                let resume = match resume {
+                                    ScanResume::Range { lo, width } => ScanResume::Range {
+                                        lo: lo.saturating_add(width),
+                                        width: retune_range_width(
+                                            width,
+                                            b.num_rows(),
+                                            self.slice_size,
+                                        ),
+                                    },
+                                    other => other,
+                                };
                                 self.state = GraphScanState::Slicing {
                                     batch: b,
                                     offset: 0,
@@ -1671,10 +1851,27 @@ impl Stream for GraphScanStream {
                                 // candidate deleted or superseded — while later
                                 // ranges do. Ending here would silently truncate
                                 // the result at the first such range.
-                                Some((vids, cursor)) => {
+                                ScanResume::Vids { vids, cursor } => {
                                     self.state = GraphScanState::Chunking { vids, cursor };
                                 }
-                                None => {
+                                // For a range walk emptiness is ambiguous, so
+                                // ask storage rather than assume either way.
+                                ScanResume::Range { lo, width } => {
+                                    let next_lo = lo.saturating_add(width);
+                                    let storage = Arc::clone(self.graph_ctx.storage());
+                                    let label = self.label.clone();
+                                    self.state = GraphScanState::ConfirmingEnd {
+                                        fut: Box::pin(async move {
+                                            storage
+                                                .vertex_rows_at_or_above(&label, next_lo)
+                                                .await
+                                                .map_err(exec_err)
+                                        }),
+                                        lo: next_lo,
+                                        width,
+                                    };
+                                }
+                                ScanResume::Finished => {
                                     self.reservation.free();
                                     self.state = GraphScanState::Done;
                                     return Poll::Ready(other.map(Ok));
@@ -1706,10 +1903,13 @@ impl Stream for GraphScanStream {
                         // its own chunk boundary.
                         self.reservation.free();
                         match resume {
-                            Some((vids, cursor)) => {
+                            ScanResume::Vids { vids, cursor } => {
                                 self.state = GraphScanState::Chunking { vids, cursor };
                             }
-                            None => {
+                            ScanResume::Range { lo, width } => {
+                                self.state = GraphScanState::RangeChunking { lo, width };
+                            }
+                            ScanResume::Finished => {
                                 self.state = GraphScanState::Done;
                                 return Poll::Ready(None);
                             }

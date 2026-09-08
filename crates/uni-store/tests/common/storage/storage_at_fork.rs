@@ -213,3 +213,100 @@ async fn append_rows(uri: &str) {
     let mut ds = lance::Dataset::open(uri).await.unwrap();
     ds.append(reader, None).await.unwrap();
 }
+
+/// `vertex_row_count` declines to answer for a table the fork has branched,
+/// and still answers for one it has not (#214).
+///
+/// The scan's range-walk gate calls this to decide whether a full-label read is
+/// large enough to be worth bounding. On primary the count is metadata-only. On
+/// a branched table it is not: `BranchedBackend::count_rows` has no
+/// branch-aware count in lancedb 0.27.1 and falls back to scanning the branch
+/// and summing `num_rows` — so sizing a forked scan would fully materialize the
+/// table in order to decide whether to avoid materializing it.
+///
+/// # Why this is asserted on the count and not on query results
+///
+/// Both arms of the gate return identical rows; only the read strategy differs.
+/// So no result assertion can distinguish "declined and read whole" from
+/// "sized and walked", and the guard has to be checked where the decision is
+/// made. The third case below is what makes this more than a session-level
+/// flag: a fork that never wrote `Other` still gets a cheap count for it, which
+/// a coarser "any fork declines" guard would fail.
+#[tokio::test]
+async fn vertex_row_count_declines_only_for_a_branched_table() {
+    let dir = TempDir::new().unwrap();
+    let storage_path = dir.path().join("storage");
+    let storage_str = storage_path.to_str().unwrap();
+    std::fs::create_dir_all(&storage_path).unwrap();
+
+    let schema_path = dir.path().join("schema.json");
+    let schema_manager = SchemaManager::load(&schema_path).await.unwrap();
+    for label in ["Person", "Other"] {
+        schema_manager.add_label(label).unwrap();
+        schema_manager
+            .add_property(label, "name", DataType::String, false)
+            .unwrap();
+    }
+    schema_manager.save().await.unwrap();
+    let schema_manager = Arc::new(schema_manager);
+
+    let storage =
+        StorageManager::new_with_config(storage_str, schema_manager.clone(), UniConfig::default())
+            .await
+            .unwrap();
+
+    // Both labels exist on primary; only `Person` gets branched below.
+    let person_uri = format!("{storage_str}/vertices_Person.lance");
+    let other_uri = format!("{storage_str}/vertices_Other.lance");
+    seed_initial_dataset(&person_uri).await;
+    seed_initial_dataset(&other_uri).await;
+
+    // Primary answers cheaply for both.
+    assert_eq!(
+        storage.vertex_row_count("Person").await.unwrap(),
+        Some(3),
+        "primary must answer from metadata"
+    );
+
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(storage_path.clone()).unwrap());
+    let registry = Arc::new(ForkRegistryHandle::load(store).await.unwrap());
+    let parent_v = lance_branch::current_version(&person_uri).await.unwrap();
+    let id = ForkId::new();
+    let branch_name = format!("fork_{id}_v_Person");
+    lance_branch::create_branch(&person_uri, &branch_name, parent_v)
+        .await
+        .unwrap();
+
+    let mut info = ForkInfo::new_pending(id, "guard_scenario", "snap-1", 1);
+    info.datasets
+        .insert("vertices_Person".into(), branch_name.clone());
+    registry.begin_create(info.clone()).await.unwrap();
+    let active = registry
+        .finish_create("guard_scenario", info.datasets.clone())
+        .await
+        .unwrap();
+
+    let scope = Arc::new(ForkScope::new(
+        Arc::new(active),
+        SchemaDelta::empty(),
+        registry.clone(),
+    ));
+    let forked = storage.at_fork(scope);
+    assert!(forked.fork_scope().is_some(), "fixture must be forked");
+
+    assert_eq!(
+        forked.vertex_row_count("Person").await.unwrap(),
+        None,
+        "a branched table has no cheap count, so the gate must be told to skip \
+         rather than handed a number that cost a full scan to produce"
+    );
+
+    // Scoped to the table, not the session: `Other` was never written through
+    // the fork, so it has no branch and counting it is as cheap as on primary.
+    assert_eq!(
+        forked.vertex_row_count("Other").await.unwrap(),
+        Some(3),
+        "a fork must still get the bound for tables it has not branched"
+    );
+}

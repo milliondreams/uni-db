@@ -5,7 +5,9 @@ use crate::backend::StorageBackend;
 #[cfg(feature = "lance-backend")]
 use crate::backend::lance::LanceDbBackend;
 use crate::backend::table_names;
-use crate::backend::types::{FilterExpr, OptimizeReport, ScanRequest, VectorQueryOpts};
+use crate::backend::types::{
+    CmpOp, FilterExpr, OptimizeReport, Scalar, ScanRequest, VectorQueryOpts,
+};
 use crate::compaction::{CompactionStats, CompactionStatus, CompactionTask};
 use crate::runtime::WorkingGraph;
 use crate::runtime::context::QueryContext;
@@ -1724,6 +1726,87 @@ impl StorageManager {
     ) -> Result<Option<arrow_array::RecordBatch>> {
         self.scan_vertex_table_counted(label, columns, additional_filter, None)
             .await
+    }
+
+    /// Rows stored for `label`, without reading any of them — or `None` when
+    /// answering would mean reading them after all.
+    ///
+    /// Metadata-only on Lance: no predicate, so fragment counts answer it.
+    /// Measured at 35-116 us against 10k-1M rows, flat in row count and
+    /// growing only with fragments (`examples/count_rows_probe.rs`), which is
+    /// what makes it affordable on the query path at all.
+    ///
+    /// Used to decide whether a scan is large enough to be worth walking in
+    /// ranges (#214). The count is an upper bound on live rows, since MVCC
+    /// keeps superseded versions, which is the right direction for that
+    /// decision — it can only over-estimate, and over-estimating chunks a scan
+    /// that did not need it rather than failing to bound one that did.
+    ///
+    /// # Why this can decline to answer
+    ///
+    /// `BranchedBackend::count_rows` has no branch-aware count in lancedb
+    /// 0.27.1, so for a table the fork has written it *scans the branch and
+    /// sums `num_rows`*. Sizing a forked scan that way would fully materialize
+    /// the table in order to decide whether to avoid materializing it — the
+    /// exact cost the caller is trying to bound, paid up front and
+    /// unconditionally.
+    ///
+    /// So this returns `None` there rather than a number, and the caller falls
+    /// back to the unchunked read. A fork keeps today's behaviour, which is a
+    /// documented limit and not a regression; the bound arrives on forks when
+    /// the backend can count a branch from metadata.
+    ///
+    /// # Errors
+    ///
+    /// Propagates backend failures. A table that does not exist reports zero.
+    pub async fn vertex_row_count(&self, label: &str) -> Result<Option<usize>> {
+        let backend = self.backend();
+        let table_name = table_names::vertex_table_name(label);
+
+        // Mirrors `BranchedBackend::count_rows`'s own branch test, so this
+        // declines exactly when that would have scanned.
+        if self
+            .fork_scope()
+            .and_then(|scope| scope.branch_for(&table_name))
+            .is_some()
+        {
+            return Ok(None);
+        }
+
+        if !backend.table_exists(&table_name).await? {
+            return Ok(Some(0));
+        }
+        backend.count_rows(&table_name, None).await.map(Some)
+    }
+
+    /// Whether any row of `label` still has `_vid >= lo`.
+    ///
+    /// The termination test for a scan walking a label in `_vid` ranges (#214).
+    /// A range walk has no upper bound to stop at: the id allocator is on the
+    /// `Writer`, which a read-only query path does not hold, and `ScanRequest`
+    /// has no ordering, so "the largest vid" cannot be read directly.
+    ///
+    /// Asking this instead is exact and is paid only when a range comes back
+    /// empty — normally once, just past the end of the label. A sparse label
+    /// pays once per gap, which is the case where being certain is worth a
+    /// count.
+    ///
+    /// Honours the same `_version` ceiling as the scans it terminates, so a
+    /// pinned session does not keep walking toward rows it cannot see.
+    ///
+    /// # Errors
+    ///
+    /// Propagates backend failures. A table that does not exist is not an
+    /// error and reports no rows.
+    pub async fn vertex_rows_at_or_above(&self, label: &str, lo: u64) -> Result<bool> {
+        let backend = self.backend();
+        let table_name = table_names::vertex_table_name(label);
+        if !backend.table_exists(&table_name).await? {
+            return Ok(false);
+        }
+        let at_or_above = FilterExpr::compare("_vid", CmpOp::GtEq, Scalar::UInt(lo));
+        let filter = combine_hwm_filter(self.version_high_water_mark(), Some(&at_or_above));
+        Ok(backend.count_rows(&table_name, filter.as_ref()).await? > 0)
     }
 
     /// [`Self::scan_vertex_table`], carrying a query's counters into the backend.

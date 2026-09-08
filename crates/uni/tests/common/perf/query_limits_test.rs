@@ -1818,3 +1818,88 @@ async fn a_full_label_scan_does_not_pay_a_round_trip_per_batch() -> Result<()> {
     );
     Ok(())
 }
+
+/// `ORDER BY … LIMIT n` keeps n rows in the sort, not the whole input (#213).
+///
+/// The physical planner builds `SortExec` directly and DataFusion's
+/// `LimitPushdown` never runs — `QueryPlanner::plan` returns the hand-built plan
+/// with no physical-optimizer pass — so the fetch has to be pushed explicitly.
+/// Without it, LDBC IC9 sorts 2.87M rows to return 20.
+///
+/// # The observable
+///
+/// Results are identical either way, and both survive a memory ceiling — one
+/// spills, one does not — so neither rows nor a ceiling can witness this. What
+/// does is `OperatorStats::actual_rows` on the sort itself: rows *produced by
+/// that operator*. A fetch-less sort emits all N and the limit trims after; a
+/// fetch-set sort emits n.
+///
+/// # Why the fetch is set at all
+///
+/// It was tried during #202 and measured as a regression — IC2 died at
+/// `TopK[0]` with 977.4 MB, because `TopK` cannot spill where `ExternalSorter`
+/// can. Re-measured at SF1 after #202/#214/#241 bounded the producers, that
+/// failure does not reproduce: 977 MB was one giant input batch, not `k` rows.
+/// IC2 and IC9 now complete with the fetch at 1 GiB and at 256 MB and are ~10%
+/// faster warm. `TopK`'s non-spillability is unchanged and remains the standing
+/// risk; a large `k` over a large input was measured as no worse.
+///
+/// Verified discriminating: dropping the `with_fetch` push makes the sort report
+/// all ROWS rows instead of LIMIT.
+#[tokio::test]
+async fn an_ordered_limit_keeps_only_n_rows_in_the_sort() -> Result<()> {
+    const ROWS: i64 = 20_000;
+    const LIMIT: usize = 10;
+
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Sorted")
+        .property("k", uni_db::DataType::Int)
+        .apply()
+        .await?;
+    let tx = db.session().tx().await?;
+    tx.query_with("UNWIND range(0, $n - 1) AS i CREATE (:Sorted {k: i})")
+        .param("n", uni_db::Value::Int(ROWS))
+        .fetch_all()
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    let session = db.session();
+    let (result, profile) = session
+        .query_with("MATCH (n:Sorted) RETURN n.k AS k ORDER BY k DESC LIMIT 10")
+        .profile()
+        .await?;
+
+    assert_eq!(result.rows().len(), LIMIT, "the limit must still apply");
+    assert_eq!(
+        result.rows()[0].values()[0],
+        uni_db::Value::Int(ROWS - 1),
+        "descending order must still be correct"
+    );
+
+    let sorts: Vec<&uni_query::query::executor::core::OperatorStats> = profile
+        .runtime_stats
+        .iter()
+        .filter(|s| s.operator.contains("Sort"))
+        .collect();
+    assert!(
+        !sorts.is_empty(),
+        "no sort operator ran, so this measured nothing; operators were {:?}",
+        profile
+            .runtime_stats
+            .iter()
+            .map(|s| &s.operator)
+            .collect::<Vec<_>>()
+    );
+    for s in &sorts {
+        assert!(
+            s.actual_rows <= LIMIT,
+            "`{}` produced {} rows for a LIMIT {LIMIT}: the fetch was not pushed \
+             into the sort, so the whole input is being sorted and discarded",
+            s.operator,
+            s.actual_rows
+        );
+    }
+    Ok(())
+}

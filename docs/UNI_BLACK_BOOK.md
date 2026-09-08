@@ -739,6 +739,60 @@ Key rules:
 - **Defaults can be backfilled asynchronously** after schema changes
 - **Property types are immutable** (since 2.5.0) — re-applying an identical schema is idempotent (the register-on-every-open pattern stays cheap), but re-declaring an existing property with a different type or vector dimension (e.g. `VECTOR(4)` → `VECTOR(8)`) raises a schema conflict error (Python: `UniSchemaError`). Use a new property name or migrate the data.
 
+### Adding a property to a label that already has data
+
+A flush batch's Arrow schema comes from the *declared catalog properties*
+(`VertexDataset::get_arrow_schema`), not from the dataset on disk. So the
+catalog and the stored table have to be kept in step, and every DDL path that
+changes a label's property set widens storage before persisting the catalog.
+
+What happens on `ADD PROPERTY`:
+
+1. **Primary is widened** via Lance `add_columns` with
+   `NewColumnTransform::AllNulls` — metadata-only. It clones fragment metadata
+   and bumps the manifest schema; no row is read or rewritten, at any table
+   size. The column is always added **nullable**: `AllNulls` requires it, and
+   every pre-existing row genuinely has no value.
+2. **Live fork branches are widened** — see *Schema Evolution × Forks*.
+3. **Schemaless values are promoted.** A property written before it was
+   declared lives in the per-row `overflow_json` blob. Because the projected
+   read path prefers a typed column and only falls back to the blob when none
+   exists, materialising an all-NULL column would make `RETURN n.p` answer NULL
+   while `RETURN properties(n)` still answered with the real value — two read
+   paths, two answers, no error. A one-time backfill therefore moves those
+   values into the typed column (**typed wins**, so a value written after the
+   declaration is never clobbered) and **strips the key from the blob**, so a
+   later `SET n.p = NULL` cannot resurrect it through the `_all_props`
+   coalesce. This pass is skipped entirely — one scan, no commit — when the
+   property has no schemaless data, which is the ordinary case.
+4. **Then, and only then, the catalog is saved.** Storage first, catalog
+   second: a Lance column the catalog does not know about is invisible and
+   harmless, whereas a catalog column Lance lacks is a hard read failure. There
+   is no WAL record for schema DDL, so ordering is the only recovery lever, and
+   because the widening is idempotent a half-applied DDL converges on re-run.
+   (Note this is deliberately the *opposite* of the index path's order, which
+   is how an index can end up recorded `Online` with no artifact on disk.)
+
+Two related behaviours:
+
+- **`NOT NULL` on a populated label is recorded as nullable**, with a `warn!`
+  naming the row count. `SchemaBuilder::property` defaults to `NOT NULL`, so
+  rejecting would break the most common builder call; and pre-existing rows
+  cannot satisfy the constraint. `NOT NULL` is still enforced forward, at write
+  time, exactly as before.
+- **`DROP PROPERTY` is the mirror case.** Lance tolerates a column missing from
+  an appended batch only when the *stored* field is nullable, so dropping a
+  `NOT NULL` property wedges the table with `missing=[p], unexpected=[]`. The
+  stored column is relaxed to nullable instead — also metadata-only.
+
+A write-path reconcile in `uni-store/src/storage/schema_evolution.rs` backstops
+all of this: before an append or merge, a batch carrying a column its table
+lacks widens the table first. It is widening-only and refuses to invent a
+missing *system* column, so a genuinely corrupt table still fails loudly rather
+than acquiring a NULL column. It fires on the fork branch a write is actually
+landing on, which is what closes the branch-creation race the eager pass cannot
+see.
+
 ## Defining a Schema
 
 ### Rust API (SchemaBuilder)
@@ -6080,10 +6134,10 @@ flushes.
 ## Schema Evolution × Forks (Phase 7)
 
 A common question: "if I open a fork, then evolve primary's schema,
-does the fork break?" The short answer is **no for label/edge-type
-additions, yes for column-altering changes**. The Phase 7 test
-`crates/uni/tests/fork_schema_evolution.rs` pins the supported
-shape:
+does the fork break?" The short answer is **no** — for label
+additions, edge-type additions, and (since issue #249) property
+additions. `crates/uni/tests/common/fork/fork_schema_evolution.rs`
+pins the supported shapes:
 
 - **Adding a new label on primary** while a fork is open or has
   been previously committed: fully safe. The fork keeps reading
@@ -6093,13 +6147,36 @@ shape:
   recreated.
 - **Adding a new edge type on primary**: same — safe and
   non-disruptive.
-- **Adding a property column to an existing primary label**:
-  not supported on a per-fork basis. A Lance branch shares its
-  parent dataset's Arrow schema, so a fork-local property
-  addition would either leak to primary or break branch
-  read-merge. Phase 3 documented this as the standing limit;
-  the workaround is to drop and recreate the fork after
-  evolving primary.
+- **Adding a property to an existing primary label**: supported
+  as of issue #249. The DDL widens primary's Lance dataset with
+  `add_columns(NewColumnTransform::AllNulls)` — metadata-only, it
+  clones fragment metadata and bumps the manifest schema without
+  rewriting a single row — and then widens every live fork branch
+  the registry lists for that table.
+
+  The fork half is not optional. A Lance branch is a shallow
+  *clone* (`Operation::Clone { is_shallow: true }`) carrying its
+  own manifest and its own copy of the schema; `base_paths` is a
+  data-file indirection, **not** a live read of primary's schema.
+  Both scan paths call `scanner.project(cols)`, which hard-errors
+  on a column the branch has never seen, so a fork left un-widened
+  fails its next read with `No field named …`. A fork with no
+  branch for that table needs nothing — its reads resolve through
+  `base_paths` to primary, which now has the column — and cutting
+  a branch just to hold the column would be wrong, since it would
+  pin a pre-declaration parent version.
+
+  Primary is widened *first*, so any branch cut afterwards inherits
+  the column. The residual race — a branch cut between the primary
+  widening and the registry snapshot — is closed by the write-path
+  reconcile in `uni-store/src/storage/schema_evolution.rs`, which
+  widens whatever branch a write is actually landing on.
+
+  Earlier revisions of this section said such an addition would
+  "leak to primary or break branch read-merge". The outcome was
+  real; the mechanism named was not. It is projection, not
+  read-merge — and it was never fork-specific: primary wedged too,
+  which is what #249 reported.
 
 Tagged historical primary states (via `Uni::tag_fork`) are also
 unaffected by primary schema evolution — the tagged Lance commit

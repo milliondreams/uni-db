@@ -2048,6 +2048,9 @@ impl UniBuilder {
         );
         // Phase 4a: apply the configured fork budget cap.
         fork_registry.set_max_forks(self.config.max_forks).await;
+        // Let storage-side DDL reach the registry, so declaring a property
+        // can widen live fork branches alongside primary (issue #249).
+        storage.set_fork_registry(fork_registry.clone());
         let recovery_store = storage.store();
         let recovery_branching = storage.backend().branching();
         // L3: pass the schema-derived candidate dataset names so recovery can

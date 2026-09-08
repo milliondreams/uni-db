@@ -166,6 +166,43 @@ pub trait StorageBackend: Send + Sync + 'static {
         schema: Arc<ArrowSchema>,
     ) -> Result<()>;
 
+    /// Widen `table`'s stored schema so it accepts a batch it currently rejects.
+    ///
+    /// `add` names columns to create, all-null, on every existing row;
+    /// `relax_nullable` names existing columns whose `NOT NULL` must become
+    /// nullable. Both are **widening-only** operations: nothing is dropped,
+    /// narrowed, renamed, or cast, so no row is ever rewritten and no value
+    /// changes.
+    ///
+    /// This exists because uni builds a flush batch's Arrow schema from the
+    /// *declared catalog properties* (`VertexDataset::get_arrow_schema`) and
+    /// never consults the dataset. Declaring a property on a label that
+    /// already has flushed data therefore produced a batch carrying a column
+    /// the dataset had never had, which Lance rejects — wedging that label
+    /// permanently (issue #249). Dropping a `NOT NULL` property is the mirror
+    /// case, since Lance only tolerates a column missing from the batch when
+    /// the *stored* field is nullable.
+    ///
+    /// Implementations must:
+    /// - treat an absent table as a no-op (uni materializes tables lazily, so
+    ///   a declared-but-never-flushed label has no dataset yet);
+    /// - be idempotent — re-widening an already-wide table succeeds;
+    /// - serialize against concurrent writes to the same table, and retry a
+    ///   commit conflict rather than surfacing it.
+    ///
+    /// # Errors
+    /// Returns an error if a name in `add` already exists with a different
+    /// type, or if the backend cannot evolve schemas.
+    async fn evolve_table_schema(
+        &self,
+        table_name: &str,
+        add: &[arrow_schema::Field],
+        relax_nullable: &[String],
+    ) -> Result<()> {
+        let _ = (table_name, add, relax_nullable);
+        anyhow::bail!("schema evolution is not supported by this backend")
+    }
+
     /// Acquire the per-table write lock, returning a guard held until dropped.
     ///
     /// A caller performing a read-modify-write that spans multiple backend calls —

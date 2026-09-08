@@ -25,6 +25,7 @@ use std::sync::Arc;
 use crate::backend::branching::ForkBranching;
 use crate::backend::types::{FilterExpr, VectorQueryOpts};
 use anyhow::{Context, Result};
+use arrow_schema::{Field, Schema as ArrowSchema};
 use lance::Dataset;
 
 /// Open the dataset at `uri` on its main branch.
@@ -629,6 +630,86 @@ where
     Ok(())
 }
 
+/// Widen a branch's stored schema so it accepts a batch it currently rejects.
+///
+/// The branch half of [`crate::backend::StorageBackend::evolve_table_schema`].
+/// A Lance branch is a shallow *clone* carrying its own manifest and its own
+/// copy of the schema, so a widening committed on the trunk does not reach it
+/// — and both scan paths project an explicit column list, which hard-errors on
+/// a column the branch's manifest has never seen.
+///
+/// `AllNulls` clones fragment metadata rather than rewriting data, so rows
+/// inherited from the parent through `base_paths` keep their indirection and
+/// stay readable. Verified by `phase249_spike_add_nullable_column_on_branch`:
+/// 3 inherited + 2 branch-local rows survive the widening, main does not gain
+/// the column, and a subsequent append carrying the wide schema is accepted.
+///
+/// # Errors
+///
+/// - The dataset or branch does not exist.
+/// - A name in `add` already exists on the branch with a different type.
+/// - The commit fails.
+pub async fn evolve_schema_on_branch(
+    uri: &str,
+    branch: &str,
+    add: &[Field],
+    relax_nullable: &[String],
+) -> Result<()> {
+    use lance::dataset::{ColumnAlteration, NewColumnTransform};
+
+    if add.is_empty() && relax_nullable.is_empty() {
+        return Ok(());
+    }
+
+    let mut on_branch = open_branch(uri, branch)
+        .await
+        .with_context(|| format!("open branch {branch} on {uri} to widen its schema"))?;
+    let current: Arc<ArrowSchema> = Arc::new(on_branch.schema().into());
+
+    let mut missing: Vec<Field> = Vec::new();
+    for field in add {
+        match current.fields().iter().find(|f| f.name() == field.name()) {
+            Some(existing) if existing.data_type() == field.data_type() => {}
+            Some(existing) => {
+                anyhow::bail!(
+                    "cannot add column '{}' to branch {branch} of {uri} as {:?}: \
+                     it already exists as {:?}",
+                    field.name(),
+                    field.data_type(),
+                    existing.data_type()
+                );
+            }
+            None => missing.push(field.clone().with_nullable(true)),
+        }
+    }
+
+    if !missing.is_empty() {
+        let added = Arc::new(ArrowSchema::new(missing));
+        on_branch
+            .add_columns(NewColumnTransform::AllNulls(added), None, None)
+            .await
+            .with_context(|| format!("add column(s) on branch {branch} of {uri}"))?;
+    }
+
+    let alterations: Vec<ColumnAlteration> = relax_nullable
+        .iter()
+        .filter(|name| {
+            current
+                .fields()
+                .iter()
+                .any(|f| f.name() == *name && !f.is_nullable())
+        })
+        .map(|name| ColumnAlteration::new(name.clone()).set_nullable(true))
+        .collect();
+    if !alterations.is_empty() {
+        on_branch
+            .alter_columns(&alterations)
+            .await
+            .with_context(|| format!("relax nullability on branch {branch} of {uri}"))?;
+    }
+    Ok(())
+}
+
 /// Delete rows on the dataset's named branch by SQL predicate.
 ///
 /// Opens the dataset on `branch`, then commits a Delete. Lance encodes
@@ -914,6 +995,16 @@ impl ForkBranching for LanceBranching {
             Self::reader(batches, schema),
         )
         .await
+    }
+
+    async fn evolve_branch_schema(
+        &self,
+        table: &str,
+        branch: &str,
+        add: &[Field],
+        relax_nullable: &[String],
+    ) -> Result<()> {
+        evolve_schema_on_branch(&self.dataset_uri(table), branch, add, relax_nullable).await
     }
 
     async fn delete_from_branch(
@@ -1514,5 +1605,233 @@ mod tests {
                 eprintln!("SPIKE OUTCOME 3: Lance refused per-branch index: {e}");
             }
         }
+    }
+
+    /// Spike S1 (#249): can a nullable column be added to a *branch* whose
+    /// fragments live in the parent via `base_paths`?
+    ///
+    /// This is the assumption the whole #249 fork story rests on. Lance's
+    /// `add_columns` rebuilds the fragment list from `dataset.get_fragments()`
+    /// into an `Operation::Merge`; if inherited base-path references did not
+    /// survive that round-trip, forks would need a different strategy
+    /// entirely.
+    ///
+    /// Probes, in order:
+    ///   1. the widening succeeds on the branch at all;
+    ///   2. main does NOT gain the column (no leak to primary);
+    ///   3. the branch reads back every row -- inherited *and* branch-local --
+    ///      with the new column NULL;
+    ///   4. a subsequent append carrying the wide schema is accepted.
+    #[tokio::test]
+    async fn phase249_spike_add_nullable_column_on_branch() {
+        use futures::TryStreamExt;
+        use lance::dataset::NewColumnTransform;
+
+        let (_dir, uri) = seed_dataset().await;
+        let v_main = current_version(&uri).await.unwrap();
+        create_branch(&uri, "add-col-spike", v_main).await.unwrap();
+
+        // Branch-local rows, so the branch has both inherited and own fragments.
+        let batch = test_batch(vec![100, 101], vec![1000, 1100]);
+        let reader =
+            arrow_array::RecordBatchIterator::new(vec![Ok(batch)].into_iter(), test_schema());
+        write_to_branch(&uri, "add-col-spike", reader)
+            .await
+            .unwrap();
+
+        // Probe 1: widen the branch.
+        let new_field = Arc::new(ArrowSchema::new(vec![Field::new(
+            "added_later",
+            DataType::Utf8,
+            true,
+        )]));
+        let mut on_branch = open_branch(&uri, "add-col-spike").await.unwrap();
+        let res = on_branch
+            .add_columns(NewColumnTransform::AllNulls(new_field), None, None)
+            .await;
+        match &res {
+            Ok(()) => eprintln!("S1 PROBE 1: add_columns on branch OK"),
+            Err(e) => eprintln!("S1 PROBE 1: add_columns on branch FAILED: {e}"),
+        }
+        res.expect("add_columns(AllNulls) on a branch");
+
+        // Probe 2: main must not have gained the column.
+        let main_after = Dataset::open(&uri).await.unwrap();
+        let main_has = main_after
+            .schema()
+            .fields
+            .iter()
+            .any(|f| f.name == "added_later");
+        let branch_after = open_branch(&uri, "add-col-spike").await.unwrap();
+        let branch_has = branch_after
+            .schema()
+            .fields
+            .iter()
+            .any(|f| f.name == "added_later");
+        eprintln!("S1 PROBE 2: main_has={main_has} branch_has={branch_has}");
+        assert!(!main_has, "column leaked to main");
+        assert!(branch_has, "branch did not gain the column");
+
+        // Probe 3: every row still readable, new column NULL throughout.
+        let rows = branch_after.count_rows(None).await.unwrap();
+        eprintln!("S1 PROBE 3: branch row count = {rows} (expect 5: 3 inherited + 2 local)");
+        assert_eq!(rows, 5, "inherited fragments lost by the widening");
+        let batches = branch_after
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let mut seen = 0usize;
+        for b in &batches {
+            let col = b
+                .column_by_name("added_later")
+                .expect("added_later present");
+            assert_eq!(col.null_count(), b.num_rows(), "new column not all-null");
+            seen += b.num_rows();
+        }
+        assert_eq!(seen, 5, "scan returned fewer rows than count_rows");
+
+        // Probe 4: an append carrying the wide schema is accepted.
+        let wide_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new("value", DataType::Int64, false),
+            Field::new("added_later", DataType::Utf8, true),
+        ]));
+        let wide = RecordBatch::try_new(
+            wide_schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![200u64])),
+                Arc::new(Int64Array::from(vec![2000i64])),
+                Arc::new(arrow_array::StringArray::from(vec![Some("x")])),
+            ],
+        )
+        .unwrap();
+        let reader = arrow_array::RecordBatchIterator::new(vec![Ok(wide)].into_iter(), wide_schema);
+        let appended = write_to_branch(&uri, "add-col-spike", reader).await;
+        eprintln!("S1 PROBE 4: wide append -> {appended:?}");
+        appended.expect("append with the widened schema");
+
+        let final_rows = open_branch(&uri, "add-col-spike")
+            .await
+            .unwrap()
+            .count_rows(None)
+            .await
+            .unwrap();
+        eprintln!("S1 VERDICT: final branch rows = {final_rows} (expect 6)");
+        assert_eq!(final_rows, 6);
+    }
+
+    /// Spike S2 (#249): does a scalar index survive a nullable-column add?
+    ///
+    /// `vertex.rs` creates default BTree indexes on every per-label table, so
+    /// if widening dropped or invalidated them the fix would silently
+    /// deoptimise every existing store.
+    #[tokio::test]
+    async fn phase249_spike_add_column_preserves_scalar_index() {
+        use lance::dataset::NewColumnTransform;
+        use lance::index::DatasetIndexExt;
+        use lance_index::{IndexType, scalar::ScalarIndexParams};
+
+        let (_dir, uri) = seed_dataset().await;
+        let mut ds = Dataset::open(&uri).await.unwrap();
+        ds.create_index_builder(&["id"], IndexType::Scalar, &ScalarIndexParams::default())
+            .name("s2_idx".to_string())
+            .replace(true)
+            .await
+            .unwrap();
+        let before = Dataset::open(&uri)
+            .await
+            .unwrap()
+            .load_indices()
+            .await
+            .unwrap();
+        eprintln!("S2: indexes before widening = {}", before.len());
+
+        let mut ds = Dataset::open(&uri).await.unwrap();
+        ds.add_columns(
+            NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![Field::new(
+                "added_later",
+                DataType::Utf8,
+                true,
+            )]))),
+            None,
+            None,
+        )
+        .await
+        .expect("widen a dataset carrying a scalar index");
+
+        let after_ds = Dataset::open(&uri).await.unwrap();
+        let after = after_ds.load_indices().await.unwrap();
+        eprintln!("S2: indexes after widening  = {}", after.len());
+        for i in after.iter() {
+            eprintln!("  index name={} uuid={}", i.name, i.uuid);
+        }
+        // Still queryable through the index path.
+        let n = after_ds.count_rows(Some("id = 2".into())).await.unwrap();
+        eprintln!(
+            "S2 VERDICT: indexes survived={} filtered_count={n}",
+            after.len() == before.len()
+        );
+        assert_eq!(after.len(), before.len(), "widening dropped a scalar index");
+        assert_eq!(n, 1);
+    }
+
+    /// Spike S4 (#249): `add_columns` builds `Operation::Merge` from the
+    /// manifest version captured at open, and has no retry of its own, while
+    /// `Merge` conflicts *retryably* with a concurrent `Append`. Establishes
+    /// what a stale handle actually does, so the production path knows whether
+    /// it must reopen inside the lock and retry.
+    #[tokio::test]
+    async fn phase249_spike_stale_handle_widening_conflicts() {
+        use lance::dataset::NewColumnTransform;
+
+        let (_dir, uri) = seed_dataset().await;
+        // Open the handle FIRST, then let an append move the dataset on.
+        let mut stale = Dataset::open(&uri).await.unwrap();
+        let batch = test_batch(vec![9], vec![900]);
+        let reader =
+            arrow_array::RecordBatchIterator::new(vec![Ok(batch)].into_iter(), test_schema());
+        Dataset::write(
+            reader,
+            &uri,
+            Some(lance::dataset::WriteParams {
+                mode: lance::dataset::WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let res = stale
+            .add_columns(
+                NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![Field::new(
+                    "added_later",
+                    DataType::Utf8,
+                    true,
+                )]))),
+                None,
+                None,
+            )
+            .await;
+        eprintln!("S4: widening from a STALE handle -> {res:?}");
+
+        // A freshly-opened handle must always succeed.
+        let mut fresh = Dataset::open(&uri).await.unwrap();
+        let fresh_res = fresh
+            .add_columns(
+                NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![Field::new(
+                    "added_later2",
+                    DataType::Utf8,
+                    true,
+                )]))),
+                None,
+                None,
+            )
+            .await;
+        eprintln!("S4 VERDICT: fresh-handle widening -> {fresh_res:?}");
+        fresh_res.expect("widening from a freshly opened handle");
     }
 }

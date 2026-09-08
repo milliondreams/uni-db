@@ -136,6 +136,21 @@ pub trait ForkBranching: Send + Sync + 'static {
         schema: Arc<ArrowSchema>,
     ) -> Result<()>;
 
+    /// Widen `branch`'s stored schema: add all-null nullable columns, and/or
+    /// relax `NOT NULL` on existing ones.
+    ///
+    /// A branch carries its own manifest and schema copy, so a widening on the
+    /// trunk does not reach it. Widening-only, metadata-only: no row is
+    /// rewritten and rows inherited from the parent keep their `base_paths`
+    /// indirection.
+    async fn evolve_branch_schema(
+        &self,
+        table: &str,
+        branch: &str,
+        add: &[arrow_schema::Field],
+        relax_nullable: &[String],
+    ) -> Result<()>;
+
     /// Delete rows matching `filter` from `branch`.
     ///
     /// A trivially-true filter ([`FilterExpr::Literal`]`(true)`, or an empty

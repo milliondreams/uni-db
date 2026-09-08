@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uni_common::DataType;
 use uni_common::core::id::{Eid, Vid};
-use uni_common::core::schema::{Constraint, ConstraintTarget, ConstraintType, SchemaManager};
+use uni_common::core::schema::{Constraint, ConstraintTarget, ConstraintType};
 use uni_common::{Path, Value};
 use uni_cypher::ast::{
     AlterAction, AlterEdgeType, AlterLabel, BinaryOp, ConstraintType as AstConstraintType,
@@ -1431,20 +1431,51 @@ impl Executor {
     /// This is a shared helper for both `execute_alter_label` and
     /// `execute_alter_edge_type` since they have identical logic.
     pub(crate) async fn execute_alter_entity(
-        sm: &Arc<SchemaManager>,
+        storage: &uni_store::storage::manager::StorageManager,
         entity_name: &str,
         action: AlterAction,
     ) -> Result<()> {
+        let sm = storage.schema_manager_arc();
+        let sm = &sm;
         match action {
             AlterAction::AddProperty(prop) => {
                 let dt = Self::parse_data_type(&prop.data_type)?;
+                // A NOT NULL property cannot be satisfied by rows that already
+                // exist -- they have no value for it. Record it as nullable and
+                // say so, rather than asserting a constraint the stored data
+                // violates. NOT NULL is enforced forward, at write time, either
+                // way. Mirrors `SchemaBuilder::apply`.
+                let rows = storage.materialized_row_count(entity_name).await?;
+                let effective_nullable = if prop.nullable || rows == 0 {
+                    prop.nullable
+                } else {
+                    tracing::warn!(
+                        entity = %entity_name,
+                        property = %prop.name,
+                        rows,
+                        "ALTER ... ADD PROPERTY declares NOT NULL on a populated entity; \
+                         recording it as nullable because existing rows have no value"
+                    );
+                    true
+                };
                 sm.add_property_with_desc(
                     entity_name,
                     &prop.name,
-                    dt,
-                    prop.nullable,
+                    dt.clone(),
+                    effective_nullable,
                     prop.description,
                 )?;
+                // Storage before catalog (`sm.save()` below): a Lance column
+                // the catalog does not know about is invisible, while a
+                // catalog column Lance lacks is a hard read failure --
+                // including through a fork branch, which carries its own
+                // schema copy and is widened here too (issue #249).
+                storage
+                    .widen_for_declared_properties(
+                        entity_name,
+                        &[arrow_schema::Field::new(&prop.name, dt.to_arrow(), true)],
+                    )
+                    .await?;
             }
             AlterAction::DropProperty(prop_name) => {
                 sm.drop_property(entity_name, &prop_name)?;
@@ -1471,21 +1502,11 @@ impl Executor {
     }
 
     pub(crate) async fn execute_alter_label(&self, clause: AlterLabel) -> Result<()> {
-        Self::execute_alter_entity(
-            &self.storage.schema_manager_arc(),
-            &clause.name,
-            clause.action,
-        )
-        .await
+        Self::execute_alter_entity(&self.storage, &clause.name, clause.action).await
     }
 
     pub(crate) async fn execute_alter_edge_type(&self, clause: AlterEdgeType) -> Result<()> {
-        Self::execute_alter_entity(
-            &self.storage.schema_manager_arc(),
-            &clause.name,
-            clause.action,
-        )
-        .await
+        Self::execute_alter_entity(&self.storage, &clause.name, clause.action).await
     }
 
     pub(crate) async fn execute_drop_label(&self, clause: DropLabel) -> Result<()> {

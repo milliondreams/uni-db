@@ -5772,6 +5772,19 @@ impl HybridPhysicalPlanner {
         use datafusion::physical_plan::projection::ProjectionExec;
         use datafusion::physical_plan::sorts::sort::SortExec;
 
+        // `LIMIT 0` must not be pushed. A `SortExec` with `fetch = Some(0)`
+        // builds a `TopK` with `k = 0`, and DataFusion asserts `k > 0`
+        // (`datafusion-physical-plan-53.1.0/src/topk/mod.rs:678`) -- so the
+        // query panics instead of returning an empty result. The
+        // `LocalLimitExec` above already yields nothing for a zero limit, so
+        // there is no work to save by pushing it.
+        //
+        // Caught by the openCypher TCK: `ReturnSkipLimit2[5] ORDER BY with
+        // LIMIT 0 should not generate errors`.
+        if limit == 0 {
+            return plan;
+        }
+
         if plan.as_any().downcast_ref::<SortExec>().is_some() {
             return plan.with_fetch(Some(limit)).unwrap_or(plan);
         }

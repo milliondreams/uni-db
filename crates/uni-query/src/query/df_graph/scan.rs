@@ -522,23 +522,75 @@ impl ExecutionPlan for GraphScanExec {
 /// on a dense region again.
 const RANGE_WIDTH_MAX: u64 = 1 << 22;
 
+/// Bytes a single range should aim to return.
+///
+/// The walk exists to bound the scan's peak, and the peak is *bytes*, so this
+/// is what the width is tuned against. An earlier version aimed at one output
+/// batch's worth of **rows** instead, which is the same target only for a row
+/// of average width — and it cost a full scan dearly. Measured on LDBC SF1
+/// `Message` (3 055 774 rows), `RETURN count(n)`:
+///
+/// | | scans | time |
+/// |---|---|---|
+/// | before the walk | 1 | 1.16 s |
+/// | walk targeting 8192 rows | 374 | 8.20 s |
+///
+/// One Lance round trip per 8192 rows is 374 of them on that table, and the
+/// per-call overhead dominated everything the walk saved. Tuning on bytes lets
+/// a narrow projection — `id(n)` is 8 bytes a row — take ranges hundreds of
+/// times wider for the same peak, while a wide row still gets small ones.
+///
+/// 64 MiB is chosen to sit far above any realistic single output batch (so the
+/// common case takes one range and pays no extra round trip) and far below the
+/// multi-GB peaks #214 exists to prevent.
+const RANGE_TARGET_BYTES: usize = 64 * 1024 * 1024;
+
+/// Share of the query's whole budget one range may aim at.
+///
+/// The walk exists so the scan fits the pool, so the pool is what it should
+/// size itself against — a fixed constant is either far too coarse for a small
+/// budget or needless round trips for a large one. A sixteenth leaves room for
+/// every other operator in the plan while still letting a 1 GiB budget take
+/// ranges at the [`RANGE_TARGET_BYTES`] cap.
+const RANGE_POOL_FRACTION: usize = 16;
+
+/// Smallest range budget worth taking. Below this the round trips cost more
+/// than the bound saves.
+const RANGE_TARGET_BYTES_MIN: usize = 64 * 1024;
+
+/// What one range should aim to return, given the budget it has to fit inside.
+///
+/// An unbounded or unknown pool gets the flat cap; a bounded one gets a share
+/// of itself, so a query run under a tight `max_memory` is bounded finely and a
+/// production query is not chopped into needless round trips.
+fn range_target_bytes(pool: &Arc<dyn MemoryPool>) -> usize {
+    match pool.memory_limit() {
+        datafusion::execution::memory_pool::MemoryLimit::Finite(bytes) => {
+            (bytes / RANGE_POOL_FRACTION).clamp(RANGE_TARGET_BYTES_MIN, RANGE_TARGET_BYTES)
+        }
+        _ => RANGE_TARGET_BYTES,
+    }
+}
+
 /// Pick the next `_vid` range width from what the last one actually returned.
 ///
 /// A range yields at most one live row per vid, so `rows <= width` always and
 /// the width is an upper bound the label's density pulls down. Aiming each
-/// range at `target` rows keeps the peak near one output batch whether the
-/// label's vids are packed or scattered — a fixed width would read one row per
-/// scan on a sparse label and a whole batch's worth on a dense one.
-fn retune_range_width(width: u64, rows: usize, target: usize) -> u64 {
-    let rows = rows as u64;
-    let target = target.max(1) as u64;
-    if rows == 0 || rows.saturating_mul(2) < target {
-        // Under-full: the vids here are sparser than the width assumed.
+/// range at [`RANGE_TARGET_BYTES`] keeps the peak bounded whether the label's
+/// vids are packed or scattered, and whether its rows are narrow or wide — a
+/// fixed width would read one row per scan on a sparse label and a whole
+/// batch's worth on a dense one.
+fn retune_range_width(width: u64, batch_bytes: usize, target_bytes: usize) -> u64 {
+    let bytes = batch_bytes as u64;
+    let target = target_bytes.max(1) as u64;
+    if bytes == 0 || bytes.saturating_mul(2) < target {
+        // Under-full: this range held less than half the budget, so the vids
+        // here are sparser or the rows narrower than the width assumed.
         width.saturating_mul(2).min(RANGE_WIDTH_MAX)
-    } else if rows > target {
+    } else if bytes > target {
         // Over-full: scale down by the ratio actually observed rather than
         // halving, which would take several ranges to converge.
-        (width.saturating_mul(target) / rows).max(1)
+        (width.saturating_mul(target) / bytes).max(1)
     } else {
         width
     }
@@ -693,6 +745,10 @@ struct GraphScanStream {
     /// `OperatorStats::index_hits`.
     index_consulted: Count,
 
+    /// Bytes one `_vid` range should aim to return, derived from the query's
+    /// budget at construction. See [`range_target_bytes`].
+    range_target_bytes: usize,
+
     /// The query pool's accounting for the batch being sliced below.
     ///
     /// That batch is the whole result for an unchunked scan and one chunk for a
@@ -727,6 +783,7 @@ impl GraphScanStream {
         pool: &Arc<dyn MemoryPool>,
     ) -> Self {
         Self {
+            range_target_bytes: range_target_bytes(pool),
             graph_ctx,
             label,
             variable,
@@ -1834,8 +1891,8 @@ impl Stream for GraphScanStream {
                                         lo: lo.saturating_add(width),
                                         width: retune_range_width(
                                             width,
-                                            b.num_rows(),
-                                            self.slice_size,
+                                            b.get_array_memory_size(),
+                                            self.range_target_bytes,
                                         ),
                                     },
                                     other => other,

@@ -1745,3 +1745,76 @@ async fn a_chunking_traversal_accounts_for_its_retained_expansions() -> Result<(
     );
     Ok(())
 }
+
+/// A full-label scan walks its ranges in O(log rows) round trips, not one per
+/// output batch (#214 follow-up).
+///
+/// The range walk shipped tuned on **rows** — each range aimed at one
+/// `batch_size` worth. That is the same thing as a memory bound only for a row
+/// of average width, and it cost a full scan dearly. Measured on LDBC SF1
+/// `Message` (3 055 774 rows), `RETURN count(n)`:
+///
+/// | | scans | time |
+/// |---|---|---|
+/// | before the walk existed | 1 | 1.16 s |
+/// | walk tuned on rows | 374 | 8.20 s |
+/// | walk tuned on bytes | 11 | 1.18 s |
+///
+/// One Lance round trip per 8192 rows is 374 of them on that table. Tuning on
+/// bytes, against a share of the query's own budget, lets a narrow projection
+/// take ranges hundreds of times wider for the same peak — the width doubles
+/// from `batch_size` until a range fills the budget, so the count is
+/// logarithmic in the table rather than linear.
+///
+/// # Why this guard is here
+///
+/// The regression reached `main`. The #214 acceptance checked that the gate
+/// *skips* for a small result, and that the walk is correct — neither of which
+/// a large result exercises, and the cost only appears when the gate fires.
+/// This asserts the round-trip count directly, at a size where the two tunings
+/// differ: 200 000 narrow rows is ~24 ranges tuned on rows and ~5 tuned on
+/// bytes.
+#[tokio::test]
+async fn a_full_label_scan_does_not_pay_a_round_trip_per_batch() -> Result<()> {
+    const ROWS: i64 = 200_000;
+    /// Comfortably above the ~5 the doubling ramp needs, far below the ~24 a
+    /// row-tuned walk would take.
+    const MAX_SCANS: u64 = 12;
+
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Wide")
+        .property("k", uni_db::DataType::Int)
+        .apply()
+        .await?;
+    let tx = db.session().tx().await?;
+    tx.query_with("UNWIND range(0, $n - 1) AS i CREATE (:Wide {k: i})")
+        .param("n", uni_db::Value::Int(ROWS))
+        .fetch_all()
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    let r = db
+        .session()
+        .query("MATCH (n:Wide) RETURN count(n) AS c")
+        .await?;
+    assert_eq!(
+        r.rows()[0].values()[0],
+        uni_db::Value::Int(ROWS),
+        "the range walk lost or repeated rows"
+    );
+    let scans = r.metrics().scans_reported;
+    eprintln!("#214 round trips: {ROWS} rows -> {scans} scans");
+    assert!(
+        scans > 0,
+        "no scan was reported at all, so this measured nothing"
+    );
+    assert!(
+        scans <= MAX_SCANS,
+        "a full scan of {ROWS} rows issued {scans} Lance round trips; the walk \
+         is tuned on rows again rather than on a share of the query budget, \
+         which cost 7x on a 3M-row table"
+    );
+    Ok(())
+}

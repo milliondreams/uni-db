@@ -69,6 +69,8 @@ mod compaction_resilience;
 mod crash_harness;
 #[path = "common/dense_resilience.rs"]
 mod dense_resilience;
+#[path = "common/fixture_shape/mod.rs"]
+mod fixture_shape;
 #[path = "common/multivector_resilience.rs"]
 mod multivector_resilience;
 #[path = "common/plan_shape/mod.rs"]

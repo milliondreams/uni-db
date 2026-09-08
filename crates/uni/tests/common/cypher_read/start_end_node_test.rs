@@ -868,9 +868,19 @@ async fn an_in_scope_endpoint_does_not_pay_for_hydration() {
 /// exists anywhere in that scope, which is why carrying variables through the
 /// projection could never have reached it.
 ///
-/// The fixture is deliberately tiny; the assertion is that the query *plans and
-/// executes*, and that the weight it computes reflects the one qualifying
-/// comment path rather than coming back zero because every endpoint was NULL.
+/// The fixture is deliberately tiny, and the load-bearing assertion is the
+/// **weight**, not that the query plans and executes. An earlier version of this
+/// test asserted only the row list and the person-id list; its fixture had no
+/// `Comment`, `Post`, `HAS_CREATOR` or `REPLY_OF`, so the comprehension matched
+/// nothing, `reduce` never evaluated its body, `startNode(r)` was never called,
+/// and it passed for weeks while covering none of this. That is issue #205.
+///
+/// Two guards keep it honest, and they are different claims:
+/// [`crate::fixture_shape::assert_pattern_reachable`] checks the fixture
+/// contains every entity type the query's patterns name — the necessary
+/// condition, and the one that was violated — while `pathWeight == 1.0` checks
+/// the value the endpoint code actually computes, which is the sufficient one.
+/// Neither substitutes for the other.
 #[tokio::test]
 async fn ldbc_ic14_plans_and_executes() {
     let db = Uni::in_memory().build().await.unwrap();
@@ -958,8 +968,12 @@ WITH
 RETURN personIdsInPath, w1 AS pathWeight
 ORDER BY pathWeight desc";
 
-    let r = db
-        .session()
+    let session = db.session();
+    // Fails loudly if the fixture ever loses one of the entity types the weight
+    // pattern needs, instead of quietly going back to matching nothing.
+    crate::fixture_shape::assert_pattern_reachable(&session, query).await;
+
+    let r = session
         .query(query)
         .await
         .expect("IC14 must plan and execute");

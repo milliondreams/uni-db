@@ -41,12 +41,22 @@ async fn test_pattern_comprehension_basic_traversal() -> Result<()> {
         .query("MATCH (n:Person) RETURN n.name, [(n)-[:KNOWS]->(m) | m.name] AS friends")
         .await?;
 
-    eprintln!("Pattern comprehension results ({} rows):", results.len());
-    for row in results.rows() {
-        eprintln!("  {:?}", row);
-    }
-
     assert_eq!(results.len(), 3, "Should have 3 rows (one per Person)");
+
+    // Assert what the comprehension COMPUTES, not just that rows came back
+    // (#205). A row count is satisfied by three empty lists, which is exactly
+    // what a comprehension that matched nothing returns -- so the count alone
+    // passes whether or not the traversal inside the comprehension ran.
+    for row in results.rows() {
+        let name: String = row.get("n.name")?;
+        let friends = sorted_strings(row.value("friends").unwrap().as_array().unwrap());
+        let want: Vec<&str> = match name.as_str() {
+            "Alice" => vec!["Bob", "Carol"],
+            "Bob" | "Carol" => vec![],
+            other => panic!("unexpected Person {other}"),
+        };
+        assert_eq!(friends, want, "friends of {name}");
+    }
 
     Ok(())
 }
@@ -62,17 +72,34 @@ async fn test_pattern_comprehension_node_property() -> Result<()> {
         .await?;
     tx.commit().await?;
 
+    // `n.ext_id` is projected alongside so each row's list can be checked
+    // against the node it belongs to. Without it the only available assertion
+    // is a row count, which three empty lists satisfy just as well (#205).
     let results = db
         .session()
-        .query("MATCH (n) RETURN [(n)-[:T]->(b) | b.name] AS list")
+        .query("MATCH (n) RETURN n.ext_id AS id, [(n)-[:T]->(b) | b.name] AS list")
         .await?;
 
-    eprintln!("TCK4 results ({} rows):", results.len());
-    for row in results.rows() {
-        eprintln!("  {:?}", row);
-    }
-
     assert_eq!(results.len(), 3, "Should have 3 rows");
+
+    for row in results.rows() {
+        let id: String = row.get("id")?;
+        let list = row.value("list").unwrap().as_array().unwrap();
+        match id.as_str() {
+            // a -[:T]-> b, and b carries `name: 'val'`.
+            "a" => assert_eq!(sorted_strings(list), vec!["val"], "list for a"),
+            // b -[:T]-> c, and c has no `name` -- one NULL element, not zero
+            // elements. The distinction is the whole point: an empty list is
+            // also what a comprehension that matched nothing returns.
+            "b" => {
+                assert_eq!(list.len(), 1, "b has one outgoing :T hop");
+                assert!(list[0].is_null(), "c has no name, so the element is NULL");
+            }
+            // c has no outgoing :T edge.
+            "c" => assert!(list.is_empty(), "list for c"),
+            other => panic!("unexpected node {other}"),
+        }
+    }
 
     Ok(())
 }
@@ -84,21 +111,42 @@ async fn test_pattern_comprehension_edge_property() -> Result<()> {
 
     // TCK Scenario 5: Introduce a new relationship variable
     let tx = db.session().tx().await?;
-    tx.execute("CREATE (a), (b), (c) CREATE (a)-[:T {name: 'val'}]->(b), (b)-[:T]->(c)")
-        .await?;
+    // The nodes carry `ext_id` so each row's list can be attributed to the node
+    // it came from. The original fixture created them anonymously, which left a
+    // row count as the only possible assertion -- and three empty lists satisfy
+    // that just as well as three correct ones (#205).
+    tx.execute(
+        "CREATE (a {ext_id: 'a'}), (b {ext_id: 'b'}), (c {ext_id: 'c'}) \
+         CREATE (a)-[:T {name: 'val'}]->(b), (b)-[:T]->(c)",
+    )
+    .await?;
     tx.commit().await?;
 
     let results = db
         .session()
-        .query("MATCH (n) RETURN [(n)-[r:T]->() | r.name] AS list")
+        .query("MATCH (n) RETURN n.ext_id AS id, [(n)-[r:T]->() | r.name] AS list")
         .await?;
 
-    eprintln!("TCK5 results ({} rows):", results.len());
-    for row in results.rows() {
-        eprintln!("  {:?}", row);
-    }
-
     assert_eq!(results.len(), 3, "Should have 3 rows");
+
+    for row in results.rows() {
+        let id: String = row.get("id")?;
+        let list = row.value("list").unwrap().as_array().unwrap();
+        match id.as_str() {
+            // The a->b edge carries `name: 'val'`.
+            "a" => assert_eq!(sorted_strings(list), vec!["val"], "list for a"),
+            // The b->c edge has no `name`: one NULL element, not an empty list.
+            "b" => {
+                assert_eq!(list.len(), 1, "b has one outgoing :T edge");
+                assert!(
+                    list[0].is_null(),
+                    "that edge has no name, so the element is NULL"
+                );
+            }
+            "c" => assert!(list.is_empty(), "list for c"),
+            other => panic!("unexpected node {other}"),
+        }
+    }
 
     Ok(())
 }
@@ -114,22 +162,31 @@ async fn test_pattern_comprehension_path_variable() -> Result<()> {
         .await?;
     tx.commit().await?;
 
-    let result = db
+    // This previously matched on the result and printed either arm, so an error
+    // passed exactly like a success and the test guarded nothing at all (#205).
+    let rows = db
         .session()
         .query("MATCH (n) RETURN [p = (n)-->() | p] AS list")
-        .await;
+        .await
+        .expect("a pattern comprehension binding a path variable must execute");
 
-    match result {
-        Ok(rows) => {
-            eprintln!("Path variable results ({} rows):", rows.len());
-            for row in rows.rows() {
-                eprintln!("  {:?}", row);
-            }
-        }
-        Err(e) => {
-            eprintln!("Path variable query failed: {:?}", e);
-        }
-    }
+    // Three nodes: a -[:T]-> b -[:T]-> (:C). So `a` and `b` each have exactly
+    // one outgoing path and the anonymous `:C` has none. Asserted as a sorted
+    // bag of lengths because the fixture gives the nodes no stable identity,
+    // and the bag still distinguishes the correct result from the all-empty one
+    // a non-matching comprehension would produce.
+    assert_eq!(rows.len(), 3, "one row per node");
+    let mut sizes: Vec<usize> = rows
+        .rows()
+        .iter()
+        .map(|r| r.value("list").unwrap().as_array().unwrap().len())
+        .collect();
+    sizes.sort_unstable();
+    assert_eq!(
+        sizes,
+        vec![0, 1, 1],
+        "two nodes have one outgoing path each and one has none"
+    );
 
     Ok(())
 }

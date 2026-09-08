@@ -286,6 +286,24 @@ async fn a_list_read_in_a_collect_subquery_survives_the_unwind() {
 #[tokio::test]
 async fn a_list_read_in_a_pattern_comprehension_survives_the_unwind() {
     let db = fixture().await;
+
+    // `names` is `collect(DISTINCT ...)` over a's friends, so `head(names)` is
+    // 'b' or 'c' with no guaranteed order. On the bare fixture neither has an
+    // outgoing :KNOWS, so the comprehension returns an empty list either way --
+    // deterministic, but indistinguishable from a comprehension that never ran
+    // (#205). Giving b and c the *same* outgoing neighbour makes the result
+    // non-empty and still order-independent: 'd' whichever head is picked.
+    let tx = db.session().tx().await.unwrap();
+    tx.execute("CREATE (:P {name:'d'})").await.unwrap();
+    for from in ["b", "c"] {
+        tx.execute(&format!(
+            "MATCH (x:P {{name:'{from}'}}), (y:P {{name:'d'}}) CREATE (x)-[:KNOWS]->(y)"
+        ))
+        .await
+        .unwrap();
+    }
+    tx.commit().await.unwrap();
+
     let rows = db
         .session()
         .query(
@@ -298,6 +316,15 @@ async fn a_list_read_in_a_pattern_comprehension_survives_the_unwind() {
         .await
         .expect("the list is read inside the comprehension's pattern");
     assert_eq!(rows.rows().len(), 2);
+    for row in rows.rows() {
+        let l: Vec<String> = row.get("l").unwrap();
+        assert_eq!(
+            l,
+            vec!["d".to_string()],
+            "the comprehension must read `names` inside its own pattern, not \
+             come back empty because the list was pruned away"
+        );
+    }
 }
 
 /// A `RETURN *` inside a subquery body is a wildcard the plan-level survey

@@ -1984,8 +1984,22 @@ impl StorageManager {
 
     /// Find labels for a vertex by VID. Uses pinned snapshot HWM if present.
     pub async fn find_vertex_labels_by_vid(&self, vid: Vid) -> Result<Option<Vec<String>>> {
-        MainVertexDataset::find_labels_by_vid(self.backend(), vid, self.version_high_water_mark())
-            .await
+        self.find_vertex_labels_by_vid_counted(vid, None).await
+    }
+
+    /// [`Self::find_vertex_labels_by_vid`], carrying a query's counters.
+    pub async fn find_vertex_labels_by_vid_counted(
+        &self,
+        vid: Vid,
+        counters: Option<&Arc<crate::runtime::counters::QueryCounters>>,
+    ) -> Result<Option<Vec<String>>> {
+        MainVertexDataset::find_labels_by_vid_counted(
+            self.backend(),
+            vid,
+            self.version_high_water_mark(),
+            counters,
+        )
+        .await
     }
 
     /// Find edges from the main edge table by type names, optionally pushing
@@ -1995,7 +2009,28 @@ impl StorageManager {
         type_names: &[&str],
         endpoint_filter: Option<(crate::storage::main_edge::EndpointSide, &[Vid])>,
     ) -> Result<Vec<(Eid, Vid, Vid, String, uni_common::Properties)>> {
-        MainEdgeDataset::find_edges_by_type_names(self.backend(), type_names, endpoint_filter).await
+        self.find_edges_by_type_names_counted(type_names, endpoint_filter, None)
+            .await
+    }
+
+    /// [`Self::find_edges_by_type_names`], carrying a query's counters.
+    ///
+    /// Same reason as `scan_delta_table_counted`: a scan the counter never sees
+    /// is missing from `scans_reported` as well as `idx_scans`, and it is the
+    /// denominator that makes the zero readable.
+    pub async fn find_edges_by_type_names_counted(
+        &self,
+        type_names: &[&str],
+        endpoint_filter: Option<(crate::storage::main_edge::EndpointSide, &[Vid])>,
+        counters: Option<&Arc<crate::runtime::counters::QueryCounters>>,
+    ) -> Result<Vec<(Eid, Vid, Vid, String, uni_common::Properties)>> {
+        MainEdgeDataset::find_edges_by_type_names_counted(
+            self.backend(),
+            type_names,
+            endpoint_filter,
+            counters,
+        )
+        .await
     }
 
     /// Scan vertex candidates matching a filter. Returns VIDs where `_deleted = false`.

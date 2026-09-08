@@ -2832,7 +2832,7 @@ async fn build_edge_adjacency_map(
         (side, vids)
     });
     let edges_with_type = storage
-        .find_edges_by_type_names(&type_refs, endpoint_filter)
+        .find_edges_by_type_names_counted(&type_refs, endpoint_filter, graph_ctx.counters())
         .await
         .map_err(exec_err)?;
 

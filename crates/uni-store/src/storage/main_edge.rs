@@ -18,6 +18,7 @@
 use crate::backend::StorageBackend;
 use crate::backend::table_names;
 use crate::backend::types::{FilterExpr, Scalar, ScalarIndexType, ScanRequest};
+use crate::runtime::counters::QueryCounters;
 use crate::storage::arrow_convert::build_timestamp_column_from_eid_map;
 use anyhow::{Result, anyhow};
 use arrow_array::builder::{LargeBinaryBuilder, StringBuilder};
@@ -306,18 +307,37 @@ impl MainEdgeDataset {
     /// so it returns true for both active and soft-deleted edges. Used by the
     /// compaction invariant check to verify dual-writes occurred.
     pub async fn exists_by_eid(backend: &dyn StorageBackend, eid: Eid) -> Result<bool> {
+        Self::exists_by_eid_counted(backend, eid, None).await
+    }
+
+    /// [`Self::exists_by_eid`], carrying a query's counters into the backend.
+    pub async fn exists_by_eid_counted(
+        backend: &dyn StorageBackend,
+        eid: Eid,
+        counters: Option<&Arc<QueryCounters>>,
+    ) -> Result<bool> {
         let filter = FilterExpr::equals("_eid", Scalar::UInt(eid.as_u64()));
-        let batches = Self::execute_query(backend, filter, Some(vec!["_eid"])).await?;
+        let batches = Self::execute_query(backend, filter, Some(vec!["_eid"]), counters).await?;
         Ok(!batches.is_empty() && batches.iter().any(|b| b.num_rows() > 0))
     }
 
     /// Execute a query on the main edges table.
     ///
     /// Returns empty vec if table doesn't exist.
+    ///
+    /// `counters` is threaded rather than defaulted because it is the *only*
+    /// way a scan issued here becomes visible: the backend never sees a
+    /// [`QueryContext`](crate::QueryContext), so `ScanRequest::counters` is what
+    /// attributes the scan back to the query that caused it. A `None` here is
+    /// not merely an unrecorded count — `attach_scan_stats` declines to register
+    /// the stats callback at all, so the scan cannot be observed after the fact.
+    /// Every main-edge scan was `None` until this parameter existed, which is
+    /// why no test could assert the scan-count shape of an edge-property read.
     async fn execute_query(
         backend: &dyn StorageBackend,
         filter: FilterExpr,
         columns: Option<Vec<&str>>,
+        counters: Option<&Arc<QueryCounters>>,
     ) -> Result<Vec<RecordBatch>> {
         let table_name = table_names::main_edge_table_name();
 
@@ -325,7 +345,9 @@ impl MainEdgeDataset {
             return Ok(Vec::new());
         }
 
-        let mut request = ScanRequest::all(table_name).with_filter(filter);
+        let mut request = ScanRequest::all(table_name)
+            .with_filter(filter)
+            .with_counters(counters.cloned());
         if let Some(cols) = columns {
             request = request.with_columns(cols.into_iter().map(String::from).collect());
         }
@@ -364,6 +386,22 @@ impl MainEdgeDataset {
         eid: Eid,
         version: Option<u64>,
     ) -> Result<Option<Properties>> {
+        Self::find_props_by_eid_counted(backend, eid, version, None).await
+    }
+
+    /// [`Self::find_props_by_eid`], carrying a query's counters into the backend.
+    ///
+    /// This is the per-edge form whose scan-per-item shape #218 measured at
+    /// ~1.5 ms each. Counting it is what lets a test assert that a traversal
+    /// resolves N edges in O(1) scans rather than O(N) — the batched and
+    /// per-item forms return identical answers, so a correctness test cannot
+    /// tell them apart and the guard has to be a count.
+    pub async fn find_props_by_eid_counted(
+        backend: &dyn StorageBackend,
+        eid: Eid,
+        version: Option<u64>,
+        counters: Option<&Arc<QueryCounters>>,
+    ) -> Result<Option<Properties>> {
         // MVCC (review C2): the scan must see deletion tombstones — the
         // highest-version row wins, and a deleted winner yields `None`.
         // Filtering `_deleted = false` here would let an OLDER live version
@@ -382,6 +420,7 @@ impl MainEdgeDataset {
             backend,
             filter,
             Some(vec!["props_json", "_version", "_deleted"]),
+            counters,
         )
         .await?;
 
@@ -459,6 +498,23 @@ impl MainEdgeDataset {
         eids: &[Eid],
         version: Option<u64>,
     ) -> Result<HashMap<Eid, Properties>> {
+        Self::find_props_by_eids_counted(backend, eids, version, None).await
+    }
+
+    /// [`Self::find_props_by_eids`], carrying a query's counters into the
+    /// backend.
+    ///
+    /// Both arms are counted — the chunked `_eid IN (...)` lookups and the
+    /// single full-scan pass. That is deliberate: `prefers_full_scan` picks
+    /// between them on table size, so a shape test that saw only one arm would
+    /// pass or fail on fixture size rather than on the property it means to
+    /// guard.
+    pub async fn find_props_by_eids_counted(
+        backend: &dyn StorageBackend,
+        eids: &[Eid],
+        version: Option<u64>,
+        counters: Option<&Arc<QueryCounters>>,
+    ) -> Result<HashMap<Eid, Properties>> {
         if eids.is_empty() {
             return Ok(HashMap::new());
         }
@@ -480,7 +536,8 @@ impl MainEdgeDataset {
             let filter = super::with_version_bound(FilterExpr::Literal(true), version);
             let request = ScanRequest::all(table_name)
                 .with_filter(filter)
-                .with_columns(columns.into_iter().map(String::from).collect());
+                .with_columns(columns.into_iter().map(String::from).collect())
+                .with_counters(counters.cloned());
 
             let mut stream = backend.scan_stream(request).await?;
             while let Some(batch) = futures::TryStreamExt::try_next(&mut stream).await? {
@@ -492,7 +549,8 @@ impl MainEdgeDataset {
                     FilterExpr::one_of("_eid", chunk.iter().map(|e| Scalar::UInt(e.as_u64()))),
                     version,
                 );
-                let batches = Self::execute_query(backend, filter, Some(columns.clone())).await?;
+                let batches =
+                    Self::execute_query(backend, filter, Some(columns.clone()), counters).await?;
                 for batch in &batches {
                     Self::merge_winning_props(batch, None, &mut best)?;
                 }
@@ -651,6 +709,17 @@ impl MainEdgeDataset {
         type_names: &[&str],
         endpoint_filter: Option<(EndpointSide, &[Vid])>,
     ) -> Result<Vec<(Eid, Vid, Vid, String, Properties)>> {
+        Self::find_edges_by_type_names_counted(backend, type_names, endpoint_filter, None).await
+    }
+
+    /// [`Self::find_edges_by_type_names`], carrying a query's counters into the
+    /// backend.
+    pub async fn find_edges_by_type_names_counted(
+        backend: &dyn StorageBackend,
+        type_names: &[&str],
+        endpoint_filter: Option<(EndpointSide, &[Vid])>,
+        counters: Option<&Arc<QueryCounters>>,
+    ) -> Result<Vec<(Eid, Vid, Vid, String, Properties)>> {
         if type_names.is_empty() {
             return Ok(Vec::new());
         }
@@ -683,7 +752,8 @@ impl MainEdgeDataset {
         match endpoint_filter {
             None => {
                 // Fetch all columns for edge data
-                let batches = Self::execute_query(backend, base_filter.clone(), None).await?;
+                let batches =
+                    Self::execute_query(backend, base_filter.clone(), None, counters).await?;
                 for batch in &batches {
                     Self::rank_edges_from_batch(batch, &mut winners)?;
                 }
@@ -703,7 +773,7 @@ impl MainEdgeDataset {
                         ]),
                     };
                     let filter = FilterExpr::all([base_filter.clone(), endpoint_clause]);
-                    let batches = Self::execute_query(backend, filter, None).await?;
+                    let batches = Self::execute_query(backend, filter, None, counters).await?;
                     for batch in &batches {
                         Self::rank_edges_from_batch(batch, &mut winners)?;
                     }

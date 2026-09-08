@@ -18,6 +18,7 @@
 use crate::backend::StorageBackend;
 use crate::backend::table_names;
 use crate::backend::types::{FilterExpr, Scalar, ScalarIndexType, ScanRequest};
+use crate::runtime::counters::QueryCounters;
 use crate::storage::arrow_convert::build_timestamp_column_from_vid_map;
 use anyhow::{Result, anyhow};
 use arrow_array::builder::{
@@ -343,6 +344,22 @@ impl MainVertexDataset {
         ext_id: &str,
         version: Option<u64>,
     ) -> Result<Option<Vid>> {
+        Self::find_by_ext_id_counted(backend, ext_id, version, None).await
+    }
+
+    /// [`Self::find_by_ext_id`], carrying a query's counters into the backend.
+    ///
+    /// Same reason as the main-edge siblings: the backend never sees a
+    /// [`QueryContext`](crate::QueryContext), so `ScanRequest::counters` is the
+    /// only route by which this scan reaches `scans_reported`. Without it the
+    /// stats callback is never even attached, so the scan is unobservable
+    /// rather than merely uncounted.
+    pub async fn find_by_ext_id_counted(
+        backend: &dyn StorageBackend,
+        ext_id: &str,
+        version: Option<u64>,
+        counters: Option<&Arc<QueryCounters>>,
+    ) -> Result<Option<Vid>> {
         let table_name = table_names::main_vertex_table_name();
 
         if !backend.table_exists(table_name).await? {
@@ -367,7 +384,8 @@ impl MainVertexDataset {
                         "_vid".to_string(),
                         "_version".to_string(),
                         "_deleted".to_string(),
-                    ]),
+                    ])
+                    .with_counters(counters.cloned()),
             )
             .await?;
 
@@ -433,6 +451,22 @@ impl MainVertexDataset {
         vid: Vid,
         version: Option<u64>,
     ) -> Result<Option<Vec<String>>> {
+        Self::find_labels_by_vid_counted(backend, vid, version, None).await
+    }
+
+    /// [`Self::find_labels_by_vid`], carrying a query's counters into the backend.
+    ///
+    /// Same reason as the main-edge siblings: the backend never sees a
+    /// [`QueryContext`](crate::QueryContext), so `ScanRequest::counters` is the
+    /// only route by which this scan reaches `scans_reported`. Without it the
+    /// stats callback is never even attached, so the scan is unobservable
+    /// rather than merely uncounted.
+    pub async fn find_labels_by_vid_counted(
+        backend: &dyn StorageBackend,
+        vid: Vid,
+        version: Option<u64>,
+        counters: Option<&Arc<QueryCounters>>,
+    ) -> Result<Option<Vec<String>>> {
         let table_name = table_names::main_vertex_table_name();
 
         if !backend.table_exists(table_name).await? {
@@ -456,7 +490,8 @@ impl MainVertexDataset {
                         "labels".to_string(),
                         "_version".to_string(),
                         "_deleted".to_string(),
-                    ]),
+                    ])
+                    .with_counters(counters.cloned()),
             )
             .await?;
 
@@ -518,6 +553,22 @@ impl MainVertexDataset {
         vids: &[Vid],
         version: Option<u64>,
     ) -> Result<HashMap<Vid, Properties>> {
+        Self::find_batch_props_by_vids_counted(backend, vids, version, None).await
+    }
+
+    /// [`Self::find_batch_props_by_vids`], carrying a query's counters into the backend.
+    ///
+    /// Same reason as the main-edge siblings: the backend never sees a
+    /// [`QueryContext`](crate::QueryContext), so `ScanRequest::counters` is the
+    /// only route by which this scan reaches `scans_reported`. Without it the
+    /// stats callback is never even attached, so the scan is unobservable
+    /// rather than merely uncounted.
+    pub async fn find_batch_props_by_vids_counted(
+        backend: &dyn StorageBackend,
+        vids: &[Vid],
+        version: Option<u64>,
+        counters: Option<&Arc<QueryCounters>>,
+    ) -> Result<HashMap<Vid, Properties>> {
         let table_name = table_names::main_vertex_table_name();
 
         if vids.is_empty() || !backend.table_exists(table_name).await? {
@@ -546,7 +597,8 @@ impl MainVertexDataset {
                         "props_json".to_string(),
                         "_version".to_string(),
                         "_deleted".to_string(),
-                    ]),
+                    ])
+                    .with_counters(counters.cloned()),
             )
             .await?;
 
@@ -631,6 +683,22 @@ impl MainVertexDataset {
         vid: Vid,
         version: Option<u64>,
     ) -> Result<Option<Properties>> {
+        Self::find_props_by_vid_counted(backend, vid, version, None).await
+    }
+
+    /// [`Self::find_props_by_vid`], carrying a query's counters into the backend.
+    ///
+    /// Same reason as the main-edge siblings: the backend never sees a
+    /// [`QueryContext`](crate::QueryContext), so `ScanRequest::counters` is the
+    /// only route by which this scan reaches `scans_reported`. Without it the
+    /// stats callback is never even attached, so the scan is unobservable
+    /// rather than merely uncounted.
+    pub async fn find_props_by_vid_counted(
+        backend: &dyn StorageBackend,
+        vid: Vid,
+        version: Option<u64>,
+        counters: Option<&Arc<QueryCounters>>,
+    ) -> Result<Option<Properties>> {
         let table_name = table_names::main_vertex_table_name();
 
         if !backend.table_exists(table_name).await? {
@@ -650,7 +718,8 @@ impl MainVertexDataset {
                         "props_json".to_string(),
                         "_version".to_string(),
                         "_deleted".to_string(),
-                    ]),
+                    ])
+                    .with_counters(counters.cloned()),
             )
             .await?;
 
@@ -711,6 +780,22 @@ impl MainVertexDataset {
         vids: &[Vid],
         version: Option<u64>,
     ) -> Result<HashMap<Vid, Vec<String>>> {
+        Self::find_batch_labels_by_vids_counted(backend, vids, version, None).await
+    }
+
+    /// [`Self::find_batch_labels_by_vids`], carrying a query's counters into the backend.
+    ///
+    /// Same reason as the main-edge siblings: the backend never sees a
+    /// [`QueryContext`](crate::QueryContext), so `ScanRequest::counters` is the
+    /// only route by which this scan reaches `scans_reported`. Without it the
+    /// stats callback is never even attached, so the scan is unobservable
+    /// rather than merely uncounted.
+    pub async fn find_batch_labels_by_vids_counted(
+        backend: &dyn StorageBackend,
+        vids: &[Vid],
+        version: Option<u64>,
+        counters: Option<&Arc<QueryCounters>>,
+    ) -> Result<HashMap<Vid, Vec<String>>> {
         let table_name = table_names::main_vertex_table_name();
 
         if vids.is_empty() || !backend.table_exists(table_name).await? {
@@ -735,7 +820,8 @@ impl MainVertexDataset {
                         "labels".to_string(),
                         "_version".to_string(),
                         "_deleted".to_string(),
-                    ]),
+                    ])
+                    .with_counters(counters.cloned()),
             )
             .await?;
 

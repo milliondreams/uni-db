@@ -38,6 +38,7 @@ pub mod issue_131_locy_iter_cross_join;
 pub mod issue_137_vector_dim_enforcement;
 pub mod issue_175_index_consulted;
 pub mod issue_175_vector_fts_consulted;
+pub mod issue_223_main_edge_scan_shape;
 pub mod issue_41_pattern_exists_perf;
 pub mod issue_55_batch_edge_patterns;
 pub mod issue_55_cross_match_pushdown;

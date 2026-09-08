@@ -1573,3 +1573,175 @@ async fn a_schemaless_traversal_accounts_for_the_batch_it_expands() -> Result<()
     );
     Ok(())
 }
+/// `VidLookupJoinExec` accounts for the structures it derives, not only the
+/// batches it holds (#242).
+///
+/// The operator reserves its build batches and probe chunks carefully — it even
+/// reserves the `concat_batches` peak, noting the chunks and the combined batch
+/// are live at once. What it did not reserve were the two structures it derives
+/// from them: `vid_set: HashSet<u64>` and the probe index
+/// `HashMap<u64, Vec<usize>>`, built `with_capacity(rows)`. Rust-side, not
+/// Arrow, and outside every `get_array_memory_size` it was summing.
+///
+/// # The window is measured, not guessed
+///
+/// On this 60 000-row join the derived structures add **3.7 MB** on top of
+/// ~17.8 MB of accounted batches. Sweeping ceilings with and without the
+/// reservation:
+///
+/// | ceiling | accounted | unaccounted |
+/// |---------|-----------|-------------|
+/// | 18 MB   | refused   | refused     |
+/// | 20 MB   | **refused** | **OK**    |
+/// | 22 MB   | OK        | OK          |
+///
+/// So 20 MB is the only kind of ceiling that can witness this, and it is why
+/// the assertion below is a required *failure*: an unaccounted structure passes
+/// every ceiling, so no successful query can prove it was ever charged for.
+///
+/// Verified discriminating: removing either `try_grow` makes this query succeed
+/// at 20 MB and the test fail.
+#[tokio::test]
+async fn a_vid_lookup_join_accounts_for_its_derived_index() -> Result<()> {
+    /// Large enough that the derived index clears the noise around the batch
+    /// bytes; below this the structures are a few hundred KB and no ceiling
+    /// separates the two cases.
+    const N: i64 = 60_000;
+    const QUERY: &str =
+        "MATCH (a:Source) MATCH (b:Target) WHERE id(b) = a.linked_vid RETURN count(*) AS c";
+
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Source")
+        .property("linked_vid", uni_db::DataType::Int)
+        .label("Target")
+        .property("name", uni_db::DataType::String)
+        .apply()
+        .await?;
+    let tx = db.session().tx().await?;
+    tx.query_with("UNWIND range(0, $n - 1) AS i CREATE (:Target {name: 't' + toString(i)})")
+        .param("n", uni_db::Value::Int(N))
+        .fetch_all()
+        .await?;
+    tx.query_with("UNWIND range(0, $n - 1) AS i CREATE (:Source {linked_vid: i})")
+        .param("n", uni_db::Value::Int(N))
+        .fetch_all()
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    // Above the accounted batches, below batches + derived structures.
+    let refused = db
+        .session()
+        .query_with(QUERY)
+        .max_memory(20 * 1024 * 1024)
+        .fetch_all()
+        .await;
+    let err = refused
+        .err()
+        .expect("the derived index must be part of the reservation")
+        .to_string();
+    assert!(
+        err.contains("VidLookupJoinExec"),
+        "the refusal must name the join, so it is the derived structures that \
+         were refused rather than something incidental; got: {err}"
+    );
+
+    // With room for both, the answer is unchanged.
+    let rows = db
+        .session()
+        .query_with(QUERY)
+        .max_memory(64 * 1024 * 1024)
+        .fetch_all()
+        .await?;
+    assert_eq!(
+        rows.rows()[0].values()[0],
+        uni_db::Value::Int(N),
+        "accounting must not change the result"
+    );
+    Ok(())
+}
+
+/// A chunking single-hop traversal accounts for the expansion set it retains
+/// (#242).
+///
+/// `GraphTraverseExec` reserves the batch it is slicing, and frees that
+/// reservation when a batch is handed straight downstream — correctly, since it
+/// no longer holds it. But when the expansion exceeds `slice_size` it takes the
+/// `Chunking` path instead, retaining the whole `Vec<Expansion>` *and* its input
+/// batch across every `MaterializingChunk` round-trip, and neither was
+/// accounted. The reservations on the other two paths cover the emitted batch,
+/// which is a different object.
+///
+/// # Measured
+///
+/// On a 300x300 fixture (90 000 expansions) the retained set is **2.8 MB**.
+/// Without the reservation the query passes a **1 MB** ceiling while holding
+/// it; with the reservation it is refused at 1 MB and 2 MB and passes at 4 MB.
+///
+/// The assertion is a required *failure* for the usual reason: an unaccounted
+/// allocation passes every ceiling, so only a demanded refusal can witness it.
+///
+/// Verified discriminating: removing the `try_resize` on the `Chunking`
+/// transition makes this query succeed at 2 MB and the test fail.
+#[tokio::test]
+async fn a_chunking_traversal_accounts_for_its_retained_expansions() -> Result<()> {
+    const S: i64 = 300;
+    const T: i64 = 300;
+    const EXPANSIONS: i64 = S * T;
+    const QUERY: &str = "MATCH (a:S)-[r:R]->(b:T) RETURN count(b.k) AS c";
+
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("S")
+        .property("k", uni_db::DataType::Int)
+        .label("T")
+        .property("k", uni_db::DataType::Int)
+        .done()
+        .edge_type("R", &["S"], &["T"])
+        .done()
+        .apply()
+        .await?;
+    let tx = db.session().tx().await?;
+    tx.query_with("UNWIND range(0, $n - 1) AS i CREATE (:S {k: i})")
+        .param("n", uni_db::Value::Int(S))
+        .fetch_all()
+        .await?;
+    tx.query_with("UNWIND range(0, $n - 1) AS i CREATE (:T {k: i})")
+        .param("n", uni_db::Value::Int(T))
+        .fetch_all()
+        .await?;
+    tx.query("MATCH (a:S), (b:T) CREATE (a)-[:R]->(b)").await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    // Below the retained expansion set. Unaccounted, this ceiling passed.
+    let refused = db
+        .session()
+        .query_with(QUERY)
+        .max_memory(2 * 1024 * 1024)
+        .fetch_all()
+        .await;
+    let err = refused
+        .err()
+        .expect("the retained expansion set must be part of the reservation")
+        .to_string();
+    assert!(
+        err.contains("GraphTraverseExec"),
+        "the refusal must name the traversal; got: {err}"
+    );
+
+    // With room, the answer is unchanged.
+    let rows = db
+        .session()
+        .query_with(QUERY)
+        .max_memory(32 * 1024 * 1024)
+        .fetch_all()
+        .await?;
+    assert_eq!(
+        rows.rows()[0].values()[0],
+        uni_db::Value::Int(EXPANSIONS),
+        "accounting must not change the result"
+    );
+    Ok(())
+}

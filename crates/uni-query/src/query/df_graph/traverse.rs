@@ -1657,6 +1657,19 @@ impl Stream for GraphTraverseStream {
                             if expansions.len() > self.slice_size {
                                 // Hydrate in chunks so each output batch owns its
                                 // data — see `TraverseStreamState::Chunking`.
+                                //
+                                // Both are retained for the whole chunking loop,
+                                // and neither was accounted (#242): the
+                                // reservations on the other two paths cover the
+                                // emitted batch, which is a different thing.
+                                // `Expansion` is a fixed-size tuple, so the set
+                                // sizes exactly.
+                                let held = expansions.len() * std::mem::size_of::<Expansion>()
+                                    + batch.get_array_memory_size();
+                                if let Err(e) = self.reservation.try_resize(held) {
+                                    self.state = TraverseStreamState::Done;
+                                    return Poll::Ready(Some(Err(e)));
+                                }
                                 self.state = TraverseStreamState::Chunking {
                                     input: batch,
                                     expansions,
@@ -1735,6 +1748,9 @@ impl Stream for GraphTraverseStream {
                     offset,
                 } => {
                     if offset >= expansions.len() {
+                        // The expansion set and its input die here, so what they
+                        // backed is released here.
+                        self.reservation.free();
                         self.state = TraverseStreamState::Reading;
                         continue;
                     }

@@ -36,9 +36,10 @@
 //! mutations use a throwaway `Uni::in_memory()`.
 
 pub mod gate;
+pub mod proofs;
 pub mod registry;
 
-use uni_db::Session;
+use uni_db::{Session, Transaction};
 use uni_query::plan_shape;
 
 /// Physical operator names from profiling `query`.
@@ -73,4 +74,30 @@ pub async fn assert_plan_uses(session: &Session, query: &str, op: &str) {
 pub async fn assert_plan_avoids(session: &Session, query: &str, op: &str) {
     let ops = plan_ops(session, query).await;
     plan_shape::assert_avoids(&ops, op, query);
+}
+
+/// Physical operator names from profiling `query` inside a transaction.
+///
+/// The read-side [`plan_ops`] cannot reach a mutation at all: `Session::query`
+/// refuses `CREATE`/`SET`/`DELETE`/`REMOVE`/`MERGE` outright, so every mutation
+/// operator has to be profiled through `tx.query_with(..).profile()`.
+///
+/// The write-path profiler is `Transaction::execute_with(..).profile()` — on
+/// `ExecuteBuilder`, not the `TxQueryBuilder` that `query_with` returns.
+///
+/// Callers pass the result to `uni_query::plan_shape::assert_uses` directly
+/// rather than through a wrapper, so that the operator literal appears as an
+/// argument to a recognised assertion helper — which is what
+/// `gate::has_proof_call` accepts as evidence.
+///
+/// # Panics
+///
+/// Panics if the query fails — `profile()` runs it.
+pub async fn tx_plan_ops(tx: &Transaction, query: &str) -> Vec<String> {
+    let (_result, profile) = tx
+        .execute_with(query)
+        .profile()
+        .await
+        .unwrap_or_else(|e| panic!("tx profile failed for `{query}`: {e}"));
+    plan_shape::op_names(&profile)
 }

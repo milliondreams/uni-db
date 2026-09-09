@@ -504,6 +504,33 @@ cargo metadata --format-version=1 --manifest-path bindings/uni-db-cuda/Cargo.tom
   LLVM dead-strip across crate boundaries — and ~94% of `.text` here is dependencies.
   `release-wheels.yml` passes `--profile dist` in every build job, so a `--release` wheel is not
   comparable to a published one. Profiles live in `.cargo/config.toml`, not `Cargo.toml`.
+- **The workspace build needs a job cap on a big box.** `cargo nextest run --workspace`
+  at the default `-j$(nproc)` was OOM-killed twice on a 62 GB / 22-core machine, during
+  the *compile*, before a single test ran. Several workspace crates link
+  datafusion + lance + candle, and enough concurrent rustc processes doing that will
+  exhaust the box. `CARGO_BUILD_JOBS=6..8` fixes it and costs little wall-clock, since
+  the tail of that build is a handful of long single-crate links that never used the
+  extra parallelism anyway. Two related traps:
+  - **Judge memory by `available`, not `free`.** At the moment of the kill, `free -g`
+    reported 9 GB free and **46 GB available** — the difference is reclaimable page
+    cache. A supervisor (or a person) watching `free` will kill a build that has ample
+    headroom.
+  - **Long builds want a foreground, chunked invocation.** `cargo` caches per-crate
+    progress, so re-running the same `cargo build ... --tests` after a timeout resumes
+    rather than restarting. Building the target first (`--no-run` / `cargo build
+    --tests`) and running the tests second keeps each step short and keeps the
+    memory-heavy phase separate from the phase you actually want the output of.
+- **`--allow-foreign-machine` does not check your change.** Its own note says
+  regressions still fail, and on a foreign machine that is close to vacuous: every
+  target already measures ~90% *below* the baseline, and the regression check is
+  computed against that same baseline, so a real regression would have to be ~10x
+  before it read as positive drift. `worst +0.00%` there is arithmetic on an offset.
+  The only local measurement that means anything is **same machine, one variable**:
+  measure the tree, change the one thing, re-measure, compare. Measured 2026-09-08
+  that way, the #249 write-path reconcile costs **+0.42%** on
+  `write_paths::l0_to_l1_flush` (8,331 Ir of 1.97 M) and **+0.05%** on the read paths
+  it does not touch — the read-path number being the control that says the write-path
+  number is signal rather than drift.
 - **loom timeout** — always pass `LOOM_MAX_PREEMPTIONS=2`; without it the exhaustive model runs past
   the nextest `terminate-after` and reports a false TIMEOUT.
 - **A version bump does not reach the editable install.** `bindings/uni-db` declares

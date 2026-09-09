@@ -672,10 +672,14 @@ property promotes those values into the typed column, so reads keep returning
 them:
 
 ```cypher
-CREATE (:Paper {title: 'A', citation_count: 12})   -- citation_count undeclared
--- later:
+// citation_count is not declared, so it is stored in the overflow blob
+CREATE (:Paper {title: 'A', citation_count: 12})
+
+// declaring it later promotes the stored values into the typed column
 ALTER LABEL Paper ADD PROPERTY citation_count INT32
-MATCH (p:Paper) RETURN p.citation_count            -- still 12
+
+// still 12
+MATCH (p:Paper) RETURN p.citation_count
 ```
 
 This promotion reads and rewrites the label's table once, so it is the one

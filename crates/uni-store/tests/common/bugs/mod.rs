@@ -65,3 +65,7 @@ pub mod repro_shadow_csr_warm_retention;
 // #223 — main-edge scans reach `scans_reported`, so a per-edge loop can be told
 // from a batched read by count rather than by wall-clock.
 pub mod issue_223_main_edge_scan_shape;
+
+// Vertex-side sibling of #222 — one unresolved vid escalates a batched vertex
+// property read to a scan of every declared label.
+pub mod repro_vertex_props_unresolved_vid_fan_out;

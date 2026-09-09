@@ -5,9 +5,9 @@
 # openCypher TCK lane, and the Python binding tests.
 #
 # The thorough/expensive remainder (sidecar + Locy TCK, reranker, cloud,
-# cargo doc, flagship notebooks, the WASM/Extism loader lane, release guards,
-# cuda smoke) runs ONCE on push to main in ci.yml and is deliberately NOT
-# repeated here. This is safe because
+# cargo doc, flagship notebooks, the WASM/Extism loader lane, the Rust-dependent
+# release guards, cuda smoke) runs ONCE on push to main in ci.yml and is
+# deliberately NOT repeated here. This is safe because
 # branch protection requires PR branches to be up to date with main before
 # merging, so these gates run against the exact tree that will land on main.
 
@@ -79,6 +79,56 @@ jobs:
   # Cheap and dependency-graph-only: no build, no `mold`/`protobuf`, and it does
   # not touch the shared cargo build cache, so it adds a lane rather than
   # lengthening the critical path.
+  # Static guards over generated and derived artifacts. Pure Python, no
+  # toolchain, ~0.5s for the whole set — these moved here from ci.yml's Release
+  # Guards job because the class they catch (a generated page, a documented
+  # count, or a version drifting from the source it is derived from) is
+  # invisible to the test suite AND to clippy, so a post-merge-only gate meant
+  # every instance was first reported by a red main. The guards that genuinely
+  # need a Rust toolchain (`cargo metadata` for the publish list, the slim wheel
+  # compile check) stay in ci.yml.
+  static-guards:
+    if: github.repository == 'rustic-ai/uni-db'
+    name: Static Guards (generated docs, versions)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Static check (no compile): every wheel variant must enable the plugin
+      # loader features its shared binding source calls unconditionally.
+      - name: Check wheel-variant plugin features
+        run: python3 scripts/ci/check_wheel_variant_features.py
+
+      # Every Python-visible version must track the workspace Cargo version.
+      # release.yml checks pyproject.toml, but only at release time; this runs
+      # per-PR and also forbids re-introducing a hardcoded `__version__`.
+      - name: Check Python version consistency
+        run: python3 scripts/ci/check_version_consistency.py
+
+      # Documented counts must match what source or the filesystem already
+      # asserts — plugin surfaces (`assert_eq!(kinds.len(), 22)` in
+      # uni_plugin::surfaces), graph algorithms (`DISTINCT_ALGORITHMS` in
+      # uni-plugin-builtin's builtin_register test), both TCK suites' feature
+      # files and scenario totals, and the skill reference pages.
+      - name: Check documented counts
+        run: python3 scripts/ci/check_documented_counts.py
+
+      # The Python symbol reference is generated from `__init__.pyi`; a stale
+      # checked-in copy is the drift this replaced, so fail rather than diverge.
+      - name: Check generated Python API reference is current
+        run: python3 scripts/gen_python_api_reference.py --check
+
+      # Documented Python methods must exist. Kills the invented-method class
+      # (`xervo.rerank`, `session.profile_with`) that two hand-maintained
+      # references produced independently.
+      - name: Check documented Python symbols exist
+        run: python3 scripts/ci/check_doc_symbols.py
+
   supply-chain:
     if: github.repository == 'rustic-ai/uni-db'
     name: Supply Chain (cargo-deny)

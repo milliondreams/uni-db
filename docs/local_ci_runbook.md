@@ -328,6 +328,27 @@ cargo nextest run -p uni-tck --test tck
   uv run pytest tests/ -v -n auto )
 ```
 
+### Static Guards (pr.yml) — run these before every push
+
+The whole set is pure Python and finishes in ~0.5s. Nothing in the Rust test
+suite or clippy can catch this class, so this is the cheapest high-value check
+in the runbook — there is no reason to skip it.
+
+```bash
+python3 scripts/ci/check_wheel_variant_features.py
+python3 scripts/ci/check_version_consistency.py   # pyproject == workspace; no hardcoded __version__
+python3 scripts/ci/check_documented_counts.py     # every documented count claim: plugin
+                                                  # surfaces, graph algorithms, both TCK
+                                                  # suites' feature files + scenario totals,
+                                                  # and the skill reference pages
+python3 scripts/gen_python_api_reference.py --check  # generated symbol page is current
+python3 scripts/ci/check_doc_symbols.py           # documented Python methods exist in __init__.pyi
+```
+
+If `gen_python_api_reference.py --check` fails, regenerate rather than hand-editing:
+`python3 scripts/gen_python_api_reference.py`. The page is generated from
+`bindings/uni-db/uni_db/__init__.pyi` and must never be edited directly.
+
 ---
 
 ## 3. `ci.yml` — main-push thorough suite (the extra lanes ONLY)
@@ -462,23 +483,16 @@ sys.exit('feature build did not take effect; missing: %r' % missing) if missing 
   uv run maturin develop )
 ```
 
-### Release Guards
+### Release Guards (ci.yml) — the two that need a toolchain
 ```bash
-python3 scripts/ci/check_wheel_variant_features.py
-python3 scripts/ci/check_version_consistency.py   # pyproject == workspace; no hardcoded __version__
-python3 scripts/ci/check_documented_counts.py     # every documented count claim: plugin
-                                                  # surfaces, graph algorithms, both TCK
-                                                  # suites' feature files + scenario totals,
-                                                  # and the skill reference pages
-python3 scripts/gen_python_api_reference.py --check  # generated symbol page is current
-python3 scripts/ci/check_doc_symbols.py           # documented Python methods exist in __init__.pyi
-python3 scripts/ci/check_publish_list.py
-cargo check -p uni-python-onnx          # slim default-features=false wheel compile guard
+python3 scripts/ci/check_publish_list.py   # needs `cargo metadata`
+cargo check -p uni-python-onnx             # slim default-features=false wheel compile guard
 ```
 
-If `gen_python_api_reference.py --check` fails, regenerate rather than hand-editing:
-`python3 scripts/gen_python_api_reference.py`. The page is generated from
-`bindings/uni-db/uni_db/__init__.pyi` and must never be edited directly.
+Note that these steps run under `bash -e`, so the **first** failure aborts every
+step behind it in the job. A red Release Guards log tells you one step failed,
+never how many would have; re-run to green rather than reading the log as a
+complete list.
 
 ### CUDA wheel-graph smoke
 ```bash

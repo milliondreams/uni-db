@@ -2038,6 +2038,24 @@ fn walk_authz_query(
                     Clause::Call(_) => {
                         operations.insert("call".to_owned());
                     }
+                    // A FOREACH body is update clauses only, so the clause is
+                    // always a write — and the operations and resources it
+                    // touches are the body's, not the FOREACH's. Classifying it
+                    // on the outer clause alone would let `FOREACH (x IN l |
+                    // DELETE x)` be authorized as a plain write, and would
+                    // report none of the labels the body names.
+                    Clause::Foreach(f) => {
+                        operations.insert("write".to_owned());
+                        walk_authz_query(
+                            &Query::Single(uni_cypher::ast::Statement {
+                                clauses: f.body.clone(),
+                            }),
+                            labels,
+                            rel_types,
+                            properties,
+                            operations,
+                        );
+                    }
                 }
             }
         }

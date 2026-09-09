@@ -260,6 +260,7 @@ pub enum Clause {
     Set(SetClause),
     Remove(RemoveClause),
     Call(CallClause),
+    Foreach(ForeachClause),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -331,6 +332,27 @@ pub enum ReturnItem {
 pub struct UnwindClause {
     pub expr: Expr,
     pub variable: String,
+}
+
+/// `FOREACH (x IN list | <update clauses>)`.
+///
+/// Shaped like [`UnwindClause`] plus a body, which is the whole difference
+/// between the two: `UNWIND` multiplies the row stream and lets later clauses
+/// see each item, while `FOREACH` runs its body once per item as a side effect
+/// and passes the *original* rows through unchanged.
+///
+/// `body` holds only update clauses. The grammar enforces that (see
+/// `foreach_body_clause` in `cypher.pest`), so a `RETURN` inside a `FOREACH` is
+/// a parse error rather than a runtime one, and it matches what
+/// `Executor::execute_foreach_body_plan` is able to run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ForeachClause {
+    /// Iteration variable, bound to each list item in turn while the body runs.
+    pub variable: String,
+    /// Expression yielding the list to iterate.
+    pub expr: Expr,
+    /// Update clauses executed once per item. May contain a nested `FOREACH`.
+    pub body: Vec<Clause>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

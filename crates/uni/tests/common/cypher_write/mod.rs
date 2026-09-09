@@ -11,6 +11,7 @@ pub mod cypher_set_advanced;
 pub mod defer_embeddings_test;
 pub mod delete_vertex_test;
 pub mod df_mutation_test;
+pub mod foreach_test;
 pub mod inlined_unwind_pushdown_test;
 pub mod merge_failclosed_test;
 pub mod mutation_stress_test;

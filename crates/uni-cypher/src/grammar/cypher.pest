@@ -24,6 +24,7 @@ DELETE    = @{ ^"delete" ~ !ident_char }
 RETURN    = @{ ^"return" ~ !ident_char }
 WITH      = @{ ^"with" ~ !ident_char }
 UNWIND    = @{ ^"unwind" ~ !ident_char }
+FOREACH   = @{ ^"foreach" ~ !ident_char }
 ORDER     = @{ ^"order" ~ !ident_char }
 BY        = @{ ^"by" ~ !ident_char }
 ASC       = @{ (^"ascending" | ^"asc") ~ !ident_char }
@@ -138,7 +139,7 @@ identifier = @{
 // Reserved keywords - these CANNOT be used as identifiers
 keyword_reserved = {
     MATCH | OPTIONAL | WHERE | CREATE | MERGE | SET | REMOVE | DELETE | DETACH |
-    RETURN | WITH | UNWIND | UNION | CALL | YIELD |
+    RETURN | WITH | UNWIND | FOREACH | UNION | CALL | YIELD |
     DISTINCT | ORDER | BY | ASC | DESC | SKIP | LIMIT | AS |
     AND | OR | XOR | NOT |
     IN | CONTAINS | STARTS | ENDS | IS |
@@ -528,6 +529,7 @@ clause = {
     | with_clause
     | return_clause
     | unwind_clause
+    | foreach_clause
     | call_clause
 }
 
@@ -593,6 +595,25 @@ skip_clause = { SKIP ~ expression }
 limit_clause = { LIMIT ~ expression }
 
 unwind_clause = { UNWIND ~ expression ~ AS ~ identifier }
+
+// FOREACH (x IN list | <update clauses>)
+//
+// The body admits only update clauses: openCypher forbids MATCH/RETURN inside
+// FOREACH, and `ForeachExec` delegates each body plan through
+// `Executor::execute_foreach_body_plan`, which accepts exactly this set (plus a
+// nested FOREACH) and errors on anything else. Keeping the grammar this narrow
+// means the parser rejects `FOREACH (x IN l | RETURN x)` rather than deferring
+// it to a runtime error.
+foreach_clause = { FOREACH ~ "(" ~ identifier ~ IN ~ expression ~ "|" ~ foreach_body_clause+ ~ ")" }
+
+foreach_body_clause = _{
+    create_clause
+    | merge_clause
+    | set_clause
+    | remove_clause
+    | delete_clause
+    | foreach_clause
+}
 
 call_clause = {
     CALL ~ "{" ~ statement ~ "}"                              // Subquery

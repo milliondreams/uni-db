@@ -8,7 +8,7 @@
 //! passed through unchanged (FOREACH does not modify the caller-visible result).
 
 use super::common::compute_plan_properties;
-use super::mutation_common::{MutationContext, batches_to_rows, rows_to_batches};
+use super::mutation_common::{MutationContext, batches_to_rows};
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use datafusion::common::Result as DFResult;
@@ -146,7 +146,6 @@ impl ExecutionPlan for ForeachExec {
 
         let stream = futures::stream::once(execute_foreach_inner(
             input,
-            schema.clone(),
             variable,
             list_expr,
             body,
@@ -169,7 +168,6 @@ impl ExecutionPlan for ForeachExec {
 #[expect(clippy::too_many_arguments)]
 async fn execute_foreach_inner(
     input: Arc<dyn ExecutionPlan>,
-    schema: SchemaRef,
     variable: String,
     list_expr: Expr,
     body: Vec<LogicalPlan>,
@@ -225,9 +223,18 @@ async fn execute_foreach_inner(
             }
         };
 
-        // Execute body plans for each item
+        // Execute body plans for each item.
+        //
+        // The scope is built once per input row and *reused* across items, with
+        // only the iteration variable rebound. Cloning it from `row` per item
+        // instead — which is what this did — discarded every write the previous
+        // items made, so an accumulating body silently under-counted:
+        // `FOREACH (i IN [1,2,3] | SET n.seen = n.seen + 1)` left `seen = 1`,
+        // because all three iterations read the row's original `seen = 0`.
+        // openCypher requires a later iteration to observe an earlier one's
+        // writes. Reachable only since #176 gave the clause a front end.
+        let mut scope = row.clone();
         for item in items {
-            let mut scope = row.clone();
             scope.insert(variable.clone(), item);
 
             for plan in &body {
@@ -252,10 +259,25 @@ async fn execute_foreach_inner(
         "FOREACH complete"
     );
 
-    // 4. Pass through original rows (FOREACH is side-effect only)
-    // Reconstruct from rows in case the schema needs normalization
-    let result_batches =
-        rows_to_batches(&rows, &schema).map_err(|e| df_err("failed to reconstruct batches", &e))?;
+    // 4. Pass through the original batches (FOREACH is side-effect only).
+    //
+    // Emitted as they arrived, not rebuilt from `rows`. The previous code did
+    // `rows_to_batches(&rows, &schema)` "in case the schema needs
+    // normalization", but that round trip is lossy: an entity column arrives as
+    // a `Struct` and comes back out of `Value` as `LargeBinary`, so the rebuild
+    // failed against this operator's own schema —
+    //
+    //   expected Struct("_vid": UInt64, "_labels": List(Utf8), ...)
+    //   but found LargeBinary at column index 4
+    //
+    // — on the first query that ever reached this operator. There was nothing
+    // to normalize in any case: `ForeachExec`'s output schema *is* its input
+    // schema, and the input batches already satisfy it. `rows` stays as the
+    // body's evaluation scope and is no longer the source of the output.
+    //
+    // Only reachable since #176 gave `FOREACH` a front end; see
+    // `cypher_write::foreach_test`.
+    let result_batches = input_batches;
     let output_rows: usize = result_batches.iter().map(|b| b.num_rows()).sum();
     baseline.record_output(output_rows);
     let results: Vec<DFResult<RecordBatch>> = result_batches.into_iter().map(Ok).collect();

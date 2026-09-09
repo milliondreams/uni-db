@@ -141,7 +141,16 @@ pub(crate) fn build_statement(pair: Pair<Rule>) -> Result<Statement, ParseError>
 
 pub(crate) fn build_clause(pair: Pair<Rule>) -> Result<Clause, ParseError> {
     let inner = pair.into_inner().next().unwrap();
+    build_clause_inner(inner)
+}
 
+/// Dispatch on an already-unwrapped clause pair.
+///
+/// Split out of [`build_clause`] for `FOREACH`: its body is a silent grammar
+/// rule (`foreach_body_clause`), so the update clauses arrive as `create_clause`
+/// / `set_clause` / … directly rather than wrapped in a `clause`, and calling
+/// `build_clause` on one would unwrap a level too far.
+fn build_clause_inner(inner: Pair<Rule>) -> Result<Clause, ParseError> {
     match inner.as_rule() {
         Rule::match_clause => build_match_clause(inner),
         Rule::create_clause => build_create_clause(inner),
@@ -154,6 +163,7 @@ pub(crate) fn build_clause(pair: Pair<Rule>) -> Result<Clause, ParseError> {
         Rule::unwind_clause => build_unwind_clause(inner),
         Rule::remove_clause => build_remove_clause(inner),
         Rule::call_clause => build_call_clause(inner),
+        Rule::foreach_clause => build_foreach_clause(inner),
         _ => unreachable!("Unexpected clause: {:?}", inner.as_rule()),
     }
 }
@@ -306,6 +316,28 @@ fn build_unwind_clause(pair: Pair<Rule>) -> Result<Clause, ParseError> {
     inner.next(); // AS
     let variable = inner.next().unwrap().as_str().to_string();
     Ok(Clause::Unwind(UnwindClause { expr, variable }))
+}
+
+/// `FOREACH (x IN list | <update clauses>)`.
+///
+/// Mirrors [`build_unwind_clause`] for the `variable`/`expr` half — the two
+/// clauses carry the same pair, in the opposite order (`FOREACH x IN e` versus
+/// `UNWIND e AS x`) — then walks the body clauses through
+/// [`build_clause_inner`], which is what lets a nested `FOREACH` recurse.
+fn build_foreach_clause(pair: Pair<Rule>) -> Result<Clause, ParseError> {
+    let mut inner = pair.into_inner();
+    inner.next(); // FOREACH
+    let variable = inner.next().unwrap().as_str().to_string();
+    inner.next(); // IN
+    let expr = build_expression(inner.next().unwrap())?;
+    let body = inner
+        .map(build_clause_inner)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Clause::Foreach(ForeachClause {
+        variable,
+        expr,
+        body,
+    }))
 }
 
 fn build_delete_clause(pair: Pair<Rule>) -> Result<Clause, ParseError> {

@@ -115,13 +115,29 @@ pub fn eval_expr(expr: &Expr, bindings: &FactRow) -> Result<Value, LocyError> {
         }
         Expr::In { expr, list } => {
             let needle = eval_expr(expr, bindings)?;
-            match eval_expr(list, bindings)? {
-                Value::List(items) => Ok(Value::Bool(
-                    items.iter().any(|item| values_equal(&needle, item)),
-                )),
-                other => Err(LocyError::EvaluationError {
-                    message: format!("IN expects a list on the right-hand side, got {other:?}"),
-                }),
+            let haystack = eval_expr(list, bindings)?;
+            // `IN` is three-valued: null when nothing matched but a comparison
+            // was unknown. The hand-rolled `any(values_equal)` this replaced
+            // could only answer true or false, so `NOT (x IN ['a', null])`
+            // came back true and kept a row Cypher drops (#216).
+            //
+            // Route through the same helper the two Cypher paths use rather
+            // than growing a third `IN`: `eval_in_op` also brings exact-i64
+            // comparison, NaN handling, recursive list/map descent and the
+            // raw-id fallback (an entity tested against a list of bare vids),
+            // none of which `values_equal` does.
+            match haystack {
+                // `x IN null` is null, not an error. The list expression is
+                // allowed to evaluate to null — a missing property, an unset
+                // parameter — and Cypher propagates rather than failing.
+                Value::Null => Ok(Value::Null),
+                haystack => {
+                    uni_query_functions::expr_eval::eval_in_op(&needle, &haystack).map_err(|e| {
+                        LocyError::EvaluationError {
+                            message: e.to_string(),
+                        }
+                    })
+                }
             }
         }
         _ => Err(LocyError::EvaluationError {

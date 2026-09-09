@@ -63,7 +63,7 @@ pub struct Operator {
 /// executed lines under a dedicated 15-test suite. Retrofitting a proof lowers
 /// the bound; the gate fails if the count exceeds it, so a new operator cannot
 /// arrive unproven.
-pub const MAX_UNPROVEN: usize = 32;
+pub const MAX_UNPROVEN: usize = 31;
 
 pub const OPERATORS: &[Operator] = &[
     // ── Measured 2026-08-14 ────────────────────────────────────────────────
@@ -154,7 +154,18 @@ pub const OPERATORS: &[Operator] = &[
     Operator {
         ty: "ForeachExec",
         runtime_name: "ForeachExec",
-        status: Status::Unproven,
+        // Was unprovable rather than unproven: #176 found the clause had no
+        // grammar rule and no AST variant, so no query could construct the plan
+        // node and the 154 executable lines beneath it were unreachable. The
+        // front end now exists, and running the operator for the first time
+        // immediately turned up two defects in it — a lossy row/batch round
+        // trip on the pass-through, and a per-item scope rebuilt from the
+        // original row. "Never ran" was not "not worth running", and it was not
+        // "works" either.
+        status: Status::Proven {
+            by: "the_foreach_clause_plans_the_foreach_operator",
+            in_file: "crates/uni/tests/common/cypher_write/foreach_test.rs",
+        },
     },
     Operator {
         ty: "GraphUnwindExec",

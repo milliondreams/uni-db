@@ -638,7 +638,7 @@ DDL selects the vector algorithm only; for metric choice or tuning, use the Rust
 
 ### Adding Properties
 
-Safe operation—existing data gets NULL:
+Safe operation—existing rows read NULL for the new property:
 
 ```json
 // Before
@@ -650,6 +650,44 @@ Safe operation—existing data gets NULL:
     "citation_count": { "type": "Int32", "nullable": true }  // New
 }}
 ```
+
+This works whether the label is empty or already holds millions of rows, and
+**no data is rewritten**: the column is added as a storage-metadata change, so
+the cost does not grow with table size. Open forks keep working too—there is no
+need to drop and recreate them.
+
+Three behaviours worth knowing:
+
+**A `NOT NULL` property on a populated label is recorded as nullable.** The
+builder's `property()` defaults to `NOT NULL`, but rows that already exist have
+no value for a property you are only now declaring, so the declaration is
+recorded as nullable and a warning is logged. `NOT NULL` is still enforced on
+every subsequent write. Use `property_nullable()` to say so explicitly and skip
+the warning.
+
+**Declaring a property that already has schemaless data keeps its values.**
+Properties you write without declaring are stored in an overflow blob (see
+[Schemaless Properties](#schemaless-properties-overflow)). Declaring such a
+property promotes those values into the typed column, so reads keep returning
+them:
+
+```cypher
+// citation_count is not declared, so it is stored in the overflow blob
+CREATE (:Paper {title: 'A', citation_count: 12})
+
+// declaring it later promotes the stored values into the typed column
+ALTER LABEL Paper ADD PROPERTY citation_count INT32
+
+// still 12
+MATCH (p:Paper) RETURN p.citation_count
+```
+
+This promotion reads and rewrites the label's table once, so it is the one
+schema change whose cost scales with data size. Declaring properties up front
+avoids it entirely.
+
+**Dropping a property is safe too**, and equally does not rewrite data. The
+column stays on disk, unread, until the next compaction.
 
 ### Deprecating Properties
 

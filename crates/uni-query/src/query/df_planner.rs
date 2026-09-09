@@ -5722,11 +5722,81 @@ impl HybridPhysicalPlanner {
         }
 
         if let Some(limit) = fetch {
+            // Push the fetch into a sort directly beneath the limit, so
+            // `ORDER BY … LIMIT n` keeps n rows rather than sorting the whole
+            // input and discarding the rest (#213).
+            //
+            // This was tried during the #202 work and **measured as a
+            // regression**: setting the fetch swaps `ExternalSorter`, which
+            // spills, for `TopK`, which does not, and LDBC IC2 failed at
+            // `TopK[0]` with 977.4 MB already allocated.
+            //
+            // Re-measured at SF1 after the scan and both traversals were made
+            // to emit bounded batches (#202, #214, #241). That failure does not
+            // reproduce: 977 MB was a single giant input batch, not `k` rows —
+            // `TopK` holds `k`. IC2 and IC9 complete with the fetch set at a
+            // 1 GiB budget and at 256 MB, ~10% faster warm (min-of-4:
+            // IC2 5046 -> 4535 ms, IC9 41631 -> 37306 ms).
+            //
+            // `TopK` still cannot spill, and that is the standing risk. What is
+            // measured: a large `k` over a large input — 400 000 rows out of
+            // 3M at 512 MB — passes with the fetch and at the same speed
+            // without it, so the gain is a small-`k` effect and the large-`k`
+            // case is no worse. Below ~64 MB the binding constraint on these
+            // queries is the traversal, not the sort.
+            //
+            // Restricted to a `SortExec` immediately below the limit: a fetch
+            // pushed past an operator that changes cardinality would be wrong,
+            // and this is the one shape where it provably is not.
+            let input_plan = Self::push_fetch_into_sort(input_plan, limit);
             Ok(Arc::new(LocalLimitExec::new(input_plan, limit)))
         } else {
             // No limit, return input as-is
             Ok(input_plan)
         }
+    }
+
+    /// Push `limit` into a `SortExec` beneath `plan`, descending through
+    /// projections.
+    ///
+    /// The sort is rarely the limit's direct child: `RETURN … ORDER BY … LIMIT`
+    /// plans as `Limit -> Projection -> Sort`, so a downcast on the immediate
+    /// input matches nothing. That is not a hypothetical — an earlier version
+    /// of this checked only the direct child, silently pushed no fetch, and the
+    /// SF1 measurements taken to justify it were measuring unmodified code.
+    ///
+    /// Descends only through `ProjectionExec`, which preserves both row count
+    /// and ordering. Anything that changes cardinality would make the pushed
+    /// fetch wrong.
+    fn push_fetch_into_sort(plan: Arc<dyn ExecutionPlan>, limit: usize) -> Arc<dyn ExecutionPlan> {
+        use datafusion::physical_plan::projection::ProjectionExec;
+        use datafusion::physical_plan::sorts::sort::SortExec;
+
+        // `LIMIT 0` must not be pushed. A `SortExec` with `fetch = Some(0)`
+        // builds a `TopK` with `k = 0`, and DataFusion asserts `k > 0`
+        // (`datafusion-physical-plan-53.1.0/src/topk/mod.rs:678`) -- so the
+        // query panics instead of returning an empty result. The
+        // `LocalLimitExec` above already yields nothing for a zero limit, so
+        // there is no work to save by pushing it.
+        //
+        // Caught by the openCypher TCK: `ReturnSkipLimit2[5] ORDER BY with
+        // LIMIT 0 should not generate errors`.
+        if limit == 0 {
+            return plan;
+        }
+
+        if plan.as_any().downcast_ref::<SortExec>().is_some() {
+            return plan.with_fetch(Some(limit)).unwrap_or(plan);
+        }
+        if plan.as_any().downcast_ref::<ProjectionExec>().is_some()
+            && let [child] = plan.children().as_slice()
+        {
+            let pushed = Self::push_fetch_into_sort(Arc::clone(child), limit);
+            if let Ok(rebuilt) = Arc::clone(&plan).with_new_children(vec![pushed]) {
+                return rebuilt;
+            }
+        }
+        plan
     }
 
     /// Project `plan` down to `cols`, in that order.

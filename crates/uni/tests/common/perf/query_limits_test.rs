@@ -1154,3 +1154,752 @@ async fn id_in_a_literal_list_selects_exactly_those_nodes() -> Result<()> {
     );
     Ok(())
 }
+
+/// A full-label scan is bounded by one `_vid` range, not by the result (#214).
+///
+/// Phase 2 bounded a scan restricted to a vid list. A plain `MATCH (n:L)` has
+/// no list to chunk, so it read the label whole; this walks it in `_vid`
+/// ranges instead. The range is the unit because `_vid` is the MVCC dedup key:
+/// every version of a vid lands in exactly one range, so the highest-`_version`
+/// choice still sees all its candidates. Chunking on anything else — arriving
+/// storage batch, row offset — would serve superseded rows.
+///
+/// Discriminating, and measured: whole, this scan reserves 2.2 MB and fails at
+/// this ceiling with `Failed to allocate additional 2.2 MB for GraphScanExec`.
+/// Walked, each range reserves 751 KB and it succeeds. The count is asserted
+/// exactly, so a range walk that skipped or repeated a stretch fails too.
+#[tokio::test]
+async fn a_full_label_scan_is_bounded_by_one_range() -> Result<()> {
+    // Above one range's 751 KB, below the 2.2 MB the whole result needs.
+    const CEILING: usize = 1 << 20;
+
+    let (db, _ids) = store_and_id_list().await?;
+
+    // Aggregated so the scan's own reservation is the binding constraint;
+    // returning the rows would trip the cursor's result-size check first, and
+    // an assertion that accepts any memory-shaped failure passes with the walk
+    // removed.
+    let rows = db
+        .session()
+        .query_with("MATCH (n:CH) RETURN count(n.k) AS c")
+        .max_memory(CEILING)
+        .fetch_all()
+        .await?;
+
+    assert_eq!(
+        rows.rows()[0].values()[0],
+        uni_db::Value::Int(CHUNKED_SCAN_ROWS),
+        "the range walk lost or repeated rows"
+    );
+    Ok(())
+}
+
+/// A label whose vids begin past the start of the range walk is still read.
+///
+/// Vids are global, so one label's rows can sit anywhere in the space and a
+/// walk from zero meets empty ranges before reaching them. Emptiness is
+/// ambiguous — past the end, or a gap — and a walk that guesses "end" returns
+/// a silently truncated result rather than failing.
+///
+/// Discriminating on exactly that: with the gap case treated as the end this
+/// returns **0 rows**, not an error. `Target`'s 12 000 rows are also above the
+/// 8 192 gate, which is what puts this fixture on the range walk at all — at
+/// 5 000 it took the ordinary unchunked path and passed with the gap handling
+/// deleted.
+#[tokio::test]
+async fn a_label_whose_vids_start_late_is_walked_past_the_gap() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    for label in ["Other", "Target"] {
+        db.schema()
+            .label(label)
+            .property("k", uni_db::DataType::Int)
+            .apply()
+            .await?;
+    }
+    let tx = db.session().tx().await?;
+    // `Other` first, so every `Target` vid is above the walk's first ranges.
+    tx.execute("UNWIND range(0, 19999) AS i CREATE (:Other {k: i})")
+        .await?;
+    tx.execute("UNWIND range(0, 11999) AS i CREATE (:Target {k: i})")
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    let rows = db
+        .session()
+        .query("MATCH (n:Target) RETURN count(n) AS c")
+        .await?;
+    assert_eq!(
+        rows.rows()[0].values()[0],
+        uni_db::Value::Int(12_000),
+        "the walk stopped at an empty range instead of crossing the gap"
+    );
+    Ok(())
+}
+
+/// The range walk is gated: a label that fits in one output batch is still read
+/// in a single scan (#214).
+///
+/// Chunking unconditionally is not free — the traversal measured ~6% against a
+/// control when it chunked a result that did not need it, which is why #214
+/// asks for the gate and not just the walk. A skipped gate is invisible in the
+/// results, so this asserts the observable that separates the two strategies:
+/// `scans_reported`, which counts completed Lance scans.
+///
+/// The sizing call itself does not pollute that count — `count_rows` answers
+/// from fragment metadata and never builds a `ScanRequest`, so it never reaches
+/// the scan-stats callback.
+///
+/// Discriminating in both directions, which is why both sizes are measured in
+/// one test: delete the gate and the small label's count rises to the large
+/// one's shape; delete the walk and the large label's falls to the small one's.
+/// A single-size assertion would pass for one of those.
+#[tokio::test]
+async fn the_range_walk_is_skipped_for_a_label_that_fits_one_batch() -> Result<()> {
+    // Well under the 8 192 default batch size, so the gate must decline.
+    const SMALL_ROWS: i64 = 500;
+
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Small")
+        .property("k", uni_db::DataType::Int)
+        .apply()
+        .await?;
+    let tx = db.session().tx().await?;
+    tx.execute(&format!(
+        "UNWIND range(0, {}) AS i CREATE (:Small {{k: i}})",
+        SMALL_ROWS - 1
+    ))
+    .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    let small = db
+        .session()
+        .query("MATCH (n:Small) RETURN count(n) AS c")
+        .await?;
+    assert_eq!(small.rows()[0].values()[0], uni_db::Value::Int(SMALL_ROWS));
+    let small_scans = small.metrics().scans_reported;
+
+    // The same query over a label well above the gate, as the contrast.
+    let (big_db, _ids) = store_and_id_list().await?;
+    let big = big_db
+        .session()
+        .query("MATCH (n:CH) RETURN count(n) AS c")
+        .await?;
+    assert_eq!(
+        big.rows()[0].values()[0],
+        uni_db::Value::Int(CHUNKED_SCAN_ROWS)
+    );
+    let big_scans = big.metrics().scans_reported;
+
+    eprintln!(
+        "#214 gate: {SMALL_ROWS} rows -> {small_scans} scans, \
+         {CHUNKED_SCAN_ROWS} rows -> {big_scans} scans"
+    );
+
+    // Exactly one, not merely "fewer than the large label". Measured: with the
+    // gate removed this is 2 — the walk reads its first range and then pays the
+    // `ConfirmingEnd` probe to learn there is nothing above it. A `>` comparison
+    // against the large label passes either way, because the large label needs
+    // more ranges whether or not the small one was gated. The exact count is
+    // what makes this fail when the gate goes.
+    assert_eq!(
+        small_scans, 1,
+        "a label that fits one output batch must be read in a single scan; \
+         {small_scans} means the range walk engaged and paid for ranges the \
+         result did not need"
+    );
+    assert!(
+        big_scans > small_scans,
+        "the large label reported {big_scans} scans against the small label's \
+         {small_scans}: the walk did not engage at all"
+    );
+    Ok(())
+}
+
+/// A variable-length expansion is bounded by one row-chunk, not by the input
+/// batch (#241).
+///
+/// `VarLengthStreamState` accumulates a `Vec<VarLengthExpansion>` carrying a
+/// node path and an edge path *per enumerated path*, so its size is paths times
+/// path length and is bounded by neither the input nor any table. It used to
+/// build that set for a whole input batch at once.
+///
+/// Chunking the *materialization*, which is what the single-hop sibling does,
+/// would not have helped: the whole set exists before materialization begins.
+/// The input rows are what had to be chunked.
+///
+/// # The ceiling is chosen from measurement, not guessed
+///
+/// On this fixture the query enumerates 111 100 paths from 10 source rows.
+/// Measured by tightening the pool until it refuses:
+///
+/// * one row-chunk asks for **1697 KB**;
+/// * the whole 10-row batch asks for **15.2 MB**.
+///
+/// 8 MB sits between them, so this passes only while the expansion is chunked.
+/// Verified discriminating: restoring `rows_per_chunk` to `slice_size` fails it
+/// with `Failed to allocate additional 15.2 MB`.
+///
+/// The same contrast at depth 6 is 184.8 MB against 1846.3 MB — a ratio of
+/// 9.99 on 10 rows, which is the bound moving from per-batch to per-row. Depth
+/// 4 is used here because it shows the same thing in two seconds.
+#[tokio::test]
+async fn a_variable_length_expansion_is_bounded_by_one_row_chunk() -> Result<()> {
+    /// Above one row-chunk's 1697 KB, below the whole batch's ~17 MB.
+    const CEILING: usize = 8 * 1024 * 1024;
+    const WIDTH: i64 = 10;
+    const LAYERS: i64 = 7;
+    const EXPECTED_PATHS: i64 = 111_100;
+
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("N")
+        .property("layer", uni_db::DataType::Int)
+        .apply()
+        .await?;
+    db.schema().edge_type("E", &["N"], &["N"]).apply().await?;
+
+    // A layered mesh, every node in layer i pointing at every node in i+1, so
+    // path count is multiplicative in depth while the graph stays at 70 nodes.
+    let tx = db.session().tx().await?;
+    for layer in 0..LAYERS {
+        tx.query_with("UNWIND range(0, $w - 1) AS i CREATE (:N {layer: $l})")
+            .param("w", uni_db::Value::Int(WIDTH))
+            .param("l", uni_db::Value::Int(layer))
+            .fetch_all()
+            .await?;
+    }
+    for layer in 0..LAYERS - 1 {
+        tx.query_with("MATCH (a:N {layer: $l}), (b:N {layer: $n}) CREATE (a)-[:E]->(b)")
+            .param("l", uni_db::Value::Int(layer))
+            .param("n", uni_db::Value::Int(layer + 1))
+            .fetch_all()
+            .await?;
+    }
+    tx.commit().await?;
+    db.flush().await?;
+
+    // `p` is bound, which is what selects full path enumeration over the
+    // endpoint-only BFS. Without it the traversal never builds the expansion
+    // set at all and this would pass with the chunking deleted.
+    let rows = db
+        .session()
+        .query_with("MATCH p = (a:N {layer: 0})-[:E*1..4]->(b:N) RETURN count(p) AS c")
+        .max_memory(CEILING)
+        .fetch_all()
+        .await?;
+
+    assert_eq!(
+        rows.rows()[0].values()[0],
+        uni_db::Value::Int(EXPECTED_PATHS),
+        "the row-chunked expansion lost or repeated paths"
+    );
+    Ok(())
+}
+
+/// The schemaless variable-length expansion is both accounted and bounded
+/// (#241, second arm).
+///
+/// `GraphVariableLengthTraverseMainExec` reserved only its adjacency map, so
+/// the expansion set — a node path and an edge path per enumerated path, and
+/// this operator's dominant allocation — was invisible to the query pool.
+/// Measured before the change: 106 MB of expansions passed an 8 MB ceiling
+/// without the pool noticing, because nothing ever asked it.
+///
+/// Two assertions, because the two halves fail differently and a single
+/// ceiling cannot catch both:
+///
+/// * **accounted** — a 1 MB ceiling must now be *refused*. Before, no ceiling
+///   could refuse this query at all: unaccounted memory cannot be rejected, so
+///   the test that catches missing accounting is one that demands a failure.
+/// * **bounded** — an 8 MB ceiling must *pass*. One row-chunk asks 1697 KB;
+///   the whole 10-row batch asks ~15 MB. Given accounting, this fails unless
+///   the expansion is chunked.
+///
+/// Verified discriminating in both directions: dropping the reservation makes
+/// the first assertion fail, and restoring `rows_per_chunk` to `slice_size`
+/// makes the second fail.
+#[tokio::test]
+async fn a_schemaless_variable_length_expansion_is_accounted_and_bounded() -> Result<()> {
+    const WIDTH: i64 = 10;
+    const LAYERS: i64 = 7;
+    const EXPECTED_PATHS: i64 = 111_100;
+    const QUERY: &str = "MATCH p = (a:N {layer: 0})-[:E*1..4]->(b:N) RETURN count(p) AS c";
+
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("N")
+        .property("layer", uni_db::DataType::Int)
+        .apply()
+        .await?;
+    // `E` is deliberately NOT declared: an undeclared edge type is what routes
+    // the pattern through `GraphVariableLengthTraverseMainExec` rather than its
+    // schema'd twin.
+    let tx = db.session().tx().await?;
+    for layer in 0..LAYERS {
+        tx.query_with("UNWIND range(0, $w - 1) AS i CREATE (:N {layer: $l})")
+            .param("w", uni_db::Value::Int(WIDTH))
+            .param("l", uni_db::Value::Int(layer))
+            .fetch_all()
+            .await?;
+    }
+    for layer in 0..LAYERS - 1 {
+        tx.query_with("MATCH (a:N {layer: $l}), (b:N {layer: $n}) CREATE (a)-[:E]->(b)")
+            .param("l", uni_db::Value::Int(layer))
+            .param("n", uni_db::Value::Int(layer + 1))
+            .fetch_all()
+            .await?;
+    }
+    tx.commit().await?;
+    db.flush().await?;
+
+    // Accounted: a ceiling below one row-chunk must be refused, naming this
+    // operator. An unaccounted expansion would sail past any ceiling.
+    let refused = db
+        .session()
+        .query_with(QUERY)
+        .max_memory(1024 * 1024)
+        .fetch_all()
+        .await;
+    let err = refused
+        .err()
+        .expect("a 1 MB ceiling must refuse a 111k-path expansion")
+        .to_string();
+    assert!(
+        err.contains("GraphVariableLengthTraverseMainExec"),
+        "the refusal must come from the schemaless VLP operator, so the \
+         expansion set is what the pool saw; got: {err}"
+    );
+
+    // Bounded: above one row-chunk but below the whole batch.
+    let rows = db
+        .session()
+        .query_with(QUERY)
+        .max_memory(8 * 1024 * 1024)
+        .fetch_all()
+        .await?;
+    assert_eq!(
+        rows.rows()[0].values()[0],
+        uni_db::Value::Int(EXPECTED_PATHS),
+        "the row-chunked expansion lost or repeated paths"
+    );
+    Ok(())
+}
+
+/// A schemaless single-hop traversal accounts for the batch it expands, not
+/// just the input it expanded from (#242).
+///
+/// `GraphTraverseMainExec` reserved `buffered_bytes + adjacency` on entering
+/// `Processing` and then returned `expand_batch(...)` directly, so its largest
+/// allocation — the expanded fan-out batch — never reached the pool. It looked
+/// accounted: it registers a `MemoryConsumer`, holds a `MemoryReservation`, and
+/// refuses a small enough ceiling. It simply refused on the wrong quantity.
+///
+/// Measured on a 500x400 fixture (200 000 edges): the pool saw 11.7 MB of
+/// adjacency and input while the expansion added a further **9.9 MB** it never
+/// saw, so a 13 MB ceiling passed a query whose true peak was 21.6 MB.
+///
+/// # Why the assertion is a required *failure*
+///
+/// An unaccounted allocation passes every ceiling, so no passing query can
+/// witness it. The only assertion that catches this is one that demands a
+/// refusal at a ceiling above what the operator used to reserve — and names the
+/// operator, so the refusal is attributable rather than incidental.
+///
+/// Verified discriminating: dropping the output term from the reservation makes
+/// the first assertion fail, because the query then succeeds.
+#[tokio::test]
+async fn a_schemaless_traversal_accounts_for_the_batch_it_expands() -> Result<()> {
+    const SOURCES: i64 = 200;
+    const TARGETS: i64 = 100;
+    const EDGES: i64 = SOURCES * TARGETS;
+    const QUERY: &str = "MATCH (a:Src)-[:E]->(b:Dst) RETURN count(*) AS c";
+
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Src")
+        .property("k", uni_db::DataType::Int)
+        .label("Dst")
+        .property("k", uni_db::DataType::Int)
+        .apply()
+        .await?;
+    // `E` is never declared: that is what routes a single hop through
+    // `GraphTraverseMainExec` rather than its schema'd twin.
+    let tx = db.session().tx().await?;
+    tx.query_with("UNWIND range(0, $n - 1) AS i CREATE (:Src {k: i})")
+        .param("n", uni_db::Value::Int(SOURCES))
+        .fetch_all()
+        .await?;
+    tx.query_with("UNWIND range(0, $n - 1) AS i CREATE (:Dst {k: i})")
+        .param("n", uni_db::Value::Int(TARGETS))
+        .fetch_all()
+        .await?;
+    tx.query("MATCH (a:Src), (b:Dst) CREATE (a)-[:E]->(b)")
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    // Above what the operator used to reserve, below its true peak. Before the
+    // fix this ceiling passed; now the expansion is part of the ask.
+    let refused = db
+        .session()
+        .query_with(QUERY)
+        .max_memory(2 * 1024 * 1024)
+        .fetch_all()
+        .await;
+    let err = refused
+        .err()
+        .expect("the expanded batch must be part of the reservation")
+        .to_string();
+    assert!(
+        err.contains("GraphTraverseMainExec"),
+        "the refusal must name the traversal, so it is the expansion that was \
+         refused rather than something incidental; got: {err}"
+    );
+
+    // With room for both, the answer is unchanged.
+    let rows = db
+        .session()
+        .query_with(QUERY)
+        .max_memory(64 * 1024 * 1024)
+        .fetch_all()
+        .await?;
+    assert_eq!(
+        rows.rows()[0].values()[0],
+        uni_db::Value::Int(EDGES),
+        "accounting must not change the result"
+    );
+    Ok(())
+}
+/// `VidLookupJoinExec` accounts for the structures it derives, not only the
+/// batches it holds (#242).
+///
+/// The operator reserves its build batches and probe chunks carefully — it even
+/// reserves the `concat_batches` peak, noting the chunks and the combined batch
+/// are live at once. What it did not reserve were the two structures it derives
+/// from them: `vid_set: HashSet<u64>` and the probe index
+/// `HashMap<u64, Vec<usize>>`, built `with_capacity(rows)`. Rust-side, not
+/// Arrow, and outside every `get_array_memory_size` it was summing.
+///
+/// # The window is measured, not guessed
+///
+/// On this 60 000-row join the derived structures add **3.7 MB** on top of
+/// ~17.8 MB of accounted batches. Sweeping ceilings with and without the
+/// reservation:
+///
+/// | ceiling | accounted | unaccounted |
+/// |---------|-----------|-------------|
+/// | 18 MB   | refused   | refused     |
+/// | 20 MB   | **refused** | **OK**    |
+/// | 22 MB   | OK        | OK          |
+///
+/// So 20 MB is the only kind of ceiling that can witness this, and it is why
+/// the assertion below is a required *failure*: an unaccounted structure passes
+/// every ceiling, so no successful query can prove it was ever charged for.
+///
+/// Verified discriminating: removing either `try_grow` makes this query succeed
+/// at 20 MB and the test fail.
+#[tokio::test]
+async fn a_vid_lookup_join_accounts_for_its_derived_index() -> Result<()> {
+    /// Large enough that the derived index clears the noise around the batch
+    /// bytes; below this the structures are a few hundred KB and no ceiling
+    /// separates the two cases.
+    const N: i64 = 60_000;
+    const QUERY: &str =
+        "MATCH (a:Source) MATCH (b:Target) WHERE id(b) = a.linked_vid RETURN count(*) AS c";
+
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Source")
+        .property("linked_vid", uni_db::DataType::Int)
+        .label("Target")
+        .property("name", uni_db::DataType::String)
+        .apply()
+        .await?;
+    let tx = db.session().tx().await?;
+    tx.query_with("UNWIND range(0, $n - 1) AS i CREATE (:Target {name: 't' + toString(i)})")
+        .param("n", uni_db::Value::Int(N))
+        .fetch_all()
+        .await?;
+    tx.query_with("UNWIND range(0, $n - 1) AS i CREATE (:Source {linked_vid: i})")
+        .param("n", uni_db::Value::Int(N))
+        .fetch_all()
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    // Above the accounted batches, below batches + derived structures.
+    let refused = db
+        .session()
+        .query_with(QUERY)
+        .max_memory(20 * 1024 * 1024)
+        .fetch_all()
+        .await;
+    let err = refused
+        .err()
+        .expect("the derived index must be part of the reservation")
+        .to_string();
+    assert!(
+        err.contains("VidLookupJoinExec"),
+        "the refusal must name the join, so it is the derived structures that \
+         were refused rather than something incidental; got: {err}"
+    );
+
+    // With room for both, the answer is unchanged.
+    let rows = db
+        .session()
+        .query_with(QUERY)
+        .max_memory(64 * 1024 * 1024)
+        .fetch_all()
+        .await?;
+    assert_eq!(
+        rows.rows()[0].values()[0],
+        uni_db::Value::Int(N),
+        "accounting must not change the result"
+    );
+    Ok(())
+}
+
+/// A chunking single-hop traversal accounts for the expansion set it retains
+/// (#242).
+///
+/// `GraphTraverseExec` reserves the batch it is slicing, and frees that
+/// reservation when a batch is handed straight downstream — correctly, since it
+/// no longer holds it. But when the expansion exceeds `slice_size` it takes the
+/// `Chunking` path instead, retaining the whole `Vec<Expansion>` *and* its input
+/// batch across every `MaterializingChunk` round-trip, and neither was
+/// accounted. The reservations on the other two paths cover the emitted batch,
+/// which is a different object.
+///
+/// # Measured
+///
+/// On a 300x300 fixture (90 000 expansions) the retained set is **2.8 MB**.
+/// Without the reservation the query passes a **1 MB** ceiling while holding
+/// it; with the reservation it is refused at 1 MB and 2 MB and passes at 4 MB.
+///
+/// The assertion is a required *failure* for the usual reason: an unaccounted
+/// allocation passes every ceiling, so only a demanded refusal can witness it.
+///
+/// Verified discriminating: removing the `try_resize` on the `Chunking`
+/// transition makes this query succeed at 2 MB and the test fail.
+#[tokio::test]
+async fn a_chunking_traversal_accounts_for_its_retained_expansions() -> Result<()> {
+    const S: i64 = 300;
+    const T: i64 = 300;
+    const EXPANSIONS: i64 = S * T;
+    const QUERY: &str = "MATCH (a:S)-[r:R]->(b:T) RETURN count(b.k) AS c";
+
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("S")
+        .property("k", uni_db::DataType::Int)
+        .label("T")
+        .property("k", uni_db::DataType::Int)
+        .done()
+        .edge_type("R", &["S"], &["T"])
+        .done()
+        .apply()
+        .await?;
+    let tx = db.session().tx().await?;
+    tx.query_with("UNWIND range(0, $n - 1) AS i CREATE (:S {k: i})")
+        .param("n", uni_db::Value::Int(S))
+        .fetch_all()
+        .await?;
+    tx.query_with("UNWIND range(0, $n - 1) AS i CREATE (:T {k: i})")
+        .param("n", uni_db::Value::Int(T))
+        .fetch_all()
+        .await?;
+    tx.query("MATCH (a:S), (b:T) CREATE (a)-[:R]->(b)").await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    // Below the retained expansion set. Unaccounted, this ceiling passed.
+    let refused = db
+        .session()
+        .query_with(QUERY)
+        .max_memory(2 * 1024 * 1024)
+        .fetch_all()
+        .await;
+    let err = refused
+        .err()
+        .expect("the retained expansion set must be part of the reservation")
+        .to_string();
+    assert!(
+        err.contains("GraphTraverseExec"),
+        "the refusal must name the traversal; got: {err}"
+    );
+
+    // With room, the answer is unchanged.
+    let rows = db
+        .session()
+        .query_with(QUERY)
+        .max_memory(32 * 1024 * 1024)
+        .fetch_all()
+        .await?;
+    assert_eq!(
+        rows.rows()[0].values()[0],
+        uni_db::Value::Int(EXPANSIONS),
+        "accounting must not change the result"
+    );
+    Ok(())
+}
+
+/// A full-label scan walks its ranges in O(log rows) round trips, not one per
+/// output batch (#214 follow-up).
+///
+/// The range walk shipped tuned on **rows** — each range aimed at one
+/// `batch_size` worth. That is the same thing as a memory bound only for a row
+/// of average width, and it cost a full scan dearly. Measured on LDBC SF1
+/// `Message` (3 055 774 rows), `RETURN count(n)`:
+///
+/// | | scans | time |
+/// |---|---|---|
+/// | before the walk existed | 1 | 1.16 s |
+/// | walk tuned on rows | 374 | 8.20 s |
+/// | walk tuned on bytes | 11 | 1.18 s |
+///
+/// One Lance round trip per 8192 rows is 374 of them on that table. Tuning on
+/// bytes, against a share of the query's own budget, lets a narrow projection
+/// take ranges hundreds of times wider for the same peak — the width doubles
+/// from `batch_size` until a range fills the budget, so the count is
+/// logarithmic in the table rather than linear.
+///
+/// # Why this guard is here
+///
+/// The regression reached `main`. The #214 acceptance checked that the gate
+/// *skips* for a small result, and that the walk is correct — neither of which
+/// a large result exercises, and the cost only appears when the gate fires.
+/// This asserts the round-trip count directly, at a size where the two tunings
+/// differ: 200 000 narrow rows is ~24 ranges tuned on rows and ~5 tuned on
+/// bytes.
+#[tokio::test]
+async fn a_full_label_scan_does_not_pay_a_round_trip_per_batch() -> Result<()> {
+    const ROWS: i64 = 200_000;
+    /// Comfortably above the ~5 the doubling ramp needs, far below the ~24 a
+    /// row-tuned walk would take.
+    const MAX_SCANS: u64 = 12;
+
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Wide")
+        .property("k", uni_db::DataType::Int)
+        .apply()
+        .await?;
+    let tx = db.session().tx().await?;
+    tx.query_with("UNWIND range(0, $n - 1) AS i CREATE (:Wide {k: i})")
+        .param("n", uni_db::Value::Int(ROWS))
+        .fetch_all()
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    let r = db
+        .session()
+        .query("MATCH (n:Wide) RETURN count(n) AS c")
+        .await?;
+    assert_eq!(
+        r.rows()[0].values()[0],
+        uni_db::Value::Int(ROWS),
+        "the range walk lost or repeated rows"
+    );
+    let scans = r.metrics().scans_reported;
+    eprintln!("#214 round trips: {ROWS} rows -> {scans} scans");
+    assert!(
+        scans > 0,
+        "no scan was reported at all, so this measured nothing"
+    );
+    assert!(
+        scans <= MAX_SCANS,
+        "a full scan of {ROWS} rows issued {scans} Lance round trips; the walk \
+         is tuned on rows again rather than on a share of the query budget, \
+         which cost 7x on a 3M-row table"
+    );
+    Ok(())
+}
+
+/// `ORDER BY … LIMIT n` keeps n rows in the sort, not the whole input (#213).
+///
+/// The physical planner builds `SortExec` directly and DataFusion's
+/// `LimitPushdown` never runs — `QueryPlanner::plan` returns the hand-built plan
+/// with no physical-optimizer pass — so the fetch has to be pushed explicitly.
+/// Without it, LDBC IC9 sorts 2.87M rows to return 20.
+///
+/// # The observable
+///
+/// Results are identical either way, and both survive a memory ceiling — one
+/// spills, one does not — so neither rows nor a ceiling can witness this. What
+/// does is `OperatorStats::actual_rows` on the sort itself: rows *produced by
+/// that operator*. A fetch-less sort emits all N and the limit trims after; a
+/// fetch-set sort emits n.
+///
+/// # Why the fetch is set at all
+///
+/// It was tried during #202 and measured as a regression — IC2 died at
+/// `TopK[0]` with 977.4 MB, because `TopK` cannot spill where `ExternalSorter`
+/// can. Re-measured at SF1 after #202/#214/#241 bounded the producers, that
+/// failure does not reproduce: 977 MB was one giant input batch, not `k` rows.
+/// IC2 and IC9 now complete with the fetch at 1 GiB and at 256 MB and are ~10%
+/// faster warm. `TopK`'s non-spillability is unchanged and remains the standing
+/// risk; a large `k` over a large input was measured as no worse.
+///
+/// Verified discriminating: dropping the `with_fetch` push makes the sort report
+/// all ROWS rows instead of LIMIT.
+#[tokio::test]
+async fn an_ordered_limit_keeps_only_n_rows_in_the_sort() -> Result<()> {
+    const ROWS: i64 = 20_000;
+    const LIMIT: usize = 10;
+
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Sorted")
+        .property("k", uni_db::DataType::Int)
+        .apply()
+        .await?;
+    let tx = db.session().tx().await?;
+    tx.query_with("UNWIND range(0, $n - 1) AS i CREATE (:Sorted {k: i})")
+        .param("n", uni_db::Value::Int(ROWS))
+        .fetch_all()
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    let session = db.session();
+    let (result, profile) = session
+        .query_with("MATCH (n:Sorted) RETURN n.k AS k ORDER BY k DESC LIMIT 10")
+        .profile()
+        .await?;
+
+    assert_eq!(result.rows().len(), LIMIT, "the limit must still apply");
+    assert_eq!(
+        result.rows()[0].values()[0],
+        uni_db::Value::Int(ROWS - 1),
+        "descending order must still be correct"
+    );
+
+    let sorts: Vec<&uni_query::query::executor::core::OperatorStats> = profile
+        .runtime_stats
+        .iter()
+        .filter(|s| s.operator.contains("Sort"))
+        .collect();
+    assert!(
+        !sorts.is_empty(),
+        "no sort operator ran, so this measured nothing; operators were {:?}",
+        profile
+            .runtime_stats
+            .iter()
+            .map(|s| &s.operator)
+            .collect::<Vec<_>>()
+    );
+    for s in &sorts {
+        assert!(
+            s.actual_rows <= LIMIT,
+            "`{}` produced {} rows for a LIMIT {LIMIT}: the fetch was not pushed \
+             into the sort, so the whole input is being sorted and discarded",
+            s.operator,
+            s.actual_rows
+        );
+    }
+    Ok(())
+}

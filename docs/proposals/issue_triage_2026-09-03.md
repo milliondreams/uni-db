@@ -588,3 +588,283 @@ second clause, and #233's P0 outranks #214.
 ~~Unchanged, and now unblocked: **#214 with #240**, then **#239**, then
 **#224** and the rest of Tier 4. #233 stays open for Tier 2 across the
 newly-audited crates — ~7 sites, none of them wrong answers.~~
+
+---
+
+## Status — 2026-09-08, full re-triage against source
+
+31 open issues, every one re-verified against the tree at `b70599649` rather
+than read from its filing. **Ten issue texts changed under verification**, in
+both directions, which is the same property this document has recorded of every
+audit it has run. The ranking below is built on the verified state, not the
+titles.
+
+### Six issues are already done
+
+The count is the first thing wrong with the board. `main` is 10 commits ahead
+of `origin/main`, in flight as **PR #262** (body empty, CI queued).
+
+| # | state | closes how |
+|---|---|---|
+| #205 | vacuous-fixture audit shipped (`85f26e72e`) + helper + discriminating self-test | `Fixes` — auto |
+| #214 | scan range-walk landed; the comment it demanded be deleted is gone | `Fixes` — auto |
+| #223 | `scans_reported` threaded through main-edge (`5e952c31f`), 2 discriminating guards | `Fixes` — auto |
+| #241 | both var-length arms now `RowChunking`; schemaless 105 MB → 26 MB | **`Refs` only — will strand** |
+| #242 | all three (B) items fixed; the (A) list was handed to #261 | **`Refs` only — will strand** |
+| #178 | `GraphMachine(RuleBasedStateMachine)` exists in `test_stateful_crud.py` | unreferenced — strands |
+
+**Action before merging #262: add `Closes #241`, `Closes #242` to the PR body.**
+They are done, and nothing in the commit trailers says so. #178 closes
+independently with a pointer to the file.
+
+Recommend also closing **#119** (Seismic sparse index) as won't-do-yet: it is
+double-gated behind #118, which has not been evaluated, and the issue's own
+analysis notes the exact `sparse_rerank` discards the approximate scores it
+would produce.
+
+That takes the board from 31 to **24**, with no engineering.
+
+### Ten filings that verification revised
+
+Recorded because re-filing from a stale text is how this project has repeatedly
+fixed the instance while the class survived.
+
+| # | the filing says | source says |
+|---|---|---|
+| #216 | two defects | **defect 1 is fixed** — `values_equal` routes through `Value::entity_ref()`. Only the 3VL half stands |
+| #222 | one edge-side site | **four sites** — the same "fallback to full scan" is on the vertex side at `property_manager.rs:551, 1966, 2244` |
+| #226 | empty scope, so anchoring never applies | true but the diagnosis misleads: the empty slice is **correct as ordered**. IS-ref joins are planned *above* an already-committed Scan→Traverse. Not a one-liner; needs #224 or a reordering |
+| #122 | test-parity gaps | conceals a **defect**: multi-vector query-text auto-embed is unwired — `search_procedures.rs:1289` calls `extract_vector_list` with no text arm, while dense (`:1362`) and sparse (`:694`) both have one |
+| #178 | "all 1,078 pytest functions are example-based" | stale; and the file **deliberately rejects** #178's proposed invariant (Hypothesis cannot drive coroutine rules) |
+| #174 | "14 source references" | **83 across 14 files**; `deny.toml:17` also contradicts `:48` on whether fxhash is ours |
+| #200 | add the cause to the barrier message | **root gap**: `finalize_failure` *consumes* the error, so no cause is retained. `:586` then interpolates the wrong variable |
+| #227 | dates admit most of the corpus | bias is systematic beyond dates — `workFromYear = max+1` admits **every** row; hub person, modal month, largest tag |
+| #237 | both inputs in hand | `count_rows` is **not** reachable from `GraphScanExec`; needs new plumbing. Raises effort to medium |
+| #220 | 8 open sites | count accurate, two descriptions understate: site 2 is **four** loops; site 5 needs a **new primitive** (`find_batch_by_ext_ids` does not exist) |
+
+### The ranking
+
+**P0 — availability. One issue.**
+
+**#249** — adding a property to an existing label wedges the label permanently.
+Verified end to end: `get_arrow_schema` (`vertex.rs:210`) never consults the
+on-disk dataset; the `AddProperty` arm (`api/schema.rs:178`) only declares; and
+`add_columns`/`alter_columns` appear **nowhere** in `uni-store`. Severity pinned
+precisely — **not** data loss: the rejection happens in the flush's stream
+phase, so `complete_flush` and `truncate_before` are skipped, the rotated buffer
+stays on `pending_flush` and the WAL keeps the durable copy. But it is
+*retained and never retried*, so L0 grows unboundedly while writes keep being
+accepted, and the automatic path downgrades it to `warn!("...(non-critical)")`.
+Reopen replays, then wedges again on the next flush.
+
+The existing repro is green because it **pins the broken behaviour**
+(`assert!(f.is_err())`). Green here confirms the defect.
+
+This needs a product decision first — support the migration or reject it at
+apply time. Rejecting is ~20 lines plus flipping 4 assertions and buys back
+availability today. `CLAUDE.md`'s fork caveat mislabels this primary-side bug as
+a fork limitation and should be corrected with the fix.
+
+**P1 — silent wrong answers.**
+
+**#216 (3VL half)** — `locy_eval.rs:116` returns `Bool` with no `has_null`
+tracking where `expr_eval.rs:276` returns `Null`. Observable through
+`NOT (x IN list)`, which negates the wrong `false` into a row that should have
+been excluded, and through `IN` in a projection. ~15 lines mirroring
+`eval_in_op`; no design call. **Write the repro against the `NOT ... IN` shape
+first** — the issue was filed from a source read and reachability is unproven.
+
+**P2 — the roots, in dependency order.**
+
+**#260** is the root of #237 and the selectivity half of #239.
+`estimate_costs(&self, _plan: &LogicalPlan)` (`planner.rs:9197`) has an
+underscore-prefixed parameter — it *cannot* consult the plan — and returns
+`estimated_rows: 100.0`. **Zero of the 58 files** in `query/df_graph/` override
+`ExecutionPlan::statistics()`, so DataFusion's own `LimitPushdown` is running
+blind on every graph node too. The counting is trivial; invalidation, L0
+inclusion, and fork/pinned-snapshot correctness are the work.
+
+**#261** is next in the memory chain now that #242 unblocked it. Only three
+files under `df_graph/` mention `MemoryConsumer` at all. **Measurement-led — do
+not size as 16 units.**
+
+Neither #261 nor #213 should be sequenced behind #260; both are independent.
+
+**P2 — instruments that cannot fail.** #179 first (it also restores a
+user-facing `PROFILE` number, ~half a day), then #259 (~1–2h, the fixture
+already determines every expected value), then batch #177 with a decision on
+#176. Note #179 does **not** block #177 today — guard 3 keeps the probe a leaf.
+
+**P3 — performance.** #222 leads on value-per-effort: 20% of IC5's `HAS_MEMBER`
+clause, and `edge_type_ids` is already in scope at the caller
+(`traverse.rs:1195`, used 5 lines later) — but sweep all four sites. Then #220's
+site 1 (`manager.rs:2787`, round-trips multiply data scale *by schema size*, and
+its batched primitives have **zero callers**) and site 8 (inside a fixpoint, so
+re-paid every iteration). Then #228, #225 (10-line option 1, still unmeasured),
+#213's spill gap.
+
+**#239 stays open but narrows**: `with_limit` has zero production callers and
+the pushdown is fully wired and permanently dead. `b70599649` did **not** touch
+it — that was a DataFusion-level `SortExec` fetch. A probe harness already
+exists at `crates/uni/examples/limit_pushdown_probe.rs` with no recorded run.
+**Run it before building anything.**
+
+**P4 — hygiene.** #227, #200 (fix the retained-cause gap, not the message),
+#174.
+
+**P5 — features.** #195 is the best value here — one bench wiring existing
+pieces, and `docs/fixtures.md` already records a recall bench reporting 1.000
+while its index never ran, which is exactly what these counters catch. Then
+#122's *defect* half. #118/#120/#123 stay parked; #118's gate needs a
+real-corpus run that needs a bulk-ingest path first.
+
+### Two things this ordering deliberately does not do
+
+It does not put #260 ahead of everything in P2/P3 on the grounds of being "the
+root". Only #237 and half of #239 actually consume it; sequencing #261, #213 or
+#222 behind it would stall measurable work behind a medium-large design task.
+
+It does not treat the 8 sites of #220 as 8 tickets. Sites 1 and 8 carry nearly
+all the cost; sites 6 and 7 are rare or trivial.
+
+### Board hygiene
+
+**15 of 31 issues carry neither `bug` nor `enhancement`**: #261 #260 #259 #242
+#241 #239 #237 #228 #227 #226 #223 #222 #220 #205 #174. Worth labelling in the
+same pass as the closes.
+
+#118–#123 have had **zero activity since 26 June** — 2.5 months, no comments.
+They are a dormant backlog, and carrying them unmarked inflates every count
+this document has tried to correct.
+
+### What this round is evidence for
+
+The delivery state, not the code, was the largest single distortion. Six issues
+were done and the tracker could not know it, because `Refs` was used where
+`Closes` was meant and because the work sits on a fork branch behind an
+unmerged PR with an empty body. **An issue tracker reads from `origin`; work
+that has not landed there is indistinguishable from work never started.**
+
+And the trailer convention is load-bearing in a way that is easy to miss:
+`Refs #241` was *honest at the time it was written* — the commit did not finish
+#241 — but nothing revisited it when a later commit did. The mechanism that
+would catch this is the PR body, which is empty.
+
+---
+
+## Status — 2026-09-08, later: #249 implemented, and PR #262 measured
+
+Two things changed since the re-triage above: the board's only P0 is fixed, and
+PR #262 — which carries the `Fixes` keywords for #205/#214/#223 — finished CI
+and is **red on one gate**, for a reason unrelated to #249.
+
+### #249 is done (uncommitted)
+
+The decision taken was to **support** the operation rather than reject it, on
+the reasoning that only nullable columns can be added and Lance can add one as
+a metadata change. That held, and the fix is larger than "call `add_columns`"
+for reasons the implementation surfaced rather than the plan predicted.
+
+Five phases, ~1,800 lines across 17 files, new file
+`crates/uni-store/src/storage/schema_evolution.rs`:
+
+| phase | what |
+|---|---|
+| 0 | Three spikes (`lance_branch.rs::phase249_spike_*`) against the assumptions that would have forced a redesign |
+| 1 | `StorageBackend::evolve_table_schema` + `ForkBranching::evolve_branch_schema` — `add_columns(NewColumnTransform::AllNulls)` / `alter_columns`, under the per-table write lock, inside `retry_on_lance_conflict` |
+| 2 | Write-path reconcile in the two shared helpers in `storage/manager.rs` — covers primary, forks, the branch-creation race, and fork-local overlays in one place |
+| 3 | Overflow backfill: promotes a property's pre-declaration schemaless values into its typed column, typed-wins, key stripped from the blob |
+| 4 | Eager DDL hook on **both** entry points — `api/schema.rs` and Cypher `ALTER` via `execute_alter_entity` — storage before catalog, with fork propagation |
+| 5 | Black book, `website/docs/guides/schema-design.md`, and the `AGENTS.md` fork invariant this work disproved |
+
+Gates: **4907/4907** across `uni-db`, `uni-store`, `uni-query`,
+`uni-query-functions`, `uni-fork`, `uni-bulk`, `uni-common`; **3925/3925**
+openCypher TCK (schemaless); `fmt`, `clippy`, and `cargo doc -D warnings` clean.
+
+### Five claims that did not survive contact, two of them from this document
+
+Recorded because the pattern is now this document's most reliable finding: an
+audit's tiering is a hypothesis, and it is wrong in both directions.
+
+1. **Lance matches appended batches BY NAME**, not position
+   (`ignore_field_order: true`, `lance-7.0.0/src/dataset/write.rs:855`). The
+   alphabetical sort in `get_arrow_schema` was ranked as the blocking hazard
+   during planning; it is irrelevant and needed no change.
+2. **`DROP PROPERTY` wedges too.** The compatibility check is
+   `allow_missing_if_nullable && expected_field.nullable`, where *expected is
+   the dataset schema* (`lance-core-7.0.0/src/datatypes/schema.rs:883`) — and
+   `SchemaBuilder::property` defaults to `NOT NULL`, so the original
+   `create_table` wrote a non-nullable field. Dropping it yields the mirror
+   failure `missing=[p], unexpected=[]`. This was asserted to be safe earlier
+   in the session, from reading the option name without its conjunct.
+3. **A write-path reconcile does not cover reads.** A design review argued it
+   subsumed fork propagation entirely and that the propagation pass should be
+   deleted. A test disproved it: the fork's *write* self-repairs, its *read*
+   dies in `scanner.project` with `No field named extra`. Both mechanisms are
+   required, for different reasons.
+4. **Widening without a backfill converts the bug into a silent wrong answer.**
+   Measured, not predicted: after declaring a property that already had
+   schemaless data, `RETURN n.tag` answered `NULL` while
+   `RETURN properties(n)` still answered `"gold"` — `columnar_scan.rs:2050` is
+   strict, `:228` coalesces through the blob. Shipping phase 2 alone would have
+   traded #249's loud failure for a quiet one.
+5. **`LanceDbBackend::invalidate_cache` is a documented no-op**
+   (`backend/lance.rs:749`), so the schema cache had to be purged directly —
+   and its "Lance schemas are stable for the table's lifetime … we never alter
+   columns in place" invariant is now false and has been rewritten.
+
+Also settled by spike rather than argument: a **stale** Lance handle returns
+`RetryableCommitConflict`, so the widening reopens the dataset *inside* the
+lock and retries (`is_lance_conflict` already classifies that variant, so the
+existing helper covers it); and `add_columns` on a branch preserves rows
+inherited through `base_paths` — 3 inherited + 2 branch-local survive, and main
+does not gain the column.
+
+### PR #262: 10 of 11 gates green, one real regression
+
+`Fixes #205`, `Fixes #214`, `Fixes #223` are in the commits and will fire on
+merge. The PR body is still **empty**, so **#241 and #242 — both finished —
+will not close**. Add `Closes #241` / `Closes #242` before merging.
+
+The red gate is `openCypher TCK (schemaless)`:
+
+```
+FAIL clauses::return-skip-limit::ReturnSkipLimit2::[5]
+     ORDER BY with LIMIT 0 should not generate errors
+```
+
+Reproduced locally and root-caused: `b70599649 perf(query): push a limit's
+fetch into the sort beneath it` pushes `fetch = Some(0)` for `LIMIT 0`, and a
+`SortExec` with a zero fetch builds a `TopK` with `k = 0`, which DataFusion
+asserts against (`datafusion-physical-plan-53.1.0/src/topk/mod.rs:678`,
+`assert!(k > 0)`). The query panics instead of returning an empty result.
+Fixed with a `limit == 0` guard in `push_fetch_into_sort`; the surrounding
+`LocalLimitExec` already yields nothing for a zero limit, so nothing is lost.
+Uncommitted, alongside the #249 work.
+
+Worth recording about the gate rather than the bug: the CI run **fail-fasted at
+767 of 3925 tests**, so it established that *something* was broken and nothing
+about how much. Running the suite with `--no-fail-fast` locally was what showed
+the answer is exactly one — and, separately, that the #249 changes leave the
+schemaless suite whole.
+
+### Board count, again
+
+31 open at the start of the day. Unchanged by this work in the tracker, because
+none of it has landed on `origin`. On merge of #262 plus this work:
+
+- **auto-close**: #205, #214, #223 (keywords present)
+- **needs a keyword added to #262's body**: #241, #242
+- **closeable on its own merge**: #249
+- **closeable with no work at all**: #178 (implemented by unrelated work);
+  #119 recommended as won't-do-yet
+
+That is 31 → 23, of which one is a code change made today.
+
+### Recommended next
+
+1. Add the two `Closes` keywords to #262, merge it, and land the `LIMIT 0`
+   guard — it is a panic on a legal query and it is currently the only thing
+   keeping that PR red.
+2. #249's work as its own commit.
+3. Then the P2 roots as ordered above: #260 → #237, and #261 measurement-led.

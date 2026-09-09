@@ -2253,3 +2253,77 @@ So the rule generalises past profiling:
 answers. Next is **#214 with #240**, still one change and still the single
 fact behind #202's unspillable sort; then **#239**; then **#224** and the rest
 of Tier 4.
+
+---
+
+## Status — 2026-09-08: #249 closed, and what its scoping note got right
+
+This document filed #249 "on the way" (2026-09-04) and then, on 2026-09-05,
+corrected itself:
+
+> **#249 should be scoped rather than queued.** … `add_columns` /
+> `alter_columns` / `NewColumnTransform` return **zero hits** across
+> `crates/uni-store/src`: there is no add-column path at all … That is a design
+> gap sized like #224, not a defect sized like #253. Loudness is detectability,
+> not severity, and the tiering in use has no row for it.
+
+Both halves held up, and the second one is the more useful.
+
+**The "zero hits" observation was the whole diagnosis.** It is not that the
+add-column path was broken; there was none, in either direction — no
+`add_columns`, no `alter_columns`, and no reconciliation between the declared
+catalog and the stored Arrow schema on any write path. The fix had to add the
+primitive before it could add the behaviour.
+
+**"Loudness is detectability, not severity" was right, and understated the
+severity twice over.** Measured while implementing:
+
+- The failure is *not* only "unwritable until the property is removed". The
+  rejection happens in the flush's **stream** phase, so `complete_flush` and
+  `truncate_before` never run: the rotated L0 stays on `pending_flush` and
+  **nothing re-flushes it** (`flush_coordinator.rs:578`). L0 then grows without
+  bound while writes keep returning `Ok`. No data is lost — the WAL holds the
+  durable copy and a reopen replays it — but the label re-wedges on the next
+  flush.
+- The loudness is conditional. An explicit `flush()` or `shutdown()` does
+  error, but the **automatic** path, which is the one that runs in production
+  on the 5s `auto_flush_interval`, downgrades it to
+  `warn!("Post-commit flush check failed (non-critical)")` (`writer.rs:1711`).
+  A permanently wedged label, annotated *non-critical*.
+
+**Fixed 2026-09-08, uncommitted.** Design, corrections, and gates are recorded
+in `issue_triage_2026-09-03.md` (status of the same date) rather than
+duplicated here. The one point that belongs in *this* document, because it is
+the same lesson it keeps re-learning: the existing repro
+(`repro_issue_249_add_property_to_existing_label.rs`) was **green throughout**,
+because it pinned the broken behaviour by design — `assert!(f.is_err(), "(c)
+but its flush is rejected")`. A green test meant the defect was still present.
+That is the deliberate, documented form of the vacuous-test problem this
+document has chased in its accidental form, and it worked exactly as intended:
+the fix turned all four tests red, which is what proved the fix was real before
+a single assertion was rewritten.
+
+### One regression found in this document's own work
+
+The `LIMIT` pushdown from the current unpushed run —
+`b70599649 perf(query): push a limit's fetch into the sort beneath it` — makes
+`ORDER BY … LIMIT 0` **panic**. A `SortExec` with `fetch = Some(0)` builds a
+`TopK` with `k = 0`, and DataFusion asserts `k > 0`
+(`datafusion-physical-plan-53.1.0/src/topk/mod.rs:678`). Caught by
+`openCypher TCK (schemaless)` on PR #262 — the only red gate of eleven — and
+fixed with a `limit == 0` guard in `push_fetch_into_sort`.
+
+Worth carrying, because it is a variant of this document's recurring theme.
+That commit's message records that the pushdown was *re-measured* after #202,
+#214 and #241 bounded the input batches, and that IC2's `TopK` now needs 3.7 MB
+rather than 977 MB. All of that is true, and none of it touches the failing
+case: **the measurement was of the shape the optimization was for, and the bug
+is in the shape it was not.** A benchmark cannot find a degenerate input it
+never runs; only the conformance suite did.
+
+And the gate reported less than it appeared to. The CI run **fail-fasted at 767
+of 3925 tests**, which establishes that something broke and nothing about how
+much. Re-running locally with `--no-fail-fast` gave the actual answer — exactly
+one failure — and simultaneously showed the #249 changes leave the schemaless
+suite intact (3925/3925). *A failing gate's count is not a finding until the
+gate has been allowed to finish.*

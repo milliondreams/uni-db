@@ -3,6 +3,7 @@
 
 use crate::backend::types::{FilterExpr, Scalar};
 use crate::runtime::context::QueryContext;
+use crate::runtime::counters::QueryCounters;
 use crate::runtime::l0::L0Buffer;
 use crate::runtime::l0_visibility;
 use crate::storage::main_vertex::MainVertexDataset;
@@ -22,6 +23,17 @@ use uni_common::Value;
 use uni_common::core::id::{Eid, Vid};
 use uni_common::core::schema::{DataType, SchemaManager};
 use uni_crdt::Crdt;
+
+/// The query's counters, if this read belongs to a query.
+///
+/// A [`QueryContext`] already carries them; the storage-fallback helpers below
+/// simply used to drop them on the floor, which is what made main-table
+/// property reads invisible to `scans_reported`. `None` here is correct only
+/// for reads issued outside a query — write-side uniqueness probes, recovery,
+/// compaction — never for a read on a query's behalf.
+fn counters_of(ctx: Option<&QueryContext>) -> Option<&Arc<QueryCounters>> {
+    ctx.and_then(|c| c.counters.as_ref())
+}
 
 pub struct PropertyManager {
     storage: Arc<StorageManager>,
@@ -200,7 +212,7 @@ impl PropertyManager {
         let mut final_props = l0_visibility::accumulate_edge_props(eid, ctx).unwrap_or_default();
 
         // 3. Fetch from storage runs
-        let storage_props = self.fetch_all_edge_props_from_storage(eid).await?;
+        let storage_props = self.fetch_all_edge_props_from_storage(eid, ctx).await?;
 
         // 4. Handle case where edge exists but has no properties
         if final_props.is_empty() && storage_props.is_none() {
@@ -220,9 +232,13 @@ impl PropertyManager {
         Ok(Some(final_props))
     }
 
-    async fn fetch_all_edge_props_from_storage(&self, eid: Eid) -> Result<Option<Properties>> {
+    async fn fetch_all_edge_props_from_storage(
+        &self,
+        eid: Eid,
+        ctx: Option<&QueryContext>,
+    ) -> Result<Option<Properties>> {
         // In the new design, we scan all edge types since EID doesn't embed type info
-        self.fetch_all_edge_props_from_storage_with_hint(eid, None)
+        self.fetch_all_edge_props_from_storage_with_hint(eid, None, ctx)
             .await
     }
 
@@ -230,6 +246,7 @@ impl PropertyManager {
         &self,
         eid: Eid,
         type_name_hint: Option<&str>,
+        ctx: Option<&QueryContext>,
     ) -> Result<Option<Properties>> {
         let schema = self.schema_manager.schema();
         let backend = self.storage.backend();
@@ -264,7 +281,11 @@ impl PropertyManager {
             let filter_expr = self.storage.apply_version_filter(base_filter);
 
             let batches = match backend
-                .scan(ScanRequest::all(&table_name).with_filter(filter_expr))
+                .scan(
+                    ScanRequest::all(&table_name)
+                        .with_filter(filter_expr)
+                        .with_counters(counters_of(ctx).cloned()),
+                )
                 .await
             {
                 Ok(b) => b,
@@ -374,10 +395,11 @@ impl PropertyManager {
         // was built over pinned storage (today: `UniInner::at_snapshot`), so
         // for a read-write transaction both tiers read at HEAD by design.
         use crate::storage::main_edge::MainEdgeDataset;
-        if let Some(props) = MainEdgeDataset::find_props_by_eid(
+        if let Some(props) = MainEdgeDataset::find_props_by_eid_counted(
             self.storage.backend(),
             eid,
             self.storage.version_high_water_mark(),
+            counters_of(ctx),
         )
         .await?
         {
@@ -444,6 +466,8 @@ impl PropertyManager {
         ]);
         let filter_expr = self.storage.apply_version_filter(base_filter);
 
+        // No counters: this is the write-side uniqueness probe, not a read on a
+        // query's behalf, so it has no result to attribute the scan to.
         let batches = backend
             .scan(ScanRequest::all(&table_name).with_filter(filter_expr))
             .await?;
@@ -470,7 +494,8 @@ impl PropertyManager {
                 continue;
             }
             let Some(props) = self
-                .fetch_all_edge_props_from_storage_with_hint(Eid::new(raw), Some(edge_type))
+                // `None` counters for the same reason as the scan above.
+                .fetch_all_edge_props_from_storage_with_hint(Eid::new(raw), Some(edge_type), None)
                 .await?
             else {
                 continue; // deleted / not live
@@ -582,7 +607,8 @@ impl PropertyManager {
             use crate::backend::types::ScanRequest;
             let request = ScanRequest::all(&vtable_name)
                 .with_filter(final_filter)
-                .with_columns(columns);
+                .with_columns(columns)
+                .with_counters(counters_of(ctx).cloned());
 
             let batches: Vec<RecordBatch> = match backend.scan(request).await {
                 Ok(b) => b,
@@ -860,7 +886,8 @@ impl PropertyManager {
             use crate::backend::types::ScanRequest;
             let request = ScanRequest::all(&dtable_name)
                 .with_filter(final_filter)
-                .with_columns(columns);
+                .with_columns(columns)
+                .with_counters(counters_of(ctx).cloned());
 
             let batches: Vec<RecordBatch> = match backend.scan(request).await {
                 Ok(b) => b,
@@ -1000,10 +1027,11 @@ impl PropertyManager {
             }
 
             if !unresolved.is_empty() {
-                let fetched = MainEdgeDataset::find_props_by_eids(
+                let fetched = MainEdgeDataset::find_props_by_eids_counted(
                     self.storage.backend(),
                     &unresolved,
                     self.storage.version_high_water_mark(),
+                    counters_of(ctx),
                 )
                 .await?;
                 for (eid, props) in fetched {
@@ -1202,7 +1230,7 @@ impl PropertyManager {
         let l0_props = l0_visibility::accumulate_vertex_props(vid, ctx);
 
         // 3. Fetch from storage
-        let storage_props_opt = self.fetch_all_props_from_storage(vid).await?;
+        let storage_props_opt = self.fetch_all_props_from_storage(vid, ctx).await?;
 
         // 4. Handle case where vertex doesn't exist in either layer
         if l0_props.is_none() && storage_props_opt.is_none() {
@@ -1355,7 +1383,8 @@ impl PropertyManager {
             .scan(
                 crate::backend::types::ScanRequest::all(&table_name)
                     .with_filter(filter_expr.clone())
-                    .with_columns(columns.clone()),
+                    .with_columns(columns.clone())
+                    .with_counters(counters_of(ctx).cloned()),
             )
             .await?;
 
@@ -1563,7 +1592,11 @@ impl PropertyManager {
         let filter_expr = self.storage.apply_version_filter(base_filter);
 
         let batches = match backend
-            .scan(ScanRequest::all(&table_name).with_filter(filter_expr))
+            .scan(
+                ScanRequest::all(&table_name)
+                    .with_filter(filter_expr)
+                    .with_counters(counters_of(ctx).cloned()),
+            )
             .await
         {
             Ok(b) => b,
@@ -1707,10 +1740,11 @@ impl PropertyManager {
         }
 
         if !unresolved.is_empty() {
-            let fetched = MainEdgeDataset::find_props_by_eids(
+            let fetched = MainEdgeDataset::find_props_by_eids_counted(
                 self.storage.backend(),
                 &unresolved,
                 self.storage.version_high_water_mark(),
+                counters_of(ctx),
             )
             .await?;
             for (eid, props) in fetched {
@@ -1913,7 +1947,11 @@ impl PropertyManager {
         Ok(())
     }
 
-    async fn fetch_all_props_from_storage(&self, vid: Vid) -> Result<Option<Properties>> {
+    async fn fetch_all_props_from_storage(
+        &self,
+        vid: Vid,
+        ctx: Option<&QueryContext>,
+    ) -> Result<Option<Properties>> {
         // In the new storage model, VID doesn't embed label info.
         // We need to scan all label datasets to find the vertex's properties.
         let schema = self.schema_manager.schema();
@@ -1955,7 +1993,8 @@ impl PropertyManager {
                 .scan(
                     crate::backend::types::ScanRequest::all(&table_name)
                         .with_filter(filter_expr.clone())
-                        .with_columns(columns.clone()),
+                        .with_columns(columns.clone())
+                        .with_counters(counters_of(ctx).cloned()),
                 )
                 .await
             {
@@ -2021,10 +2060,11 @@ impl PropertyManager {
         // an older main-table row.
         if merged_props.is_none()
             && global_best_version.is_none()
-            && let Some(main_props) = MainVertexDataset::find_props_by_vid(
+            && let Some(main_props) = MainVertexDataset::find_props_by_vid_counted(
                 self.storage.backend(),
                 vid,
                 self.storage.version_high_water_mark(),
+                counters_of(ctx),
             )
             .await?
         {
@@ -2081,7 +2121,7 @@ impl PropertyManager {
         if is_crdt {
             // For CRDT, accumulate and merge values from all L0 layers
             let l0_val = self.accumulate_crdt_from_l0(vid, prop, ctx)?;
-            return self.finalize_crdt_lookup(vid, prop, l0_val).await;
+            return self.finalize_crdt_lookup(vid, prop, l0_val, ctx).await;
         }
 
         // 4. Non-CRDT: Check L0 chain for property (returns first found)
@@ -2104,7 +2144,7 @@ impl PropertyManager {
         }
 
         // 6. Fetch from Storage
-        let storage_val = self.fetch_prop_from_storage(vid, prop).await?;
+        let storage_val = self.fetch_prop_from_storage(vid, prop, ctx).await?;
 
         // 7. Update Cache (if enabled)
         if let Some(ref cache) = self.vertex_cache {
@@ -2151,7 +2191,13 @@ impl PropertyManager {
     }
 
     /// Finalize CRDT lookup by merging with cache/storage.
-    async fn finalize_crdt_lookup(&self, vid: Vid, prop: &str, l0_val: Value) -> Result<Value> {
+    async fn finalize_crdt_lookup(
+        &self,
+        vid: Vid,
+        prop: &str,
+        l0_val: Value,
+        ctx: Option<&QueryContext>,
+    ) -> Result<Value> {
         // Check Cache (if enabled)
         let cached_val = if let Some(ref cache) = self.vertex_cache {
             let mut cache = cache.lock().await;
@@ -2166,7 +2212,7 @@ impl PropertyManager {
         }
 
         // Fetch from Storage
-        let storage_val = self.fetch_prop_from_storage(vid, prop).await?;
+        let storage_val = self.fetch_prop_from_storage(vid, prop, ctx).await?;
 
         // Update Cache (if enabled)
         if let Some(ref cache) = self.vertex_cache {
@@ -2178,7 +2224,12 @@ impl PropertyManager {
         self.merge_crdt_values(&storage_val, &l0_val)
     }
 
-    async fn fetch_prop_from_storage(&self, vid: Vid, prop: &str) -> Result<Value> {
+    async fn fetch_prop_from_storage(
+        &self,
+        vid: Vid,
+        prop: &str,
+        ctx: Option<&QueryContext>,
+    ) -> Result<Value> {
         // In the new storage model, VID doesn't embed label info.
         // We need to scan all label datasets to find the property.
         let schema = self.schema_manager.schema();
@@ -2226,7 +2277,8 @@ impl PropertyManager {
                 .scan(
                     crate::backend::types::ScanRequest::all(&table_name)
                         .with_filter(filter_expr.clone())
-                        .with_columns(columns),
+                        .with_columns(columns)
+                        .with_counters(counters_of(ctx).cloned()),
                 )
                 .await
             {
@@ -2311,10 +2363,11 @@ impl PropertyManager {
         // tombstone is never overridden by an older main-table row.
         if best_value.is_none()
             && best_version.is_none()
-            && let Some(main_props) = MainVertexDataset::find_props_by_vid(
+            && let Some(main_props) = MainVertexDataset::find_props_by_vid_counted(
                 self.storage.backend(),
                 vid,
                 self.storage.version_high_water_mark(),
+                counters_of(ctx),
             )
             .await?
         {

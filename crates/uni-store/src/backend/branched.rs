@@ -393,6 +393,34 @@ impl StorageBackend for BranchedBackend {
         )
     }
 
+    async fn evolve_table_schema(
+        &self,
+        table_name: &str,
+        add: &[arrow_schema::Field],
+        relax_nullable: &[String],
+    ) -> Result<()> {
+        if add.is_empty() && relax_nullable.is_empty() {
+            return Ok(());
+        }
+        // A branch is a shallow clone with its own manifest and its own copy
+        // of the schema, so widening the trunk does not reach it — and both
+        // scan paths project an explicit column list, which hard-errors on a
+        // column the branch has never seen. Widen the branch itself.
+        //
+        // When the fork has no branch for this table yet, `ensure_branch_for_existing`
+        // cuts one from primary's *current* version, which already carries any
+        // widening primary has had. When primary has no dataset either, there
+        // is nothing to widen: the first write materializes it from the full
+        // declared schema via `ensure_branch_for_new`.
+        let branch = match self.ensure_branch_for_existing(table_name).await {
+            Ok(b) => b,
+            Err(_) => return Ok(()),
+        };
+        self.branching()?
+            .evolve_branch_schema(table_name, &branch, add, relax_nullable)
+            .await
+    }
+
     async fn write(
         &self,
         table_name: &str,

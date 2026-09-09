@@ -299,9 +299,15 @@ async fn an_uncorrelated_comprehension_is_evaluated_once() {
 #[tokio::test]
 async fn a_correlated_comprehension_runs_once_per_row_by_necessity() {
     let db = fixture().await;
+    // The predicate is `<`, not `>`, and that is load-bearing. The only matching
+    // pair is (a)-[:KNOWS]->(b) with `a.name = 'a'`, which is not greater than
+    // any name in the fixture -- so under `>` every row's list came back empty
+    // and a comprehension wrongly hoisted to one evaluation produced the same
+    // all-empty answer. The metric caught that; the values could not. Under `<`
+    // the rows genuinely differ, so both observables have teeth (#205).
     let r = db
         .session()
-        .query("MATCH (n:P) RETURN [(a:P)-[:KNOWS]->(b:P) WHERE a.name > n.name | a.name] AS l")
+        .query("MATCH (n:P) RETURN n.name AS who, [(a:P)-[:KNOWS]->(b:P) WHERE a.name < n.name | a.name] AS l")
         .await
         .unwrap();
     assert_eq!(
@@ -309,6 +315,20 @@ async fn a_correlated_comprehension_runs_once_per_row_by_necessity() {
         r.rows().len() as u64,
         "a correlated comprehension must keep its per-row execution"
     );
+    for row in r.rows() {
+        let who: String = row.get("who").unwrap();
+        let want = if who == "a" {
+            // 'a' < 'a' is false.
+            vec![]
+        } else {
+            vec![Value::String("a".into())]
+        };
+        assert_eq!(
+            as_list(row.value("l").unwrap()),
+            want,
+            "row {who}: a hoisted comprehension would broadcast one row's answer"
+        );
+    }
 }
 
 /// A binding form in the body does not by itself make a comprehension correlated.
@@ -348,6 +368,15 @@ async fn a_list_comprehension_over_its_own_binding_is_still_uncorrelated() {
         .await
         .unwrap();
     assert_eq!(r.metrics().subquery_executions, 1);
+    // The execution count says the comprehension was evaluated once; only the
+    // value says its body ran at all. One matching pair yields one element,
+    // itself the inner list `[2, 3]` (#205).
+    for row in r.rows() {
+        assert_eq!(
+            as_list(row.value("l").unwrap()),
+            vec![Value::List(vec![Value::Int(2), Value::Int(3)])]
+        );
+    }
 }
 
 /// The safety case: a binding form whose body *does* reach the outer row.
@@ -375,6 +404,13 @@ async fn a_reduce_that_reads_the_outer_row_stays_correlated() {
         rows as u64,
         "a body that reads the outer row must keep its per-row execution"
     );
+    // Every fixture name is one character, so `size(n.name)` is 1 for every
+    // row and the value cannot separate correlated from hoisted here -- the
+    // metric above is what does that. It still separates "the body ran" from
+    // "the pattern matched nothing", which an empty list would signal (#205).
+    for row in r.rows() {
+        assert_eq!(as_list(row.value("l").unwrap()), vec![Value::Int(1)]);
+    }
 }
 
 /// A subquery in the body is still declined.
@@ -398,4 +434,13 @@ async fn a_subquery_in_the_body_still_takes_the_per_row_path() {
         r.rows().len() as u64,
         "a body containing a subquery must not be hoisted on a guess"
     );
+    // The `EXISTS` holds, so the one matching pair contributes `a.name`. An
+    // empty list here would mean the decline was measured on a comprehension
+    // that never produced anything (#205).
+    for row in r.rows() {
+        assert_eq!(
+            as_list(row.value("l").unwrap()),
+            vec![Value::String("a".into())]
+        );
+    }
 }

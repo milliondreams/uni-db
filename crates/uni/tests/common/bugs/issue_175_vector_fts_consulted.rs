@@ -265,14 +265,41 @@ async fn the_vector_counter_is_not_a_constant() {
 
 /// `index_scans` counts scalar `ScanRequest` scans and must stay out of this.
 /// Folding ANN into it would silently change every existing assertion about it.
+///
+/// Asserted as a **difference** rather than as `index_scans == 0`, and the
+/// reason matters. The `RETURN node.tag` projection above fetches properties for
+/// the hits through `get_batch_vertex_props_for_label_projected`, which is a
+/// genuine scalar `ScanRequest` against the `Doc` table and does consult the
+/// vertex table's index. That scan always happened; until #223 threaded the
+/// query's counters through `PropertyManager` it was simply invisible, and the
+/// old `== 0` form was reading that blind spot rather than the property it
+/// meant to check.
+///
+/// The comparison keeps the original intent intact and sharpens it: the two
+/// runs execute the same query over the same data and differ only in whether a
+/// vector index exists, so the scalar count must be identical. ANN work leaking
+/// into `index_scans` shows up as the indexed run exceeding the flat one —
+/// which `== 0` could only have caught while the property scan stayed unseen.
 #[tokio::test]
 async fn a_vector_search_does_not_move_the_scalar_counter() {
-    let db = fixture(Some(ivf()), false).await;
-    let m = vector_query(&db, None).await.metrics().clone();
-    assert!(m.vector_index_scans >= 1);
+    let with = fixture(Some(ivf()), false).await;
+    let without = fixture(None, false).await;
+    let m = vector_query(&with, None).await.metrics().clone();
+    let flat = vector_query(&without, None).await.metrics().clone();
+
+    assert!(
+        m.vector_index_scans >= 1,
+        "the indexed run ran no ANN search"
+    );
     assert_eq!(
-        m.index_scans, 0,
-        "a vector search moved the scalar-scan counter"
+        flat.vector_index_scans, 0,
+        "the control run consulted a vector index it does not have"
+    );
+    assert_eq!(
+        m.index_scans, flat.index_scans,
+        "adding a vector index changed the scalar-scan counter ({} with the \
+         index, {} without), so ANN work is landing in `index_scans`",
+        m.index_scans, flat.index_scans
     );
 }
 

@@ -861,6 +861,7 @@ impl ProjectionBuilder {
                     output_schema: &out_schema,
                     target_vid: None,
                     vid_list_filter: Some(&raw_vids),
+                    vid_range: None,
                     extra_lance_filter: None,
                 },
                 None,

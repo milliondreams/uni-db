@@ -121,12 +121,34 @@ from each phase for deeper context.
   Vertices happen to be visible without flush in practice but
   edges may not be from a now-dropped earlier session — relying on
   the asymmetry would silently miss promotion targets.
-- **Schema growth on primary is safe; per-fork property additions
-  are not.** Adding a new label or edge type on primary does not
-  break existing forks. Adding a property column to an existing
-  primary label *would* either leak to primary or break branch
-  read-merge — not supported. Drop and recreate the fork after
-  evolving primary if you need the new column.
+- **Schema growth on primary is safe, including property
+  additions.** Adding a new label or edge type on primary does not
+  break existing forks. Adding a *property* to an existing primary
+  label is supported as of issue #249: the DDL widens primary's
+  Lance dataset with `add_columns(NewColumnTransform::AllNulls)`
+  — metadata-only, no data rewrite — and then widens every live
+  fork branch, because a branch is a shallow clone carrying its own
+  schema copy and a read through one that lacks the column fails
+  with `No field named …` from Lance's projection. Dropping and
+  recreating the fork is no longer required.
+  (The previous note here said such an add would "leak to primary or
+  break branch read-merge". The outcome was real but the mechanism
+  named was wrong — the failure is *projection*, not read-merge —
+  and it was a primary-side bug, not a fork limitation: primary
+  wedged too.)
+- **A `NOT NULL` property declared on a populated label is recorded
+  as nullable**, with a `warn!`. Pre-existing rows have no value for
+  it and cannot satisfy the constraint; `SchemaBuilder::property`
+  defaults to `NOT NULL`, so rejecting would break the most common
+  builder call. `NOT NULL` is still enforced forward, at write time.
+- **Every catalog change that alters a label's property set must
+  widen storage before `SchemaManager::save`.** Storage first,
+  catalog second: a Lance column the catalog does not know about is
+  invisible and harmless, while a catalog column Lance lacks is a
+  hard read failure — and there is no WAL record for schema DDL, so
+  ordering is the only recovery lever. This is deliberately the
+  opposite of the index path's order, which is how an index can end
+  up recorded `Online` with no artifact on disk.
 - **Fork-local index files live under the fork's branch.** Drop
   and `drop_fork_cascade` clean them up automatically — never
   special-case index file deletion in the fork drop path.

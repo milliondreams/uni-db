@@ -61,3 +61,7 @@ pub mod repro_schemaless_edge_props_escape_pin;
 
 // Tier 1.2 — shadow-CSR retention grew unbounded in the number of warms.
 pub mod repro_shadow_csr_warm_retention;
+
+// #223 — main-edge scans reach `scans_reported`, so a per-edge loop can be told
+// from a batched read by count rather than by wall-clock.
+pub mod issue_223_main_edge_scan_shape;

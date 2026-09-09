@@ -1,6 +1,7 @@
 pub mod ast;
 mod grammar;
 pub mod locy_ast;
+pub mod pattern_requirements;
 pub mod plugin_aggregates;
 
 pub use grammar::{ParseError, parse, parse_expression, parse_locy};

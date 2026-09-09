@@ -56,9 +56,12 @@ pub struct LanceDbBackend {
     existence_cache: DashMap<String, bool>,
     /// Schema cache populated lazily by [`Self::get_table_schema`].
     ///
-    /// Lance schemas are stable for the table's lifetime under our usage
-    /// (we never alter columns in place — schema-evolving migrations would
-    /// drop/recreate the table). Caching avoids the per-query
+    /// Lance schemas change only by *widening* — [`StorageBackend::evolve_table_schema`]
+    /// adds a nullable column or relaxes a `NOT NULL`, and purges this entry
+    /// while holding the table's write lock. Nothing else alters columns in
+    /// place. (Before #249 this said schemas were stable for the table's
+    /// lifetime; declaring a property on a populated label now widens it.)
+    /// Caching avoids the per-query
     /// dataset open + schema conversion for every Cypher query that
     /// scans a label or edge type. See issue #55.
     schema_cache: DashMap<String, Arc<ArrowSchema>>,
@@ -560,6 +563,117 @@ impl StorageBackend for LanceDbBackend {
             self.create_table(name, batches).await?;
         }
         Ok(())
+    }
+
+    async fn evolve_table_schema(
+        &self,
+        table_name: &str,
+        add: &[arrow_schema::Field],
+        relax_nullable: &[String],
+    ) -> Result<()> {
+        use lance::dataset::{ColumnAlteration, NewColumnTransform};
+
+        if add.is_empty() && relax_nullable.is_empty() {
+            return Ok(());
+        }
+        // Tables are materialized lazily (nothing calls `open_or_create` up
+        // front), so a declared-but-never-flushed label has no dataset yet.
+        // The first flush builds it from the full declared schema and needs no
+        // widening.
+        if !self.table_exists(table_name).await? {
+            return Ok(());
+        }
+
+        crate::storage::manager::retry_on_lance_conflict(|| async {
+            // Serialize against `write` / `merge_insert` / `create_table`,
+            // which take this same per-table mutex internally.
+            let _guard = self.lock_table_for_write(table_name).await;
+
+            // Reopen *inside* the lock. `add_columns` commits an
+            // `Operation::Merge` against the manifest version captured when
+            // the dataset was opened, so a handle obtained before the lock is
+            // already stale and loses to any append that landed in between.
+            // Verified: `phase249_spike_stale_handle_widening_conflicts` in
+            // `lance_branch.rs` shows a stale handle returning
+            // `RetryableCommitConflict`.
+            let mut dataset = self.directory.open(table_name).await?;
+            let current: Arc<ArrowSchema> = Arc::new(dataset.schema().into());
+
+            let mut missing: Vec<arrow_schema::Field> = Vec::new();
+            for field in add {
+                match current.fields().iter().find(|f| f.name() == field.name()) {
+                    // Idempotent: an already-wide table is a no-op, which is
+                    // what makes a crash between the widening and the catalog
+                    // write recoverable by simply re-running.
+                    Some(existing) if existing.data_type() == field.data_type() => {}
+                    Some(existing) => {
+                        anyhow::bail!(
+                            "cannot add column '{}' to '{}' as {:?}: it already exists as {:?}. \
+                             A property was re-declared with a different type; the stored column \
+                             must be dropped and the data migrated before the new type can be used.",
+                            field.name(),
+                            table_name,
+                            field.data_type(),
+                            existing.data_type()
+                        );
+                    }
+                    // Always nullable: `AllNulls` requires it (Lance rejects a
+                    // non-nullable all-null column outright), and every
+                    // pre-existing row has no value for the new column, so a
+                    // NOT NULL stored field would be a claim the data cannot
+                    // support.
+                    None => missing.push(field.clone().with_nullable(true)),
+                }
+            }
+
+            if !missing.is_empty() {
+                let added = Arc::new(ArrowSchema::new(missing.clone()));
+                dataset
+                    .add_columns(NewColumnTransform::AllNulls(added), None, None)
+                    .await
+                    .map_err(|e| {
+                        anyhow!(
+                            "Failed to add column(s) {:?} to '{}': {}",
+                            missing.iter().map(|f| f.name()).collect::<Vec<_>>(),
+                            table_name,
+                            e
+                        )
+                    })?;
+            }
+
+            // Relaxing NOT NULL -> nullable is the mirror of the add: Lance
+            // only tolerates a column *missing* from an appended batch when
+            // the stored field is nullable, so a dropped NOT NULL property
+            // wedges the table exactly as an added one does.
+            let alterations: Vec<ColumnAlteration> = relax_nullable
+                .iter()
+                .filter(|name| {
+                    current
+                        .fields()
+                        .iter()
+                        .any(|f| f.name() == *name && !f.is_nullable())
+                })
+                .map(|name| ColumnAlteration::new(name.clone()).set_nullable(true))
+                .collect();
+            if !alterations.is_empty() {
+                dataset.alter_columns(&alterations).await.map_err(|e| {
+                    anyhow!(
+                        "Failed to relax nullability on '{}' for {:?}: {}",
+                        table_name,
+                        relax_nullable,
+                        e
+                    )
+                })?;
+            }
+
+            // `invalidate_cache` is a documented no-op, so purge directly --
+            // and do it before releasing the lock, or a concurrent reader
+            // re-populates the pre-widen schema and the next append re-diffs
+            // against stale data.
+            self.schema_cache.remove(table_name);
+            Ok(())
+        })
+        .await
     }
 
     async fn lock_table_for_write(&self, name: &str) -> crate::backend::traits::TableWriteGuard {

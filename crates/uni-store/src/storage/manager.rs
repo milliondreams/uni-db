@@ -5,7 +5,9 @@ use crate::backend::StorageBackend;
 #[cfg(feature = "lance-backend")]
 use crate::backend::lance::LanceDbBackend;
 use crate::backend::table_names;
-use crate::backend::types::{FilterExpr, OptimizeReport, ScanRequest, VectorQueryOpts};
+use crate::backend::types::{
+    CmpOp, FilterExpr, OptimizeReport, Scalar, ScanRequest, VectorQueryOpts,
+};
 use crate::compaction::{CompactionStats, CompactionStatus, CompactionTask};
 use crate::runtime::WorkingGraph;
 use crate::runtime::context::QueryContext;
@@ -105,6 +107,17 @@ pub struct StorageManager {
     /// builds a separate combined manager out of band; Phase 1 forbids
     /// mixing.
     fork_scope: Option<Arc<crate::fork::ForkScope>>,
+    /// The database's fork registry, when one exists.
+    ///
+    /// Set after construction — the registry is built from the metadata store
+    /// only once recovery can run, which is well after the `StorageManager`
+    /// is wrapped in an `Arc`. Shared (not copied) across every derived
+    /// manager, so a fork-scoped or pinned view sees the same registry.
+    ///
+    /// Needed so a DDL path can enumerate live fork branches and widen them
+    /// alongside primary (issue #249): a branch carries its own schema copy,
+    /// and a read through one that lacks a declared column fails outright.
+    fork_registry: Arc<std::sync::OnceLock<Arc<crate::fork::ForkRegistryHandle>>>,
     /// Pluggable storage backend.
     backend: Arc<dyn StorageBackend>,
     /// In-memory VID-to-labels index for O(1) label lookups.
@@ -412,6 +425,18 @@ async fn merge_insert_batch_inner(
     // serialized against a compaction that holds that lock across its whole
     // scan → overwrite. Do NOT take `lock_table_for_write` here as well — that
     // would re-lock the same non-reentrant mutex and self-deadlock.
+    //
+    // The widening below takes that same lock, so it runs to completion
+    // *before* the retry loop rather than nested inside it. `Partial`: a merge
+    // source carries only the touched columns, so an absent column here says
+    // nothing about whether a property was dropped.
+    crate::storage::schema_evolution::ensure_table_accepts(
+        backend,
+        table_name,
+        batch.schema_ref(),
+        crate::storage::schema_evolution::BatchCoverage::Partial,
+    )
+    .await?;
     retry_on_lance_conflict(|| async {
         // Inside the retry, not hoisted: a concurrent flush may create the table
         // between attempts, and this way the retry still merges. A `table_exists`
@@ -458,6 +483,20 @@ pub async fn write_batch_with_lance_conflict_retry(
     batch: arrow_array::RecordBatch,
 ) -> anyhow::Result<()> {
     use crate::backend::types::WriteMode;
+    // Widen the stored schema first if this batch carries a column the table
+    // does not have, or omits a NOT NULL one it does (issue #249). A no-op on
+    // every write that is not the first after a property declaration, and it
+    // must run *before* the retry loop rather than inside it: the widening
+    // takes the same per-table write lock `write` does, and re-running it per
+    // attempt would buy nothing. This batch comes from `get_arrow_schema`, so
+    // it carries the full declared schema.
+    crate::storage::schema_evolution::ensure_table_accepts(
+        backend,
+        table_name,
+        batch.schema_ref(),
+        crate::storage::schema_evolution::BatchCoverage::Full,
+    )
+    .await?;
     retry_on_lance_conflict(|| async {
         let exists = backend.table_exists(table_name).await?;
         if exists {
@@ -576,6 +615,7 @@ impl StorageManager {
             pinned_version_hwm: None,
             pin_guard: None,
             fork_scope: None,
+            fork_registry: Arc::new(std::sync::OnceLock::new()),
             backend,
             vid_labels_index: Arc::new(parking_lot::RwLock::new(
                 crate::storage::vid_labels::VidLabelsIndex::new(),
@@ -746,6 +786,7 @@ impl StorageManager {
             pinned_version_hwm: None,
             pin_guard: None,
             fork_scope: self.fork_scope.clone(),
+            fork_registry: self.fork_registry.clone(),
             backend: self.backend.clone(),
             // Deep-copy, not Arc-clone: a fork/pin must get its OWN label index
             // so its flushes/relabels don't mutate the parent's (review H1/L2),
@@ -795,6 +836,7 @@ impl StorageManager {
             pinned_version_hwm: Some(hwm),
             pin_guard,
             fork_scope: self.fork_scope.clone(),
+            fork_registry: self.fork_registry.clone(),
             backend: self.backend.clone(),
             // Deep-copy, not Arc-clone: a fork/pin must get its OWN label index
             // so its flushes/relabels don't mutate the parent's (review H1/L2),
@@ -867,6 +909,7 @@ impl StorageManager {
             pinned_version_hwm: None,
             pin_guard: None,
             fork_scope: Some(scope),
+            fork_registry: self.fork_registry.clone(),
             backend: branched_backend,
             // Deep-copy, not Arc-clone: a fork/pin must get its OWN label index
             // so its flushes/relabels don't mutate the parent's (review H1/L2),
@@ -900,6 +943,163 @@ impl StorageManager {
     /// Borrow the active fork scope, if any.
     pub fn fork_scope(&self) -> Option<&Arc<crate::fork::ForkScope>> {
         self.fork_scope.as_ref()
+    }
+
+    /// Attach the database's fork registry. Idempotent; a second call with a
+    /// different handle is ignored rather than panicking, since the first
+    /// writer wins and every caller passes the same database's registry.
+    pub fn set_fork_registry(&self, registry: Arc<crate::fork::ForkRegistryHandle>) {
+        let _ = self.fork_registry.set(registry);
+    }
+
+    /// The fork registry, if one has been attached.
+    pub fn fork_registry(&self) -> Option<&Arc<crate::fork::ForkRegistryHandle>> {
+        self.fork_registry.get()
+    }
+
+    /// Tables whose Arrow schema is derived from `entity`'s declared
+    /// properties.
+    ///
+    /// A vertex label owns one table. An edge type owns *both* delta
+    /// directions: `PropertyManager` only ever updates through `fwd`, but
+    /// `bwd` carries the same property columns and its `get_arrow_schema`
+    /// would disagree with the stored table if it were skipped.
+    pub fn property_tables_for(&self, entity: &str) -> Vec<String> {
+        use crate::backend::table_names::{delta_table_name, vertex_table_name};
+        let schema = self.schema_manager().schema();
+        if schema.labels.contains_key(entity) {
+            vec![vertex_table_name(entity)]
+        } else if schema.edge_types.contains_key(entity) {
+            vec![
+                delta_table_name(entity, "fwd"),
+                delta_table_name(entity, "bwd"),
+            ]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Rows already materialized for `entity`, or 0 when nothing is on disk.
+    ///
+    /// Tables are created lazily, so "no table" and "no rows" are the same
+    /// answer: neither can violate a `NOT NULL` a caller is about to declare.
+    pub async fn materialized_row_count(&self, entity: &str) -> anyhow::Result<usize> {
+        let backend = self.backend();
+        let mut total = 0usize;
+        for table in self.property_tables_for(entity) {
+            if backend.table_exists(&table).await? {
+                total += backend.count_rows(&table, None).await?;
+            }
+        }
+        Ok(total)
+    }
+
+    /// Widen storage so newly declared properties on `entity` have a column
+    /// everywhere they will be written **or read** (issue #249).
+    ///
+    /// Call this *before* persisting the catalog. The asymmetry decides the
+    /// order: a Lance column absent from the catalog is invisible and
+    /// harmless, while a catalog column absent from Lance is a hard read
+    /// failure. There is no WAL record for schema DDL, so ordering is the only
+    /// recovery lever — and since the widening is idempotent, re-running a
+    /// half-applied DDL converges.
+    ///
+    /// Primary is widened first, so any fork branch cut *after* this point
+    /// inherits the column from primary's current version and needs nothing.
+    /// Branches cut before it are then widened explicitly. That second step is
+    /// not redundant with the write-path reconcile in
+    /// [`crate::storage::schema_evolution`]: a *write* through a stale branch
+    /// repairs itself there, but a *read* does not go through that path at all
+    /// and fails with `No field named …` from Lance's projection.
+    pub async fn widen_for_declared_properties(
+        &self,
+        entity: &str,
+        fields: &[arrow_schema::Field],
+    ) -> anyhow::Result<()> {
+        if fields.is_empty() {
+            return Ok(());
+        }
+        let tables = self.property_tables_for(entity);
+        if tables.is_empty() {
+            return Ok(());
+        }
+
+        let backend = self.backend();
+        for table in &tables {
+            backend.evolve_table_schema(table, fields, &[]).await?;
+        }
+
+        // Promote any values the property already has as *schemaless* data.
+        // Widening alone would leave the typed column all-NULL while the blob
+        // still held the values, and the two read paths would disagree --
+        // trading #249's loud failure for a silent wrong answer. See
+        // `backfill_property_from_overflow`.
+        //
+        // Primary only. On a fork-scoped manager the backend is a
+        // `BranchedBackend`, whose `replace_table_atomic` rewrites the branch
+        // tip -- and because a branch scan *fuses* with its parent, that would
+        // materialize every inherited row into the branch, destroying the
+        // copy-on-write sharing and corrupting anything that computes a fork's
+        // own delta.
+        if self.fork_scope().is_none() {
+            let schema = self.schema_manager().schema();
+            for field in fields {
+                let Some(declared) = schema
+                    .properties
+                    .get(entity)
+                    .and_then(|p| p.get(field.name()))
+                    .map(|m| m.r#type.clone())
+                else {
+                    continue;
+                };
+                for table in &tables {
+                    crate::storage::schema_evolution::backfill_property_from_overflow(
+                        backend,
+                        table,
+                        field.name(),
+                        &declared,
+                    )
+                    .await?;
+                }
+            }
+        }
+
+        // Propagate to live fork branches. `ForkInfo::datasets` is the
+        // authoritative per-fork table -> branch map; a fork with no branch for
+        // a table needs nothing, because its reads resolve through `base_paths`
+        // to primary, which now has the column. Cutting a branch just to hold
+        // the column would be actively wrong -- it would pin a
+        // pre-declaration parent version.
+        let (Some(registry), Some(branching)) = (self.fork_registry(), backend.branching()) else {
+            return Ok(());
+        };
+        for fork in registry.snapshot().await.forks.values() {
+            if fork.status == uni_common::core::fork::ForkStatus::Tombstoned {
+                continue;
+            }
+            for table in &tables {
+                let Some(branch) = fork.datasets.get(table) else {
+                    continue;
+                };
+                if let Err(e) = branching
+                    .evolve_branch_schema(table, branch, fields, &[])
+                    .await
+                {
+                    // A fork dropped between the snapshot and here takes its
+                    // branch with it, which is benign; and a branch that still
+                    // exists would be repaired by the fork's own next write.
+                    // Surface it rather than swallowing it.
+                    tracing::warn!(
+                        fork = %fork.name,
+                        table = %table,
+                        branch = %branch,
+                        error = %e,
+                        "could not widen a fork branch for a newly declared property"
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Phase 5a: query whether a fork-local index of `kind` exists
@@ -1726,6 +1926,87 @@ impl StorageManager {
             .await
     }
 
+    /// Rows stored for `label`, without reading any of them — or `None` when
+    /// answering would mean reading them after all.
+    ///
+    /// Metadata-only on Lance: no predicate, so fragment counts answer it.
+    /// Measured at 35-116 us against 10k-1M rows, flat in row count and
+    /// growing only with fragments (`examples/count_rows_probe.rs`), which is
+    /// what makes it affordable on the query path at all.
+    ///
+    /// Used to decide whether a scan is large enough to be worth walking in
+    /// ranges (#214). The count is an upper bound on live rows, since MVCC
+    /// keeps superseded versions, which is the right direction for that
+    /// decision — it can only over-estimate, and over-estimating chunks a scan
+    /// that did not need it rather than failing to bound one that did.
+    ///
+    /// # Why this can decline to answer
+    ///
+    /// `BranchedBackend::count_rows` has no branch-aware count in lancedb
+    /// 0.27.1, so for a table the fork has written it *scans the branch and
+    /// sums `num_rows`*. Sizing a forked scan that way would fully materialize
+    /// the table in order to decide whether to avoid materializing it — the
+    /// exact cost the caller is trying to bound, paid up front and
+    /// unconditionally.
+    ///
+    /// So this returns `None` there rather than a number, and the caller falls
+    /// back to the unchunked read. A fork keeps today's behaviour, which is a
+    /// documented limit and not a regression; the bound arrives on forks when
+    /// the backend can count a branch from metadata.
+    ///
+    /// # Errors
+    ///
+    /// Propagates backend failures. A table that does not exist reports zero.
+    pub async fn vertex_row_count(&self, label: &str) -> Result<Option<usize>> {
+        let backend = self.backend();
+        let table_name = table_names::vertex_table_name(label);
+
+        // Mirrors `BranchedBackend::count_rows`'s own branch test, so this
+        // declines exactly when that would have scanned.
+        if self
+            .fork_scope()
+            .and_then(|scope| scope.branch_for(&table_name))
+            .is_some()
+        {
+            return Ok(None);
+        }
+
+        if !backend.table_exists(&table_name).await? {
+            return Ok(Some(0));
+        }
+        backend.count_rows(&table_name, None).await.map(Some)
+    }
+
+    /// Whether any row of `label` still has `_vid >= lo`.
+    ///
+    /// The termination test for a scan walking a label in `_vid` ranges (#214).
+    /// A range walk has no upper bound to stop at: the id allocator is on the
+    /// `Writer`, which a read-only query path does not hold, and `ScanRequest`
+    /// has no ordering, so "the largest vid" cannot be read directly.
+    ///
+    /// Asking this instead is exact and is paid only when a range comes back
+    /// empty — normally once, just past the end of the label. A sparse label
+    /// pays once per gap, which is the case where being certain is worth a
+    /// count.
+    ///
+    /// Honours the same `_version` ceiling as the scans it terminates, so a
+    /// pinned session does not keep walking toward rows it cannot see.
+    ///
+    /// # Errors
+    ///
+    /// Propagates backend failures. A table that does not exist is not an
+    /// error and reports no rows.
+    pub async fn vertex_rows_at_or_above(&self, label: &str, lo: u64) -> Result<bool> {
+        let backend = self.backend();
+        let table_name = table_names::vertex_table_name(label);
+        if !backend.table_exists(&table_name).await? {
+            return Ok(false);
+        }
+        let at_or_above = FilterExpr::compare("_vid", CmpOp::GtEq, Scalar::UInt(lo));
+        let filter = combine_hwm_filter(self.version_high_water_mark(), Some(&at_or_above));
+        Ok(backend.count_rows(&table_name, filter.as_ref()).await? > 0)
+    }
+
     /// [`Self::scan_vertex_table`], carrying a query's counters into the backend.
     ///
     /// The backend layer never sees a [`QueryContext`], so `ScanRequest` is the
@@ -1984,8 +2265,22 @@ impl StorageManager {
 
     /// Find labels for a vertex by VID. Uses pinned snapshot HWM if present.
     pub async fn find_vertex_labels_by_vid(&self, vid: Vid) -> Result<Option<Vec<String>>> {
-        MainVertexDataset::find_labels_by_vid(self.backend(), vid, self.version_high_water_mark())
-            .await
+        self.find_vertex_labels_by_vid_counted(vid, None).await
+    }
+
+    /// [`Self::find_vertex_labels_by_vid`], carrying a query's counters.
+    pub async fn find_vertex_labels_by_vid_counted(
+        &self,
+        vid: Vid,
+        counters: Option<&Arc<crate::runtime::counters::QueryCounters>>,
+    ) -> Result<Option<Vec<String>>> {
+        MainVertexDataset::find_labels_by_vid_counted(
+            self.backend(),
+            vid,
+            self.version_high_water_mark(),
+            counters,
+        )
+        .await
     }
 
     /// Find edges from the main edge table by type names, optionally pushing
@@ -1995,7 +2290,28 @@ impl StorageManager {
         type_names: &[&str],
         endpoint_filter: Option<(crate::storage::main_edge::EndpointSide, &[Vid])>,
     ) -> Result<Vec<(Eid, Vid, Vid, String, uni_common::Properties)>> {
-        MainEdgeDataset::find_edges_by_type_names(self.backend(), type_names, endpoint_filter).await
+        self.find_edges_by_type_names_counted(type_names, endpoint_filter, None)
+            .await
+    }
+
+    /// [`Self::find_edges_by_type_names`], carrying a query's counters.
+    ///
+    /// Same reason as `scan_delta_table_counted`: a scan the counter never sees
+    /// is missing from `scans_reported` as well as `idx_scans`, and it is the
+    /// denominator that makes the zero readable.
+    pub async fn find_edges_by_type_names_counted(
+        &self,
+        type_names: &[&str],
+        endpoint_filter: Option<(crate::storage::main_edge::EndpointSide, &[Vid])>,
+        counters: Option<&Arc<crate::runtime::counters::QueryCounters>>,
+    ) -> Result<Vec<(Eid, Vid, Vid, String, uni_common::Properties)>> {
+        MainEdgeDataset::find_edges_by_type_names_counted(
+            self.backend(),
+            type_names,
+            endpoint_filter,
+            counters,
+        )
+        .await
     }
 
     /// Scan vertex candidates matching a filter. Returns VIDs where `_deleted = false`.

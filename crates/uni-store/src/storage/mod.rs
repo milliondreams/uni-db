@@ -25,6 +25,7 @@ pub mod manager;
 pub mod muvera_index;
 pub mod property_builder;
 pub mod resilient_store;
+pub mod schema_evolution;
 pub mod shadow_csr;
 #[cfg(feature = "lance-backend")]
 pub mod sparse_index;

@@ -161,6 +161,10 @@ impl<'a> SchemaBuilder<'a> {
     pub async fn apply(self) -> Result<()> {
         let manager = &self.db.inner.schema;
         let mut indexes_to_build = Vec::new();
+        // Properties declared in this batch, paired with the Arrow field the
+        // storage layer must grow. Collected here and materialized after the
+        // loop so each table is widened once, in one commit.
+        let mut added_properties: Vec<(String, arrow_schema::Field)> = Vec::new();
 
         for change in self.pending {
             match change {
@@ -187,11 +191,48 @@ impl<'a> SchemaBuilder<'a> {
                     // nullability conflict. The old `add_property_with_desc` +
                     // swallow-"already exists" combination silently ignored dim
                     // changes like VECTOR(4) → VECTOR(8) (issue #137).
+                    // A `NOT NULL` property cannot be satisfied by rows that
+                    // already exist -- they have no value for it. `property()`
+                    // defaults to NOT NULL, so rejecting would make the most
+                    // common builder call fail against any populated label.
+                    // Record it as nullable instead, and say so: the catalog
+                    // then matches what the data can actually support, rather
+                    // than asserting a constraint every existing row violates.
+                    // (NOT NULL is enforced forward, at write time, either way.)
+                    let rows = self
+                        .db
+                        .inner
+                        .storage
+                        .materialized_row_count(&label_or_type)
+                        .await
+                        .map_err(UniError::Internal)?;
+                    let effective_nullable = if nullable || rows == 0 {
+                        nullable
+                    } else {
+                        tracing::warn!(
+                            entity = %label_or_type,
+                            property = %name,
+                            rows,
+                            "declaring a NOT NULL property on a populated entity; \
+                             recording it as nullable because existing rows have no value"
+                        );
+                        true
+                    };
                     manager
-                        .declare_property(&label_or_type, &name, data_type, nullable, description)
+                        .declare_property(
+                            &label_or_type,
+                            &name,
+                            data_type.clone(),
+                            effective_nullable,
+                            description,
+                        )
                         .map_err(|e| UniError::Schema {
                             message: e.to_string(),
                         })?;
+                    added_properties.push((
+                        label_or_type.clone(),
+                        arrow_schema::Field::new(&name, data_type.to_arrow(), true),
+                    ));
                 }
                 SchemaChange::AddIndex(idx) => {
                     // The Python config paths build an `IndexDefinition` with no
@@ -280,6 +321,24 @@ impl<'a> SchemaBuilder<'a> {
                         }
                     }
                 }
+            }
+        }
+
+        // Storage before catalog -- see
+        // `StorageManager::widen_for_declared_properties` for why this order.
+        {
+            use std::collections::BTreeMap;
+            let mut by_entity: BTreeMap<String, Vec<arrow_schema::Field>> = BTreeMap::new();
+            for (entity, field) in added_properties {
+                by_entity.entry(entity).or_default().push(field);
+            }
+            for (entity, fields) in by_entity {
+                self.db
+                    .inner
+                    .storage
+                    .widen_for_declared_properties(&entity, &fields)
+                    .await
+                    .map_err(UniError::Internal)?;
             }
         }
 

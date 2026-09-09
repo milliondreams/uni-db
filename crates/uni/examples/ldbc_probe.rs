@@ -20,11 +20,21 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(1024);
     eprintln!("[probe] batch_size={batch_size} query_timeout={secs}s");
-    let config = uni_db::UniConfig {
+    // `PROBE_MAX_MB` tightens the query memory pool, so a plan that cannot
+    // spill can be told apart from one that can (#213).
+    let max_mb: usize = std::env::var("PROBE_MAX_MB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let mut config = uni_db::UniConfig {
         query_timeout: std::time::Duration::from_secs(secs),
         batch_size,
         ..Default::default()
     };
+    if max_mb > 0 {
+        config.max_query_memory = max_mb * 1024 * 1024;
+        eprintln!("[probe] max_query_memory={max_mb} MB");
+    }
     let db = Uni::open_existing(std::env::var("LDBC_DB")?)
         .config(config)
         .build()

@@ -410,6 +410,10 @@ async fn run_join(
     }
 
     // 2. Extract distinct VIDs from the anchor build column.
+    //
+    // The set and the probe index below are derived structures: Rust-side, not
+    // Arrow, and outside the batch bytes reserved above. They were unaccounted
+    // (#242) — the operator looked covered because its batches were.
     let anchor = pairs[0];
     let build_anchor_col_idx = anchor.build_col(probe_side);
     let mut vid_set: HashSet<u64> = HashSet::new();
@@ -481,7 +485,21 @@ async fn run_join(
             probe_anchor_col_idx, probe_vid_idx
         )));
     }
+    // `vid_set` holds one `u64` per distinct build VID; the hash table carries
+    // roughly a word of overhead per slot on top, so charge two.
+    reservation.try_grow(vid_set.len() * 2 * std::mem::size_of::<u64>())?;
+
     let probe_index = build_probe_vid_index(&probe_batch, probe_vid_idx)?;
+    // The index is `HashMap<u64, Vec<usize>>` built `with_capacity(rows)`: an
+    // entry per distinct probe VID, and across all its `Vec`s one `usize` per
+    // non-null probe row. On a narrow probe batch that rivals the batch itself.
+    let index_bytes = probe_index.len()
+        * (std::mem::size_of::<u64>() + std::mem::size_of::<Vec<usize>>())
+        + probe_index
+            .values()
+            .map(|v| v.capacity() * std::mem::size_of::<usize>())
+            .sum::<usize>();
+    reservation.try_grow(index_bytes)?;
 
     // 5. Walk build rows; for each, find probe candidates by anchor VID
     // and post-filter by non-anchor pairs. Record matching pairs as

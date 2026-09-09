@@ -640,7 +640,12 @@ pub struct ScanRequest {
     pub columns: ColumnProjection,
     /// Filter expression.
     pub filter: FilterExpr,
-    /// Maximum number of rows to return.
+    /// Maximum number of raw rows the backend returns.
+    ///
+    /// **Raw rows, not entities.** The cut happens inside the Lance scanner,
+    /// below MVCC dedup and below the L0 merge, so it counts physical rows
+    /// including superseded versions and tombstones. See [`Self::with_limit`]
+    /// before setting this.
     pub limit: Option<usize>,
     /// Optional Lance branch to read from. `None` = primary (main) branch.
     ///
@@ -687,7 +692,44 @@ impl ScanRequest {
         self
     }
 
-    /// Builder: set limit.
+    /// Builder: cap the number of **raw rows** the backend returns.
+    ///
+    /// # This cannot implement a Cypher `LIMIT`
+    ///
+    /// The backend applies this with `scanner.limit(...)` after `project` and
+    /// `filter` but *before* anything that reconciles versions. A labelled read
+    /// is three stages and this is the first:
+    ///
+    /// ```text
+    /// ScanRequest            raw rows, filtered only by `_version <= hwm`
+    ///   -> mvcc_dedup_batch       sort (_vid ASC, _version DESC), first per vid
+    ///   -> merge_lance_and_l0     concat the L0 batch, dedup again
+    /// ```
+    ///
+    /// So a limit here truncates while every version of every vid is still
+    /// present, and rows arrive in write order — meaning the cut keeps the
+    /// *oldest* surviving version of a vid and discards the newest. Dedup then
+    /// has only the stale row to choose from and returns it. No error, a
+    /// well-formed wrong answer. `bugs::issue_239_scan_limit_precedes_mvcc_dedup`
+    /// demonstrates exactly this: `limit(2)` returns a vertex with `n = 1`
+    /// whose committed value is `100`.
+    ///
+    /// This class has shipped before. The only historical caller was
+    /// `rebuild_vid_labels_index` with `.with_limit(100_000)`; every vertex past
+    /// the cap was left out of the index, and because the traversal label filter
+    /// *keeps* rows it cannot resolve, a `Post` predicate admitted `Comment`s at
+    /// LDBC SF1 (#211).
+    ///
+    /// # When it is safe
+    ///
+    /// Only for a scan whose result is not interpreted as a set of current
+    /// entities: sampling a table's physical shape, bounding a diagnostic read,
+    /// or reading a table that is single-version by construction. If the caller
+    /// would be upset by a superseded row, a deleted row, or fewer distinct
+    /// entities than it asked for, this is the wrong tool.
+    ///
+    /// A sound Cypher `LIMIT` pushdown has to act **above** the merge, where a
+    /// vid appears exactly once — see #239.
     pub fn with_limit(mut self, limit: usize) -> Self {
         self.limit = Some(limit);
         self

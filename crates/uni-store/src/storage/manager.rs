@@ -2007,6 +2007,118 @@ impl StorageManager {
         Ok(backend.count_rows(&table_name, filter.as_ref()).await? > 0)
     }
 
+    /// The smallest `_vid` at or above `lo` that this label has a row for.
+    ///
+    /// [`Self::vertex_rows_at_or_above`] answers *whether* the label continues
+    /// above a point; this answers *where*. The range walk in `GraphScanExec`
+    /// needs the second question because vids are allocated globally while each
+    /// label gets its own table, so a label's rows begin at an arbitrary offset
+    /// — LDBC SF1 puts `Person` at vid 0, `Post` at 100 384 and `Comment` at
+    /// 1 103 989. A walk that starts at 0 and doubles its range to find the
+    /// first row arrives with the range already grown to ~1M vids wide, and so
+    /// reads ~985 000 rows to answer `LIMIT 1` (#239).
+    ///
+    /// # Cost
+    ///
+    /// A binary search over `count_rows` with a half-open `_vid` predicate,
+    /// bounded by `log2(hi - lo)` — at most 64 counts, and in practice ~20 for
+    /// a realistic vid space. Each is a filtered count, which is *not*
+    /// metadata-only (unlike an unfiltered one), so this is worth paying to
+    /// avoid a large read and not worth paying speculatively. Callers should
+    /// reach for it when they know a small bound makes the saved read large.
+    ///
+    /// Honours the same `_version` ceiling as the scans it steers, so a pinned
+    /// session does not seek toward rows it cannot see. Note this deliberately
+    /// consults flushed storage only: an L0-resident row at a lower vid is not
+    /// seen, so the result is an upper bound on the true minimum. That is safe
+    /// for steering a walk whose L0 overlay is applied per range anyway, but it
+    /// is the reason this is not a general "minimum vid" accessor.
+    ///
+    /// Returns `None` when the label has no row at or above `lo`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates backend failures. A missing table is not an error.
+    pub async fn vertex_min_vid_at_or_above(&self, label: &str, lo: u64) -> Result<Option<u64>> {
+        let backend = self.backend();
+        let table_name = table_names::vertex_table_name(label);
+        if !backend.table_exists(&table_name).await? {
+            return Ok(None);
+        }
+        let hwm = self.version_high_water_mark();
+
+        // Does anything remain at all? Also establishes the invariant the
+        // search below relies on: `hi` always has a row at or above `lo`.
+        let at_or_above = FilterExpr::compare("_vid", CmpOp::GtEq, Scalar::UInt(lo));
+        let filter = combine_hwm_filter(hwm, Some(&at_or_above));
+        if backend.count_rows(&table_name, filter.as_ref()).await? == 0 {
+            return Ok(None);
+        }
+
+        // Invariant: `[lo, hi)` is empty, `[lo, ..]` is not. Narrow until `hi`
+        // is the first populated vid. Starting `hi` at `lo` and doubling keeps
+        // the search proportional to the *distance to the data*, not to the
+        // width of the vid space — a label that starts right at `lo` costs two
+        // counts rather than sixty-four.
+        let mut hi = lo;
+        let mut step = 1u64;
+        loop {
+            let probe = hi.saturating_add(step);
+            if probe == hi {
+                // `hi` saturated at u64::MAX while still empty, which
+                // contradicts the check above; treat as "no row".
+                return Ok(None);
+            }
+            if self
+                .vertex_rows_in_range(&table_name, hwm, lo, probe)
+                .await?
+            {
+                break;
+            }
+            hi = probe;
+            step = step.saturating_mul(2);
+        }
+        // `[lo, hi)` empty, `[lo, hi + step)` non-empty. Bisect for the first
+        // vid, searching `[hi, hi + step)`.
+        let mut low = hi;
+        let mut high = hi.saturating_add(step);
+        while low < high {
+            let mid = low + (high - low) / 2;
+            // `mid + 1` because the predicate is half-open and we are asking
+            // "is there a row at or below `mid`".
+            if self
+                .vertex_rows_in_range(&table_name, hwm, lo, mid.saturating_add(1))
+                .await?
+            {
+                high = mid;
+            } else {
+                low = mid.saturating_add(1);
+            }
+        }
+        Ok(Some(low))
+    }
+
+    /// Whether the label's table holds a row with `lo <= _vid < hi`.
+    ///
+    /// Helper for [`Self::vertex_min_vid_at_or_above`]; the half-open shape
+    /// matches the range walk's own so an off-by-one cannot creep in between
+    /// the two.
+    async fn vertex_rows_in_range(
+        &self,
+        table_name: &str,
+        hwm: Option<u64>,
+        lo: u64,
+        hi: u64,
+    ) -> Result<bool> {
+        let backend = self.backend();
+        let in_range = FilterExpr::all([
+            FilterExpr::compare("_vid", CmpOp::GtEq, Scalar::UInt(lo)),
+            FilterExpr::compare("_vid", CmpOp::Lt, Scalar::UInt(hi)),
+        ]);
+        let filter = combine_hwm_filter(hwm, Some(&in_range));
+        Ok(backend.count_rows(table_name, filter.as_ref()).await? > 0)
+    }
+
     /// [`Self::scan_vertex_table`], carrying a query's counters into the backend.
     ///
     /// The backend layer never sees a [`QueryContext`], so `ScanRequest` is the

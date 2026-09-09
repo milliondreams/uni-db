@@ -66,6 +66,10 @@ pub mod repro_shadow_csr_warm_retention;
 // from a batched read by count rather than by wall-clock.
 pub mod issue_222_edge_prop_type_hint;
 pub mod issue_223_main_edge_scan_shape;
+// #228 — the main-edge blob read round-trips through `serde_json::Value`,
+// which is both the per-edge cost and a silent type change for Bytes,
+// vectors, temporals and non-finite floats.
+pub mod issue_228_edge_prop_value_fidelity;
 pub mod issue_239_scan_limit_precedes_mvcc_dedup;
 
 // Vertex-side sibling of #222 — one unresolved vid escalates a batched vertex

@@ -224,15 +224,20 @@ impl MainEdgeDataset {
         }
         columns.push(Arc::new(type_builder.finish()));
 
-        // props_json column (JSONB binary encoding)
+        // props_json column (JSONB binary encoding).
+        //
+        // Encoded straight from the property map. This used to serialize to a
+        // `serde_json::Value` and convert that back before encoding, which is
+        // the write-side half of the round trip described on
+        // `parse_props_json` — and where a non-finite `Float` was lost, since
+        // `serde_json` has no representation for one and maps it to `Null`
+        // (#228). The `unwrap_or(json!({}))` made that worse in the failure
+        // case: a serialization error silently dropped *every* property on the
+        // edge rather than surfacing.
         let mut props_json_builder = LargeBinaryBuilder::new();
         for (_, _, _, _, props, _, _) in edges.iter() {
-            let jsonb_bytes = {
-                let json_val = serde_json::to_value(props).unwrap_or(serde_json::json!({}));
-                let uni_val: uni_common::Value = json_val.into();
-                uni_common::cypher_value_codec::encode(&uni_val)
-            };
-            props_json_builder.append_value(&jsonb_bytes);
+            let uni_val = uni_common::Value::Map(props.clone());
+            props_json_builder.append_value(uni_common::cypher_value_codec::encode(&uni_val));
         }
         columns.push(Arc::new(props_json_builder.finish()));
 
@@ -685,6 +690,42 @@ impl MainEdgeDataset {
         Ok(())
     }
 
+    /// Decode one edge's `props_json` blob into its property map.
+    ///
+    /// `Properties` is `HashMap<String, Value>` and the blob decodes to a
+    /// `Value::Map`, so the map the decoder returns *is* the answer. This used
+    /// to convert it to a `serde_json::Value` and deserialize that back, which
+    /// cost an entire intermediate JSON tree per edge and was lossy besides
+    /// (#228).
+    ///
+    /// # Both halves of that mattered
+    ///
+    /// **Cost.** Measured on LDBC SF1 by differential
+    /// (`examples/edge_hydration_probe.rs`): reading one `Int` column off
+    /// `(Forum)-[:HAS_MEMBER]->(Person)` cost 9 204 ms over 1 611 869 edges —
+    /// 16x the 577 ms traversal that produced them. Warm and cold agreed to
+    /// within 1%, which attributes it to materialisation rather than IO. Taking
+    /// the map directly brought that to 8 294 ms, **~10%**, repeated on two
+    /// other edge types (-8.3%, -6.0%).
+    ///
+    /// It is worth being exact about the other 90%, because #228 predicts
+    /// otherwise. A `perf` profile of the same query puts
+    /// `build_property_column_static` — the row-by-row Arrow assembly the issue
+    /// names as the defect — at **~2%**, while the Lance scan and decode that
+    /// read the column at all account for ~20%. So a columnar edge-hydration
+    /// path mirroring `hydrate_vids_columnar` would buy a few percent, not the
+    /// bulk, and would owe three sets of MVCC merge semantics for it.
+    ///
+    /// **Fidelity.** `impl From<Value> for serde_json::Value` is lossy, and
+    /// silently so — the result is a well-formed value of the wrong type rather
+    /// than an error. `Bytes` came back base64-encoded as a `String`, `Vector`
+    /// and `BinaryVector` as a `List`, `Temporal` as a `String`, and any
+    /// non-finite `Float` as `Null`, because `Number::from_f64` rejects those.
+    /// Pinned by `bugs::issue_228_edge_prop_value_fidelity`.
+    ///
+    /// The JSON path is kept for a blob that decodes to something other than a
+    /// map, which is not how the writer encodes one — but that is an assumption
+    /// about historical data on disk, and falling back costs nothing.
     fn parse_props_json(arr: &arrow_array::LargeBinaryArray, idx: usize) -> Result<Properties> {
         if arr.is_null(idx) || arr.value(idx).is_empty() {
             return Ok(Properties::new());
@@ -692,8 +733,14 @@ impl MainEdgeDataset {
         let bytes = arr.value(idx);
         let uni_val = uni_common::cypher_value_codec::decode(bytes)
             .map_err(|e| anyhow!("Failed to decode CypherValue: {}", e))?;
-        let json_val: serde_json::Value = uni_val.into();
-        serde_json::from_value(json_val).map_err(|e| anyhow!("Failed to parse props_json: {}", e))
+        match uni_val {
+            uni_common::Value::Map(props) => Ok(props),
+            other => {
+                let json_val: serde_json::Value = other.into();
+                serde_json::from_value(json_val)
+                    .map_err(|e| anyhow!("Failed to parse props_json: {}", e))
+            }
+        }
     }
 
     /// Find edge data (eid, src_vid, dst_vid, edge_type, props) by multiple type names in the main edges table.

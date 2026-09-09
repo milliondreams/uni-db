@@ -434,7 +434,7 @@ async fn test_batched_edge_props_resolve_after_compaction() -> Result<()> {
 
     let ctx = QueryContext::new(writer.l0_manager.get_current());
     let props = property_manager
-        .get_batch_edge_props(&eids, &["since"], Some(&ctx))
+        .get_batch_edge_props(&eids, &["since"], None, Some(&ctx))
         .await?;
 
     assert_eq!(
@@ -503,7 +503,7 @@ async fn test_batched_edge_props_keep_deleted_edges_deleted() -> Result<()> {
 
     let ctx = QueryContext::new(writer.l0_manager.get_current());
     let props = property_manager
-        .get_batch_edge_props(&[kept, doomed], &["since"], Some(&ctx))
+        .get_batch_edge_props(&[kept, doomed], &["since"], None, Some(&ctx))
         .await?;
 
     let kept_key = uni_common::core::id::Vid::from(kept.as_u64());
@@ -586,7 +586,7 @@ async fn test_full_scan_strategy_filters_to_the_requested_eids() -> Result<()> {
     let requested: Vec<_> = all_eids[..REQUESTED].iter().map(|(e, _)| *e).collect();
     let ctx = QueryContext::new(writer.l0_manager.get_current());
     let props = property_manager
-        .get_batch_edge_props(&requested, &["since"], Some(&ctx))
+        .get_batch_edge_props(&requested, &["since"], None, Some(&ctx))
         .await?;
 
     // The deleted edge is requested but must not come back; the other 99 must.

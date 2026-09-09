@@ -695,8 +695,17 @@ impl ProjectionBuilder {
                     snap.extra.clone(),
                 )
             });
+            // The projection's scoped edge types. `scoped_edge_type_names`
+            // already returns every type when the user scoped none, so this is
+            // never narrower than the edges actually collected (#222).
+            let hinted_types = self.scoped_edge_type_names(&self.storage.schema_manager().schema());
             let batch_props = pm
-                .get_batch_edge_props(&all_eids, &fetch_names, edge_ctx.as_ref())
+                .get_batch_edge_props(
+                    &all_eids,
+                    &fetch_names,
+                    Some(&hinted_types),
+                    edge_ctx.as_ref(),
+                )
                 .await?;
             for eid in all_eids {
                 let vid_key = Vid::from(eid.as_u64());

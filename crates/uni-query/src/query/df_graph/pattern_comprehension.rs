@@ -353,11 +353,23 @@ impl PhysicalExpr for PatternComprehensionExecExpr {
                     })
                     .collect();
 
+                // The step's own edge types, so the read scans those tables
+                // rather than every type in the schema when L0 is cold (#222).
+                let hinted_types: Vec<String> = {
+                    let schema = self.graph_ctx.storage().schema_manager().schema();
+                    let mut seen = std::collections::HashSet::new();
+                    expansion.step_edge_type_ids[step_idx]
+                        .iter()
+                        .filter(|tid| seen.insert(**tid))
+                        .filter_map(|tid| schema.edge_type_name_by_id_unified(*tid))
+                        .collect()
+                };
                 let props_map = block_on_scoped(
                     "Edge prop load",
                     self.graph_ctx.property_manager().get_batch_edge_props(
                         &eids,
                         &prop_refs,
+                        Some(&hinted_types),
                         Some(&query_ctx),
                     ),
                 )?;

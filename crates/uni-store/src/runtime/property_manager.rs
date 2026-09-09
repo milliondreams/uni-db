@@ -800,10 +800,30 @@ impl PropertyManager {
 
     /// Load properties as Arrow columns for vectorized processing
     /// Batch load properties for multiple edges
+    /// Batch-load edge properties.
+    ///
+    /// # `edge_types` is the difference between one scan and fifteen
+    ///
+    /// EIDs are pure auto-increment and carry no type, so this has to know
+    /// which per-type delta tables to read. Pass `Some` whenever the caller
+    /// knows — a traversal knows the exact set from its own expansions — and
+    /// exactly those tables are scanned.
+    ///
+    /// `None` falls back to asking L0 for each EID's type, and **if a single
+    /// EID is unknown to L0 it scans every edge type in the schema**. L0 is
+    /// empty on a reloaded or compacted store, so that fallback is the normal
+    /// path there rather than the exceptional one: measured on LDBC IC5's
+    /// `HAS_MEMBER` clause at SF1, all 195 calls took it, scanning all 15 edge
+    /// types for 31.7 s — 20% of the clause (#222). The cost is per *call*, not
+    /// per edge.
+    ///
+    /// The parameter is explicit rather than inferred precisely so that a new
+    /// call site has to decide, instead of silently inheriting the fan-out.
     pub async fn get_batch_edge_props(
         &self,
         eids: &[uni_common::core::id::Eid],
         properties: &[&str],
+        edge_types: Option<&[String]>,
         ctx: Option<&QueryContext>,
     ) -> Result<HashMap<Vid, Properties>> {
         let schema = self.schema_manager.schema();
@@ -824,8 +844,14 @@ impl PropertyManager {
         // In the new storage model, EIDs are pure auto-increment and don't embed type info.
         // We need to scan all edge type datasets to find the edges.
 
-        // Try to resolve edge types from L0 context for O(1) lookup
-        let types_to_scan: Vec<String> = {
+        // A caller-supplied set is authoritative and skips both the L0
+        // round-trip and the all-types fallback (#222). An empty slice is
+        // treated as "no hint" rather than "no types", since scanning nothing
+        // would silently return no properties.
+        let types_to_scan: Vec<String> = if let Some(hint) = edge_types.filter(|h| !h.is_empty()) {
+            hint.to_vec()
+        } else {
+            // Try to resolve edge types from L0 context for O(1) lookup
             if let Some(ctx) = ctx {
                 let mut needed: std::collections::HashSet<String> =
                     std::collections::HashSet::new();

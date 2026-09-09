@@ -1191,12 +1191,32 @@ async fn build_edge_columns(
         let property_manager = graph_ctx.property_manager();
         let query_ctx = graph_ctx.query_context();
 
+        // The exact types present in *these* rows, not the plan-level
+        // `edge_type_ids` superset: each expansion carries its own
+        // `edge_type_id`, so the hint is precise and never over-scans. Without
+        // it this call asks L0 for every EID's type and, on a reloaded store
+        // where L0 is empty, scans all 15 LDBC edge types per call — 31.7 s and
+        // 20% of IC5's HAS_MEMBER clause (#222).
+        let uni_schema = graph_ctx.storage().schema_manager().schema();
+        let hinted_types: Vec<String> = {
+            let mut seen = std::collections::HashSet::new();
+            expansions
+                .iter()
+                .filter(|(_, _, _, tid, _)| seen.insert(*tid))
+                .filter_map(|(_, _, _, tid, _)| uni_schema.edge_type_name_by_id_unified(*tid))
+                .collect()
+        };
+
         let props_map = property_manager
-            .get_batch_edge_props(&eids, &prop_name_refs, Some(&query_ctx))
+            .get_batch_edge_props(
+                &eids,
+                &prop_name_refs,
+                Some(&hinted_types),
+                Some(&query_ctx),
+            )
             .await
             .map_err(exec_err)?;
 
-        let uni_schema = graph_ctx.storage().schema_manager().schema();
         let merged_edge_props = merged_edge_schema_props(&uni_schema, edge_type_ids);
         let edge_type_props = if merged_edge_props.is_empty() {
             None

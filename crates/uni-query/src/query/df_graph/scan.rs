@@ -1115,6 +1115,52 @@ fn scalar_to_u64(sv: &datafusion::common::ScalarValue) -> Option<u64> {
 /// visible under this snapshot — yields null in every column, which is how the
 /// map API's "absent from the map" signal survives. Duplicate vids in `vids`
 /// are fine: each occurrence gathers the same row.
+/// Requested target vids per target-table row at or above which deduplicating
+/// the request pays for itself.
+///
+/// Hydration is called once per traversal batch, not once per query — measured
+/// at ~8 192 vids per call carrying ~1 400-2 500 distinct ones — so the choice
+/// is made per call and has to be cheap. The statistic is the target table's
+/// row count, which `count_rows` answers from fragment metadata rather than by
+/// reading rows.
+///
+/// The two arms diverge on table size, not on request size. Deduplicating
+/// shrinks the `IN` list, which is worth real time against a *small* target
+/// table and costs a hash set over the request against a large one, where the
+/// list was already selective. Warm min-of-3 on LDBC SF1, hydration isolated by
+/// differential (`examples/vertex_selectivity_probe.rs`):
+///
+/// | traversal | target rows | requests | distinct | without | with |
+/// |---|---|---|---|---|---|
+/// | `HAS_CREATOR`->Person | 9 892 | 2 052 169 | 9 343 | 4 247 ms | 921 ms |
+/// | `KNOWS`->Person | 9 892 | 180 623 | 8 466 | 364 ms | 195 ms |
+/// | `REPLY_OF`->Comment | 2 052 169 | 1 040 749 | 441 704 | 5 732 ms | 7 601 ms |
+///
+/// At a per-call request of ~8 192, a ratio of 8 admits the two Person targets
+/// (8 192 * 8 >= 9 892) and excludes the Comment one (8 192 * 8 < 2 052 169),
+/// with two orders of magnitude of margin on each side.
+///
+/// **Fitted to three shapes on one dataset**, and named so the next person
+/// re-measures rather than trusts it -- the same caveat #221's rustdoc makes
+/// about the edge-side constants, which is why #237 refused to copy those
+/// across rather than measure the vertex side on its own terms. Sorting was
+/// tried first, on the theory that the loss came from discarding
+/// traversal-order locality; order-preserving deduplication measured the same,
+/// so the cost is the deduplication itself and the choice has to be
+/// conditional rather than reordered.
+const DEDUP_TABLE_RATIO: usize = 8;
+
+/// Distinct target vids, in first-occurrence order.
+///
+/// Correctness does not depend on whether this is used: the gather in
+/// [`hydrate_vids_columnar`] is keyed by vid, so duplicates fan back out from
+/// whichever list was fetched and the output is one row per *request* either
+/// way. Only the amount read changes.
+fn dedup_targets(raw: &[u64]) -> Vec<u64> {
+    let mut seen = std::collections::HashSet::with_capacity(raw.len());
+    raw.iter().copied().filter(|v| seen.insert(*v)).collect()
+}
+
 pub(crate) async fn hydrate_vids_columnar(
     graph_ctx: &GraphExecutionContext,
     label: &str,
@@ -1127,6 +1173,26 @@ pub(crate) async fn hydrate_vids_columnar(
         GraphScanExec::build_vertex_schema(variable, label, properties, &uni_schema);
 
     let raw: Vec<u64> = vids.iter().map(|v| v.as_u64()).collect();
+
+    // Fetch each distinct vid once, when the duplication makes that pay (#237).
+    //
+    // `vids` is one entry per *traversal target*, not per vertex, so a target
+    // reached by many edges appears many times.
+    // `count_rows` on the target table, which is metadata-only and so cheap
+    // enough to ask per call. `None` means the storage layer declined to answer
+    // cheaply (a forked session would have scanned), and an unknown table size
+    // is not a reason to pay for deduplication.
+    let target_rows = graph_ctx
+        .storage()
+        .vertex_row_count(label)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+    let pays = target_rows > 0 && raw.len().saturating_mul(DEDUP_TABLE_RATIO) >= target_rows;
+    let deduped = pays.then(|| dedup_targets(&raw));
+    let fetch_vids: &[u64] = deduped.as_deref().unwrap_or(&raw);
+
     // Chunk the vid list, bounding how much is resident at once.
     //
     // The `_vid` index is used either way, and the index work itself does not
@@ -1143,7 +1209,7 @@ pub(crate) async fn hydrate_vids_columnar(
     // one full scan beats six chunked ones, so this costs ~66 MiB on the small
     // fixture. A selectivity-aware choice would beat a fixed constant.
     let mut parts: Vec<RecordBatch> = Vec::new();
-    for chunk in raw.chunks(crate::query::df_graph::vid_lookup_join::MAX_VIDS_PER_CHUNK) {
+    for chunk in fetch_vids.chunks(crate::query::df_graph::vid_lookup_join::MAX_VIDS_PER_CHUNK) {
         parts.push(
             columnar_scan_vertex_batch_static(
                 graph_ctx,

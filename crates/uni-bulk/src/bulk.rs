@@ -957,6 +957,27 @@ impl BulkWriter {
                 .await
                 .map_err(UniError::Internal)?;
 
+            // Register the labels this batch just wrote (#269).
+            //
+            // `VidLabelsIndex` is populated at startup from the main vertex
+            // table and thereafter only by `flush_to_l1`. Bulk rows go straight
+            // to Lance and reach neither, so on the inserting handle every one
+            // of them missed the index — and `get_batch_vertex_props` answers a
+            // miss by scanning *every declared label* (#264). Correct, and a
+            // fan-out proportional to the schema.
+            //
+            // A reopen hid it, because the startup rebuild reads the table these
+            // rows are already in. Registering here is what makes the inserting
+            // handle agree with a reopened one.
+            //
+            // Note this cannot be delegated to #264's proposed L0 consultation:
+            // these rows were never in L0, so L0 cannot answer for them.
+            for (vid, labels, _) in &vertices_with_labels {
+                self.backend
+                    .storage
+                    .update_vid_labels_index(*vid, labels.clone());
+            }
+
             // Create default scalar indexes (_vid, _uid) which are critical for basic function
             ds.ensure_default_indexes(backend)
                 .await

@@ -536,16 +536,48 @@ impl PropertyManager {
         // In the new storage model, VIDs are pure auto-increment and don't embed label info.
         // We need to scan all label datasets to find the vertices.
 
-        // Try VidLabelsIndex for O(1) label resolution
+        // Resolve the labels to scan: `VidLabelsIndex` first, then L0 (#264).
+        //
+        // The index describes *flushed* vertices only -- it is built at startup
+        // from the main vertex table and refreshed by `flush_to_l1`. A vertex
+        // written and not yet flushed is therefore absent from it, and the
+        // fallback for a miss is to scan **every declared label**: correct, but
+        // a fan-out proportional to the schema on the ordinary
+        // insert-then-read sequence within a session.
+        //
+        // L0 closes exactly that gap, because L0 is what wrote those vertices.
+        // All visible buffers are consulted, not just the current one: a vertex
+        // can sit in a buffer that is mid-flush, or in the transaction's own L0,
+        // and missing either would re-open the fan-out for a subset of writes.
+        //
+        // The loop no longer stops at the first miss. Breaking discarded the
+        // labels it had already resolved *and* skipped the L0 lookup for every
+        // remaining vid, so one unresolvable vertex early in a batch defeated
+        // resolution for all of them.
+        //
+        // The fan-out remains for a vid neither source knows, and that is not a
+        // conservatism worth removing: #211 records that a truncated index
+        // silently disabled traversal label filtering, so answering "I don't
+        // know" with a narrower scan would be a wrong answer rather than a slow
+        // one.
         let labels_to_scan: Vec<String> = {
             let mut needed: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut all_resolved = true;
             for &vid in vids {
                 if let Some(labels) = self.storage.get_labels_from_index(vid) {
                     needed.extend(labels);
-                } else {
-                    all_resolved = false;
-                    break;
+                    continue;
+                }
+                let from_l0 = ctx.and_then(|ctx| {
+                    ctx.pending_flush_l0s
+                        .iter()
+                        .chain(std::iter::once(&ctx.l0))
+                        .chain(ctx.transaction_l0.iter())
+                        .find_map(|buf| buf.read().get_vertex_labels(vid).map(<[String]>::to_vec))
+                });
+                match from_l0 {
+                    Some(labels) => needed.extend(labels),
+                    None => all_resolved = false,
                 }
             }
             if all_resolved {

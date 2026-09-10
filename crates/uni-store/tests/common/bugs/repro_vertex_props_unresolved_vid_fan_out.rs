@@ -21,18 +21,25 @@
 //! This is the vertex-side sibling of #222, but it is **not** the same trigger:
 //! #222's edge fan-out fires when L0 is *cold*, this one fires when L0 is *hot*.
 //!
-//! # Why these are `#[ignore]`
+//! # These asserted the defect, and now assert the fix
 //!
-//! They pin the **defective** behaviour: the scan counts asserted here are the
-//! ones #264 exists to reduce, so a correct fix turns all three red. That is
-//! intended — the fix should update the expected counts rather than delete the
-//! tests — but it means they must not gate the default run, or the fix cannot
-//! land without appearing to break CI. Run them with
-//! `cargo nextest run -p uni-store --run-ignored all`.
+//! They were written `#[ignore]`d, pinning the *defective* counts so a fix
+//! could land without appearing to break CI, with a note that the fix should
+//! update the expected counts rather than delete the tests. That is what
+//! happened: `get_batch_vertex_props` now consults L0 for the labels the index
+//! is missing, so the counts below are the ones the batch actually needs and
+//! the tests gate the default run.
 //!
-//! The control (`a_resolved_batch_scans_only_the_labels_it_needs`) is ignored
-//! for the same reason rather than because it is expected to change: it is only
-//! meaningful read beside the other two.
+//! Measured across the change, on the 8-label fixture:
+//!
+//! | batch | before | after |
+//! |---|---|---|
+//! | 1 resolved vid | 1 | 1 |
+//! | 1 unflushed vid | 8 | **1** |
+//! | 2 resolved + 1 unflushed | 8 | **2** |
+//!
+//! The third row is the one that shows the `break` mattered: the two resolved
+//! vids used to be dragged to the full fan-out by the third.
 //!
 //! # Why the assertion is a contrast, not a threshold
 //!
@@ -139,7 +146,6 @@ async fn read(f: &Fixture, vids: &[Vid]) -> Result<(HashMap<Vid, Value>, u64)> {
 /// The control: every vid resolves, so only the labels actually involved are
 /// scanned.
 #[tokio::test]
-#[ignore = "control for #264; pins current behaviour, run with --run-ignored all"]
 async fn a_resolved_batch_scans_only_the_labels_it_needs() -> Result<()> {
     let f = fixture().await?;
 
@@ -163,7 +169,6 @@ async fn a_resolved_batch_scans_only_the_labels_it_needs() -> Result<()> {
 
 /// The defect: one unresolved vid escalates the read to every declared label.
 #[tokio::test]
-#[ignore = "pins the #264 fan-out; run with --run-ignored all"]
 async fn one_unflushed_vid_fans_the_batch_out_across_every_label() -> Result<()> {
     let f = fixture().await?;
 
@@ -195,15 +200,11 @@ async fn one_unflushed_vid_fans_the_batch_out_across_every_label() -> Result<()>
     );
 
     assert_eq!(
-        hot_scans, LABELS as u64,
-        "expected the unresolved vid to scan every one of the {LABELS} declared \
-         labels; got {hot_scans}"
-    );
-    assert!(
-        hot_scans > control_scans,
-        "the unresolved read ({hot_scans} scans) cost no more than the resolved \
-         one ({control_scans}) — the fan-out this test exists to pin is gone, or \
-         the counter stopped distinguishing them"
+        hot_scans, control_scans,
+        "an unflushed vid must now cost what a resolved one costs \
+         ({control_scans} scans), because L0 knows its label — it wrote it. \
+         Got {hot_scans} against {LABELS} declared labels; equal to {LABELS} \
+         means the L0 consultation stopped firing and the fan-out is back."
     );
     Ok(())
 }
@@ -212,7 +213,6 @@ async fn one_unflushed_vid_fans_the_batch_out_across_every_label() -> Result<()>
 /// makes every *resolved* vid in the same call pay the fan-out, because the
 /// resolution loop `break`s rather than collecting what it knows.
 #[tokio::test]
-#[ignore = "pins the #264 fan-out; run with --run-ignored all"]
 async fn a_single_unresolved_vid_escalates_an_otherwise_resolved_batch() -> Result<()> {
     let f = fixture().await?;
 
@@ -240,15 +240,10 @@ async fn a_single_unresolved_vid_escalates_an_otherwise_resolved_batch() -> Resu
     );
 
     assert_eq!(
-        mixed_scans, LABELS as u64,
-        "adding one unflushed vid to a resolved batch should escalate it to all \
-         {LABELS} labels; got {mixed_scans}"
-    );
-    assert!(
-        mixed_scans > resolved_scans,
-        "adding an unresolved vid to a batch of {} resolved ones did not \
-         increase the scan count ({mixed_scans} vs {resolved_scans})",
-        mixed.len() - 1
+        mixed_scans, resolved_scans,
+        "adding one unflushed vid to a resolved batch must not change what it \
+         scans: the unflushed vertex shares label L0 with them, so the batch \
+         still needs exactly {resolved_scans} labels. Got {mixed_scans}"
     );
     Ok(())
 }

@@ -11,14 +11,17 @@
 //! vertex table and thereafter only by the flush path — and `uni-bulk` writes
 //! straight to Lance, registering nothing.
 //!
-//! # This is #264's defect with a trigger its own fix cannot reach
+//! # Why this needed its own fix rather than #264's
 //!
 //! #264 proposes consulting L0 for the labels the index is missing, on the
 //! grounds that L0 "knows the labels of exactly the vertices the index is
-//! missing, since it is what wrote them". That holds for #264's trigger — a
+//! missing, since it is what wrote them". That holds for #264's own trigger — a
 //! written-but-unflushed vertex — and fails here: a bulk row was **never in
-//! L0**, so L0 cannot answer for it. Fixed that way, #264 closes and this path
-//! keeps fanning out with nothing red.
+//! L0**, so L0 cannot answer for it. Had #264 been closed that way alone, this
+//! path would have kept fanning out with nothing red.
+//!
+//! Both are fixed now, by the two independent routes that were actually needed:
+//! `BulkWriter` registers what it writes, and the resolver falls back to L0.
 //!
 //! Three triggers for the same fan-out, which is worth keeping straight:
 //!
@@ -237,28 +240,27 @@ async fn the_bulk_vid_is_resolved_after_a_reopen() -> Result<()> {
     Ok(())
 }
 
-/// #264's own trigger is **not** fixed here, and this pins that.
+/// #264's trigger is now fixed too, and this pins the pair.
 ///
-/// A written-but-unflushed vertex is absent from the index for a different
-/// reason, and closing it needs either the L0 consultation #264 proposes or a
-/// change to when the index is written. Asserting the current behaviour keeps
-/// the two issues from being confused for one another — and this test is what
-/// shows the measurement above is discriminating rather than reporting 1 for
-/// everything.
+/// It was written asserting that an unflushed vid still fanned out, with a note
+/// to update rather than delete it if #264 was ever fixed. It was, in the same
+/// change: `get_batch_vertex_props` now consults L0 for the labels the index is
+/// missing. Both triggers therefore resolve, by different routes — the bulk vid
+/// because `BulkWriter` registers it, the unflushed one because L0 wrote it —
+/// and the two routes are independent, so this arm going red while the bulk arm
+/// stays green would mean the L0 consultation regressed and nothing else.
 #[tokio::test]
-async fn an_unflushed_vid_still_fans_out_which_is_issue_264() -> Result<()> {
+async fn an_unflushed_vid_also_resolves_now_that_l0_is_consulted() -> Result<()> {
     let f = fixture().await?;
     let (_, resolved_scans) = measure(&f.db, f.resolved).await?;
     let (rows, unflushed_scans) = measure(&f.db, f.unflushed).await?;
 
     assert_eq!(rows, 1, "the unflushed vertex is served correctly from L0");
-    assert!(
-        unflushed_scans > resolved_scans,
-        "#264's trigger must still fan out ({unflushed_scans} vs \
-         {resolved_scans}). If this ever drops to the resolved count, #264 has \
-         been fixed — update this test rather than deleting it. If it drops \
-         because the measurement stopped reaching the resolution path, every \
-         other test in this file has quietly become vacuous."
+    assert_eq!(
+        unflushed_scans, resolved_scans,
+        "#264's trigger must cost what a resolved vid costs ({resolved_scans} \
+         scans); got {unflushed_scans} across {LABELS} declared labels. Equal to \
+         {LABELS} means the L0 consultation stopped firing."
     );
     Ok(())
 }

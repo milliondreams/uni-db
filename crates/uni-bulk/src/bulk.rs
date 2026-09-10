@@ -254,6 +254,7 @@ impl BulkWriterBuilder {
             seen_unique_keys: HashMap::new(),
             buffer_size_bytes: 0,
             committed: false,
+            write_version: None,
         })
     }
 }
@@ -377,6 +378,9 @@ pub struct BulkWriter {
     // Current buffer size in bytes (approximate)
     buffer_size_bytes: usize,
     committed: bool,
+    /// MVCC version stamped on every row this writer produces, reserved from
+    /// the live counter on first use. See [`BulkWriter::write_version`].
+    write_version: Option<u64>,
 }
 
 /// Stable identity for a UNIQUE constraint's seen-key namespace: its label plus
@@ -392,6 +396,44 @@ fn unique_set_key(label: &str, unique_props: &[String]) -> String {
 }
 
 impl BulkWriter {
+    /// The MVCC version stamped on every row this writer produces.
+    ///
+    /// Reserved from the live `L0Buffer::current_version` on first use and then
+    /// cached, so one bulk load is one logical write.
+    ///
+    /// **Advancing the shared counter is the load-bearing half** (#266). Bulk
+    /// rows go straight to Lance, bypassing L0, and used to carry a hard-coded
+    /// `_version = 1` while the counter stayed where it was. A transaction
+    /// opened afterwards on the same handle pins its L1 reads to
+    /// `_version <= started_at_version`, so on a fresh database that pin was
+    /// `<= 0` and every bulk row was invisible to it: `MATCH … SET` matched
+    /// nothing, committed cleanly, and discarded the write with no error.
+    /// Reopening masked it, because reopen re-reads the mark from the manifest.
+    ///
+    /// Drawing the version from the counter also removes a second hazard that
+    /// had no symptom yet: a fixed `1` written into a database whose counter had
+    /// already passed `1` produces rows that read as *older* than what is
+    /// already stored.
+    ///
+    /// A read-only database has no `Writer` and therefore no counter to advance;
+    /// it also cannot be written through this path, so the value is immaterial.
+    fn write_version(&mut self) -> u64 {
+        if let Some(v) = self.write_version {
+            return v;
+        }
+        let v = match self.backend.writer.as_ref() {
+            Some(writer) => {
+                let l0 = writer.l0_manager.get_current();
+                let mut guard = l0.write();
+                guard.current_version += 1;
+                guard.current_version
+            }
+            None => 1,
+        };
+        self.write_version = Some(v);
+        v
+    }
+
     /// Returns a snapshot of the current bulk load statistics.
     /// Updated after each batch flush.
     pub fn stats(&self) -> &BulkStats {
@@ -854,6 +896,7 @@ impl BulkWriter {
     /// Records the initial table version before first write for rollback support.
     /// Writes to both per-label table and main vertices table.
     async fn flush_vertices_buffer(&mut self, label: &str) -> Result<()> {
+        let write_version = self.write_version();
         if let Some(vertices) = self.pending_vertices.remove(label) {
             if vertices.is_empty() {
                 return Ok(());
@@ -878,7 +921,7 @@ impl BulkWriter {
             let schema = self.backend.schema.schema();
 
             let deleted = vec![false; vertices.len()];
-            let versions = vec![1; vertices.len()]; // Version 1 for bulk load
+            let versions = vec![write_version; vertices.len()];
 
             // Generate timestamps for this batch
             let now = Self::get_current_timestamp_micros();
@@ -989,6 +1032,9 @@ impl BulkWriter {
 
         // Convert to L1Entry format and track buffer size
         let now = Self::get_current_timestamp_micros();
+        // Same reserved version as this writer's vertices (#266) — one bulk
+        // load is one logical write, and the counter must end above it.
+        let write_version = self.write_version();
         let mut added_size = 0usize;
         let entries: Vec<L1Entry> = edges
             .into_iter()
@@ -1001,7 +1047,7 @@ impl BulkWriter {
                     dst_vid: edge.dst_vid,
                     eid: eids[i],
                     op: Op::Insert,
-                    version: 1,
+                    version: write_version,
                     properties: edge.properties,
                     created_at: Some(now),
                     updated_at: Some(now),

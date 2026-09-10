@@ -129,6 +129,7 @@ pub mod repro_issue_181_flush_resurrects_detached_edge;
 pub mod repro_issue_182_delete_before_first_flush;
 // #249: declaring a property on a label that already has flushed data leaves
 // the Lance dataset unchanged, so the next write to that label is rejected.
+pub mod issue_266_bulk_update_lost_on_inserting_handle;
 pub mod repro_distinct_entity_over_counts;
 pub mod repro_issue_249_add_property_to_existing_label;
 pub mod repro_path_element_hydration_after_flush;

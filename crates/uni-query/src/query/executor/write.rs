@@ -2543,6 +2543,11 @@ impl Executor {
                     gctx = gctx.with_cancellation_token(token);
                 }
             }
+            // And the counters, for the same reason and with the same
+            // omission: `with_l0_context` defaults them to `None`, so this
+            // path's adjacency probes counted into nothing however it was
+            // reached. A lost deadline is loud; a lost counter just reads low.
+            gctx = gctx.with_counters(Some(self.counters.clone()));
             gctx
         });
 

@@ -15,28 +15,25 @@
 //! MATCH (e:Entity {uid: 'e42'})          -- inline map: reaches Scan.filter
 //! ```
 //!
-//! # `rows_scanned` does not work here, and that is itself a finding
+//! # The instrument is `rows_scanned`
 //!
-//! The intended instrument was `QueryMetrics::rows_scanned` — rows examined by
-//! scans before filtering, which reads the plan's choice directly instead of
-//! inferring it from a duration. It does not work for Locy: `impl_locy.rs`
-//! builds its `QueryMetrics` with `total_time`, `exec_time`, `rows_returned`
-//! and `..Default::default()`, so **`rows_scanned` is always 0 for a rule
-//! evaluation** no matter what the plan did. The column is kept in the output
-//! precisely so that zero is visible rather than quietly absent; the Cypher
-//! arms populate it and the Locy arms cannot.
+//! `QueryMetrics::rows_scanned` counts rows examined by scans before filtering,
+//! so it reads the plan's choice directly instead of inferring it from a
+//! duration. An index seek examines the matching rows; a scan-and-filter
+//! examines the table.
 //!
-//! So the comparison rests on wall-clock, which is acceptable *here* only
-//! because of how the arms are built: each block runs the same predicate over
-//! the same graph in the same process, differing in one place, and asserts the
-//! arms return identical rows before any time is compared. A ratio between two
-//! such arms is a property of the plans, not of the machine.
+//! It did not work for Locy when this probe was written: every scan in a rule
+//! body runs under `execute_subplan_with_outer_vars`, which rebuilt the graph
+//! context without carrying the counters over, so a rule evaluation reported 0
+//! however much it scanned. This probe is what found that — it was written to
+//! use the counter, read zero on every Locy arm, and its first verdict said the
+//! opposite of what the timings showed. Fixed since; the column is real on both
+//! kinds of arm now.
 //!
-//! It is still weaker evidence than a counter, and this repository has
-//! repeatedly attributed a cost to a mechanism the query did not use — #267
-//! most recently. The plan-shape assertion that would settle it outright is a
-//! separate, better test: plan the two spellings and look at whether `Scan`
-//! carries a filter.
+//! Timings are reported beside it and are never the finding alone. Each block
+//! runs one predicate over one graph in one process, differing in a single
+//! place, and asserts the arms return identical rows before any comparison is
+//! made — so a ratio between them is a property of the plans, not the machine.
 //!
 //! # Two questions, two blocks of arms
 //!
@@ -312,8 +309,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ---- verdict ----------------------------------------------------------
     //
-    // Time, not `rows_scanned`: see the module note. Every comparison below is
-    // between arms already asserted to return identical rows.
+    // The verdicts read time rather than `rows_scanned`, which is now populated
+    // on both kinds of arm and printed in the table above. That is deliberate:
+    // pushdown moves rows out of `FilterExec` and into the scan's own predicate,
+    // and on a full-label scan of a low-selectivity boolean the rows *examined*
+    // barely move while the cost does. Rows examined is the right instrument for
+    // "did the planner pick a seek or a scan" (block 1); cost is the right one
+    // for "was the predicate evaluated in the cheap place" (block 2). Every
+    // comparison below is between arms already asserted to return identical
+    // rows.
     let (cypher, locy_where, locy_inline) = (&out[0], &out[1], &out[2]);
     println!("\nblock 1 — a unique indexed property (1 row of {N_NODES})");
     println!("  cypher WHERE        {:>8.3}s", cypher.seconds);

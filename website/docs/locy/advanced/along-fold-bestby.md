@@ -158,7 +158,33 @@ YIELD KEY e.action, n
 QUERY counts WHERE n >= 5 RETURN *
 ```
 
-Both are valid. Use post-FOLD `WHERE` when the filter is intrinsic to the rule's semantics. Use `QUERY WHERE` for ad-hoc filtering at call sites.
+Both are valid. Use post-FOLD `WHERE` when the filter belongs to the rule rather than to one call site. Use `QUERY WHERE` for ad-hoc filtering at call sites.
+
+In a **recursive** rule, see the caveat below before treating it as intrinsic — there, it filters the answer rather than the definition.
+
+### Caveat: in a recursive rule, it does not constrain the recursion
+
+Every example above is non-recursive, where post-FOLD `WHERE` behaves exactly like SQL `HAVING`. In a rule that references **itself**, it does not.
+
+There the filter is applied **once, to the converged answer** — not per iteration. The self-reference reads the rule's *unfiltered* folded value, so rows the threshold excludes can still derive further rows. They are correctly absent from the output *while having contributed to it*, which is what makes this hard to notice: the answer looks reasonable, and small acyclic examples often agree with the intended reading.
+
+```locy
+// WRONG if you meant "an owner only counts once it reaches 50%".
+CREATE RULE blocked AS
+MATCH (o:Entity)-[s:OWNS]->(e:Entity)
+WHERE o IS blocked          // self-reference: the stratum is recursive
+FOLD agg = MSUM(s.pct)
+WHERE agg >= 50.0           // filters the ANSWER, not the recursion
+YIELD KEY e, agg
+```
+
+An entity holding 11% is filtered out of the result, yet still satisfies `o IS blocked` on the next hop, so everything *it* owns is derived regardless. Moving the aggregate into its own rule and filtering where it is consumed does not help — the filter still sits outside the recursion.
+
+The compiler warns with `HavingInRecursivePath`; check `result.warnings()`.
+
+**This is the intended behaviour when the filter selects what you see.** A child that the threshold removes from the answer must still have been visible to its parent while the fixpoint ran — that is what probabilistic rules need, and why this is a warning rather than an error. The two intents are spelled identically, so the compiler cannot tell them apart.
+
+**If the threshold is part of the rule's definition** — an ownership or voting-control cutoff, a quorum, a cumulative-risk ceiling, reachability under a cost budget — there is no single-rule spelling for it today. Run **one non-recursive round per iteration, driving the loop from your application**, writing each round's survivors back before the next round; the post-FOLD filter applies correctly in a non-recursive stratum. This costs a round-trip per iteration.
 
 ## BEST BY (Witness Selection)
 
@@ -219,7 +245,7 @@ See the [Vector Search guide](../../guides/vector-search.md#similar_to-expressio
 
 - Use `ALONG` for accumulators (distance, risk, confidence, similarity).
 - Use `FOLD` when you need grouped summaries.
-- Use post-FOLD `WHERE` to discard groups that don't meet a threshold (e.g., `WHERE count >= 3`).
+- Use post-FOLD `WHERE` to discard groups that don't meet a threshold (e.g., `WHERE count >= 3`) — but in a recursive rule it filters the answer, not the recursion; see the caveat above.
 - Use `BEST BY` when you need one witness path, not all candidates.
 
 ## Related

@@ -338,6 +338,50 @@ CREATE RULE heavy_spender AS
 **`total_iterations` note:** non-recursive programs report `total_iterations >= 1`
 (one evaluation pass); recursive programs report the fixpoint iteration count.
 
+#### In a recursive rule, the post-FOLD WHERE does NOT constrain the recursion
+
+This is the one place the SQL `HAVING` analogy breaks, and it fails quietly.
+
+In a rule that references **itself**, the post-FOLD `WHERE` is applied **once, to
+the converged answer** — not per iteration. The self-reference therefore reads
+the rule's *unfiltered* folded value, so rows the threshold excludes can still
+derive further rows. Those rows are correctly absent from the output *while
+having contributed to it*, which is exactly why the result looks plausible.
+
+```locy
+-- WRONG if you meant "an owner only counts once it reaches 50%".
+CREATE RULE blocked AS
+    MATCH (o:Entity)-[s:OWNS]->(e:Entity)
+    WHERE o IS blocked            -- self-reference: stratum is recursive
+    FOLD agg = MSUM(s.pct)
+    WHERE agg >= 50.0             -- filters the ANSWER, not the recursion
+    YIELD KEY e, agg
+```
+
+An entity at 11% is filtered out of the result, yet still satisfies
+`o IS blocked` for the next hop, so everything it owns is derived anyway.
+Splitting the aggregate into its own rule and filtering at the consumer does not
+help either — the filter still sits outside the recursion.
+
+The compiler emits a `HavingInRecursivePath` warning for this shape. Read
+`result.warnings()`.
+
+**When it is right:** when the filter is meant to select *what you see*. A child
+that the threshold removes from the answer must still have been visible to its
+parent while the fixpoint ran — that is the intended reading for probabilistic
+rules (issue #162), and it is why this warns rather than being rejected. The two
+intents are written identically, so nothing in the syntax can tell them apart.
+
+**When you need the threshold to be part of the definition** — an ownership or
+voting-control cutoff, a quorum, a cumulative-risk ceiling, reachability under a
+cost budget — there is no single-rule spelling today. Evaluate **one
+non-recursive round per iteration and drive the loop from the host**, writing
+each round's survivors back before the next; the post-FOLD filter applies
+correctly in a non-recursive stratum. It costs a round-trip per iteration.
+
+None of this applies to a **non-recursive** rule, where the post-FOLD `WHERE`
+behaves exactly like SQL `HAVING`.
+
 ### FOLD + BEST BY Restriction
 
 BEST BY cannot be combined with a *declared lattice fold* in the same clause -- semantically contradictory (BEST BY keeps one witness row; a lattice fold aggregates across all of them). Error: `BestByWithMonotonicFold`.

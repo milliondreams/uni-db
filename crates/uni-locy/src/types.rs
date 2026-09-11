@@ -302,6 +302,23 @@ pub enum WarningCode {
     /// the pre-embedded query vectors (queries are constants per
     /// `apply_model_invocations` call).
     SharedRetrievalContext,
+    /// Issue #265: a rule that self-references *and* carries a post-FOLD
+    /// `WHERE` (HAVING). The filter is applied once to the converged answer,
+    /// not per iteration, so the self-reference reads the rule's *unfiltered*
+    /// folded value and can derive facts from groups the threshold excluded.
+    ///
+    /// That is deliberate — a non-monotone filter applied per iteration would
+    /// let a fact appear, vanish and reappear, defeating the whole-row change
+    /// test, and the post-fixpoint reading is the intended one for the PROB
+    /// case of issue #162. It is also the *only* available reading, and the two
+    /// are indistinguishable from the syntax: "filter the answer" and "the
+    /// threshold is part of the definition" are written identically. So this
+    /// warns rather than rejecting.
+    ///
+    /// The author who wanted the threshold to constrain the recursion has no
+    /// single-rule spelling for it; the message points at the host-driven
+    /// one-round-per-iteration workaround.
+    HavingInRecursivePath,
 }
 
 /// Probability semiring used to evaluate MNOR/MPROD aggregates, PROB

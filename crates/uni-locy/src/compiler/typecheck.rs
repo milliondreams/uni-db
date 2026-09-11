@@ -179,6 +179,9 @@ pub fn check(
                 // F1: clause has FOLD + recursive IS-ref (same SCC) + no ALONG
                 // → almost certainly a semantic mistake (Stress Corpus B3).
                 check_fold_in_recursive_path(rule_name, def, scc_rules, &mut warnings);
+                // #265: the same shape *plus* a post-FOLD WHERE, which does not
+                // constrain the recursion it looks like it constrains.
+                check_having_in_recursive_path(rule_name, def, scc_rules, &mut warnings);
             }
 
             // NB: deliberately outside the `is_recursive` block above — a
@@ -755,6 +758,66 @@ fn check_fold_in_recursive_path(
             rule_name: rule_name.to_string(),
         });
     }
+}
+
+/// Warn when a post-FOLD `WHERE` sits on a self-referencing rule (#265).
+///
+/// The filter runs once, over the converged answer. A self-reference therefore
+/// reads the rule's *unfiltered* folded value, and the rule can derive facts
+/// from groups the threshold excluded — while those groups are correctly absent
+/// from the output, which is what makes it hard to spot. The OFAC 50 %
+/// ownership rule is the canonical shape: an owner under the threshold is
+/// filtered out of the answer yet still qualifies everything downstream of it.
+///
+/// Deliberately a warning. The post-fixpoint reading is correct for the PROB
+/// case of #162 — a child that HAVING removes from the answer must still have
+/// been visible to its parent while the fixpoint ran — and "filter the answer"
+/// and "the threshold is part of the definition" are written identically, so
+/// nothing in the syntax says which was meant. Rejecting would refuse the
+/// intended use along with the mistaken one.
+///
+/// Fires alongside [`WarningCode::FoldInRecursivePath`] rather than replacing
+/// it: that one is about how a recursive rollup composes, this one about a
+/// filter that does not constrain what it appears to.
+fn check_having_in_recursive_path(
+    rule_name: &str,
+    def: &RuleDefinition,
+    scc_rules: &std::collections::HashSet<String>,
+    warnings: &mut Vec<CompilerWarning>,
+) {
+    if def.having.is_empty() || def.fold.is_empty() {
+        return;
+    }
+    let has_recursive_is_ref = def.where_conditions.iter().any(|cond| {
+        if let RuleCondition::IsReference(is_ref) = cond {
+            scc_rules.contains(&is_ref.rule_name.to_string())
+        } else {
+            false
+        }
+    });
+    if !has_recursive_is_ref {
+        return;
+    }
+    warnings.push(CompilerWarning {
+        code: WarningCode::HavingInRecursivePath,
+        message: format!(
+            "rule '{}' filters its FOLD result inside a recursive stratum. The \
+             post-FOLD WHERE is applied ONCE to the converged answer, not per \
+             iteration, so it does not constrain the recursion: the \
+             self-reference reads this rule's UNFILTERED folded value, and \
+             rows the threshold excludes can still derive further rows. They \
+             are absent from the output while having contributed to it, which \
+             is why the result looks plausible. This is the intended reading \
+             when the filter is meant to select what you see (issue #162). If \
+             the threshold is meant to be part of the rule's DEFINITION — an \
+             ownership or voting-control cutoff, a quorum, a cost ceiling — \
+             there is no single-rule spelling for it today: evaluate one \
+             non-recursive round per iteration and drive the loop from the \
+             host, where the post-FOLD filter does apply. (issue #265)",
+            rule_name
+        ),
+        rule_name: rule_name.to_string(),
+    });
 }
 
 // ─── Model invocation validation ─────────────────────────────────────────────

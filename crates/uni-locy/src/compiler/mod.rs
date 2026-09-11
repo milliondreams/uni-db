@@ -1238,6 +1238,95 @@ mod tests {
         );
     }
 
+    /// #265: a post-FOLD WHERE on a self-referencing rule is warned about.
+    ///
+    /// The OFAC 50 % ownership shape, reduced. `o IS blocked` makes the stratum
+    /// recursive, so `WHERE agg >= 50.0` filters the converged answer rather
+    /// than the recursion: an owner below the threshold is absent from the
+    /// output yet still qualifies rows downstream of it.
+    #[test]
+    fn issue_265_having_on_a_self_referencing_rule_warns() {
+        let prog = parse_locy(
+            "CREATE RULE blocked AS MATCH (e:Entity) WHERE e.designated = true \
+             YIELD KEY e, 100.0 AS agg \
+             CREATE RULE blocked AS MATCH (o:Entity)-[s:OWNS]->(e:Entity) \
+             WHERE o IS blocked FOLD agg = MSUM(s.pct) WHERE agg >= 50.0 \
+             YIELD KEY e, agg",
+        )
+        .unwrap();
+        let compiled = compile(&prog).unwrap();
+        assert!(
+            compiled
+                .warnings
+                .iter()
+                .any(|w| w.code == WarningCode::HavingInRecursivePath),
+            "expected HavingInRecursivePath, got: {:?}",
+            compiled.warnings
+        );
+    }
+
+    /// The negative twin: the same filter outside a recursive stratum is fine.
+    ///
+    /// Without this, a check that warned on every post-FOLD WHERE would pass
+    /// the positive case above while making the warning useless. The only
+    /// difference here is that the self-reference is replaced by a base-fact
+    /// test, which is exactly the control #265's reproduction uses.
+    #[test]
+    fn issue_265_having_without_recursion_does_not_warn() {
+        let prog = parse_locy(
+            "CREATE RULE blocked AS MATCH (e:Entity) WHERE e.designated = true \
+             YIELD KEY e, 100.0 AS agg \
+             CREATE RULE blocked AS MATCH (o:Entity)-[s:OWNS]->(e:Entity) \
+             WHERE o.designated = true FOLD agg = MSUM(s.pct) WHERE agg >= 50.0 \
+             YIELD KEY e, agg",
+        )
+        .unwrap();
+        let compiled = compile(&prog).unwrap();
+        assert!(
+            !compiled
+                .warnings
+                .iter()
+                .any(|w| w.code == WarningCode::HavingInRecursivePath),
+            "a post-FOLD WHERE outside a recursive stratum applies as written \
+             and must not warn, got: {:?}",
+            compiled.warnings
+        );
+    }
+
+    /// A recursive FOLD with no post-FOLD WHERE warns only about the rollup.
+    ///
+    /// Separates this warning from its neighbour: `FoldInRecursivePath` is
+    /// about how a recursive rollup composes, `HavingInRecursivePath` about a
+    /// filter that does not constrain what it appears to. Firing the second
+    /// whenever the first fires would make it noise.
+    #[test]
+    fn issue_265_a_recursive_fold_without_having_warns_only_about_the_fold() {
+        let prog = parse_locy(
+            "CREATE RULE r AS MATCH (a)-[:E]->(b) YIELD a, b, 0 AS total \
+             CREATE RULE r AS MATCH (a)-[:E]->(mid) WHERE mid IS r TO b \
+             FOLD total = MSUM(a.weight) YIELD a, b, total",
+        )
+        .unwrap();
+        let compiled = compile(&prog).unwrap();
+        assert!(
+            compiled
+                .warnings
+                .iter()
+                .any(|w| w.code == WarningCode::FoldInRecursivePath),
+            "the neighbouring warning must still fire, got: {:?}",
+            compiled.warnings
+        );
+        assert!(
+            !compiled
+                .warnings
+                .iter()
+                .any(|w| w.code == WarningCode::HavingInRecursivePath),
+            "no post-FOLD WHERE is present, so #265's warning must stay silent, \
+             got: {:?}",
+            compiled.warnings
+        );
+    }
+
     #[test]
     fn phase_b_f1_fires_even_when_along_present() {
         // Same recursive structure but with ALONG. F1 used to be suppressed

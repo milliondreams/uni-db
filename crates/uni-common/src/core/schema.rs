@@ -155,6 +155,28 @@ impl CrdtType {
             CrdtType::VCRegister => "VCRegister",
         }
     }
+
+    /// The SCREAMING_SNAKE name used by the Python `CrdtType.__repr__`.
+    ///
+    /// Distinct from [`CrdtType::type_name`], which renders `GCounter` where
+    /// this renders `G_COUNTER`. Both are Python-visible through different
+    /// surfaces, so neither can adopt the other's spelling; what they can share
+    /// is living beside the enum, where `#[non_exhaustive]` does not force a
+    /// catch-all and a new variant is a compile error rather than an
+    /// `"UNKNOWN"`.
+    #[must_use]
+    pub fn repr_name(&self) -> &'static str {
+        match self {
+            CrdtType::GCounter => "G_COUNTER",
+            CrdtType::GSet => "G_SET",
+            CrdtType::ORSet => "OR_SET",
+            CrdtType::LWWRegister => "LWW_REGISTER",
+            CrdtType::LWWMap => "LWW_MAP",
+            CrdtType::Rga => "RGA",
+            CrdtType::VectorClock => "VECTOR_CLOCK",
+            CrdtType::VCRegister => "VC_REGISTER",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
@@ -203,6 +225,53 @@ pub enum DataType {
 }
 
 impl DataType {
+    /// The name used by the Python `DataType.__repr__`, without the
+    /// `DataType.` prefix.
+    ///
+    /// Beside the enum rather than in the binding, because `DataType` is
+    /// `#[non_exhaustive]`: a match downstream is forced to carry a catch-all
+    /// and so cannot be compiler-checked, which is how `BinaryVector` came to
+    /// be absent from the binding's copy and fall to its `_ => "UNKNOWN"` arm.
+    /// No caller could observe that, since `PyDataType` is only built from
+    /// Python's own constructors — which have no `binary_vector` — and is never
+    /// produced from a Rust `DataType`; the omission was latent, not live.
+    /// Here the match is exhaustive and a new variant fails to build.
+    ///
+    /// The mixed casing is inherited and deliberate — scalars are
+    /// SCREAMING_SNAKE, parameterised kinds are lowercase with their argument —
+    /// and the strings are API, so they are preserved exactly rather than
+    /// tidied.
+    #[must_use]
+    pub fn repr_name(&self) -> String {
+        match self {
+            DataType::String => "STRING".to_string(),
+            DataType::Int32 => "INT32".to_string(),
+            DataType::Int64 => "INT64".to_string(),
+            DataType::Float32 => "FLOAT32".to_string(),
+            DataType::Float64 => "FLOAT64".to_string(),
+            DataType::Bool => "BOOL".to_string(),
+            DataType::Timestamp => "TIMESTAMP".to_string(),
+            DataType::Date => "DATE".to_string(),
+            DataType::Time => "TIME".to_string(),
+            DataType::DateTime => "DATETIME".to_string(),
+            DataType::Duration => "DURATION".to_string(),
+            DataType::CypherValue => "JSON".to_string(),
+            DataType::Bytes => "BYTES".to_string(),
+            DataType::Point(_) => "POINT".to_string(),
+            DataType::Btic => "BTIC".to_string(),
+            DataType::Vector { dimensions } => format!("vector({dimensions})"),
+            DataType::SparseVector { dimensions } => format!("sparse_vector({dimensions})"),
+            DataType::BinaryVector { dimensions } => format!("binary_vector({dimensions})"),
+            DataType::Crdt(ct) => format!("crdt(CrdtType.{})", ct.repr_name()),
+            DataType::List(inner) => format!("list(DataType.{})", inner.repr_name()),
+            DataType::Map(k, v) => format!(
+                "map(DataType.{}, DataType.{})",
+                k.repr_name(),
+                v.repr_name()
+            ),
+        }
+    }
+
     // Alias for compatibility/convenience if needed, but preferable to use exact types.
     #[allow(non_upper_case_globals)]
     pub const Float: DataType = DataType::Float64;
@@ -2127,6 +2196,46 @@ fn validate_reserved_property_name(name: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::value::{TemporalValue, Value};
+
+    /// The two variants a downstream catch-all was silently swallowing, plus
+    /// the nested forms, so a future tidy-up cannot change a Python-visible
+    /// string without failing here.
+    #[test]
+    fn repr_names_cover_the_variants_a_catch_all_used_to_hide() {
+        assert_eq!(
+            DataType::BinaryVector { dimensions: 64 }.repr_name(),
+            "binary_vector(64)",
+            "BinaryVector had no arm at all while this match lived downstream \
+             of a #[non_exhaustive] enum, and fell to its UNKNOWN catch-all"
+        );
+        assert_eq!(
+            DataType::SparseVector { dimensions: 30000 }.repr_name(),
+            "sparse_vector(30000)"
+        );
+        assert_eq!(DataType::Vector { dimensions: 8 }.repr_name(), "vector(8)");
+        assert_eq!(DataType::CypherValue.repr_name(), "JSON");
+
+        // Nested forms embed the `DataType.` / `CrdtType.` prefix the Python
+        // `__repr__` adds, because they used to be built by recursing through
+        // the pyclass wrapper.
+        assert_eq!(
+            DataType::List(Box::new(DataType::String)).repr_name(),
+            "list(DataType.STRING)"
+        );
+        assert_eq!(
+            DataType::Map(Box::new(DataType::String), Box::new(DataType::Int64)).repr_name(),
+            "map(DataType.STRING, DataType.INT64)"
+        );
+        assert_eq!(
+            DataType::Crdt(CrdtType::GCounter).repr_name(),
+            "crdt(CrdtType.G_COUNTER)"
+        );
+
+        // `repr_name` and `type_name` are different Python-visible spellings of
+        // the same variant and must not be collapsed into one another.
+        assert_eq!(CrdtType::GCounter.repr_name(), "G_COUNTER");
+        assert_eq!(CrdtType::GCounter.type_name(), "GCounter");
+    }
     use object_store::local::LocalFileSystem;
     use tempfile::tempdir;
 

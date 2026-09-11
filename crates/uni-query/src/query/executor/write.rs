@@ -4283,6 +4283,39 @@ impl Executor {
         }
     }
 
+    /// Whether a reversed MERGE path can still be planned.
+    ///
+    /// The head node of the walk may be unlabeled and unbound — it becomes a
+    /// `label_id = 0` scan. A node in any *later* position may not: the
+    /// traversal-target arm requires a label or a row binding and errors
+    /// otherwise. Reversal moves the original head to a later position, so a
+    /// pattern like `MERGE (a)-[:R]->(b)` with a bare `a` and a bound `b` is
+    /// legal as written and illegal reversed.
+    ///
+    /// That asymmetry predates this and is left alone; the anchor simply
+    /// declines a reversal it would trip. The cost is that a bare unlabeled
+    /// MERGE node keeps the per-row label scan — but such a node cannot be
+    /// anchored on in any case, since there is nothing to look it up by.
+    fn merge_reversal_is_legal(
+        reversed: &uni_cypher::ast::PathPattern,
+        row: &HashMap<String, Value>,
+    ) -> bool {
+        reversed
+            .elements
+            .iter()
+            .skip(1)
+            .filter_map(|e| match e {
+                PatternElement::Node(n) => Some(n),
+                _ => None,
+            })
+            .all(|n| {
+                !matches!(n.labels, uni_cypher::ast::LabelExpr::Empty)
+                    || n.variable
+                        .as_ref()
+                        .is_some_and(|v| !v.is_empty() && row.contains_key(v))
+            })
+    }
+
     pub(crate) async fn execute_merge_match(
         &self,
         pattern: &Pattern,
@@ -4307,8 +4340,38 @@ impl Executor {
             vars_in_scope.push(key.clone());
         }
 
+        // Anchor on what the input row binds, not on what was written first.
+        //
+        // This walk is MERGE's own transcription of `plan_path`'s, so neither
+        // #219's anchoring fix nor `dc232cd2a`'s ranking of it reached here. It
+        // consults boundness only for the leftmost node, which makes
+        // `MERGE (a:L)-[:R]->(b)` with `b` bound scan the whole of `L` — once
+        // per input row, since `execute_merge_match` runs per row. Measured
+        // with a fixed 400-row batch: 5.4s / 9.7s / 16.2s over labels of
+        // 5k / 10k / 20k nodes, against a flat 0.9s for the same pattern
+        // written with the bound node first (`examples/merge_anchor_probe`).
+        //
+        // Reversal is a *read-side* decision only. The create path walks the
+        // original `pattern`, so a reversed copy must not escape this loop;
+        // variable names survive reversal, so ON MATCH / ON CREATE SET see the
+        // bindings they expect either way.
+        let anchor_scope: Vec<crate::query::planner::VariableInfo> = row
+            .keys()
+            .map(|k| {
+                crate::query::planner::VariableInfo::new(
+                    k.clone(),
+                    crate::query::planner::VariableType::Node,
+                )
+            })
+            .collect();
+        let no_where = HashMap::new();
+
         // Reconstruct Match logic from Planner (simplified for MERGE pattern)
-        for path in &pattern.paths {
+        for original_path in &pattern.paths {
+            let reversed = planner
+                .reversed_for_bound_anchor(original_path, &anchor_scope, &no_where)
+                .filter(|rev| Self::merge_reversal_is_legal(rev, row));
+            let path = reversed.as_ref().unwrap_or(original_path);
             let elements = &path.elements;
             let mut i = 0;
             while i < elements.len() {

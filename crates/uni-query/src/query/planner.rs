@@ -4933,7 +4933,7 @@ impl QueryPlanner {
             .and_then(|inner| Self::equality_anchored_properties(inner).remove(variable))
     }
 
-    fn reversed_for_bound_anchor(
+    pub(crate) fn reversed_for_bound_anchor(
         &self,
         path: &PathPattern,
         vars_in_scope: &[VariableInfo],

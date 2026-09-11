@@ -129,6 +129,7 @@ pub mod repro_issue_181_flush_resurrects_detached_edge;
 pub mod repro_issue_182_delete_before_first_flush;
 // #249: declaring a property on a label that already has flushed data leaves
 // the Lance dataset unchanged, so the next write to that label is rejected.
+pub mod issue_225_merge_bound_anchor;
 pub mod issue_266_bulk_update_lost_on_inserting_handle;
 pub mod issue_268_reverse_traversal_anchor;
 pub mod issue_269_bulk_rows_absent_from_vid_labels_index;

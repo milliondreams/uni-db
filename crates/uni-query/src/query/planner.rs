@@ -150,7 +150,7 @@ fn find_var_in_scope<'a>(vars: &'a [VariableInfo], name: &str) -> Option<&'a Var
 }
 
 /// Check if a variable is in scope.
-fn is_var_in_scope(vars: &[VariableInfo], name: &str) -> bool {
+pub(crate) fn is_var_in_scope(vars: &[VariableInfo], name: &str) -> bool {
     find_var_in_scope(vars, name).is_some()
 }
 
@@ -454,7 +454,7 @@ fn infer_unwind_output_type(expr: &Expr, vars_in_scope: &[VariableInfo]) -> Vari
 }
 
 /// Collect all variable names referenced in an expression
-fn collect_expr_variables(expr: &Expr) -> Vec<String> {
+pub(crate) fn collect_expr_variables(expr: &Expr) -> Vec<String> {
     let mut vars = Vec::new();
     collect_expr_variables_inner(expr, &mut vars);
     vars
@@ -4790,21 +4790,43 @@ impl QueryPlanner {
         pattern: &Pattern,
         initial_vars: &[VariableInfo],
     ) -> Result<LogicalPlan> {
-        let mut vars_in_scope: Vec<VariableInfo> = initial_vars.to_vec();
+        let mut vars_in_scope = Vec::new();
+        self.plan_pattern_scoped(pattern, initial_vars, &mut vars_in_scope, &HashMap::new())
+    }
+
+    /// [`Self::plan_pattern`], reporting the variables the pattern brought into
+    /// scope and accepting the anchoring hints a WHERE clause provides.
+    ///
+    /// `plan_pattern` discarded both. The scope is what
+    /// [`Self::plan_where_clause`] needs in order to validate and push a
+    /// predicate, so a caller without it had no choice but to hand-build a
+    /// `Filter` above the pattern — which is how a Locy rule-body WHERE came to
+    /// miss `Scan.filter`, and with it index selection, entirely (#226).
+    ///
+    /// `where_anchored` reaches `reversed_for_bound_anchor` through
+    /// [`Self::plan_path`], so a caller that knows its predicate can also get
+    /// the pattern anchored on it rather than on whichever node it wrote first.
+    /// Callers with no WHERE pass an empty map; a node's own inline equality
+    /// still ranks, since the anchor reads that off the pattern.
+    pub(crate) fn plan_pattern_scoped(
+        &self,
+        pattern: &Pattern,
+        initial_vars: &[VariableInfo],
+        vars_in_scope: &mut Vec<VariableInfo>,
+        where_anchored: &HashMap<String, String>,
+    ) -> Result<LogicalPlan> {
+        vars_in_scope.clear();
+        vars_in_scope.extend_from_slice(initial_vars);
         let vars_before_pattern = vars_in_scope.len();
         let mut plan = LogicalPlan::Empty;
-        // No MATCH-level WHERE reaches this entry point; a node's own inline
-        // equality still ranks, since `reversed_for_bound_anchor` reads that
-        // off the pattern.
-        let where_anchored = HashMap::new();
         for path in &pattern.paths {
             plan = self.plan_path(
                 path,
                 plan,
-                &mut vars_in_scope,
+                vars_in_scope,
                 false,
                 vars_before_pattern,
-                &where_anchored,
+                where_anchored,
             )?;
         }
         Ok(plan)
@@ -4867,7 +4889,7 @@ impl QueryPlanner {
     /// Only `AND`-separated conjuncts count: a branch of an `OR` constrains
     /// nothing on its own, and equality only, so a wide `>` cannot drag the
     /// anchor onto a worse end.
-    fn equality_anchored_properties(predicate: &Expr) -> HashMap<String, String> {
+    pub(crate) fn equality_anchored_properties(predicate: &Expr) -> HashMap<String, String> {
         let mut anchored = HashMap::new();
         for conjunct in Self::split_and_conjuncts(predicate) {
             let Expr::BinaryOp {
@@ -6995,7 +7017,7 @@ impl QueryPlanner {
     ///
     /// When `optional_vars` is non-empty, the Filter will preserve rows where
     /// any of those variables are NULL (for OPTIONAL MATCH semantics).
-    fn plan_where_clause(
+    pub(crate) fn plan_where_clause(
         &self,
         predicate: &Expr,
         plan: LogicalPlan,

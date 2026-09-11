@@ -438,7 +438,9 @@ fn infer_expr_type(expr: &Expr, node_vars: &HashSet<String>) -> DataType {
 }
 
 use super::df_graph::locy_fixpoint::{DerivedScanEntry, DerivedScanRegistry, DerivedScanView};
-use super::planner::{LogicalPlan, QueryPlanner};
+use super::planner::{
+    LogicalPlan, QueryPlanner, VariableInfo, collect_expr_variables, is_var_in_scope,
+};
 use super::planner_locy_types::{
     FOLD_DISCRIMINATOR_COL_PREFIX, ISNOT_VID_COL_PREFIX, LocyClausePlan, LocyCommand, LocyIsRef,
     LocyRulePlan, LocyStratum, LocyYieldColumn,
@@ -1148,15 +1150,19 @@ impl<'a> LocyPlanBuilder<'a> {
         let mut clause_node_vars = HashSet::new();
         collect_match_node_vars(clause, &mut clause_node_vars);
 
-        // Step 1: MATCH pattern → Scan→Traverse chain
-        let mut plan = self
-            .planner
-            .plan_pattern(&clause.match_pattern, &[])
-            .context("planning MATCH pattern")?;
-
-        // Step 2: WHERE filter (non-IS conditions only).
-        // Conditions referencing IS-ref-introduced variables must be deferred
-        // until after the IS-ref CrossJoin resolves. This includes:
+        // Step 1: decide which WHERE conjuncts can reach the pattern.
+        //
+        // This used to run *after* the pattern was planned, which forced the
+        // predicate into a hand-built `Filter` above it. A `Filter` node is
+        // lowered straight to `FilterExec`, and index selection reads only
+        // `Scan.filter`, so a rule-body WHERE consulted no index and filtered a
+        // fully materialised scan — the same predicate written inline as
+        // `(e:Entity {blocked: true})` was measured at a fifth of the cost
+        // (#226). Hoisting the partition lets the predicate be planned *with*
+        // the pattern instead.
+        //
+        // Conditions referencing IS-ref-introduced variables must still be
+        // deferred until after the IS-ref CrossJoin resolves. This includes:
         //   - Target variables (e.g., `pub` from `c IS rule TO pub`)
         //   - Non-KEY value columns from the target rule's yield schema
         //     (e.g., `relevance` from a rule that YIELDs KEY c, KEY pub, relevance)
@@ -1197,8 +1203,50 @@ impl<'a> LocyPlanBuilder<'a> {
                     .partition(|e| expr_references_any(e, &is_ref_deferred_vars))
             };
 
-        if !immediate_filter_exprs.is_empty() {
-            let predicate = combine_with_and(&immediate_filter_exprs);
+        // Step 2: MATCH pattern → Scan→Traverse chain.
+        //
+        // The immediate conjuncts are handed in as anchoring hints, so an
+        // equality on the pattern's *far* node can seed the scan rather than
+        // being re-applied above the traversal.
+        let where_anchored = if immediate_filter_exprs.is_empty() {
+            HashMap::new()
+        } else {
+            QueryPlanner::equality_anchored_properties(&combine_with_and(&immediate_filter_exprs))
+        };
+        let mut pattern_vars: Vec<VariableInfo> = Vec::new();
+        let mut plan = self
+            .planner
+            .plan_pattern_scoped(
+                &clause.match_pattern,
+                &[],
+                &mut pattern_vars,
+                &where_anchored,
+            )
+            .context("planning MATCH pattern")?;
+
+        // Step 2b: push what the pattern's own scope can account for.
+        //
+        // `plan_where_clause` validates every variable against that scope and
+        // rejects anything it does not know, so a Locy-only binding — a
+        // generator output, an ALONG variable, a column another clause
+        // introduces — must not be handed to it. Partitioning on the scope is
+        // deliberate rather than catching the error afterwards: a fallback
+        // triggered by a failure cannot tell "this predicate belongs above the
+        // pattern" from "pushing it broke", and would quietly keep working
+        // while the optimisation stopped happening.
+        let (pushable, unpushable): (Vec<&Expr>, Vec<&Expr>) = immediate_filter_exprs
+            .iter()
+            .partition(|e| expr_vars_all_in_scope(e, &pattern_vars));
+
+        if !pushable.is_empty() {
+            let predicate = combine_with_and(&pushable);
+            plan = self
+                .planner
+                .plan_where_clause(&predicate, plan, &pattern_vars, HashSet::new())
+                .context("planning rule-body WHERE")?;
+        }
+        if !unpushable.is_empty() {
+            let predicate = combine_with_and(&unpushable);
             plan = LogicalPlan::Filter {
                 input: Box::new(plan),
                 predicate,
@@ -1976,6 +2024,19 @@ fn combine_with_and(exprs: &[&Expr]) -> Expr {
 /// Used to partition WHERE conditions into those that can be applied before
 /// IS-ref joins (immediate) vs those that must wait until after (deferred),
 /// when conditions reference IS-ref target variables not yet in the plan.
+/// Every variable `expr` names is already in `vars`.
+///
+/// The gate on handing a conjunct to `plan_where_clause`, which validates
+/// against the pattern's scope and errors on anything outside it. Locy binds
+/// names the Cypher pattern never sees — generator outputs, `ALONG` variables,
+/// columns another clause introduces — so a predicate over one of those belongs
+/// in a `Filter` above the pattern and must not be offered for pushdown.
+fn expr_vars_all_in_scope(expr: &Expr, vars: &[VariableInfo]) -> bool {
+    collect_expr_variables(expr)
+        .iter()
+        .all(|v| is_var_in_scope(vars, v))
+}
+
 fn expr_references_any(e: &Expr, vars: &HashSet<String>) -> bool {
     match e {
         Expr::Variable(v) => vars.contains(v.as_str()),
@@ -2982,6 +3043,89 @@ mod tests {
         assert!(plan_is_project(&result.body));
         assert!(result.is_refs.is_empty());
         assert!(result.along_bindings.is_empty());
+    }
+
+    /// A rule-body `WHERE` over the pattern's own variables must reach
+    /// `Scan.filter`, not sit in a `Filter` above the scan (#226).
+    ///
+    /// The distinction is not cosmetic. `df_planner` lowers a `Filter` node
+    /// straight to `FilterExec`, and `build_indexed_property_pushdown` reads
+    /// **only** `Scan.filter`, so a predicate left above the scan consults no
+    /// index and filters a fully materialised scan. Measured on an indexed
+    /// boolean over 40k vertices, the rule-body spelling cost 5.8x plain Cypher
+    /// while the identical predicate written inline as `(e:Entity {b: true})`
+    /// cost 1.1x — the whole difference being which node held the predicate.
+    ///
+    /// Asserting the plan shape rather than a duration is what makes this a
+    /// gate: a timing guard on the same behaviour would be at the mercy of the
+    /// machine, and would still pass if pushdown regressed on a fast enough box.
+    #[test]
+    fn issue_226_rule_body_where_reaches_the_scan() {
+        let planner = test_planner();
+        let builder = LocyPlanBuilder::new(&planner);
+
+        // `n.age > 21` — a property access on the pattern's own variable, so
+        // every name it uses is in the pattern's scope and it is pushable.
+        let clause = CompiledClause {
+            match_pattern: node_pattern("n"),
+            where_conditions: vec![RuleCondition::Expression(Expr::BinaryOp {
+                left: Box::new(Expr::Property(
+                    Box::new(Expr::Variable("n".to_string())),
+                    "age".to_string(),
+                )),
+                op: BinaryOp::Gt,
+                right: Box::new(Expr::Literal(CypherLiteral::Integer(21))),
+            })],
+            along: vec![],
+            fold: vec![],
+            require: vec![],
+            having: vec![],
+            best_by: None,
+            output: simple_yield_output(&["n"]),
+            priority: None,
+            model_invocations: vec![],
+            hidden_yield_cols: vec![],
+        };
+        let yield_cols = [yield_col("n", true)];
+        let catalog = HashMap::new();
+        let names = HashSet::new();
+
+        let result = builder
+            .build_clause(
+                &clause,
+                &yield_cols,
+                false,
+                ClauseCtx {
+                    stratum_rule_names: &names,
+                    rule_catalog: &catalog,
+                    node_vars: &HashSet::new(),
+                    deriv_vars: &[],
+                    is_recursive: false,
+                    clause_index: 0,
+                },
+                &test_classifier_ctx(),
+            )
+            .unwrap();
+
+        // Project → (scan). Anything between the projection and the scan means
+        // the predicate did not make it down.
+        let mut node = &result.body;
+        while let LogicalPlan::Project { input, .. } | LogicalPlan::LocyProject { input, .. } = node
+        {
+            node = input;
+        }
+        let filter = match node {
+            LogicalPlan::ScanAll { filter, .. } | LogicalPlan::Scan { filter, .. } => filter,
+            LogicalPlan::Filter { .. } => panic!(
+                "the rule-body WHERE is still a Filter node above the scan, so it \
+                 reaches neither Scan.filter nor index selection (#226)"
+            ),
+            other => panic!("expected a scan under the projection, got {other:?}"),
+        };
+        assert!(
+            filter.is_some(),
+            "the scan carries no filter, so `n.age > 21` was dropped or left above it"
+        );
     }
 
     #[test]

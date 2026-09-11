@@ -261,3 +261,51 @@ async fn issue_225_a_named_relationship_is_still_bound() -> Result<()> {
     assert_eq!(n.rows()[0].get::<i64>("n")?, 1, "MERGE created a duplicate");
     Ok(())
 }
+
+/// A keyed far endpoint must not drop MERGE onto the per-row plan.
+///
+/// `MERGE (a)-[e:R]->(b:L {k: v})` with `a` bound and `b` found-or-created was
+/// served by neither fast path — `merge_single_node_fastpath` wants a lone node
+/// and `merge_relationship_fastpath_shape` rejects an endpoint with properties —
+/// so every row rebuilt a `LogicalPlan` and ran a full DataFusion planning pass.
+/// Measured at 20 000 vertices with a 400-row batch: 0.81s before, 0.065s after,
+/// against a 0.11s MATCH+CREATE floor.
+///
+/// Compared against that floor rather than an absolute threshold, so the machine
+/// divides out. The fast path can legitimately come in *under* the floor — it
+/// resolves one endpoint where the floor's two-MATCH form resolves two — so the
+/// guard is one-sided.
+#[tokio::test]
+async fn issue_225_a_keyed_far_endpoint_keeps_a_fast_path() -> Result<()> {
+    const KEYED: &str = "UNWIND $batch AS r \
+                         MATCH (a:Entity {uid: r.src}) \
+                         MERGE (a)-[e:OWNS]->(b:Entity {uid: r.dst})";
+    // The same writes with no MERGE at all.
+    const FLOOR: &str = "UNWIND $batch AS r \
+                         MATCH (a:Entity {uid: r.src}), (b:Entity {uid: r.dst}) \
+                         CREATE (a)-[e:OWNS]->(b)";
+
+    let db = graph(LARGE).await?;
+    let (keyed, keyed_created) = run_on(&db, LARGE, KEYED).await?;
+    let (floor, floor_created) = run_on(&db, LARGE, FLOOR).await?;
+
+    assert_eq!(
+        keyed_created, BATCH,
+        "the keyed arm linked {keyed_created} of {BATCH} pairs"
+    );
+    assert_eq!(
+        floor_created, BATCH,
+        "the floor arm linked {floor_created} of {BATCH} pairs"
+    );
+
+    let ratio = keyed / floor.max(1e-9);
+    eprintln!("keyed endpoint {keyed:.3}s vs MATCH+CREATE floor {floor:.3}s = {ratio:.2}x");
+    assert!(
+        ratio < 3.0,
+        "a keyed far endpoint cost {ratio:.2}x the MATCH+CREATE floor \
+         ({keyed:.3}s vs {floor:.3}s), so MERGE is running its per-row plan for \
+         this shape instead of resolving the endpoint from the batch's key map \
+         (#225)."
+    );
+    Ok(())
+}

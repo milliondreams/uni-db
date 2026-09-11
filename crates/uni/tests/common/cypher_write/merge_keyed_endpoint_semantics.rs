@@ -23,7 +23,8 @@ use uni_db::{Uni, Value};
 async fn db() -> Result<Uni> {
     let db = Uni::in_memory().build().await?;
     let tx = db.session().tx().await?;
-    tx.execute("CREATE LABEL E (uid STRING, tag STRING)").await?;
+    tx.execute("CREATE LABEL E (uid STRING, tag STRING)")
+        .await?;
     tx.execute("CREATE EDGE TYPE R FROM E TO E").await?;
     tx.commit().await?;
     Ok(db)
@@ -87,7 +88,8 @@ async fn an_unlinked_node_with_the_same_key_is_not_reused() -> Result<()> {
 async fn the_same_key_from_two_sources_creates_two_nodes() -> Result<()> {
     let db = db().await?;
     let tx = db.session().tx().await?;
-    tx.execute("CREATE (:E {uid: 'a1'}), (:E {uid: 'a2'})").await?;
+    tx.execute("CREATE (:E {uid: 'a1'}), (:E {uid: 'a2'})")
+        .await?;
     tx.commit().await?;
 
     let batch = Value::List(vec![

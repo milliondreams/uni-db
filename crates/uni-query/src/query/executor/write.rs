@@ -197,6 +197,21 @@ fn unsupported_copy_format(format: &str) -> anyhow::Error {
     anyhow!("COPY TO only supports 'parquet' and 'csv' formats, got '{format}'")
 }
 
+/// The shape `merge_relationship_keyed_fastpath_shape` recognises.
+struct MergeRelKeyedShape<'p> {
+    /// The endpoint resolved from the input row.
+    bound_var: String,
+    /// The endpoint to find-or-create. Guaranteed a variable, one label and a
+    /// non-empty static map literal.
+    keyed: &'p NodePattern,
+    /// `keyed`'s label, schema-cased.
+    keyed_label: String,
+    /// Direction to walk FROM the bound endpoint TOWARDS the keyed one.
+    probe_dir: uni_store::storage::direction::Direction,
+    type_id: u32,
+    rel_var: Option<String>,
+}
+
 impl Executor {
     /// Extracts labels from a node value.
     ///
@@ -1641,6 +1656,133 @@ impl Executor {
     /// filters only the general path applies). Any deviation returns `None` and
     /// the caller keeps the general path. The caller still verifies per row that
     /// both endpoints are actually bound to vids.
+    /// A relationship MERGE with one bound endpoint and one found-or-created by
+    /// key: `MATCH (a …) MERGE (a)-[:R]->(b:L {k: v})`.
+    ///
+    /// Neither existing detector covers it — `merge_single_node_fastpath` wants
+    /// a lone node, and `merge_relationship_fastpath_shape` rejects an endpoint
+    /// carrying properties — so it fell to the per-row plan, at ~7x the
+    /// MATCH+CREATE floor for a batched ingest.
+    ///
+    /// The keyed endpoint must carry a variable. Without one,
+    /// `execute_create_pattern` hands back no vid, and the created node could
+    /// not be folded into the batch's key map — which is a correctness
+    /// requirement, not an optimisation: a later row merging the same key from
+    /// the same source has to match what this row created.
+    fn merge_relationship_keyed_fastpath_shape<'p>(
+        &self,
+        pattern: &'p Pattern,
+    ) -> Option<MergeRelKeyedShape<'p>> {
+        if pattern.paths.len() != 1 {
+            return None;
+        }
+        let path = &pattern.paths[0];
+        // A path variable needs every element bound to build `Value::Path`, and
+        // the match outcome here binds no edge. Leave it to the general path.
+        if path.variable.is_some() || path.shortest_path_mode.is_some() {
+            return None;
+        }
+        let [
+            PatternElement::Node(left),
+            PatternElement::Relationship(r),
+            PatternElement::Node(right),
+        ] = path.elements.as_slice()
+        else {
+            return None;
+        };
+        if r.range.is_some()
+            || r.properties.is_some()
+            || r.where_clause.is_some()
+            || r.types.names().len() != 1
+        {
+            return None;
+        }
+
+        // "Plain" = resolved from the input row. A label on it is a filter only
+        // the general path applies, so it disqualifies — stricter than
+        // `merge_relationship_fastpath_shape`, which can afford it because both
+        // its endpoints are already bound.
+        let is_plain = |n: &NodePattern| {
+            n.variable.as_ref().is_some_and(|v| !v.is_empty())
+                && n.properties.is_none()
+                && n.where_clause.is_none()
+                && n.labels.names().is_empty()
+        };
+        // "Keyed" = one label plus a non-empty static map literal.
+        let keyed_ok = |n: &NodePattern| {
+            n.variable.as_ref().is_some_and(|v| !v.is_empty())
+                && n.where_clause.is_none()
+                && n.labels.names().len() == 1
+                && matches!(&n.properties, Some(Expr::Map(e)) if !e.is_empty())
+        };
+
+        // Exactly one of each; both-plain is the other detector's job.
+        let (plain, keyed, plain_is_left) = match (
+            is_plain(left),
+            keyed_ok(right),
+            is_plain(right),
+            keyed_ok(left),
+        ) {
+            (true, true, _, _) => (left, right, true),
+            (_, _, true, true) => (right, left, false),
+            _ => return None,
+        };
+
+        let type_name = &r.types.names()[0];
+        let type_id = if self.config.strict_schema {
+            self.storage
+                .schema_manager()
+                .schema()
+                .edge_type_id_by_name_case_insensitive(type_name)?
+        } else {
+            self.storage
+                .schema_manager()
+                .get_or_assign_edge_type_id(type_name)
+        };
+        // The direction to walk FROM the bound endpoint TOWARDS the keyed one,
+        // so both spellings of the same link probe correctly.
+        let ast_dir = match r.direction {
+            uni_cypher::ast::Direction::Outgoing => {
+                uni_store::storage::direction::Direction::Outgoing
+            }
+            uni_cypher::ast::Direction::Incoming => {
+                uni_store::storage::direction::Direction::Incoming
+            }
+            uni_cypher::ast::Direction::Both => return None,
+        };
+        let probe_dir = if plain_is_left {
+            ast_dir
+        } else {
+            match ast_dir {
+                uni_store::storage::direction::Direction::Outgoing => {
+                    uni_store::storage::direction::Direction::Incoming
+                }
+                uni_store::storage::direction::Direction::Incoming => {
+                    uni_store::storage::direction::Direction::Outgoing
+                }
+                other => other,
+            }
+        };
+
+        // Canonical, or the scan reads a different table than the create writes.
+        let keyed_names = keyed.labels.names();
+        let keyed_label = self
+            .storage
+            .schema_manager()
+            .schema()
+            .canonical_label_name(&keyed_names[0])
+            .unwrap_or_else(|| keyed_names[0].clone());
+
+        Some(MergeRelKeyedShape {
+            bound_var: plain.variable.clone().unwrap_or_default(),
+            keyed,
+            keyed_label,
+            probe_dir,
+            type_id,
+            rel_var: r.variable.clone().filter(|v| !v.is_empty()),
+        })
+    }
+
     fn merge_relationship_fastpath_shape(
         &self,
         pattern: &Pattern,
@@ -2413,6 +2555,17 @@ impl Executor {
         // The shape is the same for every row, so it is detected once.
         let fastpath = self.merge_single_node_fastpath(pattern);
 
+        // The same batched key resolution serves a relationship MERGE whose far
+        // endpoint is found-or-created. Detected here rather than beside the
+        // other relationship fast path because the key batch below has to be
+        // built for it, and that runs first. `on_match` is checked at the point
+        // of use, as the other relationship path does.
+        let rel_keyed = if fastpath.is_none() {
+            self.merge_relationship_keyed_fastpath_shape(pattern)
+        } else {
+            None
+        };
+
         // Build the per-batch L0 snapshot once (issue #69 Phase C): the per-row
         // fast path then resolves L0/intra-batch matches with an O(1) lookup
         // instead of re-walking L0 for every row. `key_names` is the sorted
@@ -2432,7 +2585,14 @@ impl Executor {
         // `None` disables it for CRDT-bearing labels (the prefetch-hit read
         // skips CRDT normalization).
         let mut merge_prefetch: Option<Prefetch> = None;
-        if let Some((node, label)) = &fastpath {
+        // Either shape resolves its keys the same way: the machinery is keyed on
+        // `(label, key_names)`, not on the pattern it came from.
+        let key_source: Option<(&NodePattern, &String)> = match (&fastpath, &rel_keyed) {
+            (Some((node, label)), _) => Some((node, label)),
+            (None, Some(shape)) => Some((shape.keyed, &shape.keyed_label)),
+            _ => None,
+        };
+        if let Some((node, label)) = key_source {
             let mut key_names: Vec<String> = match &node.properties {
                 Some(Expr::Map(entries)) => entries.iter().map(|(k, _)| k.clone()).collect(),
                 _ => Vec::new(),
@@ -2517,7 +2677,8 @@ impl Executor {
         } else {
             None
         };
-        let rel_graph_ctx = rel_fast.as_ref().map(|_| {
+        let rel_keyed_active = rel_keyed.is_some() && on_match_empty;
+        let rel_graph_ctx = (rel_fast.is_some() || rel_keyed_active).then(|| {
             let l0_context = match ctx {
                 Some(c) => crate::query::df_graph::L0Context::from_query_context(c),
                 None => crate::query::df_graph::L0Context::empty(),
@@ -2582,6 +2743,135 @@ impl Executor {
                     .await?;
                 results.extend(row_out);
                 continue;
+            }
+
+            // Keyed-endpoint relationship fast path: one endpoint bound, the
+            // other found-or-created by key.
+            //
+            // The decision is made before anything is written, so falling
+            // through leaves the row exactly as it was found.
+            if let (true, Some(shape), Some(graph_ctx)) =
+                (rel_keyed_active, rel_keyed.as_ref(), rel_graph_ctx.as_ref())
+                && let Some(Some((key_props, key_tuple))) = row_fast.get(idx)
+                && let Some(bound_vid) = row
+                    .get(&shape.bound_var)
+                    .and_then(|v| Self::vid_from_value(v).ok())
+            {
+                // Live candidates for this key, re-verified: the persisted map
+                // is a snapshot, and an earlier row of this batch may have
+                // deleted a candidate or rewritten its key.
+                let candidates: Vec<Vid> = fast_persisted
+                    .get(key_tuple)
+                    .into_iter()
+                    .flatten()
+                    .chain(fast_existing.get(key_tuple).into_iter().flatten())
+                    .copied()
+                    .filter(|vid| {
+                        !uni_store::runtime::l0_visibility::is_vertex_deleted(*vid, ctx)
+                            && !Self::vid_overrides_break_key(*vid, key_props, ctx)
+                    })
+                    .collect();
+
+                // A whole-pattern match needs a candidate that is also a
+                // neighbour. A candidate that is NOT a neighbour must not be
+                // reused — the pattern misses and a new node is created, which
+                // is what `merge_keyed_endpoint_semantics` pins.
+                let matched = if candidates.is_empty() {
+                    None
+                } else {
+                    let by_vid: std::collections::HashSet<Vid> =
+                        candidates.iter().copied().collect();
+                    let hits: Vec<Vid> = graph_ctx
+                        .get_neighbors(bound_vid, shape.type_id, shape.probe_dir)
+                        .into_iter()
+                        .map(|(n, _eid)| n)
+                        .filter(|n| by_vid.contains(n))
+                        .collect();
+                    // Two or more matches means the general path's one-row-per-
+                    // match semantics, which this branch does not reproduce.
+                    match hits.len() {
+                        0 => Some(None),
+                        1 => Some(Some(hits[0])),
+                        // The general path emits one row per match; this branch
+                        // does not reproduce that, so hand the row back
+                        // untouched. `None` here means "not served".
+                        _ => None,
+                    }
+                };
+
+                // `None` = not served, fall through with the row exactly as it
+                // was found; `Some(None)` = create; `Some(Some(vid))` = match.
+                if let Some(outcome) = matched {
+                    match outcome {
+                        // A matched *named* edge would have to be bound to the
+                        // edge already there, which this branch cannot do; the
+                        // general path materialises it.
+                        Some(_) if shape.rel_var.is_some() => {}
+                        Some(vid) => {
+                            let empty = Prefetch::default();
+                            let props = read_vertex_props_with_prefetch(
+                                vid,
+                                merge_prefetch.as_ref().unwrap_or(&empty),
+                                prop_manager,
+                                ctx,
+                            )
+                            .await?;
+                            row.insert(
+                                shape.keyed.variable.clone().unwrap_or_default(),
+                                Self::build_node_map(vid, &shape.keyed_label, props),
+                            );
+                            Self::bind_path_variables(&path_pattern, &mut row, &temp_vars);
+                            results.push(row);
+                            continue;
+                        }
+                        None => {
+                            let writer: &uni_store::Writer = writer_lock.as_ref();
+                            let seed_props = self
+                                .on_create_seed_props(on_create, &row, prop_manager, params, ctx)
+                                .await?;
+                            self.execute_create_pattern(
+                                &path_pattern,
+                                &mut row,
+                                writer,
+                                prop_manager,
+                                params,
+                                ctx,
+                                tx_l0_override,
+                                Some(&seed_props),
+                            )
+                            .await?;
+                            if let Some(set) = on_create {
+                                self.execute_set_items_locked(
+                                    &set.items,
+                                    &mut row,
+                                    writer,
+                                    prop_manager,
+                                    params,
+                                    ctx,
+                                    tx_l0_override,
+                                    &Prefetch::default(),
+                                )
+                                .await?;
+                            }
+                            // Fold the new vid forward. Required, not an
+                            // optimisation: a later row merging the same key from
+                            // the same source must match this node, and it only
+                            // counts as a match if it is among the candidates.
+                            if let Some(new_vid) = row
+                                .get(shape.keyed.variable.as_deref().unwrap_or(""))
+                                .and_then(|v| Self::vid_from_value(v).ok())
+                            {
+                                fast_existing
+                                    .entry(key_tuple.clone())
+                                    .or_default()
+                                    .push(new_vid);
+                            }
+                            Self::bind_path_variables(&path_pattern, &mut row, &temp_vars);
+                            results.push(row);
+                            continue;
+                        }
+                    }
+                }
             }
 
             // RC3 relationship fast path: bound endpoints → resolve edge

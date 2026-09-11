@@ -1028,6 +1028,35 @@ impl Schema {
         })
     }
 
+    /// Returns the scalar index a seek on this label/property could use.
+    ///
+    /// The sibling of [`Self::vector_index_for_property`] and friends for the
+    /// scalar kinds, so a plan-time caller can ask whether an equality on a
+    /// property is backed by an index without reaching for an async catalog
+    /// read. Used by the planner to rank candidate pattern anchors (#268).
+    ///
+    /// A composite index only answers for its **leading** column: a `Hash` over
+    /// `(a, b)` cannot seek `a` alone, so matching any member the way
+    /// [`Self::fulltext_index_for_property`] does would over-claim. `BTree`
+    /// could serve a prefix, but the distinction is not worth a per-kind rule
+    /// for a caller that only needs "is a seek plausible here".
+    pub fn scalar_index_for_property(
+        &self,
+        label: &str,
+        property: &str,
+    ) -> Option<&ScalarIndexConfig> {
+        self.indexes.iter().find_map(|idx| {
+            if let IndexDefinition::Scalar(config) = idx
+                && config.label == label
+                && config.properties.first().is_some_and(|p| p == property)
+                && config.metadata.status == IndexStatus::Online
+            {
+                return Some(config);
+            }
+            None
+        })
+    }
+
     /// Get label metadata with case-insensitive lookup.
     ///
     /// This allows queries to match labels regardless of case, providing

@@ -105,7 +105,7 @@ async fn repro_batch_edge_props_resurrects_deleted_edge() {
     // eids are keyed as Vid(eid) in the result map (see get_batch_edge_props).
     let key = Vid::from(eid.as_u64());
     let res = pm
-        .get_batch_edge_props(&[eid], &["weight"], None)
+        .get_batch_edge_props(&[eid], &["weight"], None, None)
         .await
         .unwrap();
 
@@ -207,7 +207,7 @@ async fn a_delta_tombstoned_edge_is_not_resurrected_from_main_edges() {
     let key = Vid::from(eid.as_u64());
 
     let res = pm
-        .get_batch_edge_props(&[eid], &["weight"], None)
+        .get_batch_edge_props(&[eid], &["weight"], None, None)
         .await
         .unwrap();
     assert!(

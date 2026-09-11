@@ -701,6 +701,7 @@ A commit notification describing the effects of a committed transaction.
 | `tx_id` | `str` |
 | `session_id` | `str` |
 | `causal_version` | `int` |
+| `dropped_before` | `int` |
 
 ---
 

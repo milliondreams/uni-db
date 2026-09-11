@@ -436,12 +436,93 @@ fn value_from_column_inner(
 ///
 /// For DateTime/Timestamp/Date/Time, delegates to [`super::arrow_convert::arrow_to_value`].
 /// For all other types, decodes via [`value_from_column`] and converts.
+///
+/// # The scalar arms do not go through `serde_json` (#228)
+///
+/// Everything not named in the rich-type list below used to route through
+/// [`value_from_column`], which returns a **`serde_json::Value`**, and then
+/// convert that to a `uni_common::Value`. For an `Int` or a `Float` column that
+/// allocated a `serde_json::Value` per cell to carry a number both sides
+/// already represent natively.
+///
+/// The reason to remove it is **correctness, not speed** — and the distinction
+/// is measured, not assumed. `serde_json::json!(v)` is
+/// `Number::from_f64(v).map_or(Value::Null, ..)`, which has no representation
+/// for `NaN` or an infinity and maps both to `Null`. A non-finite `Float`
+/// property therefore read back as null rather than as itself, with no error
+/// anywhere: a silent wrong answer on every delta-table read, for edges and
+/// vertices alike. Pinned by `bugs::issue_228_edge_prop_value_fidelity`.
+///
+/// Removing the intermediate did **not** measurably change hydration cost:
+/// against LDBC SF1's `(Forum)-[:HAS_MEMBER]->(Person).joinDate`
+/// (`examples/edge_hydration_probe.rs`) the differential moved from 8 294 ms to
+/// 8 302 ms, inside run-to-run noise. A `perf` profile says why — the query's
+/// time is in the Lance scan and decode that reads the column, not in the
+/// per-cell conversion. Do not cite this arm as a performance fix.
+///
+/// The scalar arms are otherwise equivalent to what the JSON round trip
+/// produced: an integer column arrived as an i64-backed `Number` and became
+/// `Value::Int`, a float column as an f64-backed one and became `Value::Float`.
+/// Only the non-finite case changes.
 pub fn decode_column_value(
     col: &dyn Array,
     data_type: &DataType,
     row: usize,
     crdt_mode: CrdtDecodeMode,
 ) -> anyhow::Result<uni_common::Value> {
+    // Scalars first: these are the common case and need no intermediate.
+    match data_type {
+        DataType::Int32 => {
+            let v = col
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| anyhow!("Invalid int32 col"))?
+                .value(row);
+            return Ok(uni_common::Value::Int(i64::from(v)));
+        }
+        DataType::Int64 => {
+            let v = col
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| anyhow!("Invalid int64 col"))?
+                .value(row);
+            return Ok(uni_common::Value::Int(v));
+        }
+        DataType::Float32 => {
+            let v = col
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| anyhow!("Invalid float32 col"))?
+                .value(row);
+            return Ok(uni_common::Value::Float(f64::from(v)));
+        }
+        DataType::Float64 => {
+            let v = col
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| anyhow!("Invalid float64 col"))?
+                .value(row);
+            return Ok(uni_common::Value::Float(v));
+        }
+        DataType::Bool => {
+            let v = col
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| anyhow!("Invalid bool col"))?
+                .value(row);
+            return Ok(uni_common::Value::Bool(v));
+        }
+        DataType::String => {
+            let s = col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow!("Invalid string col"))?
+                .value(row);
+            return Ok(uni_common::Value::String(s.to_string()));
+        }
+        _ => {}
+    }
+
     match data_type {
         DataType::DateTime
         | DataType::Timestamp

@@ -129,6 +129,19 @@ pub struct GraphScanExec {
     /// Cached plan properties.
     properties: Arc<PlanProperties>,
 
+    /// Rows a `LIMIT` above this scan will keep, when the planner could prove
+    /// pushing it down is safe (#239).
+    ///
+    /// This is **not** `ScanRequest::limit`, and deliberately so: that field
+    /// truncates raw Lance rows below MVCC dedup, which returns stale values
+    /// (see `ScanRequest::with_limit`). This one bounds the `_vid` **range
+    /// walk** instead — it stops the walk once enough deduped rows have been
+    /// emitted, and keeps the range width from growing past what the limit can
+    /// consume. Every row a range produces is still fully version-resolved and
+    /// L0-merged before anything is counted, so narrowing the walk can only
+    /// change how much is read, never which rows win.
+    fetch: Option<usize>,
+
     /// Metrics for execution tracking.
     metrics: ExecutionPlanMetricsSet,
 }
@@ -259,6 +272,7 @@ impl GraphScanExec {
             is_schemaless: false,
             schema,
             properties,
+            fetch: None,
             metrics: ExecutionPlanMetricsSet::new(),
         }
     }
@@ -321,6 +335,7 @@ impl GraphScanExec {
             is_schemaless: true,
             schema,
             properties,
+            fetch: None,
             metrics: ExecutionPlanMetricsSet::new(),
         }
     }
@@ -506,11 +521,46 @@ impl ExecutionPlan for GraphScanExec {
             index_consulted,
             context.session_config().batch_size(),
             context.memory_pool(),
+            self.fetch,
         )))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        self.fetch
+    }
+
+    /// Accept a `LIMIT` from above (#239).
+    ///
+    /// Safe here in a way `ScanRequest::limit` is not: this does not truncate
+    /// the rows the backend returns, it narrows the `_vid` **range walk** that
+    /// decides which rows are asked for. Ranges are the one partitioning of
+    /// this scan that MVCC dedup survives — `_vid` is the dedup key, so every
+    /// version of a vid falls inside exactly one range — and the walk simply
+    /// continues if a range under-delivers. So a limit can make the scan read
+    /// less, never answer differently.
+    ///
+    /// The planner only offers this for a bare labelled scan under a limit with
+    /// no ordering; see `df_planner::push_fetch_into_scan` for the guard.
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        Some(Arc::new(Self {
+            graph_ctx: self.graph_ctx.clone(),
+            label: self.label.clone(),
+            variable: self.variable.clone(),
+            projected_properties: self.projected_properties.clone(),
+            filter: self.filter.clone(),
+            vid_list_filter: self.vid_list_filter.clone(),
+            extra_lance_filter: self.extra_lance_filter.clone(),
+            extra_runtime_filter: self.extra_runtime_filter.clone(),
+            is_schemaless: self.is_schemaless,
+            schema: self.schema.clone(),
+            properties: self.properties.clone(),
+            fetch: limit,
+            metrics: self.metrics.clone(),
+        }))
     }
 }
 
@@ -521,6 +571,27 @@ impl ExecutionPlan for GraphScanExec {
 /// stops that doubling from turning into a whole-table read the moment it lands
 /// on a dense region again.
 const RANGE_WIDTH_MAX: u64 = 1 << 22;
+
+/// How far the walk must have widened before a `LIMIT` makes a seek worth it.
+///
+/// Seeking costs `O(log(distance))` filtered counts and saves `width -
+/// slice_size` rows of reading, so it pays only once the gap-crossing has
+/// widened the range well past a slice. Measured on LDBC SF1, `LIMIT 1`,
+/// `rows_scanned`:
+///
+/// | label | vids begin at | before | after |
+/// |---|---|---|---|
+/// | `Person`  | 0         | 8 192   | 8 192 |
+/// | `Post`    | 100 384   | 22 496  | 8 192 |
+/// | `Comment` | 1 103 989 | 984 971 | 8 192 |
+///
+/// `Comment` is the case worth having: its width had doubled to ~1M by the
+/// time the march reached the label's first row, so the first productive range
+/// read nearly half the table to answer `LIMIT 1`. `Post` crosses only 100k
+/// vids and lands on a range that is already near a slice's worth, where the
+/// counts cost more than the rows they save — hence the factor rather than
+/// seeking on every gap.
+const SEEK_MIN_WIDTH_FACTOR: u64 = 8;
 
 /// Bytes a single range should aim to return.
 ///
@@ -613,6 +684,22 @@ enum ScanResume {
     Range { lo: u64, width: u64 },
 }
 
+/// What the end-of-range probe learned when a range came back empty.
+///
+/// The walk asks a different question depending on whether a `LIMIT` bounds it,
+/// and collapsing both answers into a `bool` is what made the expensive case
+/// invisible: "there is more above" and "there is more above, and it starts
+/// *here*" are not the same fact (#239).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeekOutcome {
+    /// Rows remain above, position unknown. Widen and continue the march.
+    ContinueHere,
+    /// Rows remain above and the next one is at this `_vid`. Jump to it.
+    ResumeAt(u64),
+    /// No rows at or above the probe point; the label is finished.
+    Exhausted,
+}
+
 /// State machine for graph scan stream execution.
 enum GraphScanState {
     /// Initial state, ready to start scanning.
@@ -658,7 +745,7 @@ enum GraphScanState {
     /// the end" and "a gap", and this resolves it exactly. Paid only when a
     /// range is empty: normally once, just past the end.
     ConfirmingEnd {
-        fut: Pin<Box<dyn std::future::Future<Output = DFResult<bool>> + Send>>,
+        fut: Pin<Box<dyn std::future::Future<Output = DFResult<SeekOutcome>> + Send>>,
         lo: u64,
         width: u64,
     },
@@ -716,6 +803,11 @@ struct GraphScanStream {
 
     /// Whether this is a schemaless scan.
     is_schemaless: bool,
+
+    /// Rows a `LIMIT` above this scan will keep, when the planner proved the
+    /// pushdown safe (#239). `None` means read the label whole.
+    fetch: Option<usize>,
+
     /// Rows per emitted slice, from the session's `batch_size`.
     slice_size: usize,
 
@@ -781,9 +873,11 @@ impl GraphScanStream {
         index_consulted: Count,
         slice_size: usize,
         pool: &Arc<dyn MemoryPool>,
+        fetch: Option<usize>,
     ) -> Self {
         Self {
             range_target_bytes: range_target_bytes(pool),
+            fetch,
             graph_ctx,
             label,
             variable,
@@ -1021,6 +1115,52 @@ fn scalar_to_u64(sv: &datafusion::common::ScalarValue) -> Option<u64> {
 /// visible under this snapshot — yields null in every column, which is how the
 /// map API's "absent from the map" signal survives. Duplicate vids in `vids`
 /// are fine: each occurrence gathers the same row.
+/// Requested target vids per target-table row at or above which deduplicating
+/// the request pays for itself.
+///
+/// Hydration is called once per traversal batch, not once per query — measured
+/// at ~8 192 vids per call carrying ~1 400-2 500 distinct ones — so the choice
+/// is made per call and has to be cheap. The statistic is the target table's
+/// row count, which `count_rows` answers from fragment metadata rather than by
+/// reading rows.
+///
+/// The two arms diverge on table size, not on request size. Deduplicating
+/// shrinks the `IN` list, which is worth real time against a *small* target
+/// table and costs a hash set over the request against a large one, where the
+/// list was already selective. Warm min-of-3 on LDBC SF1, hydration isolated by
+/// differential (`examples/vertex_selectivity_probe.rs`):
+///
+/// | traversal | target rows | requests | distinct | without | with |
+/// |---|---|---|---|---|---|
+/// | `HAS_CREATOR`->Person | 9 892 | 2 052 169 | 9 343 | 4 247 ms | 921 ms |
+/// | `KNOWS`->Person | 9 892 | 180 623 | 8 466 | 364 ms | 195 ms |
+/// | `REPLY_OF`->Comment | 2 052 169 | 1 040 749 | 441 704 | 5 732 ms | 7 601 ms |
+///
+/// At a per-call request of ~8 192, a ratio of 8 admits the two Person targets
+/// (8 192 * 8 >= 9 892) and excludes the Comment one (8 192 * 8 < 2 052 169),
+/// with two orders of magnitude of margin on each side.
+///
+/// **Fitted to three shapes on one dataset**, and named so the next person
+/// re-measures rather than trusts it -- the same caveat #221's rustdoc makes
+/// about the edge-side constants, which is why #237 refused to copy those
+/// across rather than measure the vertex side on its own terms. Sorting was
+/// tried first, on the theory that the loss came from discarding
+/// traversal-order locality; order-preserving deduplication measured the same,
+/// so the cost is the deduplication itself and the choice has to be
+/// conditional rather than reordered.
+const DEDUP_TABLE_RATIO: usize = 8;
+
+/// Distinct target vids, in first-occurrence order.
+///
+/// Correctness does not depend on whether this is used: the gather in
+/// [`hydrate_vids_columnar`] is keyed by vid, so duplicates fan back out from
+/// whichever list was fetched and the output is one row per *request* either
+/// way. Only the amount read changes.
+fn dedup_targets(raw: &[u64]) -> Vec<u64> {
+    let mut seen = std::collections::HashSet::with_capacity(raw.len());
+    raw.iter().copied().filter(|v| seen.insert(*v)).collect()
+}
+
 pub(crate) async fn hydrate_vids_columnar(
     graph_ctx: &GraphExecutionContext,
     label: &str,
@@ -1033,6 +1173,26 @@ pub(crate) async fn hydrate_vids_columnar(
         GraphScanExec::build_vertex_schema(variable, label, properties, &uni_schema);
 
     let raw: Vec<u64> = vids.iter().map(|v| v.as_u64()).collect();
+
+    // Fetch each distinct vid once, when the duplication makes that pay (#237).
+    //
+    // `vids` is one entry per *traversal target*, not per vertex, so a target
+    // reached by many edges appears many times.
+    // `count_rows` on the target table, which is metadata-only and so cheap
+    // enough to ask per call. `None` means the storage layer declined to answer
+    // cheaply (a forked session would have scanned), and an unknown table size
+    // is not a reason to pay for deduplication.
+    let target_rows = graph_ctx
+        .storage()
+        .vertex_row_count(label)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+    let pays = target_rows > 0 && raw.len().saturating_mul(DEDUP_TABLE_RATIO) >= target_rows;
+    let deduped = pays.then(|| dedup_targets(&raw));
+    let fetch_vids: &[u64] = deduped.as_deref().unwrap_or(&raw);
+
     // Chunk the vid list, bounding how much is resident at once.
     //
     // The `_vid` index is used either way, and the index work itself does not
@@ -1049,7 +1209,7 @@ pub(crate) async fn hydrate_vids_columnar(
     // one full scan beats six chunked ones, so this costs ~66 MiB on the small
     // fixture. A selectivity-aware choice would beat a fixed constant.
     let mut parts: Vec<RecordBatch> = Vec::new();
-    for chunk in raw.chunks(crate::query::df_graph::vid_lookup_join::MAX_VIDS_PER_CHUNK) {
+    for chunk in fetch_vids.chunks(crate::query::df_graph::vid_lookup_join::MAX_VIDS_PER_CHUNK) {
         parts.push(
             columnar_scan_vertex_batch_static(
                 graph_ctx,
@@ -1819,7 +1979,7 @@ impl Stream for GraphScanStream {
                 }
                 GraphScanState::ConfirmingEnd { mut fut, lo, width } => match fut.as_mut().poll(cx)
                 {
-                    Poll::Ready(Ok(true)) => {
+                    Poll::Ready(Ok(SeekOutcome::ContinueHere)) => {
                         // A gap, not the end. Widen so a sparse label costs a
                         // scan per gap rather than a scan per empty range.
                         self.state = GraphScanState::RangeChunking {
@@ -1827,7 +1987,20 @@ impl Stream for GraphScanStream {
                             width: width.saturating_mul(2).min(RANGE_WIDTH_MAX),
                         };
                     }
-                    Poll::Ready(Ok(false)) => {
+                    Poll::Ready(Ok(SeekOutcome::ResumeAt(min_vid))) => {
+                        // The seek found the label's next populated vid, so the
+                        // widening that crossed the gap has done its job and
+                        // would otherwise make the *first productive* range
+                        // enormous. Reset to one slice's width: under a fetch
+                        // bound that is all the limit can consume, and if the
+                        // region turns out sparse the ordinary retune widens it
+                        // again from here.
+                        self.state = GraphScanState::RangeChunking {
+                            lo: min_vid.max(lo),
+                            width: self.slice_size as u64,
+                        };
+                    }
+                    Poll::Ready(Ok(SeekOutcome::Exhausted)) => {
                         self.reservation.free();
                         self.state = GraphScanState::Done;
                         return Poll::Ready(None);
@@ -1918,12 +2091,42 @@ impl Stream for GraphScanStream {
                                     let next_lo = lo.saturating_add(width);
                                     let storage = Arc::clone(self.graph_ctx.storage());
                                     let label = self.label.clone();
+                                    // With a fetch bound, ask *where* the label
+                                    // resumes rather than merely whether it
+                                    // does, and restart the walk there at the
+                                    // original narrow width. Without one, the
+                                    // cheaper boolean is right: a full scan is
+                                    // going to read those rows regardless, so
+                                    // the seek would be pure overhead (#239).
+                                    // Only when a fetch bounds the read *and*
+                                    // the march has widened enough that the
+                                    // saved rows outweigh the seek's counts.
+                                    let seek = self.fetch.is_some()
+                                        && width
+                                            >= (self.slice_size as u64)
+                                                .saturating_mul(SEEK_MIN_WIDTH_FACTOR);
                                     self.state = GraphScanState::ConfirmingEnd {
                                         fut: Box::pin(async move {
-                                            storage
-                                                .vertex_rows_at_or_above(&label, next_lo)
-                                                .await
-                                                .map_err(exec_err)
+                                            if seek {
+                                                storage
+                                                    .vertex_min_vid_at_or_above(&label, next_lo)
+                                                    .await
+                                                    .map(|min| min.map(SeekOutcome::ResumeAt))
+                                                    .map(|o| o.unwrap_or(SeekOutcome::Exhausted))
+                                                    .map_err(exec_err)
+                                            } else {
+                                                storage
+                                                    .vertex_rows_at_or_above(&label, next_lo)
+                                                    .await
+                                                    .map(|more| {
+                                                        if more {
+                                                            SeekOutcome::ContinueHere
+                                                        } else {
+                                                            SeekOutcome::Exhausted
+                                                        }
+                                                    })
+                                                    .map_err(exec_err)
+                                            }
                                         }),
                                         lo: next_lo,
                                         width,

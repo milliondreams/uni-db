@@ -87,7 +87,10 @@ async fn edge_properties_survive_adjacency_compaction() {
     let names = ["sel"];
 
     // Before compaction the delta rows still hold the property.
-    let before = pm.get_batch_edge_props(&[eid], &names, None).await.unwrap();
+    let before = pm
+        .get_batch_edge_props(&[eid], &names, None, None)
+        .await
+        .unwrap();
     assert!(
         !before.is_empty(),
         "sanity: the property must resolve before compaction"
@@ -99,7 +102,10 @@ async fn edge_properties_survive_adjacency_compaction() {
         .await
         .unwrap();
 
-    let after = pm.get_batch_edge_props(&[eid], &names, None).await.unwrap();
+    let after = pm
+        .get_batch_edge_props(&[eid], &names, None, None)
+        .await
+        .unwrap();
     let key = uni_common::core::id::Vid::from(eid.as_u64());
     let got = after
         .get(&key)

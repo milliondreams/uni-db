@@ -97,6 +97,19 @@ where
             expr: rewrite_expr(u.expr, rename)?,
             variable: u.variable,
         }),
+        // The body is rewritten too: a renamed function is just as reachable
+        // from inside `FOREACH` as from a top-level `SET`, and skipping it
+        // would leave the old name in exactly the clause a user is least
+        // likely to test.
+        Clause::Foreach(f) => Clause::Foreach(uni_cypher::ast::ForeachClause {
+            expr: rewrite_expr(f.expr, rename)?,
+            variable: f.variable,
+            body: f
+                .body
+                .into_iter()
+                .map(|c| rewrite_clause(c, rename))
+                .collect::<Result<_>>()?,
+        }),
         Clause::Set(s) => Clause::Set(uni_cypher::ast::SetClause {
             items: s
                 .items

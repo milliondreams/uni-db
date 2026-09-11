@@ -3689,8 +3689,13 @@ impl Executor {
                     Value::Null => return Ok(()),
                     _ => return Err(anyhow!("FOREACH requires a list")),
                 };
+                // Cloned once, not per item: a nested FOREACH accumulates
+                // across its own iterations for the same reason the outer one
+                // does. Re-cloning per item made `FOREACH (i IN [1,2] |
+                // FOREACH (j IN [1,2,3] | SET n.seen = n.seen + 1))` leave
+                // `seen = 1` rather than 6.
+                let mut nested_scope = scope.clone();
                 for item in items {
-                    let mut nested_scope = scope.clone();
                     nested_scope.insert(variable.clone(), item);
                     for nested_plan in &body {
                         Box::pin(self.execute_foreach_body_plan(

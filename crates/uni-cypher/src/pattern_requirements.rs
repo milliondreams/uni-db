@@ -171,6 +171,18 @@ fn walk_statement(stmt: &Statement, out: &mut Vec<Requirement>) {
                 walk_return_items(&wr.items, out);
             }
             Clause::Unwind(u) => walk_expr(&u.expr, out),
+            // The list expression is evaluated per input row, so it carries
+            // requirements exactly as `UNWIND`'s does; the body clauses are
+            // writes and are walked for the same reason `CREATE`/`SET` are.
+            Clause::Foreach(f) => {
+                walk_expr(&f.expr, out);
+                walk_statement(
+                    &Statement {
+                        clauses: f.body.clone(),
+                    },
+                    out,
+                );
+            }
             Clause::Delete(d) => {
                 for e in &d.items {
                     walk_expr(e, out);

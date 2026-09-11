@@ -1421,12 +1421,32 @@ async fn a_variable_length_expansion_is_bounded_by_one_row_chunk() -> Result<()>
 /// Verified discriminating in both directions: dropping the reservation makes
 /// the first assertion fail, and restoring `rows_per_chunk` to `slice_size`
 /// makes the second fail.
+///
+/// # Sensitive to machine load, and why the timeout is explicit
+///
+/// Enumerating 111 100 paths takes ~17 s on an idle 22-core box, against
+/// `UniConfig::query_timeout`'s 30 s default — under 2x of headroom. Saturate
+/// the machine and the query crosses the deadline: measured **9 failures in 12
+/// runs** with 20 spinners running, every one of them
+/// `UniError::Timeout`, not a memory assertion.
+///
+/// That failure is doubly misleading. The second query surfaces it through `?`,
+/// so the test reports a bare "Operation timed out"; and had the *first* query
+/// timed out instead, the error would have failed the `contains` check for the
+/// operator name, reading exactly like a lost reservation.
+///
+/// So both queries carry an explicit generous timeout. This test asserts what
+/// the pool accounts for, not how fast the query is — it must not be able to
+/// fail on latency. Keep the bound finite so a genuine hang still ends.
 #[tokio::test]
 async fn a_schemaless_variable_length_expansion_is_accounted_and_bounded() -> Result<()> {
     const WIDTH: i64 = 10;
     const LAYERS: i64 = 7;
     const EXPECTED_PATHS: i64 = 111_100;
     const QUERY: &str = "MATCH p = (a:N {layer: 0})-[:E*1..4]->(b:N) RETURN count(p) AS c";
+    /// Far above the ~17 s idle cost, so contention cannot reach it, while
+    /// still bounding a real hang.
+    const NOT_A_LATENCY_TEST: std::time::Duration = std::time::Duration::from_secs(600);
 
     let db = Uni::in_memory().build().await?;
     db.schema()
@@ -1461,6 +1481,7 @@ async fn a_schemaless_variable_length_expansion_is_accounted_and_bounded() -> Re
         .session()
         .query_with(QUERY)
         .max_memory(1024 * 1024)
+        .timeout(NOT_A_LATENCY_TEST)
         .fetch_all()
         .await;
     let err = refused
@@ -1478,6 +1499,7 @@ async fn a_schemaless_variable_length_expansion_is_accounted_and_bounded() -> Re
         .session()
         .query_with(QUERY)
         .max_memory(8 * 1024 * 1024)
+        .timeout(NOT_A_LATENCY_TEST)
         .fetch_all()
         .await?;
     assert_eq!(

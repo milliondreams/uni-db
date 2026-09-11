@@ -5749,6 +5749,11 @@ impl HybridPhysicalPlanner {
             // pushed past an operator that changes cardinality would be wrong,
             // and this is the one shape where it provably is not.
             let input_plan = Self::push_fetch_into_sort(input_plan, limit);
+            // Offered after the sort pusher, never instead of it: if a
+            // `SortExec` took the fetch, the scan beneath it must still produce
+            // every row for the sort to be correct — and the scan pusher stops
+            // at the sort rather than descending past it, so both can be tried.
+            let input_plan = Self::push_fetch_into_scan(input_plan, limit);
             Ok(Arc::new(LocalLimitExec::new(input_plan, limit)))
         } else {
             // No limit, return input as-is
@@ -5768,6 +5773,47 @@ impl HybridPhysicalPlanner {
     /// Descends only through `ProjectionExec`, which preserves both row count
     /// and ordering. Anything that changes cardinality would make the pushed
     /// fetch wrong.
+    /// Offer a `LIMIT` to a bare labelled scan underneath it (#239).
+    ///
+    /// The mirror of [`Self::push_fetch_into_sort`], and guarded the same way:
+    /// it descends through `ProjectionExec` and nothing else, so anything that
+    /// changes how many input rows are needed to produce one output row —
+    /// a filter, a sort, a traversal, a join, an aggregate, a `DISTINCT` — sits
+    /// between the limit and the scan and stops the push. Reaching a
+    /// `GraphScanExec` through projections alone is exactly the case #239 calls
+    /// "a bare labelled scan with a limit and no ordering".
+    ///
+    /// Note this is *not* a `ScanRequest::limit` pushdown, which is unsound:
+    /// that truncates raw rows below MVCC dedup and can return a superseded
+    /// value (see `ScanRequest::with_limit`). `GraphScanExec::with_fetch`
+    /// narrows the `_vid` range walk instead, above the dedup and the L0 merge.
+    fn push_fetch_into_scan(plan: Arc<dyn ExecutionPlan>, limit: usize) -> Arc<dyn ExecutionPlan> {
+        use datafusion::physical_plan::projection::ProjectionExec;
+
+        // Same reasoning as the sort pusher: a zero limit yields nothing above,
+        // so there is no read to save.
+        if limit == 0 {
+            return plan;
+        }
+
+        if plan
+            .as_any()
+            .downcast_ref::<crate::query::df_graph::scan::GraphScanExec>()
+            .is_some()
+        {
+            return plan.with_fetch(Some(limit)).unwrap_or(plan);
+        }
+        if plan.as_any().downcast_ref::<ProjectionExec>().is_some()
+            && let [child] = plan.children().as_slice()
+        {
+            let pushed = Self::push_fetch_into_scan(Arc::clone(child), limit);
+            if let Ok(rebuilt) = Arc::clone(&plan).with_new_children(vec![pushed]) {
+                return rebuilt;
+            }
+        }
+        plan
+    }
+
     fn push_fetch_into_sort(plan: Arc<dyn ExecutionPlan>, limit: usize) -> Arc<dyn ExecutionPlan> {
         use datafusion::physical_plan::projection::ProjectionExec;
         use datafusion::physical_plan::sorts::sort::SortExec;

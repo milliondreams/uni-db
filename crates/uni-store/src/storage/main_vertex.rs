@@ -191,15 +191,18 @@ impl MainVertexDataset {
         }
         columns.push(Arc::new(labels_builder.finish()));
 
-        // props_json column (JSONB binary encoding)
+        // props_json column (JSONB binary encoding).
+        //
+        // Encoded straight from the property map, for the reasons on the edge
+        // sibling in `main_edge.rs` (#228): the previous
+        // `serde_json::to_value(props)` round trip had no representation for a
+        // non-finite `Float` and wrote `Null` in its place, and its
+        // `unwrap_or(json!({}))` turned a serialization failure into *every*
+        // property on the row silently disappearing rather than an error.
         let mut props_json_builder = LargeBinaryBuilder::new();
         for (_, _, props, _, _) in vertices.iter() {
-            let jsonb_bytes = {
-                let json_val = serde_json::to_value(props).unwrap_or(serde_json::json!({}));
-                let uni_val: uni_common::Value = json_val.into();
-                uni_common::cypher_value_codec::encode(&uni_val)
-            };
-            props_json_builder.append_value(&jsonb_bytes);
+            let uni_val = uni_common::Value::Map(props.clone());
+            props_json_builder.append_value(uni_common::cypher_value_codec::encode(&uni_val));
         }
         columns.push(Arc::new(props_json_builder.finish()));
 

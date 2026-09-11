@@ -1495,7 +1495,8 @@ impl MutationEvents {
     /// # Errors
     ///
     /// Returns an error if the event rows cannot be materialized. The caller
-    /// must NOT treat that as "no mutations" — see [`EventRowColumns::into_batch`].
+    /// must NOT treat that as "no mutations" — the private
+    /// `EventRowColumns::into_batch` builder is what can fail here.
     pub fn materialize_all(&self) -> anyhow::Result<Option<RecordBatch>> {
         if self.rows.is_empty() {
             return Ok(None);

@@ -49,6 +49,7 @@ pub mod scalar_subquery_test;
 pub mod start_end_node_test;
 pub mod stddev_variance_test;
 pub mod temporal_property_type_test;
+pub mod traversal_target_dedup_test;
 pub mod type_conversion_test;
 pub mod unanchored_pattern_comprehension_test;
 pub mod union_entity_test;

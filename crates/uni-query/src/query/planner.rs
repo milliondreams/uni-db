@@ -3481,6 +3481,30 @@ impl QueryPlanner {
                     let unwind_out_type = infer_unwind_output_type(&unwind.expr, &vars_in_scope);
                     add_var_to_scope(&mut vars_in_scope, &unwind.variable, unwind_out_type)?;
                 }
+                Clause::Foreach(foreach) => {
+                    validate_expression_variables(&foreach.expr, &vars_in_scope)?;
+                    // The iteration variable is in scope for the body and only
+                    // the body: `FOREACH` passes its input rows through
+                    // untouched, so binding it into `vars_in_scope` would let a
+                    // later clause reference a variable that no longer exists.
+                    let mut body_scope = vars_in_scope.clone();
+                    add_var_to_scope(
+                        &mut body_scope,
+                        &foreach.variable,
+                        infer_unwind_output_type(&foreach.expr, &vars_in_scope),
+                    )?;
+                    let body = foreach
+                        .body
+                        .iter()
+                        .map(|c| Self::plan_foreach_body_clause(c, &body_scope))
+                        .collect::<Result<Vec<_>>>()?;
+                    plan = LogicalPlan::Foreach {
+                        input: Box::new(plan),
+                        variable: foreach.variable.clone(),
+                        list: foreach.expr.clone(),
+                        body,
+                    };
+                }
                 Clause::Call(call_clause) => {
                     match &call_clause.kind {
                         CallKind::Procedure {
@@ -3970,7 +3994,12 @@ impl QueryPlanner {
             | LogicalPlan::Delete { .. }
             | LogicalPlan::Set { .. }
             | LogicalPlan::Remove { .. }
-            | LogicalPlan::Merge { .. } => LogicalPlan::Limit {
+            | LogicalPlan::Merge { .. }
+            // `FOREACH` is a write clause and terminates a statement the same
+            // way. Without this arm the plan ends at `Foreach`, which passes
+            // its input through — so the internal columns of the `MATCH` that
+            // fed it reach the top and the result namer refuses them.
+            | LogicalPlan::Foreach { .. } => LogicalPlan::Limit {
                 input: Box::new(plan),
                 skip: None,
                 fetch: Some(0),
@@ -4382,6 +4411,89 @@ impl QueryPlanner {
     }
 
     /// Plan a MATCH clause, handling both shortestPath and regular patterns.
+    /// Plan one clause of a `FOREACH` body into the node `ForeachExec` expects.
+    ///
+    /// The body is not a pipeline: `Executor::execute_foreach_body_plan`
+    /// matches each plan by shape (`Set { items, .. }`, `Create`, `Merge`,
+    /// `Delete`, `Remove`, or a nested `Foreach`) and evaluates it against a
+    /// per-item scope, ignoring `input` entirely. So each body clause becomes a
+    /// standalone node over [`LogicalPlan::Empty`] rather than being chained
+    /// onto the clause before it.
+    ///
+    /// The grammar already restricts the body to update clauses, so the final
+    /// arm is defensive rather than reachable; it exists because `Clause` is a
+    /// wider type than `foreach_body_clause`, and a clause added to the enum
+    /// later should fail loudly here rather than be dropped from the body.
+    fn plan_foreach_body_clause(
+        clause: &Clause,
+        vars_in_scope: &[VariableInfo],
+    ) -> Result<LogicalPlan> {
+        Ok(match clause {
+            Clause::Set(c) => {
+                for item in &c.items {
+                    match item {
+                        SetItem::Property { value, .. }
+                        | SetItem::Variable { value, .. }
+                        | SetItem::VariablePlus { value, .. } => {
+                            validate_expression_variables(value, vars_in_scope)?;
+                        }
+                        SetItem::Labels { .. } => {}
+                    }
+                }
+                LogicalPlan::Set {
+                    input: Box::new(LogicalPlan::Empty),
+                    items: c.items.clone(),
+                }
+            }
+            Clause::Remove(c) => LogicalPlan::Remove {
+                input: Box::new(LogicalPlan::Empty),
+                items: c.items.clone(),
+            },
+            Clause::Delete(c) => LogicalPlan::Delete {
+                input: Box::new(LogicalPlan::Empty),
+                items: c.items.clone(),
+                detach: c.detach,
+            },
+            Clause::Create(c) => LogicalPlan::Create {
+                input: Box::new(LogicalPlan::Empty),
+                pattern: c.pattern.clone(),
+            },
+            Clause::Merge(c) => LogicalPlan::Merge {
+                input: Box::new(LogicalPlan::Empty),
+                pattern: c.pattern.clone(),
+                on_match: Some(SetClause {
+                    items: c.on_match.clone(),
+                }),
+                on_create: Some(SetClause {
+                    items: c.on_create.clone(),
+                }),
+            },
+            Clause::Foreach(c) => {
+                let mut inner_scope = vars_in_scope.to_vec();
+                add_var_to_scope(
+                    &mut inner_scope,
+                    &c.variable,
+                    infer_unwind_output_type(&c.expr, vars_in_scope),
+                )?;
+                LogicalPlan::Foreach {
+                    input: Box::new(LogicalPlan::Empty),
+                    variable: c.variable.clone(),
+                    list: c.expr.clone(),
+                    body: c
+                        .body
+                        .iter()
+                        .map(|inner| Self::plan_foreach_body_clause(inner, &inner_scope))
+                        .collect::<Result<Vec<_>>>()?,
+                }
+            }
+            other => {
+                return Err(anyhow!(
+                    "SyntaxError: UnexpectedSyntax - only SET, REMOVE, DELETE, CREATE, MERGE and a nested FOREACH are allowed in a FOREACH body, got {other:?}"
+                ));
+            }
+        })
+    }
+
     fn plan_match_clause(
         &self,
         match_clause: &MatchClause,
@@ -11111,6 +11223,12 @@ fn collect_properties_from_subquery_clause(
             collect_properties_from_return_items(&wr.items, None, None, None, properties, kinds);
         }
         Clause::Unwind(u) => collect_properties_from_expr_into(&u.expr, properties, kinds),
+        Clause::Foreach(f) => {
+            collect_properties_from_expr_into(&f.expr, properties, kinds);
+            for inner in &f.body {
+                collect_properties_from_subquery_clause(inner, properties, kinds);
+            }
+        }
         Clause::Call(c) => {
             match &c.kind {
                 CallKind::Procedure { arguments, .. } => {

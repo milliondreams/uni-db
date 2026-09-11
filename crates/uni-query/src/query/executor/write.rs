@@ -1649,6 +1649,7 @@ impl Executor {
         String,
         u32,
         uni_store::storage::direction::Direction,
+        Option<String>,
     )> {
         if pattern.paths.len() != 1 {
             return None;
@@ -1672,15 +1673,23 @@ impl Executor {
         {
             return None;
         }
-        // Relationship: single concrete type, anonymous, fixed-length, unfiltered.
-        if r.variable.is_some()
-            || r.range.is_some()
+        // Relationship: single concrete type, fixed-length, unfiltered.
+        //
+        // A *named* relationship is allowed through the shape gate but is not
+        // servable in every outcome — see the caller. It used to be rejected
+        // here, which cost 7x on the commonest ingest shape there is: naming the
+        // edge in `MERGE (a)-[e:R]->(b)` dropped the whole statement onto the
+        // per-row plan. Measured over 20 000 vertices with a 400-row batch, the
+        // two spellings were 0.79s named against 0.11s anonymous, the anonymous
+        // one sitting exactly on the MATCH+CREATE floor.
+        if r.range.is_some()
             || r.properties.is_some()
             || r.where_clause.is_some()
             || r.types.names().len() != 1
         {
             return None;
         }
+        let rel_var = r.variable.clone().filter(|v| !v.is_empty());
         let type_name = &r.types.names()[0];
         let type_id = if self.config.strict_schema {
             self.storage
@@ -1703,7 +1712,7 @@ impl Executor {
             // general path handles it.
             uni_cypher::ast::Direction::Both => return None,
         };
-        Some((src_var.clone(), dst_var.clone(), type_id, dir))
+        Some((src_var.clone(), dst_var.clone(), type_id, dir, rel_var))
     }
 
     /// Whether a MERGE key can take the batched persisted-scan fast path.
@@ -2493,9 +2502,9 @@ impl Executor {
         // RC3: relationship-MERGE existence fast-path. The single-node fast path
         // above does not cover `(a)-[:R]->(b)`; the general path rebuilds and runs
         // a per-row traversal `LogicalPlan` just to check whether the edge exists
-        // (~19x the bulk CREATE of the same edges). For the bound-endpoints,
-        // anonymous-edge shape (and no ON MATCH SET, whose match-row semantics the
-        // general path materialises) we resolve existence with one MVCC-correct
+        // (~19x the bulk CREATE of the same edges). For the bound-endpoints shape
+        // (and no ON MATCH SET, whose match-row semantics the general path
+        // materialises) we resolve existence with one MVCC-correct
         // adjacency probe — `GraphExecutionContext::get_neighbors` merges CSR + all
         // L0 buffers including the transaction's own writes, so intra-batch edges
         // are seen — and reuse the general create / ON CREATE handling unchanged.
@@ -2573,7 +2582,7 @@ impl Executor {
             // RC3 relationship fast path: bound endpoints → resolve edge
             // existence with one adjacency probe and reuse the general
             // create / ON CREATE handling, skipping the per-row traversal plan.
-            if let (Some((src_var, dst_var, type_id, dir)), Some(graph_ctx)) =
+            if let (Some((src_var, dst_var, type_id, dir, rel_var)), Some(graph_ctx)) =
                 (rel_fast.as_ref(), rel_graph_ctx.as_ref())
             {
                 let src_vid = row.get(src_var).and_then(|v| Self::vid_from_value(v).ok());
@@ -2583,46 +2592,70 @@ impl Executor {
                         .get_neighbors(src_vid, *type_id, *dir)
                         .into_iter()
                         .any(|(n, _eid)| n == dst_vid);
-                    let writer: &uni_store::Writer = writer_lock.as_ref();
-                    if !exists {
-                        // Edge absent: create only the edge (endpoints are bound),
-                        // then apply ON CREATE SET — identical to the general
-                        // create branch below.
-                        let seed_props = self
-                            .on_create_seed_props(on_create, &row, prop_manager, params, ctx)
-                            .await?;
-                        self.execute_create_pattern(
-                            &path_pattern,
-                            &mut row,
-                            writer,
-                            prop_manager,
-                            params,
-                            ctx,
-                            tx_l0_override,
-                            Some(&seed_props),
-                        )
-                        .await?;
-                        if let Some(set) = on_create {
-                            self.execute_set_items_locked(
-                                &set.items,
+                    // A named relationship that *matched* has to be bound to the
+                    // edge already there, and that binding cannot be rebuilt
+                    // here. The adjacency probe yields the eid, but an `Edge`
+                    // value also carries the edge's properties, and there is no
+                    // way to enumerate them for an arbitrary edge: the batch
+                    // property read takes an explicit name list and honours no
+                    // wildcard, and outside `strict_schema` — off by default —
+                    // the declared set is not the whole set, since the
+                    // schemaless registry records type ids and not properties.
+                    // Binding a partial edge would make `RETURN e` answer
+                    // differently depending on which path served the row, which
+                    // is worse than being slow. So that one outcome falls
+                    // through to the general path.
+                    //
+                    // A named relationship that is *created* is unaffected:
+                    // `execute_create_pattern` binds it, with the properties it
+                    // just wrote. That is the insert-heavy ingest shape this is
+                    // for, and it takes the fast path in full.
+                    if exists && rel_var.is_some() {
+                        // fall through
+                    } else {
+                        let writer: &uni_store::Writer = writer_lock.as_ref();
+                        if !exists {
+                            // Edge absent: create only the edge (endpoints are bound),
+                            // then apply ON CREATE SET — identical to the general
+                            // create branch below.
+                            let seed_props = self
+                                .on_create_seed_props(on_create, &row, prop_manager, params, ctx)
+                                .await?;
+                            self.execute_create_pattern(
+                                &path_pattern,
                                 &mut row,
                                 writer,
                                 prop_manager,
                                 params,
                                 ctx,
                                 tx_l0_override,
-                                &Prefetch::default(),
+                                Some(&seed_props),
                             )
                             .await?;
+                            if let Some(set) = on_create {
+                                self.execute_set_items_locked(
+                                    &set.items,
+                                    &mut row,
+                                    writer,
+                                    prop_manager,
+                                    params,
+                                    ctx,
+                                    tx_l0_override,
+                                    &Prefetch::default(),
+                                )
+                                .await?;
+                            }
                         }
+                        // Whether matched or just created, the edge now exists;
+                        // bind path variables and emit the row. Any edge binding
+                        // needed has already been made: an anonymous edge has
+                        // none, and a named one reaching here was created rather
+                        // than matched, so `execute_create_pattern` bound it.
+                        // ON MATCH SET is excluded from this fast path.
+                        Self::bind_path_variables(&path_pattern, &mut row, &temp_vars);
+                        results.push(row);
+                        continue;
                     }
-                    // Whether matched or just created, the edge now exists; bind
-                    // path variables and emit the row (the edge is anonymous, so
-                    // there is no edge binding to reproduce, and ON MATCH SET is
-                    // excluded from this fast path).
-                    Self::bind_path_variables(&path_pattern, &mut row, &temp_vars);
-                    results.push(row);
-                    continue;
                 }
                 // Endpoints not bound to vids → fall through to the general path.
             }

@@ -153,3 +153,111 @@ async fn issue_225_both_spellings_of_the_same_link_cost_alike() -> Result<()> {
     );
     Ok(())
 }
+
+/// Naming the relationship must not drop MERGE onto the per-row plan.
+///
+/// `merge_relationship_fastpath_shape` rejected any pattern whose relationship
+/// carried a variable, so `MERGE (a)-[e:R]->(b)` — the canonical batched
+/// edge-ingest shape — paid a rebuilt `LogicalPlan` and a full DataFusion
+/// planning pass per input row, while `MERGE (a)-[:R]->(b)` ran at the
+/// MATCH+CREATE floor. Measured at 20 000 vertices with a 400-row batch:
+/// 0.79s named against 0.11s anonymous, and 0.105s named after.
+///
+/// The ratio is against the anonymous spelling rather than an absolute
+/// threshold, so the machine divides out: the two differ in one character and
+/// do the same work.
+#[tokio::test]
+async fn issue_225_naming_the_relationship_keeps_the_fast_path() -> Result<()> {
+    const NAMED: &str = "UNWIND $batch AS r \
+                         MATCH (a:Entity {uid: r.src}), (b:Entity {uid: r.dst}) \
+                         MERGE (a)-[e:OWNS]->(b)";
+    const ANON: &str = "UNWIND $batch AS r \
+                        MATCH (a:Entity {uid: r.src}), (b:Entity {uid: r.dst}) \
+                        MERGE (a)-[:OWNS]->(b)";
+
+    let db = graph(LARGE).await?;
+    let (named, named_created) = run_on(&db, LARGE, NAMED).await?;
+    let (anon, anon_created) = run_on(&db, LARGE, ANON).await?;
+
+    assert_eq!(
+        named_created, anon_created,
+        "the two spellings created {named_created} and {anon_created} \
+         relationships; they are not doing the same work"
+    );
+    assert_eq!(named_created, BATCH, "fixture linked {named_created} pairs");
+
+    let ratio = named / anon.max(1e-9);
+    eprintln!("named {named:.3}s vs anonymous {anon:.3}s = {ratio:.2}x");
+    assert!(
+        ratio < 3.0,
+        "naming the relationship cost {ratio:.2}x leaving it anonymous \
+         ({named:.3}s vs {anon:.3}s). A relationship variable is disqualifying \
+         the MERGE fast path, so every row rebuilds and re-plans (#225)."
+    );
+    Ok(())
+}
+
+/// The fast path must not cost the named relationship its binding.
+///
+/// This is the reason the *match* outcome still falls back: an `Edge` value
+/// carries properties, and they cannot be enumerated for an arbitrary edge. The
+/// created outcome is served by the fast path and must bind exactly what the
+/// general path would.
+#[tokio::test]
+async fn issue_225_a_named_relationship_is_still_bound() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL Entity (uid STRING)").await?;
+    tx.execute("CREATE EDGE TYPE OWNS (pct FLOAT) FROM Entity TO Entity")
+        .await?;
+    tx.execute("CREATE (:Entity {uid: 'a'}), (:Entity {uid: 'b'})")
+        .await?;
+    tx.commit().await?;
+
+    // Created through the fast path, with ON CREATE SET writing through the
+    // binding: if `e` were unbound the SET would have nothing to write to.
+    let tx = db.session().tx().await?;
+    let created = tx
+        .query(
+            "MATCH (a:Entity {uid: 'a'}), (b:Entity {uid: 'b'}) \
+             MERGE (a)-[e:OWNS]->(b) ON CREATE SET e.pct = 42.0 \
+             RETURN type(e) AS t, e.pct AS p",
+        )
+        .await?;
+    tx.commit().await?;
+    assert_eq!(created.rows().len(), 1, "MERGE returned no row");
+    assert_eq!(created.rows()[0].get::<String>("t")?, "OWNS");
+    assert_eq!(created.rows()[0].get::<f64>("p")?, 42.0);
+
+    // Matched this time. The fast path declines the match outcome for a named
+    // relationship, so this exercises the fallback — and must agree.
+    let tx = db.session().tx().await?;
+    let matched = tx
+        .query(
+            "MATCH (a:Entity {uid: 'a'}), (b:Entity {uid: 'b'}) \
+             MERGE (a)-[e:OWNS]->(b) \
+             RETURN type(e) AS t, e.pct AS p",
+        )
+        .await?;
+    tx.commit().await?;
+    assert_eq!(matched.rows().len(), 1, "MERGE returned no row on match");
+    assert_eq!(
+        matched.rows()[0].get::<String>("t")?,
+        "OWNS",
+        "a matched MERGE lost the relationship's type"
+    );
+    assert_eq!(
+        matched.rows()[0].get::<f64>("p")?,
+        42.0,
+        "a matched MERGE lost the relationship's properties — the fast path \
+         served an outcome it cannot bind faithfully"
+    );
+
+    // And exactly one edge exists: MERGE matched rather than creating a second.
+    let n = db
+        .session()
+        .query("MATCH (:Entity)-[e:OWNS]->(:Entity) RETURN count(e) AS n")
+        .await?;
+    assert_eq!(n.rows()[0].get::<i64>("n")?, 1, "MERGE created a duplicate");
+    Ok(())
+}

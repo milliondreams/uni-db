@@ -112,6 +112,16 @@ const ARMS: &[Arm] = &[
                 MATCH (b:Entity {uid: r.dst}) \
                 MERGE (a)-[e:OWNS]->(b)",
     },
+    // Same as arm 1 but with an *anonymous* relationship. The only difference
+    // is `[e:OWNS]` vs `[:OWNS]`, and `merge_relationship_fastpath_shape`
+    // rejects a pattern whose relationship carries a variable — so this is the
+    // one arm that can take the fastpath.
+    Arm {
+        label: "1b both bound, ANON edge   MERGE (a)-[:OWNS]->(b)",
+        query: "UNWIND $batch AS r \
+                MATCH (a:Entity {uid: r.src}), (b:Entity {uid: r.dst}) \
+                MERGE (a)-[:OWNS]->(b)",
+    },
     Arm {
         label: "4  MATCH+CREATE      (the floor, no MERGE)",
         query: "UNWIND $batch AS r \
@@ -228,7 +238,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // and they legitimately create fewer.
     for (scale, &nodes) in SCALES.iter().enumerate() {
         let created = grid[0][scale].2;
-        for i in [0usize, 1, 2, 5] {
+        for i in [0usize, 1, 2, 5, 6] {
             assert_eq!(
                 grid[i][scale].2, created,
                 "at {nodes} nodes arm `{}` created {} relationships, not \

@@ -225,6 +225,58 @@ pub enum DataType {
 }
 
 impl DataType {
+    /// The canonical type spec: the spelling accepted by the Python bindings'
+    /// `parse_data_type`, and what `PropertyMetadata.data_type` reports.
+    ///
+    /// Lowercase and colon-separated (`"string"`, `"vector:128"`,
+    /// `"list:string"`, `"map:string:float64"`), deliberately *not*
+    /// [`Self::repr_name`]'s `"STRING"` / `"vector(8)"`, which is for
+    /// `__repr__` and does not parse. The point of this spelling is that a type
+    /// read off a schema can be fed straight back into `.property(name, spec)`.
+    ///
+    /// Beside the enum, and exhaustive with no catch-all, for the reason on
+    /// [`Self::repr_name`]: `DataType` is `#[non_exhaustive]`, so a mapping
+    /// written downstream is forced to carry a catch-all and cannot be
+    /// compiler-checked. That is how `PropertyMetadata.data_type` came to report
+    /// a `format!("{:?}")` rendering — `"BinaryVector { dimensions: 64 }"` —
+    /// to Python as a type name.
+    ///
+    /// One known asymmetry: `Timestamp` renders `"timestamp"`, which the parser
+    /// maps to `DateTime`, because it has always accepted `"timestamp"` as a
+    /// spelling of `DateTime`. Re-pointing it would silently change the column
+    /// type of existing callers, which is worse than the asymmetry. The
+    /// round-trip test documents it.
+    #[must_use]
+    pub fn type_spec(&self) -> String {
+        match self {
+            DataType::String => "string".to_string(),
+            DataType::Int32 => "int32".to_string(),
+            DataType::Int64 => "int64".to_string(),
+            DataType::Float32 => "float32".to_string(),
+            DataType::Float64 => "float64".to_string(),
+            DataType::Bool => "bool".to_string(),
+            DataType::Timestamp => "timestamp".to_string(),
+            DataType::Date => "date".to_string(),
+            DataType::Time => "time".to_string(),
+            DataType::DateTime => "datetime".to_string(),
+            DataType::Duration => "duration".to_string(),
+            DataType::CypherValue => "json".to_string(),
+            DataType::Bytes => "bytes".to_string(),
+            DataType::Btic => "btic".to_string(),
+            DataType::Point(p) => match p {
+                PointType::Geographic => "point:geographic".to_string(),
+                PointType::Cartesian2D => "point:cartesian2d".to_string(),
+                PointType::Cartesian3D => "point:cartesian3d".to_string(),
+            },
+            DataType::Vector { dimensions } => format!("vector:{dimensions}"),
+            DataType::SparseVector { dimensions } => format!("sparse_vector:{dimensions}"),
+            DataType::BinaryVector { dimensions } => format!("binary_vector:{dimensions}"),
+            DataType::Crdt(ct) => format!("crdt:{}", ct.type_name()),
+            DataType::List(inner) => format!("list:{}", inner.type_spec()),
+            DataType::Map(k, v) => format!("map:{}:{}", k.type_spec(), v.type_spec()),
+        }
+    }
+
     /// The name used by the Python `DataType.__repr__`, without the
     /// `DataType.` prefix.
     ///

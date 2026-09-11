@@ -569,8 +569,11 @@ pub fn make_progress_callback(
 
 /// Map a Rust `WriteLease` to its Python representation.
 ///
-/// `WriteLease` is `#[non_exhaustive]`; the catch-all (covering `Custom` and any
-/// future variant) reports `Local`, matching the pre-existing behavior.
+/// `WriteLease` is `#[non_exhaustive]`, so a catch-all is unavoidable — but it
+/// no longer swallows `Custom`, which used to report as `Local`: "no external
+/// coordination" for a lease that is externally coordinated. A future Rust
+/// variant still lands on `Custom` rather than `Local`, which is the safer of
+/// the two wrong answers, since it at least says "not the local lock".
 pub fn write_lease_to_py(
     wl: &::uni_db::api::multi_agent::WriteLease,
 ) -> crate::types::PyWriteLease {
@@ -580,8 +583,11 @@ pub fn write_lease_to_py(
                 table: table.clone(),
             },
         },
-        _ => crate::types::PyWriteLease {
+        ::uni_db::api::multi_agent::WriteLease::Local => crate::types::PyWriteLease {
             variant: crate::types::WriteLeaseVariant::Local,
+        },
+        _ => crate::types::PyWriteLease {
+            variant: crate::types::WriteLeaseVariant::Custom,
         },
     }
 }
@@ -1890,6 +1896,49 @@ pub fn py_timedelta_to_duration(obj: &Bound<'_, PyAny>) -> PyResult<std::time::D
 #[cfg(test)]
 mod value_to_py_coverage {
     use super::*;
+
+    /// A `WriteLease::Custom` must not report to Python as `Local`.
+    ///
+    /// The catch-all used to map it there, so a lease that *is* externally
+    /// coordinated described itself as "no external coordination" — the one
+    /// answer a caller inspecting the lease is trying to avoid. This needs no
+    /// interpreter (see the note below): `write_lease_to_py` returns a plain
+    /// struct, and only reading it from Python would require one.
+    #[test]
+    fn a_custom_write_lease_does_not_report_as_local() {
+        use ::uni_db::api::multi_agent::{LeaseGuard, WriteLease, WriteLeaseProvider};
+
+        struct Dummy;
+        #[async_trait::async_trait]
+        impl WriteLeaseProvider for Dummy {
+            async fn acquire(&self) -> uni_common::Result<LeaseGuard> {
+                unreachable!("the mapping never runs the provider")
+            }
+            async fn heartbeat(&self, _g: &LeaseGuard) -> uni_common::Result<()> {
+                unreachable!()
+            }
+            async fn release(&self, _g: LeaseGuard) -> uni_common::Result<()> {
+                unreachable!()
+            }
+        }
+
+        let custom = write_lease_to_py(&WriteLease::Custom(Box::new(Dummy)));
+        assert!(
+            matches!(custom.variant, crate::types::WriteLeaseVariant::Custom),
+            "a custom lease mapped to {:?}",
+            custom.variant
+        );
+
+        // The two that were already right stay right.
+        assert!(matches!(
+            write_lease_to_py(&WriteLease::Local).variant,
+            crate::types::WriteLeaseVariant::Local
+        ));
+        assert!(matches!(
+            write_lease_to_py(&WriteLease::DynamoDB { table: "t".into() }).variant,
+            crate::types::WriteLeaseVariant::DynamoDB { .. }
+        ));
+    }
 
     /// A Rust-side exhaustiveness test is not possible here: the crate builds
     /// with pyo3's `extension-module`, so libpython is not linked and

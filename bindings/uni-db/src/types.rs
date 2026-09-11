@@ -2088,7 +2088,17 @@ pub struct PyWriteLease {
 #[derive(Debug, Clone)]
 pub(crate) enum WriteLeaseVariant {
     Local,
-    DynamoDB { table: String },
+    DynamoDB {
+        table: String,
+    },
+    /// A `WriteLease::Custom` provider configured on the Rust side.
+    ///
+    /// Read-back only: the Rust variant wraps a `Box<dyn WriteLeaseProvider>`
+    /// that Python cannot supply, so there is deliberately no `CUSTOM()`
+    /// constructor — one that only ever raised would be worse than its absence.
+    /// Before this existed, such a lease reported as `Local`, i.e. "no external
+    /// coordination" for a lease that has it.
+    Custom,
 }
 
 #[pymethods]
@@ -2114,6 +2124,7 @@ impl PyWriteLease {
     fn __repr__(&self) -> String {
         match &self.variant {
             WriteLeaseVariant::Local => "WriteLease.LOCAL".to_string(),
+            WriteLeaseVariant::Custom => "WriteLease.CUSTOM".to_string(),
             WriteLeaseVariant::DynamoDB { table } => {
                 format!("WriteLease.DYNAMODB(table={:?})", table)
             }
@@ -3387,7 +3398,11 @@ impl PySchema {
             .iter()
             .map(|(pname, pmeta)| PropertyInfo {
                 name: pname.clone(),
-                data_type: format!("{:?}", pmeta.r#type),
+                // `type_spec`, not `format!("{:?}")`: the Debug rendering put
+                // `"BinaryVector { dimensions: 64 }"` on a public field that is
+                // also an *input* type, so what a caller read off a schema
+                // could not be fed back into `.property(name, spec)`.
+                data_type: pmeta.r#type.type_spec(),
                 nullable: pmeta.nullable,
                 is_indexed: false,
                 description: pmeta.description.clone(),

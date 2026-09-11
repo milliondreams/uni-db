@@ -969,6 +969,17 @@ impl<'a> LocyPlanBuilder<'a> {
                     .collect()
             })
             .unwrap_or_default();
+        // #265: same alias substitution as HAVING — a REQUIRE naming a fold
+        // output by its original name must resolve against the snapshot the
+        // same way, or it would silently match nothing.
+        let require: Vec<Expr> = fold_clause
+            .map(|c| {
+                c.require
+                    .iter()
+                    .map(|expr| substitute_fold_aliases(expr.clone(), &fold_alias_subs))
+                    .collect()
+            })
+            .unwrap_or_default();
         let best_by_criteria = fold_clause
             .and_then(|c| c.best_by.as_ref())
             .map(|bb| {
@@ -1074,6 +1085,7 @@ impl<'a> LocyPlanBuilder<'a> {
             yield_schema,
             priority: rule.priority,
             fold_bindings,
+            require,
             having,
             best_by_criteria,
             yield_projection,
@@ -2454,6 +2466,7 @@ mod tests {
             where_conditions: vec![],
             along: vec![],
             fold: vec![],
+            require: vec![],
             having: vec![],
             best_by: None,
             output: simple_yield_output(yield_names),
@@ -2985,6 +2998,7 @@ mod tests {
             })],
             along: vec![],
             fold: vec![],
+            require: vec![],
             having: vec![],
             best_by: None,
             output: simple_yield_output(&["n"]),
@@ -3044,6 +3058,7 @@ mod tests {
             })],
             along: vec![],
             fold: vec![],
+            require: vec![],
             having: vec![],
             best_by: None,
             output: simple_yield_output(&["x"]),
@@ -3112,6 +3127,7 @@ mod tests {
             })],
             along: vec![],
             fold: vec![],
+            require: vec![],
             having: vec![],
             best_by: None,
             output: simple_yield_output(&["x", "y"]),
@@ -3168,6 +3184,7 @@ mod tests {
             })],
             along: vec![],
             fold: vec![],
+            require: vec![],
             having: vec![],
             best_by: None,
             output: simple_yield_output(&["x"]),
@@ -3246,6 +3263,7 @@ mod tests {
             ],
             along: vec![],
             fold: vec![],
+            require: vec![],
             having: vec![],
             best_by: None,
             output: simple_yield_output(&["x"]),
@@ -3464,6 +3482,7 @@ mod tests {
                 },
             }],
             fold: vec![],
+            require: vec![],
             having: vec![],
             best_by: None,
             output: simple_yield_output(&["a", "b", "cost"]),
@@ -3525,6 +3544,7 @@ mod tests {
                     window_spec: None,
                 },
             }],
+            require: vec![],
             having: vec![],
             best_by: None,
             output: simple_yield_output(&["n", "total"]),
@@ -3581,6 +3601,7 @@ mod tests {
                     window_spec: None,
                 },
             }],
+            require: vec![],
             having: vec![],
             best_by: None,
             output: simple_yield_output(&["n", "best"]),
@@ -3624,6 +3645,7 @@ mod tests {
             where_conditions: vec![],
             along: vec![],
             fold: vec![],
+            require: vec![],
             having: vec![],
             best_by: Some(BestByClause {
                 items: vec![BestByItem {
@@ -3743,6 +3765,7 @@ mod tests {
                     window_spec: None,
                 },
             }],
+            require: vec![],
             having: vec![],
             best_by: Some(BestByClause {
                 items: vec![BestByItem {
@@ -3866,6 +3889,7 @@ mod tests {
                 })],
                 along: vec![],
                 fold: vec![],
+                require: vec![],
                 having: vec![],
                 best_by: None,
                 output: simple_yield_output(&["a", "b"]),
@@ -3937,6 +3961,7 @@ mod tests {
                 })],
                 along: vec![],
                 fold: vec![],
+                require: vec![],
                 having: vec![],
                 best_by: None,
                 output: simple_yield_output(&["x"]),
@@ -4015,6 +4040,7 @@ mod tests {
                 })],
                 along: vec![],
                 fold: vec![],
+                require: vec![],
                 having: vec![],
                 best_by: None,
                 output: simple_yield_output(&["x"]),
@@ -4091,6 +4117,7 @@ mod tests {
                 })],
                 along: vec![],
                 fold: vec![],
+                require: vec![],
                 having: vec![],
                 best_by: None,
                 output: simple_yield_output(&["n"]),
@@ -4112,6 +4139,7 @@ mod tests {
                 })],
                 along: vec![],
                 fold: vec![],
+                require: vec![],
                 having: vec![],
                 best_by: None,
                 output: simple_yield_output(&["n"]),
@@ -4192,6 +4220,7 @@ mod tests {
                     })],
                     along: vec![],
                     fold: vec![],
+                    require: vec![],
                     having: vec![],
                     best_by: None,
                     output: simple_yield_output(&["x"]),
@@ -4209,6 +4238,7 @@ mod tests {
                     })],
                     along: vec![],
                     fold: vec![],
+                    require: vec![],
                     having: vec![],
                     best_by: None,
                     output: simple_yield_output(&["y"]),
@@ -4364,6 +4394,7 @@ mod tests {
                 })],
                 along: vec![],
                 fold: vec![],
+                require: vec![],
                 having: vec![],
                 best_by: None,
                 output: simple_yield_output(&["x"]),
@@ -4393,6 +4424,7 @@ mod tests {
                 ],
                 along: vec![],
                 fold: vec![],
+                require: vec![],
                 having: vec![],
                 best_by: None,
                 output: simple_yield_output(&["y"]),
@@ -4495,6 +4527,7 @@ mod tests {
             })],
             along: vec![],
             fold: vec![],
+            require: vec![],
             having: vec![],
             best_by: None,
             output: simple_yield_output(&["x"]),
@@ -4547,6 +4580,7 @@ mod tests {
             })],
             along: vec![],
             fold: vec![],
+            require: vec![],
             having: vec![],
             best_by: None,
             output: simple_yield_output(&["x"]),
@@ -4601,6 +4635,7 @@ mod tests {
                 expr: LocyExpr::PrevRef("nonexistent".to_string()),
             }],
             fold: vec![],
+            require: vec![],
             having: vec![],
             best_by: None,
             output: simple_yield_output(&["x", "cost"]),
@@ -4648,6 +4683,7 @@ mod tests {
                     window_spec: None,
                 },
             }],
+            require: vec![],
             having: vec![],
             best_by: None,
             output: simple_yield_output(&["n", "total"]),
@@ -4700,6 +4736,7 @@ mod tests {
                         window_spec: None,
                     },
                 }],
+                require: vec![],
                 having: vec![],
                 best_by: None,
                 output: simple_yield_output(&["n", "score"]),
@@ -4753,6 +4790,7 @@ mod tests {
                     window_spec: None,
                 },
             }],
+            require: vec![],
             having: vec![],
             best_by: None,
             output: simple_yield_output(&["n", "total"]),

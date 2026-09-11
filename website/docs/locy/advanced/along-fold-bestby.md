@@ -184,7 +184,26 @@ The compiler warns with `HavingInRecursivePath`; check `result.warnings()`.
 
 **This is the intended behaviour when the filter selects what you see.** A child that the threshold removes from the answer must still have been visible to its parent while the fixpoint ran — that is what probabilistic rules need, and why this is a warning rather than an error. The two intents are spelled identically, so the compiler cannot tell them apart.
 
-**If the threshold is part of the rule's definition** — an ownership or voting-control cutoff, a quorum, a cumulative-risk ceiling, reachability under a cost budget — there is no single-rule spelling for it today. Run **one non-recursive round per iteration, driving the loop from your application**, writing each round's survivors back before the next round; the post-FOLD filter applies correctly in a non-recursive stratum. This costs a round-trip per iteration.
+### REQUIRE: when the threshold is part of the definition
+
+Write `REQUIRE` instead when the threshold *defines* the rule — an ownership or voting-control cutoff, a quorum, a cumulative-risk ceiling, reachability under a cost budget. It is applied to every iteration's folded snapshot, which is what a self-reference reads, so it constrains what the recursion derives:
+
+```locy
+CREATE RULE blocked AS
+MATCH (o:Entity)-[s:OWNS]->(e:Entity)
+WHERE o IS blocked
+FOLD agg = MSUM(s.pct)
+REQUIRE agg >= 50.0         // constrains the RECURSION
+YIELD KEY e, agg
+```
+
+On the graph above this answers `{A}`: the owner at 11% is excluded, so nothing downstream of it is derived. The same rule with `WHERE` answers `{A, C}`.
+
+Both clauses may appear on one rule, `REQUIRE` first — constrain the derivation, then filter what is shown.
+
+**`REQUIRE` must be one-way.** In a recursive rule it is rejected at compile time unless the comparison can only ever turn from false to true as the fixpoint grows: a **lower** bound (`>=`, `>`) over a non-decreasing fold (`MSUM` over non-negative values, `MMAX`, `MCOUNT`, `MNOR`), or an **upper** bound (`<=`, `<`) over a non-increasing one (`MMIN`, `MPROD`). Equality is never admissible. The reverse pairings would let a fact be derived and then withdrawn, which the fixpoint reads as progress rather than oscillation, so the rule would run to the iteration limit instead of converging.
+
+Outside recursion the direction is not policed and `REQUIRE` means exactly what the post-FOLD `WHERE` means — there is one pass, so nothing can flip. That makes it safe to reach for from the start: a rule keeps the meaning its author wrote if a self-reference is added later.
 
 ## BEST BY (Witness Selection)
 
@@ -245,7 +264,7 @@ See the [Vector Search guide](../../guides/vector-search.md#similar_to-expressio
 
 - Use `ALONG` for accumulators (distance, risk, confidence, similarity).
 - Use `FOLD` when you need grouped summaries.
-- Use post-FOLD `WHERE` to discard groups that don't meet a threshold (e.g., `WHERE count >= 3`) — but in a recursive rule it filters the answer, not the recursion; see the caveat above.
+- Use post-FOLD `WHERE` to discard groups that don't meet a threshold (e.g., `WHERE count >= 3`) — but in a recursive rule that filters the answer, not the recursion; use `REQUIRE` when the threshold is part of the definition.
 - Use `BEST BY` when you need one witness path, not all candidates.
 
 ## Related

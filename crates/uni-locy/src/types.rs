@@ -125,6 +125,12 @@ pub struct CompiledClause {
     pub where_conditions: Vec<RuleCondition>,
     pub along: Vec<AlongBinding>,
     pub fold: Vec<FoldBinding>,
+    /// Post-FOLD definitional threshold (`REQUIRE`, issue #265).
+    ///
+    /// Applied to each iteration's folded snapshot — the view a same-stratum
+    /// self-reference reads — so it constrains what the recursion derives,
+    /// unlike [`Self::having`], which filters the converged answer.
+    pub require: Vec<Expr>,
     /// Post-FOLD filter conditions (HAVING semantics).
     pub having: Vec<Expr>,
     pub best_by: Option<BestByClause>,
@@ -315,9 +321,11 @@ pub enum WarningCode {
     /// threshold is part of the definition" are written identically. So this
     /// warns rather than rejecting.
     ///
-    /// The author who wanted the threshold to constrain the recursion has no
-    /// single-rule spelling for it; the message points at the host-driven
-    /// one-round-per-iteration workaround.
+    /// The author who wanted the threshold to constrain the recursion wants
+    /// `REQUIRE`, which is applied per iteration; the message says so.
+    ///
+    /// Still fires when a rule carries both: a `REQUIRE` alongside a post-FOLD
+    /// `WHERE` does not make the `WHERE` any less post-fixpoint.
     HavingInRecursivePath,
 }
 

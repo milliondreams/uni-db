@@ -979,6 +979,7 @@ fn compile_warnings_to_py(
             WarningCode::PositiveComplementCorrelation => "positive_complement_correlation",
             WarningCode::CrossPredicateCorrelation => "cross_predicate_correlation",
             WarningCode::SharedRetrievalContext => "shared_retrieval_context",
+            WarningCode::HavingInRecursivePath => "having_in_recursive_path",
         };
         wd.set_item("code", code_str)?;
         wd.set_item("message", &w.message)?;

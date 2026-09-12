@@ -1221,7 +1221,14 @@ cypher_scalar_udf! {
 
         let path = &val_args[0];
         let nodes = match path {
+            // The `Value::Path` arm, without which a real path answered Null.
+            // Only the legacy map encoding was handled, so `nodes(p)` worked
+            // wherever a path arrived as a map and silently emptied wherever it
+            // arrived as a path. `expr_eval::eval_nodes` has always had both.
+            Value::Path(p) => Value::List(p.nodes.iter().cloned().map(Value::Node).collect()),
             Value::Map(map) => map.get("nodes").cloned().unwrap_or(Value::Null),
+            // Null for a non-path, which is what this has always answered.
+            // `eval_nodes` errors instead; aligning the two is its own change.
             _ => Value::Null,
         };
 
@@ -1250,6 +1257,10 @@ cypher_scalar_udf! {
 
         let path = &val_args[0];
         let rels = match path {
+            // See `nodes`: the same arm was missing here, so `relationships(p)`
+            // answered Null for a path that arrived as a path rather than as
+            // the legacy map.
+            Value::Path(p) => Value::List(p.edges.iter().cloned().map(Value::Edge).collect()),
             Value::Map(map) => map.get("relationships").cloned().unwrap_or(Value::Null),
             _ => Value::Null,
         };

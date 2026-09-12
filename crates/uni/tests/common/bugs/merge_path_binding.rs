@@ -37,11 +37,6 @@ async fn two_nodes() -> Result<Uni> {
     Ok(db)
 }
 
-// Measured with `length` alone. `relationships(p)` would say the same thing
-// more directly, but it returns Null on this path — a separate gap, and
-// folding it in would make a failure here ambiguous between the two.
-// `length` suffices now that it counts relationships: a match branch that
-// dropped the edge reports 0 where MATCH reports 1.
 const MERGE_PATH: &str = "MATCH (a:E {uid:'a'}), (b:E {uid:'b'}) \
                           MERGE p = (a)-[:R]->(b) \
                           RETURN length(p) AS len";
@@ -134,5 +129,67 @@ async fn length_of_a_path_counts_relationships() -> Result<()> {
             "length() returned {got}, want {want}, for: {cypher}"
         );
     }
+    Ok(())
+}
+
+/// `nodes(p)` and `relationships(p)` must return a path's parts, not Null.
+///
+/// Both UDFs handled only the legacy map encoding of a path and fell to
+/// `_ => Value::Null` otherwise, so they emptied silently wherever a path
+/// arrived as a `Value::Path`. `expr_eval`'s versions have always had the arm;
+/// only the DataFusion ones were missing it — the same one-value-two-encodings
+/// split that made `length()` measure a path's JSON key count.
+///
+/// Asserted against a two-hop path so the two counts differ (3 nodes, 2
+/// relationships). With a one-hop path both sides of a confusion between them
+/// would read 2 and 1 either way round.
+#[tokio::test]
+async fn nodes_and_relationships_return_a_paths_parts() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL E (uid STRING)").await?;
+    tx.execute("CREATE EDGE TYPE R FROM E TO E").await?;
+    tx.execute(
+        "CREATE (a:E {uid:'a'}), (b:E {uid:'b'}), (c:E {uid:'c'}), \
+         (a)-[:R]->(b), (b)-[:R]->(c)",
+    )
+    .await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query(
+            "MATCH p = (:E {uid:'a'})-[:R]->()-[:R]->(:E {uid:'c'}) \
+             RETURN size(nodes(p)) AS n, size(relationships(p)) AS r",
+        )
+        .await?;
+    let row = &r.rows()[0];
+    assert_eq!(
+        row.get::<i64>("n")?,
+        3,
+        "nodes(p) did not return the path's three nodes"
+    );
+    assert_eq!(
+        row.get::<i64>("r")?,
+        2,
+        "relationships(p) did not return the path's two relationships"
+    );
+
+    // And on a MERGE'd path, which is where the Null was first seen.
+    let tx = db.session().tx().await?;
+    let merged = tx
+        .query(
+            "MATCH (a:E {uid:'a'}), (b:E {uid:'b'}) MERGE p = (a)-[:R]->(b) \
+             RETURN size(nodes(p)) AS n, size(relationships(p)) AS r",
+        )
+        .await?;
+    tx.commit().await?;
+    let row = &merged.rows()[0];
+    assert_eq!(row.get::<i64>("n")?, 2, "a MERGE'd path lost its nodes");
+    assert_eq!(
+        row.get::<i64>("r")?,
+        1,
+        "a MERGE'd path lost its relationship"
+    );
     Ok(())
 }

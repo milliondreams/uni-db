@@ -4787,6 +4787,16 @@ fn cypher_size_scalar(scalar: &ScalarValue) -> DFResult<ScalarValue> {
                             "TypeError: InvalidArgumentValue - length() is not supported for Relationship values".to_string(),
                         ))
                     }
+                    // A path's length is its relationship count, as
+                    // `expr_eval::eval_length` has always had it. Without this
+                    // arm a path fell to the catch-all below, which renders it
+                    // as the JSON object `{nodes, relationships}` and returns
+                    // that object's *key count* — so every path, of any length,
+                    // measured 2. Plausible enough to survive: a one-hop path
+                    // is 2 nodes, and 2 is what came back.
+                    uni_common::Value::Path(path) => {
+                        Ok(ScalarValue::Int64(Some(path.edges.len() as i64)))
+                    }
                     _ => {
                         let json_val: serde_json::Value = uni_val.into();
                         match json_val {

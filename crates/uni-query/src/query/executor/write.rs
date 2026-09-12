@@ -1796,6 +1796,15 @@ impl Executor {
         if pattern.paths.len() != 1 {
             return None;
         }
+        // A path variable needs every element bound to build `Value::Path`, and
+        // this path's *match* outcome binds no edge: the relationship it serves
+        // is anonymous, so nothing lands in the row, and `bind_path_variables`
+        // requires only `!nodes.is_empty()` — `p` came back holding its nodes
+        // and no relationship. The general path materialises the match rows and
+        // binds them.
+        if pattern.paths[0].variable.is_some() {
+            return None;
+        }
         let [
             PatternElement::Node(a),
             PatternElement::Relationship(r),
@@ -2960,7 +2969,15 @@ impl Executor {
             // MERGE — including unique-constrained labels, whose keys are
             // indexed — so there is no separate constraint-only fast path.)
             let matches = self
-                .execute_merge_match(pattern, &row, prop_manager, params, ctx)
+                // `path_pattern`, not `pattern`: when the MERGE carries a path
+                // variable, `prepare_pattern_for_path_binding` names the
+                // otherwise-anonymous relationships so they can be bound. The
+                // match ran on the original, which has nothing to bind, while
+                // `bind_path_variables` below reads the prepared one — so a
+                // matched `MERGE p = (a)-[:R]->(b)` produced a `p` holding its
+                // nodes and no relationship. Without a path variable the two
+                // are the same pattern.
+                .execute_merge_match(&path_pattern, &row, prop_manager, params, ctx)
                 .await?;
             let writer: &uni_store::Writer = writer_lock.as_ref();
 

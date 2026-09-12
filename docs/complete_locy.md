@@ -2220,7 +2220,7 @@ struct ExplainRule { rule_name: QualifiedName, where_expr: Option<Expr>, return_
 
 ## Appendix D: TCK Coverage Map
 
-**70 feature files, 519 scenarios** covering all Locy features.
+**72 feature files, 528 scenarios** covering all Locy features.
 
 ### Core Evaluation
 

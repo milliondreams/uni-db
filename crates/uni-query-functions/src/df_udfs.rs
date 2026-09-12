@@ -1227,9 +1227,21 @@ cypher_scalar_udf! {
             // arrived as a path. `expr_eval::eval_nodes` has always had both.
             Value::Path(p) => Value::List(p.nodes.iter().cloned().map(Value::Node).collect()),
             Value::Map(map) => map.get("nodes").cloned().unwrap_or(Value::Null),
-            // Null for a non-path, which is what this has always answered.
-            // `eval_nodes` errors instead; aligning the two is its own change.
-            _ => Value::Null,
+            // Null in, null out — the Cypher convention for a function applied
+            // to a missing value, and the one case where a null answer is a
+            // real answer rather than an absent one.
+            Value::Null => Value::Null,
+            // Anything else is a type error. This used to answer `Null`, which
+            // is indistinguishable from "a path with no nodes" and from "the
+            // encoding was not recognised" — the reading that let a missing
+            // `Value::Path` arm go unnoticed here for as long as it did.
+            // `expr_eval::eval_nodes` has always errored.
+            other => {
+                return Err(datafusion::error::DataFusionError::Execution(format!(
+                    "TypeError: InvalidArgumentValue - nodes() expects a Path, got {}",
+                    other.type_name()
+                )));
+            }
         };
 
         Ok(nodes)
@@ -1262,7 +1274,15 @@ cypher_scalar_udf! {
             // the legacy map.
             Value::Path(p) => Value::List(p.edges.iter().cloned().map(Value::Edge).collect()),
             Value::Map(map) => map.get("relationships").cloned().unwrap_or(Value::Null),
-            _ => Value::Null,
+            // See `nodes`: null in, null out; anything else is a type error
+            // rather than an empty-looking answer.
+            Value::Null => Value::Null,
+            other => {
+                return Err(datafusion::error::DataFusionError::Execution(format!(
+                    "TypeError: InvalidArgumentValue - relationships() expects a Path, got {}",
+                    other.type_name()
+                )));
+            }
         };
 
         Ok(rels)

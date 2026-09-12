@@ -193,3 +193,54 @@ async fn nodes_and_relationships_return_a_paths_parts() -> Result<()> {
     );
     Ok(())
 }
+
+/// `nodes()` / `relationships()` reject a non-path instead of answering Null.
+///
+/// Returning Null was fail-open in the most misleading way available: it is
+/// indistinguishable from "a path with no nodes" and from "this encoding was
+/// not recognised". That second reading is not hypothetical — it is exactly
+/// what a missing `Value::Path` arm produced here, and why the gap went
+/// unnoticed behind a test named after these two functions.
+///
+/// Null in, null out is kept: that is the Cypher convention for a function
+/// applied to a missing value, and the one case where a null answer is an
+/// answer rather than a silence.
+#[tokio::test]
+async fn nodes_and_relationships_reject_a_non_path() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE LABEL E (uid STRING)").await?;
+    tx.execute("CREATE (:E {uid: 'a'})").await?;
+    tx.commit().await?;
+
+    for call in [
+        "nodes(n.uid)",
+        "relationships(n.uid)",
+        "nodes(1)",
+        "relationships(1)",
+    ] {
+        let err = db
+            .session()
+            .query(&format!("MATCH (n:E {{uid:'a'}}) RETURN {call} AS x"))
+            .await
+            .err();
+        let msg = err.map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            msg.contains("expects a Path"),
+            "{call} should be a type error, got: {msg:?}"
+        );
+    }
+
+    // Null in, null out.
+    for call in ["nodes(null)", "relationships(null)"] {
+        let r = db
+            .session()
+            .query(&format!("RETURN {call} IS NULL AS is_null"))
+            .await?;
+        assert!(
+            r.rows()[0].get::<bool>("is_null")?,
+            "{call} should be null, not an error"
+        );
+    }
+    Ok(())
+}

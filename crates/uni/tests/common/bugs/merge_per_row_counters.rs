@@ -80,3 +80,61 @@ async fn merge_reports_the_rows_its_per_row_plans_scanned() -> Result<()> {
     );
     Ok(())
 }
+
+/// A keyed-node MERGE that must scan reports the rows it scanned.
+///
+/// `merge_lookup_persisted_batch` resolves the batch's keys with a filtered
+/// scan of the label's table, and used the uncounted entry point — so a
+/// `MERGE (n:L {k: v})` answered without ever appearing to look at anything.
+///
+/// The key here is deliberately **unindexed**. With an index the fast path does
+/// a point lookup and examining no scan rows is the correct answer, so an
+/// indexed key cannot tell a fixed counter from a broken one.
+#[tokio::test]
+async fn a_scanning_merge_reports_the_rows_it_scanned() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    let tx = db.session().tx().await?;
+    // No index on `tag`, which is what the MERGE keys on.
+    tx.execute("CREATE LABEL Thing (tag STRING)").await?;
+    tx.commit().await?;
+
+    let tx = db.session().tx().await?;
+    let mut bulk = tx.bulk_writer().build()?;
+    let vertices: Vec<HashMap<String, Value>> = (0..N)
+        .map(|i| HashMap::from([("tag".to_string(), Value::String(format!("t{i}")))]))
+        .collect();
+    bulk.insert_vertices("Thing", vertices).await?;
+    bulk.commit().await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    let tx = db.session().tx().await?;
+    let res = tx
+        .query("MERGE (n:Thing {tag: 't5'}) RETURN n.tag AS t")
+        .await?;
+    let m = res.metrics().clone();
+    let scanned = m.rows_scanned;
+    let rows = res.rows().len();
+    tx.rollback();
+
+    eprintln!(
+        "unindexed keyed MERGE: rows_scanned={scanned} rows={rows} \
+         scans_reported={} index_scans={} lance_iops={}",
+        m.scans_reported, m.index_scans, m.lance_iops
+    );
+    assert_eq!(rows, 1, "the MERGE should have matched the existing node");
+    // `rows_scanned` counts what the storage scan handed back — that is how
+    // `columnar_scan` computes it too (`lance_rows + l0_rows`), so a pushed-down
+    // predicate lowers it on every path, not just this one. The assertion is
+    // therefore "> 0", not a row count: it distinguishes a scan that is
+    // observable from one that is invisible, which is the defect.
+    assert!(
+        scanned > 0,
+        "the MERGE fast path's key-resolution scan reported no rows \
+         (rows_scanned=0, scans_reported={}). It scans the label to resolve an \
+         unindexed key, so a statement can do that work while appearing to do \
+         none.",
+        m.scans_reported
+    );
+    Ok(())
+}

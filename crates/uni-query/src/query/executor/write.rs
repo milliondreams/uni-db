@@ -1656,6 +1656,61 @@ impl Executor {
     /// filters only the general path applies). Any deviation returns `None` and
     /// the caller keeps the general path. The caller still verifies per row that
     /// both endpoints are actually bound to vids.
+    /// Bind a matched relationship variable to the edge that is already there.
+    ///
+    /// Both relationship fast paths used to hand a *matched* named edge back to
+    /// the general path, on the grounds that an `Edge` carries properties and
+    /// those could not be enumerated. That was wrong about the API, not about
+    /// the requirement: the batch reader takes an explicit name list, but
+    /// `PropertyManager::get_all_edge_props_with_ctx` enumerates a single
+    /// edge's properties, accumulating L0 over storage. The adjacency probe
+    /// already yields the eid, so everything an `Edge` needs is in hand.
+    ///
+    /// `probe_from` is the endpoint the probe walked out of and `neighbour` is
+    /// what it found, so the direction decides which way round the edge goes.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors the fast paths' threaded state"
+    )]
+    async fn bind_matched_edge(
+        &self,
+        row: &mut HashMap<String, Value>,
+        rel_var: &str,
+        eid: uni_common::core::id::Eid,
+        type_id: u32,
+        probe_from: Vid,
+        neighbour: Vid,
+        dir: uni_store::storage::direction::Direction,
+        prop_manager: &PropertyManager,
+        ctx: Option<&QueryContext>,
+    ) -> Result<()> {
+        let edge_type = self
+            .storage
+            .schema_manager()
+            .schema()
+            .edge_type_name_by_id_unified(type_id)
+            .unwrap_or_default();
+        let (src, dst) = match dir {
+            uni_store::storage::direction::Direction::Outgoing => (probe_from, neighbour),
+            _ => (neighbour, probe_from),
+        };
+        let properties = prop_manager
+            .get_all_edge_props_with_ctx(eid, ctx)
+            .await?
+            .unwrap_or_default();
+        row.insert(
+            rel_var.to_string(),
+            Value::Edge(uni_common::Edge {
+                eid,
+                edge_type,
+                src,
+                dst,
+                properties,
+            }),
+        );
+        Ok(())
+    }
+
     /// A relationship MERGE with one bound endpoint and one found-or-created by
     /// key: `MATCH (a …) MERGE (a)-[:R]->(b:L {k: v})`.
     ///
@@ -2083,11 +2138,25 @@ impl Executor {
         for chunk in key_list.chunks(Self::MERGE_SCAN_CHUNK) {
             let filter = Self::merge_batch_filter(key_names, chunk)
                 .ok_or_else(|| anyhow!("MERGE fast path could not build a batched key filter"))?;
+            // A `MERGE (n:L {k: v})` over an unindexed key resolves its keys by
+            // scanning the label's table, and reported nothing at all — neither
+            // the rows nor that a scan had happened.
+            //
+            // The rows are added from the returned batch rather than left to
+            // the request: `ScanRequest::count_storage_rows` exists to record a
+            // request's rows and has no callers anywhere in the workspace, so
+            // attaching counters to a request records none of them. The scans
+            // that do populate the figure go through `columnar_scan`, which
+            // adds `lance_rows + l0_rows` directly — so both count what storage
+            // handed back, and a pushed-down predicate lowers the figure either
+            // way. Passing the counters is still worth doing: it is what drives
+            // this scan's `index_scans` and `lance_iops`.
             let scanned = self
                 .storage
-                .scan_vertex_table(label, &columns, Some(&filter))
+                .scan_vertex_table_counted(label, &columns, Some(&filter), Some(&self.counters))
                 .await?;
             let Some(batch) = scanned else { continue };
+            self.counters.add_rows_scanned(batch.num_rows());
             let Some(vid_col) = batch
                 .column_by_name("_vid")
                 .and_then(|c| c.as_any().downcast_ref::<arrow_array::UInt64Array>())
@@ -2112,9 +2181,16 @@ impl Executor {
             let filter = FilterExpr::one_of("_vid", chunk.iter().map(|v| Scalar::UInt(v.as_u64())));
             let scanned = self
                 .storage
-                .scan_vertex_table(label, &verify_columns, Some(&filter))
+                .scan_vertex_table_counted(
+                    label,
+                    &verify_columns,
+                    Some(&filter),
+                    Some(&self.counters),
+                )
                 .await?;
+            // See the key scan above: the request records no rows itself.
             let Some(batch) = scanned else { continue };
+            self.counters.add_rows_scanned(batch.num_rows());
             let (Some(vid_col), Some(del_col), Some(ver_col)) = (
                 batch
                     .column_by_name("_vid")
@@ -2790,17 +2866,20 @@ impl Executor {
                 } else {
                     let by_vid: std::collections::HashSet<Vid> =
                         candidates.iter().copied().collect();
-                    let hits: Vec<Vid> = graph_ctx
+                    // The eid travels with the hit: a named relationship is
+                    // bound from it below.
+                    let hits: Vec<(Vid, uni_common::core::id::Eid)> = graph_ctx
                         .get_neighbors(bound_vid, shape.type_id, shape.probe_dir)
                         .into_iter()
-                        .map(|(n, _eid)| n)
-                        .filter(|n| by_vid.contains(n))
+                        .filter(|(n, _)| by_vid.contains(n))
                         .collect();
                     // Two or more matches means the general path's one-row-per-
                     // match semantics, which this branch does not reproduce.
                     match hits.len() {
                         0 => Some(None),
                         1 => Some(Some(hits[0])),
+                        // The general path emits one row per match; this branch
+                        // does not reproduce that, so hand the row back.
                         // The general path emits one row per match; this branch
                         // does not reproduce that, so hand the row back
                         // untouched. `None` here means "not served".
@@ -2812,11 +2891,7 @@ impl Executor {
                 // was found; `Some(None)` = create; `Some(Some(vid))` = match.
                 if let Some(outcome) = matched {
                     match outcome {
-                        // A matched *named* edge would have to be bound to the
-                        // edge already there, which this branch cannot do; the
-                        // general path materialises it.
-                        Some(_) if shape.rel_var.is_some() => {}
-                        Some(vid) => {
+                        Some((vid, eid)) => {
                             let empty = Prefetch::default();
                             let props = read_vertex_props_with_prefetch(
                                 vid,
@@ -2829,6 +2904,20 @@ impl Executor {
                                 shape.keyed.variable.clone().unwrap_or_default(),
                                 Self::build_node_map(vid, &shape.keyed_label, props),
                             );
+                            if let Some(rel_var) = shape.rel_var.as_deref() {
+                                self.bind_matched_edge(
+                                    &mut row,
+                                    rel_var,
+                                    eid,
+                                    shape.type_id,
+                                    bound_vid,
+                                    vid,
+                                    shape.probe_dir,
+                                    prop_manager,
+                                    ctx,
+                                )
+                                .await?;
+                            }
                             Self::bind_path_variables(&path_pattern, &mut row, &temp_vars);
                             results.push(row);
                             continue;
@@ -2892,29 +2981,23 @@ impl Executor {
                 let src_vid = row.get(src_var).and_then(|v| Self::vid_from_value(v).ok());
                 let dst_vid = row.get(dst_var).and_then(|v| Self::vid_from_value(v).ok());
                 if let (Some(src_vid), Some(dst_vid)) = (src_vid, dst_vid) {
-                    let exists = graph_ctx
+                    // Every edge of this type between the two endpoints, not
+                    // just the first: the eid lets a named relationship be
+                    // bound, and the *count* decides whether this branch may
+                    // serve the row at all.
+                    let matching: Vec<uni_common::core::id::Eid> = graph_ctx
                         .get_neighbors(src_vid, *type_id, *dir)
                         .into_iter()
-                        .any(|(n, _eid)| n == dst_vid);
-                    // A named relationship that *matched* has to be bound to the
-                    // edge already there, and that binding cannot be rebuilt
-                    // here. The adjacency probe yields the eid, but an `Edge`
-                    // value also carries the edge's properties, and there is no
-                    // way to enumerate them for an arbitrary edge: the batch
-                    // property read takes an explicit name list and honours no
-                    // wildcard, and outside `strict_schema` — off by default —
-                    // the declared set is not the whole set, since the
-                    // schemaless registry records type ids and not properties.
-                    // Binding a partial edge would make `RETURN e` answer
-                    // differently depending on which path served the row, which
-                    // is worse than being slow. So that one outcome falls
-                    // through to the general path.
-                    //
-                    // A named relationship that is *created* is unaffected:
-                    // `execute_create_pattern` binds it, with the properties it
-                    // just wrote. That is the insert-heavy ingest shape this is
-                    // for, and it takes the fast path in full.
-                    if exists && rel_var.is_some() {
+                        .filter(|(n, _)| *n == dst_vid)
+                        .map(|(_, eid)| eid)
+                        .collect();
+                    let exists = !matching.is_empty();
+                    // A named relationship matching more than once has to emit
+                    // one row per match, which this branch does not reproduce —
+                    // it emits a single row. Hand those to the general path.
+                    // (An anonymous relationship binds nothing and keeps the
+                    // single-row behaviour it has always had here.)
+                    if rel_var.is_some() && matching.len() > 1 {
                         // fall through
                     } else {
                         let writer: &uni_store::Writer = writer_lock.as_ref();
@@ -2950,12 +3033,27 @@ impl Executor {
                                 .await?;
                             }
                         }
-                        // Whether matched or just created, the edge now exists;
-                        // bind path variables and emit the row. Any edge binding
-                        // needed has already been made: an anonymous edge has
-                        // none, and a named one reaching here was created rather
-                        // than matched, so `execute_create_pattern` bound it.
-                        // ON MATCH SET is excluded from this fast path.
+                        // Whether matched or just created, the edge now exists.
+                        // A named relationship that was *created* was bound by
+                        // `execute_create_pattern` with the properties it just
+                        // wrote; one that *matched* is bound here, from the eid
+                        // the probe returned. ON MATCH SET is excluded from this
+                        // fast path.
+                        if let (Some(rel_var), Some(&eid)) = (rel_var.as_deref(), matching.first())
+                        {
+                            self.bind_matched_edge(
+                                &mut row,
+                                rel_var,
+                                eid,
+                                *type_id,
+                                src_vid,
+                                dst_vid,
+                                *dir,
+                                prop_manager,
+                                ctx,
+                            )
+                            .await?;
+                        }
                         Self::bind_path_variables(&path_pattern, &mut row, &temp_vars);
                         results.push(row);
                         continue;

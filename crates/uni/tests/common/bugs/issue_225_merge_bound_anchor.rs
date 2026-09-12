@@ -309,3 +309,69 @@ async fn issue_225_a_keyed_far_endpoint_keeps_a_fast_path() -> Result<()> {
     );
     Ok(())
 }
+
+/// A named relationship stays on the fast path when the edge already exists.
+///
+/// Creating a named edge always took the fast path — `execute_create_pattern`
+/// binds it with the properties it just wrote. *Matching* one did not: binding
+/// it needs the existing edge's value, which the fast path handed back to the
+/// general per-row plan. That made cost depend on whether the data was already
+/// there, so a re-ingest paid the per-row plan on every row while the first
+/// ingest paid none.
+///
+/// It is fixed by reading the edge the adjacency probe found:
+/// `get_all_edge_props_with_ctx` enumerates one edge's properties, which is
+/// what the earlier "they cannot be enumerated" reasoning got wrong — that is
+/// true of the *batch* reader, not of the single-edge one.
+///
+/// The second run of the same batch is 100% matches, so it is the arm that
+/// would regress. Compared against the first run rather than a threshold.
+#[tokio::test]
+async fn issue_225_a_matched_named_relationship_stays_on_the_fast_path() -> Result<()> {
+    const NAMED: &str = "UNWIND $batch AS r \
+                         MATCH (a:Entity {uid: r.src}), (b:Entity {uid: r.dst}) \
+                         MERGE (a)-[e:OWNS]->(b)";
+
+    let db = graph(LARGE).await?;
+
+    // Commit the first run so the second sees the edges as existing.
+    let tx = db.session().tx().await?;
+    let started = std::time::Instant::now();
+    let first = tx
+        .execute_with(NAMED)
+        .param("batch", batch(LARGE))
+        .run()
+        .await?;
+    let create_secs = started.elapsed().as_secs_f64();
+    let created = first.relationships_created();
+    tx.commit().await?;
+
+    // Second run: every row matches.
+    let tx = db.session().tx().await?;
+    let started = std::time::Instant::now();
+    let second = tx
+        .execute_with(NAMED)
+        .param("batch", batch(LARGE))
+        .run()
+        .await?;
+    let match_secs = started.elapsed().as_secs_f64();
+    let created_again = second.relationships_created();
+    tx.rollback();
+
+    assert_eq!(created, BATCH, "first run linked {created} of {BATCH}");
+    assert_eq!(
+        created_again, 0,
+        "the second run created {created_again} relationships; it should have \
+         matched every row"
+    );
+
+    let ratio = match_secs / create_secs.max(1e-9);
+    eprintln!("named edge: create {create_secs:.3}s, match {match_secs:.3}s = {ratio:.2}x");
+    assert!(
+        ratio < 3.0,
+        "matching an existing named relationship cost {ratio:.2}x creating one \
+         ({match_secs:.3}s vs {create_secs:.3}s), so the match outcome is \
+         falling back to the per-row plan (#225)."
+    );
+    Ok(())
+}

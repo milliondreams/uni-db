@@ -196,6 +196,15 @@ where
 /// Keying on `Buffer::data_ptr` — the allocation, not the array's view into it —
 /// makes the shared case cost what it actually costs: the first batch to touch
 /// a buffer pays for it, and every later batch sharing it pays nothing.
+///
+/// # When *not* to use this
+///
+/// Only accumulation needs it. An operator that holds **one** batch at a time
+/// and `try_resize`s to its size is already right with `get_array_memory_size`,
+/// and should stay that way: holding a one-row slice of a large buffer really
+/// does keep that whole allocation resident, so the parent's capacity is the
+/// honest charge rather than an over-count. The defect is specific to adding
+/// those figures up across batches that share.
 pub(crate) struct BatchFootprint {
     /// Allocation start addresses already charged.
     seen: std::collections::HashSet<usize>,

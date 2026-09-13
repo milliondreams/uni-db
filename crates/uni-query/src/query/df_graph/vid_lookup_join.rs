@@ -49,6 +49,7 @@
 //! - Anchor-pair build column types other than `UInt64`. Rejected at the
 //!   planner.
 
+use crate::query::df_graph::common::BatchFootprint;
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -435,9 +436,17 @@ async fn run_join(
     // already resident.
     let mut build_stream = build.execute(partition, Arc::clone(&context))?;
     let mut build_batches: Vec<RecordBatch> = Vec::new();
+    // One footprint across the accumulation, not `get_array_memory_size` per
+    // batch. That function reports the full capacity of every buffer an array
+    // points into, so batches sliced from a common parent each report the whole
+    // parent and the sum bills the same allocation once per batch -- charging a
+    // build side of ten thousand one-row batches tens of gigabytes for a few
+    // megabytes of memory. Correct for one retained batch, wrong the moment they
+    // are added up. See `BatchFootprint`.
+    let mut footprint = BatchFootprint::new();
     while let Some(batch) = build_stream.next().await {
         let batch = batch?;
-        reservation.try_grow(batch.get_array_memory_size())?;
+        reservation.try_grow(footprint.add(&batch))?;
         build_batches.push(batch);
     }
 
@@ -486,6 +495,7 @@ async fn run_join(
         let vids: Vec<u64> = vid_set.iter().copied().collect();
         let mut chunks: Vec<RecordBatch> = Vec::new();
         let mut chunk_bytes = 0usize;
+        let mut chunk_footprint = BatchFootprint::new();
 
         // At high selectivity one unfiltered pass replaces the chunked lookups
         // (#237, on #260's statistic). Safe here because the probe batch is
@@ -526,7 +536,10 @@ async fn run_join(
                     })?
                 }
             };
-            let size = batch.get_array_memory_size();
+            // Same reason as the build side: these accumulate, so they are
+            // charged against one footprint rather than each reporting whatever
+            // parent buffer it happens to share.
+            let size = chunk_footprint.add(&batch);
             reservation.try_grow(size)?;
             chunk_bytes += size;
             chunks.push(batch);

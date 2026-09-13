@@ -673,7 +673,7 @@ async fn a_vid_lookup_join_reserves_what_it_materializes() -> Result<()> {
     // `GraphScanExec` reserves too, and the build side is deliberately the
     // narrow one -- `linked_vid` only -- while the probe carries long strings,
     // so there is a wide band between them.
-    let db = db_with_memory_limit(4 * 1024 * 1024).await?;
+    let db = Uni::in_memory().build().await?;
     db.schema()
         .label("Target")
         .property("name", uni_db::DataType::String)
@@ -706,8 +706,31 @@ async fn a_vid_lookup_join_reserves_what_it_materializes() -> Result<()> {
     tx.commit().await?;
     db.flush().await?;
 
+    // `count(b.name)`, not `b.name`: one row out, so the post-hoc result-size
+    // check cannot see this query at all and the only thing that can refuse it
+    // is the execution-time pool.
+    //
+    // This test used to return the names and sit at a 4 MiB ceiling. That worked
+    // only while the join's charge was inflated by `get_array_memory_size`
+    // summing shared buffers; once the charge became honest the two costs landed
+    // within half a megabyte of each other and the result-size check won the
+    // race, rejecting the query with a message that names no operator. Removing
+    // the confound is better than re-tuning around it.
+    //
+    // Swept on this fixture, 20 000 rows:
+    //
+    // | ceiling | outcome |
+    // |---|---|
+    // | 1 MiB | refused, `GraphScanExec` — below what the scan itself needs |
+    // | 2–3 MiB | **refused, `VidLookupJoinExec`** |
+    // | 4 MiB and up | OK |
     let res = session
-        .query("MATCH (a:Source) MATCH (b:Target) WHERE id(b) = a.linked_vid RETURN b.name AS bn")
+        .query_with(
+            "MATCH (a:Source) MATCH (b:Target) WHERE id(b) = a.linked_vid \
+             RETURN count(b.name) AS c",
+        )
+        .max_memory(3 * 1024 * 1024)
+        .fetch_all()
         .await;
 
     match res {
@@ -716,10 +739,9 @@ async fn a_vid_lookup_join_reserves_what_it_materializes() -> Result<()> {
             // Naming the operator is what makes this discriminating. An earlier
             // version accepted any message containing "memory" and passed with
             // the reservations removed, because the post-hoc result-size check
-            // rejects this query at this ceiling too — 20k rows of names exceed
-            // it on their own. Two mechanisms, one indistinguishable assertion.
-            // The pool names the consumer that asked; the result-size check
-            // cannot.
+            // rejected this query at that ceiling too. Two mechanisms, one
+            // indistinguishable assertion. The pool names the consumer that
+            // asked; the result-size check cannot.
             assert!(
                 msg.contains("VidLookupJoinExec"),
                 "the refusal must come from the join's own reservation, not from \
@@ -727,9 +749,10 @@ async fn a_vid_lookup_join_reserves_what_it_materializes() -> Result<()> {
             );
         }
         Ok(rows) => panic!(
-            "a 4 MiB ceiling accepted a join that materialized {} rows; the \
-             operator is allocating outside the pool again",
-            rows.rows().len()
+            "a 3 MiB ceiling accepted a join that materialized the whole probe \
+             side (counted {:?}); the operator is allocating outside the pool \
+             again",
+            rows.rows()[0].values()[0]
         ),
     }
     Ok(())
@@ -1637,11 +1660,15 @@ async fn a_schemaless_traversal_accounts_for_the_batch_it_expands() -> Result<()
 /// ~17.8 MB of accounted batches. Sweeping ceilings with and without the
 /// reservation:
 ///
-/// | ceiling | accounted | unaccounted |
-/// |---------|-----------|-------------|
-/// | 18 MB   | refused   | refused     |
-/// | 20 MB   | **refused** | **OK**    |
-/// | 22 MB   | OK        | OK          |
+/// Re-swept after the join's charge stopped double-counting shared buffers
+/// (see `BatchFootprint`): the honest figure is several times smaller, so the
+/// band moved down and the old 20 MB ceiling now fits the query comfortably.
+///
+/// | ceiling | outcome |
+/// |---|---|
+/// | 1 MiB | refused, `GraphScanExec` |
+/// | 2–6 MiB | **refused, `VidLookupJoinExec`** |
+/// | 8 MiB and up | OK |
 ///
 /// So 20 MB is the only kind of ceiling that can witness this, and it is why
 /// the assertion below is a required *failure*: an unaccounted structure passes
@@ -1682,7 +1709,7 @@ async fn a_vid_lookup_join_accounts_for_its_derived_index() -> Result<()> {
     let refused = db
         .session()
         .query_with(QUERY)
-        .max_memory(20 * 1024 * 1024)
+        .max_memory(6 * 1024 * 1024)
         .fetch_all()
         .await;
     let err = refused

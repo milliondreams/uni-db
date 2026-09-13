@@ -3328,8 +3328,15 @@ impl Stream for GraphTraverseMainStream {
                         // ends, and is the largest thing this operator holds.
                         // The buffered input is already reserved; resizing to
                         // the sum keeps one reservation honest about both.
-                        let buffered_bytes: usize =
-                            buffered.iter().map(|b| b.get_array_memory_size()).sum();
+                        // Charged against one footprint, not summed per batch:
+                        // `get_array_memory_size` reports whole buffer capacity,
+                        // so buffered batches sliced from a common parent each
+                        // report that parent and the sum bills it once per
+                        // batch. Right for a single retained batch -- holding a
+                        // slice really does keep the allocation resident --
+                        // wrong the moment they are added up.
+                        let mut footprint = crate::query::df_graph::common::BatchFootprint::new();
+                        let buffered_bytes: usize = buffered.iter().map(|b| footprint.add(b)).sum();
                         self.buffered_bytes = buffered_bytes;
                         if let Err(e) = self
                             .reservation

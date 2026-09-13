@@ -354,6 +354,17 @@ async fn qpp_group_variable_misuse_is_diagnosed() -> Result<()> {
 }
 
 /// Legitimate uses must all remain legal.
+///
+/// This ran nine shapes and asserted only that none errored, which cannot tell
+/// "supported and working" from "supported and silently empty" (#259). Measured
+/// at the time: `y` binds `[2, 4]`, so nothing is empty today and no defect was
+/// hiding behind the weak assertion — this is hygiene against a future
+/// regression, not a repro.
+///
+/// The execution loop is kept: it is the cheapest way to hold nine shapes to
+/// "still legal", and most of them have exact-value equivalents in the sibling
+/// tests above. What is added is the piece with no equivalent anywhere — the
+/// negative `all()` twin — plus the two values this fixture fully determines.
 #[tokio::test]
 async fn qpp_group_variable_supported_uses() -> Result<()> {
     let db = chain_fixture().await?;
@@ -376,6 +387,60 @@ async fn qpp_group_variable_supported_uses() -> Result<()> {
             .await
             .unwrap_or_else(|e| panic!("supported use rejected: {query}\n{e}"));
     }
+
+    // The group variable actually binds, in iteration order.
+    let ids = db
+        .session()
+        .query(&format!("{prefix}RETURN [n IN y | n.id] AS ids"))
+        .await?;
+    assert_eq!(
+        ids.rows()[0].values()[0],
+        Value::List(vec![Value::Int(2), Value::Int(4)]),
+        "`y` must bind both iterations' nodes in order"
+    );
+
+    // Both group variables have one entry per iteration.
+    let sizes = db
+        .session()
+        .query(&format!("{prefix}RETURN size(y) AS sy, size(r) AS sr"))
+        .await?;
+    assert_eq!(sizes.rows()[0].values()[0], Value::Int(2), "size(y)");
+    assert_eq!(sizes.rows()[0].values()[1], Value::Int(2), "size(r)");
+
+    // The satisfiable twin, so the negative below cannot pass for an unrelated
+    // reason. Without it, a shape that returned no rows for any cause — a
+    // broken prefix, a fixture that never matched — would satisfy the
+    // assertion and prove nothing.
+    let some = db
+        .session()
+        .query(&format!(
+            "{prefix}WHERE all(n IN y WHERE n.id > 0) RETURN t.id"
+        ))
+        .await?;
+    assert!(
+        !some.rows().is_empty(),
+        "the satisfiable `all()` shape returned no rows, so the impossible one \
+         below would pass whatever the group variable contained"
+    );
+
+    // The decisive control, and the one assertion with no equivalent in the
+    // sibling tests. `all()` over an empty list is vacuously true, so an empty
+    // `y` would make this return rows — the same reason the positive
+    // `n.id > 0` shape above cannot distinguish success from emptiness. It is
+    // the *negative* twin that carries the claim.
+    let none = db
+        .session()
+        .query(&format!(
+            "{prefix}WHERE all(n IN y WHERE n.id > 999) RETURN t.id"
+        ))
+        .await?;
+    assert!(
+        none.rows().is_empty(),
+        "an impossible predicate over `y` returned {} rows; `all()` is vacuously \
+         true over an empty list, so rows here mean the group variable bound \
+         nothing and every positive shape above is passing for the wrong reason",
+        none.rows().len()
+    );
 
     Ok(())
 }

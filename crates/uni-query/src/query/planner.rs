@@ -9770,6 +9770,13 @@ impl QueryPlanner {
                         .get("quantize")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(true);
+                    // `OPTIONS{type:'sparse', idf:true}` reweights query terms by
+                    // inverse document frequency (#120). Off unless asked for.
+                    let idf = c
+                        .options
+                        .get("idf")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                     // `OPTIONS{type:'sparse', embedding:{alias, source}}` auto-embeds
                     // a text column into the sparse column (same parser as dense).
                     let embedding_config = match c.options.get("embedding") {
@@ -9782,6 +9789,7 @@ impl QueryPlanner {
                         property: c.property,
                         dimensions,
                         quantize,
+                        idf_modifier: idf,
                         embedding_config,
                         metadata: Default::default(),
                     };

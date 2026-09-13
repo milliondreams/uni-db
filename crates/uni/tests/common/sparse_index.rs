@@ -131,6 +131,7 @@ async fn define_schema_quantize(db: &Uni, quantize: bool) -> anyhow::Result<()> 
                 dimensions: VOCAB,
                 quantize,
                 embedding: None,
+                idf: false,
             },
         )
         .apply()
@@ -1067,5 +1068,157 @@ async fn sparse_recall_at_10_is_perfect_on_overlap_corpus() -> anyhow::Result<()
         );
         assert_matches_oracle(&results, &corpus);
     }
+    Ok(())
+}
+
+// ── IDF query-weight modifier (#120) ────────────────────────────────────────
+
+/// Schema + sparse index with the IDF modifier set explicitly.
+async fn define_schema_idf(db: &Uni, idf: bool) -> anyhow::Result<()> {
+    db.schema()
+        .label("Doc")
+        .property("title", DataType::String)
+        .property("emb", DataType::SparseVector { dimensions: VOCAB })
+        .index(
+            "emb",
+            IndexType::Sparse {
+                dimensions: VOCAB,
+                quantize: false,
+                embedding: None,
+                idf,
+            },
+        )
+        .apply()
+        .await?;
+    Ok(())
+}
+
+/// A corpus where one query term is ubiquitous and the other is rare.
+///
+/// Term 1 appears in every document; term 2 appears in one. Under a plain dot
+/// product `common` wins, because its weight on the ubiquitous term is larger
+/// than `rare`'s weight on the discriminating one. That is exactly the
+/// behaviour IDF exists to correct.
+async fn seed_idf_corpus(db: &Uni) -> anyhow::Result<()> {
+    let tx = db.session().tx().await?;
+    // `common`: heavy on the ubiquitous term only.
+    tx.execute_with("CREATE (:Doc {title: $t, emb: $e})")
+        .param("t", Value::String("common".into()))
+        .param("e", sv_value(&(vec![1], vec![10.0])))
+        .run()
+        .await?;
+    // `rare`: lighter, but on the discriminating term.
+    tx.execute_with("CREATE (:Doc {title: $t, emb: $e})")
+        .param("t", Value::String("rare".into()))
+        .param("e", sv_value(&(vec![1, 2], vec![1.0, 6.0])))
+        .run()
+        .await?;
+    // Filler, all carrying the ubiquitous term so its df is the whole corpus.
+    for i in 0..8 {
+        tx.execute_with("CREATE (:Doc {title: $t, emb: $e})")
+            .param("t", Value::String(format!("filler{i}")))
+            .param("e", sv_value(&(vec![1], vec![1.0])))
+            .run()
+            .await?;
+    }
+    tx.commit().await?;
+    db.flush().await?;
+    Ok(())
+}
+
+/// Top title for a query touching both the ubiquitous and the rare term.
+async fn idf_top_title(db: &Uni) -> anyhow::Result<String> {
+    let rows = db
+        .session()
+        .query_with(
+            "CALL uni.sparse.query('Doc', 'emb', $q, 3, null, null, {}) \
+             YIELD node, score RETURN node.title AS title, score",
+        )
+        .param("q", sv_value(&(vec![1, 2], vec![1.0, 1.0])))
+        .fetch_all()
+        .await?;
+    Ok(rows.rows()[0].get::<String>("title").unwrap())
+}
+
+/// With the modifier off, the ubiquitous term dominates — the control.
+///
+/// Without this the positive test below would prove only "the top result is
+/// `rare`", which a corpus quirk could produce on its own. The pair shows the
+/// ranking *changes*, and changes in the direction IDF is for.
+#[tokio::test]
+async fn sparse_without_idf_ranks_the_common_term_first() -> anyhow::Result<()> {
+    let db = Uni::in_memory().build().await?;
+    define_schema_idf(&db, false).await?;
+    seed_idf_corpus(&db).await?;
+    assert_eq!(
+        idf_top_title(&db).await?,
+        "common",
+        "a plain dot product must rank the heavy ubiquitous-term document first"
+    );
+    Ok(())
+}
+
+/// With the modifier on, the discriminating term wins.
+#[tokio::test]
+async fn sparse_with_idf_ranks_the_rare_term_first() -> anyhow::Result<()> {
+    let db = Uni::in_memory().build().await?;
+    define_schema_idf(&db, true).await?;
+    seed_idf_corpus(&db).await?;
+    assert_eq!(
+        idf_top_title(&db).await?,
+        "rare",
+        "IDF must discount the term every document has and promote the one that \
+         discriminates"
+    );
+    Ok(())
+}
+
+/// The modifier reaches the exact re-score, not just candidate generation.
+///
+/// `sparse_rerank` re-scores every candidate with `sparse_dot` after the index
+/// has generated them. If the reweighting were applied only inside the index,
+/// that re-score would silently undo it and the reported `score` would be the
+/// unweighted dot product — the trap #120 names. Comparing the reported scores
+/// across the two configurations is what detects it: same corpus, same query,
+/// so a score that did not move means the re-score saw the raw query.
+#[tokio::test]
+async fn idf_reaches_the_exact_rescore() -> anyhow::Result<()> {
+    let plain = {
+        let db = Uni::in_memory().build().await?;
+        define_schema_idf(&db, false).await?;
+        seed_idf_corpus(&db).await?;
+        let rows = db
+            .session()
+            .query_with(
+                "CALL uni.sparse.query('Doc', 'emb', $q, 1, null, null, {}) \
+                 YIELD score RETURN score",
+            )
+            .param("q", sv_value(&(vec![1, 2], vec![1.0, 1.0])))
+            .fetch_all()
+            .await?;
+        rows.rows()[0].get::<f64>("score").unwrap()
+    };
+    let weighted = {
+        let db = Uni::in_memory().build().await?;
+        define_schema_idf(&db, true).await?;
+        seed_idf_corpus(&db).await?;
+        let rows = db
+            .session()
+            .query_with(
+                "CALL uni.sparse.query('Doc', 'emb', $q, 1, null, null, {}) \
+                 YIELD score RETURN score",
+            )
+            .param("q", sv_value(&(vec![1, 2], vec![1.0, 1.0])))
+            .fetch_all()
+            .await?;
+        rows.rows()[0].get::<f64>("score").unwrap()
+    };
+
+    assert!(
+        (plain - weighted).abs() > 1e-6,
+        "the reported score is identical with and without the modifier ({plain} \
+         vs {weighted}), so the exact re-score is scoring against the raw query \
+         and undoing the reweighting"
+    );
     Ok(())
 }

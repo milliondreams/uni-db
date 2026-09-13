@@ -468,12 +468,14 @@ impl<'a> LabelBuilder<'a> {
                 dimensions,
                 quantize,
                 embedding,
+                idf,
             } => IndexDefinition::Sparse(uni_common::core::schema::SparseVectorIndexConfig {
                 name: format!("idx_{}_{}", self.name, property),
                 label: self.name.clone(),
                 property: property.to_string(),
                 dimensions,
                 quantize,
+                idf_modifier: idf,
                 embedding_config: embedding.map(EmbeddingCfg::into_internal),
                 metadata: Default::default(),
             }),
@@ -659,11 +661,14 @@ pub enum IndexType {
     /// Scored sparse-vector (SPLADE / learned-sparse) index. `dimensions` is the
     /// term-space cardinality of the column; `quantize` stores 8-bit per-term
     /// quantized weights (≈ lossless, ~4× smaller; default on); `embedding`
-    /// auto-embeds a text column into the sparse column via a xervo sparse model.
+    /// auto-embeds a text column into the sparse column via a xervo sparse model;
+    /// `idf` reweights query terms by inverse document frequency at query time
+    /// (off by default — see `SparseVectorIndexConfig::idf_modifier`).
     Sparse {
         dimensions: usize,
         quantize: bool,
         embedding: Option<EmbeddingCfg>,
+        idf: bool,
     },
 }
 
@@ -697,6 +702,7 @@ impl IndexType {
             dimensions,
             quantize: true,
             embedding: None,
+            idf: false,
         }
     }
 
@@ -708,6 +714,7 @@ impl IndexType {
             dimensions,
             quantize: true,
             embedding: Some(embedding),
+            idf: false,
         }
     }
 }

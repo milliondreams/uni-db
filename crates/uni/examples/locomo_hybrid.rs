@@ -315,6 +315,7 @@ async fn create_schema(db: &Uni) -> Result<()> {
                 dimensions: VOCAB,
                 quantize: false,
                 embedding: None,
+                idf: false,
             },
         )
         // Multivector arm: MUVERA (FDE) index over ColBERT token vectors.

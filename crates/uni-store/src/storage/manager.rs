@@ -3176,6 +3176,79 @@ impl StorageManager {
     /// property. On a fork/branch there is no per-branch sparse index, so this
     /// brute-force enumerates the branch's candidate vids (Approach A — see the
     /// branched arm) for the re-score path.
+    /// Rescale a sparse query's weights by inverse document frequency, when the
+    /// index asks for it (#120).
+    ///
+    /// Returns the query unchanged when the modifier is off, when the index is
+    /// absent, or when the corpus size cannot be read cheaply — an unknown `N`
+    /// makes `idf` meaningless, and silently scoring by a guessed one would be
+    /// worse than not scaling at all.
+    ///
+    /// Scaling happens **query-side**, once, before retrieval. That is what
+    /// keeps the index's candidate generation and the caller's exact
+    /// `sparse_dot` re-score consistent: both consume the same reweighted
+    /// query, so neither can undo the other. Applying it inside the index alone
+    /// is the trap the issue calls out.
+    ///
+    /// The form is BM25's smoothed idf, `ln(1 + (N - df + 0.5) / (df + 0.5))`,
+    /// rather than a raw `ln(N / df)`. Raw idf goes **negative** for a term in
+    /// more than half the corpus, which does not merely discount that term — it
+    /// flips the sign of its contribution, so a document matching a common term
+    /// scores *worse* than one matching nothing. The smoothed form stays
+    /// positive over the whole range.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the index exists but its posting lists cannot be
+    /// read.
+    pub async fn sparse_idf_scaled_query(
+        &self,
+        label: &str,
+        property: &str,
+        query: &[(u32, f32)],
+    ) -> Result<Vec<(u32, f32)>> {
+        let enabled = self
+            .schema_manager()
+            .schema()
+            .sparse_index_for_property(label, property)
+            .is_some_and(|cfg| cfg.idf_modifier);
+        if !enabled || query.is_empty() {
+            return Ok(query.to_vec());
+        }
+
+        let Some(total_docs) = self.vertex_row_count(label).await?.filter(|n| *n > 0) else {
+            return Ok(query.to_vec());
+        };
+        let idx = match self
+            .index_manager()
+            .sparse_vector_index(label, property)
+            .await
+        {
+            Ok(idx) => idx,
+            Err(e) if crate::store_utils::is_dataset_not_found(&e) => return Ok(query.to_vec()),
+            Err(e) => return Err(e),
+        };
+
+        let terms: Vec<u32> = query.iter().map(|(t, _)| *t).collect();
+        let dfs = idx.document_frequencies(&terms).await?;
+        let n = total_docs as f64;
+
+        Ok(query
+            .iter()
+            .map(|(term, weight)| {
+                // A term the index has never seen keeps its weight rather than
+                // being scaled by a fabricated df. It contributes nothing to the
+                // score anyway — no posting list means no document matches it.
+                let Some(&df) = dfs.get(term) else {
+                    return (*term, *weight);
+                };
+                let df = df as f64;
+                let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
+                (*term, (f64::from(*weight) * idf) as f32)
+            })
+            .collect())
+    }
+
     pub async fn sparse_search(
         &self,
         label: &str,

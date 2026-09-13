@@ -893,6 +893,9 @@ pub fn create_index_definition_from_config(
                     property: property.to_string(),
                     dimensions,
                     quantize: true,
+                    // IDF query-weight modifier, off unless the config asks for
+                    // it — same default as the Rust surface (#120).
+                    idf_modifier: config.get("idf").and_then(|v| v.as_bool()).unwrap_or(false),
                     // OGM auto-embed is out of scope (no modality exposes it via OGM yet).
                     embedding_config: None,
                     metadata: Default::default(),

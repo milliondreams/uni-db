@@ -161,6 +161,20 @@ pub struct SparseVectorIndexConfig {
     /// query is embedded at query time) — mirrors `VectorIndexConfig`.
     #[serde(default)]
     pub embedding_config: Option<EmbeddingConfig>,
+    /// Reweight query terms by inverse document frequency before scoring.
+    ///
+    /// Off by default, and deliberately so: SPLADE-style learned-sparse weights
+    /// already encode term importance during training, so IDF is largely
+    /// redundant for them and can double-count. It earns its keep on BM25-like
+    /// and BGE-M3 sparse heads, whose raw weights are closer to term-frequency
+    /// than to calibrated importance.
+    ///
+    /// Applied **query-side**: the query's weights are scaled once, before
+    /// retrieval. That is what keeps the candidate-generating index scan and
+    /// the exact `sparse_dot` re-score consistent — applying it inside the
+    /// index alone would let the re-score silently undo it.
+    #[serde(default)]
+    pub idf_modifier: bool,
     #[serde(default)]
     pub metadata: IndexMetadata,
 }

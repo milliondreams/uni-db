@@ -129,6 +129,7 @@ async fn setup_db(n: usize, quantize: bool) -> anyhow::Result<(Uni, Vec<Sparse>)
                 dimensions: VOCAB,
                 quantize,
                 embedding: None,
+                idf: false,
             },
         )
         .apply()

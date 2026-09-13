@@ -543,7 +543,25 @@ pub(crate) async fn sparse_rerank(
     retrieval_k: usize,
 ) -> DFResult<(Vec<(Vid, f32)>, HashMap<Vid, uni_common::Properties>)> {
     // 1. Flushed candidate generation via the sparse index (term-matching vids).
-    let query_pairs: Vec<(u32, f32)> = query.iter().collect();
+    //
+    // The IDF modifier, when the index asks for it, rescales the query's
+    // weights once here (#120). Both the index scan below and the exact
+    // `sparse_dot` re-score in step 5 then consume the *same* reweighted query,
+    // which is the only way the two stay consistent — scaling inside the index
+    // alone would be undone by the re-score.
+    let raw_pairs: Vec<(u32, f32)> = query.iter().collect();
+    let query_pairs = storage
+        .sparse_idf_scaled_query(label, property, &raw_pairs)
+        .await
+        .map_err(exec_err)?;
+    let scaled_query = if query_pairs == raw_pairs {
+        None
+    } else {
+        let (indices, values): (Vec<u32>, Vec<f32>) = query_pairs.iter().copied().unzip();
+        Some(uni_sparse_vector::SparseVector::new(indices, values).map_err(exec_err)?)
+    };
+    let scoring_query = scaled_query.as_ref().unwrap_or(query);
+
     let flushed = storage
         .sparse_search(label, property, &query_pairs, retrieval_k)
         .await
@@ -585,7 +603,7 @@ pub(crate) async fn sparse_rerank(
         let score = match props.get(property) {
             Some(uni_common::Value::SparseVector { indices, values }) => {
                 match uni_sparse_vector::SparseVector::new(indices.clone(), values.clone()) {
-                    Ok(doc) => uni_sparse_vector::ops::sparse_dot(query, &doc),
+                    Ok(doc) => uni_sparse_vector::ops::sparse_dot(scoring_query, &doc),
                     Err(_) => 0.0,
                 }
             }

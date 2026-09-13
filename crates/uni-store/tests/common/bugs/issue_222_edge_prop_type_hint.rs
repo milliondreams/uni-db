@@ -231,3 +231,97 @@ async fn an_empty_hint_is_treated_as_no_hint() -> Result<()> {
     );
     Ok(())
 }
+
+/// A cold L0 resolves every EID's type from `main_edges`, in one pass.
+///
+/// This is the load-bearing assertion for the fallback fix, and it is deliberately
+/// direct rather than inferred from a scan count. If `main_edges` held no row for
+/// a flushed edge, the resolver would return an empty map, `get_batch_edge_props`
+/// would fan out exactly as before, and every *contrast* test below would still
+/// pass — the unhinted arm would simply have paid one extra scan on the way to
+/// the same fan-out. Only reading the resolved types back can tell those apart.
+#[tokio::test]
+async fn a_cold_l0_resolves_edge_types_from_main_edges() -> Result<()> {
+    let (_tmp, storage, _schema_manager, eids, _l0) = fixture().await?;
+
+    let resolved = uni_store::storage::main_edge::MainEdgeDataset::find_types_by_eids_counted(
+        storage.backend(),
+        &eids,
+        None,
+    )
+    .await?;
+
+    assert_eq!(
+        resolved.len(),
+        EDGES,
+        "resolved {} of {EDGES} EIDs from main_edges. An empty or partial map \
+         means the fallback still fans out over all {TYPE_COUNT} types and the \
+         fix is inert",
+        resolved.len()
+    );
+    for eid in &eids {
+        assert_eq!(
+            resolved.get(eid).map(String::as_str),
+            Some("T0"),
+            "EID {eid:?} resolved to {:?}, not its actual type T0",
+            resolved.get(eid)
+        );
+    }
+    Ok(())
+}
+
+/// An unhinted read over a cold L0 scans fewer tables than the all-types
+/// fan-out it used to take.
+///
+/// The contrast is against an explicit all-types hint, which reproduces the old
+/// behaviour exactly, rather than against a threshold. It fails in both
+/// directions: if the resolver stops working the arms become equal, and if the
+/// counter dies the fan-out arm drops to zero.
+#[tokio::test]
+async fn a_cold_l0_read_no_longer_scans_every_edge_type() -> Result<()> {
+    let (_tmp, storage, schema_manager, eids, l0) = fixture().await?;
+    let pm = PropertyManager::new(storage.clone(), schema_manager, 0);
+
+    // Arm 1: no hint, cold L0 — resolves against main_edges, then reads T0.
+    let resolved_counters = Arc::new(QueryCounters::new());
+    let resolved_ctx = ctx_with_counters(&l0, &resolved_counters);
+    let resolved = pm
+        .get_batch_edge_props(&eids, &["w"], None, Some(&resolved_ctx))
+        .await?;
+
+    // Arm 2: every declared type, which is what the unhinted path used to do.
+    let fanout_counters = Arc::new(QueryCounters::new());
+    let fanout_ctx = ctx_with_counters(&l0, &fanout_counters);
+    let all_types: Vec<String> = (0..TYPE_COUNT).map(|i| format!("T{i}")).collect();
+    let fanned_out = pm
+        .get_batch_edge_props(&eids, &["w"], Some(&all_types), Some(&fanout_ctx))
+        .await?;
+
+    assert_eq!(
+        resolved, fanned_out,
+        "resolving the type set must not change the answer — only how many \
+         tables are read"
+    );
+    assert_eq!(
+        resolved.len(),
+        EDGES,
+        "fixture did not resolve every edge; both arms are reading nothing"
+    );
+
+    let resolved_scans = resolved_counters.scans_reported();
+    let fanout_scans = fanout_counters.scans_reported();
+    assert!(
+        fanout_scans > 0,
+        "the fan-out arm reported zero scans, so the counter is not observing \
+         this path and the comparison below cannot mean anything"
+    );
+    assert!(
+        resolved_scans < fanout_scans,
+        "an unhinted read over a cold L0 scanned {resolved_scans} tables against \
+         the all-types fan-out's {fanout_scans} over {TYPE_COUNT} declared \
+         types. Equal or worse means the main_edges resolution is not narrowing \
+         the set and #222's fan-out is still being paid — note the resolution \
+         itself costs one scan, so it must save more than it spends"
+    );
+    Ok(())
+}

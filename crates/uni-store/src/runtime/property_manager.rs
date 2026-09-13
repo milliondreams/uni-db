@@ -841,13 +841,19 @@ impl PropertyManager {
     /// knows — a traversal knows the exact set from its own expansions — and
     /// exactly those tables are scanned.
     ///
-    /// `None` falls back to asking L0 for each EID's type, and **if a single
-    /// EID is unknown to L0 it scans every edge type in the schema**. L0 is
-    /// empty on a reloaded or compacted store, so that fallback is the normal
-    /// path there rather than the exceptional one: measured on LDBC IC5's
-    /// `HAS_MEMBER` clause at SF1, all 195 calls took it, scanning all 15 edge
-    /// types for 31.7 s — 20% of the clause (#222). The cost is per *call*, not
-    /// per edge.
+    /// `None` resolves the set instead: L0 first, then whatever L0 misses in
+    /// one indexed `_eid`/`type` pass over `main_edges`
+    /// ([`MainEdgeDataset::find_types_by_eids_counted`]). Only an EID that
+    /// neither tier knows still scans every edge type in the schema.
+    ///
+    /// That fan-out used to be the *normal* path rather than the exceptional
+    /// one, because L0 is empty on a reloaded or compacted store: measured on
+    /// LDBC IC5's `HAS_MEMBER` clause at SF1, all 195 calls took it, scanning
+    /// all 15 edge types for 31.7 s — 20% of the clause (#222). The cost is per
+    /// *call*, not per edge.
+    ///
+    /// The hint is still worth passing where it is known: it skips both tiers,
+    /// and the second one is a real scan, not a memory lookup.
     ///
     /// The parameter is explicit rather than inferred precisely so that a new
     /// call site has to decide, instead of silently inheriting the fan-out.
@@ -883,26 +889,56 @@ impl PropertyManager {
         let types_to_scan: Vec<String> = if let Some(hint) = edge_types.filter(|h| !h.is_empty()) {
             hint.to_vec()
         } else {
-            // Try to resolve edge types from L0 context for O(1) lookup
+            // Resolve in two tiers before giving up. L0 answers for free but is
+            // empty on a reloaded or compacted store, which is what made the
+            // all-types fan-out below the *normal* path rather than the
+            // exceptional one (#222). Whatever L0 misses is then resolved
+            // against `main_edges` in one indexed pass over `_eid` and `type`.
+            let mut needed: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut misses: Vec<uni_common::core::id::Eid> = Vec::new();
             if let Some(ctx) = ctx {
-                let mut needed: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
-                let mut all_resolved = true;
                 for &eid in eids {
-                    if let Some(etype) = ctx.l0.read().get_edge_type(eid) {
-                        needed.insert(etype.to_string());
-                    } else {
-                        all_resolved = false;
-                        break;
+                    match ctx.l0.read().get_edge_type(eid) {
+                        Some(etype) => {
+                            needed.insert(etype.to_string());
+                        }
+                        None => misses.push(eid),
                     }
                 }
-                if all_resolved {
-                    needed.into_iter().collect()
-                } else {
-                    schema.edge_types.keys().cloned().collect() // Fallback to full scan
-                }
             } else {
-                schema.edge_types.keys().cloned().collect() // No context, full scan
+                misses.extend_from_slice(eids);
+            }
+
+            // An EID absent from both tiers is the one case that must still
+            // fan out. Narrowing on a partial answer would scan too few tables
+            // and silently return no properties for the edges left out — a
+            // wrong answer, where the fan-out is only a slow one.
+            let mut unresolved = false;
+            if !misses.is_empty() {
+                let resolved =
+                    crate::storage::main_edge::MainEdgeDataset::find_types_by_eids_counted(
+                        self.storage.backend(),
+                        &misses,
+                        counters_of(ctx),
+                    )
+                    .await?;
+                for eid in &misses {
+                    match resolved.get(eid) {
+                        Some(etype) => {
+                            needed.insert(etype.clone());
+                        }
+                        None => {
+                            unresolved = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if unresolved {
+                schema.edge_types.keys().cloned().collect() // Fallback to full scan
+            } else {
+                needed.into_iter().collect()
             }
         };
 

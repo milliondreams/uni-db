@@ -611,10 +611,10 @@ impl EntityPropertyCache {
             // The edge accessor keys its result by the eid reinterpreted as a Vid.
             // No hint available here, and this is the one caller where that is
             // true: the eids come from already-materialised paths, which carry
-            // no type column. This therefore still pays #222's all-types
-            // fan-out when L0 is cold. Resolving the misses against
-            // `main_edges` — which carries a `type` column and a BTree index on
-            // it — would fix it in one scan rather than one per type.
+            // no type column. `None` is therefore correct rather than lazy —
+            // and it no longer means the all-types fan-out, since
+            // `get_batch_edge_props` now resolves what L0 misses against
+            // `main_edges` in one indexed pass over its `type` column (#222).
             cache.edges = pm
                 .get_batch_edge_props(&distinct, &["_all_props"], None, Some(query_ctx))
                 .await

@@ -2572,11 +2572,27 @@ impl Executor {
             for vid in matches {
                 let mut m = row.clone();
                 if let Some(var) = &node.variable {
-                    // Minimal binding so ON MATCH SET resolves the node by _vid.
-                    m.insert(
-                        var.clone(),
-                        Self::build_node_map(vid, label, HashMap::new()),
-                    );
+                    // Bind with the node's properties, not just its `_vid`
+                    // (#220). They are already in hand — the per-statement
+                    // persisted lookup read them for every matched vid — and
+                    // binding them empty is what made `ON MATCH SET n.p = n.p +
+                    // x` fall back to a single-key storage read *per row*:
+                    // `evaluate_expr` checks the in-memory `Node` first and
+                    // only then asks storage. Measured at 617 such reads in one
+                    // test subset, all of them for `n.freq` in the
+                    // MERGE-in-UNWIND accumulate shape.
+                    //
+                    // Same call the post-SET rebind below already makes, so a
+                    // prefetch miss behaves as it does there: one full-property
+                    // read rather than one per property touched.
+                    let props = read_vertex_props_with_prefetch(
+                        vid,
+                        prefetched.as_deref().unwrap_or(&empty_prefetch),
+                        prop_manager,
+                        ctx,
+                    )
+                    .await?;
+                    m.insert(var.clone(), Self::build_node_map(vid, label, props));
                 }
                 if let Some(set) = on_match {
                     self.execute_set_items_locked(

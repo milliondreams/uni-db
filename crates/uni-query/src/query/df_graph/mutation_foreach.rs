@@ -25,6 +25,7 @@ use std::sync::Arc;
 use uni_common::Value;
 use uni_cypher::ast::Expr;
 
+use crate::query::df_graph::common::{collect_accounted, operator_reservation};
 use crate::query::planner::LogicalPlan;
 
 /// DataFusion `ExecutionPlan` for Cypher FOREACH clauses.
@@ -179,8 +180,11 @@ async fn execute_foreach_inner(
     // Time the whole eager-barrier body. Timer records on Drop.
     let _timer = baseline.elapsed_compute().timer();
     // 1. Collect all input batches (eager barrier)
+    // #261. An eager barrier, and one whose row-oriented copy downstream is
+    // larger than the Arrow original it is built from.
+    let mut reservation = operator_reservation("ForeachExec", partition, &task_ctx);
     let input_stream = input.execute(partition, task_ctx)?;
-    let input_batches: Vec<RecordBatch> = input_stream.try_collect().await?;
+    let input_batches = collect_accounted(input_stream, &mut reservation).await?;
 
     let input_row_count: usize = input_batches.iter().map(|b| b.num_rows()).sum();
     tracing::debug!(

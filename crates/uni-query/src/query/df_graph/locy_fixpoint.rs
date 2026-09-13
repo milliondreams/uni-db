@@ -9,7 +9,7 @@
 use crate::query::df_graph::GraphExecutionContext;
 use crate::query::df_graph::common::{
     ScalarKey, arrow_err, collect_all_partitions, compute_plan_properties,
-    execute_locy_clause_body, extract_scalar_key,
+    execute_locy_clause_body, extract_scalar_key, operator_reservation,
 };
 use crate::query::df_graph::locy_best_by::{BestByExec, SortCriterion};
 use crate::query::df_graph::locy_errors::LocyRuntimeError;
@@ -886,7 +886,11 @@ impl FixpointState {
             epsilon,
             self.semiring_kind,
         ));
-        let folded_batches = collect_all_partitions(&plan, Arc::clone(task_ctx)).await?;
+        // #261. The fixpoint's own `max_derived_bytes` budget covers facts and
+        // deltas; these post-fixpoint materializations sit outside it.
+        let mut reservation = operator_reservation("FixpointExec", 0, task_ctx);
+        let folded_batches =
+            collect_all_partitions(&plan, Arc::clone(task_ctx), &mut reservation).await?;
         let folded_out = match folded_batches.iter().find(|b| b.num_rows() > 0) {
             Some(b) => b.clone(),
             None => {
@@ -1570,7 +1574,8 @@ async fn arrow_left_anti_dedup(
     let join_arc: Arc<dyn ExecutionPlan> = Arc::new(join);
     // LeftAnti removes candidates that match `existing`, but not duplicate rows
     // within the candidate set — dedup those to match the other delta strategies.
-    let anti = collect_all_partitions(&join_arc, task_ctx.clone()).await?;
+    let mut reservation = operator_reservation("FixpointExec", 0, task_ctx);
+    let anti = collect_all_partitions(&join_arc, task_ctx.clone(), &mut reservation).await?;
     dedup_batches_all_columns(anti, schema)
 }
 
@@ -5333,7 +5338,9 @@ async fn apply_post_fixpoint_chain_inner(
     // Before HAVING, mirroring the source order: REQUIRE says what the rule
     // derives, HAVING then filters what is shown of it.
     let current: Arc<dyn ExecutionPlan> = if !rule.require.is_empty() {
-        let batches = collect_all_partitions(&current, Arc::clone(task_ctx)).await?;
+        let mut reservation = operator_reservation("FixpointExec", 0, task_ctx);
+        let batches =
+            collect_all_partitions(&current, Arc::clone(task_ctx), &mut reservation).await?;
         record_post_ops(&current, post_ops.as_deref_mut());
         let filtered = apply_having_filter(batches, &rule.require, &current.schema(), task_ctx)?;
         if filtered.is_empty() {
@@ -5346,7 +5353,9 @@ async fn apply_post_fixpoint_chain_inner(
 
     // Apply HAVING (post-FOLD WHERE filter)
     let current: Arc<dyn ExecutionPlan> = if !rule.having.is_empty() {
-        let batches = collect_all_partitions(&current, Arc::clone(task_ctx)).await?;
+        let mut reservation = operator_reservation("FixpointExec", 0, task_ctx);
+        let batches =
+            collect_all_partitions(&current, Arc::clone(task_ctx), &mut reservation).await?;
         record_post_ops(&current, post_ops.as_deref_mut());
         let filtered = apply_having_filter(batches, &rule.having, &current.schema(), task_ctx)?;
         if filtered.is_empty() {
@@ -5374,7 +5383,9 @@ async fn apply_post_fixpoint_chain_inner(
     // Only present when a YIELD column is a computed expression over a FOLD
     // output (`total * 2.0 AS score`); the common path skips it entirely.
     if !rule.yield_projection.is_empty() {
-        let batches = collect_all_partitions(&current, Arc::clone(task_ctx)).await?;
+        let mut reservation = operator_reservation("FixpointExec", 0, task_ctx);
+        let batches =
+            collect_all_partitions(&current, Arc::clone(task_ctx), &mut reservation).await?;
         record_post_ops(&current, post_ops.as_deref_mut());
         return apply_post_fold_projection(
             batches,
@@ -5384,7 +5395,8 @@ async fn apply_post_fixpoint_chain_inner(
         );
     }
 
-    let out = collect_all_partitions(&current, Arc::clone(task_ctx)).await;
+    let mut reservation = operator_reservation("FixpointExec", 0, task_ctx);
+    let out = collect_all_partitions(&current, Arc::clone(task_ctx), &mut reservation).await;
     record_post_ops(&current, post_ops);
     out
 }

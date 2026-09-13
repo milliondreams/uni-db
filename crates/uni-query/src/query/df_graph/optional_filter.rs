@@ -31,10 +31,11 @@
 //!    - If ALL rows fail the filter, emit one row with source columns preserved
 //!      and optional columns set to NULL
 
-use crate::query::df_graph::common::{arrow_err, compute_plan_properties};
+use crate::query::df_graph::common::{arrow_err, batch_bytes, compute_plan_properties};
 use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch, new_null_array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::Result as DFResult;
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
@@ -272,6 +273,8 @@ impl ExecutionPlan for OptionalFilterExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
+        // Taken before `context` is moved into the child's `execute`.
+        let pool = Arc::clone(context.memory_pool());
         let input_stream = self.input.execute(partition, context)?;
         let metrics = BaselineMetrics::new(&self.metrics, partition);
 
@@ -312,6 +315,12 @@ impl ExecutionPlan for OptionalFilterExec {
             pending_order: Vec::new(),
             flushed: false,
             metrics,
+            // #261. This operator's buffers are unbounded in the number of
+            // distinct source groups, and nothing counted them. It appears six
+            // times across the LDBC SNB corpus -- four of them in IC1 alone.
+            reservation: MemoryConsumer::new(format!("OptionalFilterExec[{partition}]"))
+                .register(&pool),
+            held: 0,
         }))
     }
 
@@ -354,6 +363,28 @@ struct OptionalFilterStream {
 
     /// Metrics.
     metrics: BaselineMetrics,
+
+    /// Pool reservation for the cross-batch buffers (#261).
+    ///
+    /// Both `passed_keys` and `pending_null` live to end-of-stream by
+    /// construction: a group that fails in this batch may pass in a later one,
+    /// so neither decision can be made early. That makes this a semantically
+    /// required barrier rather than an unchunked producer -- there is no
+    /// bounding step available before the accounting, and what the reservation
+    /// buys is a refusal naming this operator in place of a silent overrun.
+    reservation: MemoryReservation,
+
+    /// Bytes currently charged to `reservation`.
+    held: usize,
+}
+
+/// What one entry costs, charged per structure it is stored in.
+///
+/// A key is stored up to three times -- in `passed_keys`, in `pending_null`, and
+/// in `pending_order` -- so each store is charged separately rather than the key
+/// being charged once.
+fn key_bytes(key: &[u8]) -> usize {
+    std::mem::size_of::<Vec<u8>>() + key.len()
 }
 
 impl OptionalFilterStream {
@@ -410,13 +441,30 @@ impl OptionalFilterStream {
 
             if any_passed {
                 // This group is satisfied; cancel any buffered NULL recovery row.
-                self.passed_keys.insert(key.clone());
-                self.pending_null.remove(key);
+                if self.passed_keys.insert(key.clone()) {
+                    self.reservation.try_grow(key_bytes(key))?;
+                    self.held += key_bytes(key);
+                }
+                if let Some(dropped) = self.pending_null.remove(key) {
+                    // The row is gone but its key stays in `pending_order` until
+                    // the flush walks past it, so only the batch is given back.
+                    let freed = batch_bytes(&dropped) + key_bytes(key);
+                    self.reservation.shrink(freed);
+                    self.held -= freed;
+                }
             } else if !self.passed_keys.contains(key) && !self.pending_null.contains_key(key) {
                 // Group failed and has not passed in any prior batch — remember a
                 // single representative row (source cols kept, optional cols NULL)
                 // to emit at end-of-stream unless a later batch passes it.
                 let null_batch = self.build_null_row(&batch, row_indices[0])?;
+                // A one-row Arrow batch is dominated by per-column buffer
+                // overhead rather than by its single row, so a wide schema makes
+                // each of these cost far more than the row it carries -- which
+                // is why the charge is the batch's own reported size and not a
+                // per-row estimate.
+                let grew = batch_bytes(&null_batch) + 2 * key_bytes(key);
+                self.reservation.try_grow(grew)?;
+                self.held += grew;
                 self.pending_null.insert(key.clone(), null_batch);
                 self.pending_order.push(key.clone());
             }
@@ -469,7 +517,17 @@ impl OptionalFilterStream {
             return Ok(None);
         }
         let refs: Vec<&RecordBatch> = batches.iter().collect();
+        // Both the per-group batches and the combined one are live across this
+        // call, so the combined batch is charged before the parts are released.
+        let combined_bytes = refs.iter().map(|b| batch_bytes(b)).sum::<usize>();
+        self.reservation.try_grow(combined_bytes)?;
+        self.held += combined_bytes;
         let combined = arrow::compute::concat_batches(&self.schema, refs).map_err(arrow_err)?;
+        drop(batches);
+        // Everything this operator held is now either in `combined`, which
+        // belongs to the consumer from here, or dropped.
+        self.reservation.shrink(self.held);
+        self.held = 0;
         self.metrics.record_output(combined.num_rows());
         Ok(Some(combined))
     }

@@ -11,6 +11,7 @@
 use crate::query::df_graph::GraphExecutionContext;
 use crate::query::df_graph::common::{
     collect_all_partitions, compute_plan_properties, execute_locy_clause_body, execute_subplan,
+    operator_reservation,
 };
 use crate::query::df_graph::locy_best_by::SortCriterion;
 use crate::query::df_graph::locy_explain::ProvenanceStore;
@@ -967,7 +968,12 @@ async fn run_program(
             }
             let task_ctx = session_ctx.read().task_ctx();
             let exec_arc: Arc<dyn ExecutionPlan> = Arc::new(exec);
-            let batches = collect_all_partitions(&exec_arc, task_ctx).await?;
+            // #261. The derived store keeps every relation of every stratum to
+            // completion; `max_derived_bytes` bounds the fixpoint's own facts
+            // but this accumulation sits outside it, and `peak_memory_slot` only
+            // reports the total afterwards.
+            let mut reservation = operator_reservation("LocyProgramExec", 0, &task_ctx);
+            let batches = collect_all_partitions(&exec_arc, task_ctx, &mut reservation).await?;
             // The fixpoint driver spans the whole stratum and is a child of
             // nothing, so this is the only place it can be observed (#177).
             // Recorded only while profiling, so the walk is not paid otherwise.

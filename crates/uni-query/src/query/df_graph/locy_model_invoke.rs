@@ -17,6 +17,7 @@
 //! `mutation_common::execute_mutation_inner` — no novel async
 //! machinery in the codebase.
 
+use crate::query::df_graph::common::{collect_accounted, operator_reservation};
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -294,6 +295,9 @@ impl ExecutionPlan for LocyModelInvokeExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
+        // #261. An eager barrier: the whole input is resident before the model
+        // is invoked, and the model's own output is built beside it.
+        let mut reservation = operator_reservation("LocyModelInvokeExec", partition, &context);
         let input_stream = self.input.execute(partition, context)?;
         let invocations = self.invocations.clone();
         let registry = Arc::clone(&self.registry);
@@ -305,7 +309,7 @@ impl ExecutionPlan for LocyModelInvokeExec {
         let schema = self.schema.clone();
 
         let fut = async move {
-            let batches: Vec<RecordBatch> = input_stream.try_collect::<Vec<_>>().await?;
+            let batches = collect_accounted(input_stream, &mut reservation).await?;
             let out = apply_model_invocations(
                 batches,
                 &invocations,

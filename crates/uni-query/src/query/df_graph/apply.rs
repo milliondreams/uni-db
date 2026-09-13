@@ -19,7 +19,8 @@
 //! with the base parameters (standalone CALL support).
 
 use crate::query::df_graph::common::{
-    arrow_err, collect_all_partitions, compute_plan_properties, execute_subplan, extract_row_params,
+    arrow_err, collect_all_partitions, compute_plan_properties, execute_subplan,
+    extract_row_params, operator_reservation,
 };
 use crate::query::df_graph::{GraphExecutionContext, MutationContext};
 use crate::query::planner::LogicalPlan;
@@ -668,7 +669,11 @@ async fn run_apply(
 
     // 1. Execute pre-planned input physical plan directly
     let task_ctx = session_ctx.read().task_ctx();
-    let input_batches = collect_all_partitions(&input_exec, task_ctx).await?;
+    // #261. `run_apply` holds the whole input for the life of the call -- it
+    // indexes into it per row while every sub-plan runs -- so the reservation
+    // lives here rather than inside the collect.
+    let mut reservation = operator_reservation("GraphApplyExec", 0, &task_ctx);
+    let input_batches = collect_all_partitions(&input_exec, task_ctx, &mut reservation).await?;
 
     // 2. Collect (batch_ref, row_idx) for rows that pass the input filter,
     //    along with their Value-based params for subquery injection.

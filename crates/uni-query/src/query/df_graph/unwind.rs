@@ -23,7 +23,7 @@
 //!           {"list": [1,2,3], "item": 3}]
 //! ```
 
-use crate::query::df_graph::common::{arrow_err, compute_plan_properties, exec_err};
+use crate::query::df_graph::common::{arrow_err, batch_bytes, compute_plan_properties, exec_err};
 use arrow::compute::take;
 use arrow_array::builder::{
     BooleanBuilder, Float64Builder, Int64Builder, LargeBinaryBuilder, StringBuilder,
@@ -31,6 +31,7 @@ use arrow_array::builder::{
 use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::Result as DFResult;
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
@@ -297,6 +298,8 @@ impl ExecutionPlan for GraphUnwindExec {
         // Read the configured batch size before the context is handed to the
         // input: it is what bounds the output chunks below.
         let chunk_size = context.session_config().batch_size().max(1);
+        // Taken before `context` is moved into the child's `execute`.
+        let pool = Arc::clone(context.memory_pool());
         let input_stream = self.input.execute(partition, context)?;
         let metrics = BaselineMetrics::new(&self.metrics, partition);
 
@@ -309,6 +312,14 @@ impl ExecutionPlan for GraphUnwindExec {
             chunk_size,
             pending: None,
             metrics,
+            // #261. Unlike the other operators on that list this one is already
+            // bounded -- #241 chunked the output to `chunk_size x columns` -- so
+            // there is no producer left to bound and accounting is the whole of
+            // the remaining gap. It appears three times in the LDBC SNB corpus
+            // (IC6, IC9, IC14).
+            reservation: MemoryConsumer::new(format!("GraphUnwindExec[{partition}]"))
+                .register(&pool),
+            held: 0,
         }))
     }
 
@@ -344,6 +355,20 @@ struct GraphUnwindStream {
 
     /// Metrics.
     metrics: BaselineMetrics,
+
+    /// Pool reservation for the input batch being expanded and the one list
+    /// currently mid-expansion (#261).
+    ///
+    /// The output is already bounded at `chunk_size x columns` by #241, so this
+    /// charges what the operator *retains* across polls rather than what it
+    /// emits: the batch it is walking, and the remainder of the list it is part
+    /// way through. The latter is the one genuinely large thing here -- #184's
+    /// shape is a single collected list, which pruning cannot help and chunking
+    /// cannot split, because it is legitimately live.
+    reservation: MemoryReservation,
+
+    /// Bytes currently charged to `reservation`.
+    held: usize,
 }
 
 /// An input batch mid-expansion.
@@ -783,6 +808,19 @@ impl Stream for GraphUnwindStream {
                     Ok(v) => v,
                     Err(e) => return Poll::Ready(Some(Err(e))),
                 };
+                // Reconciled after the chunk is taken, when `rest` reflects what
+                // is actually still to come. `Value::size_of` is a floor -- a
+                // `Value::String`'s characters live off to the side -- so this
+                // under-charges a list of long strings rather than guessing at
+                // a multiplier.
+                let want = batch_bytes(&pending.batch)
+                    + pending
+                        .rest
+                        .as_ref()
+                        .map_or(0, |(_, it)| it.len() * std::mem::size_of::<Value>());
+                if let Err(e) = self.charge(want) {
+                    return Poll::Ready(Some(Err(e)));
+                }
                 if expansions.is_empty() {
                     // Nothing survived this batch; ask the input for the next
                     // one rather than emitting an empty batch. (`fill_chunk`
@@ -808,9 +846,31 @@ impl Stream for GraphUnwindStream {
                         rest: None,
                     });
                 }
-                other => return other,
+                other => {
+                    // The input is finished or failed; nothing is retained.
+                    self.reservation.shrink(self.held);
+                    self.held = 0;
+                    return other;
+                }
             }
         }
+    }
+}
+
+impl GraphUnwindStream {
+    /// Move the reservation to `want` bytes, in whichever direction is needed.
+    ///
+    /// A chunked operator's residency falls as well as rises -- the list being
+    /// expanded shrinks with every chunk taken -- and a grow-only account of it
+    /// would report a peak the operator never held.
+    fn charge(&mut self, want: usize) -> DFResult<()> {
+        if want > self.held {
+            self.reservation.try_grow(want - self.held)?;
+        } else {
+            self.reservation.shrink(self.held - want);
+        }
+        self.held = want;
+        Ok(())
     }
 }
 
@@ -1125,6 +1185,13 @@ mod tests {
             chunk_size: 8192,
             pending: None,
             metrics: BaselineMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
+            // Unit fixtures: an unbounded pool, so the accounting is exercised
+            // without any of these asserting a ceiling.
+            reservation: MemoryConsumer::new("GraphUnwindExec[test]").register(
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn datafusion::execution::memory_pool::MemoryPool>),
+            ),
+            held: 0,
         };
 
         let result = stream.evaluate_expr_for_row(&batch, 0).unwrap();
@@ -1184,6 +1251,13 @@ mod tests {
             chunk_size: 8192,
             pending: None,
             metrics: BaselineMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
+            // Unit fixtures: an unbounded pool, so the accounting is exercised
+            // without any of these asserting a ceiling.
+            reservation: MemoryConsumer::new("GraphUnwindExec[test]").register(
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn datafusion::execution::memory_pool::MemoryPool>),
+            ),
+            held: 0,
         };
 
         let result = stream.evaluate_expr_for_row(&batch, 0).unwrap();
@@ -1245,6 +1319,13 @@ mod tests {
             chunk_size: 8192,
             pending: None,
             metrics: BaselineMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
+            // Unit fixtures: an unbounded pool, so the accounting is exercised
+            // without any of these asserting a ceiling.
+            reservation: MemoryConsumer::new("GraphUnwindExec[test]").register(
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn datafusion::execution::memory_pool::MemoryPool>),
+            ),
+            held: 0,
         };
 
         let result = stream.evaluate_expr_impl(&prop_expr, &batch, 0).unwrap();
@@ -1299,6 +1380,13 @@ mod tests {
             chunk_size: 8192,
             pending: None,
             metrics: BaselineMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
+            // Unit fixtures: an unbounded pool, so the accounting is exercised
+            // without any of these asserting a ceiling.
+            reservation: MemoryConsumer::new("GraphUnwindExec[test]").register(
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn datafusion::execution::memory_pool::MemoryPool>),
+            ),
+            held: 0,
         };
         stream.evaluate_expr_impl(&expr, &batch, 0)
     }
@@ -1383,6 +1471,13 @@ mod tests {
             chunk_size,
             pending: None,
             metrics: BaselineMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
+            // Unit fixtures: an unbounded pool, so the accounting is exercised
+            // without any of these asserting a ceiling.
+            reservation: MemoryConsumer::new("GraphUnwindExec[test]").register(
+                &(Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+                    as Arc<dyn datafusion::execution::memory_pool::MemoryPool>),
+            ),
+            held: 0,
         };
 
         let batches: Vec<RecordBatch> = stream.map(|b| b.unwrap()).collect().await;

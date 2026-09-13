@@ -27,6 +27,7 @@ use arrow_array::builder::{ListBuilder, StructBuilder, UInt64Builder};
 use arrow_array::{Array, ArrayRef, RecordBatch, UInt32Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::Result as DFResult;
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
@@ -289,6 +290,8 @@ impl ExecutionPlan for GraphShortestPathExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
+        // Taken before `context` is moved into the child's `execute`.
+        let pool = Arc::clone(context.memory_pool());
         let input_stream = self.input.execute(partition, context)?;
 
         let metrics = BaselineMetrics::new(&self.metrics, partition);
@@ -313,6 +316,15 @@ impl ExecutionPlan for GraphShortestPathExec {
 
         Ok(Box::pin(GraphShortestPathStream {
             input: input_stream,
+            // #261. The paths this operator enumerates are combinatorial in the
+            // graph, not linear in it: `allShortestPaths` between two vertices
+            // yields the product of the predecessor counts along the layers.
+            // Nothing counted them, so the pool could not refuse, and LDBC IC14
+            // — an `allShortestPaths` query — is on record as "killed by hand
+            // after 111 min" at "19.2 GB and climbing".
+            batch_path_bytes: 0,
+            reservation: MemoryConsumer::new(format!("GraphShortestPathExec[{partition}]"))
+                .register(&pool),
             source_column: self.source_column.clone(),
             target_column: self.target_column.clone(),
             edge_type_ids: self.edge_type_ids.clone(),
@@ -400,34 +412,102 @@ struct GraphShortestPathStream {
 
     /// Metrics.
     metrics: BaselineMetrics,
+
+    /// Bytes of `reservation` currently charged to the paths of the batch in
+    /// flight, released when the next batch arrives.
+    batch_path_bytes: usize,
+
+    /// Pool reservation for the BFS state and the enumerated paths (#261).
+    ///
+    /// Sized to what this operator holds for the batch it is working on, and
+    /// resized back down when the next batch arrives — by then the previous
+    /// batch's paths have been handed downstream and are no longer ours to
+    /// account for.
+    reservation: MemoryReservation,
+}
+
+/// Charged per path held in `result`: the `Vec<Vid>` header plus its elements.
+///
+/// The elements dominate for anything but a one-hop path, but the header is not
+/// negligible at the scale that matters — 64 000 four-hop paths are half header.
+fn path_bytes(len: usize) -> usize {
+    std::mem::size_of::<Vec<Vid>>() + len * std::mem::size_of::<Vid>()
+}
+
+/// Move `reservation` to `want` bytes for the caller whose current charge is
+/// `have`, in whichever direction is needed, and update `have`.
+///
+/// Growth is the only direction that can fail. On failure `have` is left at the
+/// last successful figure, so the caller can still give back exactly what it
+/// took.
+fn charge(reservation: &mut MemoryReservation, have: &mut usize, want: usize) -> DFResult<()> {
+    if want > *have {
+        reservation.try_grow(want - *have)?;
+    } else {
+        reservation.shrink(*have - want);
+    }
+    *have = want;
+    Ok(())
 }
 
 impl GraphShortestPathStream {
     /// Compute shortest path between two vertices using BFS.
-    fn compute_shortest_path(&self, source: Vid, target: Vid) -> Option<Vec<Vid>> {
+    ///
+    /// # Memory
+    ///
+    /// The queue carries a **predecessor per vertex**, not a path per vertex.
+    /// It used to hold `(Vid, Vec<Vid>)` and clone the whole partial path on
+    /// every enqueue, which made the frontier cost `O(|V| x depth)` in a search
+    /// whose result is one path — the clone was pure amplification, since a
+    /// parent link reconstructs the same path at the end for `O(1)` per vertex.
+    /// #261 asks for the producer to be bounded before it is accounted; this is
+    /// that bound, and the reservation below is the accounting.
+    ///
+    /// `visited` is subsumed by `parent`: a vertex has a parent exactly once it
+    /// has been seen, so the two sets were always identical.
+    fn compute_shortest_path(&mut self, source: Vid, target: Vid) -> DFResult<Option<Vec<Vid>>> {
         // A zero-length path is only a match when the pattern allows zero hops.
         // `min_hops` defaults to 1, so `[:T]` and `[:T*1..n]` must not report
         // the source as reaching itself for free.
         if source == target {
-            return (self.min_hops == 0).then(|| vec![source]);
+            return Ok((self.min_hops == 0).then(|| vec![source]));
         }
         if self.max_hops == 0 {
-            return None;
+            return Ok(None);
         }
 
-        let mut visited: HashSet<Vid> = HashSet::new();
-        let mut queue: VecDeque<(Vid, Vec<Vid>)> = VecDeque::new();
+        /// Walk `parent` back from `from` to the root, returning root-first.
+        fn rebuild(parent: &FxHashMap<Vid, Vid>, from: Vid) -> Vec<Vid> {
+            let mut path = vec![from];
+            let mut cur = from;
+            while let Some(&p) = parent.get(&cur) {
+                path.push(p);
+                cur = p;
+            }
+            path.reverse();
+            path
+        }
 
-        visited.insert(source);
-        queue.push_back((source, vec![source]));
+        // `parent[v]` is the vertex `v` was first reached from; the source has
+        // no entry, which is what terminates the walk above.
+        let mut parent: FxHashMap<Vid, Vid> = FxHashMap::default();
+        let mut depth: FxHashMap<Vid, u32> = FxHashMap::default();
+        let mut queue: VecDeque<Vid> = VecDeque::new();
+        depth.insert(source, 0);
+        queue.push_back(source);
+        // Charged in blocks rather than per vertex: `try_grow` takes the pool's
+        // lock, and a per-vertex call on a million-vertex BFS would cost more
+        // than the allocation it guards.
+        const GROW_BLOCK: usize = 64 * 1024;
+        let per_vertex = 2 * std::mem::size_of::<(Vid, Vid)>() + std::mem::size_of::<Vid>();
+        let mut charged_vertices = 0usize;
+        let mut uncharged = 0usize;
 
-        while let Some((current, path)) = queue.pop_front() {
-            // `path` holds vertices, so hops taken is one less than its length.
-            let hops_taken = (path.len() - 1) as u32;
+        while let Some(current) = queue.pop_front() {
+            let hops_taken = depth[&current];
             if hops_taken >= self.max_hops {
                 continue;
             }
-            // Get neighbors for all edge types
             for &edge_type in &self.edge_type_ids {
                 let neighbors = self
                     .graph_ctx
@@ -441,40 +521,60 @@ impl GraphShortestPathStream {
                         continue;
                     }
                     if neighbor == target {
-                        // Found the target
-                        let mut result = path.clone();
+                        let mut result = rebuild(&parent, current);
                         result.push(target);
-                        return Some(result);
+                        // Every exit gives the search state back -- an early
+                        // return that kept it would leak a row's worth of
+                        // budget per row, and the operator is called once per
+                        // input row.
+                        self.reservation.shrink(charged_vertices);
+                        return Ok(Some(result));
                     }
 
-                    if !visited.contains(&neighbor) {
-                        visited.insert(neighbor);
-                        let mut new_path = path.clone();
-                        new_path.push(neighbor);
-                        queue.push_back((neighbor, new_path));
+                    if let std::collections::hash_map::Entry::Vacant(slot) = depth.entry(neighbor) {
+                        slot.insert(hops_taken + 1);
+                        parent.insert(neighbor, current);
+                        queue.push_back(neighbor);
+                        uncharged += per_vertex;
+                        if uncharged >= GROW_BLOCK {
+                            if let Err(e) = self.reservation.try_grow(uncharged) {
+                                // The reservation outlives this call -- it is a
+                                // field on the stream -- so a refusal has to
+                                // give back what this search charged before it
+                                // propagates, or the budget stays spent for the
+                                // rest of the query.
+                                self.reservation.shrink(charged_vertices);
+                                return Err(e);
+                            }
+                            charged_vertices += uncharged;
+                            uncharged = 0;
+                        }
                     }
                 }
             }
         }
 
-        None // No path found
+        // The search state dies with this call, so give it back rather than
+        // carrying it into the next row of the batch.
+        self.reservation.shrink(charged_vertices);
+        Ok(None) // No path found
     }
 
     /// Compute all shortest paths between two vertices using layer-by-layer BFS
     /// with predecessor tracking.
     ///
     /// Returns all paths of minimum length from source to target.
-    fn compute_all_shortest_paths(&self, source: Vid, target: Vid) -> Vec<Vec<Vid>> {
+    fn compute_all_shortest_paths(&mut self, source: Vid, target: Vid) -> DFResult<Vec<Vec<Vid>>> {
         // See `compute_shortest_path`: zero hops is a match only under `*0..`.
         if source == target {
-            return if self.min_hops == 0 {
+            return Ok(if self.min_hops == 0 {
                 vec![vec![source]]
             } else {
                 vec![]
-            };
+            });
         }
         if self.max_hops == 0 {
-            return vec![];
+            return Ok(vec![]);
         }
 
         // Layer-by-layer BFS recording ALL predecessors at shortest depth
@@ -530,31 +630,91 @@ impl GraphShortestPathStream {
             current_layer = next_layer_set.into_iter().collect();
         }
 
+        // The forward pass is linear in the reachable subgraph; charge it
+        // before the enumeration, which is not.
+        let search_bytes = depth.len() * std::mem::size_of::<(Vid, u32)>()
+            + predecessors
+                .values()
+                .map(|v| {
+                    std::mem::size_of::<(Vid, Vec<Vid>)>() + v.len() * std::mem::size_of::<Vid>()
+                })
+                .sum::<usize>();
+
+        // One running figure for everything this call holds, reconciled against
+        // the reservation by difference. `try_resize` is not usable here: the
+        // reservation is shared with the batch-level charge in `compute_paths`,
+        // and resizing it to a per-call figure would silently drop that.
+        let mut local = 0usize;
+        charge(&mut self.reservation, &mut local, search_bytes)?;
+
         if !target_found {
-            return vec![];
+            self.reservation.shrink(local);
+            return Ok(vec![]);
         }
 
-        // Enumerate all shortest paths via backward DFS from target to source
+        // Enumerate all shortest paths via backward DFS from target to source.
+        //
+        // # Memory (#261)
+        //
+        // This is the unbounded step. The number of shortest paths between two
+        // vertices is the *product* of the predecessor counts along the layers,
+        // so it is combinatorial in the graph rather than linear in it: a graph
+        // of 122 vertices and 3 280 edges yields 64 000 paths. Both `result` and
+        // the stack's per-branch path clones grow with that count.
+        //
+        // **Not attributed to any recorded LDBC peak.** The obvious candidate
+        // was IC14 -- an `allShortestPaths` query the remediation doc records as
+        // "killed by hand after 111 min" at "19.2 GB and climbing". It was
+        // tested: under a 1 GiB per-query ceiling IC14 against SF1 does refuse,
+        // but on `GraphTraverseExec` asking 4.2 GB, which is upstream of this
+        // operator and was already accounted. The enumeration here is never
+        // reached. The evidence for this reservation is therefore its own
+        // fixture in
+        // `a_shortest_path_search_accounts_for_the_paths_it_enumerates`, and
+        // nothing else.
+        //
+        // It cannot be bounded without changing the answer -- every shortest
+        // path is a row the query asked for -- so accounting is the whole of the
+        // remedy here, and what it buys is precisely what #261 claims for this
+        // case: a refusal naming the operator instead of a process that grows
+        // until the OS ends it.
         let mut result: Vec<Vec<Vid>> = Vec::new();
+        let mut result_bytes = 0usize;
         let mut stack: Vec<(Vid, Vec<Vid>)> = vec![(target, vec![target])];
+        let mut stack_bytes = path_bytes(1);
 
         while let Some((node, path)) = stack.pop() {
+            stack_bytes -= path_bytes(path.len());
             if node == source {
                 let mut full_path = path;
                 full_path.reverse();
+                result_bytes += path_bytes(full_path.len());
                 result.push(full_path);
-                continue;
-            }
-            if let Some(preds) = predecessors.get(&node) {
+            } else if let Some(preds) = predecessors.get(&node) {
                 for &pred in preds {
                     let mut new_path = path.clone();
                     new_path.push(pred);
+                    stack_bytes += path_bytes(new_path.len());
                     stack.push((pred, new_path));
                 }
             }
+            // Reconciled every iteration, in both directions: the stack shrinks
+            // as well as grows, and a grow-only account of a structure that
+            // shrinks reports a peak the operator never held.
+            if let Err(e) = charge(
+                &mut self.reservation,
+                &mut local,
+                search_bytes + result_bytes + stack_bytes,
+            ) {
+                self.reservation.shrink(local);
+                return Err(e);
+            }
         }
 
-        result
+        // `result` is handed to the caller, which charges what it keeps; the
+        // search state and the stack are gone.
+        self.reservation.shrink(local);
+        Ok(result)
     }
 
     /// The entities the batch's paths will materialize into path element
@@ -578,7 +738,16 @@ impl GraphShortestPathStream {
     ///
     /// Split from column materialization so path element properties can be
     /// pre-fetched from storage first — see [`EntityPropertyCache`].
-    fn compute_paths(&self, batch: RecordBatch) -> DFResult<(RecordBatch, Vec<Option<Vec<Vid>>>)> {
+    fn compute_paths(
+        &mut self,
+        batch: RecordBatch,
+    ) -> DFResult<(RecordBatch, Vec<Option<Vec<Vid>>>)> {
+        // Give back the previous batch's paths. By the time this is called
+        // again they have been through `build_output_batch` and belong to the
+        // consumer; holding a reservation against them would double-count them
+        // downstream.
+        self.reservation.shrink(self.batch_path_bytes);
+        self.batch_path_bytes = 0;
         // Extract source and target VIDs
         let source_col = batch.column_by_name(&self.source_column).ok_or_else(|| {
             datafusion::error::DataFusionError::Execution(format!(
@@ -612,13 +781,21 @@ impl GraphShortestPathStream {
                 } else {
                     let source = Vid::from(source_vids.value(i));
                     let target = Vid::from(target_vids.value(i));
-                    let paths = self.compute_all_shortest_paths(source, target);
+                    let paths = self.compute_all_shortest_paths(source, target)?;
                     if paths.is_empty() {
                         row_indices.push(i as u32);
                         all_paths.push(None);
                     } else {
                         for path in paths {
                             row_indices.push(i as u32);
+                            // Charged as it accumulates, not after: the point of
+                            // the reservation is to stop a batch whose paths do
+                            // not fit, and a charge levied once the vector is
+                            // already resident records the peak instead of
+                            // refusing it.
+                            let grew = path_bytes(path.len());
+                            self.reservation.try_grow(grew)?;
+                            self.batch_path_bytes += grew;
                             all_paths.push(Some(path));
                         }
                     }
@@ -650,8 +827,13 @@ impl GraphShortestPathStream {
                 } else {
                     let source = Vid::from(source_vids.value(i));
                     let target = Vid::from(target_vids.value(i));
-                    self.compute_shortest_path(source, target)
+                    self.compute_shortest_path(source, target)?
                 };
+                if let Some(p) = &path {
+                    let grew = path_bytes(p.len());
+                    self.reservation.try_grow(grew)?;
+                    self.batch_path_bytes += grew;
+                }
                 paths.push(path);
             }
 

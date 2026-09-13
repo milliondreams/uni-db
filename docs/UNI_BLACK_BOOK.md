@@ -5645,6 +5645,46 @@ graph TB
 | `max_recursive_cte_iterations` | `usize` | 1,000 | Maximum iterations for recursive CTE evaluation |
 | `strict_schema` | `bool` | `false` | Reject writes referencing undeclared labels or edge types |
 
+### What `max_query_memory` actually covers
+
+`max_query_memory` sizes a DataFusion `RuntimeEnv` memory pool. A pool only
+accounts operators that *reserve through it*, so the limit means what it says
+only to the extent that the operators in a plan register a `MemoryConsumer`.
+
+Every first-party physical operator in `crates/uni-query/src/query/df_graph/`
+now reserves. That was not always true, and the history is worth keeping:
+
+- Until #242 **none** of them did. Multi-GB peaks in graph operators never
+  tripped a pool that was configured and working the whole time, because every
+  refusal it had ever produced came from a stock DataFusion operator.
+- #242 covered operators whose reservation was *smaller than what they held*.
+- #261 covered the other half — sixteen operators that never reserved at all.
+
+Three principles follow from that work and should be kept when adding an
+operator:
+
+1. **Bound before accounting where a bound exists.** Reserving without bounding
+   records a peak after it exists; it converts a silent overrun into a clean
+   error, which is worth something, but it bounds nothing. Chunk the producer
+   first, then reserve per chunk. `GraphUnwindExec` and `GraphScanExec` are the
+   chunked shape; `OptionalFilterExec` and `allShortestPaths` are the cases
+   where no bound is available, because the buffer is semantically required and
+   every row in it is a row the query asked for.
+2. **Charge as the structure grows, not after.** `stream.try_collect()` resolves
+   only once the whole input is already resident, so a budget checked after it
+   records a peak that has already happened. `common::collect_accounted` is the
+   accounted replacement and is used at every eager barrier.
+3. **Name the operator in the consumer.** The name reaches the user verbatim in
+   a `ResourcesExhausted` message. An anonymous reservation refuses a query
+   without saying which part of the plan could not fit, and the tests that guard
+   these reservations discriminate on exactly that string.
+
+The tests live in `crates/uni/tests/common/perf/query_limits_test.rs` and take
+the shape of a **required failure**: an unaccounted allocation passes every
+ceiling, so no successful query can witness one. Each sets a ceiling below what
+the operator holds, requires a refusal naming it, and pairs that with a higher
+ceiling asserting the answer is unchanged.
+
 ### strict_schema
 
 When enabled, CREATE and MERGE operations that reference a label or edge type not declared in the schema are rejected with an error. This enforces schema-first discipline and catches typos at write time. Properties are not affected — unknown properties still go to overflow.

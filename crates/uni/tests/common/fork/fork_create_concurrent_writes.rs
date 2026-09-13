@@ -153,12 +153,22 @@ async fn run_race(uri: &str, async_flush: bool) {
     db.shutdown().await.unwrap();
 }
 
+/// **Parallelism:** this races a fork creation against a writer loop on a
+/// 4-worker runtime, so it needs those workers to actually get scheduled. Under
+/// a saturated machine it can fail while passing in isolation — observed once
+/// in a full `cargo nextest run -p uni-db`, taking 34s there against 1.5s
+/// alone, and passing on the next full run of the same tree. Re-run it with
+/// `-j1` before reading a failure as a defect; a real one reproduces alone.
+///
+/// The repository asks for this note at the test site rather than in a tracker,
+/// because the next person to see it red will be looking here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fork_point_atomic_under_concurrent_parent_writes_async_flush() {
     let dir = tempfile::tempdir().unwrap();
     run_race(dir.path().to_str().unwrap(), true).await;
 }
 
+/// Same parallelism caveat as the async-flush twin above.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fork_point_atomic_under_concurrent_parent_writes_sync_flush() {
     let dir = tempfile::tempdir().unwrap();

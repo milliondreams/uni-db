@@ -23,17 +23,24 @@
 //! `node / scalar` in a way they do not divide out of a wall-clock threshold.
 //! That is what makes a timing assertion tolerable here at all.
 //!
-//! It is still a timing assertion, so the guard sits at 4x: comfortably above
-//! the ~2x the fix leaves and comfortably below the 12x the defect produced,
-//! and both arms have to slow down *together* for a false pass. The equality
-//! assertion below is what keeps that honest — an arm that got fast by
-//! answering a smaller question fails before the ratio is ever consulted.
+//! It is still a timing assertion, so the guard sits at 6x: above the ~3x these
+//! arms settle at in a debug build and well below the 12x release / 41.9x debug
+//! the defect produced. Both arms have to slow down *together* for a false
+//! pass, and the equality assertion below is what keeps that honest — an arm
+//! that got fast by answering a smaller question fails before the ratio is ever
+//! consulted.
+//!
+//! It shipped at 4x, calibrated against arms measuring 0.72s and 0.49s. They
+//! now measure a fifth of that, where fixed overhead is a large share of each
+//! arm and the ratio swings with it: 3.0x alone, past 4x under a loaded
+//! full-suite run. The guard was failing on its own noise, which is worse than
+//! no guard — so each arm is measured twice with the faster kept, and the
+//! threshold moved to where the noise cannot reach it.
 //!
 //! **Parallelism note:** the measurement is CPU-bound and the ratio is taken
-//! within one process, so co-scheduled tests affect both arms alike. It is not
-//! pinned to a thread count and needs no `serial` treatment, but a regression
-//! that lands it between 4x and 12x should be reproduced with
-//! `cargo nextest run -j1` before being read as noise.
+//! within one process, so co-scheduled tests affect both arms alike. A failure
+//! between 6x and 12x should still be reproduced with `cargo nextest run -j1`
+//! before being read as a defect.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -160,8 +167,14 @@ async fn issue_267_node_key_costs_about_what_a_scalar_key_costs() -> Result<()> 
     // Scalar first, so the node arm cannot be credited with a warm-up the
     // scalar arm paid for. The reporter's script runs them the other way round
     // and the defect showed either way, but the order is free to get right.
-    let (scalar, scalar_facts) = measure(&db, RULE_SCALAR_KEY).await?;
-    let (node, node_facts) = measure(&db, RULE_NODE_KEY).await?;
+    // Twice per arm, faster run kept. The first run of each pays plan
+    // construction the second does not, and at these absolute times — tenths of
+    // a second in a debug build — that fixed cost is a large enough share of
+    // the total to move the ratio around on its own.
+    let (mut scalar, scalar_facts) = measure(&db, RULE_SCALAR_KEY).await?;
+    scalar = scalar.min(measure(&db, RULE_SCALAR_KEY).await?.0);
+    let (mut node, node_facts) = measure(&db, RULE_NODE_KEY).await?;
+    node = node.min(measure(&db, RULE_NODE_KEY).await?.0);
 
     let ratio = node.as_secs_f64() / scalar.as_secs_f64().max(1e-9);
     eprintln!(
@@ -186,10 +199,21 @@ async fn issue_267_node_key_costs_about_what_a_scalar_key_costs() -> Result<()> 
          grouping path and the guard would pass on an empty rule"
     );
 
+    // 6x, not the 4x this shipped with. That was calibrated against arms
+    // measuring 0.72s and 0.49s; they now measure a fifth of that, and at those
+    // times the ratio swings with fixed overhead rather than with the work —
+    // observed at 3.0x alone and past 4x under a loaded full-suite run, i.e.
+    // the guard was failing on its own noise. The defect it exists to catch
+    // measured 11-12x in release and 41.9x in debug, so 6 still sits far below
+    // it while clearing the noise floor.
+    //
+    // **Parallelism:** wall-clock, but both arms run in one process against one
+    // graph, so load moves them together. Re-run with `-j1` before reading a
+    // failure as a defect.
     assert!(
-        ratio < 4.0,
+        ratio < 6.0,
         "a node-valued KEY cost {ratio:.1}x a scalar one ({:.3}s vs {:.3}s) at \
-         {N_EDGES} edges, past the 4x guard. Issue #267: before `5a8dd387b` \
+         {N_EDGES} edges, past the 6x guard. Issue #267: before `5a8dd387b` \
          this shape re-decoded a tagged CypherValue argument on every row, \
          which measured 12x here and grew quadratically. Check whether the \
          per-run argument memo in `invoke_cypher_udf` still covers it.",

@@ -56,7 +56,10 @@ use uni_db::{DataType, IndexType, Uni, Value, VectorAlgo, VectorIndexCfg, Vector
 
 use uni_query::plan_shape::{assert_avoids, assert_uses};
 
-use super::{assert_plan_avoids, assert_plan_uses, tx_plan_ops};
+use super::{
+    assert_locy_plan_avoids, assert_locy_plan_uses, assert_plan_avoids, assert_plan_uses,
+    locy_plan_ops, tx_plan_ops,
+};
 
 /// Rows per label. Small: these assert plan shape, not throughput.
 const N: i64 = 8;
@@ -565,6 +568,264 @@ async fn a_vector_similarity_predicate_runs_the_vector_knn() -> Result<()> {
         "MATCH (d:Doc) RETURN d.id AS id \
          ORDER BY similar_to(d.embedding, [1.0, 0.0]) DESC LIMIT 1",
         "GraphVectorKnnExec",
+    )
+    .await;
+    Ok(())
+}
+
+// ── Locy clause-body operators ──────────────────────────────────────────────
+//
+// These reach a different profile surface. Locy's evaluator re-plans each
+// rule's clause body per fixpoint iteration and collects operator metrics with
+// the same walk Cypher uses, exposed through `LocyProfileOutput`; `locy_plan_ops`
+// flattens it. Three of the registry's `Unproven` rows were plain gaps against
+// that surface rather than anything structural.
+//
+// What this surface cannot reach is recorded on the rows it cannot reach:
+// `FoldExec` and `PriorityExec` are built imperatively in the post-fixpoint
+// chain and are never part of a collected plan.
+
+/// A tiny graph with costs on its edges, enough for BEST BY and an IS-reference.
+async fn locy_fixture() -> Result<Uni> {
+    let db = Uni::in_memory().build().await?;
+    let tx = db.session().tx().await?;
+    tx.execute(
+        "CREATE (a:Node {name: 'A'}), (b:Node {name: 'B'}), (c:Node {name: 'C'}), \
+         (a)-[:EDGE {cost: 5}]->(b), (a)-[:EDGE {cost: 3}]->(c), \
+         (b)-[:EDGE {cost: 2}]->(c)",
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(db)
+}
+
+/// `BEST BY` without `FOLD` lowers a `BestByExec` into the clause body.
+///
+/// The guard is the point and it is invisible in the program text: the body
+/// wrapper is emitted only when `best_by.is_some() && fold.is_empty()`. Paired
+/// with a FOLD the selection is deferred to the post-fixpoint chain, where it
+/// runs outside every collected plan — so every BEST BY test already in the
+/// tree pairs it with FOLD and none of them could serve as this proof.
+#[tokio::test]
+async fn a_best_by_without_fold_runs_the_best_by_operator() -> Result<()> {
+    let db = locy_fixture().await?;
+    assert_locy_plan_uses(
+        &db.session(),
+        "CREATE RULE cheapest AS MATCH (a:Node)-[e:EDGE]->(b:Node) \
+         BEST BY e.cost ASC YIELD KEY a, KEY b, e.cost AS cost",
+        "BestByExec",
+    )
+    .await;
+    Ok(())
+}
+
+/// The negative twin: the same rule without `BEST BY` emits no `BestByExec`.
+#[tokio::test]
+async fn a_rule_without_best_by_avoids_the_best_by_operator() -> Result<()> {
+    let db = locy_fixture().await?;
+    assert_locy_plan_avoids(
+        &db.session(),
+        "CREATE RULE link AS MATCH (a:Node)-[e:EDGE]->(b:Node) YIELD KEY a, KEY b",
+        "BestByExec",
+    )
+    .await;
+    Ok(())
+}
+
+/// An `IS` reference to another derived relation lowers a `DerivedScanExec`.
+#[tokio::test]
+async fn an_is_reference_runs_the_derived_scan() -> Result<()> {
+    let db = locy_fixture().await?;
+    assert_locy_plan_uses(
+        &db.session(),
+        "CREATE RULE link AS MATCH (a:Node)-[e:EDGE]->(b:Node) YIELD KEY a, KEY b\n\
+         CREATE RULE link AS MATCH (a:Node)-[e:EDGE]->(b:Node) \
+         WHERE (a) IS link TO b YIELD KEY a, KEY b",
+        "DerivedScanExec",
+    )
+    .await;
+    Ok(())
+}
+
+/// The negative twin: a rule that references no derived relation has no
+/// `DerivedScanExec` to scan.
+#[tokio::test]
+async fn a_rule_with_no_is_reference_avoids_the_derived_scan() -> Result<()> {
+    let db = locy_fixture().await?;
+    assert_locy_plan_avoids(
+        &db.session(),
+        "CREATE RULE link AS MATCH (a:Node)-[e:EDGE]->(b:Node) YIELD KEY a, KEY b",
+        "DerivedScanExec",
+    )
+    .await;
+    Ok(())
+}
+
+/// A clause calling a `CREATE MODEL` name lowers a `LocyModelInvokeExec`.
+///
+/// A `MockClassifier` stands in for the model, so this needs no external
+/// service. Note the registry key is the **model** name, not the `xervo(..)`
+/// URI inside it — registering the URI leaves the evaluator reporting
+/// "classifier 'scorer' not registered".
+#[tokio::test]
+async fn a_model_call_runs_the_model_invoke() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Customer {name: 'c1'}), (:Customer {name: 'c2'})")
+        .await?;
+    tx.commit().await?;
+
+    let ops = locy_plan_ops_with_classifier(&db).await?;
+    assert_uses(&ops, "LocyModelInvokeExec", "model-call rule");
+    Ok(())
+}
+
+/// Profile a model-calling program with a mock classifier registered.
+///
+/// Separate from [`super::locy_plan_ops`] because it needs a non-default
+/// `LocyConfig`: the classifier registry, and `neural_predicates_preview`.
+async fn locy_plan_ops_with_classifier(db: &Uni) -> Result<Vec<String>> {
+    let classifier: std::sync::Arc<dyn uni_locy::NeuralClassifier> =
+        std::sync::Arc::new(uni_locy::MockClassifier::constant("classify/scorer", 0.5));
+    let mut config = uni_locy::LocyConfig::default();
+    config
+        .classifier_registry
+        .insert("scorer".to_string(), classifier);
+
+    let program = "CREATE MODEL scorer AS INPUT (s) OUTPUT PROB risk \
+                   USING xervo('classify/scorer')\n\
+                   CREATE RULE risky AS MATCH (s:Customer) YIELD KEY s, scorer(s) AS risk";
+    let (_result, profile) = db
+        .session()
+        .locy_with(program)
+        .with_config(config)
+        .profile()
+        .await?;
+    let mut names: Vec<String> = profile
+        .profile
+        .strata
+        .iter()
+        .flat_map(|stratum| stratum.rules.iter())
+        .flat_map(|rule| rule.iterations.iter())
+        .flat_map(|iteration| iteration.operators.iter())
+        .map(|op| op.operator.clone())
+        .collect();
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
+/// The negative twin: a rule with no model call emits no `LocyModelInvokeExec`.
+#[tokio::test]
+async fn a_rule_without_a_model_call_avoids_the_model_invoke() -> Result<()> {
+    let db = locy_fixture().await?;
+    assert_locy_plan_avoids(
+        &db.session(),
+        "CREATE RULE link AS MATCH (a:Node)-[e:EDGE]->(b:Node) YIELD KEY a, KEY b",
+        "LocyModelInvokeExec",
+    )
+    .await;
+    Ok(())
+}
+
+/// `FOLD` runs a `FoldExec`, in the post-fixpoint chain.
+///
+/// `LocyFold` is deliberately not lowered into a clause body — the planner says
+/// wrapping the body would double-apply the aggregate — so the `FoldExec` that
+/// runs is assembled in the post-fixpoint chain. That chain now reports its own
+/// operators into the rule's profile, which is what makes this assertable at
+/// all (#177).
+#[tokio::test]
+async fn a_fold_runs_the_fold_operator() -> Result<()> {
+    let db = locy_fixture().await?;
+    assert_locy_plan_uses(
+        &db.session(),
+        "CREATE RULE total AS MATCH (a:Node)-[e:EDGE]->(b:Node) \
+         FOLD total = SUM(e.cost) YIELD KEY a, total",
+        "FoldExec",
+    )
+    .await;
+    Ok(())
+}
+
+/// The negative twin: a rule without `FOLD` runs no `FoldExec`.
+#[tokio::test]
+async fn a_rule_without_fold_avoids_the_fold_operator() -> Result<()> {
+    let db = locy_fixture().await?;
+    assert_locy_plan_avoids(
+        &db.session(),
+        "CREATE RULE link AS MATCH (a:Node)-[e:EDGE]->(b:Node) YIELD KEY a, KEY b",
+        "FoldExec",
+    )
+    .await;
+    Ok(())
+}
+
+/// `PRIORITY` runs a `PriorityExec`, also in the post-fixpoint chain.
+///
+/// `clause.priority` stays a scalar field and is never lowered into the body
+/// plan — the planner's own `test_clause_with_priority` asserts there is no
+/// wrapper — so like `FoldExec` it runs only in the chain.
+#[tokio::test]
+async fn a_priority_rule_runs_the_priority_operator() -> Result<()> {
+    let db = locy_fixture().await?;
+    assert_locy_plan_uses(
+        &db.session(),
+        "CREATE RULE classify PRIORITY 1 AS MATCH (a:Node) YIELD KEY a, 'low' AS label\n\
+         CREATE RULE classify PRIORITY 2 AS MATCH (a:Node) WHERE a.name = 'A' \
+         YIELD KEY a, 'high' AS label",
+        "PriorityExec",
+    )
+    .await;
+    Ok(())
+}
+
+/// The negative twin: rules without `PRIORITY` run no `PriorityExec`.
+#[tokio::test]
+async fn a_rule_without_priority_avoids_the_priority_operator() -> Result<()> {
+    let db = locy_fixture().await?;
+    assert_locy_plan_avoids(
+        &db.session(),
+        "CREATE RULE link AS MATCH (a:Node)-[e:EDGE]->(b:Node) YIELD KEY a, KEY b",
+        "PriorityExec",
+    )
+    .await;
+    Ok(())
+}
+
+/// A recursive stratum runs a `FixpointExec`.
+///
+/// The fixpoint driver spans every rule in its stratum and is a child of no
+/// plan, so it can never appear in a *rule's* operator list however often it
+/// runs. It is reported against the stratum instead, which is where it belongs
+/// and is what `locy_plan_ops` now folds in (#177).
+#[tokio::test]
+async fn a_recursive_rule_runs_the_fixpoint_operator() -> Result<()> {
+    let db = locy_fixture().await?;
+    assert_locy_plan_uses(
+        &db.session(),
+        "CREATE RULE reach AS MATCH (a:Node)-[e:EDGE]->(b:Node) YIELD KEY a, KEY b\n\
+         CREATE RULE reach AS MATCH (a:Node)-[e:EDGE]->(b:Node) \
+         WHERE (a) IS reach TO b YIELD KEY a, KEY b",
+        "FixpointExec",
+    )
+    .await;
+    Ok(())
+}
+
+/// The negative twin: a non-recursive program has no fixpoint to drive.
+///
+/// This is the load-bearing half of the pair. A stratum-level operator list
+/// that was populated unconditionally would satisfy the positive assertion for
+/// every program, so the proof means nothing without a shape that leaves it
+/// empty.
+#[tokio::test]
+async fn a_non_recursive_rule_avoids_the_fixpoint_operator() -> Result<()> {
+    let db = locy_fixture().await?;
+    assert_locy_plan_avoids(
+        &db.session(),
+        "CREATE RULE link AS MATCH (a:Node)-[e:EDGE]->(b:Node) YIELD KEY a, KEY b",
+        "FixpointExec",
     )
     .await;
     Ok(())

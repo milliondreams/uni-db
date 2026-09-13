@@ -76,6 +76,71 @@ pub async fn assert_plan_avoids(session: &Session, query: &str, op: &str) {
     plan_shape::assert_avoids(&ops, op, query);
 }
 
+/// Physical operator names from profiling a Locy `program`'s clause bodies.
+///
+/// Locy has its own profile surface. `Session::locy_with(..).profile()` returns
+/// a `LocyProfileOutput`, whose per-iteration `operators` are produced by the
+/// same `collect_plan_metrics` walk Cypher's profile uses — but over each
+/// rule's re-planned clause body, once per fixpoint iteration. Flattening
+/// strata → rules → iterations → operators gives the same shape
+/// [`plan_ops`] returns, so the ordinary matchers apply.
+///
+/// This reaches only what is lowered *into a clause body*. An operator the
+/// evaluator builds imperatively in the post-fixpoint chain — `FoldExec`,
+/// `PriorityExec` — never becomes part of a collected plan and cannot be seen
+/// here however often it runs. The registry records which those are.
+///
+/// # Panics
+///
+/// Panics if the program fails to run — `profile()` evaluates it.
+pub async fn locy_plan_ops(session: &Session, program: &str) -> Vec<String> {
+    let (_result, profile) = session
+        .locy_with(program)
+        .profile()
+        .await
+        .unwrap_or_else(|e| panic!("locy profile failed for `{program}`: {e}"));
+    let mut names: Vec<String> = profile
+        .profile
+        .strata
+        .iter()
+        .flat_map(|stratum| {
+            // Stratum-level operators first — the fixpoint driver belongs to the
+            // stratum, not to any one of its rules.
+            stratum.operators.iter().chain(
+                stratum
+                    .rules
+                    .iter()
+                    .flat_map(|rule| rule.iterations.iter())
+                    .flat_map(|iteration| iteration.operators.iter()),
+            )
+        })
+        .map(|op| op.operator.clone())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Asserts a Locy `program` runs physical operator `op` in some clause body.
+///
+/// # Panics
+///
+/// Panics if the program fails, or if `op` is absent from every clause body.
+pub async fn assert_locy_plan_uses(session: &Session, program: &str, op: &str) {
+    let ops = locy_plan_ops(session, program).await;
+    plan_shape::assert_uses(&ops, op, program);
+}
+
+/// Asserts a Locy `program` does **not** run physical operator `op`.
+///
+/// # Panics
+///
+/// Panics if the program fails, or if `op` is present in a clause body.
+pub async fn assert_locy_plan_avoids(session: &Session, program: &str, op: &str) {
+    let ops = locy_plan_ops(session, program).await;
+    plan_shape::assert_avoids(&ops, op, program);
+}
+
 /// Physical operator names from profiling `query` inside a transaction.
 ///
 /// The read-side [`plan_ops`] cannot reach a mutation at all: `Session::query`

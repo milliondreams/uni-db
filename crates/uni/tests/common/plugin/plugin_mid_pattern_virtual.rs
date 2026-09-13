@@ -395,3 +395,52 @@ async fn shortest_path_through_virtual_midpoint_does_not_crash() -> anyhow::Resu
     let _ = res;
     Ok(())
 }
+
+/// A traversal over a plugin-provided virtual edge type runs
+/// `CatalogEdgeScanExec` (#177).
+///
+/// The registry recorded this operator as reachable "only in principle",
+/// because the one fixture that exercised it discarded its result with a note
+/// that a bare `MATCH ()-[r:VirtualRel]->()` "requires a native source/target
+/// label resolution that the MVP doesn't cover", and said to prove it by
+/// finishing that resolution rather than by writing a test against the planner
+/// of the day. That resolution is what this file's mid-pattern support *is* —
+/// measured, the operator is emitted for both the native-source and
+/// virtual-source shapes.
+#[tokio::test]
+async fn a_virtual_edge_traversal_runs_the_catalog_edge_scan() -> anyhow::Result<()> {
+    let (db, _catalog) = fresh_db_with_catalog().await;
+    // Allocate the virtual label's vids, as the sibling tests do, so the
+    // traversal resolves its endpoints.
+    let _ = db.session().query("MATCH (n:External) RETURN n").await?;
+
+    crate::plan_shape::assert_plan_uses(
+        &db.session(),
+        "MATCH (a:Native)-[r:VirtualRel]->(b:External) RETURN b.foo AS f",
+        "CatalogEdgeScanExec",
+    )
+    .await;
+    Ok(())
+}
+
+/// The negative twin: a native edge type traverses natively.
+///
+/// Load-bearing for the same reason as the vertex twin — the two are chosen by
+/// whether the edge type resolves in the local schema, which the query text
+/// does not show.
+#[tokio::test]
+async fn a_native_edge_traversal_avoids_the_catalog_edge_scan() -> anyhow::Result<()> {
+    let (db, _catalog) = fresh_db_with_catalog().await;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Native {foo: 'a'})-[:NativeRel]->(:Native {foo: 'b'})")
+        .await?;
+    tx.commit().await?;
+
+    crate::plan_shape::assert_plan_avoids(
+        &db.session(),
+        "MATCH (a:Native)-[r:NativeRel]->(b:Native) RETURN b.foo AS f",
+        "CatalogEdgeScanExec",
+    )
+    .await;
+    Ok(())
+}

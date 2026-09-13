@@ -227,7 +227,9 @@ impl<'a> LocyBuilder<'a> {
     /// Compiles the program and returns plan introspection data (strata,
     /// rule names, recursion info, compiler warnings).
     pub fn explain(self) -> Result<crate::api::locy_result::LocyExplainOutput> {
-        let compiled = self.session.compile_locy(&self.program)?;
+        let compiled = self
+            .session
+            .compile_locy_with_config(&self.program, &self.config)?;
         Ok(crate::api::locy_result::LocyExplainOutput::from_compiled(
             &compiled,
         ))
@@ -238,7 +240,9 @@ impl<'a> LocyBuilder<'a> {
     /// per-operator metrics). The Locy analog of Cypher's `query.profile()`.
     pub async fn profile(self) -> Result<(LocyResult, crate::api::locy_result::LocyProfileOutput)> {
         let explain = crate::api::locy_result::LocyExplainOutput::from_compiled(
-            &self.session.compile_locy(&self.program)?,
+            &self
+                .session
+                .compile_locy_with_config(&self.program, &self.config)?,
         );
         let capture = std::sync::Arc::new(std::sync::Mutex::new(None));
         let result = crate::api::impl_locy::evaluate_with_db_and_config_capturing(

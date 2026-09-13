@@ -912,6 +912,9 @@ async fn run_program(
         // Profiling (profile() path only): time this stratum and collect its
         // per-rule, per-iteration detail. `None` → zero overhead on `run()`.
         let stratum_start = Instant::now();
+        // Operators belonging to this stratum rather than to any of its rules —
+        // today the `FixpointExec` driving a recursive stratum (#177).
+        let mut stratum_operators: Vec<crate::query::executor::core::OperatorStats> = Vec::new();
         let collector = profile_enabled.then(|| Arc::new(LocyProfileCollector::default()));
 
         let remaining_timeout = timeout.saturating_sub(start.elapsed());
@@ -965,6 +968,12 @@ async fn run_program(
             let task_ctx = session_ctx.read().task_ctx();
             let exec_arc: Arc<dyn ExecutionPlan> = Arc::new(exec);
             let batches = collect_all_partitions(&exec_arc, task_ctx).await?;
+            // The fixpoint driver spans the whole stratum and is a child of
+            // nothing, so this is the only place it can be observed (#177).
+            // Recorded only while profiling, so the walk is not paid otherwise.
+            if collector.is_some() {
+                stratum_operators = crate::query::executor::core::collect_plan_metrics(&exec_arc);
+            }
 
             // FixpointExec concatenates all rules' output; store per-rule.
             // For now, store all output under each rule name (since FixpointExec
@@ -1192,6 +1201,11 @@ async fn run_program(
                     derivation_tracker.as_ref().map(Arc::clone),
                     top_k_proofs,
                     Some(Arc::clone(&registry)),
+                    // The chain's own operators join this rule's clause-body
+                    // ops, so `FoldExec` and friends reach the Locy profile
+                    // (#177). `None` when not profiling, so the metric walk is
+                    // not paid on the ordinary path.
+                    collector.as_ref().map(|_| &mut iter_ops),
                 )
                 .await?;
 
@@ -1223,6 +1237,7 @@ async fn run_program(
                 index: stratum_idx,
                 recursive: stratum.is_recursive,
                 elapsed_ms: stratum_start.elapsed().as_secs_f64() * 1000.0,
+                operators: std::mem::take(&mut stratum_operators),
                 iterations,
                 facts_derived,
                 rules,

@@ -609,3 +609,41 @@ fn virtual_label_id_predicate_excludes_sentinel() {
     assert!(is_virtual_label_id(VIRTUAL_LABEL_ID_START + 10));
     assert!(!is_virtual_label_id(VIRTUAL_LABEL_ID_SENTINEL));
 }
+
+/// `MATCH` on a plugin-provided virtual label runs `CatalogVertexScanExec`
+/// (#177).
+///
+/// The fixture above already proved the *rows* come back. That cannot
+/// distinguish "the catalog scan ran" from "something else produced the same
+/// rows", which is the gap this closes: if virtual-label dispatch regressed to
+/// a native scan the result assertions would stay green.
+#[tokio::test]
+async fn vertex_match_runs_the_catalog_vertex_scan() -> anyhow::Result<()> {
+    let (db, _catalog) = fresh_db_with_catalog().await;
+    crate::plan_shape::assert_plan_uses(
+        &db.session(),
+        "MATCH (n:External) RETURN n.foo AS f",
+        "CatalogVertexScanExec",
+    )
+    .await;
+    Ok(())
+}
+
+/// The negative twin: a native label goes to `GraphScanExec`, not the catalog.
+///
+/// Load-bearing because the two are chosen by whether the label resolves in the
+/// local schema — invisible in the query text, and exactly the kind of routing
+/// a planner change could silently flip.
+#[tokio::test]
+async fn a_native_label_avoids_the_catalog_vertex_scan() -> anyhow::Result<()> {
+    let (db, _catalog) = fresh_db_with_catalog().await;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Native {foo: 'x'})").await?;
+    tx.commit().await?;
+
+    let session = db.session();
+    let query = "MATCH (n:Native) RETURN n.foo AS f";
+    crate::plan_shape::assert_plan_avoids(&session, query, "CatalogVertexScanExec").await;
+    crate::plan_shape::assert_plan_uses(&session, query, "GraphScanExec").await;
+    Ok(())
+}

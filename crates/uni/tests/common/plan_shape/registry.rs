@@ -27,6 +27,7 @@
 /// So `Unproven` exists, and the dumping-ground risk is handled by a **ratchet**
 /// instead: `MAX_UNPROVEN` may never increase. New operators must arrive
 /// `Proven` or `Unreachable`, and every retrofit lowers the bound permanently.
+/// As of #177 the bound is zero and no row uses this status.
 #[derive(Debug, Clone, Copy)]
 pub enum Status {
     /// A named, non-ignored test asserts this operator appears in an executed
@@ -63,7 +64,14 @@ pub struct Operator {
 /// executed lines under a dedicated 15-test suite. Retrofitting a proof lowers
 /// the bound; the gate fails if the count exceeds it, so a new operator cannot
 /// arrive unproven.
-pub const MAX_UNPROVEN: usize = 10;
+///
+/// It is now **zero** (#177), which changes what this constant does. It no
+/// longer records a debt to pay down; it is a floor, and every operator added
+/// from here must arrive `Proven` or `Unreachable` or the gate fails on the
+/// spot. `Unproven` keeps its meaning — an honest home for "reachable, not yet
+/// asserted" — but reaching for it now requires lowering a bound that cannot be
+/// lowered, which is the intended friction.
+pub const MAX_UNPROVEN: usize = 0;
 
 pub const OPERATORS: &[Operator] = &[
     // ── Measured 2026-08-14 ────────────────────────────────────────────────
@@ -229,24 +237,31 @@ pub const OPERATORS: &[Operator] = &[
             in_file: "crates/uni/tests/common/plan_shape/proofs.rs",
         },
     },
-    // Reachable: a plugin `CatalogProvider` registers a virtual label and
-    // `MATCH (n:External)` dispatches to it. The fixture exists
-    // (`plugin/plugin_virtual_label_dispatch.rs`); this row is a plain gap.
+    // A plugin `CatalogProvider` registers a virtual label and
+    // `MATCH (n:External)` dispatches to it. The fixture already existed and
+    // asserted only the rows; the proof adds the shape, with a native-label
+    // twin because the two are chosen by schema resolution, not query text.
     Operator {
         ty: "CatalogVertexScanExec",
         runtime_name: "CatalogVertexScanExec",
-        status: Status::Unproven,
+        status: Status::Proven {
+            by: "vertex_match_runs_the_catalog_vertex_scan",
+            in_file: "crates/uni/tests/common/plugin/plugin_virtual_label_dispatch.rs",
+        },
     },
-    // Reachable only in principle. `plan_traverse_virtual_edge` requires the
-    // traversal's edge-type ids to be *all* virtual, and the one test that
-    // exercises it (`plugin_virtual_label_dispatch.rs`) discards its result with
-    // a note that a bare `MATCH ()-[r:VirtualRel]->()` "requires a native
-    // source/target label resolution that the MVP doesn't cover". Prove it by
-    // finishing that resolution, not by writing a test against today's planner.
+    // This row said "reachable only in principle", pending a native
+    // source/target label resolution "the MVP doesn't cover", and said to prove
+    // it by finishing that resolution rather than testing the planner of the
+    // day. The resolution landed in the meantime — `plugin_mid_pattern_virtual.rs`
+    // is exactly that work — and nobody revisited the row. Measured: both the
+    // native-source and virtual-source shapes emit it.
     Operator {
         ty: "CatalogEdgeScanExec",
         runtime_name: "CatalogEdgeScanExec",
-        status: Status::Unproven,
+        status: Status::Proven {
+            by: "a_virtual_edge_traversal_runs_the_catalog_edge_scan",
+            in_file: "crates/uni/tests/common/plugin/plugin_mid_pattern_virtual.rs",
+        },
     },
     Operator {
         ty: "GraphVectorKnnExec",
@@ -313,82 +328,114 @@ pub const OPERATORS: &[Operator] = &[
         },
     },
     // UNOBSERVABLE, not merely unproven. It is the root of a plan that
-    // `impl_locy.rs` executes directly, and that execution produces no
-    // `ProfileOutput` -- while `LocyProfileOutput` carries only clause-body
-    // sub-plans. So it appears in neither profile surface. Provable today only
-    // by a `uni-query` test that plans a `LocyProgram` and asserts
-    // `plan.name()`; a query-level proof needs a collector change first.
+    // Still in neither profile surface: `impl_locy.rs` executes it directly so
+    // no `ProfileOutput` is produced, and `LocyProfileOutput` carries what is
+    // *inside* it rather than itself. Proven the way this row prescribed —
+    // planning the logical node in `uni-query` and asserting `plan.name()`.
+    // That proves emission rather than execution, which is one step weaker than
+    // every other row here and is said plainly rather than papered over.
     Operator {
         ty: "LocyProgramExec",
         runtime_name: "LocyProgramExec",
-        status: Status::Unproven,
+        status: Status::Proven {
+            by: "a_locy_program_node_plans_the_locy_program_operator",
+            in_file: "crates/uni-query/tests/common/planner/locy_program_plan_shape.rs",
+        },
     },
-    // UNOBSERVABLE for a structural reason, and the sharpest case here.
-    // `LocyProgramExec::execute` constructs it imperatively
-    // (`locy_program.rs:934`) and drives it with `collect_all_partitions`; it is
-    // never a *child* of any plan, so it cannot reach `runtime_stats` however
-    // often it runs. The collector it is handed records the clause bodies
-    // inside it, never itself. Unlike PowerStepExec above it genuinely runs --
-    // which is why this is not `Unreachable`.
+    // Was unobservable for a structural reason: constructed imperatively and
+    // driven with `collect_all_partitions`, it is a child of no plan, so it
+    // could not reach `runtime_stats` however often it ran, and the collector it
+    // is handed records the clause bodies inside it rather than itself.
+    // Resolved by giving the *stratum* an operator list. Attributing a fixpoint
+    // driver to one of its rules would have been a misstatement — it evaluates
+    // all of them — so it is reported where it belongs.
     Operator {
         ty: "FixpointExec",
         runtime_name: "FixpointExec",
-        status: Status::Unproven,
+        status: Status::Proven {
+            by: "a_recursive_rule_runs_the_fixpoint_operator",
+            in_file: "crates/uni/tests/common/plan_shape/proofs.rs",
+        },
     },
-    // Reachable and observable, via `session.locy_with(..).profile()` op names
-    // (a positive IS-reference cross-joins one in per occurrence). A plain gap:
-    // it needs the Locy profile accessor, not a planner change.
+    // Observable via `session.locy_with(..).profile()` op names (a positive
+    // IS-reference cross-joins one in per occurrence). The gap was the accessor,
+    // now `plan_shape::locy_plan_ops`.
     Operator {
         ty: "DerivedScanExec",
         runtime_name: "DerivedScanExec",
-        status: Status::Unproven,
+        status: Status::Proven {
+            by: "an_is_reference_runs_the_derived_scan",
+            in_file: "crates/uni/tests/common/plan_shape/proofs.rs",
+        },
     },
-    // UNOBSERVABLE. `LocyFold` is never lowered into a clause body -- the
-    // planner says wrapping the body would double-apply the aggregate -- so the
-    // `FoldExec` that runs is built ad hoc in the post-fixpoint chain, outside
-    // every metric-collected plan. `locy_issue_162_fold_scaling.rs` already
-    // records this. Fix by adding it to the post-fixpoint op list, then prove.
+    // `LocyFold` is still never lowered into a clause body -- wrapping the body
+    // would double-apply the aggregate -- so the `FoldExec` that runs is built
+    // in the post-fixpoint chain. Fixed the way this row prescribed: the chain
+    // now reports its own operators into the rule's profile. Recorded at each of
+    // the chain's execution points, because every stage replaces the plan with
+    // an in-memory source over its output and only the stage that ran a tree can
+    // report it.
     Operator {
         ty: "FoldExec",
         runtime_name: "FoldExec",
-        status: Status::Unproven,
+        status: Status::Proven {
+            by: "a_fold_runs_the_fold_operator",
+            in_file: "crates/uni/tests/common/plan_shape/proofs.rs",
+        },
     },
-    // Reachable and observable, but the guard is a trap worth stating: the body
-    // wrapper is emitted only when `best_by.is_some() && fold.is_empty()`. With
-    // FOLD it is deferred to the post-fixpoint chain and becomes unobservable
-    // like `FoldExec`. Every existing BEST BY test in the tree pairs it with
-    // FOLD, so none of them can serve as the proof.
+    // The guard is a trap worth keeping stated: the body wrapper is emitted only
+    // when `best_by.is_some() && fold.is_empty()`. With FOLD it is deferred to
+    // the post-fixpoint chain, which is why every pre-existing BEST BY test in
+    // the tree — all of which pair it with FOLD — could not serve as this proof.
+    // The proof uses BEST BY without FOLD; the chain path is now observable too.
     Operator {
         ty: "BestByExec",
         runtime_name: "BestByExec",
-        status: Status::Unproven,
+        status: Status::Proven {
+            by: "a_best_by_without_fold_runs_the_best_by_operator",
+            in_file: "crates/uni/tests/common/plan_shape/proofs.rs",
+        },
     },
-    // UNOBSERVABLE, same shape as `FoldExec`: `clause.priority` stays a scalar
-    // field and is never lowered into the body plan (the planner's own
-    // `test_clause_with_priority` asserts no wrapper). It runs only in the
-    // post-fixpoint chain, outside metric collection.
+    // Same shape as `FoldExec`: `clause.priority` stays a scalar field and is
+    // never lowered into the body plan (the planner's own
+    // `test_clause_with_priority` asserts no wrapper), so it runs only in the
+    // post-fixpoint chain — which now reports its operators.
     Operator {
         ty: "PriorityExec",
         runtime_name: "PriorityExec",
-        status: Status::Unproven,
+        status: Status::Proven {
+            by: "a_priority_rule_runs_the_priority_operator",
+            in_file: "crates/uni/tests/common/plan_shape/proofs.rs",
+        },
     },
-    // Reachable and observable: a clause calling a `CREATE MODEL` name emits it,
-    // and `LocyConfig::classifier_registry` takes a `MockClassifier` so no
-    // external service is needed. A plain gap.
+    // A clause calling a `CREATE MODEL` name emits it, with a `MockClassifier`
+    // standing in for the service. Proving it turned up a real defect first:
+    // `LocyBuilder::profile` compiled its explain half through the no-config
+    // entry point, so it rejected any `CREATE MODEL` program that `run()`
+    // executed happily. Fixed by threading the builder's config into the
+    // compile step.
     Operator {
         ty: "LocyModelInvokeExec",
         runtime_name: "LocyModelInvokeExec",
-        status: Status::Unproven,
+        status: Status::Proven {
+            by: "a_model_call_runs_the_model_invoke",
+            in_file: "crates/uni/tests/common/plan_shape/proofs.rs",
+        },
     },
     // Not reachable from Cypher at all: it comes from
     // `StorageTableProvider::scan`, and nothing in `uni`/`uni-query` registers
     // that provider into a session context. The virtual-label MATCH path goes
     // to `CatalogVertexScanExec` instead — a different leg to the same trait.
-    // Provable from `crates/uni-query/tests` against a raw DataFusion
-    // `SessionContext` (that root is already scanned), not from a query here.
+    // Proven from `crates/uni-query/tests` against a raw DataFusion
+    // `SessionContext`, as this row prescribed. Note the pre-existing EXPLAIN
+    // assertion there is not the proof: it matches by substring and disjoins
+    // with `"TableScan"`, the *logical* name, so it holds either way.
     Operator {
         ty: "StorageScanExec",
         runtime_name: "StorageScanExec",
-        status: Status::Unproven,
+        status: Status::Proven {
+            by: "a_storage_table_scan_runs_the_storage_scan_exec",
+            in_file: "crates/uni-query/tests/common/dispatch/storage_table_provider.rs",
+        },
     },
 ];

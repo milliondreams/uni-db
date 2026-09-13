@@ -2061,6 +2061,10 @@ async fn run_fixpoint_loop(
             derivation_tracker.as_ref().map(Arc::clone),
             top_k_proofs,
             Some(Arc::clone(&registry)),
+            // Recursive strata have no profile collector in scope here; the
+            // non-recursive path in `locy_program.rs` is where these operators
+            // become observable (#177).
+            None,
         )
         .await?;
         all_output.extend(processed);
@@ -5137,6 +5141,7 @@ pub(crate) async fn apply_post_fixpoint_chain(
     provenance_tracker: Option<Arc<ProvenanceStore>>,
     top_k_proofs_k: usize,
     registry: Option<Arc<DerivedScanRegistry>>,
+    post_ops: Option<&mut Vec<OperatorStats>>,
 ) -> DFResult<Vec<RecordBatch>> {
     let out = apply_post_fixpoint_chain_inner(
         facts,
@@ -5148,6 +5153,7 @@ pub(crate) async fn apply_post_fixpoint_chain(
         provenance_tracker,
         top_k_proofs_k,
         registry,
+        post_ops,
     )
     .await?;
     super::locy_complement::strip_derivation_discriminator_columns(out)
@@ -5168,6 +5174,12 @@ async fn apply_post_fixpoint_chain_inner(
     provenance_tracker: Option<Arc<ProvenanceStore>>,
     top_k_proofs_k: usize,
     registry: Option<Arc<DerivedScanRegistry>>,
+    // Sink for the operators this chain builds and runs (#177). `PriorityExec`,
+    // `FoldExec` and the post-fixpoint `BestByExec` are assembled here rather
+    // than lowered into a clause body, so they sit in no plan the profile
+    // collector otherwise walks — which is why the registry recorded them
+    // unobservable however often they ran.
+    mut post_ops: Option<&mut Vec<OperatorStats>>,
 ) -> DFResult<Vec<RecordBatch>> {
     if !rule.has_fold && !rule.has_best_by && !rule.has_priority && rule.having.is_empty() {
         return Ok(facts);
@@ -5322,6 +5334,7 @@ async fn apply_post_fixpoint_chain_inner(
     // derives, HAVING then filters what is shown of it.
     let current: Arc<dyn ExecutionPlan> = if !rule.require.is_empty() {
         let batches = collect_all_partitions(&current, Arc::clone(task_ctx)).await?;
+        record_post_ops(&current, post_ops.as_deref_mut());
         let filtered = apply_having_filter(batches, &rule.require, &current.schema(), task_ctx)?;
         if filtered.is_empty() {
             return Ok(filtered);
@@ -5334,6 +5347,7 @@ async fn apply_post_fixpoint_chain_inner(
     // Apply HAVING (post-FOLD WHERE filter)
     let current: Arc<dyn ExecutionPlan> = if !rule.having.is_empty() {
         let batches = collect_all_partitions(&current, Arc::clone(task_ctx)).await?;
+        record_post_ops(&current, post_ops.as_deref_mut());
         let filtered = apply_having_filter(batches, &rule.having, &current.schema(), task_ctx)?;
         if filtered.is_empty() {
             return Ok(filtered);
@@ -5361,6 +5375,7 @@ async fn apply_post_fixpoint_chain_inner(
     // output (`total * 2.0 AS score`); the common path skips it entirely.
     if !rule.yield_projection.is_empty() {
         let batches = collect_all_partitions(&current, Arc::clone(task_ctx)).await?;
+        record_post_ops(&current, post_ops.as_deref_mut());
         return apply_post_fold_projection(
             batches,
             &rule.yield_projection,
@@ -5369,7 +5384,22 @@ async fn apply_post_fixpoint_chain_inner(
         );
     }
 
-    collect_all_partitions(&current, Arc::clone(task_ctx)).await
+    let out = collect_all_partitions(&current, Arc::clone(task_ctx)).await;
+    record_post_ops(&current, post_ops);
+    out
+}
+
+/// Append `plan`'s per-operator metrics to `sink`, if one was supplied.
+///
+/// Called after each execution point in the post-fixpoint chain rather than
+/// once at the end, because each stage replaces `current` with an in-memory
+/// source over its own output — so the tree holding `PriorityExec` and
+/// `FoldExec` is gone by the time the next stage runs, and only the stage that
+/// actually executed it can report it.
+fn record_post_ops(plan: &Arc<dyn ExecutionPlan>, sink: Option<&mut Vec<OperatorStats>>) {
+    if let Some(sink) = sink {
+        sink.extend(crate::query::executor::core::collect_plan_metrics(plan));
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -47,6 +47,16 @@ pub struct LocyStratumProfile {
     pub facts_derived: usize,
     /// Per-rule detail for the rules in this stratum.
     pub rules: Vec<LocyRuleProfile>,
+    /// Operators belonging to the stratum rather than to any one rule (#177).
+    ///
+    /// A recursive stratum is driven by a single `FixpointExec` that spans every
+    /// rule in it. It is built imperatively and executed directly, so it is not
+    /// a child of any collected plan and cannot appear in a rule's
+    /// [`LocyIterationProfile::operators`] however often it runs — and
+    /// attributing it to one rule would be a misstatement, since it evaluates
+    /// all of them. It belongs here instead. Empty for a non-recursive stratum,
+    /// which has no fixpoint driver.
+    pub operators: Vec<OperatorStats>,
 }
 
 /// Per-rule slice of a [`LocyStratumProfile`].

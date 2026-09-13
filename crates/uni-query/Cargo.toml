@@ -56,7 +56,7 @@ rand = { workspace = true }
 base64 = "0.22"
 datafusion = { workspace = true }
 bitvec = "1"
-fxhash = { workspace = true }
+rustc-hash = { workspace = true }
 biodivine-lib-bdd = { workspace = true }
 tokio-util = { workspace = true }
 

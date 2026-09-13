@@ -5,12 +5,12 @@
 
 use crate::algo::GraphProjection;
 use crate::algo::algorithms::Algorithm;
-use fxhash::FxHashSet;
 use rand::distr::Distribution;
 use rand::distr::weighted::WeightedIndex;
 use rand::prelude::*;
 use rand::rngs::StdRng;
 use rayon::prelude::*;
+use rustc_hash::FxHashSet;
 use uni_common::core::id::Vid;
 
 /// Fixed default seed used when no explicit `seed` is supplied, so results are

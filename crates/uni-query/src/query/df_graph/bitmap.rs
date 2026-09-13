@@ -1,5 +1,5 @@
 use bitvec::vec::BitVec;
-use fxhash::FxHashSet;
+use rustc_hash::FxHashSet;
 use uni_common::core::id::{Eid, Vid};
 
 /// Density threshold: if set bits exceed this fraction of total range, use DenseBitVec.

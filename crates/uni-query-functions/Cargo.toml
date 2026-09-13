@@ -30,7 +30,7 @@ chrono = { workspace = true }
 chrono-tz = { workspace = true }
 rand = { workspace = true }
 datafusion = { workspace = true }
-fxhash = { workspace = true }
+rustc-hash = { workspace = true }
 futures = { workspace = true }
 parking_lot = { workspace = true }
 async-trait = { workspace = true }

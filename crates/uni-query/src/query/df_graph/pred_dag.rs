@@ -1,4 +1,4 @@
-use fxhash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::ops::ControlFlow;
 use uni_common::core::id::{Eid, Vid};
 

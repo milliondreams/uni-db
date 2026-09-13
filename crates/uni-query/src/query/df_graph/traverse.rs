@@ -54,7 +54,7 @@ use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskCo
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::{Stream, StreamExt};
-use fxhash::FxHashSet;
+use rustc_hash::FxHashSet;
 use std::any::Any;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;

@@ -31,7 +31,7 @@ use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskCo
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::{Stream, StreamExt};
-use fxhash::FxHashMap;
+use rustc_hash::FxHashMap;
 use std::any::Any;
 use std::collections::{HashSet, VecDeque};
 use std::fmt;

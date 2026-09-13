@@ -2,7 +2,7 @@
 // Copyright 2024-2026 Dragonscale Team
 
 use crate::CrdtMerge;
-use fxhash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use std::hash::Hash;
 use uuid::Uuid;

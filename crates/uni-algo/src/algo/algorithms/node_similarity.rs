@@ -5,8 +5,8 @@
 
 use crate::algo::GraphProjection;
 use crate::algo::algorithms::Algorithm;
-use fxhash::FxHashMap;
 use rayon::prelude::*;
+use rustc_hash::FxHashMap;
 use std::sync::Mutex;
 use uni_common::core::id::Vid;
 

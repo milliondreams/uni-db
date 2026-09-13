@@ -14,8 +14,10 @@
 # rotting into permanent silence.
 #
 # `unmaintained` and `yanked` WARN. Seven of the original 24 were unmaintained
-# transitive crates (bincode, bitmaps, fxhash, im-rc, number_prefix, paste,
-# proc-macro-error2), none of them ours and none actionable here. Denying them
+# crates (bincode, bitmaps, fxhash, im-rc, number_prefix, paste,
+# proc-macro-error2). Six were transitive and not actionable here; fxhash was
+# the exception — ours, declared directly — and has since been migrated to
+# `rustc-hash` (#174), leaving only its transitive copy. Denying them
 # would have made the gate red on day one, and a gate that is red on day one
 # gets disabled rather than fixed -- which buys nothing and costs the
 # vulnerability coverage too.
@@ -44,14 +46,17 @@ ignore = [
   { id = "RUSTSEC-2026-0188", reason = "wasmtime-wasi 43.0.2 pinned by extism 1.30.0. Hard links/renames bypass the preopen sandbox." },
   { id = "RUSTSEC-2026-0269", reason = "wasmtime 43.0.2 pinned by extism 1.30.0. Trailing-slash path/symlink sandbox escape. Verified 2026-09-02: the advisory's patched ranges are >=24.0.13, >=36.0.14, >=46.0.3, >=47.0.4 -- 43 was never backported and crates.io has no 43.x above 43.0.2, so `cargo update -p wasmtime` cannot clear it. extism 1.30.0 is still the newest release." },
 
-  # ---- ours, and actionable ----
-  # The only advisory here on a crate WE declare directly (Cargo.toml:158,
-  # used by uni-query and uni-crdt). Unmaintained, not vulnerable. The fix is a
-  # migration to `rustc-hash`, its maintained successor -- deliberately not
-  # bundled into the commit that introduces this gate, because swapping a hasher
-  # changes HashMap iteration order and that deserves its own change with its
-  # own test run rather than riding along with a policy file.
-  { id = "RUSTSEC-2025-0057", reason = "fxhash 0.2 is a DIRECT workspace dep (Cargo.toml:158). Unmaintained, no vulnerability. TODO: migrate to rustc-hash; iteration-order change wants its own PR." },
+  # RUSTSEC-2025-0057 (fxhash, unmaintained) was here and is gone (#174).
+  #
+  # The migration to `rustc-hash` removed fxhash as a *workspace-direct*
+  # dependency, and `unmaintained = "workspace"` above scopes this check to
+  # exactly that — so the advisory no longer fires at all. fxhash is still in the
+  # tree transitively, through `biodivine-lib-bdd`, which is not ours to change
+  # and which the policy deliberately does not ask about.
+  #
+  # The entry is deleted rather than kept as a comment: an ignore list that
+  # records advisories no longer in scope stops being readable as the set of
+  # things still owed.
 ]
 
 [licenses]

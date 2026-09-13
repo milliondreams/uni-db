@@ -208,7 +208,10 @@ impl GraphScanExec {
     /// scan's own predicate still applies, only the `_vid IN (...)` restriction
     /// is dropped. Callers must key into the result by vid — extra rows are the
     /// point, and are the caller's to ignore.
-    pub(crate) async fn execute_all(&self) -> DFResult<RecordBatch> {
+    pub(crate) async fn execute_all(
+        &self,
+        index_consulted: Option<&datafusion::physical_plan::metrics::Count>,
+    ) -> DFResult<RecordBatch> {
         if self.is_schemaless {
             columnar_scan_schemaless_vertex_batch_static(
                 &self.graph_ctx,
@@ -234,7 +237,7 @@ impl GraphScanExec {
                 None,
                 self.extra_lance_filter.as_deref(),
                 self.extra_runtime_filter.as_ref(),
-                None,
+                index_consulted,
             )
             .await
         }
@@ -260,7 +263,11 @@ impl GraphScanExec {
         }
     }
 
-    pub(crate) async fn execute_with_vid_filter(&self, vids: &[u64]) -> DFResult<RecordBatch> {
+    pub(crate) async fn execute_with_vid_filter(
+        &self,
+        vids: &[u64],
+        index_consulted: Option<&datafusion::physical_plan::metrics::Count>,
+    ) -> DFResult<RecordBatch> {
         if self.is_schemaless {
             columnar_scan_schemaless_vertex_batch_static(
                 &self.graph_ctx,
@@ -286,11 +293,10 @@ impl GraphScanExec {
                 None,
                 self.extra_lance_filter.as_deref(),
                 self.extra_runtime_filter.as_ref(),
-                // No per-node metric: this is the probe side of
-                // `VidLookupJoinExec`, which does not expose this scan as a
-                // child, so nothing would collect it (#179). The query-level
-                // counters still see it.
-                None,
+                // The probe side of `VidLookupJoinExec`. It is still not a
+                // child, but the join now collects this metric set and reports
+                // it as its own entry, so the sink is no longer pointless (#179).
+                index_consulted,
             )
             .await
         }

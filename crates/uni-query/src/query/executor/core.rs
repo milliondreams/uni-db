@@ -1075,6 +1075,26 @@ fn collect_plan_metrics_inner(
         None => (0, 0.0, None),
     };
 
+    // The probe side of a `VidLookupJoinExec` is not a child, so the recursion
+    // above never reaches it and a profile showed a join with one input and no
+    // scan beneath it — omitting precisely the side the operator exists to make
+    // cheaper (#179). Emitted before the join itself, keeping the post-order
+    // the rest of the walk produces.
+    if let Some(join) = plan
+        .as_any()
+        .downcast_ref::<crate::query::df_graph::vid_lookup_join::VidLookupJoinExec>()
+    {
+        let probe = join.probe_metrics();
+        out.push(OperatorStats {
+            operator: join.probe_operator_name(),
+            actual_rows: probe.output_rows().unwrap_or(0),
+            time_ms: probe.elapsed_compute().unwrap_or(0) as f64 / 1_000_000.0,
+            memory_bytes: 0,
+            index_hits: probe.sum_by_name("index_consulted").map(|v| v.as_usize()),
+            index_misses: None,
+        });
+    }
+
     out.push(OperatorStats {
         operator,
         actual_rows,

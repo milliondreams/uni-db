@@ -201,6 +201,65 @@ impl GraphScanExec {
     /// Only supported for vertex and schemaless-vertex scans; edge scans
     /// have a different shape and aren't currently a join target for this
     /// optimization.
+    /// One unfiltered pass over this scan's table, for the high-selectivity arm
+    /// of [`vertex_scan_beats_lookup`] (#237).
+    ///
+    /// Identical to [`Self::execute_with_vid_filter`] with no vid list: the
+    /// scan's own predicate still applies, only the `_vid IN (...)` restriction
+    /// is dropped. Callers must key into the result by vid — extra rows are the
+    /// point, and are the caller's to ignore.
+    pub(crate) async fn execute_all(&self) -> DFResult<RecordBatch> {
+        if self.is_schemaless {
+            columnar_scan_schemaless_vertex_batch_static(
+                &self.graph_ctx,
+                &self.label,
+                &self.variable,
+                &self.projected_properties,
+                &self.schema,
+                &self.filter,
+                None,
+                self.extra_lance_filter.as_deref(),
+                self.extra_runtime_filter.as_ref(),
+            )
+            .await
+        } else {
+            columnar_scan_vertex_batch_static(
+                &self.graph_ctx,
+                &self.label,
+                &self.variable,
+                &self.projected_properties,
+                &self.schema,
+                &self.filter,
+                None,
+                None,
+                self.extra_lance_filter.as_deref(),
+                self.extra_runtime_filter.as_ref(),
+                None,
+            )
+            .await
+        }
+    }
+
+    /// Rows in this scan's table, cached where possible (#260).
+    ///
+    /// Zero means "unknown" — a fork, a pinned view, or a table that has not
+    /// been counted — and every caller treats that as a reason not to read the
+    /// whole table.
+    pub(crate) async fn cached_table_rows(&self) -> usize {
+        let key = uni_store::storage::cardinality::CardinalityKey::Vertex(self.label.clone());
+        match self.graph_ctx.storage().cached_row_count(&key, None) {
+            Some(rows) => rows as usize,
+            None => self
+                .graph_ctx
+                .storage()
+                .refresh_row_count(&key)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or(0) as usize,
+        }
+    }
+
     pub(crate) async fn execute_with_vid_filter(&self, vids: &[u64]) -> DFResult<RecordBatch> {
         if self.is_schemaless {
             columnar_scan_schemaless_vertex_batch_static(
@@ -1150,6 +1209,56 @@ fn scalar_to_u64(sv: &datafusion::common::ScalarValue) -> Option<u64> {
 /// conditional rather than reordered.
 const DEDUP_TABLE_RATIO: usize = 8;
 
+/// Requested vids per table row at which one unfiltered pass replaces chunked
+/// `_vid IN (...)` lookups (#237).
+///
+/// Four, meaning 25% of the table.
+const VERTEX_SCAN_SELECTIVITY_DIVISOR: usize = 4;
+
+/// Whether one pass over the label's table beats chunked vid lookups.
+///
+/// # Measured
+///
+/// `uni-store/examples/vertex_arm_probe.rs`, release, min-of-3, over a table
+/// written through the ordinary path so its `_vid` BTree exists — and the probe
+/// refuses to report unless `index_comparisons` proves the lookup arm actually
+/// used it:
+///
+/// | rows | scan | crossover K | K/N |
+/// |---|---|---|---|
+/// | 30 000 | 1.7 ms | ~280 | ~0.9% |
+/// | 300 000 | 4.0 ms | ~800 | ~0.27% |
+/// | 1 000 000 | 7.0 ms | ~1 100 | ~0.11% |
+///
+/// Two things follow. The scan arm is flat in K and the lookup arm is linear, so
+/// a crossover exists at every size; and **K/N is not stable** — it falls about
+/// 8x across a 33x range of rows, because the columnar scan grows far slower
+/// than linearly. #237 predicted exactly this when it refused to let #221's
+/// edge-side ratio be copied across, and it is why the threshold below is not
+/// derived from those crossovers.
+///
+/// # Why the threshold is far above the crossover
+///
+/// Time is not the only axis, and the two disagree. Just past the crossover the
+/// scan arm is barely faster while materialising the whole table to return a
+/// few hundred rows: at K=1 000 of 1 000 000 it would save 0.7 ms and read 1 000x
+/// the rows. Chunking exists here to bound peak residency — 60 000 vids from a
+/// 300k-row table went 815 MiB -> 226 MiB — and trading that away for
+/// sub-millisecond wins would undo it.
+///
+/// So the switch waits until the memory is comparable anyway, where the time win
+/// is large rather than marginal. At 25% the scan reads 4x the rows for a ~50x
+/// speed-up (208 ms -> 4.0 ms at 300k); at 50%, 2x the rows for ~100x (412 ms ->
+/// 4.0 ms). Below that the chunked arm keeps the residency bound it was written
+/// for.
+///
+/// Returns `false` when the table size is unknown — a fork, a pinned view, or a
+/// declined count — because an unknown size is not a reason to read a whole
+/// table.
+pub(crate) fn vertex_scan_beats_lookup(requested: usize, table_rows: usize) -> bool {
+    table_rows > 0 && requested.saturating_mul(VERTEX_SCAN_SELECTIVITY_DIVISOR) >= table_rows
+}
+
 /// Distinct target vids, in first-occurrence order.
 ///
 /// Correctness does not depend on whether this is used: the gather in
@@ -1182,13 +1291,22 @@ pub(crate) async fn hydrate_vids_columnar(
     // enough to ask per call. `None` means the storage layer declined to answer
     // cheaply (a forked session would have scanned), and an unknown table size
     // is not a reason to pay for deduplication.
-    let target_rows = graph_ctx
-        .storage()
-        .vertex_row_count(label)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or(0);
+    // Cached where possible (#260), measured on a miss. Same contract as the
+    // `vertex_row_count` call this replaces — `None` for a fork or a pinned
+    // view, and zero standing for "declined" — but paid once per table rather
+    // than once per call.
+    let cardinality_key =
+        uni_store::storage::cardinality::CardinalityKey::Vertex(label.to_string());
+    let target_rows = match graph_ctx.storage().cached_row_count(&cardinality_key, None) {
+        Some(rows) => rows as usize,
+        None => graph_ctx
+            .storage()
+            .refresh_row_count(&cardinality_key)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(0) as usize,
+    };
     let pays = target_rows > 0 && raw.len().saturating_mul(DEDUP_TABLE_RATIO) >= target_rows;
     let deduped = pays.then(|| dedup_targets(&raw));
     let fetch_vids: &[u64] = deduped.as_deref().unwrap_or(&raw);
@@ -1205,11 +1323,15 @@ pub(crate) async fn hydrate_vids_columnar(
     // and stopped tracking the table's size.
     //
     // `VidLookupJoinExec` already chunks this exact shape at the same constant.
-    // Note the trade: at 100% selectivity — asking for every row in the table —
-    // one full scan beats six chunked ones, so this costs ~66 MiB on the small
-    // fixture. A selectivity-aware choice would beat a fixed constant.
+    //
+    // At high selectivity one unfiltered pass replaces the chunks entirely —
+    // see `vertex_scan_beats_lookup` for the measurement and for why the
+    // threshold is not the point where the scan merely becomes faster.
+    let scan_whole_table = vertex_scan_beats_lookup(fetch_vids.len(), target_rows);
     let mut parts: Vec<RecordBatch> = Vec::new();
-    for chunk in fetch_vids.chunks(crate::query::df_graph::vid_lookup_join::MAX_VIDS_PER_CHUNK) {
+    if scan_whole_table {
+        // No vid filter: every row comes back and the gather below selects the
+        // requested ones, exactly as it does from the chunked parts.
         parts.push(
             columnar_scan_vertex_batch_static(
                 graph_ctx,
@@ -1218,7 +1340,7 @@ pub(crate) async fn hydrate_vids_columnar(
                 properties,
                 &output_schema,
                 &None,
-                Some(chunk),
+                None,
                 None,
                 None,
                 None,
@@ -1226,6 +1348,26 @@ pub(crate) async fn hydrate_vids_columnar(
             )
             .await?,
         );
+    } else {
+        for chunk in fetch_vids.chunks(crate::query::df_graph::vid_lookup_join::MAX_VIDS_PER_CHUNK)
+        {
+            parts.push(
+                columnar_scan_vertex_batch_static(
+                    graph_ctx,
+                    label,
+                    variable,
+                    properties,
+                    &output_schema,
+                    &None,
+                    Some(chunk),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await?,
+            );
+        }
     }
     let batch = if parts.len() == 1 {
         parts
@@ -2203,6 +2345,36 @@ impl RecordBatchStream for GraphScanStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An unknown table size never licenses reading the whole table.
+    ///
+    /// Zero is what a fork, a pinned view, or an uncounted table yields, and it
+    /// is the one input where guessing wrong is unbounded: the scan arm would
+    /// read every row of a table whose size is precisely what is not known.
+    #[test]
+    fn an_unknown_table_size_keeps_the_chunked_arm() {
+        assert!(!vertex_scan_beats_lookup(1_000_000, 0));
+        assert!(!vertex_scan_beats_lookup(0, 0));
+    }
+
+    /// The threshold is 25% of the table, and it is a threshold on the
+    /// *requested* count rather than on the table's size alone.
+    #[test]
+    fn the_switch_happens_at_a_quarter_of_the_table() {
+        // 300k-row table: the measured crossover is near K=800, and the switch
+        // deliberately waits until 75 000 — see `vertex_scan_beats_lookup` for
+        // why the time-optimal point is the wrong threshold.
+        assert!(!vertex_scan_beats_lookup(800, 300_000));
+        assert!(!vertex_scan_beats_lookup(74_999, 300_000));
+        assert!(vertex_scan_beats_lookup(75_000, 300_000));
+        assert!(vertex_scan_beats_lookup(300_000, 300_000));
+    }
+
+    /// A huge request cannot overflow its way into the wrong arm.
+    #[test]
+    fn a_saturating_request_does_not_wrap() {
+        assert!(vertex_scan_beats_lookup(usize::MAX, 10));
+    }
 
     #[test]
     fn test_build_vertex_schema() {

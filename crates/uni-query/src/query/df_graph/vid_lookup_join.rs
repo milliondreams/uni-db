@@ -442,13 +442,31 @@ async fn run_join(
         let vids: Vec<u64> = vid_set.iter().copied().collect();
         let mut chunks: Vec<RecordBatch> = Vec::new();
         let mut chunk_bytes = 0usize;
-        for chunk in vids.chunks(MAX_VIDS_PER_CHUNK) {
-            let batch = probe_scan.execute_with_vid_filter(chunk).await?;
+        // At high selectivity one unfiltered pass replaces the chunked lookups
+        // (#237, on #260's statistic). Safe here because the probe batch is
+        // consumed through a `_vid` index that *build* rows drive: a probe row
+        // whose vid is not wanted is simply never looked up. The reservations
+        // below are unchanged and still measure the real batch, so the larger
+        // residency this arm accepts is accounted rather than hidden — which is
+        // why the threshold waits until the memory is comparable anyway.
+        let table_rows = probe_scan.cached_table_rows().await;
+        if crate::query::df_graph::scan::vertex_scan_beats_lookup(vids.len(), table_rows) {
+            let batch = probe_scan.execute_all().await?;
             if batch.num_rows() > 0 {
                 let size = batch.get_array_memory_size();
                 reservation.try_grow(size)?;
                 chunk_bytes += size;
                 chunks.push(batch);
+            }
+        } else {
+            for chunk in vids.chunks(MAX_VIDS_PER_CHUNK) {
+                let batch = probe_scan.execute_with_vid_filter(chunk).await?;
+                if batch.num_rows() > 0 {
+                    let size = batch.get_array_memory_size();
+                    reservation.try_grow(size)?;
+                    chunk_bytes += size;
+                    chunks.push(batch);
+                }
             }
         }
         if chunks.is_empty() {

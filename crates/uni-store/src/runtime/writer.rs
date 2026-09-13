@@ -3554,6 +3554,14 @@ impl Writer {
 
                 // Batch fetch existing CRDT values: collect VIDs that need merging,
                 // then query once via PropertyManager instead of per-vertex lookups.
+                //
+                // The reader has to be the CRDT-aware batched one. The generic
+                // `get_batch_vertex_props_for_label` lets an L0 overlay win a key
+                // outright where the singular reader merges it with storage, so on
+                // a partial overlay it answers with storage's replica dropped —
+                // and merging the incoming value against *that* writes a counter
+                // that has gone backwards. Pinned by
+                // `bugs::issue_220_crdt_reader_equivalence` (#220 site 4).
                 let schema = self.schema_manager.schema();
                 let crdt_keys: Vec<String> = schema
                     .properties
@@ -3569,17 +3577,27 @@ impl Writer {
                     })
                     .unwrap_or_default();
 
-                if let Some(pm) = &self.property_manager {
+                if let Some(pm) = &self.property_manager
+                    && !crdt_keys.is_empty()
+                {
                     let ctx = self.get_query_context(tx_l0).await;
+                    let existing_by_vid = pm
+                        .get_batch_vertex_crdt_props(&vids, label, &crdt_keys, ctx.as_ref())
+                        .await?;
                     for (vid, props) in vids.iter().zip(&mut properties_batch) {
                         for key in &crdt_keys {
                             if props.contains_key(key) {
-                                let existing =
-                                    pm.get_vertex_prop_with_ctx(*vid, key, ctx.as_ref()).await?;
+                                // Absent means the same thing the singular
+                                // reader's null did: nothing to merge against.
+                                let Some(existing) =
+                                    existing_by_vid.get(vid).and_then(|p| p.get(key.as_str()))
+                                else {
+                                    continue;
+                                };
                                 if !existing.is_null()
                                     && let Some(val) = props.get_mut(key)
                                 {
-                                    *val = pm.merge_crdt_values(&existing, val)?;
+                                    *val = pm.merge_crdt_values(existing, val)?;
                                 }
                             }
                         }

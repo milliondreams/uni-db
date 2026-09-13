@@ -2249,6 +2249,71 @@ impl PropertyManager {
         Ok(storage_val)
     }
 
+    /// Batched read of CRDT-typed properties, with the singular reader's
+    /// semantics.
+    ///
+    /// [`Self::get_batch_vertex_props_for_label`] is **not** a substitute for
+    /// [`Self::get_vertex_prop_with_ctx`] on a CRDT key, and #220 lists it as
+    /// one. The batched reader folds L0 over storage with `or_insert` — the
+    /// overlay wins the key outright — while the singular one *merges* the two.
+    /// On an overlay that does not already subsume storage they disagree:
+    /// measured on a `GCounter` split `actor1=10` in storage and `actor2=20` in
+    /// the overlay, the batched form answers 20 and the singular one 30
+    /// (`bugs::issue_220_crdt_reader_equivalence`).
+    ///
+    /// That difference is not cosmetic where it is read. The CRDT pre-merge in
+    /// `Writer::insert_vertices_batch` reads the existing value to merge the
+    /// incoming batch against, so a reader that drops storage's replica writes
+    /// a counter that has gone *backwards* — the lost update the OCC work
+    /// closed once already.
+    ///
+    /// So this batches the half that actually costs round-trips — the storage
+    /// read, one call for every vid — and keeps the merge exact: the L0
+    /// accumulation is a walk over in-memory buffers and never touched storage
+    /// to begin with.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the storage read fails or a CRDT merge fails.
+    pub async fn get_batch_vertex_crdt_props(
+        &self,
+        vids: &[Vid],
+        label: &str,
+        keys: &[String],
+        ctx: Option<&QueryContext>,
+    ) -> Result<HashMap<Vid, Properties>> {
+        let mut out: HashMap<Vid, Properties> = HashMap::new();
+        if vids.is_empty() || keys.is_empty() {
+            return Ok(out);
+        }
+
+        // `None` context on purpose: this is the storage half only. The overlay
+        // is folded in per key below, by merging rather than by overwriting.
+        let storage_props = self
+            .get_batch_vertex_props_for_label(vids, label, None)
+            .await?;
+
+        for &vid in vids {
+            if l0_visibility::is_vertex_deleted(vid, ctx) {
+                continue;
+            }
+            for key in keys {
+                let l0_val = self.accumulate_crdt_from_l0(vid, key, ctx)?;
+                let storage_val = storage_props
+                    .get(&vid)
+                    .and_then(|props| props.get(key.as_str()))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let merged = self.merge_crdt_values(&storage_val, &l0_val)?;
+                if !merged.is_null() {
+                    out.entry(vid).or_default().insert(key.clone(), merged);
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
     /// Accumulate CRDT values from all L0 layers by merging them together.
     fn accumulate_crdt_from_l0(
         &self,

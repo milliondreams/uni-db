@@ -187,7 +187,8 @@ async fn a_batch_insert_probes_ext_ids_once_for_the_batch() -> Result<()> {
     let fault = Arc::new(FaultBackend::new(Arc::new(lance)));
     let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new_with_prefix(dir.path())?);
     let schema_manager = Arc::new(
-        SchemaManager::load_from_store(store.clone(), &ObjectStorePath::from("schema.json")).await?,
+        SchemaManager::load_from_store(store.clone(), &ObjectStorePath::from("schema.json"))
+            .await?,
     );
     schema_manager.add_label("N")?;
     schema_manager.save().await?;
@@ -255,7 +256,8 @@ async fn a_batch_insert_probes_ext_ids_once_for_the_batch() -> Result<()> {
          observing the ext_id probe and the comparison below cannot mean anything"
     );
     assert_eq!(
-        small_scans, large_scans,
+        small_scans,
+        large_scans,
         "a batch of {} issued {small_scans} storage scans and one of {} issued \
          {large_scans}. The ext_id probe is batched, so doubling the batch must \
          not change the count — growth means it is back to one probe per vertex",

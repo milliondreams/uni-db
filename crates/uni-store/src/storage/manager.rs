@@ -53,6 +53,15 @@ use uni_common::core::snapshot::SnapshotManifest;
 
 use uni_common::graph::simple_graph::Direction as GraphDirection;
 
+/// Maximum frontier VIDs per adjacency or delta scan in
+/// [`StorageManager::load_subgraph`].
+///
+/// Mirrors `MAX_VIDS_PER_CHUNK` on the vertex read path and `MAX_EIDS_PER_CHUNK`
+/// on the edge one: a BFS frontier is unbounded, and an unbounded `IN` list
+/// inflates the scan request and stops the scalar index earning its keep, while
+/// a bounded one preserves the indexed lookup at any frontier size.
+const MAX_SUBGRAPH_VIDS_PER_SCAN: usize = 10_000;
+
 /// Edge state during subgraph loading - tracks version and deletion status.
 struct EdgeState {
     neighbor: Vid,
@@ -3142,73 +3151,117 @@ impl StorageManager {
         for _hop in 0..max_hops {
             let mut next_frontier = HashSet::new();
 
-            for &vid in &frontier {
-                if visited.contains(&vid) {
-                    continue;
+            // The whole hop's vertices, resolved before any storage read, so the
+            // reads below can be issued once per (edge type, label) rather than
+            // once per vertex per hop (#220). Marking them visited up front is
+            // what makes that possible, and does not change the resulting graph:
+            // `visited` gates only `next_frontier` insertion, never an edge, and
+            // a neighbour suppressed by it is one this hop already covers — the
+            // old code would have queued it and skipped it on arrival.
+            let hop_vids: Vec<Vid> = {
+                let mut seen = Vec::new();
+                for &vid in &frontier {
+                    if visited.insert(vid) {
+                        graph.add_vertex(vid);
+                        seen.push(vid);
+                    }
                 }
-                visited.insert(vid);
-                graph.add_vertex(vid);
+                seen
+            };
+            if hop_vids.is_empty() {
+                break;
+            }
 
-                // For each edge type we want to traverse
-                for &etype_id in &target_edge_types {
-                    let etype_name = edge_type_map
-                        .get(&etype_id)
-                        .ok_or_else(|| anyhow!("Unknown edge type ID: {}", etype_id))?;
+            // For each edge type we want to traverse
+            for &etype_id in &target_edge_types {
+                let etype_name = edge_type_map
+                    .get(&etype_id)
+                    .ok_or_else(|| anyhow!("Unknown edge type ID: {}", etype_id))?;
 
-                    // Determine directions
-                    // Storage direction: "fwd" or "bwd".
-                    // Query direction: Outgoing -> "fwd", Incoming -> "bwd".
-                    let (dir_str, neighbor_is_dst) = match direction {
-                        GraphDirection::Outgoing => ("fwd", true),
-                        GraphDirection::Incoming => ("bwd", false),
-                    };
+                // Determine directions
+                // Storage direction: "fwd" or "bwd".
+                // Query direction: Outgoing -> "fwd", Incoming -> "bwd".
+                let (dir_str, neighbor_is_dst) = match direction {
+                    GraphDirection::Outgoing => ("fwd", true),
+                    GraphDirection::Incoming => ("bwd", false),
+                };
 
-                    let mut edges: HashMap<Eid, EdgeState> = HashMap::new();
+                let mut per_vid: HashMap<Vid, HashMap<Eid, EdgeState>> = HashMap::new();
 
-                    // 1. L2: Adjacency (Base)
-                    // In the new storage model, VIDs don't embed label info.
-                    // We need to try all labels to find the adjacency data.
-                    // Edge version from snapshot (reserved for future version filtering)
-                    let _edge_ver = self
-                        .pinned_snapshot
-                        .as_ref()
-                        .and_then(|s| s.edges.get(etype_name).map(|es| es.lance_version));
+                // 1. L2: Adjacency (Base)
+                // In the new storage model, VIDs don't embed label info.
+                // We need to try all labels to find the adjacency data.
+                // Edge version from snapshot (reserved for future version filtering)
+                let _edge_ver = self
+                    .pinned_snapshot
+                    .as_ref()
+                    .and_then(|s| s.edges.get(etype_name).map(|es| es.lance_version));
 
-                    // Try each label until we find adjacency data
-                    let backend = self.backend();
-                    for current_src_label in label_map.values() {
-                        let adj_ds =
-                            match self.adjacency_dataset(etype_name, current_src_label, dir_str) {
-                                Ok(ds) => ds,
-                                Err(_) => continue,
-                            };
-                        if let Some((neighbors, eids)) =
-                            adj_ds.read_adjacency_backend(backend, vid).await?
-                        {
-                            for (n, eid) in neighbors.into_iter().zip(eids) {
-                                edges.insert(
-                                    eid,
-                                    EdgeState {
-                                        neighbor: n,
-                                        version: 0,
-                                        deleted: false,
-                                    },
-                                );
-                            }
-                            break; // Found adjacency data for this vid, no need to try other labels
+                // Try each label, carrying forward only the vertices no earlier
+                // label answered for. This preserves the per-vertex `break` the
+                // unbatched form used — the first label with data for a vertex
+                // wins — while costing one scan per label instead of one per
+                // (vertex, label).
+                let backend = self.backend();
+                let mut unresolved: Vec<Vid> = hop_vids.clone();
+                for current_src_label in label_map.values() {
+                    if unresolved.is_empty() {
+                        break;
+                    }
+                    let adj_ds =
+                        match self.adjacency_dataset(etype_name, current_src_label, dir_str) {
+                            Ok(ds) => ds,
+                            Err(_) => continue,
+                        };
+                    let mut found: HashMap<Vid, (Vec<Vid>, Vec<Eid>)> = HashMap::new();
+                    for chunk in unresolved.chunks(MAX_SUBGRAPH_VIDS_PER_SCAN) {
+                        found.extend(adj_ds.read_adjacency_backend_batch(backend, chunk).await?);
+                    }
+                    if found.is_empty() {
+                        continue;
+                    }
+                    for (vid, (neighbors, eids)) in found {
+                        let edges = per_vid.entry(vid).or_default();
+                        for (n, eid) in neighbors.into_iter().zip(eids) {
+                            edges.insert(
+                                eid,
+                                EdgeState {
+                                    neighbor: n,
+                                    version: 0,
+                                    deleted: false,
+                                },
+                            );
                         }
                     }
+                    unresolved.retain(|vid| !per_vid.contains_key(vid));
+                }
 
-                    // 2. L1: Delta
-                    let delta_ds = self.delta_dataset(etype_name, dir_str)?;
-                    let delta_entries = delta_ds
-                        .read_deltas(backend, vid, &schema, self.snapshot_version_hwm())
+                // 2. L1: Delta
+                let delta_ds = self.delta_dataset(etype_name, dir_str)?;
+                let mut delta_by_vid: HashMap<Vid, Vec<crate::storage::delta::L1Entry>> =
+                    HashMap::new();
+                for chunk in hop_vids.chunks(MAX_SUBGRAPH_VIDS_PER_SCAN) {
+                    let part = delta_ds
+                        .read_deltas_batch(backend, chunk, &schema, self.snapshot_version_hwm())
                         .await?;
-                    Self::apply_delta_to_edges(&mut edges, delta_entries, neighbor_is_dst);
+                    for (vid, entries) in part {
+                        delta_by_vid.entry(vid).or_default().extend(entries);
+                    }
+                }
+
+                for &vid in &hop_vids {
+                    let mut edges = per_vid.remove(&vid).unwrap_or_default();
+                    if let Some(entries) = delta_by_vid.remove(&vid) {
+                        Self::apply_delta_to_edges(&mut edges, entries, neighbor_is_dst);
+                    }
 
                     // 3. L0: Buffer
                     if let Some(l0) = l0 {
                         Self::apply_l0_to_edges(&mut edges, l0, vid, etype_id, direction);
+                    }
+
+                    if edges.is_empty() {
+                        continue;
                     }
 
                     // Add resulting edges to graph

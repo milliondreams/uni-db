@@ -62,6 +62,10 @@ pub mod repro_schemaless_edge_props_escape_pin;
 // Tier 1.2 — shadow-CSR retention grew unbounded in the number of warms.
 pub mod repro_shadow_csr_warm_retention;
 
+// #220 site 1 — `load_subgraph`'s BFS issued one adjacency scan per (vertex,
+// label) and one delta scan per vertex; both batched primitives existed with
+// zero callers.
+pub mod issue_220_subgraph_batched_reads;
 // #223 — main-edge scans reach `scans_reported`, so a per-edge loop can be told
 // from a batched read by count rather than by wall-clock.
 pub mod issue_222_edge_prop_type_hint;

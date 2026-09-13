@@ -13,7 +13,7 @@
 #![allow(dead_code)]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use anyhow::{Result, anyhow};
 use arrow_array::RecordBatch;
@@ -26,6 +26,7 @@ pub struct FaultBackend {
     inner: Arc<dyn StorageBackend>,
     fail_table_exists: AtomicBool,
     fail_scan: AtomicBool,
+    scan_count: AtomicUsize,
 }
 
 impl FaultBackend {
@@ -34,7 +35,24 @@ impl FaultBackend {
             inner,
             fail_table_exists: AtomicBool::new(false),
             fail_scan: AtomicBool::new(false),
+            scan_count: AtomicUsize::new(0),
         }
+    }
+
+    /// Storage round-trips issued through `scan` and `scan_stream` so far.
+    ///
+    /// Counted here rather than via `QueryCounters` because the read paths this
+    /// observes — `load_subgraph`'s adjacency and delta reads — build their
+    /// `ScanRequest`s without counters, so the query-level counter cannot see
+    /// them. Decorating the backend counts what actually reaches storage,
+    /// whoever built the request.
+    pub fn scans(&self) -> usize {
+        self.scan_count.load(Ordering::SeqCst)
+    }
+
+    /// Resets the round-trip count, so one fixture can time two arms.
+    pub fn reset_scans(&self) {
+        self.scan_count.store(0, Ordering::SeqCst);
     }
 
     pub fn set_fail_table_exists(&self, on: bool) {
@@ -81,6 +99,7 @@ impl StorageBackend for FaultBackend {
     }
 
     async fn scan(&self, request: ScanRequest) -> Result<Vec<RecordBatch>> {
+        self.scan_count.fetch_add(1, Ordering::SeqCst);
         if self.fail_scan.load(Ordering::SeqCst) {
             return Err(anyhow!(
                 "injected transient read failure for {}",
@@ -91,6 +110,7 @@ impl StorageBackend for FaultBackend {
     }
 
     async fn scan_stream(&self, request: ScanRequest) -> Result<RecordBatchStream> {
+        self.scan_count.fetch_add(1, Ordering::SeqCst);
         if self.fail_scan.load(Ordering::SeqCst) {
             return Err(anyhow!(
                 "injected transient read failure for {}",

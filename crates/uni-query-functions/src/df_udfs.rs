@@ -4829,6 +4829,7 @@ fn cypher_size_scalar(scalar: &ScalarValue) -> DFResult<ScalarValue> {
                         Ok(ScalarValue::Int64(Some(path.edges.len() as i64)))
                     }
                     _ => {
+                        let type_name = uni_val.type_name();
                         let json_val: serde_json::Value = uni_val.into();
                         match json_val {
                             serde_json::Value::Array(arr) => Ok(ScalarValue::Int64(Some(arr.len() as i64))),
@@ -4836,7 +4837,22 @@ fn cypher_size_scalar(scalar: &ScalarValue) -> DFResult<ScalarValue> {
                                 Ok(ScalarValue::Int64(Some(s.chars().count() as i64)))
                             }
                             serde_json::Value::Object(m) => Ok(ScalarValue::Int64(Some(m.len() as i64))),
-                            _ => Ok(ScalarValue::Int64(None)),
+                            // Null in, null out: the Cypher convention for a
+                            // function applied to a missing value.
+                            serde_json::Value::Null => Ok(ScalarValue::Int64(None)),
+                            // A number or a boolean has no length. Answering
+                            // null was indistinguishable from "an empty
+                            // collection" and from "this encoding was not
+                            // understood" — and the second reading is what hid
+                            // a missing `Value::Path` arm in this very match
+                            // until `length(p)` was caught measuring a JSON
+                            // object's key count. The outer match already
+                            // errors on a type it does not know; this one now
+                            // agrees with it.
+                            _ => Err(datafusion::error::DataFusionError::Execution(format!(
+                                "TypeError: InvalidArgumentValue - length() is not supported \
+                                 for {type_name} values"
+                            ))),
                         }
                     }
                 }

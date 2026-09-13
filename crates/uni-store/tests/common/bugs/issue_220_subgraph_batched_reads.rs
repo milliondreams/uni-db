@@ -168,3 +168,114 @@ async fn a_subgraph_load_scans_per_edge_type_not_per_vertex() -> Result<()> {
     );
     Ok(())
 }
+
+/// A batch insert probes flushed `ext_id`s once for the batch, not once per
+/// vertex (#220, site 5).
+///
+/// Unlike the other sites in this class, this one had no batched primitive to
+/// call — `MainVertexDataset::find_by_ext_ids_counted` is new. The probe backs
+/// a uniqueness constraint, so the test asserts on the *answer* as well as the
+/// shape: an insert whose `ext_id` already exists on disk must still be
+/// rejected, and rejected at the right index.
+#[tokio::test]
+async fn a_batch_insert_probes_ext_ids_once_for_the_batch() -> Result<()> {
+    use uni_common::Value;
+
+    let dir = TempDir::new()?;
+    let uri = dir.path().to_str().unwrap().to_string();
+    let lance = LanceDbBackend::connect(&uri, None).await?;
+    let fault = Arc::new(FaultBackend::new(Arc::new(lance)));
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new_with_prefix(dir.path())?);
+    let schema_manager = Arc::new(
+        SchemaManager::load_from_store(store.clone(), &ObjectStorePath::from("schema.json")).await?,
+    );
+    schema_manager.add_label("N")?;
+    schema_manager.save().await?;
+    let storage = Arc::new(
+        StorageManager::new_with_backend(
+            &uri,
+            store,
+            fault.clone(),
+            schema_manager.clone(),
+            UniConfig::default(),
+        )
+        .await?,
+    );
+    let writer = Writer::new(storage, schema_manager, 1).await?;
+
+    // One flushed vertex, so the main-table probe has something to find and is
+    // not trivially skipped on an absent table.
+    let seed = writer.next_vid().await?;
+    let mut seed_props = Properties::new();
+    seed_props.insert("ext_id".to_string(), Value::String("seed".to_string()));
+    writer
+        .insert_vertex_with_labels(seed, seed_props, &["N".to_string()], None)
+        .await?;
+    writer.flush_to_l1(None).await?;
+
+    let batch = |n: usize, offset: usize| -> (Vec<Properties>, Vec<String>) {
+        let props = (0..n)
+            .map(|i| {
+                let mut p = Properties::new();
+                p.insert(
+                    "ext_id".to_string(),
+                    Value::String(format!("e{}", i + offset)),
+                );
+                p
+            })
+            .collect();
+        (props, vec!["N".to_string()])
+    };
+
+    let (small_props, labels) = batch(SOURCES, 0);
+    let mut small_vids = Vec::new();
+    for _ in 0..SOURCES {
+        small_vids.push(writer.next_vid().await?);
+    }
+    fault.reset_scans();
+    writer
+        .insert_vertices_batch(small_vids, small_props, labels.clone(), None)
+        .await?;
+    let small_scans = fault.scans();
+
+    let (large_props, _) = batch(SOURCES * 2, 1000);
+    let mut large_vids = Vec::new();
+    for _ in 0..SOURCES * 2 {
+        large_vids.push(writer.next_vid().await?);
+    }
+    fault.reset_scans();
+    writer
+        .insert_vertices_batch(large_vids, large_props, labels.clone(), None)
+        .await?;
+    let large_scans = fault.scans();
+
+    assert!(
+        small_scans > 0,
+        "the small batch issued zero storage scans, so the decorator is not \
+         observing the ext_id probe and the comparison below cannot mean anything"
+    );
+    assert_eq!(
+        small_scans, large_scans,
+        "a batch of {} issued {small_scans} storage scans and one of {} issued \
+         {large_scans}. The ext_id probe is batched, so doubling the batch must \
+         not change the count — growth means it is back to one probe per vertex",
+        SOURCES,
+        SOURCES * 2
+    );
+
+    // The probe must still answer correctly: "seed" is on disk, so an insert
+    // carrying it is a constraint violation. A batched probe that quietly
+    // returned nothing would pass the shape assertion above and admit this.
+    let dup_vid = writer.next_vid().await?;
+    let mut dup = Properties::new();
+    dup.insert("ext_id".to_string(), Value::String("seed".to_string()));
+    let err = writer
+        .insert_vertices_batch(vec![dup_vid], vec![dup], labels, None)
+        .await
+        .expect_err("a flushed duplicate ext_id must be rejected");
+    assert!(
+        err.to_string().contains("already exists"),
+        "expected a uniqueness violation, got: {err}"
+    );
+    Ok(())
+}

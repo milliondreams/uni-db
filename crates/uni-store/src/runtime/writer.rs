@@ -2168,6 +2168,22 @@ impl Writer {
         let mut batch_keys: HashMap<String, HashMap<String, usize>> = HashMap::new();
         let mut batch_extids: HashMap<String, usize> = HashMap::new();
 
+        // Probe the main vertex table once for the whole batch rather than once
+        // per vertex (#220). Ordering is unchanged: the per-vertex checks below
+        // still run in index order and still report the first offending index,
+        // and the error semantics are those of the singular probe — an absent
+        // table is `Ok`, a failed scan is an error, because a uniqueness probe
+        // that reads as "no duplicate" on an I/O failure admits the duplicate
+        // it exists to reject (#233).
+        let flushed_extids = {
+            let wanted: Vec<String> = properties_batch
+                .iter()
+                .filter_map(|p| p.get("ext_id").and_then(|v| v.as_str()).map(str::to_string))
+                .collect();
+            MainVertexDataset::find_by_ext_ids_counted(self.storage.backend(), &wanted, None, None)
+                .await?
+        };
+
         for (idx, (_vid, properties)) in vids.iter().zip(properties_batch.iter()).enumerate() {
             // Check ext_id uniqueness
             if let Some(ext_id) = properties.get("ext_id").and_then(|v| v.as_str()) {
@@ -2197,9 +2213,7 @@ impl Writer {
                 // error. `find_by_ext_id` already answers `Ok(None)` when the
                 // table is absent (see `main_vertex.rs`), so every `Err` here
                 // is a genuine failure with no benign case to absorb.
-                if let Some(found_vid) =
-                    MainVertexDataset::find_by_ext_id(self.storage.backend(), ext_id, None).await?
-                {
+                if let Some(found_vid) = flushed_extids.get(ext_id) {
                     return Err(anyhow!(
                         "Constraint violation at index {}: ext_id '{}' already exists (vertex {:?})",
                         idx,
@@ -5075,6 +5089,17 @@ impl Writer {
                 count = orphaned_tombstones.len(),
                 "Tombstones missing labels in L0, querying storage as fallback"
             );
+            // One batched read for the whole orphan set rather than one scan
+            // per vid (#220). Absence from the map is the batched spelling of
+            // the singular form's `None`, and the error still propagates —
+            // which is the #233 property below, preserved.
+            let orphan_vids: Vec<Vid> = orphaned_tombstones.iter().map(|(vid, _)| *vid).collect();
+            let orphan_labels = MainVertexDataset::find_batch_labels_by_vids(
+                self.storage.backend(),
+                &orphan_vids,
+                None,
+            )
+            .await?;
             for (vid, version) in orphaned_tombstones {
                 // #233 Tier 1: this was `if let Ok(Some(..))`, and the
                 // callee additionally ate its scan error with
@@ -5083,7 +5108,7 @@ impl Writer {
                 // vertex stays visible after the flush — a silent
                 // resurrection. A failed flush is retriable; a lost tombstone
                 // is not.
-                if let Some(labels) = self.find_vertex_labels_in_storage(vid).await?
+                if let Some(labels) = orphan_labels.get(&vid).cloned()
                     && !labels.is_empty()
                 {
                     for label in &labels {
@@ -5263,16 +5288,29 @@ impl Writer {
                 })
                 .collect()
         };
+        // Both reads below are batched over the whole relabel set rather than
+        // issued twice per vid (#220). The version bounds are unchanged: the
+        // props read carries the high-water mark as before, and the labels read
+        // carries none, matching `find_vertex_labels_in_storage`, which ranks
+        // versions itself rather than filtering on one.
+        let relabel_vids: Vec<Vid> = overwrite_only.iter().map(|(vid, ..)| *vid).collect();
+        let relabel_props = MainVertexDataset::find_batch_props_by_vids(
+            self.storage.backend(),
+            &relabel_vids,
+            self.storage.version_high_water_mark(),
+        )
+        .await?;
+        let relabel_old_labels = MainVertexDataset::find_batch_labels_by_vids(
+            self.storage.backend(),
+            &relabel_vids,
+            None,
+        )
+        .await?;
+
         for (vid, new_labels, version) in overwrite_only {
             // Persisted props of the prior-window row — required so the
             // re-Appended main row does not blank the vertex's properties.
-            let Some(props) = MainVertexDataset::find_props_by_vid(
-                self.storage.backend(),
-                vid,
-                self.storage.version_high_water_mark(),
-            )
-            .await?
-            else {
+            let Some(props) = relabel_props.get(&vid).cloned() else {
                 tracing::warn!(
                     vid = vid.as_u64(),
                     "label-only mutation for a vid with no persisted main row; skipping flush \
@@ -5283,10 +5321,7 @@ impl Writer {
             // Labels the vid carried BEFORE this relabel; the storage read
             // reflects pre-flush state. Any label no longer present must be
             // tombstoned in its per-label dataset.
-            let old_labels = self
-                .find_vertex_labels_in_storage(vid)
-                .await?
-                .unwrap_or_default();
+            let old_labels = relabel_old_labels.get(&vid).cloned().unwrap_or_default();
 
             main_vertices.push((vid, new_labels.clone(), props.clone(), false, version));
             for label in &new_labels {

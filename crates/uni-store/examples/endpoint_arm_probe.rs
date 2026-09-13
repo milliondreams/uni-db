@@ -18,12 +18,11 @@
 //! Both arms run over the SAME edge type on a real SF1 store and are made to
 //! return the same edges, so the only difference is read strategy:
 //!
-//!   * **lookup** -- `Some((Src, vids))`, the chunked `IN (...)` path.
-//!   * **scan**   -- `None`, one pass over the type, filtered to the same vids
-//!                   in memory afterwards. That is the floor for a
-//!                   scan-and-filter arm, so a crossover reported here is
-//!                   optimistic for the scan side and reads as "no earlier
-//!                   than".
+//! * **lookup** -- `Some((Src, vids))`, the chunked `IN (...)` path.
+//! * **scan** -- `None`, one pass over the type, filtered to the same vids in
+//!   memory afterwards. That is the floor for a scan-and-filter arm, so a
+//!   crossover reported here is optimistic for the scan side and reads as "no
+//!   earlier than".
 //!
 //! `K` (requested src vids) is swept across three orders of magnitude. A run
 //! reporting the same cost at every `K` is measuring nothing, so the sweep is

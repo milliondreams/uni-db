@@ -4554,27 +4554,55 @@ async fn precompute_neighbor_feature_maps(
         // row time).
         let mut vid_to_values: HashMap<u64, Vec<f64>> = HashMap::new();
         let adj = storage.adjacency_manager();
+
+        // Walk the adjacency for every subject first, then read the property
+        // for all neighbours in one batch rather than one round-trip per
+        // neighbour (#220). The walk is in-memory; only the property read
+        // reaches storage, so hoisting it is what removes the round-trips.
+        let mut neighbors_by_subject: Vec<(u64, Vec<uni_common::core::id::Vid>)> = Vec::new();
+        let mut all_neighbors: Vec<uni_common::core::id::Vid> = Vec::new();
         for subject_vid in subject_vids {
-            let mut neighbors: Vec<(uni_common::core::id::Vid, uni_common::core::id::Eid)> =
-                Vec::new();
+            let mut neighbors: Vec<uni_common::core::id::Vid> = Vec::new();
             for dir in direction.store_directions() {
-                neighbors.extend(adj.get_neighbors(
-                    uni_common::core::id::Vid::from(subject_vid),
-                    edge_type_id,
-                    *dir,
-                ));
+                neighbors.extend(
+                    adj.get_neighbors(
+                        uni_common::core::id::Vid::from(subject_vid),
+                        edge_type_id,
+                        *dir,
+                    )
+                    .into_iter()
+                    .map(|(neighbor_vid, _eid)| neighbor_vid),
+                );
             }
+            all_neighbors.extend(neighbors.iter().copied());
+            neighbors_by_subject.push((subject_vid, neighbors));
+        }
+        all_neighbors.sort_unstable();
+        all_neighbors.dedup();
+
+        let props_by_vid = property_manager
+            .get_batch_vertex_props(&all_neighbors, &[prop_name.as_str()], query_ctx.as_ref())
+            .await
+            .map_err(|e| {
+                datafusion::error::DataFusionError::Execution(format!(
+                    "neighbor-aggregator: failed to read property '{prop_name}' \
+                     across {} neighbours: {e}",
+                    all_neighbors.len()
+                ))
+            })?;
+
+        for (subject_vid, neighbors) in neighbors_by_subject {
             let mut values: Vec<f64> = Vec::with_capacity(neighbors.len());
-            for (neighbor_vid, _eid) in neighbors {
-                let val = property_manager
-                    .get_vertex_prop_with_ctx(neighbor_vid, &prop_name, query_ctx.as_ref())
-                    .await
-                    .map_err(|e| {
-                        datafusion::error::DataFusionError::Execution(format!(
-                            "neighbor-aggregator: failed to read property \
-                             '{prop_name}' on neighbor vid {neighbor_vid:?}: {e}"
-                        ))
-                    })?;
+            for neighbor_vid in neighbors {
+                // A neighbour absent from the map, or carrying no value for
+                // this property, contributes nothing — the same outcome the
+                // per-neighbour read reached via a null that failed `as_f64`.
+                let Some(val) = props_by_vid
+                    .get(&neighbor_vid)
+                    .and_then(|props| props.get(prop_name.as_str()))
+                else {
+                    continue;
+                };
                 if let Some(f) = val.as_f64()
                     && !f.is_nan()
                 {

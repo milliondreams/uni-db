@@ -53,6 +53,24 @@ use uni_common::core::snapshot::SnapshotManifest;
 
 use uni_common::graph::simple_graph::Direction as GraphDirection;
 
+/// Requested endpoint vids per edge-type row at which one pass beats lookups.
+///
+/// Measured, not chosen: see `StorageManager::endpoint_scan_beats_lookup`. The
+/// crossover sat near 25 000 requested vids against 1 611 869 rows, which is
+/// about one requested vid per 64 rows.
+///
+/// Like every constant of this shape in this codebase it is fitted to one
+/// dataset on one machine, and unlike most of them it now has a probe that can
+/// be re-run to refit it.
+const ENDPOINT_SCAN_CROSSOVER_RATIO: u64 = 64;
+
+/// Requested endpoint vids below which the scan arm is never worth considering.
+///
+/// A small request cannot repay a whole-type pass whatever the table looks
+/// like, and stopping here avoids paying for the per-type count that the
+/// decision would otherwise need.
+const MIN_ENDPOINT_VIDS_FOR_SCAN: usize = 4_096;
+
 /// Maximum frontier VIDs per adjacency or delta scan in
 /// [`StorageManager::load_subgraph`].
 ///
@@ -85,6 +103,14 @@ pub struct StorageManager {
     /// about to append. Counter (not bool) so multiple async flushes can
     /// be in flight concurrently.
     pub flush_in_progress: std::sync::atomic::AtomicUsize,
+    /// Cached flushed row counts, readable without `await` (#260).
+    ///
+    /// Shared by `Arc` with every manager derived from this one, so a refresh
+    /// on any view is visible to all of them. Sharing is safe because the
+    /// derived views that must not use it — fork-scoped and pinned — decline in
+    /// [`Self::cached_row_count`] rather than relying on holding a separate
+    /// cache.
+    cardinality: Arc<crate::storage::cardinality::CardinalityCache>,
     /// Optional pinned snapshot for time-travel
     pinned_snapshot: Option<SnapshotManifest>,
     /// Optional row-version pin for transaction snapshot reads (C2).
@@ -618,6 +644,7 @@ impl StorageManager {
             snapshot_manager,
             adjacency_manager: Arc::new(AdjacencyManager::new(config.cache_size)),
             config,
+            cardinality: Arc::new(crate::storage::cardinality::CardinalityCache::new()),
             compaction_status: Arc::new(Mutex::new(CompactionStatus::default())),
             flush_in_progress: std::sync::atomic::AtomicUsize::new(0),
             pinned_snapshot: None,
@@ -789,6 +816,7 @@ impl StorageManager {
             // This prevents live DB's CSR (with all edges) from leaking into snapshots.
             adjacency_manager: Arc::new(AdjacencyManager::new(self.adjacency_manager.max_bytes())),
             config: self.config.clone(),
+            cardinality: self.cardinality.clone(),
             compaction_status: Arc::new(Mutex::new(CompactionStatus::default())),
             flush_in_progress: std::sync::atomic::AtomicUsize::new(0),
             pinned_snapshot: Some(snapshot),
@@ -839,6 +867,7 @@ impl StorageManager {
             snapshot_manager: self.snapshot_manager.clone(),
             adjacency_manager: self.adjacency_manager.clone(),
             config: self.config.clone(),
+            cardinality: self.cardinality.clone(),
             compaction_status: Arc::new(Mutex::new(CompactionStatus::default())),
             flush_in_progress: std::sync::atomic::AtomicUsize::new(0),
             pinned_snapshot: None,
@@ -912,6 +941,7 @@ impl StorageManager {
             snapshot_manager,
             adjacency_manager: Arc::new(AdjacencyManager::new(self.adjacency_manager.max_bytes())),
             config: self.config.clone(),
+            cardinality: self.cardinality.clone(),
             compaction_status: Arc::new(Mutex::new(CompactionStatus::default())),
             flush_in_progress: std::sync::atomic::AtomicUsize::new(0),
             pinned_snapshot: None,
@@ -1966,6 +1996,126 @@ impl StorageManager {
     /// # Errors
     ///
     /// Propagates backend failures. A table that does not exist reports zero.
+    /// The shared cardinality cache, for invalidation hooks and tests (#260).
+    #[must_use]
+    pub fn cardinality(&self) -> &Arc<crate::storage::cardinality::CardinalityCache> {
+        &self.cardinality
+    }
+
+    /// An upper bound on this table's live rows, readable without `await`
+    /// (#260).
+    ///
+    /// `None` means "no answer", and callers must keep whatever behaviour they
+    /// had without one — it is never to be read as zero. There are three ways to
+    /// get it, and they are deliberately indistinguishable, because the caller's
+    /// response to all three is the same:
+    ///
+    /// * nothing has counted this table since it was last invalidated;
+    /// * this view is fork-scoped for the table, where `BranchedBackend::count_rows`
+    ///   degrades to a real scan, so the cached primary count is not this
+    ///   reader's answer;
+    /// * this view is pinned, to a snapshot or a version, where the count must
+    ///   match the version being read and the cache tracks the live tip.
+    ///
+    /// # It is an upper bound
+    ///
+    /// The flushed half comes from the cache and the L0 half is read live, so an
+    /// unflushed write is never invisible. Their overlap is not knowable
+    /// synchronously: a vertex updated in place is counted twice, and an L0
+    /// tombstone over a flushed row is not subtracted. See the module docs for
+    /// why that direction is the safe one for the decisions this feeds.
+    ///
+    /// Pass `l0` to include unflushed rows. Passing `None` asks for the flushed
+    /// count alone, which is exact but can badly understate a young table.
+    #[must_use]
+    pub fn cached_row_count(
+        &self,
+        key: &crate::storage::cardinality::CardinalityKey,
+        l0: Option<&crate::runtime::l0::L0Buffer>,
+    ) -> Option<u64> {
+        use crate::storage::cardinality::CardinalityKey;
+
+        if self.pinned_snapshot.is_some() || self.pinned_version_hwm.is_some() {
+            return None;
+        }
+        let table_name = match key {
+            CardinalityKey::Vertex(label) => table_names::vertex_table_name(label),
+            CardinalityKey::EdgeType(_) => table_names::main_edge_table_name().to_string(),
+        };
+        if self
+            .fork_scope()
+            .and_then(|scope| scope.branch_for(&table_name))
+            .is_some()
+        {
+            return None;
+        }
+
+        let flushed = self.cardinality.get(key)?;
+        let Some(l0) = l0 else {
+            return Some(flushed);
+        };
+
+        let pending = match key {
+            CardinalityKey::Vertex(label) => {
+                l0.label_to_vids.get(label).map_or(0, HashSet::len) as u64
+            }
+            // O(L0 edges) rather than an index lookup: L0 keys edges by eid and
+            // carries the type beside it, with no per-type index to ask. The
+            // walk is bounded by `auto_flush_threshold` (10 000 by default) and
+            // is paid once per decision, against a scan this exists to avoid.
+            CardinalityKey::EdgeType(etype) => {
+                l0.edge_types.values().filter(|t| *t == etype).count() as u64
+            }
+        };
+        Some(flushed.saturating_add(pending))
+    }
+
+    /// Measure a table's flushed row count and cache it (#260).
+    ///
+    /// The `async` half that [`Self::cached_row_count`] exists to avoid. Returns
+    /// `None` without caching anything when this view cannot answer for the
+    /// primary — the same fork and pin conditions the sync reader declines on,
+    /// so a fork's count can never be written into the shared cache and read
+    /// back later as primary's.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the count cannot be read.
+    pub async fn refresh_row_count(
+        &self,
+        key: &crate::storage::cardinality::CardinalityKey,
+    ) -> Result<Option<u64>> {
+        use crate::backend::types::{FilterExpr, Scalar};
+        use crate::storage::cardinality::CardinalityKey;
+
+        if self.pinned_snapshot.is_some() || self.pinned_version_hwm.is_some() {
+            return Ok(None);
+        }
+        let backend = self.backend();
+        let (table_name, filter) = match key {
+            CardinalityKey::Vertex(label) => (table_names::vertex_table_name(label), None),
+            CardinalityKey::EdgeType(etype) => (
+                table_names::main_edge_table_name().to_string(),
+                Some(FilterExpr::equals("type", Scalar::Str(etype.clone()))),
+            ),
+        };
+        if self
+            .fork_scope()
+            .and_then(|scope| scope.branch_for(&table_name))
+            .is_some()
+        {
+            return Ok(None);
+        }
+        if !backend.table_exists(&table_name).await? {
+            self.cardinality.put(key.clone(), 0);
+            return Ok(Some(0));
+        }
+
+        let rows = backend.count_rows(&table_name, filter.as_ref()).await? as u64;
+        self.cardinality.put(key.clone(), rows);
+        Ok(Some(rows))
+    }
+
     pub async fn vertex_row_count(&self, label: &str) -> Result<Option<usize>> {
         let backend = self.backend();
         let table_name = table_names::vertex_table_name(label);
@@ -2426,6 +2576,31 @@ impl StorageManager {
         endpoint_filter: Option<(crate::storage::main_edge::EndpointSide, &[Vid])>,
         counters: Option<&Arc<crate::runtime::counters::QueryCounters>>,
     ) -> Result<Vec<(Eid, Vid, Vid, String, uni_common::Properties)>> {
+        // Choose the read strategy on measured selectivity rather than on which
+        // `match` arm the caller lands in (#237, using #260's statistic).
+        if let Some((side, vids)) = endpoint_filter
+            && self.endpoint_scan_beats_lookup(type_names, vids).await?
+        {
+            let all = MainEdgeDataset::find_edges_by_type_names_counted(
+                self.backend(),
+                type_names,
+                None,
+                counters,
+            )
+            .await?;
+            let wanted: HashSet<Vid> = vids.iter().copied().collect();
+            return Ok(all
+                .into_iter()
+                .filter(|(_, src, dst, ..)| match side {
+                    crate::storage::main_edge::EndpointSide::Src => wanted.contains(src),
+                    crate::storage::main_edge::EndpointSide::Dst => wanted.contains(dst),
+                    crate::storage::main_edge::EndpointSide::Either => {
+                        wanted.contains(src) || wanted.contains(dst)
+                    }
+                })
+                .collect());
+        }
+
         MainEdgeDataset::find_edges_by_type_names_counted(
             self.backend(),
             type_names,
@@ -2433,6 +2608,60 @@ impl StorageManager {
             counters,
         )
         .await
+    }
+
+    /// Whether one pass over the edge type beats chunked endpoint lookups.
+    ///
+    /// The endpoint-vid arm used to chunk `src_vid IN (...)` unconditionally,
+    /// with `prefers_full_scan` — the selectivity helper #221 added for the eid
+    /// path — sitting in the same file and never consulted (#237).
+    ///
+    /// # Measured, not fitted by eye
+    ///
+    /// `examples/endpoint_arm_probe.rs` at LDBC SF1 over `HAS_MEMBER`
+    /// (1 611 869 edges, 79 470 distinct src vids), min-of-3, release: the
+    /// lookup arm is linear in the requested set (21 ms at K=100, 389 ms at
+    /// 10 000, 2 485 ms at 79 000) and the scan arm is flat at 840 ms. They
+    /// cross between K = 20 000 and K = 30 000. At full breadth the lookup this
+    /// used to take unconditionally is **3.0x slower** than the scan.
+    ///
+    /// [`ENDPOINT_SCAN_CROSSOVER_RATIO`] is that crossover expressed against the
+    /// type's row count, which is the denominator actually available here.
+    ///
+    /// # Why it declines rather than guesses
+    ///
+    /// `false` — keep chunked lookups — whenever the type's size is unknown:
+    /// nothing cached and no cheap way to find out, a fork, or a pinned view.
+    /// Lookup costs the request and scan costs the table, so the unknown case
+    /// errs toward the arm whose cost the caller already controls.
+    ///
+    /// The count is only *refreshed* once the request is large enough for the
+    /// answer to change the decision. A per-type count needs a predicate and a
+    /// filtered count reads every row, so asking is itself a scan — worth it
+    /// once, cached thereafter, and not worth it at all for a small request
+    /// that was always going to take the lookup.
+    async fn endpoint_scan_beats_lookup(&self, type_names: &[&str], vids: &[Vid]) -> Result<bool> {
+        use crate::storage::cardinality::CardinalityKey;
+
+        // A single-type request is the only shape with a meaningful denominator;
+        // a multi-type one would need them summed, and no caller does that here.
+        let [type_name] = type_names else {
+            return Ok(false);
+        };
+        if vids.len() < MIN_ENDPOINT_VIDS_FOR_SCAN {
+            return Ok(false);
+        }
+
+        let key = CardinalityKey::EdgeType((*type_name).to_string());
+        let rows = match self.cached_row_count(&key, None) {
+            Some(rows) => rows,
+            None => match self.refresh_row_count(&key).await? {
+                Some(rows) => rows,
+                None => return Ok(false),
+            },
+        };
+
+        Ok(rows > 0 && (vids.len() as u64).saturating_mul(ENDPOINT_SCAN_CROSSOVER_RATIO) >= rows)
     }
 
     /// Scan vertex candidates matching a filter. Returns VIDs where `_deleted = false`.

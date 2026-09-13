@@ -2540,6 +2540,12 @@ pub struct QueryPlanner {
     plugin_registry: Option<Arc<uni_plugin::PluginRegistry>>,
     /// Gate for replacement-scan dispatch on unknown identifiers (M5b).
     replacement_scans_enabled: bool,
+    /// Cached row counts, when the caller wired them in (#260).
+    ///
+    /// Optional because most planner construction sites — tests, the Locy
+    /// front-end — have no storage to read from, and a planner without
+    /// statistics must still work exactly as it did.
+    cardinality: Option<Arc<uni_store::storage::cardinality::CardinalityCache>>,
     /// Names of parameters folded into a `LIMIT`/`SKIP` position during the
     /// plan. The resulting `LogicalPlan::Limit` bakes the concrete values in, so
     /// a plan cache keyed on query text must additionally key on these
@@ -2601,8 +2607,19 @@ impl QueryPlanner {
             params: HashMap::new(),
             plugin_registry: None,
             replacement_scans_enabled: false,
+            cardinality: None,
             folded_limit_skip_params: std::sync::Mutex::new(std::collections::BTreeSet::new()),
         }
+    }
+
+    /// Give the planner access to cached row counts (#260).
+    #[must_use]
+    pub fn with_cardinality(
+        mut self,
+        cardinality: Arc<uni_store::storage::cardinality::CardinalityCache>,
+    ) -> Self {
+        self.cardinality = Some(cardinality);
+        self
     }
 
     /// Graph schema this planner resolves labels and property types against.
@@ -9474,11 +9491,74 @@ impl QueryPlanner {
         }
     }
 
-    fn estimate_costs(&self, _plan: &LogicalPlan) -> Result<CostEstimates> {
+    /// Row and cost estimates for `EXPLAIN`.
+    ///
+    /// This used to take `_plan` — the parameter was unused — and return
+    /// `estimated_rows: 100.0` unconditionally (#260). It now sums the cached
+    /// row counts of the labels the plan actually scans, when they are known.
+    ///
+    /// # It falls back rather than reporting a confident zero
+    ///
+    /// The cached counts are flushed-only here: the planner holds no L0 handle,
+    /// and a label whose rows are all unflushed has a legitimately cached count
+    /// of zero. Reporting `estimated_rows: 0` for a table that is not empty is
+    /// the silent wrong answer #260 names, so a total of zero is treated as "no
+    /// information" and yields the previous constant. That keeps the estimate
+    /// wrong-but-harmless in exactly the case it cannot see, rather than
+    /// confidently wrong.
+    ///
+    /// This is an estimate for display, not a cost model: no selectivity, no
+    /// join ordering, and nothing consumes it to choose a plan.
+    fn estimate_costs(&self, plan: &LogicalPlan) -> Result<CostEstimates> {
+        const UNKNOWN_ROWS: f64 = 100.0;
+        const COST_PER_ROW: f64 = 0.1;
+
+        let Some(cardinality) = self.cardinality.as_ref() else {
+            return Ok(CostEstimates {
+                estimated_rows: UNKNOWN_ROWS,
+                estimated_cost: 10.0,
+            });
+        };
+
+        let mut labels = Vec::new();
+        Self::collect_scanned_labels(plan, &mut labels);
+        let total: u64 = labels
+            .iter()
+            .filter_map(|label| {
+                cardinality.get(&uni_store::storage::cardinality::CardinalityKey::Vertex(
+                    label.clone(),
+                ))
+            })
+            .sum();
+
+        let estimated_rows = if total == 0 {
+            UNKNOWN_ROWS
+        } else {
+            total as f64
+        };
         Ok(CostEstimates {
-            estimated_rows: 100.0,
-            estimated_cost: 10.0,
+            estimated_rows,
+            estimated_cost: estimated_rows * COST_PER_ROW,
         })
+    }
+
+    /// Labels named by the scans under `plan`, for [`Self::estimate_costs`].
+    fn collect_scanned_labels(plan: &LogicalPlan, out: &mut Vec<String>) {
+        match plan {
+            LogicalPlan::Scan { labels, .. } => out.extend(labels.iter().cloned()),
+            LogicalPlan::Explain { plan } => Self::collect_scanned_labels(plan, out),
+            LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Project { input, .. }
+            | LogicalPlan::Limit { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::Traverse { input, .. } => Self::collect_scanned_labels(input, out),
+            LogicalPlan::Union { left, right, .. } | LogicalPlan::CrossJoin { left, right } => {
+                Self::collect_scanned_labels(left, out);
+                Self::collect_scanned_labels(right, out);
+            }
+            _ => {}
+        }
     }
 
     /// Collect index suggestions based on query patterns.

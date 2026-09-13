@@ -538,8 +538,12 @@ impl crate::api::UniInner {
     /// write rejection) all silently no-op, so a query would drop catalog rows
     /// the default path returns.
     fn base_planner(&self) -> uni_query::QueryPlanner {
+        // The cardinality cache is wired here so `EXPLAIN`'s cost estimate can
+        // report the size of the labels a plan scans instead of a constant
+        // (#260). Nothing chooses a plan from it.
         uni_query::QueryPlanner::new(self.schema.schema().clone())
             .with_plugin_registry(Arc::clone(&self.plugin_registry))
+            .with_cardinality(Arc::clone(self.storage.cardinality()))
     }
 
     /// Plan `ast`, then apply the two rewrites every call site must run.

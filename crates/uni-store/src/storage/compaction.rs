@@ -33,6 +33,14 @@ impl Compactor {
         let schema = self.storage.schema_manager().schema();
         let mut report = SemanticCompactionReport::default();
 
+        // Compaction rewrites tables and drops superseded rows, so every cached
+        // row count is now wrong (#260). Invalidated up front rather than at the
+        // end: the loop below deliberately continues past a per-label failure,
+        // so a partial run must still leave no stale count behind, and a count
+        // taken *during* compaction would be stale the moment its table is
+        // replaced.
+        self.storage.cardinality().invalidate_all();
+
         // Compact Vertices
         for label in schema.labels.keys() {
             info!("Compacting vertices for label {}", label);

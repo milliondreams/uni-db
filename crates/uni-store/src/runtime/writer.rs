@@ -5916,6 +5916,16 @@ impl Writer {
         initial_count: usize,
         start: std::time::Instant,
     ) -> Result<String> {
+        // Flushed row counts have just moved, so forget them (#260). Placed in
+        // the shared finalize body rather than in `flush_to_l1`, because the
+        // sync and async paths both land here and a hook on either alone would
+        // leave the other serving a stale count. Blunt rather than per-table: a
+        // flush can touch every label and edge type in the batch, and an
+        // invalidation that enumerated them would be a second place to get the
+        // set wrong. A missing entry costs one `count_rows`; a stale one is a
+        // wrong answer.
+        shared.storage.cardinality().invalidate_all();
+
         // Parent-snapshot fixup. The stream phase built `manifest` with
         // parent_snapshot set from cached_manifest at stream time. If
         // OTHER flushes (sync or async) have finalized since then,

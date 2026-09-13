@@ -374,3 +374,55 @@ async fn hybrid_mixed_group_on_single_task_alias_errors() -> anyhow::Result<()> 
     );
     Ok(())
 }
+
+/// Hybrid: a **string** query embeds against both heads and returns rows
+/// (#122).
+///
+/// The hybrid model produces a dense and a per-token head in one pass, and both
+/// columns carry an `embedding_config` pointing at the same alias. The
+/// query-time success path was uncovered for both — only the multi-vector error
+/// path existed — and the multi-vector half turned out to be unwired: a string
+/// query to a `List<Vector>` column was rejected outright. This exercises both
+/// heads from the same fixture, so a regression on either side is visible.
+#[tokio::test]
+async fn hybrid_string_query_succeeds_on_both_heads() -> anyhow::Result<()> {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let db = Uni::in_memory()
+        .xervo_runtime(hybrid_runtime(calls.clone()).await)
+        .build()
+        .await?;
+    define_hybrid_schema(&db).await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Doc {content: 'alpha'}), (:Doc {content: 'beta'})")
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    // Dense head.
+    let dense = db
+        .session()
+        .query(
+            "CALL uni.vector.query('Doc', 'embedding', 'some text', 2) \
+             YIELD node RETURN node.content AS c",
+        )
+        .await?;
+    assert!(
+        !dense.rows().is_empty(),
+        "a string query against the dense head must embed and return rows"
+    );
+
+    // Per-token head — the one that was unwired.
+    let multi = db
+        .session()
+        .query(
+            "CALL uni.vector.query('Doc', 'tokens', 'some text', 2) \
+             YIELD node RETURN node.content AS c",
+        )
+        .await?;
+    assert!(
+        !multi.rows().is_empty(),
+        "a string query against the multi-vector head must embed and return rows"
+    );
+    Ok(())
+}

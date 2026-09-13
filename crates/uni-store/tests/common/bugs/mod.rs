@@ -65,6 +65,8 @@ pub mod repro_shadow_csr_warm_retention;
 // #220 site 1 — `load_subgraph`'s BFS issued one adjacency scan per (vertex,
 // label) and one delta scan per vertex; both batched primitives existed with
 // zero callers.
+// #200 — a failed flush barrier now names the failure that caused it.
+pub mod issue_200_flush_barrier_cause;
 pub mod issue_220_crdt_reader_equivalence;
 // #260 — a cached, invalidated row count readable without `await`.
 pub mod issue_220_subgraph_batched_reads;

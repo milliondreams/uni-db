@@ -4615,10 +4615,19 @@ impl Writer {
         if let Some(coord) = self.flush_coordinator.as_ref() {
             let failed = coord.failed_flush_count();
             if failed > 0 {
+                // The cause, not just the count (#200). One occurrence of this
+                // under ordinary full-suite load could not be diagnosed
+                // afterwards — it did not reproduce, and all that survived was
+                // the number. Whatever the next occurrence is, it now says so
+                // in the error that stops the run.
+                let cause = coord.last_flush_error().unwrap_or_else(|| {
+                    "no cause recorded — the failure predates this coordinator".to_string()
+                });
                 return Err(anyhow::anyhow!(
                     "flush_to_l1 barrier not established: {failed} async flush(es) have failed and \
                      their L0 is stranded; the WAL retains that data and replay recovers it on \
-                     restart, but it is NOT in Lance and no later flush picks it up"
+                     restart, but it is NOT in Lance and no later flush picks it up. \
+                     Most recent failure: {cause}"
                 ));
             }
         }

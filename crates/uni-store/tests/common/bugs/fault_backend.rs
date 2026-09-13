@@ -26,6 +26,7 @@ pub struct FaultBackend {
     inner: Arc<dyn StorageBackend>,
     fail_table_exists: AtomicBool,
     fail_scan: AtomicBool,
+    fail_write: AtomicBool,
     scan_count: AtomicUsize,
 }
 
@@ -35,6 +36,7 @@ impl FaultBackend {
             inner,
             fail_table_exists: AtomicBool::new(false),
             fail_scan: AtomicBool::new(false),
+            fail_write: AtomicBool::new(false),
             scan_count: AtomicUsize::new(0),
         }
     }
@@ -67,6 +69,14 @@ impl FaultBackend {
     pub fn set_fail_scan(&self, on: bool) {
         self.fail_scan.store(on, Ordering::SeqCst);
     }
+
+    /// Arms every table-writing method to fail, modelling a store that accepts
+    /// reads and refuses writes — which is what an async flush's stream phase
+    /// runs into. Broader than `write` alone because the flush reaches Lance
+    /// through whichever of create/open/append the table's state calls for.
+    pub fn set_fail_write(&self, on: bool) {
+        self.fail_write.store(on, Ordering::SeqCst);
+    }
 }
 
 #[async_trait]
@@ -83,14 +93,23 @@ impl StorageBackend for FaultBackend {
     }
 
     async fn create_table(&self, name: &str, batches: Vec<RecordBatch>) -> Result<()> {
+        if self.fail_write.load(Ordering::SeqCst) {
+            return Err(anyhow!("injected write failure for {name}"));
+        }
         self.inner.create_table(name, batches).await
     }
 
     async fn create_empty_table(&self, name: &str, schema: Arc<ArrowSchema>) -> Result<()> {
+        if self.fail_write.load(Ordering::SeqCst) {
+            return Err(anyhow!("injected write failure for {name}"));
+        }
         self.inner.create_empty_table(name, schema).await
     }
 
     async fn open_or_create_table(&self, name: &str, schema: Arc<ArrowSchema>) -> Result<()> {
+        if self.fail_write.load(Ordering::SeqCst) {
+            return Err(anyhow!("injected write failure for {name}"));
+        }
         self.inner.open_or_create_table(name, schema).await
     }
 
@@ -134,6 +153,9 @@ impl StorageBackend for FaultBackend {
         batches: Vec<RecordBatch>,
         mode: WriteMode,
     ) -> Result<()> {
+        if self.fail_write.load(Ordering::SeqCst) {
+            return Err(anyhow!("injected write failure for {table_name}"));
+        }
         self.inner.write(table_name, batches, mode).await
     }
 

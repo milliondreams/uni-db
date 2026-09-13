@@ -83,6 +83,35 @@ pub(crate) use uni_store::runtime::columnar_scan::{
 /// let stream = scan.execute(0, task_ctx)?;
 /// // Stream yields batches with columns: _vid, n.name, n.age
 /// ```
+/// A `_vid` list that is not known until another operator has run (#179).
+///
+/// `VidLookupJoinExec` cannot pass its probe a vid list at plan time — the set
+/// comes from materialising the build side. That is why the probe used to be
+/// driven through a bespoke helper instead of `execute()`, which in turn is why
+/// it was not a child and was invisible to every `children()` walk: profiling,
+/// the operator-activation gate, and DataFusion's own optimizer rules.
+///
+/// Handing the scan a shared slot instead lets the join publish the vids just
+/// before executing the probe through the ordinary `ExecutionPlan` API, so the
+/// probe can be a real child. The join writes once per chunk and the scan reads
+/// it on each `execute()`.
+#[derive(Debug, Default)]
+pub(crate) struct DynamicVidFilter {
+    vids: parking_lot::RwLock<Option<Vec<u64>>>,
+}
+
+impl DynamicVidFilter {
+    /// Publish the vid set the next `execute()` should restrict to.
+    pub(crate) fn set(&self, vids: Option<Vec<u64>>) {
+        *self.vids.write() = vids;
+    }
+
+    /// The currently published set, if any.
+    pub(crate) fn get(&self) -> Option<Vec<u64>> {
+        self.vids.read().clone()
+    }
+}
+
 pub struct GraphScanExec {
     /// Graph execution context with storage and L0 access.
     graph_ctx: Arc<GraphExecutionContext>,
@@ -142,6 +171,15 @@ pub struct GraphScanExec {
     /// change how much is read, never which rows win.
     fetch: Option<usize>,
 
+    /// A vid list published by an operator above, resolved at `execute()` time
+    /// rather than at plan time (#179). Only `VidLookupJoinExec` sets this.
+    ///
+    /// When present and populated it takes precedence over `vid_list_filter`,
+    /// which is the planner's static equivalent. `None` inside the slot means
+    /// "no restriction" — the high-selectivity arm, where reading the whole
+    /// table beats a vid list (#237).
+    dynamic_vid_filter: Option<Arc<DynamicVidFilter>>,
+
     /// Metrics for execution tracking.
     metrics: ExecutionPlanMetricsSet,
 }
@@ -165,6 +203,30 @@ impl GraphScanExec {
     /// `_vid IN (v1, v2, ...)` to Lance at execute time. Use this for
     /// pre-resolved vid sets (e.g. from `UNWIND $list AS e WHERE id(x)=e.field`).
     /// See issue #55 PR #4.
+    /// A copy of this scan carrying a slot an operator above will fill in
+    /// before executing it (#179). See [`DynamicVidFilter`].
+    ///
+    /// By reference because the caller holds the probe as a `&dyn ExecutionPlan`
+    /// downcast, which it cannot move out of.
+    pub(crate) fn with_dynamic_vid_filter(&self, slot: Arc<DynamicVidFilter>) -> Self {
+        Self {
+            graph_ctx: self.graph_ctx.clone(),
+            label: self.label.clone(),
+            variable: self.variable.clone(),
+            projected_properties: self.projected_properties.clone(),
+            filter: self.filter.clone(),
+            vid_list_filter: self.vid_list_filter.clone(),
+            extra_lance_filter: self.extra_lance_filter.clone(),
+            extra_runtime_filter: self.extra_runtime_filter.clone(),
+            dynamic_vid_filter: Some(slot),
+            is_schemaless: self.is_schemaless,
+            schema: self.schema.clone(),
+            properties: self.properties.clone(),
+            fetch: self.fetch,
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
+
     pub fn with_vid_list_filter(mut self, vids: Vec<u64>) -> Self {
         self.vid_list_filter = Some(vids);
         self
@@ -201,48 +263,6 @@ impl GraphScanExec {
     /// Only supported for vertex and schemaless-vertex scans; edge scans
     /// have a different shape and aren't currently a join target for this
     /// optimization.
-    /// One unfiltered pass over this scan's table, for the high-selectivity arm
-    /// of [`vertex_scan_beats_lookup`] (#237).
-    ///
-    /// Identical to [`Self::execute_with_vid_filter`] with no vid list: the
-    /// scan's own predicate still applies, only the `_vid IN (...)` restriction
-    /// is dropped. Callers must key into the result by vid — extra rows are the
-    /// point, and are the caller's to ignore.
-    pub(crate) async fn execute_all(
-        &self,
-        index_consulted: Option<&datafusion::physical_plan::metrics::Count>,
-    ) -> DFResult<RecordBatch> {
-        if self.is_schemaless {
-            columnar_scan_schemaless_vertex_batch_static(
-                &self.graph_ctx,
-                &self.label,
-                &self.variable,
-                &self.projected_properties,
-                &self.schema,
-                &self.filter,
-                None,
-                self.extra_lance_filter.as_deref(),
-                self.extra_runtime_filter.as_ref(),
-            )
-            .await
-        } else {
-            columnar_scan_vertex_batch_static(
-                &self.graph_ctx,
-                &self.label,
-                &self.variable,
-                &self.projected_properties,
-                &self.schema,
-                &self.filter,
-                None,
-                None,
-                self.extra_lance_filter.as_deref(),
-                self.extra_runtime_filter.as_ref(),
-                index_consulted,
-            )
-            .await
-        }
-    }
-
     /// Rows in this scan's table, cached where possible (#260).
     ///
     /// Zero means "unknown" — a fork, a pinned view, or a table that has not
@@ -260,45 +280,6 @@ impl GraphScanExec {
                 .ok()
                 .flatten()
                 .unwrap_or(0) as usize,
-        }
-    }
-
-    pub(crate) async fn execute_with_vid_filter(
-        &self,
-        vids: &[u64],
-        index_consulted: Option<&datafusion::physical_plan::metrics::Count>,
-    ) -> DFResult<RecordBatch> {
-        if self.is_schemaless {
-            columnar_scan_schemaless_vertex_batch_static(
-                &self.graph_ctx,
-                &self.label,
-                &self.variable,
-                &self.projected_properties,
-                &self.schema,
-                &self.filter,
-                Some(vids),
-                self.extra_lance_filter.as_deref(),
-                self.extra_runtime_filter.as_ref(),
-            )
-            .await
-        } else {
-            columnar_scan_vertex_batch_static(
-                &self.graph_ctx,
-                &self.label,
-                &self.variable,
-                &self.projected_properties,
-                &self.schema,
-                &self.filter,
-                Some(vids),
-                None,
-                self.extra_lance_filter.as_deref(),
-                self.extra_runtime_filter.as_ref(),
-                // The probe side of `VidLookupJoinExec`. It is still not a
-                // child, but the join now collects this metric set and reports
-                // it as its own entry, so the sink is no longer pointless (#179).
-                index_consulted,
-            )
-            .await
         }
     }
 }
@@ -334,6 +315,7 @@ impl GraphScanExec {
             vid_list_filter: None,
             extra_lance_filter: None,
             extra_runtime_filter: None,
+            dynamic_vid_filter: None,
             is_schemaless: false,
             schema,
             properties,
@@ -397,6 +379,7 @@ impl GraphScanExec {
             vid_list_filter: None,
             extra_lance_filter: None,
             extra_runtime_filter: None,
+            dynamic_vid_filter: None,
             is_schemaless: true,
             schema,
             properties,
@@ -571,6 +554,15 @@ impl ExecutionPlan for GraphScanExec {
         let index_consulted =
             MetricBuilder::new(&self.metrics).counter("index_consulted", partition);
 
+        // A dynamic slot wins over the planner's static list: it is only ever
+        // set by the operator immediately above, which knows the vids this run
+        // needs. An attached-but-empty slot means "no vid restriction" and is a
+        // deliberate value, not a miss — see `DynamicVidFilter`.
+        let vid_list_filter = match self.dynamic_vid_filter.as_ref() {
+            Some(slot) => slot.get(),
+            None => self.vid_list_filter.clone(),
+        };
+
         Ok(Box::pin(GraphScanStream::new(
             self.graph_ctx.clone(),
             self.label.clone(),
@@ -578,7 +570,7 @@ impl ExecutionPlan for GraphScanExec {
             self.projected_properties.clone(),
             self.is_schemaless,
             self.filter.clone(),
-            self.vid_list_filter.clone(),
+            vid_list_filter,
             self.extra_lance_filter.clone(),
             self.extra_runtime_filter.clone(),
             self.schema.clone(),
@@ -620,6 +612,7 @@ impl ExecutionPlan for GraphScanExec {
             vid_list_filter: self.vid_list_filter.clone(),
             extra_lance_filter: self.extra_lance_filter.clone(),
             extra_runtime_filter: self.extra_runtime_filter.clone(),
+            dynamic_vid_filter: self.dynamic_vid_filter.clone(),
             is_schemaless: self.is_schemaless,
             schema: self.schema.clone(),
             properties: self.properties.clone(),

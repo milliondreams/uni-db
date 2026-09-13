@@ -9,11 +9,13 @@
 //!
 //!   1. Run the build side fully and collect its rows.
 //!   2. Extract distinct VIDs from the build side's anchor-pair column.
-//!   3. Push them as `_vid IN (...)` to the probe scan via
-//!      `GraphScanExec::execute_with_vid_filter`. If the build VID set
-//!      exceeds `MAX_VIDS_PER_CHUNK` we chunk into multiple `_vid IN`
-//!      filters and concat the batches — bounded list size, indexed lookup
-//!      preserved at scale.
+//!   3. Publish them into the probe scan's [`DynamicVidFilter`] and run the
+//!      probe through the ordinary `ExecutionPlan::execute`, which pushes them
+//!      as `_vid IN (...)`. If the build VID set exceeds `MAX_VIDS_PER_CHUNK`
+//!      we publish and execute once per chunk and concat the batches — bounded
+//!      list size, indexed lookup preserved at scale. At high selectivity the
+//!      slot is published empty instead, so one unfiltered pass replaces the
+//!      chunks (#237).
 //!   4. Index probe by `_vid` and join in memory. Non-anchor equi-pairs
 //!      become per-candidate post-filters.
 //!
@@ -60,14 +62,12 @@ use arrow_schema::{Field, Schema, SchemaRef};
 use datafusion::common::{Result as DFResult, ScalarValue};
 use datafusion::execution::memory_pool::MemoryConsumer;
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
-use datafusion::physical_plan::metrics::{
-    BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
-};
+use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::{Stream, StreamExt};
 
 use super::common::compute_plan_properties;
-use super::scan::GraphScanExec;
+use super::scan::{DynamicVidFilter, GraphScanExec};
 
 /// Maximum VIDs per `_vid IN (...)` chunk. Larger build sets are split into
 /// multiple sequential probe scans whose results are concatenated. Mirrors
@@ -128,39 +128,13 @@ pub struct VidLookupJoinExec {
     output_schema: SchemaRef,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
-    /// Metrics for the probe-side scan, which is not a child and so is never
-    /// reached by the `children()` walk that collects everything else (#179).
+    /// The slot this operator publishes each chunk of probe vids into before
+    /// executing the probe child (#179).
     ///
-    /// Kept separate from `metrics` rather than folded into it: they describe
-    /// two different operators, and adding the probe's rows to this join's
-    /// output rows would make the join look like it emitted rows it did not.
-    /// `collect_plan_metrics` reads this set back out and reports it as its own
-    /// entry.
-    probe_metrics: ExecutionPlanMetricsSet,
-}
-
-impl VidLookupJoinExec {
-    /// The probe-side scan's metrics, for `collect_plan_metrics` to report as a
-    /// separate operator (#179).
-    ///
-    /// The probe is deliberately not a child — see `children()` — so the walk
-    /// that collects every other operator never reaches it. Rather than change
-    /// the plan shape, the join records the probe's rows, time and index
-    /// consultation here and hands them over on request.
-    pub(crate) fn probe_metrics(&self) -> MetricsSet {
-        self.probe_metrics.clone_inner()
-    }
-
-    /// The operator name to report the probe under.
-    ///
-    /// Its real name, not a synthetic label: the probe genuinely is a
-    /// `GraphScanExec`, and a profile that called it something else would send
-    /// a reader looking for an operator that does not exist. Note the build
-    /// side is also a `GraphScanExec`, so a profile of this shape shows two —
-    /// which is the point, and is what a test must distinguish.
-    pub(crate) fn probe_operator_name(&self) -> String {
-        self.probe_child().name().to_string()
-    }
+    /// Shared with the `GraphScanExec` stored as the probe child — `try_new`
+    /// wires them together, so the child in `left`/`right` is a clone carrying
+    /// this same handle.
+    probe_filter: Arc<DynamicVidFilter>,
 }
 
 impl fmt::Debug for VidLookupJoinExec {
@@ -207,6 +181,23 @@ impl VidLookupJoinExec {
                 "VidLookupJoinExec: probe-side child must be a GraphScanExec".into(),
             ));
         }
+        // Give the probe a slot this operator fills in before executing it
+        // (#179). That is what lets the probe run through the ordinary
+        // `execute()` API and therefore be a real child: the vid set is not
+        // known until the build side is materialised, which is the whole reason
+        // it used to be driven through a bespoke helper.
+        let probe_filter = Arc::new(DynamicVidFilter::default());
+        let probe_scan = probe_plan
+            .as_any()
+            .downcast_ref::<GraphScanExec>()
+            .expect("probe was checked to be a GraphScanExec above")
+            .with_dynamic_vid_filter(probe_filter.clone());
+        let probe_wired: Arc<dyn ExecutionPlan> = Arc::new(probe_scan);
+        let (left, right) = match probe_side {
+            ProbeSide::Left => (probe_wired, right),
+            ProbeSide::Right => (left, probe_wired),
+        };
+
         // For a LEFT outer join this operator null-pads unmatched BUILD rows,
         // so it is the PROBE side's columns that receive NULLs and must be
         // nullable.
@@ -224,8 +215,8 @@ impl VidLookupJoinExec {
             join_kind,
             output_schema,
             properties,
+            probe_filter,
             metrics: ExecutionPlanMetricsSet::new(),
-            probe_metrics: ExecutionPlanMetricsSet::new(),
         })
     }
 
@@ -274,39 +265,34 @@ impl ExecutionPlan for VidLookupJoinExec {
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        // Expose the build child only — DataFusion's plan walker will see
-        // exactly the side that we'll execute through its standard
-        // `execute()` API. The probe is driven via the GraphScanExec
-        // helper at runtime and isn't a child in the traditional sense.
-        //
-        // The profile hole this used to open is closed elsewhere: the probe's
-        // metrics are recorded against `probe_metrics` and spliced in by
-        // `collect_plan_metrics` (#179). What is NOT addressed is optimizer
-        // visibility — DataFusion's rules also recurse through `children()`, so
-        // the probe subtree is skipped by any tree-walking rule. That is
-        // currently harmless rather than correct: the planner's guard keeps the
-        // probe a bare `GraphScanExec`, which is a leaf with no work for a rule
-        // to do. It stops being harmless the moment that guard admits a
-        // non-leaf probe. The fix for that is routing the probe through
-        // `execute()` with a dynamic filter, which is a larger change.
-        vec![self.build_child()]
+        // Both, in plan order. The probe used to be omitted because it was
+        // driven through a bespoke helper rather than `execute()`, which made
+        // it invisible to every `children()` walk: `PROFILE`, the
+        // operator-activation gate that reads `runtime_stats`, and DataFusion's
+        // own tree-walking optimizer rules (#179). It now runs through
+        // `execute()` with its vid set published into a `DynamicVidFilter`
+        // immediately before each call, so there is nothing left to hide.
+        vec![&self.left, &self.right]
     }
 
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        if children.len() != 1 {
+        if children.len() != 2 {
             return Err(datafusion::error::DataFusionError::Plan(format!(
-                "VidLookupJoinExec expects exactly one child (the build side); got {}",
+                "VidLookupJoinExec expects two children (build and probe); got {}",
                 children.len()
             )));
         }
-        let new_build = children.into_iter().next().unwrap();
-        let (new_left, new_right) = match self.probe_side {
-            ProbeSide::Left => (self.left.clone(), new_build),
-            ProbeSide::Right => (new_build, self.right.clone()),
-        };
+        let mut it = children.into_iter();
+        let new_left = it.next().unwrap();
+        let new_right = it.next().unwrap();
+        // Rebuilt through `try_new`, which re-wires a fresh `DynamicVidFilter`
+        // into whichever child is the probe. Re-wrapping an already-wired probe
+        // is harmless — `with_dynamic_vid_filter` replaces the slot — and doing
+        // it here is what keeps the link intact when a rule hands back a
+        // rewritten subtree.
         Ok(Arc::new(Self::try_new(
             new_left,
             new_right,
@@ -322,9 +308,7 @@ impl ExecutionPlan for VidLookupJoinExec {
         context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         let metrics = BaselineMetrics::new(&self.metrics, partition);
-        let probe_metrics = BaselineMetrics::new(&self.probe_metrics, partition);
-        let probe_index_consulted =
-            MetricBuilder::new(&self.probe_metrics).counter("index_consulted", partition);
+        let probe_filter = self.probe_filter.clone();
         let build = self.build_child().clone();
         let probe = self.probe_child().clone();
         let probe_side = self.probe_side;
@@ -338,8 +322,7 @@ impl ExecutionPlan for VidLookupJoinExec {
             run_join(
                 build,
                 probe,
-                probe_metrics,
-                probe_index_consulted,
+                probe_filter,
                 probe_side,
                 pairs,
                 join_kind,
@@ -417,8 +400,7 @@ impl RecordBatchStream for VidLookupJoinStream {
 async fn run_join(
     build: Arc<dyn ExecutionPlan>,
     probe: Arc<dyn ExecutionPlan>,
-    probe_metrics: BaselineMetrics,
-    probe_index_consulted: Count,
+    probe_filter: Arc<DynamicVidFilter>,
     probe_side: ProbeSide,
     pairs: Vec<EquiPair>,
     join_kind: VidJoinKind,
@@ -480,20 +462,22 @@ async fn run_join(
         }
     }
 
-    // 3. Execute the probe scan with chunked IN-list filters and concat
-    // the batches. With cap-busting build sizes we chunk into
-    // MAX_VIDS_PER_CHUNK pieces; total Lance work scales the same as a
-    // single big scan, but no chunk's IN-list exceeds the safe bound.
+    // 3. Execute the probe scan through the ordinary `ExecutionPlan` API,
+    // publishing each chunk of vids into the slot it was wired with (#179).
+    //
+    // Going through `execute()` is what lets the probe be a real child: its own
+    // `BaselineMetrics` and `index_consulted` counter register on its own node,
+    // so `collect_plan_metrics`, the operator-activation gate and DataFusion's
+    // tree-walking rules all see it without this operator splicing anything in.
+    //
+    // Chunking is unchanged and still lives here. `GraphScanStream` hands its
+    // whole vid list to one scan call, so a cap-busting build set must be split
+    // before it is published or the `_vid` IN-list would exceed the bound that
+    // keeps the scalar index earning its keep.
     let probe_scan = probe
         .as_any()
         .downcast_ref::<GraphScanExec>()
         .expect("planner ensured probe is GraphScanExec");
-    // Time and count the probe read as its own operator (#179). The probe is
-    // not a child, so nothing else records it: before this, a `PROFILE` of a
-    // query using this operator showed a join with one input and no scan
-    // beneath it, and both `actual_rows` and `time_ms` for the expensive side
-    // read zero.
-    let probe_timer = probe_metrics.elapsed_compute().timer();
     let probe_batch = if vid_set.is_empty() {
         // No build VIDs → no probe rows to fetch. Still need an empty
         // batch with the correct schema for downstream NULL-padding logic.
@@ -502,6 +486,7 @@ async fn run_join(
         let vids: Vec<u64> = vid_set.iter().copied().collect();
         let mut chunks: Vec<RecordBatch> = Vec::new();
         let mut chunk_bytes = 0usize;
+
         // At high selectivity one unfiltered pass replaces the chunked lookups
         // (#237, on #260's statistic). Safe here because the probe batch is
         // consumed through a `_vid` index that *build* rows drive: a probe row
@@ -510,27 +495,43 @@ async fn run_join(
         // residency this arm accepts is accounted rather than hidden — which is
         // why the threshold waits until the memory is comparable anyway.
         let table_rows = probe_scan.cached_table_rows().await;
-        if crate::query::df_graph::scan::vertex_scan_beats_lookup(vids.len(), table_rows) {
-            let batch = probe_scan.execute_all(Some(&probe_index_consulted)).await?;
-            if batch.num_rows() > 0 {
-                let size = batch.get_array_memory_size();
-                reservation.try_grow(size)?;
-                chunk_bytes += size;
-                chunks.push(batch);
-            }
-        } else {
-            for chunk in vids.chunks(MAX_VIDS_PER_CHUNK) {
-                let batch = probe_scan
-                    .execute_with_vid_filter(chunk, Some(&probe_index_consulted))
-                    .await?;
+        let publish: Vec<Option<Vec<u64>>> =
+            if crate::query::df_graph::scan::vertex_scan_beats_lookup(vids.len(), table_rows) {
+                // `None` in the slot means "no vid restriction" — the whole
+                // table, in one execution.
+                vec![None]
+            } else {
+                vids.chunks(MAX_VIDS_PER_CHUNK)
+                    .map(|chunk| Some(chunk.to_vec()))
+                    .collect()
+            };
+
+        for restriction in publish {
+            probe_filter.set(restriction);
+            let mut stream = probe.execute(partition, context.clone())?;
+            let mut parts: Vec<RecordBatch> = Vec::new();
+            while let Some(batch) = futures::StreamExt::next(&mut stream).await {
+                let batch = batch?;
                 if batch.num_rows() > 0 {
-                    let size = batch.get_array_memory_size();
-                    reservation.try_grow(size)?;
-                    chunk_bytes += size;
-                    chunks.push(batch);
+                    parts.push(batch);
                 }
             }
+            let batch = match parts.len() {
+                0 => continue,
+                1 => parts.pop().unwrap(),
+                _ => {
+                    let schema = parts[0].schema();
+                    arrow::compute::concat_batches(&schema, &parts).map_err(|e| {
+                        datafusion::error::DataFusionError::ArrowError(Box::new(e), None)
+                    })?
+                }
+            };
+            let size = batch.get_array_memory_size();
+            reservation.try_grow(size)?;
+            chunk_bytes += size;
+            chunks.push(batch);
         }
+
         if chunks.is_empty() {
             RecordBatch::new_empty(probe_scan.schema())
         } else if chunks.len() == 1 {
@@ -549,8 +550,6 @@ async fn run_join(
             combined
         }
     };
-    probe_timer.done();
-    probe_metrics.record_output(probe_batch.num_rows());
 
     // 4. Index probe by `_vid`. The probe scan's schema always carries a
     // `_vid` column at a known position relative to its projected

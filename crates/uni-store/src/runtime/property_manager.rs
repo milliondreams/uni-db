@@ -843,7 +843,8 @@ impl PropertyManager {
     ///
     /// `None` resolves the set instead: L0 first, then whatever L0 misses in
     /// one indexed `_eid`/`type` pass over `main_edges`
-    /// ([`MainEdgeDataset::find_types_by_eids_counted`]). Only an EID that
+    /// ([`crate::storage::main_edge::MainEdgeDataset::find_types_by_eids_counted`]).
+    /// Only an EID that
     /// neither tier knows still scans every edge type in the schema.
     ///
     /// That fan-out used to be the *normal* path rather than the exceptional

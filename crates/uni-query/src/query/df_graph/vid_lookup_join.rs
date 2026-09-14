@@ -9,7 +9,7 @@
 //!
 //!   1. Run the build side fully and collect its rows.
 //!   2. Extract distinct VIDs from the build side's anchor-pair column.
-//!   3. Publish them into the probe scan's [`DynamicVidFilter`] and run the
+//!   3. Publish them into the probe scan's `DynamicVidFilter` and run the
 //!      probe through the ordinary `ExecutionPlan::execute`, which pushes them
 //!      as `_vid IN (...)`. If the build VID set exceeds `MAX_VIDS_PER_CHUNK`
 //!      we publish and execute once per chunk and concat the batches — bounded

@@ -714,7 +714,7 @@ impl LocyAggState for CollectState {
 pub struct MnorAgg;
 
 impl LocyAggregate for MnorAgg {
-    /// `MNOR`: noisy-OR over [0,1] only rises.
+    /// `MNOR`: noisy-OR over `[0, 1]` only rises.
     fn direction(&self) -> FoldDirection {
         FoldDirection::NonDecreasing
     }
@@ -839,7 +839,7 @@ impl LocyAggState for MnorState {
 pub struct MprodAgg;
 
 impl LocyAggregate for MprodAgg {
-    /// `MPROD`: a product of values in [0,1] only falls.
+    /// `MPROD`: a product of values in `[0, 1]` only falls.
     fn direction(&self) -> FoldDirection {
         FoldDirection::NonIncreasing
     }

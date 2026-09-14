@@ -10465,39 +10465,6 @@ fn terminal_projection(plan: &LogicalPlan) -> Option<&Vec<(Expr, Option<String>)
     }
 }
 
-/// Record, under [`DEAD_UNWIND_SOURCES_KEY`], every `UNWIND` source variable
-/// that nothing else in the plan reads.
-///
-/// `UNWIND xs AS x` consumes `xs`, but the list column keeps flowing: every
-/// operator above it copies its input columns forward, and a traversal copies
-/// them once **per fan-out row**. So a collected list of *n* entities unwound
-/// and then traversed is re-materialised `rows × n` times, in
-/// `GraphUnwindStream::build_output_batch`'s `take` over the input columns —
-/// which is `rows × list_size` bytes and is the 14 TB allocation that aborts
-/// the process on LDBC SNB IC6 and IC9 at SF1 (#184). Inserting a bare `WITH f`
-/// after the `UNWIND` makes the identical query answer correctly, because the
-/// projection drops the list; this does the same thing without the user having
-/// to know.
-///
-/// Liveness is decided by absence, not by a top-down required-set walk: a
-/// source is dead when the *whole* plan, with the `UNWIND` expressions
-/// themselves blanked out, never mentions it. Re-using
-/// [`collect_properties_from_plan`] for that is the point — it is the
-/// exhaustive walker this crate already maintains, so a plan variant added
-/// later cannot quietly escape the analysis and leave a live column pruned.
-///
-/// Three deliberate refusals, each of which would otherwise be a wrong answer
-/// rather than a slow query:
-///
-/// - **`RETURN *` / `WITH *`.** A wildcard names nothing, so absence proves
-///   nothing. Any wildcard anywhere and the whole analysis stands down — both a
-///   `LogicalPlan::Project` wildcard and one inside a subquery body, which is
-///   AST hanging off an expression and so invisible to the plan-level survey.
-/// - **A source unwound more than once.** Blanking removes every `UNWIND`
-///   expression at once, so two `UNWIND xs` nodes would each look unreferenced
-///   by the other. Only a source used by exactly one is considered.
-/// - **A non-variable source.** `UNWIND range(1,10) AS i` has no column to
-///   drop; only a bare variable is a candidate.
 /// Downgrade `"*"` to the structural-only marker for an entity whose only use
 /// is being counted.
 ///
@@ -10661,6 +10628,39 @@ fn survey_count_only(
     }
 }
 
+/// Record, under [`DEAD_UNWIND_SOURCES_KEY`], every `UNWIND` source variable
+/// that nothing else in the plan reads.
+///
+/// `UNWIND xs AS x` consumes `xs`, but the list column keeps flowing: every
+/// operator above it copies its input columns forward, and a traversal copies
+/// them once **per fan-out row**. So a collected list of *n* entities unwound
+/// and then traversed is re-materialised `rows × n` times, in
+/// `GraphUnwindStream::build_output_batch`'s `take` over the input columns —
+/// which is `rows × list_size` bytes and is the 14 TB allocation that aborts
+/// the process on LDBC SNB IC6 and IC9 at SF1 (#184). Inserting a bare `WITH f`
+/// after the `UNWIND` makes the identical query answer correctly, because the
+/// projection drops the list; this does the same thing without the user having
+/// to know.
+///
+/// Liveness is decided by absence, not by a top-down required-set walk: a
+/// source is dead when the *whole* plan, with the `UNWIND` expressions
+/// themselves blanked out, never mentions it. Re-using
+/// [`collect_properties_from_plan`] for that is the point — it is the
+/// exhaustive walker this crate already maintains, so a plan variant added
+/// later cannot quietly escape the analysis and leave a live column pruned.
+///
+/// Three deliberate refusals, each of which would otherwise be a wrong answer
+/// rather than a slow query:
+///
+/// - **`RETURN *` / `WITH *`.** A wildcard names nothing, so absence proves
+///   nothing. Any wildcard anywhere and the whole analysis stands down — both a
+///   `LogicalPlan::Project` wildcard and one inside a subquery body, which is
+///   AST hanging off an expression and so invisible to the plan-level survey.
+/// - **A source unwound more than once.** Blanking removes every `UNWIND`
+///   expression at once, so two `UNWIND xs` nodes would each look unreferenced
+///   by the other. Only a source used by exactly one is considered.
+/// - **A non-variable source.** `UNWIND range(1,10) AS i` has no column to
+///   drop; only a bare variable is a candidate.
 pub(crate) fn mark_dead_unwind_sources(
     plan: &LogicalPlan,
     properties: &mut HashMap<String, HashSet<String>>,

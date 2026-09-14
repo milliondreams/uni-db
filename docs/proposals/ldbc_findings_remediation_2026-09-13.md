@@ -253,28 +253,72 @@ Do the fixture first. It answers whether the gate is worth building.
 Neither of these has a mechanism. Both are listed with the cheapest test that
 could kill the first hypothesis, per the ordering principle's rule 4.
 
-### 1.1 ~712 MB is held before the traverse asks — **narrowed, folds into 0.1**
+### 1.1 ~712 MB is held before the traverse asks — **RESOLVED 2026-09-14**
 
-Every refusal in the *unlabelled-source* shape ends with the byte-identical
-string `361.9 MB remain available for the total pool`. Against a 1073.7 MB pool
-that is **711.8 MB already held** at the moment `GraphTraverseExec[0]` asks,
-with `0.0 B already allocated for this reservation`. It did not vary with the
-query, the edge type, the batch size, or the store.
+It is `GraphScanExec`'s reservation for the `ScanAll`, and it is an honest
+charge for a batch that genuinely exists.
 
-**An earlier draft of this plan called that invariant across all queries. IC14
-falsifies it:** IC14 refuses with `1023.6 MB remain available` — the pool is
-nearly empty there. So the 711.8 MB is not a constant baseline. It appears in
-the unlabelled-source traverse shape and not otherwise, which makes the most
-likely holder the full vertex scan that shape provokes — i.e. the same defect as
-0.1, seen from the pool's side rather than the operator's.
+`ScanAll` lowers to `GraphScanExec::new_schemaless_all_scan`, which sets
+`is_schemaless = true`. The chunking gate at
+`crates/uni-query/src/query/df_graph/scan.rs:2063` reads
+`whole.is_none() && self.filter.is_none() && !self.is_schemaless`, so a
+schemaless scan never reaches `RangeChunking` — the #214 path that bounds
+construction for a full-label scan. **The entire vertex set is therefore built
+as one batch**, and `scan.rs:2195` reserves its true size. The rustdoc at
+`scan.rs:828-834` states the consequence outright: for an unchunked scan "the
+batch is already built by this point, so the reservation bounds how long an
+over-budget result survives rather than preventing its construction."
 
-**Demoted from an independent open question to a check on 0.1's fix.** If 0.1 is
-fixed and the 711.8 MB disappears from these plans, this is closed with it. If
-it survives, it is a separate holder and gets its own item.
+The exclusion is not arbitrary. The sizing step it guards calls
+`storage.vertex_row_count(&label)` (`scan.rs:2066`) — a *per-label* count — and
+a label-less scan has no label to count. Same missing primitive as 0.3.
 
-**Test, unchanged and still worth running:** dump the per-consumer reservation
-table at the point of refusal (`GreedyMemoryPool`, `read.rs:723`). That names
-the holder directly instead of inferring it, and it is one debug build.
+Measured, same process, RSS above a 9892-row baseline:
+
+| scan | rows | RSS | delta | bytes/row |
+|---|---:|---:|---:|---:|
+| `(n:Person)` | 9 892 | 845 MB | — | — |
+| `(n:Comment)`, chunked | 2 052 169 | 1230 MB | +384 MB | 187 |
+| `(n)`, unchunked | 3 181 724 | 3091 MB | **+2245 MB** | **706** |
+
+Comment carries 64.5% of ScanAll's rows for 17% of its memory growth: 5.8x the
+memory for 1.55x the rows. That gap is the chunking, not the row count.
+
+**Two consequences.**
+
+First, it closes the question as predicted: the 711.8 MB does fold into 0.1,
+because narrowing an unlabelled source does not merely read fewer rows — it
+moves the scan off the schemaless path onto the chunked one. That is the larger
+half of 0.1's 76x memory reduction and it was not in the original diagnosis.
+
+Second, it promotes a defect in its own right — 1.4.
+
+### 1.4 `ScanAll` is never chunked — **P1, new, opened by 1.1**
+
+Every full-graph scan materialises every vertex in a single `RecordBatch`. At
+SF1 that is 711.8 MB reserved and ~2245 MB resident for `MATCH (n)`, a query
+with no traversal in it at all. `RangeChunking` already solves exactly this for
+a labelled scan (#214); the schemaless arm is excluded only because it cannot
+name a label to size.
+
+This is not confined to the benchmark: it is every unlabelled `MATCH (n)` on any
+graph, and it scales with the graph rather than with the result. The pool cannot
+prevent it either — by the time the reservation is taken the batch exists, so
+the refusal bounds residency, not construction.
+
+**Fix shape, and it is shared with 0.3.** Give `CardinalityCache` an
+`AllVertices` key over the main `vertices` table, then let the schemaless arm
+size itself from it and take `RangeChunking`. The same addition supplies the
+denominator 0.3 needs to widen the source narrowing to multiple labels. One
+primitive unblocks both — which is the argument for doing it once, properly,
+rather than either in isolation.
+
+Sizing: **M**. Per the earlier survey the cache addition is four small edits
+(variant, two table mappings, an L0 arm using `l0.vertex_labels.len()` since
+`label_to_vids` double-counts multi-labelled vertices) plus a seeding call on
+the async query entry path, because the cache is lazily populated and the
+planner can only `get`. Wiring the scan arm is separate and needs care: the
+existing `Sizing` state is label-keyed throughout.
 
 ### 1.2 CONTAINER_OF ingests at 8.5k rows/s against HAS_MEMBER's 133k — **open question**
 
@@ -359,22 +403,62 @@ their own. IC14's ceiling is a live question for 1.3: whether 4.2 GB is the
 honest cost of SF1 `allShortestPaths` or an over-estimate is unmeasured, and the
 2026-08-27 record of 19.2 GB and climbing suggests the former.
 
-### 2.1 Parameters admit most of the corpus — [#227], **open, unchanged**
+### 2.1 Parameters admit most of the corpus — [#227], **investigated 2026-09-14**
 
-Confirmed still accurate this run. `minDate` is the corpus-minimum post date, so
+Confirmed still accurate. The date window collapses to the whole corpus:
+`startDate = minDate = min(Post.creationDate)`, `endDate = minDate + span =
+maxDate`, so IC3's and IC4's `[startDate, endDate)` filter is a **no-op** and
 IC5's `membership.joinDate > $minDate` admits essentially all 1.6M HAS_MEMBER
-edges. **Any latency this harness reports is an upper bound, not an
-LDBC-comparable figure**, and nothing in this plan changes that.
+edges. For scale, LDBC's own example header on ic3.cypher uses a **28-day**
+window; ours is the full corpus span.
 
-The issue's own re-verification note cites
-`crates/uni/benches/common/ldbc/params.rs`; that path does not exist —
-`benches/common/` contains only `ann_fixtures.rs`. The file is at
-`crates/uni/benches/ldbc/params.rs`. Worth correcting on the issue so the next
-reader does not chase it.
+`durationDays` is confirmed dead — `grep -rn durationDays` hits only
+`params.rs:114`, no `.cypher` file references it. The issue's own correction was
+right.
 
-Sizing per the issue: **M**, a second curated parameter source selected
-alongside the derivation, not a narrowing of it — the `VACUOUS` gate
-(`ldbc_snb.rs:798-812`) is why the parameters were widened in the first place.
+**The curated parameters cannot be sourced. This is the finding.** The issue is
+written as though a curated set exists to be selected alongside the derivation.
+It does not, anywhere this repo can reach:
+
+- `scripts/fixtures/fixtures.toml` has 31 LDBC entries, every one a
+  `dynamic/*.csv` or `static/*.csv` dataset file. No substitution-parameter,
+  `*_param.txt` or factor-table entry.
+- The upstream mirror the fixtures point at holds 33 files total: the 31 CSVs,
+  `.gitattributes`, and a rename script. No `substitution_parameters/`.
+- Repo-wide, `substitution_param|paramgen|_param.txt|factor_table` matches only
+  doc comments in `ldbc_snb.rs` and `params.rs`.
+
+LDBC's `paramgen` consumes datagen's factor tables, which a pre-baked CSV mirror
+does not ship. So there are exactly two paths, and the issue's **M** sizing
+covers neither honestly:
+
+1. **Regenerate** — run LDBC datagen + paramgen at SF1, mirror
+   `substitution_parameters/*_param.txt` as new fixtures. Authentic and
+   reusable; cost is a datagen run and a new fixture set, not a code change.
+2. **Hand-author** — pick a narrow window and ids against the loaded graph and
+   justify each. Cheap to write, but it is *our* parameter set wearing LDBC's
+   name, and it cannot be defended as comparable to anyone else's numbers. If
+   this path is taken the document must say so wherever the numbers appear.
+
+Recommend (1). The whole point of #227 is comparability, and (2) does not
+deliver it — it would replace "not comparable, and we say so" with "not
+comparable, and we imply otherwise", which is worse.
+
+**The wiring is genuinely small either way.** `params::derive` returns
+`HashMap<String, uni_db::Value>` (`params.rs:46`) and is called at one place,
+`ldbc_snb.rs:592-595`. An alternative producer of the same type behind an env
+switch is a few lines, and `run_query` binds only keys the query text mentions
+(`ldbc_snb.rs:349-353`), so a curated map may be partial and merged over the
+derived one. The 13 live keys are listed in the survey above.
+
+**One blocker that must land with it:** the `VACUOUS` gate
+(`ldbc_snb.rs:795-812`) exits 1 on any zero-row query, and its error message
+tells the reader to *widen* `params.rs`. A curated window will legitimately make
+some queries return nothing at SF1. The gate has to become lane-aware — assert
+non-emptiness for the derived/oracle lane, report-but-do-not-fail for the
+curated lane — or the honest parameters turn the harness red and the next person
+widens them again. That is the same pressure that produced today's parameters,
+so leaving the gate alone would re-create the problem.
 
 ### 2.2 The load docstring understates the load by ~80% — **S**
 
@@ -440,7 +524,8 @@ a store is trusted, not after a measurement is published.
 | 0.1 | narrow an unlabelled source to its edge type's labels | 0 | **done** | — |
 | 1.1 | dump the per-consumer reservation table | 1 | S | 1.3 |
 | 0.3 | multi-label fixture, then decide on a cardinality gate | 0 | S | widening 0.1 |
-| 2.1 | curated parameter source (#227) | 2 | M | 2.0's IC3, comparable latencies |
+| 2.1 | curated parameter source (#227) | 2 | M code, L to source values | 2.0's IC3, comparable latencies |
+| 1.4 | chunk `ScanAll` (shares 0.3's primitive) | 1 | M | full-graph scan memory |
 | 2.0 | IC3 / IC9 / IC14 | 2 | IC3 gated on 2.1 | — |
 | 1.3 | what the pool does not bound | 1 | M to investigate | honest memory claims |
 | 1.2 | CONTAINER_OF load-order test | 1 | S | — |

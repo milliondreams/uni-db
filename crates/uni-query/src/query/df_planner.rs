@@ -743,6 +743,8 @@ impl HybridPhysicalPlanner {
         // Record which UNWIND sources are dead so `plan_unwind` can stop
         // carrying them past the operator that consumed them (#184).
         crate::query::planner::mark_dead_unwind_sources(&logical_rewritten, &mut all_properties);
+        // `count(n)` needs to know a row exists, not what is in it (#184 family).
+        crate::query::planner::relax_count_only_entities(&logical_rewritten, &mut all_properties);
 
         // Delegate to internal planning with properties context
         self.plan_internal(&logical_rewritten, &all_properties)
@@ -766,6 +768,8 @@ impl HybridPhysicalPlanner {
         }
         apply_passthrough_reconciliation(&logical_rewritten, &mut all_properties);
         crate::query::planner::mark_dead_unwind_sources(&logical_rewritten, &mut all_properties);
+        // `count(n)` needs to know a row exists, not what is in it (#184 family).
+        crate::query::planner::relax_count_only_entities(&logical_rewritten, &mut all_properties);
         self.plan_internal(&logical_rewritten, &all_properties)
     }
 
@@ -2523,7 +2527,22 @@ impl HybridPhysicalPlanner {
         let need_full = all_properties
             .get(variable)
             .is_some_and(|p| p.contains("*") || p.contains(STRUCT_ONLY_SENTINEL));
-        if !properties.iter().any(|p| p == "_all_props") {
+        let need_full_record = all_properties
+            .get(variable)
+            .is_some_and(|p| p.contains("*"));
+        // Schemaless properties live in one JSON blob, so reading *any* of them
+        // means reading it -- a named property is extracted from the blob just
+        // as `_all_props` is. A full record needs it; so does any specific
+        // property.
+        //
+        // What does not is a variable nothing reads at all. That used to be
+        // unreachable, because every pattern variable arrived marked `"*"`.
+        // `relax_count_only_entities` makes it reachable by downgrading a
+        // count-only entity to the structural marker, and this is the half that
+        // turns the downgrade into a narrower scan -- forcing the blob
+        // unconditionally here would discard it before it reached storage.
+        let reads_a_property = !properties.is_empty();
+        if (need_full_record || reads_a_property) && !properties.iter().any(|p| p == "_all_props") {
             properties.push("_all_props".to_string());
         }
         (properties, need_full)

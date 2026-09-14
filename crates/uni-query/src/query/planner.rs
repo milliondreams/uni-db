@@ -10498,6 +10498,169 @@ fn terminal_projection(plan: &LogicalPlan) -> Option<&Vec<(Expr, Option<String>)
 ///   by the other. Only a source used by exactly one is considered.
 /// - **A non-variable source.** `UNWIND range(1,10) AS i` has no column to
 ///   drop; only a bare variable is a candidate.
+/// Downgrade `"*"` to the structural-only marker for an entity whose only use
+/// is being counted.
+///
+/// `mark_pattern_variables` marks every pattern variable `"*"` — a full record
+/// — before anything has said it wants one, because most uses of a variable do.
+/// `count(n)` does not: it needs to know a row exists, not what is in it. For a
+/// schemaless scan the difference is the whole property blob of every vertex,
+/// and at LDBC SF1 `MATCH (n) RETURN count(n)` was reading every property of
+/// 3.18M vertices in order to count them. Fat rows also narrow the `_vid` range
+/// walk, which sizes each range against a byte budget, so the waste paid twice:
+/// once in bytes moved and again in per-range overhead.
+///
+/// The downgrade target is deliberately [`STRUCT_ONLY_SENTINEL`] rather than
+/// nothing. `SET n.prop = val` already uses it to mean "build the bare struct
+/// column, do not pull the full schema", which is exactly what `count(n)` needs
+/// — `count` over an entity still evaluates the column, it just never looks
+/// inside it. Removing the marker outright would take the column away too.
+///
+/// **Fails closed.** The survey returns `false` on any operator it does not
+/// explicitly understand and then nothing is changed, because the cost of being
+/// wrong here is asymmetric: projecting too much is slow, projecting too little
+/// is a silently missing property. A new `LogicalPlan` variant therefore
+/// disables this optimization rather than quietly under-projecting through it.
+pub(crate) fn relax_count_only_entities(
+    plan: &LogicalPlan,
+    properties: &mut HashMap<String, HashSet<String>>,
+) {
+    // The same kinds map `collect_properties_from_plan` uses. It is not
+    // optional: `collect_properties_from_expr_into` consults it to decide
+    // whether a bare variable is an entity, and an empty map makes it record
+    // *fewer* reads. Under-recording reads here is the one direction that
+    // breaks correctness -- a variable whose read went unseen looks count-only
+    // and loses properties something actually wanted.
+    let mut kinds: HashMap<String, VariableKind> = HashMap::new();
+    crate::query::df_planner::collect_variable_kinds(plan, &mut kinds);
+
+    let mut counted: HashSet<String> = HashSet::new();
+    let mut used: HashSet<String> = HashSet::new();
+    if !survey_count_only(plan, &kinds, &mut counted, &mut used) {
+        return;
+    }
+    for var in counted.difference(&used) {
+        if let Some(set) = properties.get_mut(var)
+            && set.remove("*")
+        {
+            set.insert(STRUCT_ONLY_SENTINEL.to_string());
+        }
+    }
+}
+
+/// Is `expr` exactly `count(v)` over a bare variable? Returns the variable.
+///
+/// `count(n.prop)` does not qualify — that reads a property.
+///
+/// `count(DISTINCT n)` is excluded too, conservatively: it must compare
+/// entities rather than merely observe that a row exists. Do not read that
+/// exclusion as an explanation of what `count(DISTINCT n)` costs. Measured at
+/// LDBC SF1 it projects as narrowly as the non-distinct form (11 ranges, not
+/// 18) through some path this pass does not control and which is *not
+/// identified* — two attempts to attribute it were inconclusive, the second
+/// because `ORDER BY … LIMIT 1` over a scalar aggregate is elided and so did
+/// not disable this pass as the control assumed. The guard stays because it is
+/// the safe direction, not because it is known to bind.
+fn count_arg_variable(expr: &Expr) -> Option<&str> {
+    let Expr::FunctionCall {
+        name,
+        args,
+        distinct,
+        ..
+    } = expr
+    else {
+        return None;
+    };
+    if !name.eq_ignore_ascii_case("count") || *distinct || args.len() != 1 {
+        return None;
+    }
+    match &args[0] {
+        Expr::Variable(v) => Some(v.as_str()),
+        _ => None,
+    }
+}
+
+/// Walk the plan recording counted-only variables and every other variable read.
+///
+/// Returns `false` the moment it meets an operator it does not model, which
+/// makes the caller leave every projection alone.
+fn survey_count_only(
+    plan: &LogicalPlan,
+    kinds: &HashMap<String, VariableKind>,
+    counted: &mut HashSet<String>,
+    used: &mut HashSet<String>,
+) -> bool {
+    let note = |e: &Expr, used: &mut HashSet<String>| {
+        let mut props: HashMap<String, HashSet<String>> = HashMap::new();
+        collect_properties_from_expr_into(e, &mut props, kinds);
+        used.extend(props.into_keys());
+    };
+    match plan {
+        // Leaves. Their `filter` is a real read of the variable.
+        LogicalPlan::Scan { filter, .. }
+        | LogicalPlan::ScanAll { filter, .. }
+        | LogicalPlan::ScanMainByLabels { filter, .. } => {
+            if let Some(f) = filter {
+                note(f, used);
+            }
+            true
+        }
+        LogicalPlan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => {
+            for g in group_by {
+                note(g, used);
+            }
+            for a in aggregates {
+                match count_arg_variable(a) {
+                    Some(v) => {
+                        counted.insert(v.to_string());
+                    }
+                    // Any other aggregate reads whatever it names.
+                    None => note(a, used),
+                }
+            }
+            survey_count_only(input, kinds, counted, used)
+        }
+        LogicalPlan::Project { input, projections } => {
+            for (e, _) in projections {
+                match count_arg_variable(e) {
+                    Some(v) => {
+                        counted.insert(v.to_string());
+                    }
+                    None => note(e, used),
+                }
+            }
+            survey_count_only(input, kinds, counted, used)
+        }
+        LogicalPlan::Filter {
+            input, predicate, ..
+        } => {
+            note(predicate, used);
+            survey_count_only(input, kinds, counted, used)
+        }
+        LogicalPlan::Traverse {
+            input,
+            target_filter,
+            edge_filter_expr,
+            ..
+        } => {
+            if let Some(f) = target_filter {
+                note(f, used);
+            }
+            if let Some(f) = edge_filter_expr {
+                note(f, used);
+            }
+            survey_count_only(input, kinds, counted, used)
+        }
+        // Everything else -- including every operator added after this was
+        // written -- is unmodelled, so the optimization declines.
+        _ => false,
+    }
+}
+
 pub(crate) fn mark_dead_unwind_sources(
     plan: &LogicalPlan,
     properties: &mut HashMap<String, HashSet<String>>,

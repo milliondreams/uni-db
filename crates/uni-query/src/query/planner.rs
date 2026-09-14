@@ -6091,6 +6091,12 @@ impl QueryPlanner {
         // no rows.
         let mut src_labels = Vec::new();
         let mut unknown_types = Vec::new();
+        // How many of `params.rel.types` resolved to a schema edge type that
+        // contributed endpoint labels. Virtual and unknown types contribute
+        // none, so this is not `params.rel.types.len()` in general — and the
+        // source-narrowing below requires *every* named type to have declared
+        // endpoints before it can bound the source.
+        let mut declared_types = 0usize;
 
         if params.rel.types.is_empty() {
             // All types - include both schema and schemaless edge types
@@ -6107,6 +6113,7 @@ impl QueryPlanner {
                     edge_type_ids.push(edge_meta.id);
                     dst_labels.extend(edge_meta.dst_labels.iter().cloned());
                     src_labels.extend(edge_meta.src_labels.iter().cloned());
+                    declared_types += 1;
                 } else if let Some((vid, _)) = self.allocate_virtual_edge_type(type_name)? {
                     // M5b.3: virtual edge type (plugin-registered CatalogTable).
                     // Resolving it into `edge_type_ids` (not `unknown_types`)
@@ -6126,6 +6133,110 @@ impl QueryPlanner {
         edge_type_ids.dedup();
         unknown_types.sort_unstable();
         unknown_types.dedup();
+
+        // Labels an *unlabelled source* can be narrowed to, from the edge
+        // type's declared endpoints. Computed here because the target-side
+        // inference below consumes `src_labels`/`dst_labels` by move.
+        //
+        // `MATCH ()-[w:WORK_AT]->()` planned the source as `ScanAll` — every
+        // vertex in the graph — and expanded from each one, even though the
+        // traversal can only ever depart from a label WORK_AT declares. At
+        // LDBC SF1 that is 3.18M vertices for 21654 edges: 2278 MB resident
+        // and 5.2s, against 30 MB and 0.13s for the identical answer once the
+        // source is labelled, and the 1 GiB default query pool refuses it
+        // outright.
+        //
+        // This is sound because the storage layer has already made the same
+        // commitment: `AdjacencyManager` loads CSR adjacency only for
+        // `src_labels` on an outgoing traversal and `dst_labels` on an
+        // incoming one (`adjacency_manager.rs`, `labels_to_load`). A typed
+        // traversal reads exclusively through that CSR, so an edge whose
+        // source carries none of the declared labels is *already* invisible
+        // to it. Narrowing the scan to the same set cannot drop a row the
+        // traverse would have produced.
+        //
+        // The direction mapping mirrors `labels_to_load` exactly, and is the
+        // source-side mirror of the target-side inference further down —
+        // which carries its own comment about the silent wrong answer that
+        // ignoring direction caused there:
+        //
+        //   ()-[:R]->(b)   the source is on the edge's src side -> src_labels
+        //   ()<-[:R]-(b)   the source is on the edge's dst side -> dst_labels
+        //   ()-[:R]-(b)    either side -> the union, which is what the CSR
+        //                  loads for `Direction::Both`
+        let source_narrowing: Option<Vec<String>> = {
+            let every_type_declared =
+                !params.rel.types.is_empty() && declared_types == params.rel.types.len();
+            if !every_type_declared || !unknown_types.is_empty() {
+                // A bare `-[r]->` means every edge type, whose endpoint union
+                // is every label — narrowing to it buys nothing and would
+                // exclude unlabelled vertices. A virtual or unknown type
+                // declares no endpoints and an unknown one is served by
+                // `TraverseMainByType`, which reads the main edge table
+                // rather than per-label adjacency, so the label set does not
+                // bound it.
+                None
+            } else {
+                let mut labels: Vec<String> = match params.rel.direction {
+                    Direction::Outgoing => src_labels.clone(),
+                    Direction::Incoming => dst_labels.clone(),
+                    Direction::Both => {
+                        let mut both = src_labels.clone();
+                        both.extend(dst_labels.iter().cloned());
+                        both
+                    }
+                };
+                labels.sort();
+                labels.dedup();
+                // Bail rather than narrow to a subset: a declared endpoint
+                // label that is not itself a declared label cannot be turned
+                // into a `Scan`, and silently dropping it would be a wrong
+                // answer rather than a slow one.
+                let all_resolvable = labels
+                    .iter()
+                    .all(|l| self.schema.get_label_case_insensitive(l).is_some());
+                // Single label only, and this is measured rather than
+                // cautious. With one label the rewrite collapses to a plain
+                // `Scan` — the same operator the hand-written
+                // `(:Person)-[...]` form gets. With two or more it replaces
+                // one `ScanAll` with N `ScanMainByLabels` plus N-1 `Union`
+                // nodes, and that is not a narrowing: `ScanAll` reads the
+                // shared `vertices` table once, while the union reads N
+                // per-label tables whose rows together can exceed it.
+                //
+                // Measured at LDBC SF1, both arms in one process against the
+                // same store, warm sample of a repeated pair:
+                //
+                //   IS_LOCATED_IN  5297 ms -> 11630 ms   (2.2x slower)
+                //   HAS_TAG        5944 ms ->  8737 ms   (1.5x slower)
+                //   HAS_CREATOR    5666 ms ->  7999 ms   (1.4x slower)
+                //
+                // Those three are every multi-source type at SF1 with enough
+                // rows to time, and their label sets each cover ~96% of the
+                // graph, so there is no row saving to offset the union. A
+                // multi-label type whose labels are collectively *small*
+                // could still win; no such type exists in this corpus, so
+                // that case is unmeasured and deliberately not enabled on a
+                // guess. Enabling it would want a cardinality gate, which
+                // needs a total-vertex count `CardinalityCache` does not have
+                // (its `Vertex(label)` keys count `vertices_{label}`, a
+                // different table from the `vertices` that `ScanAll` reads,
+                // and it is populated lazily with no pre-warm).
+                //
+                // One label is not automatically a small label, and that
+                // costs nothing: REPLY_OF's only source label is Comment,
+                // 2052169 of SF1's 3181724 vertices, and it measures
+                // 5564/5479 ms narrowed against 5536/5503 ms not — the same
+                // within noise. Scan cost is linear in rows at ~530 ms/Mrow
+                // with the per-row cost alike on both tables, so narrowing to
+                // any single label is at worst neutral.
+                if labels.len() != 1 || !all_resolvable {
+                    None
+                } else {
+                    Some(labels)
+                }
+            }
+        };
 
         let mut target_variable = params.target_node.variable.clone().unwrap_or_default();
         if target_variable.is_empty() {
@@ -6505,6 +6616,26 @@ impl QueryPlanner {
         // Include bound edge variables from this path for cross-segment Trail mode
         // enforcement (same as the schemaless path above).
         scope_match_variables.extend(path_bound_edge_vars.iter().cloned());
+
+        // Apply the source narrowing computed above. Gated on the rewriter
+        // actually being able to rebuild this plan — the same gate the
+        // `WHERE n:A OR n:B` disjunction rewrite uses — so a `ScanAll` sitting
+        // under an operator the rewriter cannot descend is left alone rather
+        // than silently not narrowed. `replace_scan_all_with_label_union` is a
+        // no-op unless `source_variable` is currently bound to a `ScanAll`, so
+        // an already-labelled source keeps its `Scan`.
+        let plan = match source_narrowing {
+            Some(labels)
+                if Self::rewrite_target_reachable(
+                    &plan,
+                    source_variable,
+                    RewriteTarget::LabelUnion,
+                ) =>
+            {
+                self.replace_scan_all_with_label_union(plan, source_variable, &labels, false)
+            }
+            _ => plan,
+        };
 
         let mut plan = LogicalPlan::Traverse {
             input: Box::new(plan),

@@ -479,3 +479,138 @@ async fn a_disjunction_does_not_anchor() {
         "neither branch of an OR pins its variable, so the pattern plans as written"
     );
 }
+
+// ---------------------------------------------------------------------------
+// An anonymous unlabelled source, narrowed by the edge type's declared endpoints
+// ---------------------------------------------------------------------------
+//
+// `MATCH ()-[w:WORK_AT]->()` planned the source as `ScanAll` — every vertex —
+// and expanded from each, though the traversal can only depart from a label the
+// edge type declares. At LDBC SF1 that was 3.18M vertices for 21654 edges:
+// 2278 MB resident and 5.2s, refused outright by the 1 GiB default query pool,
+// against 30 MB and 0.13s once the source carries the label.
+//
+// Soundness is storage's, not the schema's: `AdjacencyManager` loads CSR
+// adjacency only for `src_labels` outgoing / `dst_labels` incoming, and a typed
+// traverse reads only through that CSR, so an edge whose source is outside the
+// declared set is already invisible. These assert on plan shape because the
+// answers are identical either way — only the plan can tell them apart.
+
+/// Two single-source types, one multi-source type, one self-referential type.
+async fn endpoint_planner() -> QueryPlanner {
+    let dir = tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    let sm = uni_common::core::schema::SchemaManager::load(&path.join("schema.json"))
+        .await
+        .unwrap();
+
+    for label in ["Person", "Post", "City", "Company"] {
+        sm.add_label(label).unwrap();
+        sm.add_property(label, "id", uni_common::core::schema::DataType::Int64, true)
+            .unwrap();
+    }
+    // Single source label: the narrowing applies.
+    sm.add_edge_type("WORK_AT", vec!["Person".into()], vec!["Company".into()])
+        .unwrap();
+    // Same label both ends: even undirected resolves to one label.
+    sm.add_edge_type("KNOWS", vec!["Person".into()], vec!["Person".into()])
+        .unwrap();
+    // Two source labels: the narrowing declines.
+    sm.add_edge_type(
+        "LOCATED_IN",
+        vec!["Person".into(), "Post".into()],
+        vec!["City".into()],
+    )
+    .unwrap();
+
+    QueryPlanner::new(sm.schema())
+}
+
+fn scans_all(plan: &LogicalPlan) -> bool {
+    format!("{plan:?}").contains("ScanAll")
+}
+
+/// Does the plan contain a label-scoped `Scan` naming `label`?
+fn scans_label(plan: &LogicalPlan, label: &str) -> bool {
+    format!("{plan:?}").contains(&format!("{label:?}"))
+}
+
+#[tokio::test]
+async fn an_anonymous_source_is_narrowed_to_the_edge_type_s_source_label() {
+    let p = endpoint_planner().await;
+    let plan = plan_of(&p, "MATCH ()-[w:WORK_AT]->() RETURN count(w) AS c");
+    assert!(
+        !scans_all(&plan),
+        "an outgoing typed edge declares its source label, so the source must \
+         not be a scan of every vertex: {plan:?}"
+    );
+    assert!(scans_label(&plan, "Person"), "{plan:?}");
+}
+
+/// Direction decides which side the source sits on. Getting this backwards is
+/// how the *target*-side inference once made `(b:B)<-[:R]-()` match nothing —
+/// a silent wrong answer with the data untouched.
+#[tokio::test]
+async fn an_incoming_anonymous_source_takes_the_destination_label() {
+    let p = endpoint_planner().await;
+    let plan = plan_of(&p, "MATCH ()<-[w:WORK_AT]-() RETURN count(w) AS c");
+    assert!(!scans_all(&plan), "{plan:?}");
+    assert!(
+        scans_label(&plan, "Company"),
+        "written `()<-[:WORK_AT]-()` the anonymous source is the edge's \
+         *destination*, so it narrows to Company, not Person: {plan:?}"
+    );
+}
+
+/// Undirected reaches both sides, so the source may be either. That is only one
+/// label when the type is self-referential.
+#[tokio::test]
+async fn an_undirected_self_referential_type_still_narrows() {
+    let p = endpoint_planner().await;
+    let plan = plan_of(&p, "MATCH ()-[w:KNOWS]-() RETURN count(w) AS c");
+    assert!(!scans_all(&plan), "{plan:?}");
+    assert!(scans_label(&plan, "Person"), "{plan:?}");
+}
+
+/// Two or more labels would replace one `ScanAll` over the shared `vertices`
+/// table with a union of per-label scans whose rows together can exceed it.
+/// Measured slower at SF1 on every multi-source type big enough to time, both
+/// arms in one process: IS_LOCATED_IN 5297 -> 11630 ms, HAS_TAG 5944 -> 8737,
+/// HAS_CREATOR 5666 -> 7999. So the rule declines.
+#[tokio::test]
+async fn a_multi_source_edge_type_keeps_its_single_scan() {
+    let p = endpoint_planner().await;
+    let plan = plan_of(&p, "MATCH ()-[w:LOCATED_IN]->() RETURN count(w) AS c");
+    assert!(
+        scans_all(&plan),
+        "two source labels is not a narrowing; the single scan must stand: {plan:?}"
+    );
+}
+
+/// Undirected across two different endpoint labels is the same case: the source
+/// may be either, which is two labels.
+#[tokio::test]
+async fn an_undirected_type_with_distinct_endpoints_keeps_its_single_scan() {
+    let p = endpoint_planner().await;
+    let plan = plan_of(&p, "MATCH ()-[w:WORK_AT]-() RETURN count(w) AS c");
+    assert!(scans_all(&plan), "{plan:?}");
+}
+
+/// A bare relationship means every edge type, whose endpoint union is every
+/// label. Narrowing to it buys nothing and would exclude unlabelled vertices.
+#[tokio::test]
+async fn an_untyped_relationship_is_not_narrowed() {
+    let p = endpoint_planner().await;
+    let plan = plan_of(&p, "MATCH ()-[w]->() RETURN count(w) AS c");
+    assert!(scans_all(&plan), "{plan:?}");
+}
+
+/// The rewrite fires only on a `ScanAll`, so a source the user already labelled
+/// keeps the plan it had.
+#[tokio::test]
+async fn an_already_labelled_source_is_untouched() {
+    let p = endpoint_planner().await;
+    let plan = plan_of(&p, "MATCH (:Person)-[w:WORK_AT]->() RETURN count(w) AS c");
+    assert!(!scans_all(&plan), "{plan:?}");
+    assert!(scans_label(&plan, "Person"), "{plan:?}");
+}

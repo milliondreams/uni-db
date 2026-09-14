@@ -209,6 +209,23 @@ What survives unchanged: **11 of 14, with every answering query returning an
 identical row count** to the run without the fix. That is a count comparison,
 not a timing or counter one, and it is the claim the fix rests on.
 
+**Re-verified 2026-09-14 against the full committed set** (source narrowing +
+`ScanAll` chunking + the count-only projection rule), same store: 11 of 14, the
+same three failures, and **all fourteen row counts identical**. Nine of the
+eleven answering queries are byte-identical.
+
+IC1 and IC12 differ in bytes and do not differ in answer. Both return
+`collect(...)` lists, whose element order is undefined -- the same #208 property
+`params.rs` documents. Compared properly: IC12's twenty rows carry identical
+`personId`/`replyCount` in identical order and identical list *lengths and
+sets* (733, 676, 639 ... elements), and IC1 matches on all 260 fields with lists
+read as sets. Only the order inside each list moves.
+
+That distinction is the whole point of running this: a row count alone cannot
+see a dropped property, and the projection rule's failure mode is precisely a
+silently missing one. Comparing full result content, with list fields compared
+as sets, is what closes it.
+
 Guarded by seven plan-shape tests in
 `crates/uni-query/tests/common/planner/pattern_anchor_test.rs` covering
 direction, undirected, the multi-label decline, untyped relationships and an

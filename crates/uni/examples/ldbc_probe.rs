@@ -51,11 +51,20 @@ async fn main() -> anyhow::Result<()> {
         let outcome = db.session().query(q).await;
         let ms = t.elapsed().as_secs_f64() * 1000.0;
         match outcome {
-            Ok(r) => println!(
-                "rows={:<8} ms={ms:>10.1} first={:?}\n  {q}",
-                r.rows().len(),
-                r.rows().first().map(|x| x.values().to_vec())
-            ),
+            Ok(r) => {
+                // `scans_reported` counts storage round trips, which is what
+                // separates "this plan is chunked" from "this plan is one
+                // scan" -- a timing alone cannot tell those apart.
+                let m = r.metrics();
+                println!(
+                    "rows={:<8} ms={ms:>10.1} scans={:<6} idx={:<5} cmp={:<12} first={:?}\n  {q}",
+                    r.rows().len(),
+                    m.scans_reported,
+                    m.index_scans,
+                    m.index_comparisons,
+                    r.rows().first().map(|x| x.values().to_vec())
+                )
+            }
             Err(e) => println!("ERROR ms={ms:>10.1} {e}\n  {q}"),
         }
     }

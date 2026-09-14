@@ -264,6 +264,15 @@ fn merge_dotted_columns(row: &mut HashMap<String, Value>, var: &str) {
 static DUMP_PHYSICAL_PLAN: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("UNI_DUMP_PHYSICAL").is_ok());
 
+/// Rows per batched property read when exporting a whole label or edge type.
+///
+/// The export loops used to issue one property read per row (#220). Reading the
+/// whole label in one call would remove the round-trips but hold every row's
+/// properties at once, so the CSV path would stop streaming; chunking gets the
+/// batched read with the residency bounded instead. Matches the 10 000 used by
+/// the vertex and edge read paths.
+const EXPORT_BATCH: usize = 10_000;
+
 impl Executor {
     /// Helper to verify and filter candidates against an optional predicate.
     ///
@@ -281,9 +290,19 @@ impl Executor {
         candidates.sort_unstable();
         candidates.dedup();
 
+        // One batched read rather than one round-trip per candidate (#220).
+        // A vid absent from the map is the batched spelling of the singular
+        // form's `None`: deleted, or present in neither L0 nor storage. A live
+        // vertex carrying no properties is still returned, with an empty map —
+        // measured, because the two forms disagreeing on that would silently
+        // drop rows here rather than merely slow them down.
+        let props_by_vid = prop_manager
+            .get_batch_vertex_props(&candidates, &["_all_props"], ctx)
+            .await?;
+
         let mut verified_vids = Vec::new();
         for vid in candidates {
-            let Some(props) = prop_manager.get_all_vertex_props_with_ctx(vid, ctx).await? else {
+            let Some(props) = props_by_vid.get(&vid).cloned() else {
                 continue; // Deleted
             };
 
@@ -5713,20 +5732,22 @@ impl Executor {
                 .scan_label_with_filter(label_id, "n", None, ctx, prop_manager, &HashMap::new())
                 .await?;
 
-            for vid in vids {
-                let props = prop_manager
-                    .get_all_vertex_props_with_ctx(vid, ctx)
-                    .await?
-                    .unwrap_or_default();
+            for chunk in vids.chunks(EXPORT_BATCH) {
+                let props_by_vid = prop_manager
+                    .get_batch_vertex_props_for_label(chunk, target, ctx)
+                    .await?;
+                for vid in chunk {
+                    let props = props_by_vid.get(vid).cloned().unwrap_or_default();
 
-                let mut row = Vec::with_capacity(headers.len());
-                row.push(vid.to_string());
-                for p_name in &prop_names {
-                    let val = props.get(p_name).cloned().unwrap_or(Value::Null);
-                    row.push(self.format_csv_value(val));
+                    let mut row = Vec::with_capacity(headers.len());
+                    row.push(vid.to_string());
+                    for p_name in &prop_names {
+                        let val = props.get(p_name).cloned().unwrap_or(Value::Null);
+                        row.push(self.format_csv_value(val));
+                    }
+                    wtr.write_record(&row)?;
+                    count += 1;
                 }
-                wtr.write_record(&row)?;
-                count += 1;
             }
         } else if let Some(meta) = edge_meta {
             let props_meta = schema.properties.get(target).unwrap_or(&empty_props);
@@ -5748,24 +5769,27 @@ impl Executor {
 
             let edges = self.scan_edge_type(target, ctx).await?;
 
-            for (eid, src, dst) in edges {
-                let props = prop_manager
-                    .get_all_edge_props_with_ctx(eid, ctx)
-                    .await?
-                    .unwrap_or_default();
+            for chunk in edges.chunks(EXPORT_BATCH) {
+                let eids: Vec<Eid> = chunk.iter().map(|(eid, ..)| *eid).collect();
+                let props_by_eid = prop_manager
+                    .get_batch_edge_props_for_type(&eids, target, ctx)
+                    .await?;
+                for (eid, src, dst) in chunk {
+                    let props = props_by_eid.get(eid).cloned().unwrap_or_default();
 
-                let mut row = Vec::with_capacity(headers.len());
-                row.push(eid.to_string());
-                row.push(src.to_string());
-                row.push(dst.to_string());
-                row.push(meta.id.to_string());
+                    let mut row = Vec::with_capacity(headers.len());
+                    row.push(eid.to_string());
+                    row.push(src.to_string());
+                    row.push(dst.to_string());
+                    row.push(meta.id.to_string());
 
-                for p_name in &prop_names {
-                    let val = props.get(p_name).cloned().unwrap_or(Value::Null);
-                    row.push(self.format_csv_value(val));
+                    for p_name in &prop_names {
+                        let val = props.get(p_name).cloned().unwrap_or(Value::Null);
+                        row.push(self.format_csv_value(val));
+                    }
+                    wtr.write_record(&row)?;
+                    count += 1;
                 }
-                wtr.write_record(&row)?;
-                count += 1;
             }
         }
 
@@ -5807,49 +5831,54 @@ impl Executor {
                 .scan_label_with_filter(label_id, "n", None, ctx, prop_manager, &HashMap::new())
                 .await?;
 
-            for vid in vids {
-                let mut props = prop_manager
-                    .get_all_vertex_props_with_ctx(vid, ctx)
-                    .await?
-                    .unwrap_or_default();
+            for chunk in vids.chunks(EXPORT_BATCH) {
+                let props_by_vid = prop_manager
+                    .get_batch_vertex_props_for_label(chunk, target, ctx)
+                    .await?;
+                for vid in chunk {
+                    let mut props = props_by_vid.get(vid).cloned().unwrap_or_default();
 
-                props.insert(
-                    "_vid".to_string(),
-                    uni_common::Value::Int(vid.as_u64() as i64),
-                );
-                if !props.contains_key("_uid") {
                     props.insert(
-                        "_uid".to_string(),
-                        uni_common::Value::List(vec![uni_common::Value::Int(0); 32]),
+                        "_vid".to_string(),
+                        uni_common::Value::Int(vid.as_u64() as i64),
                     );
+                    if !props.contains_key("_uid") {
+                        props.insert(
+                            "_uid".to_string(),
+                            uni_common::Value::List(vec![uni_common::Value::Int(0); 32]),
+                        );
+                    }
+                    props.insert("_deleted".to_string(), uni_common::Value::Bool(false));
+                    props.insert("_version".to_string(), uni_common::Value::Int(1));
+                    rows.push(props);
                 }
-                props.insert("_deleted".to_string(), uni_common::Value::Bool(false));
-                props.insert("_version".to_string(), uni_common::Value::Int(1));
-                rows.push(props);
             }
         } else if edge_meta.is_some() {
             let edges = self.scan_edge_type(target, ctx).await?;
-            for (eid, src, dst) in edges {
-                let mut props = prop_manager
-                    .get_all_edge_props_with_ctx(eid, ctx)
-                    .await?
-                    .unwrap_or_default();
+            for chunk in edges.chunks(EXPORT_BATCH) {
+                let eids: Vec<Eid> = chunk.iter().map(|(eid, ..)| *eid).collect();
+                let props_by_eid = prop_manager
+                    .get_batch_edge_props_for_type(&eids, target, ctx)
+                    .await?;
+                for (eid, src, dst) in chunk {
+                    let mut props = props_by_eid.get(eid).cloned().unwrap_or_default();
 
-                props.insert(
-                    "eid".to_string(),
-                    uni_common::Value::Int(eid.as_u64() as i64),
-                );
-                props.insert(
-                    "src_vid".to_string(),
-                    uni_common::Value::Int(src.as_u64() as i64),
-                );
-                props.insert(
-                    "dst_vid".to_string(),
-                    uni_common::Value::Int(dst.as_u64() as i64),
-                );
-                props.insert("_deleted".to_string(), uni_common::Value::Bool(false));
-                props.insert("_version".to_string(), uni_common::Value::Int(1));
-                rows.push(props);
+                    props.insert(
+                        "eid".to_string(),
+                        uni_common::Value::Int(eid.as_u64() as i64),
+                    );
+                    props.insert(
+                        "src_vid".to_string(),
+                        uni_common::Value::Int(src.as_u64() as i64),
+                    );
+                    props.insert(
+                        "dst_vid".to_string(),
+                        uni_common::Value::Int(dst.as_u64() as i64),
+                    );
+                    props.insert("_deleted".to_string(), uni_common::Value::Bool(false));
+                    props.insert("_version".to_string(), uni_common::Value::Int(1));
+                    rows.push(props);
+                }
             }
         }
 

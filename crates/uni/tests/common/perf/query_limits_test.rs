@@ -628,6 +628,20 @@ fn disk_manager_default_is_a_real_directory() {
 }
 
 /// A database whose only unusual setting is a small query-memory ceiling.
+///
+/// # Prefer `.max_memory()` on the query
+///
+/// A database-wide ceiling applies to the fixture's own writes as well as to
+/// the query under test, which conflates two costs that have nothing to do with
+/// each other. That stayed invisible while the seeding path reserved almost
+/// nothing; once #261 made `GraphUnwindExec` and `MutationExec` account for what
+/// they hold, two tests here began failing in their `UNWIND range(...) CREATE`
+/// seeding — reporting a defect in a fixture rather than in the operator each
+/// was written to guard.
+///
+/// Use this only where the ceiling is genuinely a property of the database (the
+/// result-size estimator, the "modest query is unaffected" control). Where the
+/// subject is one query, put the ceiling on that query.
 async fn db_with_memory_limit(bytes: usize) -> Result<Uni> {
     let mut config = uni_db::UniConfig::default();
     config.max_query_memory = bytes;
@@ -659,7 +673,7 @@ async fn a_vid_lookup_join_reserves_what_it_materializes() -> Result<()> {
     // `GraphScanExec` reserves too, and the build side is deliberately the
     // narrow one -- `linked_vid` only -- while the probe carries long strings,
     // so there is a wide band between them.
-    let db = db_with_memory_limit(4 * 1024 * 1024).await?;
+    let db = Uni::in_memory().build().await?;
     db.schema()
         .label("Target")
         .property("name", uni_db::DataType::String)
@@ -692,8 +706,31 @@ async fn a_vid_lookup_join_reserves_what_it_materializes() -> Result<()> {
     tx.commit().await?;
     db.flush().await?;
 
+    // `count(b.name)`, not `b.name`: one row out, so the post-hoc result-size
+    // check cannot see this query at all and the only thing that can refuse it
+    // is the execution-time pool.
+    //
+    // This test used to return the names and sit at a 4 MiB ceiling. That worked
+    // only while the join's charge was inflated by `get_array_memory_size`
+    // summing shared buffers; once the charge became honest the two costs landed
+    // within half a megabyte of each other and the result-size check won the
+    // race, rejecting the query with a message that names no operator. Removing
+    // the confound is better than re-tuning around it.
+    //
+    // Swept on this fixture, 20 000 rows:
+    //
+    // | ceiling | outcome |
+    // |---|---|
+    // | 1 MiB | refused, `GraphScanExec` — below what the scan itself needs |
+    // | 2–3 MiB | **refused, `VidLookupJoinExec`** |
+    // | 4 MiB and up | OK |
     let res = session
-        .query("MATCH (a:Source) MATCH (b:Target) WHERE id(b) = a.linked_vid RETURN b.name AS bn")
+        .query_with(
+            "MATCH (a:Source) MATCH (b:Target) WHERE id(b) = a.linked_vid \
+             RETURN count(b.name) AS c",
+        )
+        .max_memory(3 * 1024 * 1024)
+        .fetch_all()
         .await;
 
     match res {
@@ -702,10 +739,9 @@ async fn a_vid_lookup_join_reserves_what_it_materializes() -> Result<()> {
             // Naming the operator is what makes this discriminating. An earlier
             // version accepted any message containing "memory" and passed with
             // the reservations removed, because the post-hoc result-size check
-            // rejects this query at this ceiling too — 20k rows of names exceed
-            // it on their own. Two mechanisms, one indistinguishable assertion.
-            // The pool names the consumer that asked; the result-size check
-            // cannot.
+            // rejected this query at that ceiling too. Two mechanisms, one
+            // indistinguishable assertion. The pool names the consumer that
+            // asked; the result-size check cannot.
             assert!(
                 msg.contains("VidLookupJoinExec"),
                 "the refusal must come from the join's own reservation, not from \
@@ -713,9 +749,10 @@ async fn a_vid_lookup_join_reserves_what_it_materializes() -> Result<()> {
             );
         }
         Ok(rows) => panic!(
-            "a 4 MiB ceiling accepted a join that materialized {} rows; the \
-             operator is allocating outside the pool again",
-            rows.rows().len()
+            "a 3 MiB ceiling accepted a join that materialized the whole probe \
+             side (counted {:?}); the operator is allocating outside the pool \
+             again",
+            rows.rows()[0].values()[0]
         ),
     }
     Ok(())
@@ -727,9 +764,10 @@ async fn a_vid_lookup_join_reserves_what_it_materializes() -> Result<()> {
 /// the execution-time pool.
 #[tokio::test]
 async fn max_query_memory_bounds_execution_not_just_results() -> Result<()> {
-    // 256 KiB: comfortably above what the seeding writes need, far below the
-    // distinct-value hash table built below.
-    let db = db_with_memory_limit(256 * 1024).await?;
+    // The ceiling goes on the query, not the database: the seeding below writes
+    // 40 000 rows and has no business being measured against a limit written
+    // for a hash table.
+    let db = Uni::in_memory().build().await?;
     db.schema()
         .label("W")
         .property("k", uni_db::DataType::String)
@@ -748,9 +786,12 @@ async fn max_query_memory_bounds_execution_not_just_results() -> Result<()> {
     // allocates its hash set directly. The inner aggregate builds 40k groups;
     // the outer collapses them so only one row is ever returned, which is what
     // keeps the post-hoc result-size check out of the picture.
+    // 256 KiB: far below the distinct-value hash table this builds.
     let res = db
         .session()
-        .query("MATCH (n:W) WITH n.k AS k, count(*) AS per RETURN count(k) AS c")
+        .query_with("MATCH (n:W) WITH n.k AS k, count(*) AS per RETURN count(k) AS c")
+        .max_memory(256 * 1024)
+        .fetch_all()
         .await;
 
     match res {
@@ -975,7 +1016,9 @@ async fn a_group_key_returned_whole_still_carries_its_properties() -> Result<()>
 /// passes with the reservation removed.
 #[tokio::test]
 async fn a_graph_scan_reserves_the_batch_it_builds() -> Result<()> {
-    let db = db_with_memory_limit(256 * 1024).await?;
+    // On the query, not the database — the 20 000-row seed below is not what
+    // this test is about, and a database-wide ceiling makes it refuse first.
+    let db = Uni::in_memory().build().await?;
     db.schema()
         .label("W")
         .property("k", uni_db::DataType::String)
@@ -990,7 +1033,13 @@ async fn a_graph_scan_reserves_the_batch_it_builds() -> Result<()> {
     tx.commit().await?;
     db.flush().await?;
 
-    match db.session().query("MATCH (n:W) RETURN n.k AS k").await {
+    match db
+        .session()
+        .query_with("MATCH (n:W) RETURN n.k AS k")
+        .max_memory(256 * 1024)
+        .fetch_all()
+        .await
+    {
         Err(e) => {
             let msg = e.to_string();
             assert!(
@@ -1611,11 +1660,15 @@ async fn a_schemaless_traversal_accounts_for_the_batch_it_expands() -> Result<()
 /// ~17.8 MB of accounted batches. Sweeping ceilings with and without the
 /// reservation:
 ///
-/// | ceiling | accounted | unaccounted |
-/// |---------|-----------|-------------|
-/// | 18 MB   | refused   | refused     |
-/// | 20 MB   | **refused** | **OK**    |
-/// | 22 MB   | OK        | OK          |
+/// Re-swept after the join's charge stopped double-counting shared buffers
+/// (see `BatchFootprint`): the honest figure is several times smaller, so the
+/// band moved down and the old 20 MB ceiling now fits the query comfortably.
+///
+/// | ceiling | outcome |
+/// |---|---|
+/// | 1 MiB | refused, `GraphScanExec` |
+/// | 2–6 MiB | **refused, `VidLookupJoinExec`** |
+/// | 8 MiB and up | OK |
 ///
 /// So 20 MB is the only kind of ceiling that can witness this, and it is why
 /// the assertion below is a required *failure*: an unaccounted structure passes
@@ -1656,7 +1709,7 @@ async fn a_vid_lookup_join_accounts_for_its_derived_index() -> Result<()> {
     let refused = db
         .session()
         .query_with(QUERY)
-        .max_memory(20 * 1024 * 1024)
+        .max_memory(6 * 1024 * 1024)
         .fetch_all()
         .await;
     let err = refused
@@ -1923,5 +1976,322 @@ async fn an_ordered_limit_keeps_only_n_rows_in_the_sort() -> Result<()> {
             s.actual_rows
         );
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// #261 — operators that hold memory the query pool never sees
+// ---------------------------------------------------------------------------
+//
+// #242 covered operators whose reservation was smaller than what they held.
+// This is the other half: operators that never reserve at all. The issue lists
+// sixteen and then refuses to treat the list as a work queue, because "a static
+// list is a starting point for measurement, not a work queue".
+//
+// **Step 1 was a census of the real corpus.** `crates/uni/examples/operator_census.rs`
+// plans all fourteen LDBC SNB interactive-complex queries against SF1 and counts
+// physical operators. Three of the sixteen appear:
+//
+// | operator | occurrences | queries |
+// |---|---|---|
+// | `OptionalFilterExec` | 6 | IC1 x4, IC5, IC10 |
+// | `GraphShortestPathExec` | 3 | IC1, IC13, IC14 |
+// | `GraphUnwindExec` | 3 | IC6, IC9, IC14 |
+//
+// The other thirteen appear in none of the fourteen plans. That is a finding
+// about priority, not about correctness: they are still unaccounted, and the
+// tests further down cover them, but these three are the ones tied to a query
+// whose peak is on record.
+//
+// **Step 2 was the attribution, and none of the sixteen is the answer.** Each IC
+// query was then *run* against SF1 under a 1 GiB per-query ceiling — per query,
+// because a database-wide one dies in parameter derivation, where
+// `GraphTraverseExec` asks 614.7 MB of a 409.9 MB remainder.
+//
+// Thirteen of the fourteen complete. The one that refuses is **IC14**, and the
+// refusal names `GraphTraverseExec` asking **4.2 GB** — an operator that already
+// reserved before this change, and not one of the sixteen.
+//
+// IC14 was also the obvious attribution for `GraphShortestPathExec`: it is
+// `allShortestPaths`, and `docs/proposals/ldbc_findings_remediation_2026-08-27.md`
+// records it as "executes; killed by hand after 111 min" at "19.2 GB and
+// climbing". The pool refuses it long before the enumeration, on a different
+// operator entirely. #261 warns in as many words that this repository has twice
+// attributed an LDBC peak to a mechanism the query did not use; this would have
+// been the third.
+//
+// Two caveats, both against reading this as "the corpus is fine": four of the
+// fourteen (IC2, IC7, IC8, IC9) returned **zero rows**, so their parameters
+// select nothing and they measure nothing — the same class of problem as #227.
+// And the doc's 29–45 GB figures are process-wide `VmHWM` across a whole bench
+// child, never per-query peaks, so they were not comparable with a per-query
+// ceiling to begin with.
+//
+// So these fixes are preventive, not a repair of a measured failure: they turn a
+// class of silent overrun into a refusal that names the operator. The evidence
+// for each is its own fixture below, where the cost is constructed and measured
+// — never an LDBC number it would have been convenient to claim.
+//
+// **The assertion is a required failure.** An unaccounted allocation passes
+// every ceiling, so no successful query can witness one. Each test sets
+// `max_memory` below what the operator holds and requires a refusal *naming the
+// operator*, because the post-hoc result-size check rejects these same queries
+// at these same ceilings for an unrelated reason, and an assertion that accepts
+// any memory error cannot tell the two apart.
+
+/// `allShortestPaths` enumerates every shortest path into memory at once.
+///
+/// `compute_all_shortest_paths` finds the target by layered BFS and then walks
+/// `predecessors` backwards, pushing a **cloned partial path per branch** onto a
+/// DFS stack and collecting every complete one into a `Vec<Vec<Vid>>`. The
+/// number of shortest paths between two vertices is the product of the
+/// predecessor counts along the layers, so it is combinatorial in the graph, not
+/// linear in it — and nothing bounded or counted it.
+///
+/// The fixture makes that explicit at a size the suite can afford: three middle
+/// layers of `WIDTH` nodes, fully connected layer to layer, so every path
+/// `S -> L1 -> L2 -> L3 -> T` is a shortest path and there are `WIDTH.pow(3)` of
+/// them. At `WIDTH = 40` that is 122 vertices and 3 280 edges producing **64 000
+/// paths** — a graph small enough to build in a test, holding an intermediate
+/// three orders of magnitude larger than itself.
+///
+/// The ceiling is applied **per query**, not to the database: an earlier version
+/// configured the whole `Uni` and the *fixture build* hit the limit first, in
+/// `HashJoinInput`, so the test failed without the operator under test ever
+/// running. Both arms also carry a generous explicit timeout, so a refusal can
+/// never be a disguised `Operation timed out`.
+#[tokio::test]
+async fn a_shortest_path_search_accounts_for_the_paths_it_enumerates() -> Result<()> {
+    const WIDTH: usize = 40;
+    const QUERY: &str = "MATCH (s:P {tag: 'S'}), (t:P {tag: 'T'}) \
+                         MATCH p = allShortestPaths((s)-[:R*]-(t)) \
+                         RETURN count(p) AS c";
+
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("P")
+        .property("tag", uni_db::DataType::String)
+        .done()
+        .edge_type("R", &["P"], &["P"])
+        .apply()
+        .await?;
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (:P {tag: 'S'}) CREATE (:P {tag: 'T'})")
+        .await?;
+    for layer in 1..=3 {
+        tx.execute(&format!(
+            "UNWIND range(0, {}) AS i CREATE (:P {{tag: 'L{layer}'}})",
+            WIDTH - 1
+        ))
+        .await?;
+    }
+    tx.execute("MATCH (s:P {tag: 'S'}), (a:P {tag: 'L1'}) CREATE (s)-[:R]->(a)")
+        .await?;
+    tx.execute("MATCH (a:P {tag: 'L1'}), (b:P {tag: 'L2'}) CREATE (a)-[:R]->(b)")
+        .await?;
+    tx.execute("MATCH (b:P {tag: 'L2'}), (c:P {tag: 'L3'}) CREATE (b)-[:R]->(c)")
+        .await?;
+    tx.execute("MATCH (c:P {tag: 'L3'}), (t:P {tag: 'T'}) CREATE (c)-[:R]->(t)")
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    // 1 MiB: above everything the 122-vertex graph itself needs, and reached
+    // after roughly a quarter of the enumeration, so the refusal arrives early
+    // rather than at the very end of a long walk.
+    match session
+        .query_with(QUERY)
+        .max_memory(1024 * 1024)
+        .timeout(Duration::from_secs(300))
+        .fetch_all()
+        .await
+    {
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("GraphShortestPathExec"),
+                "the refusal must name the operator that asked, not come from \
+                 some other ceiling this query also exceeds: {msg}"
+            );
+        }
+        Ok(rows) => panic!(
+            "a 1 MiB ceiling accepted an enumeration of {:?} shortest paths; the \
+             operator is still allocating outside the pool",
+            rows.rows()[0].values()[0]
+        ),
+    }
+
+    // The control. `count(p)` returns one row, so nothing but the enumeration
+    // itself can be what the tight ceiling rejected — and at a ceiling that
+    // fits it, the answer must still be WIDTH^3.
+    let rows = session
+        .query_with(QUERY)
+        .max_memory(512 * 1024 * 1024)
+        .timeout(Duration::from_secs(300))
+        .fetch_all()
+        .await?;
+    assert_eq!(
+        rows.rows()[0].values()[0],
+        uni_db::Value::Int((WIDTH * WIDTH * WIDTH) as i64),
+        "the reservation must not change the answer"
+    );
+    Ok(())
+}
+
+/// `OPTIONAL MATCH ... WHERE` buffers one batch per unmatched source group.
+///
+/// `OptionalFilterStream` cannot decide a group's NULL-recovery row until the
+/// input is exhausted, because a group that fails in this batch may pass in a
+/// later one. So it holds `passed_keys` for every group that ever passed, and
+/// `pending_null` — a **one-row `RecordBatch` per group that has not** — to
+/// end-of-stream. One-row Arrow batches are dominated by per-column buffer
+/// overhead rather than by their single row, so a wide schema makes each one
+/// cost far more than the row it carries.
+///
+/// This is a semantically required barrier: unlike an unwind, it cannot be
+/// chunked without changing the answer. Reserving is therefore the whole of the
+/// fix — it converts a silent overrun into a clean refusal, which is what #261
+/// says such an operator is owed.
+#[tokio::test]
+async fn an_optional_filter_accounts_for_the_null_rows_it_buffers() -> Result<()> {
+    const ROWS: usize = 60_000;
+    // Every source row fails the predicate, so **every** group lands in
+    // `pending_null` and none is ever cancelled — the operator's worst case, and
+    // the one an ordinary OPTIONAL MATCH reaches whenever the optional side
+    // rarely matches.
+    const QUERY: &str = "MATCH (a:Src) OPTIONAL MATCH (a)-[:E]->(b:Dst) \
+                         WHERE b.k < 0 RETURN count(a) AS c";
+
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Src")
+        .property("k", uni_db::DataType::Int64)
+        .done()
+        .label("Dst")
+        .property("k", uni_db::DataType::Int64)
+        .done()
+        .edge_type("E", &["Src"], &["Dst"])
+        .apply()
+        .await?;
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute(&format!(
+        "UNWIND range(0, {}) AS i CREATE (:Src {{k: i}})",
+        ROWS - 1
+    ))
+    .await?;
+    // **One** shared target, not a handful: the operator's cost is in the number
+    // of *source* groups, so extra edges buy this test nothing.
+    //
+    // Four targets is also what exposed the buffer-sharing defect described on
+    // `BatchFootprint`. The seeding refused at 968 MB against the shipped 1 GiB
+    // default — and went on refusing at 966 MB with a quarter of the edges and
+    // at 1021 MB with a sixth of the rows. A charge that does not move when its
+    // input is cut by four is not measuring its input, which is what sent the
+    // investigation to the measure rather than to the fixture.
+    tx.execute("CREATE (:Dst {k: 0})").await?;
+    tx.execute("MATCH (a:Src), (b:Dst) CREATE (a)-[:E]->(b)")
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    match session
+        .query_with(QUERY)
+        .max_memory(8 * 1024 * 1024)
+        .timeout(Duration::from_secs(300))
+        .fetch_all()
+        .await
+    {
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("OptionalFilterExec"),
+                "the refusal must name the operator that asked: {msg}"
+            );
+        }
+        Ok(rows) => panic!(
+            "an 8 MiB ceiling accepted {ROWS} buffered NULL-recovery rows \
+             (returned {:?}); the operator is still allocating outside the pool",
+            rows.rows()[0].values()[0]
+        ),
+    }
+
+    let rows = session
+        .query_with(QUERY)
+        .max_memory(512 * 1024 * 1024)
+        .timeout(Duration::from_secs(300))
+        .fetch_all()
+        .await?;
+    assert_eq!(
+        rows.rows()[0].values()[0],
+        uni_db::Value::Int(ROWS as i64),
+        "the reservation must not change the answer"
+    );
+    Ok(())
+}
+
+/// UNWIND accounts for the list it is part way through.
+///
+/// This operator is the one case on #261's list where the *bounding* step had
+/// already happened: #241 chunked the output to `chunk_size x columns`, which is
+/// why its peak is not the fan-out. What it still retains across polls is the
+/// input batch and the remainder of the single list being expanded — and #184's
+/// shape is exactly one enormous collected list, which chunking cannot split
+/// because every element is legitimately live.
+///
+/// # Why there is no `collect()` here
+///
+/// The first version of this test built the list with
+/// `MATCH (n:U) WITH collect(n.k) AS big UNWIND big AS y`, on the theory that
+/// the aggregate would hold the list Arrow-encoded at a few bytes an element
+/// while the unwind held its remainder as `Vec<Value>` at several times that,
+/// leaving a band between them. There is no band: `AggregateStream` grew to
+/// **5.5 MB under a 6 MiB ceiling and to 15.0 MB under a 16 MiB one**, on the
+/// same 300 000 values. It expands to fill whatever it is given, so it refuses
+/// first at every ceiling and the operator under test never runs.
+///
+/// `UNWIND range(...)` produces the same one-huge-list shape with nothing else
+/// in the plan, so the only consumer that can refuse is the one being tested.
+#[tokio::test]
+async fn an_unwind_accounts_for_the_list_it_is_expanding() -> Result<()> {
+    const N: i64 = 2_000_000;
+    let query = format!("UNWIND range(0, {}) AS x RETURN count(x) AS c", N - 1);
+
+    let db = Uni::in_memory().build().await?;
+    let session = db.session();
+
+    match session
+        .query_with(&query)
+        .max_memory(8 * 1024 * 1024)
+        .timeout(Duration::from_secs(300))
+        .fetch_all()
+        .await
+    {
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("GraphUnwindExec"),
+                "the refusal must name the operator that asked: {msg}"
+            );
+        }
+        Ok(rows) => panic!(
+            "an 8 MiB ceiling accepted an unwind of {N} elements (returned {:?}); \
+             the operator is still allocating outside the pool",
+            rows.rows()[0].values()[0]
+        ),
+    }
+
+    let rows = session
+        .query_with(&query)
+        .max_memory(512 * 1024 * 1024)
+        .timeout(Duration::from_secs(300))
+        .fetch_all()
+        .await?;
+    assert_eq!(
+        rows.rows()[0].values()[0],
+        uni_db::Value::Int(N),
+        "the reservation must not change the answer"
+    );
     Ok(())
 }

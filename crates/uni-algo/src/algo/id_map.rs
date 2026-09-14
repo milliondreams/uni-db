@@ -7,7 +7,7 @@
 //! array-based state storage. Uni uses sparse 64-bit VIDs. This module provides
 //! bidirectional mapping between these representations.
 
-use fxhash::FxHashMap;
+use rustc_hash::FxHashMap;
 use uni_common::core::id::Vid;
 
 /// Bidirectional mapping between sparse VIDs and dense algorithm slots.

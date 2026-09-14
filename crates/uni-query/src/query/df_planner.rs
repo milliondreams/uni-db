@@ -4502,12 +4502,17 @@ impl HybridPhysicalPlanner {
         //
         // We deliberately do NOT peek through an SSI `ReadSetRecordingExec`
         // here. That wrapper is only inserted for read-write transactions with
-        // an active read-set, and `VidLookupJoinExec` drives the probe scan via
-        // `execute_with_vid_filter`, bypassing the wrapper — which would silently
-        // skip read-set capture for the probe rows. Letting the wrapper mask the
-        // scan makes this rewrite bail to `HashJoinExec`, which executes the
+        // an active read-set, and `VidLookupJoinExec::try_new` requires the
+        // probe child to be a bare `GraphScanExec` — so peeking through would
+        // hand it the inner scan and drop the wrapper from the plan, silently
+        // skipping read-set capture for the probe rows. Letting the wrapper mask
+        // the scan makes this rewrite bail to `HashJoinExec`, which executes the
         // wrapper normally and records the reads. Non-SSI / read-only contexts
         // have no wrapper, so the optimization still fires there.
+        //
+        // (The probe now runs through `execute()` like any other child (#179),
+        // but that does not rescue the wrapper: it is the *discarding* of it at
+        // plan time that would lose the reads, not how the scan is driven.)
         //
         // We DO peek through the `wrap_optional` wrapper, and only that one.
         // An OPTIONAL MATCH scan is wrapped in
@@ -4606,8 +4611,8 @@ impl HybridPhysicalPlanner {
         drop(session);
 
         // Hand `try_new` the unwrapped probe: it re-validates that the probe
-        // child is a `GraphScanExec`, and it drives that scan directly via
-        // `execute_with_vid_filter`.
+        // child is a `GraphScanExec` and wires it with the `DynamicVidFilter`
+        // it will publish vids into at execute time.
         let (final_left, final_right) = match probe_side {
             ProbeSide::Left => (probe_plan.clone(), right_plan.clone()),
             ProbeSide::Right => (left_plan.clone(), probe_plan.clone()),

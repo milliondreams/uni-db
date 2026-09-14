@@ -155,7 +155,7 @@ cron = "0.16"
 ulid = { version = "1.2", features = ["serde"] }
 chrono = "0.4.45"
 chrono-tz = "0.10"
-fxhash = "0.2"
+rustc-hash = "2.1"
 bytes = "1.11"
 parking_lot = "0.12"
 rand = "0.10"

@@ -13,7 +13,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 multibase = "0.9"
-fxhash = { workspace = true }
+rustc-hash = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 tokio = { workspace = true, features = ["fs", "io-util"] }
 arrow-schema = { workspace = true }

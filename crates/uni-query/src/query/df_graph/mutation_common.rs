@@ -10,6 +10,7 @@
 //! - [`MutationExec`]: Eager-barrier RecordBatchStream that collects all input, applies
 //!   mutations via Writer, and yields output batches.
 
+use crate::query::df_graph::common::{collect_accounted, operator_reservation};
 use anyhow::Result;
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, SchemaRef};
@@ -701,8 +702,14 @@ async fn execute_mutation_inner(
     let mutation_label = mutation_kind_label(&mutation_kind);
 
     // 1. Collect all input batches (eager barrier)
+    //
+    // #261. Two things are held at once here and neither was counted: the whole
+    // Arrow input, and the row-oriented `Vec<HashMap<String, Value>>` built from
+    // it below -- which is *larger* than the Arrow original, because a columnar
+    // batch amortises what a per-row map repeats.
+    let mut reservation = operator_reservation("MutationExec", partition, &task_ctx);
     let input_stream = input.execute(partition, task_ctx)?;
-    let input_batches: Vec<RecordBatch> = input_stream.try_collect().await?;
+    let input_batches = collect_accounted(input_stream, &mut reservation).await?;
 
     let input_row_count: usize = input_batches.iter().map(|b| b.num_rows()).sum();
     tracing::debug!(
@@ -713,6 +720,12 @@ async fn execute_mutation_inner(
     );
 
     // 2. Convert to rows for mutation helpers (they operate on HashMap rows)
+    // Charged before it is built, not after, and at the Arrow size as a floor:
+    // a `HashMap<String, Value>` per row costs more than the columns it came
+    // from, so this under-charges rather than estimating a multiplier it cannot
+    // justify. Held alongside `input_batches` for the rest of the call.
+    let mut footprint = crate::query::df_graph::common::BatchFootprint::new();
+    reservation.try_grow(input_batches.iter().map(|b| footprint.add(b)).sum())?;
     let mut rows = batches_to_rows(&input_batches).map_err(|e| {
         datafusion::error::DataFusionError::Execution(format!(
             "Failed to convert batches to rows: {e}"

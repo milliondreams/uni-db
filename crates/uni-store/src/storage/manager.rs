@@ -53,6 +53,33 @@ use uni_common::core::snapshot::SnapshotManifest;
 
 use uni_common::graph::simple_graph::Direction as GraphDirection;
 
+/// Requested endpoint vids per edge-type row at which one pass beats lookups.
+///
+/// Measured, not chosen: see `StorageManager::endpoint_scan_beats_lookup`. The
+/// crossover sat near 25 000 requested vids against 1 611 869 rows, which is
+/// about one requested vid per 64 rows.
+///
+/// Like every constant of this shape in this codebase it is fitted to one
+/// dataset on one machine, and unlike most of them it now has a probe that can
+/// be re-run to refit it.
+const ENDPOINT_SCAN_CROSSOVER_RATIO: u64 = 64;
+
+/// Requested endpoint vids below which the scan arm is never worth considering.
+///
+/// A small request cannot repay a whole-type pass whatever the table looks
+/// like, and stopping here avoids paying for the per-type count that the
+/// decision would otherwise need.
+const MIN_ENDPOINT_VIDS_FOR_SCAN: usize = 4_096;
+
+/// Maximum frontier VIDs per adjacency or delta scan in
+/// [`StorageManager::load_subgraph`].
+///
+/// Mirrors `MAX_VIDS_PER_CHUNK` on the vertex read path and `MAX_EIDS_PER_CHUNK`
+/// on the edge one: a BFS frontier is unbounded, and an unbounded `IN` list
+/// inflates the scan request and stops the scalar index earning its keep, while
+/// a bounded one preserves the indexed lookup at any frontier size.
+const MAX_SUBGRAPH_VIDS_PER_SCAN: usize = 10_000;
+
 /// Edge state during subgraph loading - tracks version and deletion status.
 struct EdgeState {
     neighbor: Vid,
@@ -76,6 +103,14 @@ pub struct StorageManager {
     /// about to append. Counter (not bool) so multiple async flushes can
     /// be in flight concurrently.
     pub flush_in_progress: std::sync::atomic::AtomicUsize,
+    /// Cached flushed row counts, readable without `await` (#260).
+    ///
+    /// Shared by `Arc` with every manager derived from this one, so a refresh
+    /// on any view is visible to all of them. Sharing is safe because the
+    /// derived views that must not use it — fork-scoped and pinned — decline in
+    /// [`Self::cached_row_count`] rather than relying on holding a separate
+    /// cache.
+    cardinality: Arc<crate::storage::cardinality::CardinalityCache>,
     /// Optional pinned snapshot for time-travel
     pinned_snapshot: Option<SnapshotManifest>,
     /// Optional row-version pin for transaction snapshot reads (C2).
@@ -609,6 +644,7 @@ impl StorageManager {
             snapshot_manager,
             adjacency_manager: Arc::new(AdjacencyManager::new(config.cache_size)),
             config,
+            cardinality: Arc::new(crate::storage::cardinality::CardinalityCache::new()),
             compaction_status: Arc::new(Mutex::new(CompactionStatus::default())),
             flush_in_progress: std::sync::atomic::AtomicUsize::new(0),
             pinned_snapshot: None,
@@ -780,6 +816,7 @@ impl StorageManager {
             // This prevents live DB's CSR (with all edges) from leaking into snapshots.
             adjacency_manager: Arc::new(AdjacencyManager::new(self.adjacency_manager.max_bytes())),
             config: self.config.clone(),
+            cardinality: self.cardinality.clone(),
             compaction_status: Arc::new(Mutex::new(CompactionStatus::default())),
             flush_in_progress: std::sync::atomic::AtomicUsize::new(0),
             pinned_snapshot: Some(snapshot),
@@ -830,6 +867,7 @@ impl StorageManager {
             snapshot_manager: self.snapshot_manager.clone(),
             adjacency_manager: self.adjacency_manager.clone(),
             config: self.config.clone(),
+            cardinality: self.cardinality.clone(),
             compaction_status: Arc::new(Mutex::new(CompactionStatus::default())),
             flush_in_progress: std::sync::atomic::AtomicUsize::new(0),
             pinned_snapshot: None,
@@ -903,6 +941,7 @@ impl StorageManager {
             snapshot_manager,
             adjacency_manager: Arc::new(AdjacencyManager::new(self.adjacency_manager.max_bytes())),
             config: self.config.clone(),
+            cardinality: self.cardinality.clone(),
             compaction_status: Arc::new(Mutex::new(CompactionStatus::default())),
             flush_in_progress: std::sync::atomic::AtomicUsize::new(0),
             pinned_snapshot: None,
@@ -1957,6 +1996,126 @@ impl StorageManager {
     /// # Errors
     ///
     /// Propagates backend failures. A table that does not exist reports zero.
+    /// The shared cardinality cache, for invalidation hooks and tests (#260).
+    #[must_use]
+    pub fn cardinality(&self) -> &Arc<crate::storage::cardinality::CardinalityCache> {
+        &self.cardinality
+    }
+
+    /// An upper bound on this table's live rows, readable without `await`
+    /// (#260).
+    ///
+    /// `None` means "no answer", and callers must keep whatever behaviour they
+    /// had without one — it is never to be read as zero. There are three ways to
+    /// get it, and they are deliberately indistinguishable, because the caller's
+    /// response to all three is the same:
+    ///
+    /// * nothing has counted this table since it was last invalidated;
+    /// * this view is fork-scoped for the table, where `BranchedBackend::count_rows`
+    ///   degrades to a real scan, so the cached primary count is not this
+    ///   reader's answer;
+    /// * this view is pinned, to a snapshot or a version, where the count must
+    ///   match the version being read and the cache tracks the live tip.
+    ///
+    /// # It is an upper bound
+    ///
+    /// The flushed half comes from the cache and the L0 half is read live, so an
+    /// unflushed write is never invisible. Their overlap is not knowable
+    /// synchronously: a vertex updated in place is counted twice, and an L0
+    /// tombstone over a flushed row is not subtracted. See the module docs for
+    /// why that direction is the safe one for the decisions this feeds.
+    ///
+    /// Pass `l0` to include unflushed rows. Passing `None` asks for the flushed
+    /// count alone, which is exact but can badly understate a young table.
+    #[must_use]
+    pub fn cached_row_count(
+        &self,
+        key: &crate::storage::cardinality::CardinalityKey,
+        l0: Option<&crate::runtime::l0::L0Buffer>,
+    ) -> Option<u64> {
+        use crate::storage::cardinality::CardinalityKey;
+
+        if self.pinned_snapshot.is_some() || self.pinned_version_hwm.is_some() {
+            return None;
+        }
+        let table_name = match key {
+            CardinalityKey::Vertex(label) => table_names::vertex_table_name(label),
+            CardinalityKey::EdgeType(_) => table_names::main_edge_table_name().to_string(),
+        };
+        if self
+            .fork_scope()
+            .and_then(|scope| scope.branch_for(&table_name))
+            .is_some()
+        {
+            return None;
+        }
+
+        let flushed = self.cardinality.get(key)?;
+        let Some(l0) = l0 else {
+            return Some(flushed);
+        };
+
+        let pending = match key {
+            CardinalityKey::Vertex(label) => {
+                l0.label_to_vids.get(label).map_or(0, HashSet::len) as u64
+            }
+            // O(L0 edges) rather than an index lookup: L0 keys edges by eid and
+            // carries the type beside it, with no per-type index to ask. The
+            // walk is bounded by `auto_flush_threshold` (10 000 by default) and
+            // is paid once per decision, against a scan this exists to avoid.
+            CardinalityKey::EdgeType(etype) => {
+                l0.edge_types.values().filter(|t| *t == etype).count() as u64
+            }
+        };
+        Some(flushed.saturating_add(pending))
+    }
+
+    /// Measure a table's flushed row count and cache it (#260).
+    ///
+    /// The `async` half that [`Self::cached_row_count`] exists to avoid. Returns
+    /// `None` without caching anything when this view cannot answer for the
+    /// primary — the same fork and pin conditions the sync reader declines on,
+    /// so a fork's count can never be written into the shared cache and read
+    /// back later as primary's.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the count cannot be read.
+    pub async fn refresh_row_count(
+        &self,
+        key: &crate::storage::cardinality::CardinalityKey,
+    ) -> Result<Option<u64>> {
+        use crate::backend::types::{FilterExpr, Scalar};
+        use crate::storage::cardinality::CardinalityKey;
+
+        if self.pinned_snapshot.is_some() || self.pinned_version_hwm.is_some() {
+            return Ok(None);
+        }
+        let backend = self.backend();
+        let (table_name, filter) = match key {
+            CardinalityKey::Vertex(label) => (table_names::vertex_table_name(label), None),
+            CardinalityKey::EdgeType(etype) => (
+                table_names::main_edge_table_name().to_string(),
+                Some(FilterExpr::equals("type", Scalar::Str(etype.clone()))),
+            ),
+        };
+        if self
+            .fork_scope()
+            .and_then(|scope| scope.branch_for(&table_name))
+            .is_some()
+        {
+            return Ok(None);
+        }
+        if !backend.table_exists(&table_name).await? {
+            self.cardinality.put(key.clone(), 0);
+            return Ok(Some(0));
+        }
+
+        let rows = backend.count_rows(&table_name, filter.as_ref()).await? as u64;
+        self.cardinality.put(key.clone(), rows);
+        Ok(Some(rows))
+    }
+
     pub async fn vertex_row_count(&self, label: &str) -> Result<Option<usize>> {
         let backend = self.backend();
         let table_name = table_names::vertex_table_name(label);
@@ -2417,6 +2576,31 @@ impl StorageManager {
         endpoint_filter: Option<(crate::storage::main_edge::EndpointSide, &[Vid])>,
         counters: Option<&Arc<crate::runtime::counters::QueryCounters>>,
     ) -> Result<Vec<(Eid, Vid, Vid, String, uni_common::Properties)>> {
+        // Choose the read strategy on measured selectivity rather than on which
+        // `match` arm the caller lands in (#237, using #260's statistic).
+        if let Some((side, vids)) = endpoint_filter
+            && self.endpoint_scan_beats_lookup(type_names, vids).await?
+        {
+            let all = MainEdgeDataset::find_edges_by_type_names_counted(
+                self.backend(),
+                type_names,
+                None,
+                counters,
+            )
+            .await?;
+            let wanted: HashSet<Vid> = vids.iter().copied().collect();
+            return Ok(all
+                .into_iter()
+                .filter(|(_, src, dst, ..)| match side {
+                    crate::storage::main_edge::EndpointSide::Src => wanted.contains(src),
+                    crate::storage::main_edge::EndpointSide::Dst => wanted.contains(dst),
+                    crate::storage::main_edge::EndpointSide::Either => {
+                        wanted.contains(src) || wanted.contains(dst)
+                    }
+                })
+                .collect());
+        }
+
         MainEdgeDataset::find_edges_by_type_names_counted(
             self.backend(),
             type_names,
@@ -2424,6 +2608,60 @@ impl StorageManager {
             counters,
         )
         .await
+    }
+
+    /// Whether one pass over the edge type beats chunked endpoint lookups.
+    ///
+    /// The endpoint-vid arm used to chunk `src_vid IN (...)` unconditionally,
+    /// with `prefers_full_scan` — the selectivity helper #221 added for the eid
+    /// path — sitting in the same file and never consulted (#237).
+    ///
+    /// # Measured, not fitted by eye
+    ///
+    /// `examples/endpoint_arm_probe.rs` at LDBC SF1 over `HAS_MEMBER`
+    /// (1 611 869 edges, 79 470 distinct src vids), min-of-3, release: the
+    /// lookup arm is linear in the requested set (21 ms at K=100, 389 ms at
+    /// 10 000, 2 485 ms at 79 000) and the scan arm is flat at 840 ms. They
+    /// cross between K = 20 000 and K = 30 000. At full breadth the lookup this
+    /// used to take unconditionally is **3.0x slower** than the scan.
+    ///
+    /// [`ENDPOINT_SCAN_CROSSOVER_RATIO`] is that crossover expressed against the
+    /// type's row count, which is the denominator actually available here.
+    ///
+    /// # Why it declines rather than guesses
+    ///
+    /// `false` — keep chunked lookups — whenever the type's size is unknown:
+    /// nothing cached and no cheap way to find out, a fork, or a pinned view.
+    /// Lookup costs the request and scan costs the table, so the unknown case
+    /// errs toward the arm whose cost the caller already controls.
+    ///
+    /// The count is only *refreshed* once the request is large enough for the
+    /// answer to change the decision. A per-type count needs a predicate and a
+    /// filtered count reads every row, so asking is itself a scan — worth it
+    /// once, cached thereafter, and not worth it at all for a small request
+    /// that was always going to take the lookup.
+    async fn endpoint_scan_beats_lookup(&self, type_names: &[&str], vids: &[Vid]) -> Result<bool> {
+        use crate::storage::cardinality::CardinalityKey;
+
+        // A single-type request is the only shape with a meaningful denominator;
+        // a multi-type one would need them summed, and no caller does that here.
+        let [type_name] = type_names else {
+            return Ok(false);
+        };
+        if vids.len() < MIN_ENDPOINT_VIDS_FOR_SCAN {
+            return Ok(false);
+        }
+
+        let key = CardinalityKey::EdgeType((*type_name).to_string());
+        let rows = match self.cached_row_count(&key, None) {
+            Some(rows) => rows,
+            None => match self.refresh_row_count(&key).await? {
+                Some(rows) => rows,
+                None => return Ok(false),
+            },
+        };
+
+        Ok(rows > 0 && (vids.len() as u64).saturating_mul(ENDPOINT_SCAN_CROSSOVER_RATIO) >= rows)
     }
 
     /// Scan vertex candidates matching a filter. Returns VIDs where `_deleted = false`.
@@ -2938,6 +3176,79 @@ impl StorageManager {
     /// property. On a fork/branch there is no per-branch sparse index, so this
     /// brute-force enumerates the branch's candidate vids (Approach A — see the
     /// branched arm) for the re-score path.
+    /// Rescale a sparse query's weights by inverse document frequency, when the
+    /// index asks for it (#120).
+    ///
+    /// Returns the query unchanged when the modifier is off, when the index is
+    /// absent, or when the corpus size cannot be read cheaply — an unknown `N`
+    /// makes `idf` meaningless, and silently scoring by a guessed one would be
+    /// worse than not scaling at all.
+    ///
+    /// Scaling happens **query-side**, once, before retrieval. That is what
+    /// keeps the index's candidate generation and the caller's exact
+    /// `sparse_dot` re-score consistent: both consume the same reweighted
+    /// query, so neither can undo the other. Applying it inside the index alone
+    /// is the trap the issue calls out.
+    ///
+    /// The form is BM25's smoothed idf, `ln(1 + (N - df + 0.5) / (df + 0.5))`,
+    /// rather than a raw `ln(N / df)`. Raw idf goes **negative** for a term in
+    /// more than half the corpus, which does not merely discount that term — it
+    /// flips the sign of its contribution, so a document matching a common term
+    /// scores *worse* than one matching nothing. The smoothed form stays
+    /// positive over the whole range.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the index exists but its posting lists cannot be
+    /// read.
+    pub async fn sparse_idf_scaled_query(
+        &self,
+        label: &str,
+        property: &str,
+        query: &[(u32, f32)],
+    ) -> Result<Vec<(u32, f32)>> {
+        let enabled = self
+            .schema_manager()
+            .schema()
+            .sparse_index_for_property(label, property)
+            .is_some_and(|cfg| cfg.idf_modifier);
+        if !enabled || query.is_empty() {
+            return Ok(query.to_vec());
+        }
+
+        let Some(total_docs) = self.vertex_row_count(label).await?.filter(|n| *n > 0) else {
+            return Ok(query.to_vec());
+        };
+        let idx = match self
+            .index_manager()
+            .sparse_vector_index(label, property)
+            .await
+        {
+            Ok(idx) => idx,
+            Err(e) if crate::store_utils::is_dataset_not_found(&e) => return Ok(query.to_vec()),
+            Err(e) => return Err(e),
+        };
+
+        let terms: Vec<u32> = query.iter().map(|(t, _)| *t).collect();
+        let dfs = idx.document_frequencies(&terms).await?;
+        let n = total_docs as f64;
+
+        Ok(query
+            .iter()
+            .map(|(term, weight)| {
+                // A term the index has never seen keeps its weight rather than
+                // being scaled by a fabricated df. It contributes nothing to the
+                // score anyway — no posting list means no document matches it.
+                let Some(&df) = dfs.get(term) else {
+                    return (*term, *weight);
+                };
+                let df = df as f64;
+                let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
+                (*term, (f64::from(*weight) * idf) as f32)
+            })
+            .collect())
+    }
+
     pub async fn sparse_search(
         &self,
         label: &str,
@@ -3142,73 +3453,117 @@ impl StorageManager {
         for _hop in 0..max_hops {
             let mut next_frontier = HashSet::new();
 
-            for &vid in &frontier {
-                if visited.contains(&vid) {
-                    continue;
+            // The whole hop's vertices, resolved before any storage read, so the
+            // reads below can be issued once per (edge type, label) rather than
+            // once per vertex per hop (#220). Marking them visited up front is
+            // what makes that possible, and does not change the resulting graph:
+            // `visited` gates only `next_frontier` insertion, never an edge, and
+            // a neighbour suppressed by it is one this hop already covers — the
+            // old code would have queued it and skipped it on arrival.
+            let hop_vids: Vec<Vid> = {
+                let mut seen = Vec::new();
+                for &vid in &frontier {
+                    if visited.insert(vid) {
+                        graph.add_vertex(vid);
+                        seen.push(vid);
+                    }
                 }
-                visited.insert(vid);
-                graph.add_vertex(vid);
+                seen
+            };
+            if hop_vids.is_empty() {
+                break;
+            }
 
-                // For each edge type we want to traverse
-                for &etype_id in &target_edge_types {
-                    let etype_name = edge_type_map
-                        .get(&etype_id)
-                        .ok_or_else(|| anyhow!("Unknown edge type ID: {}", etype_id))?;
+            // For each edge type we want to traverse
+            for &etype_id in &target_edge_types {
+                let etype_name = edge_type_map
+                    .get(&etype_id)
+                    .ok_or_else(|| anyhow!("Unknown edge type ID: {}", etype_id))?;
 
-                    // Determine directions
-                    // Storage direction: "fwd" or "bwd".
-                    // Query direction: Outgoing -> "fwd", Incoming -> "bwd".
-                    let (dir_str, neighbor_is_dst) = match direction {
-                        GraphDirection::Outgoing => ("fwd", true),
-                        GraphDirection::Incoming => ("bwd", false),
-                    };
+                // Determine directions
+                // Storage direction: "fwd" or "bwd".
+                // Query direction: Outgoing -> "fwd", Incoming -> "bwd".
+                let (dir_str, neighbor_is_dst) = match direction {
+                    GraphDirection::Outgoing => ("fwd", true),
+                    GraphDirection::Incoming => ("bwd", false),
+                };
 
-                    let mut edges: HashMap<Eid, EdgeState> = HashMap::new();
+                let mut per_vid: HashMap<Vid, HashMap<Eid, EdgeState>> = HashMap::new();
 
-                    // 1. L2: Adjacency (Base)
-                    // In the new storage model, VIDs don't embed label info.
-                    // We need to try all labels to find the adjacency data.
-                    // Edge version from snapshot (reserved for future version filtering)
-                    let _edge_ver = self
-                        .pinned_snapshot
-                        .as_ref()
-                        .and_then(|s| s.edges.get(etype_name).map(|es| es.lance_version));
+                // 1. L2: Adjacency (Base)
+                // In the new storage model, VIDs don't embed label info.
+                // We need to try all labels to find the adjacency data.
+                // Edge version from snapshot (reserved for future version filtering)
+                let _edge_ver = self
+                    .pinned_snapshot
+                    .as_ref()
+                    .and_then(|s| s.edges.get(etype_name).map(|es| es.lance_version));
 
-                    // Try each label until we find adjacency data
-                    let backend = self.backend();
-                    for current_src_label in label_map.values() {
-                        let adj_ds =
-                            match self.adjacency_dataset(etype_name, current_src_label, dir_str) {
-                                Ok(ds) => ds,
-                                Err(_) => continue,
-                            };
-                        if let Some((neighbors, eids)) =
-                            adj_ds.read_adjacency_backend(backend, vid).await?
-                        {
-                            for (n, eid) in neighbors.into_iter().zip(eids) {
-                                edges.insert(
-                                    eid,
-                                    EdgeState {
-                                        neighbor: n,
-                                        version: 0,
-                                        deleted: false,
-                                    },
-                                );
-                            }
-                            break; // Found adjacency data for this vid, no need to try other labels
+                // Try each label, carrying forward only the vertices no earlier
+                // label answered for. This preserves the per-vertex `break` the
+                // unbatched form used — the first label with data for a vertex
+                // wins — while costing one scan per label instead of one per
+                // (vertex, label).
+                let backend = self.backend();
+                let mut unresolved: Vec<Vid> = hop_vids.clone();
+                for current_src_label in label_map.values() {
+                    if unresolved.is_empty() {
+                        break;
+                    }
+                    let adj_ds =
+                        match self.adjacency_dataset(etype_name, current_src_label, dir_str) {
+                            Ok(ds) => ds,
+                            Err(_) => continue,
+                        };
+                    let mut found: HashMap<Vid, (Vec<Vid>, Vec<Eid>)> = HashMap::new();
+                    for chunk in unresolved.chunks(MAX_SUBGRAPH_VIDS_PER_SCAN) {
+                        found.extend(adj_ds.read_adjacency_backend_batch(backend, chunk).await?);
+                    }
+                    if found.is_empty() {
+                        continue;
+                    }
+                    for (vid, (neighbors, eids)) in found {
+                        let edges = per_vid.entry(vid).or_default();
+                        for (n, eid) in neighbors.into_iter().zip(eids) {
+                            edges.insert(
+                                eid,
+                                EdgeState {
+                                    neighbor: n,
+                                    version: 0,
+                                    deleted: false,
+                                },
+                            );
                         }
                     }
+                    unresolved.retain(|vid| !per_vid.contains_key(vid));
+                }
 
-                    // 2. L1: Delta
-                    let delta_ds = self.delta_dataset(etype_name, dir_str)?;
-                    let delta_entries = delta_ds
-                        .read_deltas(backend, vid, &schema, self.snapshot_version_hwm())
+                // 2. L1: Delta
+                let delta_ds = self.delta_dataset(etype_name, dir_str)?;
+                let mut delta_by_vid: HashMap<Vid, Vec<crate::storage::delta::L1Entry>> =
+                    HashMap::new();
+                for chunk in hop_vids.chunks(MAX_SUBGRAPH_VIDS_PER_SCAN) {
+                    let part = delta_ds
+                        .read_deltas_batch(backend, chunk, &schema, self.snapshot_version_hwm())
                         .await?;
-                    Self::apply_delta_to_edges(&mut edges, delta_entries, neighbor_is_dst);
+                    for (vid, entries) in part {
+                        delta_by_vid.entry(vid).or_default().extend(entries);
+                    }
+                }
+
+                for &vid in &hop_vids {
+                    let mut edges = per_vid.remove(&vid).unwrap_or_default();
+                    if let Some(entries) = delta_by_vid.remove(&vid) {
+                        Self::apply_delta_to_edges(&mut edges, entries, neighbor_is_dst);
+                    }
 
                     // 3. L0: Buffer
                     if let Some(l0) = l0 {
                         Self::apply_l0_to_edges(&mut edges, l0, vid, etype_id, direction);
+                    }
+
+                    if edges.is_empty() {
+                        continue;
                     }
 
                     // Add resulting edges to graph

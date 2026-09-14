@@ -751,6 +751,22 @@ impl ScanRequest {
     ///
     /// Takes an `Option` so call sites can forward
     /// `ctx.and_then(|c| c.counters.clone())` without branching.
+    ///
+    /// Note what this does and does not buy, because the difference has cost
+    /// time. Attaching counters makes a scan report *index* work — the
+    /// execution-stats callback feeds `index_scans`, `index_comparisons` and
+    /// `lance_iops`, and `count_branch_scan` records a fork-branch read. It
+    /// does **not** make the scan report rows: `rows_scanned` and
+    /// `storage_rows` are added by `columnar_scan::merge_lance_and_l0` from the
+    /// batch it gets back, after this request has returned.
+    ///
+    /// A `count_storage_rows` used to sit beside `count_branch_scan`, adding
+    /// both row counters, with no caller anywhere in the workspace. It read as
+    /// the mechanism by which requests count rows, so switching a call site to
+    /// a counted scan looked like it would start counting them, and it did not.
+    /// Wiring it would have double-counted every Lance row against the site
+    /// above. Removed rather than left as a false affordance; count rows where
+    /// the batch is in hand.
     pub fn with_counters(mut self, counters: Option<Arc<QueryCounters>>) -> Self {
         self.counters = counters;
         self
@@ -760,14 +776,6 @@ impl ScanRequest {
     pub fn count_branch_scan(&self) {
         if let Some(c) = &self.counters {
             c.add_branch_scan();
-        }
-    }
-
-    /// Records `n` rows produced by this scan, if counting is on.
-    pub fn count_storage_rows(&self, n: usize) {
-        if let Some(c) = &self.counters {
-            c.add_storage_rows(n);
-            c.add_rows_scanned(n);
         }
     }
 }

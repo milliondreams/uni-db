@@ -161,3 +161,91 @@ async fn measure_left_outer_payoff() {
         "OPTIONAL MATCH must preserve every Source"
     );
 }
+
+/// The probe-side scan appears in `PROFILE`, with the rows it actually read
+/// (#179).
+///
+/// `VidLookupJoinExec::children()` returns the build side only — the probe is
+/// driven through a `GraphScanExec` helper rather than `execute()` — and
+/// `collect_plan_metrics` recurses strictly through `children()`. So a profile
+/// of this shape used to show a join with one input and no scan beneath it,
+/// omitting the side the operator exists to make cheaper. The join now records
+/// the probe's metrics separately and the collector reports them as their own
+/// entry.
+///
+/// # Why this cannot be "assert a GraphScanExec is present"
+///
+/// The build side is a `GraphScanExec` too, so that assertion passed before the
+/// fix and proves nothing. The test therefore demands **two** scans, and pins
+/// the probe by its row count: the build reads `SOURCES` rows and the probe
+/// reads the `TARGETS` it was asked for. Asserting on the count alone would
+/// still pass if the second entry were an empty duplicate, so the row totals
+/// are checked as well.
+#[tokio::test]
+async fn the_probe_scan_is_visible_in_profile() {
+    let db = fixture().await;
+    let s = db.session();
+    let q = "MATCH (a:Source) MATCH (b:Target) WHERE id(b) = a.linked_vid \
+             RETURN count(b) AS n";
+
+    let (result, profile) = s.query_with(q).profile().await.unwrap();
+    assert_eq!(
+        result.rows()[0].values()[0],
+        Value::Int(SOURCES),
+        "the join must still return every linked Target"
+    );
+
+    let ops: Vec<&str> = profile
+        .runtime_stats
+        .iter()
+        .map(|st| st.operator.as_str())
+        .collect();
+    assert!(
+        ops.iter().any(|o| o.contains("VidLookupJoin")),
+        "this query did not plan a VidLookupJoinExec, so the profile below says \
+         nothing about its probe. Operators were {ops:?}"
+    );
+
+    let scans: Vec<&uni_query::query::executor::core::OperatorStats> = profile
+        .runtime_stats
+        .iter()
+        .filter(|st| st.operator.contains("GraphScan"))
+        .collect();
+    assert_eq!(
+        scans.len(),
+        2,
+        "expected two GraphScanExec entries — the build side and the probe — \
+         but saw {}: {ops:?}. One means the probe is still invisible to the \
+         `children()` walk",
+        scans.len()
+    );
+
+    assert!(
+        scans.iter().all(|st| st.actual_rows > 0),
+        "a scan entry reported zero rows, so its metrics are being collected but \
+         never recorded: {:?}",
+        scans.iter().map(|st| st.actual_rows).collect::<Vec<_>>()
+    );
+
+    // Exactly one of the two consults an index, and that is what proves the
+    // second entry is the probe's own metric set rather than a copy of the
+    // build's. Row counts cannot carry that weight here: both sides read
+    // `SOURCES` rows, so a spliced duplicate of the build would satisfy any
+    // assertion written on rows alone.
+    let indexed = scans
+        .iter()
+        .filter(|st| st.index_hits.is_some_and(|h| h > 0))
+        .count();
+    assert_eq!(
+        indexed,
+        1,
+        "expected exactly one of the two scans to report index consultation — \
+         the probe looks its targets up by `_vid`, the build scans Sources — but \
+         {indexed} did: {:?}. Zero means the probe's index counter is not wired; \
+         two means the entry is not the probe's",
+        scans
+            .iter()
+            .map(|st| (st.actual_rows, st.index_hits))
+            .collect::<Vec<_>>()
+    );
+}

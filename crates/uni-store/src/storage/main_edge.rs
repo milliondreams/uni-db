@@ -568,6 +568,76 @@ impl MainEdgeDataset {
             .collect())
     }
 
+    /// Resolve which edge types a set of EIDs belongs to, in one indexed pass.
+    ///
+    /// This exists to give `PropertyManager::get_batch_edge_props` a type hint
+    /// when L0 cannot supply one. EIDs are pure auto-increment and carry no
+    /// type, so without a hint that reader scans *every* edge type's delta
+    /// table; L0 is empty on a reloaded or compacted store, which made the
+    /// all-types fan-out the normal path rather than the exceptional one —
+    /// 31.7 s, 20% of LDBC IC5's `HAS_MEMBER` clause at SF1 (#222).
+    ///
+    /// The read is deliberately narrow: `_eid` and `type` only, never
+    /// `props_json`. The point is to *choose* which tables to read, so paying a
+    /// blob decode here would defeat it.
+    ///
+    /// # Why this needs no MVCC contest
+    ///
+    /// Unlike [`Self::find_props_by_eids`], no version ranking and no tombstone
+    /// filtering happens. An edge's type is fixed for the life of its EID, so
+    /// every row for an EID — live, superseded, or tombstoned — agrees on it.
+    /// Ranking could only narrow the answer, and narrowing is the one direction
+    /// that is unsafe: a type wrongly dropped from the hint silently returns no
+    /// properties for its edges, where a type wrongly kept is merely slow. The
+    /// result is therefore a superset by construction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table query fails.
+    pub async fn find_types_by_eids_counted(
+        backend: &dyn StorageBackend,
+        eids: &[Eid],
+        counters: Option<&Arc<QueryCounters>>,
+    ) -> Result<HashMap<Eid, String>> {
+        let mut found: HashMap<Eid, String> = HashMap::new();
+        if eids.is_empty() {
+            return Ok(found);
+        }
+
+        let table_name = table_names::main_edge_table_name();
+        if !backend.table_exists(table_name).await? {
+            return Ok(found);
+        }
+
+        let columns = vec!["_eid", "type"];
+        for chunk in eids.chunks(MAX_EIDS_PER_CHUNK) {
+            let filter = FilterExpr::one_of("_eid", chunk.iter().map(|e| Scalar::UInt(e.as_u64())));
+            let batches =
+                Self::execute_query(backend, filter, Some(columns.clone()), counters).await?;
+            for batch in &batches {
+                let eid_arr = batch
+                    .column_by_name("_eid")
+                    .and_then(|c| c.as_any().downcast_ref::<UInt64Array>());
+                let type_arr = batch
+                    .column_by_name("type")
+                    .and_then(|c| c.as_any().downcast_ref::<arrow_array::StringArray>());
+                let (Some(eid_arr), Some(type_arr)) = (eid_arr, type_arr) else {
+                    continue;
+                };
+                for i in 0..batch.num_rows() {
+                    if eid_arr.is_null(i) || type_arr.is_null(i) {
+                        continue;
+                    }
+                    found
+                        .entry(Eid::from(eid_arr.value(i)))
+                        .or_insert_with(|| type_arr.value(i).to_string());
+                }
+            }
+        }
+
+        Ok(found)
+    }
+
     /// Whether one unfiltered pass beats chunked `_eid IN (...)` lookups.
     ///
     /// The two strategies scale differently: a full scan costs the table, an

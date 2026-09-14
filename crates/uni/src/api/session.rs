@@ -718,6 +718,40 @@ impl Session {
     /// Compile a Locy program without executing it, using this session's rule registry.
     #[instrument(skip(self), fields(session_id = %self.id))]
     pub fn compile_locy(&self, program: &str) -> Result<uni_locy::CompiledProgram> {
+        // Preview off, preserving this entry point's long-standing behaviour.
+        // `LocyBuilder::explain`/`profile` call the config-taking sibling with
+        // the config the caller actually set (#177).
+        self.compile_locy_with_config(
+            program,
+            &uni_locy::LocyConfig {
+                neural_predicates_preview: false,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// [`Self::compile_locy`], compiling under `config`.
+    ///
+    /// The compile-time half of a `LocyConfig` — today
+    /// `neural_predicates_preview` — has to reach the compiler, or a path that
+    /// compiles before evaluating rejects programs the evaluator accepts.
+    /// That is exactly what happened to `LocyBuilder::profile`: it compiles for
+    /// its explain half, did so through the no-config entry point, and so
+    /// failed on any `CREATE MODEL` program that `run()` executed happily.
+    ///
+    /// The same asymmetry is already called out below for the monotonicity
+    /// oracle, which is passed explicitly rather than read from a task-local so
+    /// that "`explain()` rejects a program `run()` accepts" cannot happen. The
+    /// config needed the same treatment and had not had it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the program fails to parse or compile.
+    pub fn compile_locy_with_config(
+        &self,
+        program: &str,
+        config: &uni_locy::LocyConfig,
+    ) -> Result<uni_locy::CompiledProgram> {
         let ast = uni_cypher::parse_locy(program).map_err(|e| UniError::Parse {
             message: format!("LocyParseError: {e}"),
             position: None,
@@ -746,12 +780,17 @@ impl Session {
                     )
                 })
         };
-        uni_locy::compile_with_oracle(&ast, &HashMap::new(), &external_names, &oracle).map_err(
-            |e| UniError::Query {
-                message: format!("LocyCompileError: {e}"),
-                query: None,
-            },
+        uni_locy::compile_with_oracle_and_config(
+            &ast,
+            &HashMap::new(),
+            &external_names,
+            config,
+            &oracle,
         )
+        .map_err(|e| UniError::Query {
+            message: format!("LocyCompileError: {e}"),
+            query: None,
+        })
     }
 
     // ── Transaction & Writer Factories ────────────────────────────────

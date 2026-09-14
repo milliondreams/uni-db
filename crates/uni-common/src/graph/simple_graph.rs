@@ -10,7 +10,7 @@
 //! - Safe edge deletion without panics
 
 use crate::core::id::{Eid, Vid};
-use fxhash::FxBuildHasher;
+use rustc_hash::FxBuildHasher;
 use std::collections::HashMap;
 
 /// Edge entry stored in adjacency lists.
@@ -53,10 +53,10 @@ pub enum Direction {
 impl Default for SimpleGraph {
     fn default() -> Self {
         Self {
-            vertices: HashMap::with_hasher(FxBuildHasher::default()),
-            outgoing: HashMap::with_hasher(FxBuildHasher::default()),
-            incoming: HashMap::with_hasher(FxBuildHasher::default()),
-            edge_map: HashMap::with_hasher(FxBuildHasher::default()),
+            vertices: HashMap::with_hasher(FxBuildHasher),
+            outgoing: HashMap::with_hasher(FxBuildHasher),
+            incoming: HashMap::with_hasher(FxBuildHasher),
+            edge_map: HashMap::with_hasher(FxBuildHasher),
         }
     }
 }
@@ -70,10 +70,10 @@ impl SimpleGraph {
     /// Creates a new graph with pre-allocated capacity.
     pub fn with_capacity(vertices: usize, edges: usize) -> Self {
         Self {
-            vertices: HashMap::with_capacity_and_hasher(vertices, FxBuildHasher::default()),
-            outgoing: HashMap::with_capacity_and_hasher(vertices, FxBuildHasher::default()),
-            incoming: HashMap::with_capacity_and_hasher(vertices, FxBuildHasher::default()),
-            edge_map: HashMap::with_capacity_and_hasher(edges, FxBuildHasher::default()),
+            vertices: HashMap::with_capacity_and_hasher(vertices, FxBuildHasher),
+            outgoing: HashMap::with_capacity_and_hasher(vertices, FxBuildHasher),
+            incoming: HashMap::with_capacity_and_hasher(vertices, FxBuildHasher),
+            edge_map: HashMap::with_capacity_and_hasher(edges, FxBuildHasher),
         }
     }
 

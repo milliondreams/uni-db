@@ -64,6 +64,8 @@ struct IndexConfig {
     embedding: Option<EmbeddingOptions>,
     // Sparse-specific: 8-bit weight quantization (default on).
     quantize: Option<bool>,
+    // Sparse-specific: IDF query-weight modifier (default off, #120).
+    idf: Option<bool>,
     // Generic
     name: Option<String>,
 }
@@ -399,6 +401,9 @@ async fn create_index_internal(
                 dimensions,
                 // `OPTIONS{type:'sparse', quantize:false}` stores lossless f32.
                 quantize: config.quantize.unwrap_or(true),
+                // `OPTIONS{type:'sparse', idf:true}` reweights query terms by
+                // inverse document frequency (#120). Off unless asked for.
+                idf_modifier: config.idf.unwrap_or(false),
                 embedding_config,
                 metadata: Default::default(),
             })

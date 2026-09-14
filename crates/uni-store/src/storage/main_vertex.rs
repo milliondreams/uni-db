@@ -32,6 +32,15 @@ use std::sync::Arc;
 use uni_common::Properties;
 use uni_common::core::id::{UniId, Vid};
 
+/// Maximum `ext_id`s per `ext_id IN (...)` chunk in
+/// [`MainVertexDataset::find_by_ext_ids_counted`].
+///
+/// Mirrors `MAX_VIDS_PER_CHUNK` on the vertex read path and `MAX_EIDS_PER_CHUNK`
+/// on the edge one: an unbounded `IN` list inflates the scan request and stops
+/// the scalar index earning its keep, while a bounded one preserves the indexed
+/// lookup at any batch size.
+const MAX_EXT_IDS_PER_CHUNK: usize = 10_000;
+
 /// Main vertex dataset for the unified `vertices` table.
 ///
 /// This table contains all vertices regardless of label, providing:
@@ -427,6 +436,117 @@ impl MainVertexDataset {
             return Ok(None);
         }
         Ok(best_vid)
+    }
+
+    /// The batched counterpart of [`Self::find_by_ext_id`].
+    ///
+    /// Batch insert probed one `ext_id` at a time to enforce global uniqueness,
+    /// so a batch of N vertices issued N scans of the main vertex table before
+    /// writing anything (#220). This collapses them into one chunked
+    /// `ext_id IN (...)` lookup, which keeps the scalar index in play.
+    ///
+    /// Version selection matches the singular form exactly, per `ext_id`: the
+    /// highest `_version` wins with tombstones included in the contest, and an
+    /// `ext_id` whose winner is a tombstone is absent from the map — the
+    /// batched spelling of its `Ok(None)`. Ties resolve to the later row, as
+    /// they do there.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table query fails. Note that an absent table is
+    /// `Ok`, not an error, matching the singular form — but a failed *scan*
+    /// must stay an error here: this backs a uniqueness constraint, and a probe
+    /// that reads as "no duplicate" on an I/O failure admits the very duplicate
+    /// it exists to reject (#233).
+    pub async fn find_by_ext_ids_counted(
+        backend: &dyn StorageBackend,
+        ext_ids: &[String],
+        version: Option<u64>,
+        counters: Option<&Arc<QueryCounters>>,
+    ) -> Result<HashMap<String, Vid>> {
+        let mut found: HashMap<String, Vid> = HashMap::new();
+        if ext_ids.is_empty() {
+            return Ok(found);
+        }
+
+        let table_name = table_names::main_vertex_table_name();
+        if !backend.table_exists(table_name).await? {
+            return Ok(found);
+        }
+
+        // Winner per ext_id: (version, deleted, vid). Tombstones stay in the
+        // map until the end so a lower-version live row cannot displace them.
+        let mut best: HashMap<String, (u64, bool, Vid)> = HashMap::new();
+        for chunk in ext_ids.chunks(MAX_EXT_IDS_PER_CHUNK) {
+            let filter = with_version_bound(
+                FilterExpr::one_of("ext_id", chunk.iter().map(|e| Scalar::Str(e.clone()))),
+                version,
+            );
+            let results = backend
+                .scan(
+                    ScanRequest::all(table_name)
+                        .with_filter(filter)
+                        .with_columns(vec![
+                            "_vid".to_string(),
+                            "ext_id".to_string(),
+                            "_version".to_string(),
+                            "_deleted".to_string(),
+                        ])
+                        .with_counters(counters.cloned()),
+                )
+                .await?;
+
+            for batch in results {
+                let vid_col = batch
+                    .column_by_name("_vid")
+                    .and_then(|c| c.as_any().downcast_ref::<UInt64Array>());
+                let ext_col = batch
+                    .column_by_name("ext_id")
+                    .and_then(|c| c.as_any().downcast_ref::<arrow_array::StringArray>());
+                let ver_col = batch
+                    .column_by_name("_version")
+                    .and_then(|c| c.as_any().downcast_ref::<UInt64Array>());
+                let deleted_col = batch
+                    .column_by_name("_deleted")
+                    .and_then(|c| c.as_any().downcast_ref::<arrow_array::BooleanArray>());
+
+                let (Some(vid_arr), Some(ext_arr), Some(ver_arr)) = (vid_col, ext_col, ver_col)
+                else {
+                    continue;
+                };
+
+                for i in 0..batch.num_rows() {
+                    if ext_arr.is_null(i) || vid_arr.is_null(i) {
+                        continue;
+                    }
+                    let key = ext_arr.value(i).to_string();
+                    let v = if ver_arr.is_null(i) {
+                        0
+                    } else {
+                        ver_arr.value(i)
+                    };
+                    // `>=` keeps the singular form's tie-breaking, where the
+                    // later row wins.
+                    if best.get(&key).is_none_or(|(best_v, ..)| v >= *best_v) {
+                        best.insert(
+                            key,
+                            (
+                                v,
+                                deleted_col.is_some_and(|d| d.value(i)),
+                                Vid::from(vid_arr.value(i)),
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+
+        for (ext_id, (_, deleted, vid)) in best {
+            if !deleted {
+                found.insert(ext_id, vid);
+            }
+        }
+        Ok(found)
     }
 
     /// Check if an ext_id already exists in the main vertices table.

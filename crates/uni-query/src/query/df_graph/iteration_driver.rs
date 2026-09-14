@@ -34,7 +34,9 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Pla
 use parking_lot::RwLock;
 use uni_algo::algo::GraphProjection;
 
-use crate::query::df_graph::common::{collect_all_partitions, compute_plan_properties, exec_err};
+use crate::query::df_graph::common::{
+    collect_all_partitions, compute_plan_properties, exec_err, operator_reservation,
+};
 
 /// The per-round state shared between the driver and its cached round plan.
 ///
@@ -494,7 +496,9 @@ impl IterationDriver {
     pub async fn run(&self, task_ctx: Arc<TaskContext>) -> DFResult<Vec<f64>> {
         self.rounds_run.store(0, Ordering::Relaxed);
         for _ in 0..self.max_iters {
-            let batches = collect_all_partitions(&self.round, task_ctx.clone()).await?;
+            let mut reservation = operator_reservation("PowerStepExec", 0, &task_ctx);
+            let batches =
+                collect_all_partitions(&self.round, task_ctx.clone(), &mut reservation).await?;
             let next = extract_score_column(&batches)?;
             let cur = self.state.read().clone();
             let l1: f64 = cur

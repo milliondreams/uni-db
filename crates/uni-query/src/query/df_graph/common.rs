@@ -13,7 +13,6 @@ use datafusion::common::Result as DFResult;
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::PlanProperties;
 use datafusion::prelude::SessionContext;
-use futures::TryStreamExt;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -167,6 +166,172 @@ where
             )))
         })
     })
+}
+
+/// Tracks how much *distinct* memory a set of `RecordBatch`es holds.
+///
+/// # Why identity, not arithmetic
+///
+/// Neither of Arrow's own size functions answers the question a memory
+/// reservation asks. `get_array_memory_size` reports the full capacity of every
+/// buffer an array points into, so batches that share buffers each report the
+/// whole parent and summing them multiplies the same bytes once per batch.
+/// `get_slice_memory_size` narrows an array to its own window but does not push
+/// that window down into nested children, so it is only right for flat types.
+///
+/// All three were measured on the same input — a `MATCH (a:Src), (b:Dst) CREATE
+/// (a)-[:E]->(b)` whose join emits **one row per batch**:
+///
+/// | measure | per one-row batch | 10 000 rows |
+/// |---|---|---|
+/// | `get_array_memory_size` | 3 256 057 B | ~32 GB claimed |
+/// | `get_slice_memory_size` | 420 185 B | ~4 GB claimed |
+/// | ...with struct children re-sliced | 420 185 B | unchanged — the residue is a `List(Utf8)` child Arrow does not narrow either |
+/// | distinct buffers (this) | ~420 KB once, then ~0 | a few MB |
+///
+/// The first two both exhausted a 1 GiB pool on ten thousand rows. The tell was
+/// that the figure did not move when the row count was cut by four: a charge
+/// that ignores its input is not measuring it.
+///
+/// Keying on `Buffer::data_ptr` — the allocation, not the array's view into it —
+/// makes the shared case cost what it actually costs: the first batch to touch
+/// a buffer pays for it, and every later batch sharing it pays nothing.
+///
+/// # When *not* to use this
+///
+/// Only accumulation needs it. An operator that holds **one** batch at a time
+/// and `try_resize`s to its size is already right with `get_array_memory_size`,
+/// and should stay that way: holding a one-row slice of a large buffer really
+/// does keep that whole allocation resident, so the parent's capacity is the
+/// honest charge rather than an over-count. The defect is specific to adding
+/// those figures up across batches that share.
+pub(crate) struct BatchFootprint {
+    /// Allocation start addresses already charged.
+    seen: std::collections::HashSet<usize>,
+    /// A clone of every buffer counted, purely to keep it alive.
+    ///
+    /// Without this the address key is unsound: free an array and the allocator
+    /// hands the same address back for the next one, which then matches a stale
+    /// entry and is charged nothing. That is not hypothetical — it is what the
+    /// `unshared_batches_are_each_charged` control caught, which reported ten
+    /// independent 1 000-row arrays as **36 772 bytes** because each was dropped
+    /// before the next was built.
+    ///
+    /// Holding an `Arc` bump per distinct buffer makes the invariant structural
+    /// instead of a comment: an address in `seen` cannot be recycled while the
+    /// footprint that recorded it is alive. The footprints here are locals that
+    /// live for one collection loop, so this pins nothing for long.
+    keepalive: Vec<arrow::buffer::Buffer>,
+}
+
+impl BatchFootprint {
+    pub(crate) fn new() -> Self {
+        Self {
+            seen: std::collections::HashSet::new(),
+            keepalive: Vec::new(),
+        }
+    }
+
+    /// Bytes `batch` adds beyond everything already counted.
+    pub(crate) fn add(&mut self, batch: &RecordBatch) -> usize {
+        batch
+            .columns()
+            .iter()
+            .map(|c| self.add_data(&c.to_data()))
+            .sum()
+    }
+
+    fn add_data(&mut self, data: &arrow::array::ArrayData) -> usize {
+        let mut bytes = 0;
+        for buf in data.buffers() {
+            if self.seen.insert(buf.data_ptr().as_ptr() as usize) {
+                bytes += buf.capacity();
+                self.keepalive.push(buf.clone());
+            }
+        }
+        if let Some(nulls) = data.nulls() {
+            let buf = nulls.buffer();
+            if self.seen.insert(buf.data_ptr().as_ptr() as usize) {
+                bytes += buf.capacity();
+                self.keepalive.push(buf.clone());
+            }
+        }
+        for child in data.child_data() {
+            bytes += self.add_data(child);
+        }
+        bytes
+    }
+}
+
+/// What one `RecordBatch` costs on its own, sharing nothing.
+pub(crate) fn batch_bytes(batch: &RecordBatch) -> usize {
+    BatchFootprint::new().add(batch)
+}
+
+/// Register a memory-pool consumer for one operator instance (#261).
+///
+/// The name reaches the user verbatim in a `ResourcesExhausted` message, and
+/// that is the whole point of it: an operator that reserves anonymously refuses
+/// a query without saying which part of the plan could not fit, and the tests
+/// that guard these reservations discriminate on exactly this string. Keep it
+/// the operator's type name.
+pub(crate) fn operator_reservation(
+    name: &str,
+    partition: usize,
+    context: &datafusion::execution::TaskContext,
+) -> datafusion::execution::memory_pool::MemoryReservation {
+    datafusion::execution::memory_pool::MemoryConsumer::new(format!("{name}[{partition}]"))
+        .register(context.memory_pool())
+}
+
+/// Drain a stream into a `Vec<RecordBatch>`, charging the pool as it grows.
+///
+/// This replaces `stream.try_collect().await?` at every eager barrier in
+/// `df_graph` (#261). The difference is not cosmetic: `try_collect` resolves
+/// only once the whole input is already resident, so a budget checked after it
+/// records a peak that has already happened, while charging batch by batch
+/// refuses at the point the budget is actually crossed.
+///
+/// The caller owns the returned batches and the reservation that covers them;
+/// releasing is the caller's business, because only the caller knows when they
+/// stop being its own.
+pub(crate) async fn collect_accounted(
+    mut stream: datafusion::execution::SendableRecordBatchStream,
+    reservation: &mut datafusion::execution::memory_pool::MemoryReservation,
+) -> DFResult<Vec<RecordBatch>> {
+    use futures::StreamExt;
+    let mut batches = Vec::new();
+    // One footprint across the whole collection: batches from the same producer
+    // routinely share buffers, and charging each in isolation would bill the
+    // same allocation once per batch.
+    let mut footprint = BatchFootprint::new();
+    while let Some(batch) = stream.next().await {
+        let batch = batch?;
+        reservation.try_grow(footprint.add(&batch))?;
+        batches.push(batch);
+    }
+    Ok(batches)
+}
+
+/// Concatenate accounted batches into one, charging the combined copy.
+///
+/// `concat_batches` holds the parts and the whole at once — which #261 names as
+/// one of the recurring shapes — so the combined batch is charged *before* it
+/// exists and the parts are released only after it does. Doing it the other way
+/// round would let a concatenation that does not fit succeed, because the
+/// ceiling would be measured against a budget the parts had already vacated.
+pub(crate) fn concat_accounted(
+    schema: &SchemaRef,
+    batches: Vec<RecordBatch>,
+    reservation: &mut datafusion::execution::memory_pool::MemoryReservation,
+) -> DFResult<RecordBatch> {
+    let mut footprint = BatchFootprint::new();
+    let parts: usize = batches.iter().map(|b| footprint.add(b)).sum();
+    reservation.try_grow(parts)?;
+    let combined = arrow::compute::concat_batches(schema, batches.iter()).map_err(arrow_err)?;
+    drop(batches);
+    reservation.shrink(parts);
+    Ok(combined)
 }
 
 /// Compute standard plan properties for graph operators.
@@ -611,10 +776,10 @@ impl EntityPropertyCache {
             // The edge accessor keys its result by the eid reinterpreted as a Vid.
             // No hint available here, and this is the one caller where that is
             // true: the eids come from already-materialised paths, which carry
-            // no type column. This therefore still pays #222's all-types
-            // fan-out when L0 is cold. Resolving the misses against
-            // `main_edges` — which carries a `type` column and a BTree index on
-            // it — would fix it in one scan rather than one per type.
+            // no type column. `None` is therefore correct rather than lazy —
+            // and it no longer means the all-types fan-out, since
+            // `get_batch_edge_props` now resolves what L0 misses against
+            // `main_edges` in one indexed pass over its `type` column (#222).
             cache.edges = pm
                 .get_batch_edge_props(&distinct, &["_all_props"], None, Some(query_ctx))
                 .await
@@ -1378,17 +1543,28 @@ pub fn cv_array_to_large_list(
 ///
 /// Iterates over each partition, executes it, and collects all resulting
 /// batches into a single `Vec`. Shared by `execute_subplan` and `run_apply`.
+///
+/// # Memory (#261)
+///
+/// This is the single largest unaccounted materialization in `df_graph`: it had
+/// thirteen call sites -- `GraphApplyExec`, `RecursiveCTEExec` (through
+/// `execute_subplan`), `LocyProgramExec`, and six inside the fixpoint driver --
+/// and every one of them held a whole sub-plan's output with nothing counting
+/// it. Taking the reservation as a parameter rather than registering one here is
+/// deliberate: the batches outlive this call, so only the caller knows when they
+/// stop being its own, and a reservation released on return would account for
+/// the accumulation while missing everything held concurrently after it.
 pub async fn collect_all_partitions(
     plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
     task_ctx: Arc<datafusion::execution::TaskContext>,
+    reservation: &mut datafusion::execution::memory_pool::MemoryReservation,
 ) -> DFResult<Vec<RecordBatch>> {
     let partition_count = plan.properties().output_partitioning().partition_count();
 
     let mut all_batches = Vec::new();
     for partition in 0..partition_count {
         let stream = plan.execute(partition, task_ctx.clone())?;
-        let batches: Vec<RecordBatch> = stream.try_collect().await?;
-        all_batches.extend(batches);
+        all_batches.extend(collect_accounted(stream, reservation).await?);
     }
     Ok(all_batches)
 }
@@ -1599,7 +1775,13 @@ pub async fn execute_subplan_with_outer_vars(
     })?;
 
     let task_ctx = session_ctx.read().task_ctx();
-    let all_batches = collect_all_partitions(&execution_plan, task_ctx).await?;
+    // #261. `execute_subplan` is how `RecursiveCTEExec` runs each iteration and
+    // how `GraphApplyExec` runs each row's body, so this one reservation covers
+    // the per-iteration and per-row materializations of both. It is released
+    // when this call returns: the batches become the caller's, and the caller
+    // has its own reservation for whatever it goes on to retain.
+    let mut reservation = operator_reservation("RecursiveCTEExec", 0, &task_ctx);
+    let all_batches = collect_all_partitions(&execution_plan, task_ctx, &mut reservation).await?;
 
     Ok((all_batches, execution_plan))
 }
@@ -2131,6 +2313,72 @@ mod tests {
         assert_eq!(
             params.get("m._all_props"),
             Some(&Value::Map(HashMap::new()))
+        );
+    }
+
+    /// Batches that share buffers are charged once, not once each.
+    ///
+    /// This is the defect `BatchFootprint` exists for, pinned directly rather
+    /// than only through a query. One 10 000-element string array is sliced into
+    /// 10 000 one-row batches — the shape a join emits when it produces a row at
+    /// a time — and every one of them points into the same allocation.
+    ///
+    /// `get_array_memory_size` charges each of them the whole parent, so the sum
+    /// is ~10 000x the truth; that is what exhausted a 1 GiB pool on ten
+    /// thousand rows. The footprint must land within a small factor of a *single*
+    /// batch's own cost, and the assertion is written against the per-batch
+    /// figure rather than an absolute byte count so it cannot rot when Arrow's
+    /// padding changes.
+    #[test]
+    fn shared_buffers_are_charged_once() {
+        use arrow_array::StringArray;
+
+        const N: usize = 10_000;
+        let values: StringArray = (0..N)
+            .map(|i| Some(format!("a-value-long-enough-to-allocate-{i}")))
+            .collect();
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, true)]));
+        let whole = RecordBatch::try_new(schema, vec![Arc::new(values)]).unwrap();
+
+        let rows: Vec<RecordBatch> = (0..N).map(|i| whole.slice(i, 1)).collect();
+        let naive: usize = rows.iter().map(RecordBatch::get_array_memory_size).sum();
+        let mut footprint = BatchFootprint::new();
+        let charged: usize = rows.iter().map(|b| footprint.add(b)).sum();
+        let one = whole.get_array_memory_size();
+
+        assert!(
+            naive > one * 1000,
+            "the fixture must actually exhibit the over-count this guards against: \
+             {N} shared slices summed to {naive} against a parent of {one}"
+        );
+        assert!(
+            charged <= one * 2,
+            "shared buffers were charged more than once: {charged} for slices of a \
+             {one}-byte parent"
+        );
+    }
+
+    /// ...and a batch that shares nothing is still charged for what it holds.
+    ///
+    /// The control. Without it, `add` returning zero unconditionally would
+    /// satisfy the test above.
+    #[test]
+    fn unshared_batches_are_each_charged() {
+        use arrow_array::StringArray;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, true)]));
+        let mut footprint = BatchFootprint::new();
+        let mut total = 0;
+        for i in 0..10 {
+            let values: StringArray = (0..1000)
+                .map(|j| Some(format!("independent-allocation-{i}-{j}")))
+                .collect();
+            let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(values)]).unwrap();
+            total += footprint.add(&batch);
+        }
+        assert!(
+            total > 10 * 1000 * 20,
+            "ten independent 1 000-row arrays were charged only {total} bytes"
         );
     }
 }

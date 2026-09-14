@@ -543,7 +543,25 @@ pub(crate) async fn sparse_rerank(
     retrieval_k: usize,
 ) -> DFResult<(Vec<(Vid, f32)>, HashMap<Vid, uni_common::Properties>)> {
     // 1. Flushed candidate generation via the sparse index (term-matching vids).
-    let query_pairs: Vec<(u32, f32)> = query.iter().collect();
+    //
+    // The IDF modifier, when the index asks for it, rescales the query's
+    // weights once here (#120). Both the index scan below and the exact
+    // `sparse_dot` re-score in step 5 then consume the *same* reweighted query,
+    // which is the only way the two stay consistent — scaling inside the index
+    // alone would be undone by the re-score.
+    let raw_pairs: Vec<(u32, f32)> = query.iter().collect();
+    let query_pairs = storage
+        .sparse_idf_scaled_query(label, property, &raw_pairs)
+        .await
+        .map_err(exec_err)?;
+    let scaled_query = if query_pairs == raw_pairs {
+        None
+    } else {
+        let (indices, values): (Vec<u32>, Vec<f32>) = query_pairs.iter().copied().unzip();
+        Some(uni_sparse_vector::SparseVector::new(indices, values).map_err(exec_err)?)
+    };
+    let scoring_query = scaled_query.as_ref().unwrap_or(query);
+
     let flushed = storage
         .sparse_search(label, property, &query_pairs, retrieval_k)
         .await
@@ -585,7 +603,7 @@ pub(crate) async fn sparse_rerank(
         let score = match props.get(property) {
             Some(uni_common::Value::SparseVector { indices, values }) => {
                 match uni_sparse_vector::SparseVector::new(indices.clone(), values.clone()) {
-                    Ok(doc) => uni_sparse_vector::ops::sparse_dot(query, &doc),
+                    Ok(doc) => uni_sparse_vector::ops::sparse_dot(scoring_query, &doc),
                     Err(_) => 0.0,
                 }
             }
@@ -799,22 +817,121 @@ async fn auto_embed_text(
         )
     })?;
 
-    let embedder = runtime
-        .embedding(&embedding_config.alias)
+    let prefixed_query = match &embedding_config.query_prefix {
+        Some(prefix) => format!("{prefix}{query_text}"),
+        None => query_text.to_string(),
+    };
+
+    let embeddings = match runtime.embedding(&embedding_config.alias).await {
+        Ok(embedder) => {
+            embedder
+                .embed(&[prefixed_query.as_str()])
+                .await
+                .map_err(exec_err)?
+                .vectors
+        }
+        Err(per_task_err) => hybrid_head_for_query(
+            host,
+            &embedding_config.alias,
+            &prefixed_query,
+            uni_xervo::traits::HeadSet::DENSE,
+        )
         .await
-        .map_err(exec_err)?;
+        .and_then(|r| r.dense)
+        .ok_or_else(|| exec_err(per_task_err))?,
+    };
+    embeddings.into_iter().next().ok_or_else(|| {
+        datafusion::error::DataFusionError::Execution(
+            "Embedding service returned no results".to_string(),
+        )
+    })
+}
+
+/// Embed a query string through a hybrid model's single forward pass, taking
+/// one head (#122).
+///
+/// A hybrid alias resolves only through `hybrid_embedder`: `runtime.embedding`
+/// and `runtime.multi_vector_embedder` are per-task resolvers and report a
+/// capability mismatch for it. So a column whose `embedding_config` names a
+/// hybrid model — which is the ordinary setup for BGE-M3-style single-pass
+/// auto-embed, where one alias fills both a `Vector` and a `List<Vector>`
+/// column — could not answer a text query on either head.
+///
+/// Returns `None` when the alias is not hybrid, so the caller can surface the
+/// per-task resolver's own error rather than this one.
+async fn hybrid_head_for_query(
+    host: &QueryProcedureHost,
+    alias: &str,
+    text: &str,
+    head: uni_xervo::traits::HeadSet,
+) -> Option<uni_xervo::traits::HybridEmbedResult> {
+    let runtime = host.xervo_runtime()?;
+    let embedder = runtime.hybrid_embedder(alias).await.ok()?;
+    embedder.embed(&[text], head).await.ok()
+}
+
+/// Embed a text query into per-token vectors via the multi-vector index's
+/// configured xervo model (#122).
+///
+/// The dense and sparse paths have had this since they shipped; the
+/// multi-vector one did not, so `uni.vector.query` on a `List<Vector>` column
+/// rejected a string query with "Multi-vector query must be a list of vectors"
+/// even with a runtime configured. Only the *error* path was covered by tests,
+/// which is why an unwired success path looked the same as a working one.
+///
+/// `query_prefix` is honoured for the same reason the dense path honours it: a
+/// model trained with asymmetric prefixes returns a different vector without
+/// one, and silently worse recall is the failure mode.
+async fn auto_embed_multi_text(
+    host: &QueryProcedureHost,
+    label: &str,
+    property: &str,
+    query_text: &str,
+) -> DFResult<Vec<Vec<f32>>> {
+    let storage = host.storage();
+    let uni_schema = storage.schema_manager().schema();
+    let embedding_config = uni_schema
+        .vector_index_for_property(label, property)
+        .and_then(|cfg| cfg.embedding_config.as_ref())
+        .ok_or_else(|| {
+            datafusion::error::DataFusionError::Execution(format!(
+                "Cannot auto-embed: vector index for {label}.{property} has no embedding_config. \
+                 Either provide a pre-computed multi-vector or create the index with embedding \
+                 options."
+            ))
+        })?;
+
+    let runtime = host.xervo_runtime().ok_or_else(|| {
+        datafusion::error::DataFusionError::Execution(
+            "Cannot auto-embed: Uni-Xervo runtime not configured".to_string(),
+        )
+    })?;
 
     let prefixed_query = match &embedding_config.query_prefix {
         Some(prefix) => format!("{prefix}{query_text}"),
         None => query_text.to_string(),
     };
 
-    let embeddings = embedder
-        .embed(&[prefixed_query.as_str()])
+    let vectors = match runtime.multi_vector_embedder(&embedding_config.alias).await {
+        Ok(embedder) => {
+            embedder
+                .embed(&[prefixed_query.as_str()])
+                .await
+                .map_err(exec_err)?
+                .vectors
+        }
+        Err(per_task_err) => hybrid_head_for_query(
+            host,
+            &embedding_config.alias,
+            &prefixed_query,
+            uni_xervo::traits::HeadSet::MULTI_VECTOR,
+        )
         .await
-        .map_err(exec_err)?
-        .vectors;
-    embeddings.into_iter().next().ok_or_else(|| {
+        .and_then(|r| r.multi_vector)
+        .ok_or_else(|| exec_err(per_task_err))?,
+    };
+
+    vectors.into_iter().next().ok_or_else(|| {
         datafusion::error::DataFusionError::Execution(
             "Embedding service returned no results".to_string(),
         )
@@ -1286,7 +1403,12 @@ pub(crate) async fn run_vector_query(
             .get(6)
             .and_then(|v| if v.is_null() { None } else { v.as_object() });
         let opts = parse_vector_query_opts(options_map);
-        let queries = extract_vector_list(query_val)?;
+        // A string query is auto-embedded through the index's configured model,
+        // matching the dense and sparse paths (#122).
+        let queries = match query_val.as_str() {
+            Some(text) => auto_embed_multi_text(host, &label, &property, text).await?,
+            None => extract_vector_list(query_val)?,
+        };
         let query_ctx = host.query_context();
 
         // Default Cosine for multi-vector (ColBERT) when the property has no index.

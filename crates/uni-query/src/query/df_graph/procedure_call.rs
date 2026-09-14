@@ -32,9 +32,11 @@ use uni_cypher::ast::Expr;
 
 use crate::query::df_graph::GraphExecutionContext;
 use crate::query::df_graph::common::{
-    arrow_err, compute_plan_properties, evaluate_simple_expr, exec_err, labels_data_type,
+    arrow_err, compute_plan_properties, concat_accounted, evaluate_simple_expr, exec_err,
+    labels_data_type,
 };
 use crate::query::df_graph::scan::{property_field, resolve_property_type};
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 
 /// Maps a user-provided yield name to a canonical name.
 ///
@@ -453,7 +455,7 @@ impl ExecutionPlan for GraphProcedureCallExec {
     fn execute(
         &self,
         partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         let metrics = BaselineMetrics::new(&self.metrics, partition);
 
@@ -471,6 +473,11 @@ impl ExecutionPlan for GraphProcedureCallExec {
             self.target_properties.clone(),
             self.schema.clone(),
             metrics,
+            // #261. The buffered path holds every batch a plugin yields and
+            // then concatenates them, so the parts and the whole are live at
+            // once -- and a procedure's output size is the plugin's business,
+            // not this operator's, which is exactly the case for counting it.
+            Arc::clone(context.memory_pool()),
         )))
     }
 
@@ -516,9 +523,14 @@ struct ProcedureCallStream {
     schema: SchemaRef,
     state: ProcedureCallState,
     metrics: BaselineMetrics,
+    /// Pool the per-dispatch reservation is registered against (#261). Held as
+    /// the pool rather than a reservation because the dispatch future is
+    /// `'static` and cannot borrow one from the stream.
+    pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
 }
 
 impl ProcedureCallStream {
+    #[expect(clippy::too_many_arguments, reason = "threading the pool for #261")]
     fn new(
         graph_ctx: Arc<GraphExecutionContext>,
         procedure_name: String,
@@ -527,6 +539,7 @@ impl ProcedureCallStream {
         target_properties: HashMap<String, Vec<String>>,
         schema: SchemaRef,
         metrics: BaselineMetrics,
+        pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
     ) -> Self {
         Self {
             graph_ctx,
@@ -537,6 +550,7 @@ impl ProcedureCallStream {
             schema,
             state: ProcedureCallState::Init,
             metrics,
+            pool,
         }
     }
 }
@@ -558,8 +572,11 @@ impl Stream for ProcedureCallStream {
                     let yield_items = self.yield_items.clone();
                     let target_properties = self.target_properties.clone();
                     let schema = self.schema.clone();
+                    let pool = Arc::clone(&self.pool);
 
                     let fut = async move {
+                        let reservation =
+                            MemoryConsumer::new("GraphProcedureCallExec").register(&pool);
                         graph_ctx.check_timeout().map_err(exec_err)?;
 
                         // DF-4 streaming lift: an algorithm provider (procedure-
@@ -588,6 +605,7 @@ impl Stream for ProcedureCallStream {
                             &yield_items,
                             &target_properties,
                             &schema,
+                            reservation,
                         )
                         .await
                         .map(ProcStep::Single)
@@ -674,6 +692,7 @@ async fn execute_procedure(
     yield_items: &[(String, Option<String>)],
     target_properties: &HashMap<String, Vec<String>>,
     schema: &SchemaRef,
+    reservation: MemoryReservation,
 ) -> DFResult<Option<RecordBatch>> {
     // Plugin path — every built-in (`uni.schema.*`, `uni.algo.*`,
     // `uni.vector.query`, `uni.fts.query`, `uni.search`, APOC, …) is
@@ -691,6 +710,7 @@ async fn execute_procedure(
             yield_items,
             target_properties,
             schema,
+            reservation,
         )
         .await;
     }
@@ -711,10 +731,15 @@ async fn execute_procedure(
             args,
             yield_items,
             schema,
+            reservation,
         )
         .await;
     }
 
+    // The TCK mock-procedure path builds its batch from the registry's own
+    // static rows rather than draining a plugin stream, so there is nothing here
+    // for the reservation to cover; it is released instead of threaded.
+    drop(reservation);
     execute_registered_procedure(graph_ctx, procedure_name, args, yield_items, schema).await
 }
 
@@ -737,9 +762,10 @@ async fn execute_algorithm_provider(
     args: &[Value],
     yield_items: &[(String, Option<String>)],
     schema: &SchemaRef,
+    reservation: MemoryReservation,
 ) -> DFResult<Option<RecordBatch>> {
     let stream = run_algorithm_provider_raw(graph_ctx, procedure_name, entry, args)?;
-    finalize_procedure_stream(stream, procedure_name, yield_items, schema).await
+    finalize_procedure_stream(stream, procedure_name, yield_items, schema, reservation).await
 }
 
 /// Runs an [`AlgorithmProvider`] and returns its **raw** `RecordBatch` stream.
@@ -832,6 +858,10 @@ fn execute_algorithm_provider_streaming(
 /// [`uni_plugin::traits::procedure::ProcedureSignature::yields`]; the
 /// caller-supplied `schema` is informational here since the plugin's
 /// output schema is authoritative.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "threading the reservation for #261"
+)]
 async fn execute_plugin_procedure(
     graph_ctx: &GraphExecutionContext,
     procedure_name: &str,
@@ -840,6 +870,7 @@ async fn execute_plugin_procedure(
     yield_items: &[(String, Option<String>)],
     target_properties: &HashMap<String, Vec<String>>,
     schema: &SchemaRef,
+    reservation: MemoryReservation,
 ) -> DFResult<Option<RecordBatch>> {
     use datafusion::logical_expr::ColumnarValue;
 
@@ -883,7 +914,7 @@ async fn execute_plugin_procedure(
         datafusion::error::DataFusionError::Execution(format!("Procedure '{procedure_name}': {e}"))
     })?;
 
-    finalize_procedure_stream(stream, procedure_name, yield_items, schema).await
+    finalize_procedure_stream(stream, procedure_name, yield_items, schema, reservation).await
 }
 
 /// Drain a plugin's result stream into a single, yield-projected batch.
@@ -905,6 +936,10 @@ async fn finalize_procedure_stream(
     procedure_name: &str,
     yield_items: &[(String, Option<String>)],
     schema: &SchemaRef,
+    // Taken by value and dropped here: everything it covers is either released
+    // with the parts below or folded into the single batch this returns, which
+    // belongs to the consumer from that point.
+    mut reservation: MemoryReservation,
 ) -> DFResult<Option<RecordBatch>> {
     use futures::StreamExt;
 
@@ -912,12 +947,14 @@ async fn finalize_procedure_stream(
     // stream produces a single batch; this works for multi-batch streams
     // by concatenating.
     let mut batches: Vec<RecordBatch> = Vec::new();
+    let mut footprint = crate::query::df_graph::common::BatchFootprint::new();
     while let Some(item) = stream.next().await {
         let batch = item.map_err(|e| {
             datafusion::error::DataFusionError::Execution(format!(
                 "Procedure '{procedure_name}' stream error: {e}"
             ))
         })?;
+        reservation.try_grow(footprint.add(&batch))?;
         batches.push(batch);
     }
 
@@ -933,7 +970,11 @@ async fn finalize_procedure_stream(
     let combined = if batches.len() == 1 {
         batches.pop().unwrap()
     } else {
-        arrow::compute::concat_batches(&plugin_schema, &batches).map_err(arrow_err)?
+        concat_accounted(
+            &plugin_schema,
+            std::mem::take(&mut batches),
+            &mut reservation,
+        )?
     };
 
     // Pass-through when the plugin already produced columns matching the

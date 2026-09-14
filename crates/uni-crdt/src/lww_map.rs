@@ -2,7 +2,7 @@
 // Copyright 2024-2026 Dragonscale Team
 
 use crate::{CrdtMerge, LWWRegister};
-use fxhash::FxHashMap;
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use std::hash::Hash;
 

@@ -13,7 +13,7 @@
 #![allow(dead_code)]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use anyhow::{Result, anyhow};
 use arrow_array::RecordBatch;
@@ -26,6 +26,8 @@ pub struct FaultBackend {
     inner: Arc<dyn StorageBackend>,
     fail_table_exists: AtomicBool,
     fail_scan: AtomicBool,
+    fail_write: AtomicBool,
+    scan_count: AtomicUsize,
 }
 
 impl FaultBackend {
@@ -34,7 +36,25 @@ impl FaultBackend {
             inner,
             fail_table_exists: AtomicBool::new(false),
             fail_scan: AtomicBool::new(false),
+            fail_write: AtomicBool::new(false),
+            scan_count: AtomicUsize::new(0),
         }
+    }
+
+    /// Storage round-trips issued through `scan` and `scan_stream` so far.
+    ///
+    /// Counted here rather than via `QueryCounters` because the read paths this
+    /// observes — `load_subgraph`'s adjacency and delta reads — build their
+    /// `ScanRequest`s without counters, so the query-level counter cannot see
+    /// them. Decorating the backend counts what actually reaches storage,
+    /// whoever built the request.
+    pub fn scans(&self) -> usize {
+        self.scan_count.load(Ordering::SeqCst)
+    }
+
+    /// Resets the round-trip count, so one fixture can time two arms.
+    pub fn reset_scans(&self) {
+        self.scan_count.store(0, Ordering::SeqCst);
     }
 
     pub fn set_fail_table_exists(&self, on: bool) {
@@ -48,6 +68,14 @@ impl FaultBackend {
     /// and a fix that only covers the probe leaves the read uncovered.
     pub fn set_fail_scan(&self, on: bool) {
         self.fail_scan.store(on, Ordering::SeqCst);
+    }
+
+    /// Arms every table-writing method to fail, modelling a store that accepts
+    /// reads and refuses writes — which is what an async flush's stream phase
+    /// runs into. Broader than `write` alone because the flush reaches Lance
+    /// through whichever of create/open/append the table's state calls for.
+    pub fn set_fail_write(&self, on: bool) {
+        self.fail_write.store(on, Ordering::SeqCst);
     }
 }
 
@@ -65,14 +93,23 @@ impl StorageBackend for FaultBackend {
     }
 
     async fn create_table(&self, name: &str, batches: Vec<RecordBatch>) -> Result<()> {
+        if self.fail_write.load(Ordering::SeqCst) {
+            return Err(anyhow!("injected write failure for {name}"));
+        }
         self.inner.create_table(name, batches).await
     }
 
     async fn create_empty_table(&self, name: &str, schema: Arc<ArrowSchema>) -> Result<()> {
+        if self.fail_write.load(Ordering::SeqCst) {
+            return Err(anyhow!("injected write failure for {name}"));
+        }
         self.inner.create_empty_table(name, schema).await
     }
 
     async fn open_or_create_table(&self, name: &str, schema: Arc<ArrowSchema>) -> Result<()> {
+        if self.fail_write.load(Ordering::SeqCst) {
+            return Err(anyhow!("injected write failure for {name}"));
+        }
         self.inner.open_or_create_table(name, schema).await
     }
 
@@ -81,6 +118,7 @@ impl StorageBackend for FaultBackend {
     }
 
     async fn scan(&self, request: ScanRequest) -> Result<Vec<RecordBatch>> {
+        self.scan_count.fetch_add(1, Ordering::SeqCst);
         if self.fail_scan.load(Ordering::SeqCst) {
             return Err(anyhow!(
                 "injected transient read failure for {}",
@@ -91,6 +129,7 @@ impl StorageBackend for FaultBackend {
     }
 
     async fn scan_stream(&self, request: ScanRequest) -> Result<RecordBatchStream> {
+        self.scan_count.fetch_add(1, Ordering::SeqCst);
         if self.fail_scan.load(Ordering::SeqCst) {
             return Err(anyhow!(
                 "injected transient read failure for {}",
@@ -114,6 +153,9 @@ impl StorageBackend for FaultBackend {
         batches: Vec<RecordBatch>,
         mode: WriteMode,
     ) -> Result<()> {
+        if self.fail_write.load(Ordering::SeqCst) {
+            return Err(anyhow!("injected write failure for {table_name}"));
+        }
         self.inner.write(table_name, batches, mode).await
     }
 

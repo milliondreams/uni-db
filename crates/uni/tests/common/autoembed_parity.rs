@@ -604,6 +604,7 @@ async fn sparse_schema(db: &Uni, embedding: Option<EmbeddingCfg>) -> anyhow::Res
                 dimensions: VOCAB,
                 quantize: true,
                 embedding,
+                idf: false,
             },
         )
         .apply()
@@ -684,6 +685,7 @@ async fn sparse_autoembed_multi_source() -> anyhow::Result<()> {
                 dimensions: VOCAB,
                 quantize: true,
                 embedding: Some(emb_cfg("s/mock", &["a", "b"], None)),
+                idf: false,
             },
         )
         .apply()
@@ -849,6 +851,118 @@ async fn prebuilt_runtime_carrying_the_required_alias_opens() -> anyhow::Result<
     assert!(
         db.xervo().raw_runtime().is_some(),
         "the injected runtime must be handed back out for sharing"
+    );
+    Ok(())
+}
+
+// ──────────────── #122 residual cells ────────────────
+//
+// Two gaps the parity matrix still had. Both are coverage; neither implicates
+// production behaviour.
+
+/// Multi-vector: a **string** query embeds and returns rows when a runtime is
+/// present (#122).
+///
+/// Its sibling `multi_autoembed_string_query_requires_runtime` covers only the
+/// error path — that a string query without a runtime is refused. That test
+/// passes whether or not the success path works at all, which is exactly the
+/// gap: an unwired query-time embed would look identical from there.
+#[tokio::test]
+async fn multi_autoembed_string_query_succeeds_with_runtime() -> anyhow::Result<()> {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let db = Uni::in_memory()
+        .xervo_runtime(multi_runtime(calls.clone()).await)
+        .build()
+        .await?;
+    multi_schema(&db, Some(emb_cfg("m/mock", &["content"], None))).await?;
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Doc {title: 'a', content: 'alpha'})")
+        .await?;
+    tx.execute("CREATE (:Doc {title: 'b', content: 'beta'})")
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    let before = calls.load(Ordering::SeqCst);
+    let res = db
+        .session()
+        .query("CALL uni.vector.query('Doc', 'tokens', 'some text', 3) YIELD node RETURN node.title AS title")
+        .await?;
+
+    assert!(
+        !res.rows().is_empty(),
+        "a string query with a runtime present must embed and return rows"
+    );
+    assert!(
+        calls.load(Ordering::SeqCst) > before,
+        "the string query must have driven an embed call; {before} before, {} after — \
+         equal means the text was not embedded and the rows came from somewhere else",
+        calls.load(Ordering::SeqCst)
+    );
+    Ok(())
+}
+
+/// Sparse: a label's rows embed in one batched inference (#122).
+///
+/// The dense path asserts this (`dense_autoembed_batches_one_inference`); its
+/// sparse sibling did not, so a regression to per-row inference here would be
+/// invisible.
+#[tokio::test]
+async fn sparse_autoembed_batches_one_inference() -> anyhow::Result<()> {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let db = Uni::in_memory()
+        .config(UniConfig {
+            defer_embeddings: true,
+            ..UniConfig::default()
+        })
+        .xervo_runtime(sparse_runtime(calls.clone()).await)
+        .build()
+        .await?;
+    sparse_schema(&db, Some(emb_cfg("s/mock", &["content"], None))).await?;
+
+    let tx = db.session().tx().await?;
+    for i in 0..5 {
+        tx.execute(&format!("CREATE (:Doc {{title: 't{i}', content: 'a b'}})"))
+            .await?;
+    }
+    tx.commit().await?;
+    db.flush().await?;
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "5 docs must embed in one batched sparse inference"
+    );
+    Ok(())
+}
+
+/// Multi-vector: a label's rows embed in one batched inference (#122).
+#[tokio::test]
+async fn multi_autoembed_batches_one_inference() -> anyhow::Result<()> {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let db = Uni::in_memory()
+        .config(UniConfig {
+            defer_embeddings: true,
+            ..UniConfig::default()
+        })
+        .xervo_runtime(multi_runtime(calls.clone()).await)
+        .build()
+        .await?;
+    multi_schema(&db, Some(emb_cfg("m/mock", &["content"], None))).await?;
+
+    let tx = db.session().tx().await?;
+    for i in 0..5 {
+        tx.execute(&format!("CREATE (:Doc {{title: 't{i}', content: 'a b'}})"))
+            .await?;
+    }
+    tx.commit().await?;
+    db.flush().await?;
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "5 docs must embed in one batched multi-vector inference"
     );
     Ok(())
 }

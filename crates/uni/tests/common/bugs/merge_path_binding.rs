@@ -244,3 +244,55 @@ async fn nodes_and_relationships_reject_a_non_path() -> Result<()> {
     }
     Ok(())
 }
+
+/// `length()` rejects a value that has no length, rather than answering null.
+///
+/// The tagged-value arm of `cypher_size_scalar` handled lists, strings and maps
+/// and fell to `Null` for everything else — so `length(1)` answered null, which
+/// is indistinguishable from "an empty collection" and from "this encoding was
+/// not understood". That second reading is not hypothetical: it is what hid a
+/// missing `Value::Path` arm in the same match until `length(p)` was caught
+/// measuring a JSON object's key count.
+///
+/// The outer match already errored on types it did not know; this makes the
+/// inner one agree. Null in, null out is kept.
+#[tokio::test]
+async fn length_rejects_a_value_with_no_length() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    let tx = db.session().tx().await?;
+    // `tagged` is a CypherValue column, so its number arrives through the
+    // tagged-value decode — the arm that used to answer null. `n` is a native
+    // Int64 and takes the outer match, which already errored; both are asserted
+    // so the two halves of one function cannot drift apart again.
+    tx.execute("CREATE LABEL E (n INT, flag BOOL, tagged JSON)")
+        .await?;
+    tx.execute("CREATE (:E {n: 7, flag: true, tagged: 7})")
+        .await?;
+    tx.commit().await?;
+
+    for call in ["length(e.n)", "length(e.flag)", "length(e.tagged)"] {
+        let msg = db
+            .session()
+            .query(&format!("MATCH (e:E) RETURN {call} AS x"))
+            .await
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            msg.contains("not supported") || msg.contains("unsupported type"),
+            "{call} should be a type error, got: {msg:?}"
+        );
+    }
+
+    // The kinds that do have a length still answer, and null still passes
+    // through rather than erroring.
+    let r = db
+        .session()
+        .query("RETURN length('abc') AS s, length([1,2]) AS l, length(null) IS NULL AS n")
+        .await?;
+    let row = &r.rows()[0];
+    assert_eq!(row.get::<i64>("s")?, 3);
+    assert_eq!(row.get::<i64>("l")?, 2);
+    assert!(row.get::<bool>("n")?, "length(null) should be null");
+    Ok(())
+}

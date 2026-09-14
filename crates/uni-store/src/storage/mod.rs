@@ -5,6 +5,7 @@ pub mod adjacency;
 pub mod adjacency_manager;
 pub mod adjacency_overlay;
 pub mod arrow_convert;
+pub mod cardinality;
 pub mod compaction;
 pub mod csr;
 pub mod delta;

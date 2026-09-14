@@ -119,11 +119,17 @@ fn all_test_sources(root: &Path) -> String {
 /// and this repo comments heavily — every operator name already appears in
 /// prose somewhere. Only the helper actually profiles a query and compares
 /// against the executed plan, so only a helper call is evidence.
+///
+/// `assert_locy_plan_uses` counts for the same reason the others do: it
+/// profiles a Locy program and compares against the operators its clause bodies
+/// and strata actually ran. A Locy-only operator can be proven no other way —
+/// it never appears in a Cypher `ProfileOutput`.
 fn has_proof_call(haystack: &str, op: &str) -> bool {
     let needle = format!("\"{op}\"");
     haystack.lines().any(|l| {
         (l.contains("assert_plan_uses(")
             || l.contains("assert_plan_uses_any(")
+            || l.contains("assert_locy_plan_uses(")
             || l.contains("assert_uses(")
             || l.contains("assert_uses_any("))
             && l.contains(&needle)
@@ -133,6 +139,7 @@ fn has_proof_call(haystack: &str, op: &str) -> bool {
         for l in haystack.lines() {
             if l.contains("assert_plan_uses(")
                 || l.contains("assert_plan_uses_any(")
+                || l.contains("assert_locy_plan_uses(")
                 || l.contains("assert_uses(")
                 || l.contains("assert_uses_any(")
             {

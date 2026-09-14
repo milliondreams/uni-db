@@ -2,7 +2,7 @@
 // Copyright 2024-2026 Dragonscale Team
 
 use crate::CrdtMerge;
-use fxhash::FxHashSet;
+use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 use std::hash::Hash;
 

@@ -122,6 +122,12 @@ async fn explain_elides_filter_for_encodable_predicate() {
     let batches = df.collect().await.expect("collect");
     let rendered = pretty_format_batches(&batches).expect("format").to_string();
 
+    // Not a proof that `StorageScanExec` ran — `TableScan` is the *logical*
+    // node name, so this disjunction holds either way, and it matches by
+    // substring besides. `a_storage_table_scan_runs_the_storage_scan_exec`
+    // carries that claim against the physical plan by exact name (#177). What
+    // is checked here is only that the scan survived into the EXPLAIN at all,
+    // which is the precondition for the elision assertion below.
     assert!(
         rendered.contains("StorageScanExec") || rendered.contains("TableScan"),
         "EXPLAIN output should reference the scan; got:\n{rendered}"
@@ -191,5 +197,70 @@ async fn explain_keeps_filter_for_inexpressible_predicate() {
         has_filter,
         "Filter MUST stay above the scan when the predicate is inexpressible; \
          negative-guard regression. Optimized plan:\n{optimized:?}"
+    );
+}
+
+/// Collect `ExecutionPlan::name()` for every node, depth-first.
+fn physical_op_names(
+    plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    out: &mut Vec<String>,
+) {
+    out.push(plan.name().to_string());
+    for child in plan.children() {
+        physical_op_names(child, out);
+    }
+}
+
+/// A scan through `StorageTableProvider` runs `StorageScanExec` (#177).
+///
+/// Asserted on the **physical** plan by exact operator name. The `EXPLAIN`
+/// assertion below cannot serve as this proof for two reasons #177 names
+/// directly: it matches by substring, and it is a disjunction with
+/// `"TableScan"` — the *logical* node name — so it passes whether or not the
+/// physical operator was ever built.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_storage_table_scan_runs_the_storage_scan_exec() {
+    let ctx = pushdown_only_ctx();
+    register_memtable(&ctx).await;
+    let df = ctx
+        .sql("SELECT x FROM mem_table WHERE x > 5")
+        .await
+        .expect("sql");
+    let plan = df.create_physical_plan().await.expect("physical plan");
+    let mut names = Vec::new();
+    physical_op_names(&plan, &mut names);
+    uni_query::query::executor::plan_shape::assert_uses(
+        &names,
+        "StorageScanExec",
+        "SELECT x FROM mem_table WHERE x > 5",
+    );
+}
+
+/// The negative twin: a plain in-memory table is served by DataFusion's own
+/// scan, not this bridge.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_datafusion_memtable_avoids_the_storage_scan_exec() {
+    let ctx = pushdown_only_ctx();
+    let batch = RecordBatch::try_new(
+        fixture_schema(),
+        vec![Arc::new(Int64Array::from(vec![6_i64, 7, 8]))],
+    )
+    .expect("fixture batch");
+    let mem = datafusion::datasource::MemTable::try_new(fixture_schema(), vec![vec![batch]])
+        .expect("memtable");
+    ctx.register_table("plain_table", Arc::new(mem))
+        .expect("register_table");
+
+    let df = ctx
+        .sql("SELECT x FROM plain_table WHERE x > 5")
+        .await
+        .expect("sql");
+    let plan = df.create_physical_plan().await.expect("physical plan");
+    let mut names = Vec::new();
+    physical_op_names(&plan, &mut names);
+    uni_query::query::executor::plan_shape::assert_avoids(
+        &names,
+        "StorageScanExec",
+        "SELECT x FROM plain_table WHERE x > 5",
     );
 }

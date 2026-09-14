@@ -134,6 +134,14 @@ pub struct FlushCoordinator {
     /// `pending_flush` and is never re-flushed inline, so this is
     /// monotonic until a restart replays the WAL.
     flush_failures: Arc<AtomicU64>,
+    /// The most recent stream-phase failure, as text (#200).
+    ///
+    /// The count alone says a barrier cannot be honoured but not why, which is
+    /// what made the one observed occurrence undiagnosable: it did not
+    /// reproduce, and by the time anyone looked there was nothing left but a
+    /// number. Kept as a `String` rather than the error, because the error is
+    /// consumed by `finalize_failure` and this only ever has to be printed.
+    last_flush_error: Arc<parking_lot::Mutex<Option<String>>>,
     drain_notify: Arc<tokio::sync::Notify>,
     max_pending_flushes: usize,
     /// Wall-clock bound on a single stream phase. A stream that exceeds this
@@ -219,10 +227,13 @@ impl FlushCoordinator {
         let (submit_tx, submit_rx) = mpsc::unbounded_channel::<FlushSubmit>();
         let pending_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let flush_failures = Arc::new(AtomicU64::new(0));
+        let last_flush_error: Arc<parking_lot::Mutex<Option<String>>> =
+            Arc::new(parking_lot::Mutex::new(None));
         let drain_notify = Arc::new(tokio::sync::Notify::new());
 
         let pending_count_for_task = pending_count.clone();
         let flush_failures_for_task = flush_failures.clone();
+        let last_flush_error_for_task = last_flush_error.clone();
         let drain_notify_for_task = drain_notify.clone();
         let handle = tokio::spawn(finalizer_loop(
             submit_rx,
@@ -231,6 +242,7 @@ impl FlushCoordinator {
             pending_count_for_task,
             drain_notify_for_task,
             flush_failures_for_task,
+            last_flush_error_for_task,
         ));
 
         Self {
@@ -239,6 +251,7 @@ impl FlushCoordinator {
             submit_tx: parking_lot::Mutex::new(Some(submit_tx)),
             pending_count,
             flush_failures,
+            last_flush_error,
             drain_notify,
             max_pending_flushes,
             stream_timeout,
@@ -338,6 +351,15 @@ impl FlushCoordinator {
     /// barrier having failed.
     pub fn failed_flush_count(&self) -> u64 {
         self.flush_failures.load(Ordering::Acquire)
+    }
+
+    /// The most recent stream-phase failure, if any (#200).
+    ///
+    /// Paired with [`Self::failed_flush_count`]: the count says the barrier
+    /// cannot be honoured, this says why. Only the latest is kept — a failure
+    /// here strands an L0 and the first one is normally the whole story.
+    pub fn last_flush_error(&self) -> Option<String> {
+        self.last_flush_error.lock().clone()
     }
 
     /// Submit a completed-stream flush for ordered finalization.
@@ -556,6 +578,7 @@ async fn finalizer_loop(
     pending_count: Arc<std::sync::atomic::AtomicUsize>,
     drain_notify: Arc<tokio::sync::Notify>,
     flush_failures: Arc<AtomicU64>,
+    last_flush_error: Arc<parking_lot::Mutex<Option<String>>>,
 ) {
     // Reorder-by-seq using a min-heap; finalize strictly in seq order.
     let mut pending: BinaryHeap<Reverse<(u64, FlushSubmit)>> = BinaryHeap::new();
@@ -576,12 +599,17 @@ async fn finalizer_loop(
             let ack_result = match result {
                 Ok(outcome) => finalize_fn.finalize(rotated, outcome, shared.clone()).await,
                 Err(e) => {
+                    // Captured before the error is consumed below. The count
+                    // alone cannot be acted on: an occurrence that does not
+                    // reproduce leaves nothing but a number (#200).
+                    let cause = e.to_string();
                     let _err = finalize_fn
                         .finalize_failure(rotated, e, shared.clone())
                         .await;
                     // Recorded so `flush_to_l1` can refuse to claim a barrier it
                     // cannot honour: the rotated L0 stays on `pending_flush` and
                     // nothing re-flushes it.
+                    *last_flush_error.lock() = Some(cause);
                     flush_failures.fetch_add(1, Ordering::AcqRel);
                     Err(anyhow::anyhow!("flush stream failed: {}", _err))
                 }

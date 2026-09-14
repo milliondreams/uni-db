@@ -8,7 +8,8 @@
 //! is consumed and removed from the output schema.
 
 use crate::query::df_graph::common::{
-    ScalarKey, arrow_err, compute_plan_properties, extract_scalar_key,
+    ScalarKey, arrow_err, collect_accounted, compute_plan_properties, concat_accounted,
+    extract_scalar_key, operator_reservation,
 };
 use arrow::compute::filter as arrow_filter;
 use arrow_array::{BooleanArray, Int64Array, RecordBatch};
@@ -17,7 +18,7 @@ use datafusion::common::Result as DFResult;
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
-use futures::{Stream, TryStreamExt};
+use futures::Stream;
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
@@ -134,16 +135,20 @@ impl ExecutionPlan for PriorityExec {
         let output_schema = Arc::clone(&self.schema);
         let input_schema = self.input.schema();
 
+        // #261. This is an eager barrier: it holds the whole input, and
+        // then the input and its concatenation at once. Nothing counted
+        // either, so the pool could neither refuse nor report it.
+        let mut reservation = operator_reservation("PriorityExec", partition, &context);
         let fut = async move {
             // Collect all input batches
-            let batches: Vec<RecordBatch> = input_stream.try_collect().await?;
+            // #261: charged as the barrier fills, not after it is full.
+            let batches = collect_accounted(input_stream, &mut reservation).await?;
 
             if batches.is_empty() {
                 return Ok(RecordBatch::new_empty(output_schema));
             }
 
-            let batch =
-                arrow::compute::concat_batches(&input_schema, &batches).map_err(arrow_err)?;
+            let batch = concat_accounted(&input_schema, batches, &mut reservation)?;
 
             if batch.num_rows() == 0 {
                 return Ok(RecordBatch::new_empty(output_schema));

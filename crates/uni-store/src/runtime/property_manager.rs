@@ -841,13 +841,20 @@ impl PropertyManager {
     /// knows — a traversal knows the exact set from its own expansions — and
     /// exactly those tables are scanned.
     ///
-    /// `None` falls back to asking L0 for each EID's type, and **if a single
-    /// EID is unknown to L0 it scans every edge type in the schema**. L0 is
-    /// empty on a reloaded or compacted store, so that fallback is the normal
-    /// path there rather than the exceptional one: measured on LDBC IC5's
-    /// `HAS_MEMBER` clause at SF1, all 195 calls took it, scanning all 15 edge
-    /// types for 31.7 s — 20% of the clause (#222). The cost is per *call*, not
-    /// per edge.
+    /// `None` resolves the set instead: L0 first, then whatever L0 misses in
+    /// one indexed `_eid`/`type` pass over `main_edges`
+    /// ([`crate::storage::main_edge::MainEdgeDataset::find_types_by_eids_counted`]).
+    /// Only an EID that
+    /// neither tier knows still scans every edge type in the schema.
+    ///
+    /// That fan-out used to be the *normal* path rather than the exceptional
+    /// one, because L0 is empty on a reloaded or compacted store: measured on
+    /// LDBC IC5's `HAS_MEMBER` clause at SF1, all 195 calls took it, scanning
+    /// all 15 edge types for 31.7 s — 20% of the clause (#222). The cost is per
+    /// *call*, not per edge.
+    ///
+    /// The hint is still worth passing where it is known: it skips both tiers,
+    /// and the second one is a real scan, not a memory lookup.
     ///
     /// The parameter is explicit rather than inferred precisely so that a new
     /// call site has to decide, instead of silently inheriting the fan-out.
@@ -883,26 +890,56 @@ impl PropertyManager {
         let types_to_scan: Vec<String> = if let Some(hint) = edge_types.filter(|h| !h.is_empty()) {
             hint.to_vec()
         } else {
-            // Try to resolve edge types from L0 context for O(1) lookup
+            // Resolve in two tiers before giving up. L0 answers for free but is
+            // empty on a reloaded or compacted store, which is what made the
+            // all-types fan-out below the *normal* path rather than the
+            // exceptional one (#222). Whatever L0 misses is then resolved
+            // against `main_edges` in one indexed pass over `_eid` and `type`.
+            let mut needed: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut misses: Vec<uni_common::core::id::Eid> = Vec::new();
             if let Some(ctx) = ctx {
-                let mut needed: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
-                let mut all_resolved = true;
                 for &eid in eids {
-                    if let Some(etype) = ctx.l0.read().get_edge_type(eid) {
-                        needed.insert(etype.to_string());
-                    } else {
-                        all_resolved = false;
-                        break;
+                    match ctx.l0.read().get_edge_type(eid) {
+                        Some(etype) => {
+                            needed.insert(etype.to_string());
+                        }
+                        None => misses.push(eid),
                     }
                 }
-                if all_resolved {
-                    needed.into_iter().collect()
-                } else {
-                    schema.edge_types.keys().cloned().collect() // Fallback to full scan
-                }
             } else {
-                schema.edge_types.keys().cloned().collect() // No context, full scan
+                misses.extend_from_slice(eids);
+            }
+
+            // An EID absent from both tiers is the one case that must still
+            // fan out. Narrowing on a partial answer would scan too few tables
+            // and silently return no properties for the edges left out — a
+            // wrong answer, where the fan-out is only a slow one.
+            let mut unresolved = false;
+            if !misses.is_empty() {
+                let resolved =
+                    crate::storage::main_edge::MainEdgeDataset::find_types_by_eids_counted(
+                        self.storage.backend(),
+                        &misses,
+                        counters_of(ctx),
+                    )
+                    .await?;
+                for eid in &misses {
+                    match resolved.get(eid) {
+                        Some(etype) => {
+                            needed.insert(etype.clone());
+                        }
+                        None => {
+                            unresolved = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if unresolved {
+                schema.edge_types.keys().cloned().collect() // Fallback to full scan
+            } else {
+                needed.into_iter().collect()
             }
         };
 
@@ -2211,6 +2248,71 @@ impl PropertyManager {
         }
 
         Ok(storage_val)
+    }
+
+    /// Batched read of CRDT-typed properties, with the singular reader's
+    /// semantics.
+    ///
+    /// [`Self::get_batch_vertex_props_for_label`] is **not** a substitute for
+    /// [`Self::get_vertex_prop_with_ctx`] on a CRDT key, and #220 lists it as
+    /// one. The batched reader folds L0 over storage with `or_insert` — the
+    /// overlay wins the key outright — while the singular one *merges* the two.
+    /// On an overlay that does not already subsume storage they disagree:
+    /// measured on a `GCounter` split `actor1=10` in storage and `actor2=20` in
+    /// the overlay, the batched form answers 20 and the singular one 30
+    /// (`bugs::issue_220_crdt_reader_equivalence`).
+    ///
+    /// That difference is not cosmetic where it is read. The CRDT pre-merge in
+    /// `Writer::insert_vertices_batch` reads the existing value to merge the
+    /// incoming batch against, so a reader that drops storage's replica writes
+    /// a counter that has gone *backwards* — the lost update the OCC work
+    /// closed once already.
+    ///
+    /// So this batches the half that actually costs round-trips — the storage
+    /// read, one call for every vid — and keeps the merge exact: the L0
+    /// accumulation is a walk over in-memory buffers and never touched storage
+    /// to begin with.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the storage read fails or a CRDT merge fails.
+    pub async fn get_batch_vertex_crdt_props(
+        &self,
+        vids: &[Vid],
+        label: &str,
+        keys: &[String],
+        ctx: Option<&QueryContext>,
+    ) -> Result<HashMap<Vid, Properties>> {
+        let mut out: HashMap<Vid, Properties> = HashMap::new();
+        if vids.is_empty() || keys.is_empty() {
+            return Ok(out);
+        }
+
+        // `None` context on purpose: this is the storage half only. The overlay
+        // is folded in per key below, by merging rather than by overwriting.
+        let storage_props = self
+            .get_batch_vertex_props_for_label(vids, label, None)
+            .await?;
+
+        for &vid in vids {
+            if l0_visibility::is_vertex_deleted(vid, ctx) {
+                continue;
+            }
+            for key in keys {
+                let l0_val = self.accumulate_crdt_from_l0(vid, key, ctx)?;
+                let storage_val = storage_props
+                    .get(&vid)
+                    .and_then(|props| props.get(key.as_str()))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let merged = self.merge_crdt_values(&storage_val, &l0_val)?;
+                if !merged.is_null() {
+                    out.entry(vid).or_default().insert(key.clone(), merged);
+                }
+            }
+        }
+
+        Ok(out)
     }
 
     /// Accumulate CRDT values from all L0 layers by merging them together.

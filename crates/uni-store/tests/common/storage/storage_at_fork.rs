@@ -310,3 +310,90 @@ async fn vertex_row_count_declines_only_for_a_branched_table() {
         "a fork must still get the bound for tables it has not branched"
     );
 }
+
+/// A fork-scoped reader declines the cached count for a branched table (#260).
+///
+/// The cache holds primary's count. On a table the fork has branched, that is
+/// not this reader's answer — and `BranchedBackend::count_rows` would degrade
+/// to a real scan rather than a metadata read, which is the same condition
+/// `StorageManager::vertex_row_count` already declines on. Declining keeps the
+/// two consistent; answering would hand a fork primary's number.
+#[tokio::test]
+async fn a_fork_scoped_reader_declines_the_cached_count() {
+    use uni_store::storage::cardinality::CardinalityKey;
+
+    let dir = TempDir::new().unwrap();
+    let storage_path = dir.path().join("storage");
+    let storage_str = storage_path.to_str().unwrap();
+    std::fs::create_dir_all(&storage_path).unwrap();
+
+    let schema_path = dir.path().join("schema.json");
+    let schema_manager = SchemaManager::load(&schema_path).await.unwrap();
+    schema_manager.add_label("Person").unwrap();
+    schema_manager
+        .add_property("Person", "name", DataType::String, false)
+        .unwrap();
+    schema_manager.save().await.unwrap();
+    let schema_manager = Arc::new(schema_manager);
+
+    let storage =
+        StorageManager::new_with_config(storage_str, schema_manager.clone(), UniConfig::default())
+            .await
+            .unwrap();
+
+    let dataset_uri = format!("{storage_str}/vertices_Person.lance");
+    seed_initial_dataset(&dataset_uri).await;
+
+    let key = CardinalityKey::Vertex("Person".to_string());
+    let primary = storage.refresh_row_count(&key).await.unwrap();
+    assert!(
+        primary.is_some_and(|n| n > 0),
+        "primary must have a real count for this test to mean anything, got {primary:?}"
+    );
+
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(storage_path.clone()).unwrap());
+    let registry = Arc::new(ForkRegistryHandle::load(store).await.unwrap());
+    let parent_v = lance_branch::current_version(&dataset_uri).await.unwrap();
+    let id = ForkId::new();
+    let branch_name = format!("fork_{id}_v_Person");
+    lance_branch::create_branch(&dataset_uri, &branch_name, parent_v)
+        .await
+        .unwrap();
+
+    let mut info = ForkInfo::new_pending(id, "cardinality_fork", "snap-1", 1);
+    info.datasets
+        .insert("vertices_Person".into(), branch_name.clone());
+    registry.begin_create(info.clone()).await.unwrap();
+    let active = registry
+        .finish_create("cardinality_fork", info.datasets.clone())
+        .await
+        .unwrap();
+
+    let scope = Arc::new(ForkScope::new(
+        Arc::new(active),
+        SchemaDelta::empty(),
+        registry.clone(),
+    ));
+    let forked_storage = storage.at_fork(scope);
+
+    assert_eq!(
+        forked_storage.cached_row_count(&key, None),
+        None,
+        "a fork-scoped reader served primary's count for a table it has \
+         branched; it must decline"
+    );
+    assert_eq!(
+        forked_storage.refresh_row_count(&key).await.unwrap(),
+        None,
+        "and a refresh from a fork must not write its own count into the cache \
+         primary reads"
+    );
+
+    // The primary view is unaffected by the fork's presence.
+    assert_eq!(
+        storage.cached_row_count(&key, None),
+        primary,
+        "the fork must not have disturbed primary's cached count"
+    );
+}

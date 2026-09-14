@@ -2572,11 +2572,35 @@ impl Executor {
             for vid in matches {
                 let mut m = row.clone();
                 if let Some(var) = &node.variable {
-                    // Minimal binding so ON MATCH SET resolves the node by _vid.
-                    m.insert(
-                        var.clone(),
-                        Self::build_node_map(vid, label, HashMap::new()),
-                    );
+                    // Bind with the node's properties, not just its `_vid`
+                    // (#220) — but only when there is an `ON MATCH SET` to read
+                    // them. They are already in hand (the per-statement
+                    // persisted lookup read them for every matched vid), and
+                    // binding them empty is what made `ON MATCH SET n.p = n.p +
+                    // x` fall back to a single-key storage read *per row*:
+                    // `evaluate_expr` checks the in-memory `Node` first and only
+                    // then asks storage. Measured at 617 such reads in one test
+                    // subset, all for `n.freq` in the MERGE-in-UNWIND
+                    // accumulate shape.
+                    //
+                    // Gated on `on_match` because the rebind below runs
+                    // regardless, for RETURN fidelity. Reading here as well when
+                    // nothing consumes it made a plain `MERGE (a)-[e]->(b)` pay
+                    // two property reads per matched node where it used to pay
+                    // one — pure waste on the commonest MERGE shape, which has
+                    // no `ON MATCH SET` at all.
+                    let props = if on_match.is_some() {
+                        read_vertex_props_with_prefetch(
+                            vid,
+                            prefetched.as_deref().unwrap_or(&empty_prefetch),
+                            prop_manager,
+                            ctx,
+                        )
+                        .await?
+                    } else {
+                        HashMap::new()
+                    };
+                    m.insert(var.clone(), Self::build_node_map(vid, label, props));
                 }
                 if let Some(set) = on_match {
                     self.execute_set_items_locked(

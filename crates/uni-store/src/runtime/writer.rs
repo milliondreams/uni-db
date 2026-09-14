@@ -2168,6 +2168,22 @@ impl Writer {
         let mut batch_keys: HashMap<String, HashMap<String, usize>> = HashMap::new();
         let mut batch_extids: HashMap<String, usize> = HashMap::new();
 
+        // Probe the main vertex table once for the whole batch rather than once
+        // per vertex (#220). Ordering is unchanged: the per-vertex checks below
+        // still run in index order and still report the first offending index,
+        // and the error semantics are those of the singular probe — an absent
+        // table is `Ok`, a failed scan is an error, because a uniqueness probe
+        // that reads as "no duplicate" on an I/O failure admits the duplicate
+        // it exists to reject (#233).
+        let flushed_extids = {
+            let wanted: Vec<String> = properties_batch
+                .iter()
+                .filter_map(|p| p.get("ext_id").and_then(|v| v.as_str()).map(str::to_string))
+                .collect();
+            MainVertexDataset::find_by_ext_ids_counted(self.storage.backend(), &wanted, None, None)
+                .await?
+        };
+
         for (idx, (_vid, properties)) in vids.iter().zip(properties_batch.iter()).enumerate() {
             // Check ext_id uniqueness
             if let Some(ext_id) = properties.get("ext_id").and_then(|v| v.as_str()) {
@@ -2197,9 +2213,7 @@ impl Writer {
                 // error. `find_by_ext_id` already answers `Ok(None)` when the
                 // table is absent (see `main_vertex.rs`), so every `Err` here
                 // is a genuine failure with no benign case to absorb.
-                if let Some(found_vid) =
-                    MainVertexDataset::find_by_ext_id(self.storage.backend(), ext_id, None).await?
-                {
+                if let Some(found_vid) = flushed_extids.get(ext_id) {
                     return Err(anyhow!(
                         "Constraint violation at index {}: ext_id '{}' already exists (vertex {:?})",
                         idx,
@@ -3540,6 +3554,14 @@ impl Writer {
 
                 // Batch fetch existing CRDT values: collect VIDs that need merging,
                 // then query once via PropertyManager instead of per-vertex lookups.
+                //
+                // The reader has to be the CRDT-aware batched one. The generic
+                // `get_batch_vertex_props_for_label` lets an L0 overlay win a key
+                // outright where the singular reader merges it with storage, so on
+                // a partial overlay it answers with storage's replica dropped —
+                // and merging the incoming value against *that* writes a counter
+                // that has gone backwards. Pinned by
+                // `bugs::issue_220_crdt_reader_equivalence` (#220 site 4).
                 let schema = self.schema_manager.schema();
                 let crdt_keys: Vec<String> = schema
                     .properties
@@ -3555,17 +3577,27 @@ impl Writer {
                     })
                     .unwrap_or_default();
 
-                if let Some(pm) = &self.property_manager {
+                if let Some(pm) = &self.property_manager
+                    && !crdt_keys.is_empty()
+                {
                     let ctx = self.get_query_context(tx_l0).await;
+                    let existing_by_vid = pm
+                        .get_batch_vertex_crdt_props(&vids, label, &crdt_keys, ctx.as_ref())
+                        .await?;
                     for (vid, props) in vids.iter().zip(&mut properties_batch) {
                         for key in &crdt_keys {
                             if props.contains_key(key) {
-                                let existing =
-                                    pm.get_vertex_prop_with_ctx(*vid, key, ctx.as_ref()).await?;
+                                // Absent means the same thing the singular
+                                // reader's null did: nothing to merge against.
+                                let Some(existing) =
+                                    existing_by_vid.get(vid).and_then(|p| p.get(key.as_str()))
+                                else {
+                                    continue;
+                                };
                                 if !existing.is_null()
                                     && let Some(val) = props.get_mut(key)
                                 {
-                                    *val = pm.merge_crdt_values(&existing, val)?;
+                                    *val = pm.merge_crdt_values(existing, val)?;
                                 }
                             }
                         }
@@ -4583,10 +4615,19 @@ impl Writer {
         if let Some(coord) = self.flush_coordinator.as_ref() {
             let failed = coord.failed_flush_count();
             if failed > 0 {
+                // The cause, not just the count (#200). One occurrence of this
+                // under ordinary full-suite load could not be diagnosed
+                // afterwards — it did not reproduce, and all that survived was
+                // the number. Whatever the next occurrence is, it now says so
+                // in the error that stops the run.
+                let cause = coord.last_flush_error().unwrap_or_else(|| {
+                    "no cause recorded — the failure predates this coordinator".to_string()
+                });
                 return Err(anyhow::anyhow!(
                     "flush_to_l1 barrier not established: {failed} async flush(es) have failed and \
                      their L0 is stranded; the WAL retains that data and replay recovers it on \
-                     restart, but it is NOT in Lance and no later flush picks it up"
+                     restart, but it is NOT in Lance and no later flush picks it up. \
+                     Most recent failure: {cause}"
                 ));
             }
         }
@@ -5075,6 +5116,17 @@ impl Writer {
                 count = orphaned_tombstones.len(),
                 "Tombstones missing labels in L0, querying storage as fallback"
             );
+            // One batched read for the whole orphan set rather than one scan
+            // per vid (#220). Absence from the map is the batched spelling of
+            // the singular form's `None`, and the error still propagates —
+            // which is the #233 property below, preserved.
+            let orphan_vids: Vec<Vid> = orphaned_tombstones.iter().map(|(vid, _)| *vid).collect();
+            let orphan_labels = MainVertexDataset::find_batch_labels_by_vids(
+                self.storage.backend(),
+                &orphan_vids,
+                None,
+            )
+            .await?;
             for (vid, version) in orphaned_tombstones {
                 // #233 Tier 1: this was `if let Ok(Some(..))`, and the
                 // callee additionally ate its scan error with
@@ -5083,7 +5135,7 @@ impl Writer {
                 // vertex stays visible after the flush — a silent
                 // resurrection. A failed flush is retriable; a lost tombstone
                 // is not.
-                if let Some(labels) = self.find_vertex_labels_in_storage(vid).await?
+                if let Some(labels) = orphan_labels.get(&vid).cloned()
                     && !labels.is_empty()
                 {
                     for label in &labels {
@@ -5263,16 +5315,29 @@ impl Writer {
                 })
                 .collect()
         };
+        // Both reads below are batched over the whole relabel set rather than
+        // issued twice per vid (#220). The version bounds are unchanged: the
+        // props read carries the high-water mark as before, and the labels read
+        // carries none, matching `find_vertex_labels_in_storage`, which ranks
+        // versions itself rather than filtering on one.
+        let relabel_vids: Vec<Vid> = overwrite_only.iter().map(|(vid, ..)| *vid).collect();
+        let relabel_props = MainVertexDataset::find_batch_props_by_vids(
+            self.storage.backend(),
+            &relabel_vids,
+            self.storage.version_high_water_mark(),
+        )
+        .await?;
+        let relabel_old_labels = MainVertexDataset::find_batch_labels_by_vids(
+            self.storage.backend(),
+            &relabel_vids,
+            None,
+        )
+        .await?;
+
         for (vid, new_labels, version) in overwrite_only {
             // Persisted props of the prior-window row — required so the
             // re-Appended main row does not blank the vertex's properties.
-            let Some(props) = MainVertexDataset::find_props_by_vid(
-                self.storage.backend(),
-                vid,
-                self.storage.version_high_water_mark(),
-            )
-            .await?
-            else {
+            let Some(props) = relabel_props.get(&vid).cloned() else {
                 tracing::warn!(
                     vid = vid.as_u64(),
                     "label-only mutation for a vid with no persisted main row; skipping flush \
@@ -5283,10 +5348,7 @@ impl Writer {
             // Labels the vid carried BEFORE this relabel; the storage read
             // reflects pre-flush state. Any label no longer present must be
             // tombstoned in its per-label dataset.
-            let old_labels = self
-                .find_vertex_labels_in_storage(vid)
-                .await?
-                .unwrap_or_default();
+            let old_labels = relabel_old_labels.get(&vid).cloned().unwrap_or_default();
 
             main_vertices.push((vid, new_labels.clone(), props.clone(), false, version));
             for label in &new_labels {
@@ -5863,6 +5925,16 @@ impl Writer {
         initial_count: usize,
         start: std::time::Instant,
     ) -> Result<String> {
+        // Flushed row counts have just moved, so forget them (#260). Placed in
+        // the shared finalize body rather than in `flush_to_l1`, because the
+        // sync and async paths both land here and a hook on either alone would
+        // leave the other serving a stale count. Blunt rather than per-table: a
+        // flush can touch every label and edge type in the batch, and an
+        // invalidation that enumerated them would be a second place to get the
+        // set wrong. A missing entry costs one `count_rows`; a stale one is a
+        // wrong answer.
+        shared.storage.cardinality().invalidate_all();
+
         // Parent-snapshot fixup. The stream phase built `manifest` with
         // parent_snapshot set from cached_manifest at stream time. If
         // OTHER flushes (sync or async) have finalized since then,

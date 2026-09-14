@@ -407,6 +407,7 @@ async fn profile_sparse(
                 dimensions: VOCAB,
                 quantize: false,
                 embedding: None,
+                idf: false,
             },
         )
         .apply()

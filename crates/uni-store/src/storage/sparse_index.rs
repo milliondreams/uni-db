@@ -454,6 +454,56 @@ impl SparseVectorIndex {
         Arc::new(ArrowSchema::new(fields))
     }
 
+    /// Document frequency for each of `terms` — the length of its posting list
+    /// (#120).
+    ///
+    /// A term absent from the index is absent from the map rather than zero:
+    /// zero would make `N/df` divide by zero, and "no document has this term"
+    /// is a different statement from "this term is maximally rare".
+    ///
+    /// Reads only `term_id` and `vids`, under the same `term_id IN (...)`
+    /// filter the query scan uses, so it costs one extra indexed scan over the
+    /// query's own terms rather than anything proportional to the corpus.
+    pub async fn document_frequencies(&self, terms: &[u32]) -> Result<HashMap<u32, u64>> {
+        let mut out = HashMap::new();
+        let Some(ds) = &self.dataset else {
+            return Ok(out);
+        };
+        if terms.is_empty() {
+            return Ok(out);
+        }
+
+        let filter =
+            FilterExpr::one_of("term_id", terms.iter().map(|t| Scalar::UInt(u64::from(*t))))
+                .to_sql()?;
+        let mut scanner = ds.scan();
+        scanner.filter(&filter)?;
+        scanner.project(&["term_id", "vids"])?;
+        let mut stream = scanner.try_into_stream().await?;
+
+        while let Some(batch) = stream.try_next().await? {
+            let term_col = batch
+                .column_by_name("term_id")
+                .ok_or_else(|| anyhow!("Missing term_id column"))?
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .ok_or_else(|| anyhow!("Invalid term_id column"))?;
+            let vids_col = batch
+                .column_by_name("vids")
+                .ok_or_else(|| anyhow!("Missing vids column"))?
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .ok_or_else(|| anyhow!("Invalid vids column"))?;
+            for i in 0..batch.num_rows() {
+                if vids_col.is_null(i) {
+                    continue;
+                }
+                out.insert(term_col.value(i), vids_col.value(i).len() as u64);
+            }
+        }
+        Ok(out)
+    }
+
     /// Score the corpus against `query` (`[(term_id, weight)]`) by dot product
     /// and return the top `k` `(Vid, score)` pairs, highest score first.
     ///

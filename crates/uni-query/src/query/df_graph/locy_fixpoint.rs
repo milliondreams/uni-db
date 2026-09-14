@@ -9,7 +9,7 @@
 use crate::query::df_graph::GraphExecutionContext;
 use crate::query::df_graph::common::{
     ScalarKey, arrow_err, collect_all_partitions, compute_plan_properties,
-    execute_locy_clause_body, extract_scalar_key,
+    execute_locy_clause_body, extract_scalar_key, operator_reservation,
 };
 use crate::query::df_graph::locy_best_by::{BestByExec, SortCriterion};
 use crate::query::df_graph::locy_errors::LocyRuntimeError;
@@ -886,7 +886,11 @@ impl FixpointState {
             epsilon,
             self.semiring_kind,
         ));
-        let folded_batches = collect_all_partitions(&plan, Arc::clone(task_ctx)).await?;
+        // #261. The fixpoint's own `max_derived_bytes` budget covers facts and
+        // deltas; these post-fixpoint materializations sit outside it.
+        let mut reservation = operator_reservation("FixpointExec", 0, task_ctx);
+        let folded_batches =
+            collect_all_partitions(&plan, Arc::clone(task_ctx), &mut reservation).await?;
         let folded_out = match folded_batches.iter().find(|b| b.num_rows() > 0) {
             Some(b) => b.clone(),
             None => {
@@ -1570,7 +1574,8 @@ async fn arrow_left_anti_dedup(
     let join_arc: Arc<dyn ExecutionPlan> = Arc::new(join);
     // LeftAnti removes candidates that match `existing`, but not duplicate rows
     // within the candidate set — dedup those to match the other delta strategies.
-    let anti = collect_all_partitions(&join_arc, task_ctx.clone()).await?;
+    let mut reservation = operator_reservation("FixpointExec", 0, task_ctx);
+    let anti = collect_all_partitions(&join_arc, task_ctx.clone(), &mut reservation).await?;
     dedup_batches_all_columns(anti, schema)
 }
 
@@ -2061,6 +2066,10 @@ async fn run_fixpoint_loop(
             derivation_tracker.as_ref().map(Arc::clone),
             top_k_proofs,
             Some(Arc::clone(&registry)),
+            // Recursive strata have no profile collector in scope here; the
+            // non-recursive path in `locy_program.rs` is where these operators
+            // become observable (#177).
+            None,
         )
         .await?;
         all_output.extend(processed);
@@ -4554,27 +4563,55 @@ async fn precompute_neighbor_feature_maps(
         // row time).
         let mut vid_to_values: HashMap<u64, Vec<f64>> = HashMap::new();
         let adj = storage.adjacency_manager();
+
+        // Walk the adjacency for every subject first, then read the property
+        // for all neighbours in one batch rather than one round-trip per
+        // neighbour (#220). The walk is in-memory; only the property read
+        // reaches storage, so hoisting it is what removes the round-trips.
+        let mut neighbors_by_subject: Vec<(u64, Vec<uni_common::core::id::Vid>)> = Vec::new();
+        let mut all_neighbors: Vec<uni_common::core::id::Vid> = Vec::new();
         for subject_vid in subject_vids {
-            let mut neighbors: Vec<(uni_common::core::id::Vid, uni_common::core::id::Eid)> =
-                Vec::new();
+            let mut neighbors: Vec<uni_common::core::id::Vid> = Vec::new();
             for dir in direction.store_directions() {
-                neighbors.extend(adj.get_neighbors(
-                    uni_common::core::id::Vid::from(subject_vid),
-                    edge_type_id,
-                    *dir,
-                ));
+                neighbors.extend(
+                    adj.get_neighbors(
+                        uni_common::core::id::Vid::from(subject_vid),
+                        edge_type_id,
+                        *dir,
+                    )
+                    .into_iter()
+                    .map(|(neighbor_vid, _eid)| neighbor_vid),
+                );
             }
+            all_neighbors.extend(neighbors.iter().copied());
+            neighbors_by_subject.push((subject_vid, neighbors));
+        }
+        all_neighbors.sort_unstable();
+        all_neighbors.dedup();
+
+        let props_by_vid = property_manager
+            .get_batch_vertex_props(&all_neighbors, &[prop_name.as_str()], query_ctx.as_ref())
+            .await
+            .map_err(|e| {
+                datafusion::error::DataFusionError::Execution(format!(
+                    "neighbor-aggregator: failed to read property '{prop_name}' \
+                     across {} neighbours: {e}",
+                    all_neighbors.len()
+                ))
+            })?;
+
+        for (subject_vid, neighbors) in neighbors_by_subject {
             let mut values: Vec<f64> = Vec::with_capacity(neighbors.len());
-            for (neighbor_vid, _eid) in neighbors {
-                let val = property_manager
-                    .get_vertex_prop_with_ctx(neighbor_vid, &prop_name, query_ctx.as_ref())
-                    .await
-                    .map_err(|e| {
-                        datafusion::error::DataFusionError::Execution(format!(
-                            "neighbor-aggregator: failed to read property \
-                             '{prop_name}' on neighbor vid {neighbor_vid:?}: {e}"
-                        ))
-                    })?;
+            for neighbor_vid in neighbors {
+                // A neighbour absent from the map, or carrying no value for
+                // this property, contributes nothing — the same outcome the
+                // per-neighbour read reached via a null that failed `as_f64`.
+                let Some(val) = props_by_vid
+                    .get(&neighbor_vid)
+                    .and_then(|props| props.get(prop_name.as_str()))
+                else {
+                    continue;
+                };
                 if let Some(f) = val.as_f64()
                     && !f.is_nan()
                 {
@@ -5109,6 +5146,7 @@ pub(crate) async fn apply_post_fixpoint_chain(
     provenance_tracker: Option<Arc<ProvenanceStore>>,
     top_k_proofs_k: usize,
     registry: Option<Arc<DerivedScanRegistry>>,
+    post_ops: Option<&mut Vec<OperatorStats>>,
 ) -> DFResult<Vec<RecordBatch>> {
     let out = apply_post_fixpoint_chain_inner(
         facts,
@@ -5120,6 +5158,7 @@ pub(crate) async fn apply_post_fixpoint_chain(
         provenance_tracker,
         top_k_proofs_k,
         registry,
+        post_ops,
     )
     .await?;
     super::locy_complement::strip_derivation_discriminator_columns(out)
@@ -5140,6 +5179,12 @@ async fn apply_post_fixpoint_chain_inner(
     provenance_tracker: Option<Arc<ProvenanceStore>>,
     top_k_proofs_k: usize,
     registry: Option<Arc<DerivedScanRegistry>>,
+    // Sink for the operators this chain builds and runs (#177). `PriorityExec`,
+    // `FoldExec` and the post-fixpoint `BestByExec` are assembled here rather
+    // than lowered into a clause body, so they sit in no plan the profile
+    // collector otherwise walks — which is why the registry recorded them
+    // unobservable however often they ran.
+    mut post_ops: Option<&mut Vec<OperatorStats>>,
 ) -> DFResult<Vec<RecordBatch>> {
     if !rule.has_fold && !rule.has_best_by && !rule.has_priority && rule.having.is_empty() {
         return Ok(facts);
@@ -5293,7 +5338,10 @@ async fn apply_post_fixpoint_chain_inner(
     // Before HAVING, mirroring the source order: REQUIRE says what the rule
     // derives, HAVING then filters what is shown of it.
     let current: Arc<dyn ExecutionPlan> = if !rule.require.is_empty() {
-        let batches = collect_all_partitions(&current, Arc::clone(task_ctx)).await?;
+        let mut reservation = operator_reservation("FixpointExec", 0, task_ctx);
+        let batches =
+            collect_all_partitions(&current, Arc::clone(task_ctx), &mut reservation).await?;
+        record_post_ops(&current, post_ops.as_deref_mut());
         let filtered = apply_having_filter(batches, &rule.require, &current.schema(), task_ctx)?;
         if filtered.is_empty() {
             return Ok(filtered);
@@ -5305,7 +5353,10 @@ async fn apply_post_fixpoint_chain_inner(
 
     // Apply HAVING (post-FOLD WHERE filter)
     let current: Arc<dyn ExecutionPlan> = if !rule.having.is_empty() {
-        let batches = collect_all_partitions(&current, Arc::clone(task_ctx)).await?;
+        let mut reservation = operator_reservation("FixpointExec", 0, task_ctx);
+        let batches =
+            collect_all_partitions(&current, Arc::clone(task_ctx), &mut reservation).await?;
+        record_post_ops(&current, post_ops.as_deref_mut());
         let filtered = apply_having_filter(batches, &rule.having, &current.schema(), task_ctx)?;
         if filtered.is_empty() {
             return Ok(filtered);
@@ -5332,7 +5383,10 @@ async fn apply_post_fixpoint_chain_inner(
     // Only present when a YIELD column is a computed expression over a FOLD
     // output (`total * 2.0 AS score`); the common path skips it entirely.
     if !rule.yield_projection.is_empty() {
-        let batches = collect_all_partitions(&current, Arc::clone(task_ctx)).await?;
+        let mut reservation = operator_reservation("FixpointExec", 0, task_ctx);
+        let batches =
+            collect_all_partitions(&current, Arc::clone(task_ctx), &mut reservation).await?;
+        record_post_ops(&current, post_ops.as_deref_mut());
         return apply_post_fold_projection(
             batches,
             &rule.yield_projection,
@@ -5341,7 +5395,23 @@ async fn apply_post_fixpoint_chain_inner(
         );
     }
 
-    collect_all_partitions(&current, Arc::clone(task_ctx)).await
+    let mut reservation = operator_reservation("FixpointExec", 0, task_ctx);
+    let out = collect_all_partitions(&current, Arc::clone(task_ctx), &mut reservation).await;
+    record_post_ops(&current, post_ops);
+    out
+}
+
+/// Append `plan`'s per-operator metrics to `sink`, if one was supplied.
+///
+/// Called after each execution point in the post-fixpoint chain rather than
+/// once at the end, because each stage replaces `current` with an in-memory
+/// source over its own output — so the tree holding `PriorityExec` and
+/// `FoldExec` is gone by the time the next stage runs, and only the stage that
+/// actually executed it can report it.
+fn record_post_ops(plan: &Arc<dyn ExecutionPlan>, sink: Option<&mut Vec<OperatorStats>>) {
+    if let Some(sink) = sink {
+        sink.extend(crate::query::executor::core::collect_plan_metrics(plan));
+    }
 }
 
 // ---------------------------------------------------------------------------

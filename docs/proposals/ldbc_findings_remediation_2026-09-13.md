@@ -177,28 +177,37 @@ with the fix in: **11 of 14**, the same three failures (IC3, IC9, IC14) and
 **every answering query returning an identical row count** to the run without
 it.
 
-Read the comparison counter, not the clock. Four queries — IC1, IC11, IC12,
-IC13 — planned byte-identically across the two runs and still moved -2.5%,
-+29.1%, +16.4% and -1.9%, so single-shot latency on this harness carries at
-least ±29% run-to-run variance and no per-query timing comparison between the
-runs means anything. `index_comparisons` is deterministic and does:
+Read neither the clock nor the comparison counter for this comparison. Four
+queries — IC1, IC11, IC12, IC13 — planned byte-identically across the two runs
+and still moved -2.5%, +29.1%, +16.4% and -1.9% in wall time, so single-shot
+latency carries at least ±29% run-to-run variance here.
 
-| query | comparisons, without -> with |
-|---|---|
-| IC2 | 122814874 -> 122302874 (-0.4%) |
-| IC4 | 12116194 -> 12050050 (-0.5%) |
-| IC5 | 21959580 -> 21941180 (-0.1%) |
-| IC6 | 2316040 -> **2412520 (+4.2%)** |
-| IC7 | 5832008 -> 5796844 (-0.6%) |
-| IC8 | 2745324 -> 2724844 (-0.7%) |
-| IC10 | 8082140 -> 7934684 (-1.8%) |
+**And `index_comparisons` is not the deterministic fallback an earlier draft of
+this section claimed.** Measured 2026-09-14, the same binary against the same
+store running IC6 three times in one process: 154 / 149 / 153 index scans and
+2332120 / 2239736 / 2312248 comparisons — a **4.1% spread with nothing
+changed**. The cause is in the query: `collect(distinct friend)` has undefined
+element order and `UNWIND friends as f` then drives the per-`f` MATCH in a
+different order each run, which is issue #208's nondeterminism reaching the
+counters. Simple shapes *are* stable (`MATCH (n) RETURN count(n)` reproduces
+cmp=73728 across every run), so the counter is deterministic only when nothing
+reorders rows — and every LDBC query that collects or unwinds reorders rows.
 
-The rewrite therefore reaches half the IC set, which a scan of the query text
-for a literal `()` does not predict — it also fires on a *named but unlabelled*
-variable that plans as `ScanAll`. Six of the seven do less work. **IC6 does
-4.2% more and that is unexplained**; its `index_scans` also rose 153 -> 159.
-Small, but it is a cost the rule imposes somewhere and nobody has looked at
-where. First step is `EXPLAIN` on IC6 either side of the rewrite.
+Two claims are withdrawn as a result:
+
+- **"IC6 does 4.2% more comparisons and that is unexplained."** It does not. The
+  reported 2316040 -> 2412520 sits inside the ±4.1% band above, and IC6's plan
+  contains no `ScanAll` at all — only `Scan{Tag}` and `Scan{Person}`, both
+  labelled in the query text — so the narrowing cannot have touched it. There is
+  no IC6 regression to explain.
+- **"The rewrite reaches 7 of the 14."** Unsupported. That was inferred from
+  comparison deltas of -0.1% to -1.8%, all inside the noise. Which IC queries the
+  rewrite actually reaches is *unmeasured*; answering it needs plan inspection
+  (`EXPLAIN`, looking for `ScanAll`), not counter diffing.
+
+What survives unchanged: **11 of 14, with every answering query returning an
+identical row count** to the run without the fix. That is a count comparison,
+not a timing or counter one, and it is the claim the fix rests on.
 
 Guarded by seven plan-shape tests in
 `crates/uni-query/tests/common/planner/pattern_anchor_test.rs` covering

@@ -6,16 +6,19 @@
 // Creates 300 Message nodes with 2 edges each on a persistent KB,
 // triggering multiple flush + compaction cycles that previously raced.
 //
-// Run with:
-//   cargo nextest run -p uni-db --test issue46_compaction_race --run-ignored all --no-capture
 
 use anyhow::Result;
 use uni_db::{DataType, Uni, UniConfig};
 
 const NUM_INSERTS: usize = 300;
 
+// Un-ignored 2026-09-15. The `#[ignore]` carried no reason -- the only one in
+// the repo without one -- and the test needs no external service, no feature
+// flag and ~2.5 s. Measured 10/10 green before un-ignoring, since a race repro
+// passing once proves little. If it does flake, the flake is the bug: this
+// guards the #46 flush/compaction panic, so re-pin it with a stated reason
+// rather than deleting it.
 #[tokio::test]
-#[ignore]
 async fn issue46_edge_compaction_no_panic() -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let path = tmp.path().to_str().unwrap();

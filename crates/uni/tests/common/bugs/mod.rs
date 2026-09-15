@@ -63,9 +63,10 @@ pub mod repro_schema_edge_type_swallow;
 // Correctness-scan Wave 1 repros (R5 constraint visibility).
 pub mod bug_bulk_index_skip_both_defer_false_repro;
 pub mod bug_bulk_unique_preexisting_repro;
-// Correctness-scan Wave 0 findings that fell through — neither fixed nor
-// deferred; tracked as D9/D10 in docs/correctness-deferred.md (bug-pinning
-// tests are #[ignore]d until fixed).
+// Correctness-scan Wave 0 findings D9/D10 (docs/correctness-deferred.md).
+// Both are FIXED — these tests are active and assert the fixed behavior. The
+// note here used to say they were "neither fixed nor deferred" with the
+// bug-pinning tests "#[ignore]d until fixed"; neither was true any more.
 pub mod bug_bulk_check_int_float_repro; // uni-bulk[5] / D10
 pub mod bug_bulk_check_large_int_repro; // uni-bulk compare_values i64->f64 (D5 mirror)
 pub mod bug_bulk_flush_intent_abandon_repro; // uni-bulk[2] / D9

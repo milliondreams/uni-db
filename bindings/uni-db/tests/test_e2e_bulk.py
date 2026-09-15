@@ -183,26 +183,52 @@ def test_bulk_stats_attributes(social_db):
     assert stats.index_build_duration_secs >= 0
 
 
-@pytest.mark.xfail(
-    reason="abort() only sets a flag; insert_vertices writes directly to engine without batching, so data is already committed before abort"
-)
 def test_bulk_writer_abort(social_db):
-    """Test aborting a bulk writer."""
+    """abort() is what suppresses the rows -- asserted differentially.
+
+    Was `xfail`ed on "abort() only sets a flag ... data is already committed
+    before abort". That no longer describes the code: `BulkWriter::abort`
+    (crates/uni-bulk/src/bulk.rs:1557) clears the pending buffers and calls
+    `rollback_table` for every table the load touched. The marker was not
+    strict, so the XPASS was silent and the stale reason outlived the fix.
+
+    The control arm is load-bearing. Bulk rows land only on `writer.commit()`,
+    so the original single-arm shape ("abort, then count == 0") passed whether
+    or not abort did anything -- deleting the `abort()` call left it green. The
+    two arms together are what make abort the variable: same inserts, and the
+    only difference is the abort.
+    """
     session = social_db.session()
+
+    # Control: no abort, writer commits -> the row lands.
     tx = session.tx()
     writer = tx.bulk_writer().build()
-
-    people_data = [{"name": "Alice", "age": 30}]
-    writer.insert_vertices("Person", people_data)
-
-    # Abort the writer
-    writer.abort()
-    tx.rollback()
-
-    # Verify data was not committed
+    writer.insert_vertices("Person", [{"name": "Control", "age": 30}])
+    writer.commit()
+    tx.commit()
     social_db.flush()
-    result = session.query("MATCH (p:Person) RETURN count(p) AS cnt")
-    assert result[0]["cnt"] == 0
+    assert (
+        session.query("MATCH (p:Person {name: 'Control'}) RETURN count(p) AS cnt")[0][
+            "cnt"
+        ]
+        == 1
+    ), "control arm did not land; the test below would pass for free"
+
+    # Abort: the same sequence, aborted -> commit is refused and nothing lands.
+    tx = session.tx()
+    writer = tx.bulk_writer().build()
+    writer.insert_vertices("Person", [{"name": "Aborted", "age": 30}])
+    writer.abort()
+    with pytest.raises(RuntimeError):
+        writer.commit()
+    tx.rollback()
+    social_db.flush()
+    assert (
+        session.query("MATCH (p:Person {name: 'Aborted'}) RETURN count(p) AS cnt")[0][
+            "cnt"
+        ]
+        == 0
+    ), "abort() must discard the insert"
 
 
 def test_operations_after_abort_raise_error(social_db):

@@ -122,23 +122,40 @@ async def test_bulk_stats_attributes(async_social_db):
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    reason="abort() only sets a flag; insert_vertices writes directly to engine without batching, so data is already committed before abort"
-)
 async def test_bulk_writer_abort(async_social_db):
-    """Test bulk writer abort functionality."""
+    """Async twin of test_e2e_bulk.py::test_bulk_writer_abort.
+
+    See that test for why the stale `xfail` came off and why the control arm
+    is load-bearing (bulk rows land only on `writer.commit()`, so a single-arm
+    version passes whether or not abort does anything).
+    """
     session = async_social_db.session()
+
+    # Control: no abort, writer commits -> the row lands.
     tx = await session.tx()
     writer = await tx.bulk_writer().build()
-    await writer.insert_vertices(
-        "Person", [{"name": "Iris", "age": 27, "email": "iris@example.com"}]
+    await writer.insert_vertices("Person", [{"name": "AsyncControl", "age": 27}])
+    await writer.commit()
+    await tx.commit()
+    result = await session.query(
+        "MATCH (p:Person {name: 'AsyncControl'}) RETURN p.name"
+    )
+    assert len(result) == 1, (
+        "control arm did not land; the assertion below would pass for free"
     )
 
+    # Abort: same sequence, aborted -> commit refused, nothing lands.
+    tx = await session.tx()
+    writer = await tx.bulk_writer().build()
+    await writer.insert_vertices("Person", [{"name": "AsyncAborted", "age": 27}])
     await writer.abort()
+    with pytest.raises(RuntimeError):
+        await writer.commit()
     await tx.rollback()
-
-    result = await session.query("MATCH (p:Person {name: 'Iris'}) RETURN p.name")
-    assert len(result) == 0
+    result = await session.query(
+        "MATCH (p:Person {name: 'AsyncAborted'}) RETURN p.name"
+    )
+    assert len(result) == 0, "abort() must discard the insert"
 
 
 @pytest.mark.asyncio

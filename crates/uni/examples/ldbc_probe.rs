@@ -65,7 +65,10 @@ async fn main() -> anyhow::Result<()> {
                     for o in sorted.iter().take(12) {
                         println!(
                             "    {:<34} {:>9.1}ms rows={:<10} mem={}MB",
-                            o.operator, o.time_ms, o.actual_rows, o.memory_bytes / 1_048_576
+                            o.operator,
+                            o.time_ms,
+                            o.actual_rows,
+                            o.memory_bytes / 1_048_576
                         );
                     }
                 }

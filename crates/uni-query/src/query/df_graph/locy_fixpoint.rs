@@ -554,6 +554,10 @@ struct FoldViewState {
     /// self-reference reads. Empty for a rule that carries no `REQUIRE`, in
     /// which case the stage is skipped entirely.
     require: Vec<Expr>,
+    /// The query's bound parameters, so a `REQUIRE` that references `$name`
+    /// resolves on the per-iteration snapshot exactly as it does on the final
+    /// answer (#273).
+    params: HashMap<String, Value>,
     /// KEY-grouped snapshot of `facts`, in the rule's contribution schema.
     folded: Vec<RecordBatch>,
     /// Whole-row set from the previous merge, for change detection.
@@ -624,12 +628,14 @@ impl FixpointState {
         has_priority: bool,
         probability_epsilon: f64,
         require: Vec<Expr>,
+        params: HashMap<String, Value>,
     ) {
         self.fold_view = Some(FoldViewState {
             bindings,
             has_priority,
             probability_epsilon,
             require,
+            params,
             folded: Vec::new(),
             prev_rows: HashSet::new(),
         });
@@ -978,15 +984,15 @@ impl FixpointState {
         // (`check_require_direction`); a predicate that could turn back off
         // would let a fact be withdrawn, which the change test below reads as
         // progress rather than oscillation.
-        let require = self
+        let (require, params) = self
             .fold_view
             .as_ref()
-            .map(|fv| fv.require.clone())
+            .map(|fv| (fv.require.clone(), fv.params.clone()))
             .unwrap_or_default();
         let folded = if require.is_empty() {
             vec![folded]
         } else {
-            apply_having_filter(vec![folded], &require, &self.schema, task_ctx)?
+            apply_having_filter(vec![folded], &require, &self.schema, task_ctx, &params)?
         };
         if let Some(fv) = self.fold_view.as_mut() {
             fv.folded = folded;
@@ -1790,6 +1796,7 @@ async fn run_fixpoint_loop(
                     rule.has_priority,
                     probability_epsilon,
                     rule.require.clone(),
+                    params.clone(),
                 );
             }
             state
@@ -2070,6 +2077,7 @@ async fn run_fixpoint_loop(
             // non-recursive path in `locy_program.rs` is where these operators
             // become observable (#177).
             None,
+            &params,
         )
         .await?;
         all_output.extend(processed);
@@ -4922,6 +4930,23 @@ impl ExecutionPlan for DerivedScanExec {
 // Post-fixpoint chain — FOLD and BEST BY on converged facts
 // ---------------------------------------------------------------------------
 
+/// Wrap the query's parameters in a [`TranslationContext`] so `$name`
+/// references in an expression compiled at execution time resolve to literals.
+///
+/// `None` when the program bound no parameters, which keeps the existing
+/// zero-allocation path for the overwhelmingly common case.
+fn translation_context_for_params(
+    params: &HashMap<String, Value>,
+) -> Option<crate::query::df_expr::TranslationContext> {
+    if params.is_empty() {
+        return None;
+    }
+    Some(crate::query::df_expr::TranslationContext {
+        parameters: params.clone(),
+        ..Default::default()
+    })
+}
+
 /// Apply post-FOLD WHERE (HAVING) filter to aggregated batches.
 ///
 /// Converts each Cypher HAVING expression to a DataFusion physical expression
@@ -4932,6 +4957,7 @@ fn apply_having_filter(
     having_exprs: &[Expr],
     schema: &SchemaRef,
     task_ctx: &Arc<TaskContext>,
+    params: &HashMap<String, Value>,
 ) -> DFResult<Vec<RecordBatch>> {
     use arrow::compute::{and, filter_record_batch};
     use arrow_array::BooleanArray;
@@ -4958,6 +4984,14 @@ fn apply_having_filter(
     let config = (**task_ctx.session_config().options()).clone();
     let props = ExecutionProps::new();
 
+    // `$param` references reach here unresolved — the post-FOLD WHERE is
+    // compiled at execution time rather than by the DataFusion planner that
+    // splices the query's parameters into the pre-FOLD body. Passing `None`
+    // here was issue #273: the same `$thr` worked before FOLD and failed after
+    // it with "Unresolved parameter". Built only when the rule has params to
+    // bind, so a parameterless program allocates nothing.
+    let translation_ctx = translation_context_for_params(params);
+
     // Cypher Expr → DataFusion DfExpr → type-coerced DfExpr → PhysicalExpr.
     //
     // Type coercion is needed because FOLD aggregates produce Float64 (SUM,
@@ -4966,11 +5000,12 @@ fn apply_having_filter(
     let physical_exprs: Vec<Arc<dyn datafusion::physical_expr::PhysicalExpr>> = having_exprs
         .iter()
         .map(|expr| {
-            let df_expr = crate::query::df_expr::cypher_expr_to_df(expr, None).map_err(|e| {
-                datafusion::common::DataFusionError::Internal(format!(
-                    "HAVING expression conversion: {e}"
-                ))
-            })?;
+            let df_expr = crate::query::df_expr::cypher_expr_to_df(expr, translation_ctx.as_ref())
+                .map_err(|e| {
+                    datafusion::common::DataFusionError::Internal(format!(
+                        "HAVING expression conversion: {e}"
+                    ))
+                })?;
 
             // Run DataFusion's type coercion by wrapping in a Filter plan,
             // applying the TypeCoercion analyzer rule, then extracting the
@@ -5034,6 +5069,7 @@ fn apply_post_fold_projection(
     specs: &[(String, Expr)],
     schema: &SchemaRef,
     task_ctx: &Arc<TaskContext>,
+    params: &HashMap<String, Value>,
 ) -> DFResult<Vec<RecordBatch>> {
     use datafusion::common::DFSchema;
     use datafusion::logical_expr::LogicalPlanBuilder;
@@ -5053,6 +5089,9 @@ fn apply_post_fold_projection(
     })?;
     let config = (**task_ctx.session_config().options()).clone();
     let props = ExecutionProps::new();
+    // See `apply_having_filter` — a post-FOLD YIELD expression resolves its
+    // `$param` references the same way, and for the same reason (issue #273).
+    let translation_ctx = translation_context_for_params(params);
 
     // Compile each projection expression to a PhysicalExpr against the post-fold
     // schema. Type coercion (via a Projection plan) resolves mixed-type
@@ -5060,11 +5099,12 @@ fn apply_post_fold_projection(
     let physical_exprs: Vec<Arc<dyn datafusion::physical_expr::PhysicalExpr>> = specs
         .iter()
         .map(|(name, expr)| {
-            let df_expr = crate::query::df_expr::cypher_expr_to_df(expr, None).map_err(|e| {
-                datafusion::common::DataFusionError::Internal(format!(
-                    "post-fold projection '{name}' conversion: {e}"
-                ))
-            })?;
+            let df_expr = crate::query::df_expr::cypher_expr_to_df(expr, translation_ctx.as_ref())
+                .map_err(|e| {
+                    datafusion::common::DataFusionError::Internal(format!(
+                        "post-fold projection '{name}' conversion: {e}"
+                    ))
+                })?;
             let empty = datafusion::logical_expr::LogicalPlan::EmptyRelation(
                 datafusion::logical_expr::EmptyRelation {
                     produce_one_row: false,
@@ -5147,6 +5187,9 @@ pub(crate) async fn apply_post_fixpoint_chain(
     top_k_proofs_k: usize,
     registry: Option<Arc<DerivedScanRegistry>>,
     post_ops: Option<&mut Vec<OperatorStats>>,
+    // The query's bound parameters, for the `$name` references a post-FOLD
+    // REQUIRE / WHERE / YIELD expression compiles at execution time (#273).
+    params: &HashMap<String, Value>,
 ) -> DFResult<Vec<RecordBatch>> {
     let out = apply_post_fixpoint_chain_inner(
         facts,
@@ -5159,6 +5202,7 @@ pub(crate) async fn apply_post_fixpoint_chain(
         top_k_proofs_k,
         registry,
         post_ops,
+        params,
     )
     .await?;
     super::locy_complement::strip_derivation_discriminator_columns(out)
@@ -5185,6 +5229,7 @@ async fn apply_post_fixpoint_chain_inner(
     // collector otherwise walks — which is why the registry recorded them
     // unobservable however often they ran.
     mut post_ops: Option<&mut Vec<OperatorStats>>,
+    params: &HashMap<String, Value>,
 ) -> DFResult<Vec<RecordBatch>> {
     if !rule.has_fold && !rule.has_best_by && !rule.has_priority && rule.having.is_empty() {
         return Ok(facts);
@@ -5342,7 +5387,8 @@ async fn apply_post_fixpoint_chain_inner(
         let batches =
             collect_all_partitions(&current, Arc::clone(task_ctx), &mut reservation).await?;
         record_post_ops(&current, post_ops.as_deref_mut());
-        let filtered = apply_having_filter(batches, &rule.require, &current.schema(), task_ctx)?;
+        let filtered =
+            apply_having_filter(batches, &rule.require, &current.schema(), task_ctx, params)?;
         if filtered.is_empty() {
             return Ok(filtered);
         }
@@ -5357,7 +5403,8 @@ async fn apply_post_fixpoint_chain_inner(
         let batches =
             collect_all_partitions(&current, Arc::clone(task_ctx), &mut reservation).await?;
         record_post_ops(&current, post_ops.as_deref_mut());
-        let filtered = apply_having_filter(batches, &rule.having, &current.schema(), task_ctx)?;
+        let filtered =
+            apply_having_filter(batches, &rule.having, &current.schema(), task_ctx, params)?;
         if filtered.is_empty() {
             return Ok(filtered);
         }
@@ -5392,6 +5439,7 @@ async fn apply_post_fixpoint_chain_inner(
             &rule.yield_projection,
             &current.schema(),
             task_ctx,
+            params,
         );
     }
 

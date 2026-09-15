@@ -62,3 +62,5 @@ pub mod locy_issue_267_node_key_scaling;
 pub mod locy_metrics_counters;
 // Issue #272: `IS <rule> TO <value column>` returns zero rows with no error.
 pub mod locy_issue_272_is_ref_to_value_column;
+// Issue #273: a query parameter is not resolved in the post-FOLD (HAVING) position.
+pub mod locy_issue_273_post_fold_param;

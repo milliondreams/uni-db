@@ -52,7 +52,7 @@ use uni_common::Properties;
 use uni_common::Value;
 use uni_common::core::id::Vid;
 use uni_common::core::schema::Schema as UniSchema;
-use uni_store::backend::types::{FilterExpr, Scalar};
+use uni_store::backend::types::{CmpOp, FilterExpr, Scalar};
 use uni_store::runtime::columnar_scan::{
     build_overflow_property_column, drop_superseded_pushdown_rows, extract_from_overflow_blob,
     filter_deleted_rows, filter_l0_label_overwrites, filter_l0_tombstones, merge_lance_and_l0,
@@ -987,6 +987,7 @@ impl GraphScanStream {
                     &schema,
                     &filter,
                     vid_list_filter.as_deref(),
+                    vid_range,
                     extra_lance_filter.as_deref(),
                     extra_runtime_filter.as_ref(),
                 )
@@ -1276,6 +1277,119 @@ pub(crate) async fn hydrate_vids_columnar(
     properties: &[String],
     vids: &[Vid],
 ) -> DFResult<Vec<ArrayRef>> {
+    prefetch_vids_columnar(graph_ctx, label, variable, properties, vids)
+        .await?
+        .gather(vids)
+}
+
+/// Target property columns read once, ready to gather by vid.
+///
+/// Splitting the read from the gather is what lets a traversal pay the storage
+/// cost for its whole expansion set at once, in `_vid` order, and then serve
+/// each output chunk from the result -- see [`prefetch_vids_columnar`].
+pub(crate) struct PrefetchedProps {
+    row_of: HashMap<u64, u32>,
+    columns: Vec<ArrayRef>,
+}
+
+impl PrefetchedProps {
+    /// Bytes this read holds, for the query pool.
+    ///
+    /// Counted per distinct allocation rather than by summing
+    /// `get_array_memory_size`, because the columns can be slices of one scan's
+    /// buffers and summing their parents' capacities charges the same
+    /// allocation once per column (#261).
+    pub(crate) fn memory_bytes(&self) -> usize {
+        let mut footprint = crate::query::df_graph::common::BatchFootprint::new();
+        let columns = footprint.add_arrays(&self.columns);
+        // The vid -> row map is the other half of what is held, and it is not
+        // Arrow-shaped: one entry per distinct vid read.
+        let index =
+            self.row_of.capacity() * (std::mem::size_of::<u64>() + std::mem::size_of::<u32>());
+        columns + index
+    }
+
+    /// Gather one output column per requested property, one row per vid.
+    ///
+    /// A vid with no row (deleted, or not of this label) gathers as null, which
+    /// is what the per-chunk read did for the same case.
+    pub(crate) fn gather(&self, vids: &[Vid]) -> DFResult<Vec<ArrayRef>> {
+        let indices: arrow_array::UInt32Array = vids
+            .iter()
+            .map(|vid| self.row_of.get(&vid.as_u64()).copied())
+            .collect::<Vec<Option<u32>>>()
+            .into();
+        let mut out = Vec::with_capacity(self.columns.len());
+        for col in &self.columns {
+            out.push(arrow::compute::take(col.as_ref(), &indices, None).map_err(arrow_err)?);
+        }
+        Ok(out)
+    }
+}
+
+/// Read property columns for targets that span several labels.
+///
+/// Each group is read columnar from its own label's table -- typed, and key-local
+/// because the vids are sorted -- and the groups are then concatenated into one
+/// [`PrefetchedProps`], which gathers exactly as the single-label one does,
+/// including yielding null for a vid no group returned.
+///
+/// The caller must have established that every label here declares every
+/// requested property at the same type (see `uniform_target_schema_props`);
+/// otherwise the concatenation below has nothing well-typed to produce.
+///
+/// # Errors
+///
+/// Propagates each group's read, and fails if the groups disagree on a column
+/// type after all -- which would mean the uniformity check and the schema have
+/// drifted apart.
+pub(crate) async fn prefetch_vids_columnar_grouped(
+    graph_ctx: &GraphExecutionContext,
+    variable: &str,
+    properties: &[String],
+    groups: &[(String, Vec<Vid>)],
+) -> DFResult<PrefetchedProps> {
+    let mut row_of: HashMap<u64, u32> = HashMap::new();
+    let mut per_group: Vec<Vec<ArrayRef>> = Vec::with_capacity(groups.len());
+    let mut offset: u32 = 0;
+
+    for (label, vids) in groups {
+        let group = prefetch_vids_columnar(graph_ctx, label, variable, properties, vids).await?;
+        let rows = group
+            .columns
+            .first()
+            .map_or(0, |c| u32::try_from(c.len()).unwrap_or(u32::MAX));
+        for (vid, row) in &group.row_of {
+            row_of.insert(*vid, row.saturating_add(offset));
+        }
+        offset = offset.saturating_add(rows);
+        per_group.push(group.columns);
+    }
+
+    let mut columns = Vec::with_capacity(properties.len());
+    for idx in 0..properties.len() {
+        let arrays: Vec<&dyn arrow_array::Array> = per_group
+            .iter()
+            .filter_map(|g| g.get(idx).map(|c| c.as_ref()))
+            .collect();
+        columns.push(arrow::compute::concat(&arrays).map_err(arrow_err)?);
+    }
+
+    Ok(PrefetchedProps { row_of, columns })
+}
+
+/// Read the property columns for `vids`, fetching in `_vid` order.
+///
+/// # Errors
+///
+/// Propagates the storage read, and fails if the scan returns no `_vid` column.
+pub(crate) async fn prefetch_vids_columnar(
+    graph_ctx: &GraphExecutionContext,
+    label: &str,
+    variable: &str,
+    properties: &[String],
+    vids: &[Vid],
+) -> DFResult<PrefetchedProps> {
     let uni_schema = graph_ctx.storage().schema_manager().schema();
     let output_schema =
         GraphScanExec::build_vertex_schema(variable, label, properties, &uni_schema);
@@ -1308,18 +1422,56 @@ pub(crate) async fn hydrate_vids_columnar(
     };
     let pays = target_rows > 0 && raw.len().saturating_mul(DEDUP_TABLE_RATIO) >= target_rows;
     let deduped = pays.then(|| dedup_targets(&raw));
-    let fetch_vids: &[u64] = deduped.as_deref().unwrap_or(&raw);
+    let unsorted: &[u64] = deduped.as_deref().unwrap_or(&raw);
+
+    // Fetch in key order, so each chunk below covers a narrow `_vid` range.
+    //
+    // A `_vid IN (...)` lookup costs the *span* it straddles -- the distance
+    // from its smallest key to its largest -- not the number of vids it asks
+    // for. Measured on LDBC SF1's 3.06M-row `vertices_Message`, 8192 vids per
+    // scan in every arm, only the span varied:
+    //
+    // | span      | index_comparisons | ms  |
+    // |-----------|-------------------|-----|
+    // | 8 192     | 12 288            | 137 |
+    // | 65 536    | 69 632            | 154 |
+    // | 524 288   | 528 384           | 335 |
+    // | 2 000 000 | 2 002 944         | 886 |
+    //
+    // Comparisons track the span to within one 4096-entry page. Traversal
+    // emits targets in visit order, scattered across the whole table, so
+    // chunking them as they arrive gave *every* chunk the full span: 51 chunks
+    // x ~2.4M = 123M comparisons to read one property off 416k rows, 48 s.
+    // Sorting first gives each chunk its own ~1/51 slice of the key space.
+    //
+    // Sorting *within* a chunk is not what pays and was measured too: the same
+    // scattered 8192 vids sorted and shuffled both cost 2 899 968 comparisons,
+    // identical. The list has to be ordered before it is cut, not after.
+    //
+    // Correctness does not depend on the order: the gather below gathers by
+    // `raw` against a vid-keyed row map, so the output stays one row per
+    // request in request order however the fetch was sequenced.
+    let sorted = (unsorted.len() > 1).then(|| {
+        let mut v = unsorted.to_vec();
+        v.sort_unstable();
+        v
+    });
+    let fetch_vids: &[u64] = sorted.as_deref().unwrap_or(unsorted);
 
     // Chunk the vid list, bounding how much is resident at once.
     //
-    // The `_vid` index is used either way, and the index work itself does not
-    // scale with the table: `index_comparisons` is ~1 per requested vid and
-    // barely moves when the table grows 5x (60,000 -> 61,440). What scales is
-    // what happens *after* the lookup — the matching rows are scattered across
-    // proportionally more pages in a larger table, and unchunked they are all
-    // materialised at once. Chunking caps the peak at one chunk's worth:
-    // 60,000 vids read from a 300k-row table went from 815 MiB to 226 MiB,
-    // and stopped tracking the table's size.
+    // The `_vid` index is used either way. The index work costs the span each
+    // chunk straddles, which is why the list is sorted above: "~1 comparison
+    // per requested vid", as this comment used to claim, holds only for a
+    // dense list and was measured on one. A scattered chunk pays its whole
+    // range -- 8192 vids spread over 2M keys cost 2 002 944 comparisons, the
+    // same 8192 vids packed together cost 12 288.
+    //
+    // What chunking itself bounds is what happens *after* the lookup -- the
+    // matching rows are scattered across proportionally more pages in a larger
+    // table, and unchunked they are all materialised at once. Chunking caps the
+    // peak at one chunk's worth: 60,000 vids read from a 300k-row table went
+    // from 815 MiB to 226 MiB, and stopped tracking the table's size.
     //
     // `VidLookupJoinExec` already chunks this exact shape at the same constant.
     //
@@ -1394,20 +1546,12 @@ pub(crate) async fn hydrate_vids_columnar(
             row_of.insert(vid_col.value(row), row as u32);
         }
     }
-    let indices: arrow_array::UInt32Array = raw
-        .iter()
-        .map(|vid| row_of.get(vid).copied())
-        .collect::<Vec<Option<u32>>>()
-        .into();
-
     // Skip `_vid`/`_labels`; the caller wants the property columns only, in the
     // order it asked for them.
-    let mut columns = Vec::with_capacity(properties.len());
-    for (idx, _) in properties.iter().enumerate() {
-        let col = batch.column(idx + 2);
-        columns.push(arrow::compute::take(col.as_ref(), &indices, None).map_err(arrow_err)?);
-    }
-    Ok(columns)
+    let columns = (0..properties.len())
+        .map(|idx| Arc::clone(batch.column(idx + 2)))
+        .collect();
+    Ok(PrefetchedProps { row_of, columns })
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -1513,6 +1657,7 @@ async fn columnar_scan_schemaless_vertex_batch_static(
     output_schema: &SchemaRef,
     filter: &Option<Arc<dyn PhysicalExpr>>,
     vid_list_filter: Option<&[u64]>,
+    vid_range: Option<(u64, u64)>,
     extra_lance_filter: Option<&str>,
     extra_runtime_filter: Option<&Arc<dyn PhysicalExpr>>,
 ) -> DFResult<RecordBatch> {
@@ -1537,7 +1682,14 @@ async fn columnar_scan_schemaless_vertex_batch_static(
                 vs.iter().map(|v| Scalar::UInt(*v)),
             )),
             (_, Some(vid)) => parts.push(FilterExpr::equals("_vid", Scalar::UInt(vid))),
-            _ => {}
+            // A range is two comparisons however wide it gets, where an IN list
+            // would grow with it — same shape the labelled path uses.
+            _ => {
+                if let Some((lo, hi)) = vid_range {
+                    parts.push(FilterExpr::compare("_vid", CmpOp::GtEq, Scalar::UInt(lo)));
+                    parts.push(FilterExpr::compare("_vid", CmpOp::Lt, Scalar::UInt(hi)));
+                }
+            }
         }
 
         // Label filter
@@ -1565,15 +1717,46 @@ async fn columnar_scan_schemaless_vertex_batch_static(
         }
     };
 
+    // `props_json` carries every property of every vertex as a blob, and it is
+    // read only by the projected-property loop below. A query that projects
+    // nothing from the row — `count(n)`, `id(n)` — was still paying to read
+    // and ship it for every row.
+    //
+    // The cost is not only the bytes. The `_vid` range walk sizes each range
+    // against a byte budget, so fat rows buy narrow ranges: at LDBC SF1 a
+    // `MATCH (n) RETURN count(n)` took 18 ranges carrying the blob and the
+    // per-range overhead dominated. Dropping the column when nothing reads it
+    // makes the same budget buy far wider ranges *and* moves less data.
+    //
+    // `projected_properties` is the whole test: `_all_props` arrives through it
+    // like any other name, so an empty list is the only case where no reader
+    // exists. The internal schema is taken from the scanned batch below, so
+    // omitting the column here removes it consistently -- the L0 builder's
+    // `props_json` arm stops firing and `column_by_name` returns `None`, which
+    // only the projected-property loop would have consulted.
+    //
+    // **This guard does not fire for `MATCH (n) RETURN count(n)` today**, and
+    // that is worth knowing before anyone measures it and calls it dead. That
+    // query arrives here with `projected_properties == ["_all_props"]` and an
+    // output schema of `n._vid, n._labels, n._all_props` -- the planner asks
+    // for every property of every vertex in order to count them. Nothing in
+    // this file can tell that the blob is unread, because by the time the
+    // request arrives the projection already claims a reader. Closing that is
+    // a column-pruning pass (there is none; see #184/#185), or a narrower rule
+    // that an aggregate over an entity does not need the entity's properties.
+    // Until then the blob is read regardless and this branch waits for it.
+    let needs_props_blob = !projected_properties.is_empty();
+    let scan_columns: &[&str] = if needs_props_blob {
+        &["_vid", "_deleted", "labels", "props_json", "_version"]
+    } else {
+        &["_vid", "_deleted", "labels", "_version"]
+    };
+
     // Single Lance query via StorageManager domain method. Counted, so this
     // scan appears in `scans_reported` — the schemaless path was invisible to
     // the counters the labelled path already reports through.
     let lance_batch = storage
-        .scan_main_vertex_table_counted(
-            &["_vid", "_deleted", "labels", "props_json", "_version"],
-            filter.as_ref(),
-            graph_ctx.counters(),
-        )
+        .scan_main_vertex_table_counted(scan_columns, filter.as_ref(), graph_ctx.counters())
         .await
         .map_err(exec_err)?;
 
@@ -1609,16 +1792,21 @@ async fn columnar_scan_schemaless_vertex_batch_static(
     // from issue #55 PR #4 — must restrict L0 to match Lance filtering, see
     // issue #72 item 1). Fall back to single-VID.
     let single_vid_buf: [u64; 1];
-    let l0_target_vids: Option<&[u64]> = match (vid_list_filter, target_vid) {
-        (Some(vs), _) if !vs.is_empty() => Some(vs),
+    let l0_targets: SchemalessL0Targets<'_> = match (vid_list_filter, target_vid) {
+        (Some(vs), _) if !vs.is_empty() => SchemalessL0Targets::Vids(vs),
         (_, Some(v)) => {
             single_vid_buf = [v];
-            Some(&single_vid_buf)
+            SchemalessL0Targets::Vids(&single_vid_buf)
         }
-        _ => None,
+        // Same restriction Lance was given. Without it every range would
+        // re-emit the whole L0 set and the chunks would duplicate rather than
+        // partition — the labelled path carries the identical note.
+        _ => match vid_range {
+            Some((lo, hi)) => SchemalessL0Targets::Range(lo, hi),
+            None => SchemalessL0Targets::All,
+        },
     };
-    let l0_batch =
-        build_l0_schemaless_vertex_batch(l0_ctx, label, &internal_schema, l0_target_vids)?;
+    let l0_batch = build_l0_schemaless_vertex_batch(l0_ctx, label, &internal_schema, l0_targets)?;
 
     // Merge Lance + L0
     let Some(merged) = merge_lance_and_l0(
@@ -1668,11 +1856,25 @@ async fn columnar_scan_schemaless_vertex_batch_static(
 /// Merges L0 buffers in visibility order (pending_flush → current → transaction),
 /// with later buffers overwriting earlier ones for the same VID. Produces a batch
 /// matching the internal schema: `_vid, labels, props_json, _version`.
+/// Which L0 vids a schemaless scan should contribute.
+///
+/// Mirrors `uni_store::runtime::columnar_scan::L0VertexTargets`, which the
+/// labelled path uses; kept local because this builder walks `L0Context`
+/// rather than the store's own buffers.
+enum SchemalessL0Targets<'a> {
+    /// Exactly these vids, from an `id(x) = ?` or `id(x) IN [...]` pushdown.
+    Vids(&'a [u64]),
+    /// Every matching vid in the half-open range `[lo, hi)` (#214).
+    Range(u64, u64),
+    /// Every matching vid.
+    All,
+}
+
 fn build_l0_schemaless_vertex_batch(
     l0_ctx: &crate::query::df_graph::L0Context,
     label: &str,
     internal_schema: &SchemaRef,
-    target_vids: Option<&[u64]>,
+    targets: SchemalessL0Targets<'_>,
 ) -> DFResult<RecordBatch> {
     // Collect all L0 vertex data, merging in visibility order
     // vid -> (merged_props, highest_version, labels)
@@ -1698,7 +1900,7 @@ fn build_l0_schemaless_vertex_batch(
 
         // Collect VIDs matching the label filter — short-circuit when target_vids is set
         // (see issue #72 item 1; multi-VID IN-list must filter L0 too).
-        let vids: Vec<Vid> = if let Some(tvs) = target_vids {
+        let vids: Vec<Vid> = if let SchemalessL0Targets::Vids(tvs) = targets {
             let mut out = Vec::with_capacity(tvs.len());
             for &tv in tvs {
                 let vid = Vid::from(tv);
@@ -1719,12 +1921,21 @@ fn build_l0_schemaless_vertex_batch(
                 }
             }
             out
-        } else if label_filter.is_empty() {
-            guard.all_vertex_vids()
-        } else if label_filter.len() == 1 {
-            guard.vids_for_label(label_filter[0])
         } else {
-            guard.vids_with_all_labels(&label_filter)
+            let mut selected = if label_filter.is_empty() {
+                guard.all_vertex_vids()
+            } else if label_filter.len() == 1 {
+                guard.vids_for_label(label_filter[0])
+            } else {
+                guard.vids_with_all_labels(&label_filter)
+            };
+            if let SchemalessL0Targets::Range(lo, hi) = targets {
+                selected.retain(|vid| {
+                    let v = vid.as_u64();
+                    v >= lo && v < hi
+                });
+            }
+            selected
         };
 
         for vid in vids {
@@ -2054,17 +2265,32 @@ impl Stream for GraphScanStream {
                             };
                         }
                         whole => {
-                            // A full-label scan is the one shape that can be
-                            // walked by `_vid` range, and the one that has no
-                            // bound at all today. A single-vid short circuit
-                            // (`self.filter`) returns one row, and the
-                            // schemaless path takes a different scan function
-                            // that carries no range — neither is worth a walk.
-                            if whole.is_none() && self.filter.is_none() && !self.is_schemaless {
+                            // A full-label scan and a full-graph `ScanAll` are
+                            // both walkable by `_vid` range; a single-vid short
+                            // circuit (`self.filter`) returns one row and is not
+                            // worth a walk.
+                            //
+                            // The schemaless arm used to be excluded here
+                            // because its scan function carried no range. It
+                            // does now, and the exclusion was expensive: with
+                            // no chunked state to bound construction, a
+                            // `ScanAll` built every vertex as one batch, which
+                            // the pool can only charge for after the fact --
+                            // 711.8 MB reserved and ~2.2 GB resident at LDBC
+                            // SF1 for a bare `MATCH (n)`. Sizing it needs a
+                            // count over the shared `vertices` table rather
+                            // than a per-label one, which is the only reason a
+                            // label-less scan could not answer the question.
+                            if whole.is_none() && self.filter.is_none() {
                                 let storage = Arc::clone(self.graph_ctx.storage());
                                 let label = self.label.clone();
+                                let schemaless = self.is_schemaless;
                                 self.state = GraphScanState::Sizing(Box::pin(async move {
-                                    storage.vertex_row_count(&label).await.map_err(exec_err)
+                                    if schemaless {
+                                        storage.main_vertex_row_count().await.map_err(exec_err)
+                                    } else {
+                                        storage.vertex_row_count(&label).await.map_err(exec_err)
+                                    }
                                 }));
                             } else {
                                 self.state = GraphScanState::Executing {
@@ -2232,6 +2458,7 @@ impl Stream for GraphScanStream {
                                     let next_lo = lo.saturating_add(width);
                                     let storage = Arc::clone(self.graph_ctx.storage());
                                     let label = self.label.clone();
+                                    let schemaless = self.is_schemaless;
                                     // With a fetch bound, ask *where* the label
                                     // resumes rather than merely whether it
                                     // does, and restart the walk there at the
@@ -2249,24 +2476,42 @@ impl Stream for GraphScanStream {
                                     self.state = GraphScanState::ConfirmingEnd {
                                         fut: Box::pin(async move {
                                             if seek {
-                                                storage
-                                                    .vertex_min_vid_at_or_above(&label, next_lo)
-                                                    .await
-                                                    .map(|min| min.map(SeekOutcome::ResumeAt))
-                                                    .map(|o| o.unwrap_or(SeekOutcome::Exhausted))
-                                                    .map_err(exec_err)
+                                                // A schemaless walk is over the
+                                                // shared table, so its gap seek
+                                                // has to ask that table too --
+                                                // asking a per-label one would
+                                                // report the walk exhausted at
+                                                // the first gap.
+                                                if schemaless {
+                                                    storage
+                                                        .main_vertex_min_vid_at_or_above(next_lo)
+                                                        .await
+                                                } else {
+                                                    storage
+                                                        .vertex_min_vid_at_or_above(&label, next_lo)
+                                                        .await
+                                                }
+                                                .map(|min| min.map(SeekOutcome::ResumeAt))
+                                                .map(|o| o.unwrap_or(SeekOutcome::Exhausted))
+                                                .map_err(exec_err)
                                             } else {
-                                                storage
-                                                    .vertex_rows_at_or_above(&label, next_lo)
-                                                    .await
-                                                    .map(|more| {
-                                                        if more {
-                                                            SeekOutcome::ContinueHere
-                                                        } else {
-                                                            SeekOutcome::Exhausted
-                                                        }
-                                                    })
-                                                    .map_err(exec_err)
+                                                if schemaless {
+                                                    storage
+                                                        .main_vertex_rows_at_or_above(next_lo)
+                                                        .await
+                                                } else {
+                                                    storage
+                                                        .vertex_rows_at_or_above(&label, next_lo)
+                                                        .await
+                                                }
+                                                .map(|more| {
+                                                    if more {
+                                                        SeekOutcome::ContinueHere
+                                                    } else {
+                                                        SeekOutcome::Exhausted
+                                                    }
+                                                })
+                                                .map_err(exec_err)
                                             }
                                         }),
                                         lo: next_lo,

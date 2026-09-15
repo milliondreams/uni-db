@@ -2117,23 +2117,42 @@ impl StorageManager {
     }
 
     pub async fn vertex_row_count(&self, label: &str) -> Result<Option<usize>> {
+        self.table_row_count(&table_names::vertex_table_name(label))
+            .await
+    }
+
+    /// Rows in the shared `vertices` table.
+    ///
+    /// [`Self::vertex_row_count`] answers this for one label's own table, which
+    /// is what a labelled `Scan` reads. A `ScanAll` reads `vertices` instead
+    /// (`GraphScanExec::new_schemaless_all_scan`), so sizing *its* range walk
+    /// needs this count and not a per-label one. Without it the schemaless arm
+    /// had no cheap size and was excluded from chunking altogether, so a
+    /// full-graph scan built every vertex as a single batch — 711.8 MB reserved
+    /// and ~2.2 GB resident at LDBC SF1 for a `MATCH (n)`.
+    pub async fn main_vertex_row_count(&self) -> Result<Option<usize>> {
+        self.table_row_count(table_names::main_vertex_table_name())
+            .await
+    }
+
+    /// Rows in `table_name`, or `None` when no cheap count is available.
+    async fn table_row_count(&self, table_name: &str) -> Result<Option<usize>> {
         let backend = self.backend();
-        let table_name = table_names::vertex_table_name(label);
 
         // Mirrors `BranchedBackend::count_rows`'s own branch test, so this
         // declines exactly when that would have scanned.
         if self
             .fork_scope()
-            .and_then(|scope| scope.branch_for(&table_name))
+            .and_then(|scope| scope.branch_for(table_name))
             .is_some()
         {
             return Ok(None);
         }
 
-        if !backend.table_exists(&table_name).await? {
+        if !backend.table_exists(table_name).await? {
             return Ok(Some(0));
         }
-        backend.count_rows(&table_name, None).await.map(Some)
+        backend.count_rows(table_name, None).await.map(Some)
     }
 
     /// Whether any row of `label` still has `_vid >= lo`.
@@ -2156,14 +2175,25 @@ impl StorageManager {
     /// Propagates backend failures. A table that does not exist is not an
     /// error and reports no rows.
     pub async fn vertex_rows_at_or_above(&self, label: &str, lo: u64) -> Result<bool> {
+        self.table_rows_at_or_above(&table_names::vertex_table_name(label), lo)
+            .await
+    }
+
+    /// [`Self::vertex_rows_at_or_above`] over the shared `vertices` table, for
+    /// a `ScanAll`'s range walk.
+    pub async fn main_vertex_rows_at_or_above(&self, lo: u64) -> Result<bool> {
+        self.table_rows_at_or_above(table_names::main_vertex_table_name(), lo)
+            .await
+    }
+
+    async fn table_rows_at_or_above(&self, table_name: &str, lo: u64) -> Result<bool> {
         let backend = self.backend();
-        let table_name = table_names::vertex_table_name(label);
-        if !backend.table_exists(&table_name).await? {
+        if !backend.table_exists(table_name).await? {
             return Ok(false);
         }
         let at_or_above = FilterExpr::compare("_vid", CmpOp::GtEq, Scalar::UInt(lo));
         let filter = combine_hwm_filter(self.version_high_water_mark(), Some(&at_or_above));
-        Ok(backend.count_rows(&table_name, filter.as_ref()).await? > 0)
+        Ok(backend.count_rows(table_name, filter.as_ref()).await? > 0)
     }
 
     /// The smallest `_vid` at or above `lo` that this label has a row for.
@@ -2199,8 +2229,20 @@ impl StorageManager {
     ///
     /// Propagates backend failures. A missing table is not an error.
     pub async fn vertex_min_vid_at_or_above(&self, label: &str, lo: u64) -> Result<Option<u64>> {
+        self.table_min_vid_at_or_above(&table_names::vertex_table_name(label), lo)
+            .await
+    }
+
+    /// [`Self::vertex_min_vid_at_or_above`] over the shared `vertices` table,
+    /// for a `ScanAll`'s range walk.
+    pub async fn main_vertex_min_vid_at_or_above(&self, lo: u64) -> Result<Option<u64>> {
+        self.table_min_vid_at_or_above(table_names::main_vertex_table_name(), lo)
+            .await
+    }
+
+    async fn table_min_vid_at_or_above(&self, table_name: &str, lo: u64) -> Result<Option<u64>> {
         let backend = self.backend();
-        let table_name = table_names::vertex_table_name(label);
+        let table_name = table_name.to_string();
         if !backend.table_exists(&table_name).await? {
             return Ok(None);
         }

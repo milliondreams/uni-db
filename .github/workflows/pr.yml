@@ -194,6 +194,14 @@ jobs:
           workspaces: fuzz
           cache-on-failure: true
 
+      - name: Verify fuzz lockfile is current
+        working-directory: fuzz
+        # `cargo fuzz` has no `--locked` passthrough, so assert it separately.
+        # Without this the build silently re-resolves a drifted lock, which is
+        # how an upstream publish (aws-smithy-types 1.7.0) broke this job with
+        # no change on our side. Fail loudly and let a human bump the lock.
+        run: cargo +nightly metadata --locked --format-version 1 > /dev/null
+
       - name: Run fuzz targets (30 s each, seed-corpus first)
         working-directory: fuzz
         # `--target x86_64-unknown-linux-gnu` is load-bearing — see the nightly

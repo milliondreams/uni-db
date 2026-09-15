@@ -214,8 +214,22 @@ pub async fn derive(db: &Uni) -> anyhow::Result<HashMap<String, Value>> {
     p.insert("countryName".to_string(), Value::String(names[0].clone()));
 
     // A work-start year late enough that `workFrom < $workFromYear` admits rows.
+    //
+    // The source is labelled even though WORK_AT declares exactly one source
+    // label, because an anonymous unlabelled source does not drive from the edge
+    // type's adjacency — it scans every vertex and expands. At SF1 that is 2.3 GB
+    // resident and 5.2s against 30 MB and 0.13s for the labelled form, for an
+    // identical answer, and the 1 GiB default pool refuses it outright once the
+    // traverse charges for what it holds (#242). The engine gap is the defect and
+    // this label is not a workaround for it but the query that should have been
+    // written; the gap reproduces on its own with
+    // `MATCH ()-[w:KNOWS]->() RETURN count(w)`.
     let work_year = need(
-        scalar(db, "MATCH ()-[w:WORK_AT]->() RETURN max(w.workFrom) AS y").await?,
+        scalar(
+            db,
+            "MATCH (:Person)-[w:WORK_AT]->() RETURN max(w.workFrom) AS y",
+        )
+        .await?,
         "a WORK_AT year",
     )?;
     p.insert(

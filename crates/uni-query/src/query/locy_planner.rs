@@ -37,23 +37,110 @@ use uni_locy::types::{
 /// NOTE: For IS-ref predicate building (where `{var}._vid` column references are
 /// needed), use `collect_match_node_vars` instead — only MATCH pattern variables
 /// have expanded `._vid` columns in the graph scan output.
-fn collect_node_vars(clauses: &[CompiledClause]) -> HashSet<String> {
+fn collect_node_vars(
+    clauses: &[CompiledClause],
+    rule_catalog: &HashMap<String, CompiledRule>,
+) -> HashSet<String> {
+    collect_node_vars_guarded(clauses, rule_catalog, &mut HashSet::new())
+}
+
+/// Body of [`collect_node_vars`], carrying the cycle guard that
+/// [`is_ref_target_binds_node`] needs to walk into the referenced rule.
+fn collect_node_vars_guarded(
+    clauses: &[CompiledClause],
+    rule_catalog: &HashMap<String, CompiledRule>,
+    visiting: &mut HashSet<String>,
+) -> HashSet<String> {
     let mut node_vars = HashSet::new();
     for clause in clauses {
         collect_match_node_vars(clause, &mut node_vars);
-        // IS-ref subjects and targets are also node VIDs (UInt64)
+        // IS-ref subjects are always node VIDs (UInt64) — a subject binds a KEY
+        // column by construction. A TO target only sometimes is; ask the
+        // referenced rule (issue #272).
         for condition in &clause.where_conditions {
             if let RuleCondition::IsReference(is_ref) = condition {
                 for subject in &is_ref.subjects {
                     node_vars.insert(subject.clone());
                 }
-                if let Some(target_var) = &is_ref.target {
+                if let Some(target_var) = &is_ref.target
+                    && is_ref_target_binds_node(
+                        &is_ref.rule_name.to_string(),
+                        is_ref.subjects.len(),
+                        rule_catalog,
+                        visiting,
+                    )
+                {
                     node_vars.insert(target_var.clone());
                 }
             }
         }
     }
     node_vars
+}
+
+/// Whether `IS <rule_name> TO <target>`, with `subject_count` subjects, binds
+/// its target to a **node VID** rather than to an ordinary scalar.
+///
+/// A KEY column always holds a VID. A value column usually does not — a FOLD
+/// result, an ALONG accumulation, a projected property — but it can: `YIELD KEY
+/// a, b` over `MATCH (a:N)-[:E]->(b:N)` carries `b` as a VID in a non-KEY
+/// column. So the test is the one [`infer_yield_type_rec`] uses to type a
+/// column UInt64: the yield expression is a bare variable naming one of the
+/// source rule's node variables.
+///
+/// The answer decides how the target is bound: a node is materialized with a
+/// `ScanAll` and joined on `target._vid`, a scalar is aliased to the derived
+/// scan's column. Getting it wrong is silent — the VID equality simply matches
+/// nothing (issue #272).
+///
+/// `visiting` breaks the cycle a recursive rule creates by reaching its own
+/// yield columns; a target reached only through a cycle keeps the pre-#272
+/// node assumption, which is what `reachable(a,b) :- reachable(a,mid),
+/// reachable(mid,b)` needs.
+fn is_ref_target_binds_node(
+    rule_name: &str,
+    subject_count: usize,
+    rule_catalog: &HashMap<String, CompiledRule>,
+    visiting: &mut HashSet<String>,
+) -> bool {
+    // An unknown rule, or one with no column left to bind, errors in
+    // `build_clause`; until then keep the pre-#272 assumption.
+    let Some(target_rule) = rule_catalog.get(rule_name) else {
+        return true;
+    };
+    let Some((col_name, is_key)) = is_ref_target_column(subject_count, &target_rule.yield_schema)
+    else {
+        return true;
+    };
+    if is_key {
+        return true;
+    }
+    let Some(first_clause) = target_rule.clauses.first() else {
+        return true;
+    };
+    // A FOLD output or an ALONG binding is a scalar whatever its name.
+    if first_clause.fold.iter().any(|fb| fb.name == col_name)
+        || first_clause.along.iter().any(|a| a.name == col_name)
+    {
+        return false;
+    }
+    let RuleOutput::Yield(yc) = &first_clause.output else {
+        return true;
+    };
+    if !visiting.insert(rule_name.to_string()) {
+        return true; // cycle
+    }
+    let source_node_vars = collect_node_vars_guarded(&target_rule.clauses, rule_catalog, visiting);
+    visiting.remove(rule_name);
+
+    let item_names = resolve_yield_column_names(&yc.items);
+    yc.items
+        .iter()
+        .zip(item_names.iter())
+        .any(|(item, item_name)| {
+            *item_name == col_name
+                && matches!(&item.expr, Expr::Variable(v) if source_node_vars.contains(v))
+        })
 }
 
 /// Collect node variable names from a single clause's MATCH pattern only.
@@ -329,7 +416,7 @@ fn infer_is_ref_value_col_type(
         let Some(src_clause) = rule.clauses.first() else {
             return Some(DataType::LargeUtf8);
         };
-        let src_node_vars = collect_node_vars(&rule.clauses);
+        let src_node_vars = collect_node_vars(&rule.clauses, rule_catalog);
         let src_fold: HashSet<&str> = src_clause.fold.iter().map(|fb| fb.name.as_str()).collect();
         let src_along: HashSet<&str> = src_clause.along.iter().map(|a| a.name.as_str()).collect();
         let src_var_labels = clause_var_labels(src_clause);
@@ -871,7 +958,7 @@ impl<'a> LocyPlanBuilder<'a> {
         classifiers: &ClassifierContext,
     ) -> Result<LocyRulePlan> {
         // Collect node variable names from match patterns for VID-based joins
-        let node_vars = collect_node_vars(&rule.clauses);
+        let node_vars = collect_node_vars(&rule.clauses, rule_catalog);
 
         // Derivation discriminators for a recursive FOLD / ALONG rule (#159).
         // See `derivation_discriminator_columns`.
@@ -1460,23 +1547,34 @@ impl<'a> LocyPlanBuilder<'a> {
                     // the derived column name (e.g., `m` vs `b`), add an implicit
                     // ScanAll for the target so it becomes a proper node column.
                     if let Some(target_var) = &is_ref.target {
-                        let key_cols: Vec<&YieldColumn> = target_rule
-                            .yield_schema
-                            .iter()
-                            .filter(|yc| yc.is_key)
-                            .collect();
-                        let non_key_cols: Vec<&YieldColumn> = target_rule
-                            .yield_schema
-                            .iter()
-                            .filter(|yc| !yc.is_key)
-                            .collect();
-                        let target_col_name = if is_ref.subjects.len() < key_cols.len() {
-                            key_cols.get(is_ref.subjects.len()).map(|c| c.name.clone())
-                        } else {
-                            non_key_cols.first().map(|c| c.name.clone())
-                        };
+                        let target_col =
+                            is_ref_target_column(is_ref.subjects.len(), &target_rule.yield_schema);
+                        let target_is_node = is_ref_target_binds_node(
+                            &target_rule_name,
+                            is_ref.subjects.len(),
+                            rule_catalog,
+                            &mut HashSet::new(),
+                        );
 
-                        if let Some(col_name) = target_col_name {
+                        if let Some((col_name, _)) = &target_col
+                            && !target_is_node
+                        {
+                            // The target binds a scalar column — a FOLD
+                            // result, an ALONG accumulation, a projected
+                            // property. Bind it by name: record `target_var` →
+                            // this scan's column so FOLD, YIELD and the
+                            // deferred WHERE resolve it, and do not scan,
+                            // VID-join, or register it as a node. Treating it
+                            // as a node is issue #272 — the emitted
+                            // `target._vid = <scalar col>` matched nothing and
+                            // the rule silently returned no rows.
+                            let scan_col = format!("{col_prefix}{col_name}");
+                            if *target_var != scan_col {
+                                is_ref_col_aliases.insert(target_var.clone(), scan_col);
+                            }
+                        }
+
+                        if let Some((col_name, _)) = target_col.filter(|_| target_is_node) {
                             // Materialize `target_var` as a proper node (with
                             // `._vid`, `._labels`, and property columns) the
                             // FIRST time it appears, so property access (e.g.
@@ -2100,6 +2198,33 @@ fn alias_derived_schema(schema: &SchemaRef, prefix: &str) -> SchemaRef {
     Arc::new(ArrowSchema::new(fields))
 }
 
+/// Which yield column an `IS <rule> TO <target>` binds, and whether that column
+/// is a KEY.
+///
+/// Subjects consume the referenced rule's KEY columns positionally; the
+/// optional target binds the next remaining KEY column, or — once the subjects
+/// have consumed every KEY — the rule's first value (non-KEY) column.
+///
+/// The `is_key` half of the answer is load-bearing: a KEY column holds a node
+/// VID and is bound by node identity (`target._vid = <col>`), while a value
+/// column holds an ordinary scalar (a FOLD result, a projected property) and
+/// must be bound by name. Binding a value column as a node compares a UInt64
+/// VID against, say, an `MSUM` float — a filter nothing satisfies, so the rule
+/// yields zero rows and reports nothing (issue #272).
+fn is_ref_target_column(
+    subject_count: usize,
+    yield_schema: &[YieldColumn],
+) -> Option<(String, bool)> {
+    let mut keys = yield_schema.iter().filter(|yc| yc.is_key);
+    match keys.nth(subject_count) {
+        Some(key) => Some((key.name.clone(), true)),
+        None => yield_schema
+            .iter()
+            .find(|yc| !yc.is_key)
+            .map(|c| (c.name.clone(), false)),
+    }
+}
+
 /// Maps subjects → KEY yield columns by position, and target → remaining KEY
 /// or first non-KEY yield column. For node variables, compares `._vid` property
 /// (UInt64) instead of bare variable (which doesn't exist as a column).
@@ -2115,7 +2240,6 @@ fn build_is_ref_predicate(
     col_prefix: &str,
 ) -> Result<Expr> {
     let key_cols: Vec<&YieldColumn> = yield_schema.iter().filter(|yc| yc.is_key).collect();
-    let non_key_cols: Vec<&YieldColumn> = yield_schema.iter().filter(|yc| !yc.is_key).collect();
 
     let mut predicates = Vec::new();
 
@@ -2155,19 +2279,14 @@ fn build_is_ref_predicate(
     }
 
     // target: bind to remaining KEY column (after subjects) or first non-KEY
-    if let Some(target_var) = target {
-        let target_col = if subjects.len() < key_cols.len() {
-            Some(key_cols[subjects.len()])
-        } else {
-            non_key_cols.first().copied()
-        };
-        if let Some(col) = target_col {
-            predicates.push(Expr::BinaryOp {
-                left: Box::new(make_var_expr(target_var, node_vars)),
-                op: BinaryOp::Eq,
-                right: Box::new(Expr::Variable(format!("{col_prefix}{}", col.name))),
-            });
-        }
+    if let Some(target_var) = target
+        && let Some((col_name, _is_key)) = is_ref_target_column(subjects.len(), yield_schema)
+    {
+        predicates.push(Expr::BinaryOp {
+            left: Box::new(make_var_expr(target_var, node_vars)),
+            op: BinaryOp::Eq,
+            right: Box::new(Expr::Variable(format!("{col_prefix}{col_name}"))),
+        });
     }
 
     if predicates.is_empty() {
@@ -2342,7 +2461,7 @@ fn yield_schema_to_arrow_from_rule(
     rule_catalog: &HashMap<String, CompiledRule>,
     schema: &Schema,
 ) -> SchemaRef {
-    let target_node_vars = collect_node_vars(&target_rule.clauses);
+    let target_node_vars = collect_node_vars(&target_rule.clauses, rule_catalog);
     let first_clause = target_rule.clauses.first();
     let fold_names: HashSet<&str> = first_clause
         .map(|c| c.fold.iter().map(|fb| fb.name.as_str()).collect())

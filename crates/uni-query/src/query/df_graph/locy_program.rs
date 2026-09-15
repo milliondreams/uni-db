@@ -1212,6 +1212,7 @@ async fn run_program(
                     // (#177). `None` when not profiling, so the metric walk is
                     // not paid on the ordinary path.
                     collector.as_ref().map(|_| &mut iter_ops),
+                    &params,
                 )
                 .await?;
 

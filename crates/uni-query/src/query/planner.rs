@@ -6091,6 +6091,12 @@ impl QueryPlanner {
         // no rows.
         let mut src_labels = Vec::new();
         let mut unknown_types = Vec::new();
+        // How many of `params.rel.types` resolved to a schema edge type that
+        // contributed endpoint labels. Virtual and unknown types contribute
+        // none, so this is not `params.rel.types.len()` in general — and the
+        // source-narrowing below requires *every* named type to have declared
+        // endpoints before it can bound the source.
+        let mut declared_types = 0usize;
 
         if params.rel.types.is_empty() {
             // All types - include both schema and schemaless edge types
@@ -6107,6 +6113,7 @@ impl QueryPlanner {
                     edge_type_ids.push(edge_meta.id);
                     dst_labels.extend(edge_meta.dst_labels.iter().cloned());
                     src_labels.extend(edge_meta.src_labels.iter().cloned());
+                    declared_types += 1;
                 } else if let Some((vid, _)) = self.allocate_virtual_edge_type(type_name)? {
                     // M5b.3: virtual edge type (plugin-registered CatalogTable).
                     // Resolving it into `edge_type_ids` (not `unknown_types`)
@@ -6126,6 +6133,110 @@ impl QueryPlanner {
         edge_type_ids.dedup();
         unknown_types.sort_unstable();
         unknown_types.dedup();
+
+        // Labels an *unlabelled source* can be narrowed to, from the edge
+        // type's declared endpoints. Computed here because the target-side
+        // inference below consumes `src_labels`/`dst_labels` by move.
+        //
+        // `MATCH ()-[w:WORK_AT]->()` planned the source as `ScanAll` — every
+        // vertex in the graph — and expanded from each one, even though the
+        // traversal can only ever depart from a label WORK_AT declares. At
+        // LDBC SF1 that is 3.18M vertices for 21654 edges: 2278 MB resident
+        // and 5.2s, against 30 MB and 0.13s for the identical answer once the
+        // source is labelled, and the 1 GiB default query pool refuses it
+        // outright.
+        //
+        // This is sound because the storage layer has already made the same
+        // commitment: `AdjacencyManager` loads CSR adjacency only for
+        // `src_labels` on an outgoing traversal and `dst_labels` on an
+        // incoming one (`adjacency_manager.rs`, `labels_to_load`). A typed
+        // traversal reads exclusively through that CSR, so an edge whose
+        // source carries none of the declared labels is *already* invisible
+        // to it. Narrowing the scan to the same set cannot drop a row the
+        // traverse would have produced.
+        //
+        // The direction mapping mirrors `labels_to_load` exactly, and is the
+        // source-side mirror of the target-side inference further down —
+        // which carries its own comment about the silent wrong answer that
+        // ignoring direction caused there:
+        //
+        //   ()-[:R]->(b)   the source is on the edge's src side -> src_labels
+        //   ()<-[:R]-(b)   the source is on the edge's dst side -> dst_labels
+        //   ()-[:R]-(b)    either side -> the union, which is what the CSR
+        //                  loads for `Direction::Both`
+        let source_narrowing: Option<Vec<String>> = {
+            let every_type_declared =
+                !params.rel.types.is_empty() && declared_types == params.rel.types.len();
+            if !every_type_declared || !unknown_types.is_empty() {
+                // A bare `-[r]->` means every edge type, whose endpoint union
+                // is every label — narrowing to it buys nothing and would
+                // exclude unlabelled vertices. A virtual or unknown type
+                // declares no endpoints and an unknown one is served by
+                // `TraverseMainByType`, which reads the main edge table
+                // rather than per-label adjacency, so the label set does not
+                // bound it.
+                None
+            } else {
+                let mut labels: Vec<String> = match params.rel.direction {
+                    Direction::Outgoing => src_labels.clone(),
+                    Direction::Incoming => dst_labels.clone(),
+                    Direction::Both => {
+                        let mut both = src_labels.clone();
+                        both.extend(dst_labels.iter().cloned());
+                        both
+                    }
+                };
+                labels.sort();
+                labels.dedup();
+                // Bail rather than narrow to a subset: a declared endpoint
+                // label that is not itself a declared label cannot be turned
+                // into a `Scan`, and silently dropping it would be a wrong
+                // answer rather than a slow one.
+                let all_resolvable = labels
+                    .iter()
+                    .all(|l| self.schema.get_label_case_insensitive(l).is_some());
+                // Single label only, and this is measured rather than
+                // cautious. With one label the rewrite collapses to a plain
+                // `Scan` — the same operator the hand-written
+                // `(:Person)-[...]` form gets. With two or more it replaces
+                // one `ScanAll` with N `ScanMainByLabels` plus N-1 `Union`
+                // nodes, and that is not a narrowing: `ScanAll` reads the
+                // shared `vertices` table once, while the union reads N
+                // per-label tables whose rows together can exceed it.
+                //
+                // Measured at LDBC SF1, both arms in one process against the
+                // same store, warm sample of a repeated pair:
+                //
+                //   IS_LOCATED_IN  5297 ms -> 11630 ms   (2.2x slower)
+                //   HAS_TAG        5944 ms ->  8737 ms   (1.5x slower)
+                //   HAS_CREATOR    5666 ms ->  7999 ms   (1.4x slower)
+                //
+                // Those three are every multi-source type at SF1 with enough
+                // rows to time, and their label sets each cover ~96% of the
+                // graph, so there is no row saving to offset the union. A
+                // multi-label type whose labels are collectively *small*
+                // could still win; no such type exists in this corpus, so
+                // that case is unmeasured and deliberately not enabled on a
+                // guess. Enabling it would want a cardinality gate, which
+                // needs a total-vertex count `CardinalityCache` does not have
+                // (its `Vertex(label)` keys count `vertices_{label}`, a
+                // different table from the `vertices` that `ScanAll` reads,
+                // and it is populated lazily with no pre-warm).
+                //
+                // One label is not automatically a small label, and that
+                // costs nothing: REPLY_OF's only source label is Comment,
+                // 2052169 of SF1's 3181724 vertices, and it measures
+                // 5564/5479 ms narrowed against 5536/5503 ms not — the same
+                // within noise. Scan cost is linear in rows at ~530 ms/Mrow
+                // with the per-row cost alike on both tables, so narrowing to
+                // any single label is at worst neutral.
+                if labels.len() != 1 || !all_resolvable {
+                    None
+                } else {
+                    Some(labels)
+                }
+            }
+        };
 
         let mut target_variable = params.target_node.variable.clone().unwrap_or_default();
         if target_variable.is_empty() {
@@ -6505,6 +6616,26 @@ impl QueryPlanner {
         // Include bound edge variables from this path for cross-segment Trail mode
         // enforcement (same as the schemaless path above).
         scope_match_variables.extend(path_bound_edge_vars.iter().cloned());
+
+        // Apply the source narrowing computed above. Gated on the rewriter
+        // actually being able to rebuild this plan — the same gate the
+        // `WHERE n:A OR n:B` disjunction rewrite uses — so a `ScanAll` sitting
+        // under an operator the rewriter cannot descend is left alone rather
+        // than silently not narrowed. `replace_scan_all_with_label_union` is a
+        // no-op unless `source_variable` is currently bound to a `ScanAll`, so
+        // an already-labelled source keeps its `Scan`.
+        let plan = match source_narrowing {
+            Some(labels)
+                if Self::rewrite_target_reachable(
+                    &plan,
+                    source_variable,
+                    RewriteTarget::LabelUnion,
+                ) =>
+            {
+                self.replace_scan_all_with_label_union(plan, source_variable, &labels, false)
+            }
+            _ => plan,
+        };
 
         let mut plan = LogicalPlan::Traverse {
             input: Box::new(plan),
@@ -10331,6 +10462,169 @@ fn terminal_projection(plan: &LogicalPlan) -> Option<&Vec<(Expr, Option<String>)
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Distinct { input } => terminal_projection(input),
         _ => None,
+    }
+}
+
+/// Downgrade `"*"` to the structural-only marker for an entity whose only use
+/// is being counted.
+///
+/// `mark_pattern_variables` marks every pattern variable `"*"` — a full record
+/// — before anything has said it wants one, because most uses of a variable do.
+/// `count(n)` does not: it needs to know a row exists, not what is in it. For a
+/// schemaless scan the difference is the whole property blob of every vertex,
+/// and at LDBC SF1 `MATCH (n) RETURN count(n)` was reading every property of
+/// 3.18M vertices in order to count them. Fat rows also narrow the `_vid` range
+/// walk, which sizes each range against a byte budget, so the waste paid twice:
+/// once in bytes moved and again in per-range overhead.
+///
+/// The downgrade target is deliberately [`STRUCT_ONLY_SENTINEL`] rather than
+/// nothing. `SET n.prop = val` already uses it to mean "build the bare struct
+/// column, do not pull the full schema", which is exactly what `count(n)` needs
+/// — `count` over an entity still evaluates the column, it just never looks
+/// inside it. Removing the marker outright would take the column away too.
+///
+/// **Fails closed.** The survey returns `false` on any operator it does not
+/// explicitly understand and then nothing is changed, because the cost of being
+/// wrong here is asymmetric: projecting too much is slow, projecting too little
+/// is a silently missing property. A new `LogicalPlan` variant therefore
+/// disables this optimization rather than quietly under-projecting through it.
+pub(crate) fn relax_count_only_entities(
+    plan: &LogicalPlan,
+    properties: &mut HashMap<String, HashSet<String>>,
+) {
+    // The same kinds map `collect_properties_from_plan` uses. It is not
+    // optional: `collect_properties_from_expr_into` consults it to decide
+    // whether a bare variable is an entity, and an empty map makes it record
+    // *fewer* reads. Under-recording reads here is the one direction that
+    // breaks correctness -- a variable whose read went unseen looks count-only
+    // and loses properties something actually wanted.
+    let mut kinds: HashMap<String, VariableKind> = HashMap::new();
+    crate::query::df_planner::collect_variable_kinds(plan, &mut kinds);
+
+    let mut counted: HashSet<String> = HashSet::new();
+    let mut used: HashSet<String> = HashSet::new();
+    if !survey_count_only(plan, &kinds, &mut counted, &mut used) {
+        return;
+    }
+    for var in counted.difference(&used) {
+        if let Some(set) = properties.get_mut(var)
+            && set.remove("*")
+        {
+            set.insert(STRUCT_ONLY_SENTINEL.to_string());
+        }
+    }
+}
+
+/// Is `expr` exactly `count(v)` over a bare variable? Returns the variable.
+///
+/// `count(n.prop)` does not qualify — that reads a property.
+///
+/// `count(DISTINCT n)` is excluded too, conservatively: it must compare
+/// entities rather than merely observe that a row exists. Do not read that
+/// exclusion as an explanation of what `count(DISTINCT n)` costs. Measured at
+/// LDBC SF1 it projects as narrowly as the non-distinct form (11 ranges, not
+/// 18) through some path this pass does not control and which is *not
+/// identified* — two attempts to attribute it were inconclusive, the second
+/// because `ORDER BY … LIMIT 1` over a scalar aggregate is elided and so did
+/// not disable this pass as the control assumed. The guard stays because it is
+/// the safe direction, not because it is known to bind.
+fn count_arg_variable(expr: &Expr) -> Option<&str> {
+    let Expr::FunctionCall {
+        name,
+        args,
+        distinct,
+        ..
+    } = expr
+    else {
+        return None;
+    };
+    if !name.eq_ignore_ascii_case("count") || *distinct || args.len() != 1 {
+        return None;
+    }
+    match &args[0] {
+        Expr::Variable(v) => Some(v.as_str()),
+        _ => None,
+    }
+}
+
+/// Walk the plan recording counted-only variables and every other variable read.
+///
+/// Returns `false` the moment it meets an operator it does not model, which
+/// makes the caller leave every projection alone.
+fn survey_count_only(
+    plan: &LogicalPlan,
+    kinds: &HashMap<String, VariableKind>,
+    counted: &mut HashSet<String>,
+    used: &mut HashSet<String>,
+) -> bool {
+    let note = |e: &Expr, used: &mut HashSet<String>| {
+        let mut props: HashMap<String, HashSet<String>> = HashMap::new();
+        collect_properties_from_expr_into(e, &mut props, kinds);
+        used.extend(props.into_keys());
+    };
+    match plan {
+        // Leaves. Their `filter` is a real read of the variable.
+        LogicalPlan::Scan { filter, .. }
+        | LogicalPlan::ScanAll { filter, .. }
+        | LogicalPlan::ScanMainByLabels { filter, .. } => {
+            if let Some(f) = filter {
+                note(f, used);
+            }
+            true
+        }
+        LogicalPlan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => {
+            for g in group_by {
+                note(g, used);
+            }
+            for a in aggregates {
+                match count_arg_variable(a) {
+                    Some(v) => {
+                        counted.insert(v.to_string());
+                    }
+                    // Any other aggregate reads whatever it names.
+                    None => note(a, used),
+                }
+            }
+            survey_count_only(input, kinds, counted, used)
+        }
+        LogicalPlan::Project { input, projections } => {
+            for (e, _) in projections {
+                match count_arg_variable(e) {
+                    Some(v) => {
+                        counted.insert(v.to_string());
+                    }
+                    None => note(e, used),
+                }
+            }
+            survey_count_only(input, kinds, counted, used)
+        }
+        LogicalPlan::Filter {
+            input, predicate, ..
+        } => {
+            note(predicate, used);
+            survey_count_only(input, kinds, counted, used)
+        }
+        LogicalPlan::Traverse {
+            input,
+            target_filter,
+            edge_filter_expr,
+            ..
+        } => {
+            if let Some(f) = target_filter {
+                note(f, used);
+            }
+            if let Some(f) = edge_filter_expr {
+                note(f, used);
+            }
+            survey_count_only(input, kinds, counted, used)
+        }
+        // Everything else -- including every operator added after this was
+        // written -- is unmodelled, so the optimization declines.
+        _ => false,
     }
 }
 

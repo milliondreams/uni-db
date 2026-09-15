@@ -47,15 +47,53 @@ async fn main() -> anyhow::Result<()> {
         }
         // Elapsed is printed per query: a bisection ladder without per-step
         // timing cannot attribute a cost to a step, only observe that it ran.
+        if let Some(inner) = q.strip_prefix("PROFILE ") {
+            let t = std::time::Instant::now();
+            match db.session().query_with(inner).profile().await {
+                Ok((r, p)) => {
+                    let ms = t.elapsed().as_secs_f64() * 1000.0;
+                    println!(
+                        "PROFILE rows={} wall={ms:.1}ms total={}ms peak={}MB\n  {inner}",
+                        r.rows().len(),
+                        p.total_time_ms,
+                        p.peak_memory_bytes / 1_048_576
+                    );
+                    let mut sorted = p.runtime_stats.clone();
+                    sorted.sort_by(|a, b| b.time_ms.partial_cmp(&a.time_ms).unwrap());
+                    let sum: f64 = p.runtime_stats.iter().map(|o| o.time_ms).sum();
+                    println!("  accounted={sum:.1}ms of wall={ms:.1}ms");
+                    for o in sorted.iter().take(12) {
+                        println!(
+                            "    {:<34} {:>9.1}ms rows={:<10} mem={}MB",
+                            o.operator,
+                            o.time_ms,
+                            o.actual_rows,
+                            o.memory_bytes / 1_048_576
+                        );
+                    }
+                }
+                Err(e) => println!("PROFILE ERROR {e}\n  {inner}"),
+            }
+            continue;
+        }
         let t = std::time::Instant::now();
         let outcome = db.session().query(q).await;
         let ms = t.elapsed().as_secs_f64() * 1000.0;
         match outcome {
-            Ok(r) => println!(
-                "rows={:<8} ms={ms:>10.1} first={:?}\n  {q}",
-                r.rows().len(),
-                r.rows().first().map(|x| x.values().to_vec())
-            ),
+            Ok(r) => {
+                // `scans_reported` counts storage round trips, which is what
+                // separates "this plan is chunked" from "this plan is one
+                // scan" -- a timing alone cannot tell those apart.
+                let m = r.metrics();
+                println!(
+                    "rows={:<8} ms={ms:>10.1} scans={:<6} idx={:<5} cmp={:<12} first={:?}\n  {q}",
+                    r.rows().len(),
+                    m.scans_reported,
+                    m.index_scans,
+                    m.index_comparisons,
+                    r.rows().first().map(|x| x.values().to_vec())
+                )
+            }
             Err(e) => println!("ERROR ms={ms:>10.1} {e}\n  {q}"),
         }
     }

@@ -455,9 +455,14 @@ def test_multiple_vertex_labels_in_single_writer(social_db):
     assert result[0]["cnt"] == 1
 
 
-@pytest.mark.xfail(reason="BulkWriter commit with zero data fails on missing table")
 def test_bulk_insert_with_empty_data(social_db):
-    """Test bulk insert with empty data arrays."""
+    """An all-empty bulk load commits as a no-op.
+
+    Was `xfail`ed: `insert_vertices` marked the label touched even for an empty
+    vec, and `commit` then counted rows in a `vertices_<label>` table that was
+    never created, failing the whole commit. Empty inserts now return early
+    without marking the label (crates/uni-bulk/src/bulk.rs::insert_vertices).
+    """
     session = social_db.session()
     tx = session.tx()
     writer = tx.bulk_writer().build()

@@ -538,7 +538,7 @@ impl TxBulkWriterBuilder {
             .build()
             .map_err(crate::exceptions::anyhow_to_pyerr)?;
         Ok(crate::builders::BulkWriter {
-            inner: std::sync::Mutex::new(Some(real_writer)),
+            inner: std::sync::Mutex::new(crate::builders::BulkWriterState::new(real_writer)),
         })
     }
 }
@@ -1062,6 +1062,13 @@ impl Database {
     // -----------------------------------------------------------------------
 
     /// List all currently-Active forks across the database.
+    ///
+    /// Lists forks created through **this** handle. The fork registry is
+    /// cached per handle, so a fork created by a different `Uni`/`AsyncUni`
+    /// on the same store is omitted -- silently, as a shorter list rather
+    /// than an error. Multi-handle fork administration is unsupported; see
+    /// the `Uni::list_forks` rustdoc. Note schema and property reads do not
+    /// share this limitation.
     fn list_forks(&self, py: Python<'_>) -> Vec<crate::types::PyForkInfo> {
         py.detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(self.inner.list_forks()))
             .into_iter()

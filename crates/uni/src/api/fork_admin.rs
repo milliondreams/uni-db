@@ -23,6 +23,25 @@ impl Uni {
     /// Returns metadata snapshots — see [`uni_common::core::fork::ForkInfo`].
     /// Pending or Tombstoned entries are omitted; recovery resumes them
     /// on the next [`Uni::open`].
+    ///
+    /// # Scope: forks created through *this* handle
+    ///
+    /// The fork registry is cached in memory per handle and refreshed only by
+    /// that handle's own fork-lifecycle calls. A fork created through a
+    /// *different* [`Uni`] handle on the same store — even one that has since
+    /// been shut down — is **not** reflected here, and the omission is silent:
+    /// you get a shorter list, never an error. If a stale list would be acted
+    /// on (creating a duplicate, sweeping by TTL, deciding a store is fork-free),
+    /// re-open the handle rather than trusting this call across handles.
+    ///
+    /// Note this differs from schema and property reads, which *do* observe a
+    /// second handle's writes. The divergence is deliberate rather than
+    /// overlooked: every registry mutation goes through `ForkRegistryHandle`'s
+    /// 2PC state machine as the single writer, so refreshing the cache from
+    /// disk on a read has to be reconciled with that protocol. Multi-handle
+    /// fork administration on one store is outside the supported model.
+    /// Pinned by `second_handle_observes_fork_created_elsewhere`
+    /// (crates/uni/tests/common/bugs/repro_issue_168_family_stale_second_handle.rs).
     pub async fn list_forks(&self) -> Vec<uni_common::core::fork::ForkInfo> {
         self.inner.fork_registry.list_active().await
     }

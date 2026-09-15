@@ -2470,12 +2470,91 @@ impl SessionTemplate {
 // BulkWriter (wrapping real Rust BulkWriter)
 // ============================================================================
 
+/// Why the slot is empty is load-bearing, so it is a state, not an `Option`.
+///
+/// A second `abort()` must be a no-op; an `abort()` after `commit()` must
+/// raise. With `Option<BulkWriter>` both were `None`, so abort-after-commit
+/// silently succeeded -- and `uni-bulk`'s own guard for it
+/// (`Cannot abort: bulk load already committed`, bulk.rs) was unreachable,
+/// because `commit()` had already moved the writer out of the `Option`.
+///
+/// `Active` is boxed: `BulkWriter` is large next to two unit variants, and
+/// clippy's `large_enum_variant` fires on the unboxed form.
+pub(crate) enum BulkWriterState {
+    Active(Box<::uni_db::api::bulk::BulkWriter>),
+    Committed,
+    Aborted,
+}
+
+impl BulkWriterState {
+    pub(crate) fn new(writer: ::uni_db::api::bulk::BulkWriter) -> Self {
+        Self::Active(Box::new(writer))
+    }
+
+    fn completed_err(op: &str) -> PyErr {
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+            "BulkWriter already completed ({op})"
+        ))
+    }
+
+    /// Borrow the live writer, or fail if the load already finished.
+    pub(crate) fn active_mut(
+        &mut self,
+        op: &str,
+    ) -> PyResult<&mut ::uni_db::api::bulk::BulkWriter> {
+        match self {
+            Self::Active(w) => Ok(w),
+            _ => Err(Self::completed_err(op)),
+        }
+    }
+
+    pub(crate) fn active_ref(&self, op: &str) -> PyResult<&::uni_db::api::bulk::BulkWriter> {
+        match self {
+            Self::Active(w) => Ok(w),
+            _ => Err(Self::completed_err(op)),
+        }
+    }
+
+    /// Take the writer for a commit. Committing twice, or after an abort, is an
+    /// error -- unchanged from the `Option` behaviour.
+    pub(crate) fn take_for_commit(&mut self) -> PyResult<::uni_db::api::bulk::BulkWriter> {
+        match std::mem::replace(self, Self::Committed) {
+            Self::Active(w) => Ok(*w),
+            // Restore the state we replaced so a failed call does not mutate it.
+            other => {
+                *self = other;
+                Err(Self::completed_err("commit"))
+            }
+        }
+    }
+
+    /// Take the writer for an abort. `Ok(None)` means "already aborted", which
+    /// is a documented no-op; aborting a committed load is an error.
+    pub(crate) fn take_for_abort(&mut self) -> PyResult<Option<::uni_db::api::bulk::BulkWriter>> {
+        match std::mem::replace(self, Self::Aborted) {
+            Self::Active(w) => Ok(Some(*w)),
+            Self::Aborted => Ok(None),
+            Self::Committed => {
+                *self = Self::Committed;
+                Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    "Cannot abort: bulk load already committed",
+                ))
+            }
+        }
+    }
+
+    /// Whether a context-manager exit should auto-abort.
+    pub(crate) fn is_active(&self) -> bool {
+        matches!(self, Self::Active(_))
+    }
+}
+
 /// Bulk writer for high-throughput data ingestion.
 ///
-/// Wraps the real Rust `BulkWriter` via `Mutex<Option<T>>` ownership pattern.
+/// Wraps the real Rust `BulkWriter` via a `Mutex<BulkWriterState>`.
 #[pyclass]
 pub struct BulkWriter {
-    pub(crate) inner: std::sync::Mutex<Option<::uni_db::api::bulk::BulkWriter>>,
+    pub(crate) inner: std::sync::Mutex<BulkWriterState>,
 }
 
 impl BulkWriter {
@@ -2487,12 +2566,7 @@ impl BulkWriter {
             .inner
             .lock()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-        let writer = guard.as_mut().ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                "BulkWriter already completed ({})",
-                op
-            ))
-        })?;
+        let writer = guard.active_mut(op)?;
         f(writer)
     }
 }
@@ -2589,9 +2663,7 @@ impl BulkWriter {
             .inner
             .lock()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-        let writer = guard.take().ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("BulkWriter already completed")
-        })?;
+        let writer = guard.take_for_commit()?;
         let stats = py
             .detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(writer.commit()))
             .map_err(crate::exceptions::anyhow_to_pyerr)?;
@@ -2612,7 +2684,7 @@ impl BulkWriter {
             .inner
             .lock()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-        if let Some(writer) = guard.take() {
+        if let Some(writer) = guard.take_for_abort()? {
             py.detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(writer.abort()))
                 .map_err(crate::exceptions::anyhow_to_pyerr)?;
         }
@@ -2633,7 +2705,7 @@ impl BulkWriter {
         _exc_tb: Option<Py<PyAny>>,
     ) -> PyResult<bool> {
         let guard = self.inner.lock().unwrap();
-        if guard.is_some() {
+        if guard.is_active() {
             drop(guard);
             self.abort(py)?;
         }

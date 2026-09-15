@@ -606,6 +606,13 @@ impl AsyncDatabase {
     // -----------------------------------------------------------------------
 
     /// List all currently-Active forks across the database.
+    ///
+    /// Lists forks created through **this** handle. The fork registry is
+    /// cached per handle, so a fork created by a different `Uni`/`AsyncUni`
+    /// on the same store is omitted -- silently, as a shorter list rather
+    /// than an error. Multi-handle fork administration is unsupported; see
+    /// the `Uni::list_forks` rustdoc. Note schema and property reads do not
+    /// share this limitation.
     fn list_forks<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let db = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -1843,7 +1850,9 @@ impl AsyncTxBulkWriterBuilder {
                 .build()
                 .map_err(crate::exceptions::anyhow_to_pyerr)?;
             Ok(AsyncBulkWriter {
-                inner: Arc::new(std::sync::Mutex::new(Some(real_writer))),
+                inner: Arc::new(std::sync::Mutex::new(
+                    crate::builders::BulkWriterState::new(real_writer),
+                )),
             })
         })
     }
@@ -2969,7 +2978,10 @@ impl AsyncTransactionBuilder {
 /// `.await` points in a `tokio::sync::Mutex`.
 #[pyclass]
 pub struct AsyncBulkWriter {
-    inner: Arc<std::sync::Mutex<Option<::uni_db::api::bulk::BulkWriter>>>,
+    // Shares `BulkWriterState` with the sync wrapper: abort-after-commit must
+    // raise while abort-after-abort stays a no-op, and `Option` cannot tell
+    // those apart. See crate::builders::BulkWriterState.
+    inner: Arc<std::sync::Mutex<crate::builders::BulkWriterState>>,
 }
 
 #[pymethods]
@@ -2997,11 +3009,7 @@ impl AsyncBulkWriter {
                 let mut guard = inner.lock().map_err(|e| {
                     PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
                 })?;
-                let writer = guard.as_mut().ok_or_else(|| {
-                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                        "BulkWriter already completed",
-                    )
-                })?;
+                let writer = guard.active_mut("bulk")?;
                 let rt = tokio::runtime::Handle::current();
                 rt.block_on(writer.insert_vertices(&label, rust_props))
                     .map_err(crate::exceptions::anyhow_to_pyerr)
@@ -3037,11 +3045,7 @@ impl AsyncBulkWriter {
                 let mut guard = inner.lock().map_err(|e| {
                     PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
                 })?;
-                let writer = guard.as_mut().ok_or_else(|| {
-                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                        "BulkWriter already completed",
-                    )
-                })?;
+                let writer = guard.active_mut("bulk")?;
                 let rt = tokio::runtime::Handle::current();
                 rt.block_on(writer.insert_edges(&edge_type, rust_edges))
                     .map_err(crate::exceptions::anyhow_to_pyerr)
@@ -3058,9 +3062,7 @@ impl AsyncBulkWriter {
             .inner
             .lock()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-        let writer = guard.as_ref().ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("BulkWriter already completed")
-        })?;
+        let writer = guard.active_ref("bulk")?;
         let s = writer.stats();
         Ok(BulkStats {
             vertices_inserted: s.vertices_inserted,
@@ -3079,9 +3081,7 @@ impl AsyncBulkWriter {
             .inner
             .lock()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-        let writer = guard.as_ref().ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("BulkWriter already completed")
-        })?;
+        let writer = guard.active_ref("bulk")?;
         Ok(writer.touched_labels())
     }
 
@@ -3091,9 +3091,7 @@ impl AsyncBulkWriter {
             .inner
             .lock()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-        let writer = guard.as_ref().ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("BulkWriter already completed")
-        })?;
+        let writer = guard.active_ref("bulk")?;
         Ok(writer.touched_edge_types())
     }
 
@@ -3105,11 +3103,7 @@ impl AsyncBulkWriter {
                 let mut guard = inner.lock().map_err(|e| {
                     PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
                 })?;
-                let writer = guard.take().ok_or_else(|| {
-                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                        "BulkWriter already completed",
-                    )
-                })?;
+                let writer = guard.take_for_commit()?;
                 let rt = tokio::runtime::Handle::current();
                 rt.block_on(writer.commit())
                     .map_err(crate::exceptions::anyhow_to_pyerr)
@@ -3136,7 +3130,7 @@ impl AsyncBulkWriter {
                 let mut guard = inner.lock().map_err(|e| {
                     PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
                 })?;
-                if let Some(writer) = guard.take() {
+                if let Some(writer) = guard.take_for_abort()? {
                     let rt = tokio::runtime::Handle::current();
                     rt.block_on(writer.abort())
                         .map_err(crate::exceptions::anyhow_to_pyerr)?;
@@ -3167,7 +3161,9 @@ impl AsyncBulkWriter {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             tokio::task::spawn_blocking(move || {
                 let mut guard = inner.lock().unwrap();
-                if let Some(writer) = guard.take() {
+                // Only auto-abort a still-active load; `take_for_abort` on a
+                // committed one is an error and __aexit__ must not raise it.
+                if let Ok(Some(writer)) = guard.take_for_abort() {
                     let rt = tokio::runtime::Handle::current();
                     let _ = rt.block_on(writer.abort());
                 }

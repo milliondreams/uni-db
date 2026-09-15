@@ -118,6 +118,78 @@ fn verify_key_columns_are_vids(
     Ok(())
 }
 
+/// Narrows a composite negation key to the components an identity join can
+/// actually compare.
+///
+/// The key joins on node identity: every component is a `UInt64` VID on both
+/// sides, and both key builders below skip any negated fact whose key columns
+/// are not. A `TO` target that lands on a **scalar** column of the negated rule
+/// — a FOLD output, an ALONG accumulation, a projected property — therefore
+/// invalidated *every* fact, leaving the banned set (or the probability map)
+/// empty, and the "nothing to exclude" fast path then handed back every body
+/// row. That is the same laundering of "we could not compare this" into
+/// "nothing was excluded" that [`resolve_key_indices`] exists to prevent,
+/// re-entering through the column's *type* rather than through a missing name.
+///
+/// Such a component is dropped rather than compared, because an unbound `TO`
+/// target is existentially quantified: `b IS NOT stake TO agg` reads "no
+/// `stake` fact for `b`, whatever `agg` is", which is exactly the key without
+/// that component. When the body *does* bind the column the variable is not
+/// existential, the composite key cannot express value equality over it, and
+/// dropping it would over-exclude — so that case is an error instead.
+///
+/// Subjects are node variables by compile-time check
+/// (`LocyCompileError::IsNotSubjectNotANode`), so a key cannot narrow to
+/// nothing in practice; an empty result would ban every row, and is rejected.
+fn identity_join_cols(
+    body: Option<&RecordBatch>,
+    neg_facts: &[RecordBatch],
+    join_cols: &[(String, String)],
+) -> datafusion::error::Result<Vec<(String, String)>> {
+    use arrow_schema::DataType;
+
+    let Some(neg) = neg_facts.first() else {
+        return Ok(join_cols.to_vec());
+    };
+    let neg_schema = neg.schema();
+
+    let mut kept: Vec<(String, String)> = Vec::with_capacity(join_cols.len());
+    let mut dropped: Vec<&str> = Vec::new();
+    for (left, right) in join_cols {
+        // An absent column is `resolve_key_indices`'s diagnostic to report, not
+        // this one's — keep the component so it reaches that error.
+        let Ok(right_idx) = neg_schema.index_of(right) else {
+            kept.push((left.clone(), right.clone()));
+            continue;
+        };
+        let right_type = neg_schema.field(right_idx).data_type();
+        if *right_type == DataType::UInt64 {
+            kept.push((left.clone(), right.clone()));
+            continue;
+        }
+        if body.is_some_and(|b| b.schema().index_of(left).is_ok()) {
+            return Err(datafusion::error::DataFusionError::Plan(format!(
+                "Locy `IS NOT` cannot compare `TO` target `{left}`: it is bound by \
+                 the rule's body and the negated rule yields it as {right_type:?}, not a node \
+                 id. Negation keys join on node identity, so a bound scalar target \
+                 cannot be matched by value. Bind the target to a node column of the \
+                 negated rule, or drop `TO {left}` to negate on the subject alone."
+            )));
+        }
+        dropped.push(left.as_str());
+    }
+
+    if kept.is_empty() {
+        return Err(datafusion::error::DataFusionError::Plan(format!(
+            "Locy `IS NOT` has no node-identity column left to join on after \
+             dropping existentially-quantified scalar target(s) [{}]. An empty \
+             composite key matches every row, which would exclude the entire body.",
+            dropped.join(", ")
+        )));
+    }
+    Ok(kept)
+}
+
 /// Drops the hidden `IS NOT` subject-`_vid` columns after the anti-join has run.
 ///
 /// The planner projects `{var}._vid` under a reserved name so the anti-join can
@@ -226,6 +298,8 @@ pub fn apply_prob_complement_composite(
 ) -> datafusion::error::Result<Vec<RecordBatch>> {
     use arrow_array::{Array as _, Float64Array, UInt64Array};
 
+    let join_cols = &identity_join_cols(batches.first(), neg_facts, join_cols)?;
+
     // Build composite-key → probability lookup from negative facts.
     let mut prob_map: HashMap<Vec<u64>, f64> = HashMap::new();
     for batch in neg_facts {
@@ -333,6 +407,8 @@ pub fn apply_anti_join_composite(
 ) -> datafusion::error::Result<Vec<RecordBatch>> {
     use arrow::compute::filter_record_batch;
     use arrow_array::{Array as _, BooleanArray, UInt64Array};
+
+    let join_cols = &identity_join_cols(batches.first(), neg_facts, join_cols)?;
 
     // Collect composite keys from the negated rule's derived facts.
     let mut banned: HashSet<Vec<u64>> = HashSet::new();

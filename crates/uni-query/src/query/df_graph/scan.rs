@@ -1277,6 +1277,103 @@ pub(crate) async fn hydrate_vids_columnar(
     properties: &[String],
     vids: &[Vid],
 ) -> DFResult<Vec<ArrayRef>> {
+    prefetch_vids_columnar(graph_ctx, label, variable, properties, vids)
+        .await?
+        .gather(vids)
+}
+
+/// Target property columns read once, ready to gather by vid.
+///
+/// Splitting the read from the gather is what lets a traversal pay the storage
+/// cost for its whole expansion set at once, in `_vid` order, and then serve
+/// each output chunk from the result -- see [`prefetch_vids_columnar`].
+pub(crate) struct PrefetchedProps {
+    row_of: HashMap<u64, u32>,
+    columns: Vec<ArrayRef>,
+}
+
+impl PrefetchedProps {
+    /// Gather one output column per requested property, one row per vid.
+    ///
+    /// A vid with no row (deleted, or not of this label) gathers as null, which
+    /// is what the per-chunk read did for the same case.
+    pub(crate) fn gather(&self, vids: &[Vid]) -> DFResult<Vec<ArrayRef>> {
+        let indices: arrow_array::UInt32Array = vids
+            .iter()
+            .map(|vid| self.row_of.get(&vid.as_u64()).copied())
+            .collect::<Vec<Option<u32>>>()
+            .into();
+        let mut out = Vec::with_capacity(self.columns.len());
+        for col in &self.columns {
+            out.push(arrow::compute::take(col.as_ref(), &indices, None).map_err(arrow_err)?);
+        }
+        Ok(out)
+    }
+}
+
+/// Read property columns for targets that span several labels.
+///
+/// Each group is read columnar from its own label's table -- typed, and key-local
+/// because the vids are sorted -- and the groups are then concatenated into one
+/// [`PrefetchedProps`], which gathers exactly as the single-label one does,
+/// including yielding null for a vid no group returned.
+///
+/// The caller must have established that every label here declares every
+/// requested property at the same type (see `uniform_target_schema_props`);
+/// otherwise the concatenation below has nothing well-typed to produce.
+///
+/// # Errors
+///
+/// Propagates each group's read, and fails if the groups disagree on a column
+/// type after all -- which would mean the uniformity check and the schema have
+/// drifted apart.
+pub(crate) async fn prefetch_vids_columnar_grouped(
+    graph_ctx: &GraphExecutionContext,
+    variable: &str,
+    properties: &[String],
+    groups: &[(String, Vec<Vid>)],
+) -> DFResult<PrefetchedProps> {
+    let mut row_of: HashMap<u64, u32> = HashMap::new();
+    let mut per_group: Vec<Vec<ArrayRef>> = Vec::with_capacity(groups.len());
+    let mut offset: u32 = 0;
+
+    for (label, vids) in groups {
+        let group = prefetch_vids_columnar(graph_ctx, label, variable, properties, vids).await?;
+        let rows = group
+            .columns
+            .first()
+            .map_or(0, |c| u32::try_from(c.len()).unwrap_or(u32::MAX));
+        for (vid, row) in &group.row_of {
+            row_of.insert(*vid, row.saturating_add(offset));
+        }
+        offset = offset.saturating_add(rows);
+        per_group.push(group.columns);
+    }
+
+    let mut columns = Vec::with_capacity(properties.len());
+    for idx in 0..properties.len() {
+        let arrays: Vec<&dyn arrow_array::Array> = per_group
+            .iter()
+            .filter_map(|g| g.get(idx).map(|c| c.as_ref()))
+            .collect();
+        columns.push(arrow::compute::concat(&arrays).map_err(arrow_err)?);
+    }
+
+    Ok(PrefetchedProps { row_of, columns })
+}
+
+/// Read the property columns for `vids`, fetching in `_vid` order.
+///
+/// # Errors
+///
+/// Propagates the storage read, and fails if the scan returns no `_vid` column.
+pub(crate) async fn prefetch_vids_columnar(
+    graph_ctx: &GraphExecutionContext,
+    label: &str,
+    variable: &str,
+    properties: &[String],
+    vids: &[Vid],
+) -> DFResult<PrefetchedProps> {
     let uni_schema = graph_ctx.storage().schema_manager().schema();
     let output_schema =
         GraphScanExec::build_vertex_schema(variable, label, properties, &uni_schema);
@@ -1309,18 +1406,56 @@ pub(crate) async fn hydrate_vids_columnar(
     };
     let pays = target_rows > 0 && raw.len().saturating_mul(DEDUP_TABLE_RATIO) >= target_rows;
     let deduped = pays.then(|| dedup_targets(&raw));
-    let fetch_vids: &[u64] = deduped.as_deref().unwrap_or(&raw);
+    let unsorted: &[u64] = deduped.as_deref().unwrap_or(&raw);
+
+    // Fetch in key order, so each chunk below covers a narrow `_vid` range.
+    //
+    // A `_vid IN (...)` lookup costs the *span* it straddles -- the distance
+    // from its smallest key to its largest -- not the number of vids it asks
+    // for. Measured on LDBC SF1's 3.06M-row `vertices_Message`, 8192 vids per
+    // scan in every arm, only the span varied:
+    //
+    // | span      | index_comparisons | ms  |
+    // |-----------|-------------------|-----|
+    // | 8 192     | 12 288            | 137 |
+    // | 65 536    | 69 632            | 154 |
+    // | 524 288   | 528 384           | 335 |
+    // | 2 000 000 | 2 002 944         | 886 |
+    //
+    // Comparisons track the span to within one 4096-entry page. Traversal
+    // emits targets in visit order, scattered across the whole table, so
+    // chunking them as they arrive gave *every* chunk the full span: 51 chunks
+    // x ~2.4M = 123M comparisons to read one property off 416k rows, 48 s.
+    // Sorting first gives each chunk its own ~1/51 slice of the key space.
+    //
+    // Sorting *within* a chunk is not what pays and was measured too: the same
+    // scattered 8192 vids sorted and shuffled both cost 2 899 968 comparisons,
+    // identical. The list has to be ordered before it is cut, not after.
+    //
+    // Correctness does not depend on the order: the gather below gathers by
+    // `raw` against a vid-keyed row map, so the output stays one row per
+    // request in request order however the fetch was sequenced.
+    let sorted = (unsorted.len() > 1).then(|| {
+        let mut v = unsorted.to_vec();
+        v.sort_unstable();
+        v
+    });
+    let fetch_vids: &[u64] = sorted.as_deref().unwrap_or(unsorted);
 
     // Chunk the vid list, bounding how much is resident at once.
     //
-    // The `_vid` index is used either way, and the index work itself does not
-    // scale with the table: `index_comparisons` is ~1 per requested vid and
-    // barely moves when the table grows 5x (60,000 -> 61,440). What scales is
-    // what happens *after* the lookup — the matching rows are scattered across
-    // proportionally more pages in a larger table, and unchunked they are all
-    // materialised at once. Chunking caps the peak at one chunk's worth:
-    // 60,000 vids read from a 300k-row table went from 815 MiB to 226 MiB,
-    // and stopped tracking the table's size.
+    // The `_vid` index is used either way. The index work costs the span each
+    // chunk straddles, which is why the list is sorted above: "~1 comparison
+    // per requested vid", as this comment used to claim, holds only for a
+    // dense list and was measured on one. A scattered chunk pays its whole
+    // range -- 8192 vids spread over 2M keys cost 2 002 944 comparisons, the
+    // same 8192 vids packed together cost 12 288.
+    //
+    // What chunking itself bounds is what happens *after* the lookup -- the
+    // matching rows are scattered across proportionally more pages in a larger
+    // table, and unchunked they are all materialised at once. Chunking caps the
+    // peak at one chunk's worth: 60,000 vids read from a 300k-row table went
+    // from 815 MiB to 226 MiB, and stopped tracking the table's size.
     //
     // `VidLookupJoinExec` already chunks this exact shape at the same constant.
     //
@@ -1395,20 +1530,12 @@ pub(crate) async fn hydrate_vids_columnar(
             row_of.insert(vid_col.value(row), row as u32);
         }
     }
-    let indices: arrow_array::UInt32Array = raw
-        .iter()
-        .map(|vid| row_of.get(vid).copied())
-        .collect::<Vec<Option<u32>>>()
-        .into();
-
     // Skip `_vid`/`_labels`; the caller wants the property columns only, in the
     // order it asked for them.
-    let mut columns = Vec::with_capacity(properties.len());
-    for (idx, _) in properties.iter().enumerate() {
-        let col = batch.column(idx + 2);
-        columns.push(arrow::compute::take(col.as_ref(), &indices, None).map_err(arrow_err)?);
-    }
-    Ok(columns)
+    let columns = (0..properties.len())
+        .map(|idx| Arc::clone(batch.column(idx + 2)))
+        .collect();
+    Ok(PrefetchedProps { row_of, columns })
 }
 
 #[expect(clippy::too_many_arguments)]

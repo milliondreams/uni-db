@@ -418,6 +418,19 @@ jobs:
             tests/test_plugin_conformance.py \
             tests/test_stub_drift.py -v
 
+      # Same stubtest gate as pr.yml, but against the feature build -- this is
+      # the only lane where `load_wasm_component` / `load_wasm_extism` actually
+      # exist, so it is the only place their stub signatures are ever checked.
+      - name: Check stub against built module (stubtest, wasm features)
+        working-directory: bindings/uni-db
+        run: |
+          uv run python -m mypy.stubtest uni_db \
+            --mypy-config-file stubtest-mypy.ini \
+            --allowlist stubtest-allowlist.txt \
+            --ignore-unused-allowlist \
+            --ignore-positional-only \
+            --ignore-disjoint-bases
+
   # Release-path guards. Feature drift (a wheel variant missing a plugin feature)
   # and an incomplete crates.io publish list slip through the workspace build and
   # only fail at release time; these reproduce both failure modes cheaply.

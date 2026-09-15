@@ -820,6 +820,28 @@ jobs:
         working-directory: bindings/uni-db
         run: uv run pytest tests/ -v -n auto
 
+      # `stubtest` imports the compiled extension and diffs `__init__.pyi`
+      # against it, signatures included. `tests/test_stub_drift.py` checks the
+      # same four directions but builds its stub surface from `ast.ClassDef`
+      # nodes only, so a module-level alias falls outside what it compares --
+      # which is how `PreparedQuery = PyPreparedQuery`, an alias that never
+      # existed at runtime, passed it while `from uni_db import PreparedQuery`
+      # raised ImportError. The two are complementary: keep both.
+      #
+      # `--ignore-unused-allowlist` is required, not cosmetic: ci.yml's
+      # `python-wasm-tests` runs this same allowlist against a
+      # `--features wasm-plugins,extism-plugins` build, where the four
+      # cfg'd-out wasm entries below are present and so go unused.
+      - name: Check stub against built module (stubtest, uni-db)
+        working-directory: bindings/uni-db
+        run: |
+          uv run python -m mypy.stubtest uni_db \
+            --mypy-config-file stubtest-mypy.ini \
+            --allowlist stubtest-allowlist.txt \
+            --ignore-unused-allowlist \
+            --ignore-positional-only \
+            --ignore-disjoint-bases
+
       # The `uni-plugin-pyo3` Rust tests only exist under `--features pyo3`, and
       # every one of its source files is `#![cfg(feature = "pyo3")]`. The
       # workspace run above uses default features (none), and the `uni-python*`

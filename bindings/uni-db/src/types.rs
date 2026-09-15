@@ -1600,7 +1600,12 @@ impl PyCommitResult {
 // ============================================================================
 
 /// A prepared Cypher query that can be executed multiple times with different parameters.
-#[pyclass]
+// `name` is load-bearing: without it PyO3 exports the Rust identifier, so the
+// class reached Python as `PyPreparedQuery` — the only `Py`-prefixed name in
+// the module. The `Py` prefix exists to avoid colliding with the wrapped
+// `uni_db::PreparedQuery`, not to be user-visible; the sibling binder below
+// already spells its name out.
+#[pyclass(name = "PreparedQuery")]
 pub struct PyPreparedQuery {
     // Shared, lock-free handle. `PreparedQuery` is `Send + Sync` with its own
     // internal `RwLock`, so an outer `Mutex` is unnecessary — and holding a

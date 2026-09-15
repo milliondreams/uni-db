@@ -242,6 +242,14 @@ impl BatchFootprint {
             .sum()
     }
 
+    /// Bytes these columns add beyond everything already counted.
+    ///
+    /// The batch-shaped [`add`](Self::add) with the batch taken apart, for
+    /// columns held on their own rather than inside a `RecordBatch`.
+    pub(crate) fn add_arrays(&mut self, arrays: &[ArrayRef]) -> usize {
+        arrays.iter().map(|c| self.add_data(&c.to_data())).sum()
+    }
+
     fn add_data(&mut self, data: &arrow::array::ArrayData) -> usize {
         let mut bytes = 0;
         for buf in data.buffers() {

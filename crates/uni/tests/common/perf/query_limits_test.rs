@@ -2295,3 +2295,92 @@ async fn an_unwind_accounts_for_the_list_it_is_expanding() -> Result<()> {
     );
     Ok(())
 }
+
+/// A traversal reserves the target read it shares across its output chunks.
+///
+/// Hydration reads the whole expansion set once, in `_vid` order, so that each
+/// `_vid IN (...)` scan covers a narrow key range instead of the whole table.
+/// That read then stays resident for the entire chunking loop while the chunks
+/// gather from it -- a second thing the traversal holds, beside the expansion
+/// set and input it already reserved, and the pool has to see it.
+///
+/// **The expansion set must exceed one output slice**, or the traversal takes
+/// its single-batch arm, hydrates once inside one call, and there is no shared
+/// read to charge for. Hence one hub with more edges than `batch_size`.
+///
+/// `count(t.name)`, not `t.name`: one row out, so the post-hoc result-size check
+/// cannot see this query and the only thing that can refuse it is the pool.
+///
+/// Like the scan's own reservation, this charge is taken after the read exists,
+/// so it bounds how long an over-budget result survives rather than preventing
+/// its construction.
+#[tokio::test]
+async fn a_traversal_reserves_the_target_read_it_shares() -> Result<()> {
+    const TARGETS: usize = 20_000;
+
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("Hub")
+        .property("id", uni_db::DataType::Int64)
+        .done()
+        .label("Leaf")
+        .property("name", uni_db::DataType::String)
+        .done()
+        .edge_type("TO", &["Hub"], &["Leaf"])
+        .apply()
+        .await?;
+
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("CREATE (:Hub {id: 0})").await?;
+    tx.execute(&format!(
+        "UNWIND range(0, {}) AS i CREATE (:Leaf {{name: \
+         'a-name-long-enough-that-twenty-thousand-of-them-are-megabytes-' + toString(i)}})",
+        TARGETS - 1
+    ))
+    .await?;
+    tx.commit().await?;
+
+    let tx = session.tx().await?;
+    tx.execute("MATCH (h:Hub), (l:Leaf) CREATE (h)-[:TO]->(l)")
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    let res = session
+        .query_with("MATCH (h:Hub)-[:TO]->(t:Leaf) RETURN count(t.name) AS c")
+        .max_memory(1024 * 1024)
+        .fetch_all()
+        .await;
+
+    match res {
+        Err(e) => {
+            let msg = e.to_string();
+            // Naming the operator is what makes this discriminating: a message
+            // that merely mentions memory passes with the charge removed, since
+            // some other consumer refuses this query at a tight ceiling too.
+            assert!(
+                msg.contains("GraphTraverseExec"),
+                "the refusal must come from the traversal's own reservation, not \
+                 from some other limit that happens to reject this query: {msg}"
+            );
+        }
+        Ok(rows) => panic!(
+            "a 1 MiB ceiling accepted a traversal holding {TARGETS} hydrated \
+             targets (counted {:?}); the shared read is being held outside the \
+             pool again",
+            rows.rows()[0].values()[0]
+        ),
+    }
+
+    // The control: the same query, the same shared read, a ceiling that fits.
+    // Without it a charge that always refuses would pass the assertion above.
+    let ok = session
+        .query_with("MATCH (h:Hub)-[:TO]->(t:Leaf) RETURN count(t.name) AS c")
+        .max_memory(64 * 1024 * 1024)
+        .fetch_all()
+        .await?;
+    assert_eq!(ok.rows().len(), 1, "the control query must answer");
+
+    Ok(())
+}

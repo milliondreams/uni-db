@@ -1293,6 +1293,22 @@ pub(crate) struct PrefetchedProps {
 }
 
 impl PrefetchedProps {
+    /// Bytes this read holds, for the query pool.
+    ///
+    /// Counted per distinct allocation rather than by summing
+    /// `get_array_memory_size`, because the columns can be slices of one scan's
+    /// buffers and summing their parents' capacities charges the same
+    /// allocation once per column (#261).
+    pub(crate) fn memory_bytes(&self) -> usize {
+        let mut footprint = crate::query::df_graph::common::BatchFootprint::new();
+        let columns = footprint.add_arrays(&self.columns);
+        // The vid -> row map is the other half of what is held, and it is not
+        // Arrow-shaped: one entry per distinct vid read.
+        let index =
+            self.row_of.capacity() * (std::mem::size_of::<u64>() + std::mem::size_of::<u32>());
+        columns + index
+    }
+
     /// Gather one output column per requested property, one row per vid.
     ///
     /// A vid with no row (deleted, or not of this label) gathers as null, which

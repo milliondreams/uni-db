@@ -675,6 +675,8 @@ impl ExecutionPlan for GraphTraverseExec {
             .warming_future(self.edge_type_ids.clone(), self.direction);
 
         Ok(Box::pin(GraphTraverseStream {
+            held_base: 0,
+            prefetch_charged: false,
             target_props: None,
             target_props_map: None,
             target_label_candidates: self.target_label_candidates.clone().map(Arc::new),
@@ -825,6 +827,13 @@ struct GraphTraverseStream {
     ///
     /// `None` until the first chunk asks; reset per expansion set.
     target_props: Option<Arc<tokio::sync::OnceCell<PrefetchedProps>>>,
+
+    /// What the expansion set and its input reserved, before the shared target
+    /// read is added to it.
+    held_base: usize,
+
+    /// Whether the shared target read has been charged for this expansion set.
+    prefetch_charged: bool,
 
     /// Candidate labels for an unlabelled target, when the edge type's declared
     /// endpoints agree on every requested property's type.
@@ -1880,6 +1889,8 @@ impl Stream for GraphTraverseStream {
                                     self.state = TraverseStreamState::Done;
                                     return Poll::Ready(Some(Err(e)));
                                 }
+                                self.held_base = held;
+                                self.prefetch_charged = false;
                                 self.all_target_vids = Arc::new(
                                     expansions.iter().map(|(_, vid, _, _, _)| *vid).collect(),
                                 );
@@ -2015,6 +2026,26 @@ impl Stream for GraphTraverseStream {
                 } => match fut.as_mut().poll(cx) {
                     Poll::Ready(Ok(batch)) => {
                         self.metrics.record_output(batch.num_rows());
+                        // The first chunk fills the shared target read, which
+                        // then stays resident for the whole chunking loop -- so
+                        // it is charged here, once, on top of the expansion set
+                        // and input this arm already reserved.
+                        //
+                        // Like the scan's own reservation, this is taken after
+                        // the read exists, so it bounds how long an over-budget
+                        // result survives rather than preventing it. Bounding
+                        // construction would mean reading the expansion set in
+                        // windows, which is what trades the key locality away.
+                        if !self.prefetch_charged
+                            && let Some(props) = self.target_props.as_ref().and_then(|c| c.get())
+                        {
+                            let held = self.held_base.saturating_add(props.memory_bytes());
+                            if let Err(e) = self.reservation.try_resize(held) {
+                                self.state = TraverseStreamState::Done;
+                                return Poll::Ready(Some(Err(e)));
+                            }
+                            self.prefetch_charged = true;
+                        }
                         self.state = TraverseStreamState::Chunking {
                             input,
                             expansions,

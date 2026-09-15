@@ -20,6 +20,7 @@ use uni_common::Value;
 use uni_common::core::id::{Eid, Vid};
 use uni_common::core::schema::Schema as UniSchema;
 use uni_cypher::ast::{BinaryOp, CypherLiteral, Expr};
+use uni_store::storage::direction::Direction;
 use uni_store::storage::manager::StorageManager;
 
 use super::GraphExecutionContext;
@@ -2047,6 +2048,97 @@ pub(crate) fn evaluate_simple_expr(
 /// resolves conflicts: if two types define the same property with different
 /// data types, the merged type widens to `CypherValue`. Nullability is merged
 /// with OR (if either is nullable, the result is nullable).
+/// Target-vertex property types a traversal can rely on without a target label.
+///
+/// The planner collapses a multi-label edge endpoint to "no label", which left
+/// the target's properties untyped (`LargeBinary`) and so read through the
+/// per-vertex map path. But the edge type *declares* its endpoints, so the
+/// candidate labels are known even when the pattern names none -- the same
+/// source the unlabelled-source narrowing draws on, read from the other end.
+///
+/// Returns the candidate labels and their merged property metadata, and only
+/// when every candidate declares every requested property at the same type.
+/// Anything less returns `None` and leaves the caller on the untyped path:
+/// a label that lacks the column cannot be scanned for it (the read fails with
+/// `No field named ...`), and two labels that disagree on its type cannot share
+/// one Arrow column. Being wrong here yields a silently absent value rather than
+/// an error, so the bar is unanimity, not a best guess.
+pub fn uniform_target_schema_props(
+    uni_schema: &UniSchema,
+    edge_type_ids: &[u32],
+    direction: Direction,
+    target_properties: &[String],
+) -> Option<(
+    Vec<String>,
+    HashMap<String, uni_common::core::schema::PropertyMeta>,
+)> {
+    // `_all_props` is a whole-entity request with no columnar form.
+    if target_properties.is_empty() || target_properties.iter().any(|p| p == "_all_props") {
+        return None;
+    }
+
+    let mut labels: Vec<String> = Vec::new();
+    let mut sorted_ids = edge_type_ids.to_vec();
+    sorted_ids.sort_unstable();
+    for edge_type_id in sorted_ids {
+        let name = uni_schema.edge_type_name_by_id_unified(edge_type_id)?;
+        let meta = uni_schema.edge_types.get(name.as_str())?;
+        // Traversing outgoing lands on the declared destination, incoming on the
+        // declared source; an undirected hop can land on either.
+        let sides: &[&Vec<String>] = match direction {
+            Direction::Outgoing => &[&meta.dst_labels],
+            Direction::Incoming => &[&meta.src_labels],
+            Direction::Both => &[&meta.src_labels, &meta.dst_labels],
+        };
+        for side in sides {
+            if side.is_empty() {
+                // An undeclared endpoint means the target could be anything.
+                return None;
+            }
+            labels.extend(side.iter().cloned());
+        }
+    }
+    labels.sort_unstable();
+    labels.dedup();
+    if labels.is_empty() {
+        return None;
+    }
+
+    let merged = merged_label_props(uni_schema, &labels, target_properties)?;
+    Some((labels, merged))
+}
+
+/// Merge the given labels' metadata for the given properties, when they agree.
+///
+/// `None` unless every label declares every property at the same type -- the
+/// same bar [`uniform_target_schema_props`] applies, exposed separately so the
+/// read path can resolve the very types the schema was built from. The two must
+/// not drift: a column typed one way and produced another fails the batch.
+pub fn merged_label_props(
+    uni_schema: &UniSchema,
+    labels: &[String],
+    properties: &[String],
+) -> Option<HashMap<String, uni_common::core::schema::PropertyMeta>> {
+    let mut merged: HashMap<String, uni_common::core::schema::PropertyMeta> = HashMap::new();
+    for prop in properties {
+        let mut agreed: Option<uni_common::core::schema::PropertyMeta> = None;
+        for label in labels {
+            let meta = uni_schema.properties.get(label.as_str())?.get(prop)?;
+            match &mut agreed {
+                Some(acc) => {
+                    if acc.r#type != meta.r#type {
+                        return None;
+                    }
+                    acc.nullable |= meta.nullable;
+                }
+                None => agreed = Some(meta.clone()),
+            }
+        }
+        merged.insert(prop.clone(), agreed?);
+    }
+    Some(merged)
+}
+
 pub fn merged_edge_schema_props(
     uni_schema: &UniSchema,
     edge_type_ids: &[u32],

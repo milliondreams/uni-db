@@ -42,7 +42,7 @@ use crate::query::df_graph::nfa::{
 };
 use crate::query::df_graph::pred_dag::PredecessorDag;
 use crate::query::df_graph::scan::{
-    build_property_column_static, property_field, resolve_property_type,
+    PrefetchedProps, build_property_column_static, property_field, resolve_property_type,
 };
 use crate::query::planner::COL_FWD;
 use arrow::compute::take;
@@ -368,6 +368,13 @@ pub struct GraphTraverseExec {
     /// Optional target label filter.
     target_label_id: Option<u16>,
 
+    /// Labels an unlabelled target can carry, taken from the edge type's
+    /// declared endpoints when they agree on every requested property's type.
+    ///
+    /// `Some` is what lets the unlabelled target be read columnar per label
+    /// group rather than through the per-vertex map path.
+    target_label_candidates: Option<Vec<String>>,
+
     /// Graph execution context.
     graph_ctx: Arc<GraphExecutionContext>,
 
@@ -447,9 +454,25 @@ impl GraphTraverseExec {
 
         // Resolve target property Arrow types from the schema
         let uni_schema = graph_ctx.storage().schema_manager().schema();
-        let label_props = target_label_name
-            .as_deref()
-            .and_then(|ln| uni_schema.properties.get(ln));
+        // With no target label the endpoint is still declared by the edge type,
+        // so the target's properties can be typed from the candidate labels and
+        // read columnar instead of through the per-vertex map path.
+        let uniform_target = if target_label_name.is_none() {
+            crate::query::df_graph::common::uniform_target_schema_props(
+                &uni_schema,
+                &edge_type_ids,
+                direction,
+                &target_properties,
+            )
+        } else {
+            None
+        };
+        let target_label_candidates = uniform_target.as_ref().map(|(labels, _)| labels.clone());
+        let label_props = match (target_label_name.as_deref(), uniform_target.as_ref()) {
+            (Some(ln), _) => uni_schema.properties.get(ln),
+            (None, Some((_, merged))) => Some(merged),
+            (None, None) => None,
+        };
         let merged_edge_props = merged_edge_schema_props(&uni_schema, &edge_type_ids);
         let edge_props = if merged_edge_props.is_empty() {
             None
@@ -482,6 +505,7 @@ impl GraphTraverseExec {
             target_properties,
             target_label_name,
             target_label_id,
+            target_label_candidates,
             graph_ctx,
             optional,
             optional_pattern_vars,
@@ -651,6 +675,10 @@ impl ExecutionPlan for GraphTraverseExec {
             .warming_future(self.edge_type_ids.clone(), self.direction);
 
         Ok(Box::pin(GraphTraverseStream {
+            target_props: None,
+            target_props_map: None,
+            target_label_candidates: self.target_label_candidates.clone().map(Arc::new),
+            all_target_vids: Arc::new(Vec::new()),
             reservation,
             slice_size,
             input: input_stream,
@@ -728,6 +756,9 @@ enum TraverseStreamState {
 }
 
 /// Stream that performs single-hop traversal with async property materialization.
+/// Vertex properties keyed by vid, the shape an unlabelled target read returns.
+type TargetPropsMap = HashMap<Vid, HashMap<String, uni_common::Value>>;
+
 struct GraphTraverseStream {
     /// Rows per emitted slice, from the session's `batch_size`.
     slice_size: usize,
@@ -783,6 +814,32 @@ struct GraphTraverseStream {
 
     /// Metrics.
     metrics: BaselineMetrics,
+
+    /// Target properties for the current expansion set, read once in key order.
+    ///
+    /// A `_vid IN (...)` lookup costs the span it straddles, so reading each
+    /// output chunk's targets separately made every chunk pay the whole table:
+    /// targets arrive in visit order, scattered. Reading the expansion set's
+    /// targets once, sorted, and gathering each chunk from the result keeps the
+    /// emitted batches chunked while the storage read stays key-local.
+    ///
+    /// `None` until the first chunk asks; reset per expansion set.
+    target_props: Option<Arc<tokio::sync::OnceCell<PrefetchedProps>>>,
+
+    /// Candidate labels for an unlabelled target, when the edge type's declared
+    /// endpoints agree on every requested property's type.
+    target_label_candidates: Option<Arc<Vec<String>>>,
+
+    /// The same, for an unlabelled target, whose read is map-shaped.
+    ///
+    /// An unlabelled target is not exotic: the planner collapses a multi-label
+    /// edge endpoint to "no label", and that read fans out across candidate
+    /// label tables, so paying it per chunk costs more than the labelled path
+    /// ever did -- 246M index comparisons against 3.2M for the same 416k rows.
+    target_props_map: Option<Arc<tokio::sync::OnceCell<TargetPropsMap>>>,
+
+    /// Every target vid of the current expansion set, in visit order.
+    all_target_vids: Arc<Vec<Vid>>,
 
     /// The query pool's accounting for what this traversal materializes.
     ///
@@ -943,6 +1000,64 @@ impl GraphTraverseStream {
 /// Lance storage (after a flush or on a fork) are not dropped. A vertex absent
 /// from both falls back to `target_label_name` — the schema label that scoped
 /// the traversal, which storage already filtered to — or an empty set.
+/// The Arrow type an unlabelled target's property column must carry.
+///
+/// Mirrors what `GraphTraverseExec::build_schema` resolved from the candidate
+/// labels, so the untyped read path fills the same column shape the typed one
+/// would. Falls back to `LargeBinary` exactly when the schema did.
+fn fallback_prop_type(
+    prop_name: &str,
+    label_candidates: Option<&[String]>,
+    graph_ctx: &GraphExecutionContext,
+) -> arrow::datatypes::DataType {
+    let uni_schema = graph_ctx.storage().schema_manager().schema();
+    label_candidates
+        .and_then(|labels| {
+            crate::query::df_graph::common::merged_label_props(
+                &uni_schema,
+                labels,
+                std::slice::from_ref(&prop_name.to_string()),
+            )
+        })
+        .map_or(arrow::datatypes::DataType::LargeBinary, |merged| {
+            uni_store::runtime::columnar_scan::resolve_property_type(prop_name, Some(&merged))
+        })
+}
+
+/// Group target vids by which candidate label each one carries.
+///
+/// Returns `None` if any vid resolves to none of the candidates, which sends the
+/// caller back to the untyped map path rather than reading a vertex from a table
+/// that may not hold its column -- that failure is a silently absent value, not
+/// an error. Groups come out sorted by vid, which is what makes each group's
+/// read a narrow `_vid` range.
+fn group_targets_by_label(
+    all_target_vids: &[Vid],
+    candidates: &[String],
+    graph_ctx: &GraphExecutionContext,
+) -> Option<Vec<(String, Vec<Vid>)>> {
+    let query_ctx = graph_ctx.query_context();
+    let mut distinct: Vec<Vid> = all_target_vids.to_vec();
+    distinct.sort_unstable();
+    distinct.dedup();
+
+    let mut groups: HashMap<&str, Vec<Vid>> = HashMap::new();
+    for vid in distinct {
+        let labels = graph_ctx.resolve_vertex_labels(vid, &query_ctx)?;
+        // First candidate the vertex carries, in the candidates' own order, so a
+        // multi-label vertex always lands in the same group.
+        let chosen = candidates.iter().find(|c| labels.iter().any(|l| l == *c))?;
+        groups.entry(chosen.as_str()).or_default().push(vid);
+    }
+
+    let mut out: Vec<(String, Vec<Vid>)> = groups
+        .into_iter()
+        .map(|(label, vids)| (label.to_string(), vids))
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Some(out)
+}
+
 fn resolve_output_labels(
     vid: Vid,
     target_label_name: &Option<String>,
@@ -1016,11 +1131,25 @@ fn build_target_labels_column_opt(
 }
 
 /// Build target vertex property columns from storage and L0.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Hydration needs the targets, what to read, and the two prefetch handles"
+)]
 async fn build_target_property_columns(
     target_vids: &[Vid],
     target_properties: &[String],
     target_label_name: &Option<String>,
     graph_ctx: &Arc<GraphExecutionContext>,
+    // Filled once per expansion set, shared by every chunk cut from it.
+    prefetch: Option<&tokio::sync::OnceCell<PrefetchedProps>>,
+    // The unlabelled read's equivalent, keyed by vid rather than by row.
+    prefetch_map: Option<&tokio::sync::OnceCell<TargetPropsMap>>,
+    // Labels the unlabelled target can carry, when they are known well enough
+    // to read it columnar per group.
+    label_candidates: Option<&[String]>,
+    // The whole expansion set's targets, which is what makes the read key-local
+    // where `target_vids` alone is one scattered slice of it.
+    all_target_vids: &[Vid],
 ) -> DFResult<Vec<ArrayRef>> {
     let mut columns = Vec::new();
 
@@ -1030,6 +1159,20 @@ async fn build_target_property_columns(
         // columns and never becomes a per-row map (#209).
         let wants_all = target_properties.iter().any(|p| p == "_all_props");
         if !wants_all {
+            if let Some(cell) = prefetch {
+                let props = cell
+                    .get_or_try_init(|| {
+                        crate::query::df_graph::scan::prefetch_vids_columnar(
+                            graph_ctx,
+                            label_name,
+                            "t",
+                            target_properties,
+                            all_target_vids,
+                        )
+                    })
+                    .await?;
+                return props.gather(target_vids);
+            }
             return crate::query::df_graph::scan::hydrate_vids_columnar(
                 graph_ctx,
                 label_name,
@@ -1082,6 +1225,29 @@ async fn build_target_property_columns(
         // sentinel straight through — that was the issue #135 fix, which reached
         // `GraphTraverseMainStream` and not this stream.
         let wants_all = target_properties.iter().any(|p| p == "_all_props");
+
+        // Read the unlabelled target columnar when the edge type's declared
+        // endpoints pin its type. Grouping by the vertex's own label keeps each
+        // group's read on the table that actually holds the column, and the
+        // whole expansion set is read at once so each group's vids form a sorted
+        // key range rather than a scatter.
+        if !wants_all
+            && let (Some(candidates), Some(cell)) = (label_candidates, prefetch)
+            && let Some(groups) = group_targets_by_label(all_target_vids, candidates, graph_ctx)
+        {
+            let props = cell
+                .get_or_try_init(|| {
+                    crate::query::df_graph::scan::prefetch_vids_columnar_grouped(
+                        graph_ctx,
+                        "t",
+                        target_properties,
+                        &groups,
+                    )
+                })
+                .await?;
+            return props.gather(target_vids);
+        }
+
         let requested: Vec<&str> = if wants_all {
             // The wildcard subsumes any individually-named properties.
             vec!["_all_props"]
@@ -1091,26 +1257,42 @@ async fn build_target_property_columns(
         let property_manager = graph_ctx.property_manager();
         let query_ctx = graph_ctx.query_context();
 
-        let props_map = if !requested.is_empty() {
-            property_manager
+        // Read the whole expansion set once, in vid order, and serve every
+        // chunk from it. Chunk-at-a-time this read pays its span per candidate
+        // label table, which is what left IC3's unlabelled `message` at 93 s
+        // where the same query labelled runs in 4 s.
+        let fetched;
+        let props_map: &TargetPropsMap = if requested.is_empty() {
+            fetched = TargetPropsMap::new();
+            &fetched
+        } else {
+            // Reading the whole expansion set here was tried and measured
+            // WORSE: 155 scans and 246M comparisons became 5 and 6.1M, and the
+            // query went 92.9 s -> 140.5/142.6 s. This read returns a
+            // `HashMap<String, Value>` per vertex, so hydrating 416k targets at
+            // once trades the span win for 416k map allocations -- the per-row
+            // map cost the columnar path exists to avoid (#209). Locality has
+            // to come with columnar materialisation here, not instead of it.
+            let _ = prefetch_map;
+            fetched = property_manager
                 .get_batch_vertex_props(target_vids, &requested, Some(&query_ctx))
                 .await
-                .map_err(exec_err)?
-        } else {
-            std::collections::HashMap::new()
+                .map_err(exec_err)?;
+            &fetched
         };
 
         for prop_name in target_properties {
             if prop_name == "_all_props" {
-                columns.push(build_all_props_column(target_vids, &props_map, graph_ctx));
+                columns.push(build_all_props_column(target_vids, props_map, graph_ctx));
             } else {
-                let column = build_property_column_static(
-                    target_vids,
-                    &props_map,
-                    prop_name,
-                    &arrow::datatypes::DataType::LargeBinary,
-                )
-                .map_err(exec_err)?;
+                // The schema types this column from the candidate labels when
+                // they agree, so the fallback has to produce that same type --
+                // emitting `LargeBinary` under an `Int64` field fails the batch
+                // with "column types must match schema types".
+                let data_type = fallback_prop_type(prop_name, label_candidates, graph_ctx);
+                let column =
+                    build_property_column_static(target_vids, props_map, prop_name, &data_type)
+                        .map_err(exec_err)?;
                 columns.push(column);
             }
         }
@@ -1349,6 +1531,10 @@ async fn build_traverse_output_batch(
     graph_ctx: Arc<GraphExecutionContext>,
     optional: bool,
     optional_pattern_vars: HashSet<String>,
+    target_props: Option<Arc<tokio::sync::OnceCell<PrefetchedProps>>>,
+    target_props_map: Option<Arc<tokio::sync::OnceCell<TargetPropsMap>>>,
+    target_label_candidates: Option<Arc<Vec<String>>>,
+    all_target_vids: Arc<Vec<Vid>>,
 ) -> DFResult<RecordBatch> {
     if expansions.is_empty()
         && let Some(batch) =
@@ -1388,6 +1574,10 @@ async fn build_traverse_output_batch(
             &target_properties,
             &target_label_name,
             &graph_ctx,
+            target_props.as_deref(),
+            target_props_map.as_deref(),
+            target_label_candidates.as_deref().map(Vec::as_slice),
+            &all_target_vids,
         )
         .await?;
         columns.extend(prop_cols);
@@ -1690,6 +1880,12 @@ impl Stream for GraphTraverseStream {
                                     self.state = TraverseStreamState::Done;
                                     return Poll::Ready(Some(Err(e)));
                                 }
+                                self.all_target_vids = Arc::new(
+                                    expansions.iter().map(|(_, vid, _, _, _)| *vid).collect(),
+                                );
+                                self.target_props = Some(Arc::new(tokio::sync::OnceCell::new()));
+                                self.target_props_map =
+                                    Some(Arc::new(tokio::sync::OnceCell::new()));
                                 self.state = TraverseStreamState::Chunking {
                                     input: batch,
                                     expansions,
@@ -1698,6 +1894,12 @@ impl Stream for GraphTraverseStream {
                                 continue;
                             }
 
+                            // This arm builds the whole batch in one call, so
+                            // the "whole expansion set" is simply its own
+                            // targets -- but it still has to take the same
+                            // typed read, because the schema was typed for it.
+                            let expansions_for_prefetch: Vec<Vid> =
+                                expansions.iter().map(|(_, vid, _, _, _)| *vid).collect();
                             let fut = build_traverse_output_batch(
                                 batch,
                                 expansions,
@@ -1710,6 +1912,10 @@ impl Stream for GraphTraverseStream {
                                 graph_ctx,
                                 optional,
                                 optional_pattern_vars,
+                                Some(Arc::new(tokio::sync::OnceCell::new())),
+                                Some(Arc::new(tokio::sync::OnceCell::new())),
+                                self.target_label_candidates.clone(),
+                                Arc::new(expansions_for_prefetch),
                             );
 
                             self.state = TraverseStreamState::Materializing(Box::pin(fut));
@@ -1788,6 +1994,10 @@ impl Stream for GraphTraverseStream {
                         self.graph_ctx.clone(),
                         self.optional,
                         self.optional_pattern_vars.clone(),
+                        self.target_props.clone(),
+                        self.target_props_map.clone(),
+                        self.target_label_candidates.clone(),
+                        Arc::clone(&self.all_target_vids),
                     );
                     self.state = TraverseStreamState::MaterializingChunk {
                         fut: Box::pin(fut),

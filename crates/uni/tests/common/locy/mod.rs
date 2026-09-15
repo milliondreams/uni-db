@@ -60,3 +60,5 @@ pub mod locy_debug_fallback_nondeterminism;
 pub mod locy_issue_216_in_three_valued_logic;
 pub mod locy_issue_267_node_key_scaling;
 pub mod locy_metrics_counters;
+// Issue #272: `IS <rule> TO <value column>` returns zero rows with no error.
+pub mod locy_issue_272_is_ref_to_value_column;

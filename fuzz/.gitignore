@@ -1,4 +1,15 @@
 target/
 artifacts/
 corpus/
-Cargo.lock
+
+# Cargo.lock is deliberately NOT ignored here, despite `cargo fuzz init`
+# generating it that way. This is a binary (fuzz-target) workspace, and it is
+# the only lane in the repo that does not ride the root Cargo.lock — an ignored
+# lock made it re-resolve the whole graph on every CI run, so an upstream
+# publish could turn the job red with no change on our side. That is exactly
+# what happened on 2026-09-14: aws-smithy-types 1.7.0 changed
+# `Document::Object` to take a `DocumentObject` and added a variant to a
+# `#[non_exhaustive]` enum, while aws-smithy-json 0.63.0 — which declares
+# `^1.6.1` and so admits it — still builds a HashMap. The fixed pair
+# (aws-smithy-json 0.64.0 via aws-sdk-sts 1.115.0) is unreachable because
+# aws-runtime 1.9.3 is yanked, so no fresh resolution of this graph compiles.

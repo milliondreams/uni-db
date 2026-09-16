@@ -174,7 +174,13 @@ criterion = "0.8"
 url = "2.5"
 proptest = "1.11"
 datafusion = "53.1.0"
-uni-xervo = { version = ">=0.17.0, <1.0.0", default-features = false }
+# Floor is 0.18.0, not 0.17.0: `crates/uni` enables `provider-llamacpp` in its
+# default features and that feature does not exist before 0.18.0. Our lock pins
+# 0.18.0 so the workspace never saw it, but the declared range advertised a
+# compatibility that does not hold -- a downstream graph that pinned uni-xervo
+# to 0.17.0 got "uni-xervo does not have these features" at build time, and
+# `cargo outdated` could not resolve the workspace at all.
+uni-xervo = { version = ">=0.18.0, <1.0.0", default-features = false }
 biodivine-lib-bdd = "0.6"
 candle-core = "0.10"
 candle-nn = "0.10"

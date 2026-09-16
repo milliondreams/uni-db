@@ -82,6 +82,13 @@ target-version = ['py310']
 include = '\.pyi?$'
 
 [tool.ruff]
+# Markdown is excluded from discovery. ruff 0.16 began formatting Python code
+# blocks inside `.md`, which collapses the hand-written builder examples in
+# README.md and REVIEW.md -- the explicit line continuations there exist to show
+# the schema builder's nesting, and the formatter rewrites them into a single
+# run-on chain broken at arbitrary argument boundaries. Those files are
+# documentation; their code samples are formatted for a reader, not a linter.
+extend-exclude = ["*.md"]
 line-length = 88
 target-version = "py310"
 

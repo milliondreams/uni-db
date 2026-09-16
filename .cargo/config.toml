@@ -22,7 +22,29 @@
 RUST_MIN_STACK = "8388608"
 
 [target.'cfg(target_os = "linux")']
-rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+# `--icf=safe` folds byte-identical function bodies into one copy -- generic
+# monomorphization emits a lot of them (`Vec<u64>` and `Vec<i64>` operations
+# compile to the same instructions). The machine code is unchanged, only
+# deduplicated, so there is no codegen cost; measured flat on hot_paths_iai.
+# `safe` skips functions whose addresses are taken, so function-pointer
+# identity still holds -- `--icf=all` folds ~3.6 MiB more but can make two
+# distinct `fn` pointers compare equal, which is not worth it for the delta.
+# `--gc-sections` drops unreferenced sections.
+#
+# Measured on lib_uni_db.so via `--profile dist` (opt-level=3, thin LTO, cgu=1):
+#   baseline                     225.8 MiB   peakRSS 10.0 GiB
+#   --icf=safe --gc-sections     222.4 MiB   peakRSS 10.1 GiB   <- chosen
+#   --icf=all  --gc-sections     218.8 MiB   peakRSS 10.3 GiB
+#
+# Cargo has no per-profile rustflags, so this applies to dev and test builds
+# too. Both mold flags are linker-only; GNU ld does not support `--icf`, which
+# is why this lives in the linux block next to the mold selection rather than
+# in a shared rustflags array.
+rustflags = [
+    "-C", "link-arg=-fuse-ld=mold",
+    "-C", "link-arg=-Wl,--icf=safe",
+    "-C", "link-arg=-Wl,--gc-sections",
+]
 
 [profile.dev]
 debug = 1  # Line tables only - saves ~50% debug info size

@@ -23,10 +23,25 @@ async fn issue46_edge_compaction_no_panic() -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let path = tmp.path().to_str().unwrap();
 
-    // Use a persistent KB with aggressive flush to maximize race window
+    // Use a persistent KB with aggressive flush to maximize race window.
+    //
+    // `commit_timeout` is raised from its 5 s default because this test is
+    // sensitive to parallelism: under `cargo nextest`'s full-suite fan-out it
+    // gets a fraction of a core, and a 300-vertex / 600-edge commit contending
+    // with a 2 s auto-flush exceeds 5 s waiting on the writer lock. That aborts
+    // the commit with `CommitTimeout` and fails the test for a reason that has
+    // nothing to do with what it guards.
+    //
+    // Raising it does not weaken the assertion. This test asserts that the
+    // flush/compaction race does not *panic* (issue #46) -- it says nothing
+    // about commit latency, so a bound that measures the test runner's
+    // scheduling rather than the engine is the wrong bound. Observed failing at
+    // the 5 s default roughly 1 run in 3 in a full parallel suite; green in
+    // isolation, which is exactly why isolation was the wrong control.
     let config = UniConfig {
         auto_flush_interval: Some(std::time::Duration::from_secs(2)),
         auto_flush_threshold: 100,
+        commit_timeout: std::time::Duration::from_secs(120),
         ..Default::default()
     };
 

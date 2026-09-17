@@ -15,10 +15,26 @@ use std::sync::Arc;
 use tempfile::tempdir;
 use uni_common::core::schema::SchemaManager;
 use uni_common::core::snapshot::SnapshotManifest;
-use uni_db::Uni;
+use uni_db::{Uni, UniConfig};
 use uni_store::runtime::wal::WriteAheadLog;
 use uni_store::storage::manager::StorageManager;
 use uni_store::store_utils::{DEFAULT_TIMEOUT, delete_with_timeout, list_with_timeout};
+
+/// A fixture database with the time-based auto-flush timer disabled.
+///
+/// `Drop for Uni` broadcasts shutdown and the auto-flush task answers with a
+/// full `flush_to_l1` that **nothing awaits**. These tests delete manifest files
+/// after the `Uni` goes out of scope, so that un-awaited flush can land *after*
+/// the deletion and put a manifest back — turning "no manifest" into "manifest
+/// present" and the assertion into a coin flip. It passed alone and failed in
+/// the full failpoints suite, which is exactly the shape of a load-dependent
+/// race rather than a logic error.
+fn quiesced(path: &str) -> uni_db::UniBuilder {
+    Uni::open(path).config(UniConfig {
+        auto_flush_interval: None,
+        ..Default::default()
+    })
+}
 
 /// Test 1: Fresh database starts at version zero
 #[tokio::test]
@@ -36,29 +52,33 @@ async fn test_lost_latest_pointer_recovers_from_manifest() -> Result<()> {
 
     // Create database, insert data, and flush
     {
-        let db = Uni::open(path).build().await?;
+        let db = quiesced(path).build().await?;
         let tx = db.session().tx().await?;
         tx.execute("CREATE (n:Person {name: 'Alice'})").await?;
         tx.commit().await?;
         db.flush().await?;
     }
 
-    // Check if snapshot was created
+    // Manifests live under the STORAGE root, not the database root: the
+    // `SnapshotManager`'s object store is built from `base_uri`, which is
+    // `<db>/storage`. Listing `catalog/manifests` from `dir.path()` finds the
+    // root `catalog/`, which holds only `schema.json` — so it came back empty,
+    // the early return below fired, and this test silently skipped on every run
+    // it has ever had. Asserting non-empty is what keeps it honest.
     let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path())?)
         as Arc<dyn object_store::ObjectStore>;
-    let manifests_prefix = ObjectStorePath::from("catalog/manifests");
+    let manifests_prefix = ObjectStorePath::from("storage/catalog/manifests");
     let metas = list_with_timeout(&store, Some(&manifests_prefix), DEFAULT_TIMEOUT).await?;
 
-    if metas.is_empty() {
-        // No snapshot was created (probably because dataset was too small)
-        // Test is not applicable in this case
-        eprintln!("Skipping test - no snapshot created after flush");
-        return Ok(());
-    }
+    assert!(
+        !metas.is_empty(),
+        "no manifest under storage/catalog/manifests after an explicit flush — \
+         the rest of this test would be vacuous"
+    );
 
-    // Delete the latest pointer file
-    let latest_path = ObjectStorePath::from("catalog/latest");
-    let _ = delete_with_timeout(&store, &latest_path, DEFAULT_TIMEOUT).await; // Ignore error if file doesn't exist
+    // Delete the latest pointer file, keeping the manifests it pointed at.
+    let latest_path = ObjectStorePath::from("storage/catalog/latest");
+    delete_with_timeout(&store, &latest_path, DEFAULT_TIMEOUT).await?;
 
     // Reopen - should recover from manifest (success means version recovery worked)
     let db_result = Uni::open(path).build().await;
@@ -73,32 +93,61 @@ async fn test_lost_latest_pointer_recovers_from_manifest() -> Result<()> {
     Ok(())
 }
 
-/// Test 3: WAL without manifest fails loudly
+/// Test 3: L1 data with lost manifests fails loudly.
+///
+/// This is issue #72's actual shape and the one that must keep failing: L1 holds
+/// rows whose versions came from a counter this open cannot reconstruct, because
+/// the WAL is truncated at each flush and so does not bound what L1 already used.
+/// Replaying from 0 over it would reuse those versions and corrupt data.
+///
+/// Two defects used to make this pass for the wrong reason, and they cancelled
+/// out. It never flushed ("data only in WAL"), and it deleted `catalog/*` at the
+/// database root while manifests live under `<db>/storage/catalog/`. So it
+/// deleted nothing, no manifest ever existed to delete, and the guard fired on
+/// the *absence* of a first flush — issue #275's case, not #72's. Whether a
+/// table existed at all came down to a race with the un-awaited flush in
+/// `Drop for Uni`.
+///
+/// The #275 case now has its own coverage in `first_flush_resilience.rs`, where
+/// it must *succeed*. This one flushes explicitly so there is real L1 data, and
+/// removes the manifests that describe it.
 #[tokio::test]
 async fn test_wal_without_manifest_fails_loudly() -> Result<()> {
     let dir = tempdir()?;
     let path = dir.path().to_str().unwrap();
 
-    // Create database and insert data (writes to WAL)
+    // Create database, insert, and FLUSH so L1 data and a manifest both exist.
     {
-        let db = Uni::open(path).build().await?;
+        let db = quiesced(path).build().await?;
         let tx = db.session().tx().await?;
         tx.execute("CREATE (n:Person {name: 'Alice'})").await?;
         tx.commit().await?;
-        // Don't flush - data only in WAL
+        db.flush().await?;
+
+        // A second uncommitted-to-L1 write, so WAL segments outlive the flush
+        // and the reopen genuinely sees "WAL + tables + no manifest".
+        let tx = db.session().tx().await?;
+        tx.execute("CREATE (n:Person {name: 'Bob'})").await?;
+        tx.commit().await?;
     }
 
-    // Delete all manifests AND latest pointer (keep WAL)
+    // Delete all manifests AND the latest pointer, keeping the L1 data they
+    // describe. Paths are relative to the STORAGE root — see test 2.
     let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path())?)
         as Arc<dyn object_store::ObjectStore>;
-    let latest_path = ObjectStorePath::from("catalog/latest");
-    let manifests_prefix = ObjectStorePath::from("catalog/manifests");
+    let latest_path = ObjectStorePath::from("storage/catalog/latest");
+    let manifests_prefix = ObjectStorePath::from("storage/catalog/manifests");
 
     // Delete latest pointer
-    let _ = delete_with_timeout(&store, &latest_path, DEFAULT_TIMEOUT).await;
+    delete_with_timeout(&store, &latest_path, DEFAULT_TIMEOUT).await?;
 
     // Delete all manifests
     let metas = list_with_timeout(&store, Some(&manifests_prefix), DEFAULT_TIMEOUT).await?;
+    assert!(
+        !metas.is_empty(),
+        "no manifests to delete — this test would then assert against issue \
+         #275's fresh-store case, which is now expected to succeed"
+    );
     for meta in metas {
         delete_with_timeout(&store, &meta.location, DEFAULT_TIMEOUT).await?;
     }
@@ -122,6 +171,15 @@ async fn test_wal_without_manifest_fails_loudly() -> Result<()> {
     assert!(
         error_msg.contains("no snapshot manifest"),
         "Error message should mention missing snapshot manifest, got: {}",
+        error_msg
+    );
+    // The discriminator between #72 and #275 is whether L1 tables exist, so the
+    // error has to say so. Without this, a regression that stopped checking
+    // tables — and so rejected every unflushed store again — would still pass
+    // both assertions above.
+    assert!(
+        error_msg.contains("table(s)"),
+        "Error should report the L1 tables that make version reuse unsafe, got: {}",
         error_msg
     );
 

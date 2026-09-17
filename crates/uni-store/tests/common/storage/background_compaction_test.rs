@@ -66,9 +66,10 @@ async fn test_write_throttling_config() {
             .await
             .unwrap(),
     );
-    let _writer = Writer::new_with_config(storage.clone(), schema_manager, 0, config, None, None)
-        .await
-        .unwrap();
+    let _writer =
+        Writer::new_with_config(storage.clone(), schema_manager, 0, config, None, None, None)
+            .await
+            .unwrap();
 
     // Ideally we would mock the storage state to simulate high L1 runs,
     // but for now we just verify the Writer can be created with the config.
@@ -147,6 +148,7 @@ async fn write_and_flush(
         schema_manager.clone(),
         0,
         config,
+        None,
         None,
         None,
     )

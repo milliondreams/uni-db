@@ -241,6 +241,7 @@ async fn a_partial_l0_write_does_not_hide_stored_properties() -> Result<()> {
         config,
         None,
         None,
+        None,
     )
     .await?;
 

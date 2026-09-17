@@ -456,9 +456,17 @@ pub struct Writer {
     /// single-flusher critical section.
     cached_manifest: Arc<PlMutex<Option<SnapshotManifest>>>,
     /// Identifier of the fork this writer serves, if any. `None` for
-    /// primary's writer. Set by [`crate::fork::writer_factory::new_for_fork`]
-    /// and read in `flush_to_l1` to emit fork-tagged metrics and to fire
-    /// the fragment-count guard rail (Phase 2 Day 12).
+    /// primary's writer. Read in `flush_to_l1` to emit fork-tagged metrics and
+    /// to fire the fragment-count guard rail (Phase 2 Day 12).
+    ///
+    /// **Set at construction, never afterwards.** It used to be patched on by
+    /// `writer_factory::new_for_fork` after `new_with_config` returned, which
+    /// left a window the async flush path fell into: `new_with_config` captures
+    /// a `SharedFlushCtx` for the `FlushCoordinator`, and that snapshot froze
+    /// `fork_id: None` before the factory could tag the writer. The coordinator
+    /// then finalized every async flush under primary's identity — publishing a
+    /// fork's manifest pointer through the primary namespace. The sync path was
+    /// unaffected because it builds its ctx per call from `shared_ctx()`.
     pub fork_id: Option<ForkId>,
     /// Number of `flush_to_l1` calls since this writer was constructed.
     /// Used as a proxy for L1 fragment growth on the fork's branches:
@@ -536,10 +544,16 @@ impl Writer {
             UniConfig::default(),
             None,
             None,
+            None,
         )
         .await
     }
 
+    /// `fork_id` identifies the fork this writer serves, or `None` for primary.
+    /// It is a constructor argument rather than a field assigned afterwards
+    /// because the `FlushCoordinator`'s `SharedFlushCtx` is captured in here:
+    /// anything set after this returns is invisible to every async flush. See
+    /// the field docs on [`Writer::fork_id`].
     pub async fn new_with_config(
         storage: Arc<StorageManager>,
         schema_manager: Arc<uni_common::core::schema::SchemaManager>,
@@ -547,6 +561,7 @@ impl Writer {
         config: UniConfig,
         wal: Option<Arc<WriteAheadLog>>,
         allocator: Option<Arc<IdAllocator>>,
+        fork_id: Option<ForkId>,
     ) -> Result<Self> {
         let allocator = if let Some(a) = allocator {
             a
@@ -585,6 +600,19 @@ impl Writer {
             OnceLock<Arc<crate::storage::index_rebuild::IndexRebuildManager>>,
         > = Arc::new(OnceLock::new());
 
+        // Catch a mismatched writer/storage pairing HERE, where it is
+        // deterministic, rather than at `flush_finalize_body`'s equivalent
+        // assertion, which only fires if an async flush happens to reach
+        // finalize — a race that hid this for three months and then failed one
+        // PR in CI twice with two different symptoms.
+        debug_assert_eq!(
+            fork_id.is_some(),
+            storage.snapshot_manager().is_fork_scoped(),
+            "writer fork identity must agree with its storage's snapshot namespace: \
+             fork_id={fork_id:?}, storage is_fork_scoped={}",
+            storage.snapshot_manager().is_fork_scoped()
+        );
+
         let flush_coordinator = if config.async_flush_enabled {
             let shared = SharedFlushCtx {
                 storage: storage.clone(),
@@ -594,7 +622,10 @@ impl Writer {
                 schema_manager: schema_manager.clone(),
                 cached_manifest: cached_manifest.clone(),
                 last_flush_time: last_flush_time.clone(),
-                fork_id: None,
+                // Must match the writer's own `fork_id` (asserted in
+                // `flush_finalize_body`). Hard-coding `None` here is what sent
+                // fork async flushes through primary's snapshot namespace.
+                fork_id,
                 fork_flush_count: fork_flush_count.clone(),
                 fork_fragment_warn_fired: fork_fragment_warn_fired.clone(),
                 fork_fragment_warn_threshold: config.fork_fragment_warn_threshold,
@@ -635,7 +666,7 @@ impl Writer {
             compaction_handle,
             index_rebuild_manager,
             cached_manifest,
-            fork_id: None,
+            fork_id,
             fork_flush_count,
             fork_fragment_warn_fired,
             flush_lock,
@@ -6340,6 +6371,7 @@ mod tests {
             UniConfig::default(),
             Some(wal),
             None,
+            None,
         )
         .await?;
 
@@ -6483,6 +6515,7 @@ mod tests {
             1,
             UniConfig::default(),
             Some(wal),
+            None,
             None,
         )
         .await?;
@@ -6729,6 +6762,7 @@ mod tests {
             UniConfig::default(),
             Some(wal.clone()),
             None,
+            None,
         )
         .await?;
 
@@ -6770,6 +6804,7 @@ mod tests {
             1,
             UniConfig::default(),
             Some(wal),
+            None,
             None,
         )
         .await?;
@@ -6846,7 +6881,7 @@ mod tests {
             ..Default::default()
         };
         let mut writer =
-            Writer::new_with_config(storage, schema_manager, 1, config, None, None).await?;
+            Writer::new_with_config(storage, schema_manager, 1, config, None, None, None).await?;
 
         // Primary path: never fires.
         for _ in 0..10 {
@@ -6910,9 +6945,16 @@ mod tests {
             StorageManager::new(dir.path().to_str().unwrap(), schema_manager.clone()).await?,
         );
 
-        let writer =
-            Writer::new_with_config(storage, schema_manager, 1, UniConfig::default(), None, None)
-                .await?;
+        let writer = Writer::new_with_config(
+            storage,
+            schema_manager,
+            1,
+            UniConfig::default(),
+            None,
+            None,
+            None,
+        )
+        .await?;
 
         /// Captures every `Writer` field that *could* be written by a
         /// hot-path mutator (i.e., every non-Arc, non-immutable-after-

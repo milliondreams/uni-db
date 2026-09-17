@@ -93,6 +93,7 @@ impl AlgoBenchContext {
                 config,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap(),

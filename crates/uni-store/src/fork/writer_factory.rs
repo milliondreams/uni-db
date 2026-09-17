@@ -62,7 +62,12 @@ pub async fn new_for_fork(
     // segments from prior sessions on the same fork.
     wal.initialize().await?;
 
-    let mut writer = Writer::new_with_config(
+    // The fork identity is a constructor argument, not a later assignment:
+    // `new_with_config` captures the `SharedFlushCtx` the `FlushCoordinator`
+    // uses for every async flush, so anything tagged on afterwards never
+    // reaches that path. Tagging it here previously left the coordinator
+    // finalizing this fork's flushes under primary's identity.
+    Writer::new_with_config(
         storage,
         schema_manager,
         // Bootstrap the fork's version floor to the parent's fork-point
@@ -71,12 +76,9 @@ pub async fn new_for_fork(
         config,
         Some(wal),
         Some(allocator),
+        Some(*fork_id),
     )
-    .await?;
-    // Tag the writer with its fork identity so flush-time observability
-    // (Phase 2 Day 12) can label metrics and fire the fragment guard rail.
-    writer.fork_id = Some(*fork_id);
-    Ok(writer)
+    .await
 }
 
 #[cfg(test)]
@@ -86,6 +88,43 @@ mod tests {
     use object_store::local::LocalFileSystem;
     use object_store::path::Path as ObjectStorePath;
     use tempfile::TempDir;
+
+    /// Build a **fork-scoped** StorageManager for `fork_id`, alongside its
+    /// schema manager.
+    ///
+    /// These tests used to hand `new_for_fork` a *primary* StorageManager.
+    /// That pairing is invalid — a writer carrying a `fork_id` must publish
+    /// through a fork-scoped snapshot namespace, which is asserted both at
+    /// construction and in `flush_finalize_body`. It went unnoticed because
+    /// these tests never flush, so only the construction-time assertion catches
+    /// it. Building the real object graph costs a dozen lines and keeps the
+    /// allocator contract being tested here anchored to a writer that could
+    /// actually flush.
+    async fn fork_storage(fork_id: ForkId) -> (TempDir, Arc<StorageManager>, Arc<SchemaManager>) {
+        let (dir, primary, schema) = primary_storage().await;
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+        let registry = Arc::new(crate::fork::ForkRegistryHandle::load(store).await.unwrap());
+        let info = uni_common::core::fork::ForkInfo::new_pending(
+            fork_id,
+            "writer_factory_test",
+            "snap-1",
+            1,
+        );
+        registry.begin_create(info.clone()).await.unwrap();
+        let active = registry
+            .finish_create("writer_factory_test", info.datasets.clone())
+            .await
+            .unwrap();
+        let scope = Arc::new(crate::fork::ForkScope::new(
+            Arc::new(active),
+            uni_common::core::fork::SchemaDelta::empty(),
+            registry,
+        ));
+        let forked = Arc::new(primary.at_fork(scope));
+        debug_assert!(forked.fork_scope().is_some());
+        (dir, forked, schema)
+    }
 
     /// Build a primary StorageManager + SchemaManager from a temp dir.
     async fn primary_storage() -> (TempDir, Arc<StorageManager>, Arc<SchemaManager>) {
@@ -112,8 +151,8 @@ mod tests {
 
     #[tokio::test]
     async fn new_for_fork_builds_writer_with_fork_allocator() {
-        let (_dir, storage, schema) = primary_storage().await;
         let fork_id = ForkId::new();
+        let (_dir, storage, schema) = fork_storage(fork_id).await;
 
         let writer = new_for_fork(
             storage.clone(),
@@ -132,28 +171,20 @@ mod tests {
 
     #[tokio::test]
     async fn two_fork_writers_have_independent_allocators() {
-        let (_dir, storage, schema) = primary_storage().await;
+        // One fork-scoped storage per fork: a storage manager is scoped to a
+        // single fork, so sharing one across two fork writers would pair at
+        // least one of them with the wrong namespace.
         let id_a = ForkId::new();
         let id_b = ForkId::new();
+        let (_dir_a, storage_a, schema_a) = fork_storage(id_a).await;
+        let (_dir_b, storage_b, schema_b) = fork_storage(id_b).await;
 
-        let writer_a = new_for_fork(
-            storage.clone(),
-            schema.clone(),
-            &id_a,
-            0,
-            UniConfig::default(),
-        )
-        .await
-        .unwrap();
-        let writer_b = new_for_fork(
-            storage.clone(),
-            schema.clone(),
-            &id_b,
-            0,
-            UniConfig::default(),
-        )
-        .await
-        .unwrap();
+        let writer_a = new_for_fork(storage_a, schema_a, &id_a, 0, UniConfig::default())
+            .await
+            .unwrap();
+        let writer_b = new_for_fork(storage_b, schema_b, &id_b, 0, UniConfig::default())
+            .await
+            .unwrap();
 
         // Each starts at VID 0, independently — promotion later
         // resolves any collisions via UniId dedup.

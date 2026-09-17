@@ -19,10 +19,11 @@ use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 use uni_common::Vid;
 use uni_common::config::UniConfig;
-use uni_common::core::fork::ForkId;
+use uni_common::core::fork::{ForkId, ForkInfo, SchemaDelta};
 use uni_common::core::schema::SchemaManager;
 use uni_store::fork::wal as fork_wal;
 use uni_store::fork::writer_factory;
+use uni_store::fork::{ForkRegistryHandle, ForkScope};
 use uni_store::runtime::wal::Mutation;
 use uni_store::storage::manager::StorageManager;
 
@@ -66,10 +67,40 @@ async fn fixture() -> (
     (dir, storage_store, storage, schema)
 }
 
+/// Scope `storage` to `fork_id`, the way `UniInner::at_fork` does.
+///
+/// Without this the tests below built a fork writer (`fork_id: Some`) over a
+/// *primary* storage manager — a pairing the writer rejects at construction,
+/// because a writer carrying a fork id must publish through
+/// `catalog/forks/{id}/`. They asserted they mirrored `UniInner::at_fork`'s flow
+/// while skipping the part that makes the storage a fork's storage.
+async fn fork_scoped(
+    dir: &TempDir,
+    storage: Arc<StorageManager>,
+    fork_id: ForkId,
+) -> Arc<StorageManager> {
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let registry = Arc::new(ForkRegistryHandle::load(store).await.unwrap());
+    let info = ForkInfo::new_pending(fork_id, "recovery_fork_wal", "snap-1", 1);
+    registry.begin_create(info.clone()).await.unwrap();
+    let active = registry
+        .finish_create("recovery_fork_wal", info.datasets.clone())
+        .await
+        .unwrap();
+    let scope = Arc::new(ForkScope::new(
+        Arc::new(active),
+        SchemaDelta::empty(),
+        registry,
+    ));
+    Arc::new(storage.at_fork(scope))
+}
+
 #[tokio::test]
 async fn fork_wal_replay_restores_persisted_mutations() {
     let (_dir, store, storage, schema) = fixture().await;
     let fork_id = ForkId::new();
+    let storage = fork_scoped(&_dir, storage, fork_id).await;
 
     // 1. Persist some mutations directly through the fork WAL.
     //    This mirrors what a Writer would do on commit_transaction_l0.
@@ -130,6 +161,7 @@ async fn primary_wal_unaffected_by_fork_wal_segments() {
 async fn replay_with_no_persisted_mutations_is_noop() {
     let (_dir, _store, storage, schema) = fixture().await;
     let fork_id = ForkId::new();
+    let storage = fork_scoped(&_dir, storage, fork_id).await;
 
     let writer = writer_factory::new_for_fork(storage, schema, &fork_id, 0, UniConfig::default())
         .await

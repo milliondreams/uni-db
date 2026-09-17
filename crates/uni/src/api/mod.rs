@@ -1889,6 +1889,7 @@ impl UniBuilder {
                 self.config.clone(),
                 wal,
                 Some(allocator),
+                None,
             )
             .await
             .map_err(UniError::Internal)?,

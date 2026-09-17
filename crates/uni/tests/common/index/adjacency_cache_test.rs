@@ -41,6 +41,7 @@ async fn test_adjacency_manager_lifecycle() -> anyhow::Result<()> {
         UniConfig::default(),
         None,
         None,
+        None,
     )
     .await
     .unwrap();

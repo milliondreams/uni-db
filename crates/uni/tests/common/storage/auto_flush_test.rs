@@ -37,6 +37,7 @@ async fn test_l0_auto_flush_threshold() -> anyhow::Result<()> {
         config,
         None,
         None,
+        None,
     )
     .await?;
 

@@ -22,8 +22,8 @@ use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, FixedSizeBinaryArray,
     FixedSizeListArray, Float32Array, Float64Array, Int32Array, Int64Array,
     IntervalMonthDayNanoArray, LargeBinaryArray, LargeStringArray, ListArray, StringArray,
-    StructArray, Time64NanosecondArray, TimestampNanosecondArray, UInt8Array, UInt32Array,
-    UInt64Array,
+    StringViewArray, StructArray, Time64NanosecondArray, TimestampNanosecondArray, UInt8Array,
+    UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType as ArrowDataType, Field};
 use std::collections::HashMap;
@@ -456,6 +456,12 @@ pub fn arrow_to_value(
     // so `derived` reported NULL while `QUERY` (which evaluates natively, never
     // touching Arrow) reported the real value.
     if let Some(s) = col.as_any().downcast_ref::<LargeStringArray>() {
+        return Ok(Value::String(s.value(row).to_string()));
+    }
+    // `Utf8View`. DataFusion 54 returns `Utf8View` from a growing set of string functions (`left`, `right`, `split_part` joined `btrim`, `initcap`, `md5`, `substr` in 54). It is a distinct Arrow type, so a `StringArray` / `LargeStringArray` downcast does not match it, which is how `left()`/`right()` started
+    // erroring here on the DataFusion 54 upgrade. Expect this set to keep
+    // growing as DataFusion migrates more functions to StringView.
+    if let Some(s) = col.as_any().downcast_ref::<StringViewArray>() {
         return Ok(Value::String(s.value(row).to_string()));
     }
 

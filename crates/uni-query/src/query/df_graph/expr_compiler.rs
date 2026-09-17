@@ -118,10 +118,6 @@ impl PartialEq<dyn std::any::Any> for LargeListToCypherValueExpr {
 }
 
 impl PhysicalExpr for LargeListToCypherValueExpr {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn data_type(&self, _input_schema: &Schema) -> datafusion::error::Result<DataType> {
         Ok(DataType::LargeBinary)
     }
@@ -2568,10 +2564,6 @@ impl DisplayAs for CypherStringMatchExpr {
 }
 
 impl PhysicalExpr for CypherStringMatchExpr {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn data_type(
         &self,
         _input_schema: &Schema,
@@ -2636,7 +2628,7 @@ impl PhysicalExpr for CypherStringMatchExpr {
 
 impl PartialEq<dyn PhysicalExpr> for CypherStringMatchExpr {
     fn eq(&self, other: &dyn PhysicalExpr) -> bool {
-        if let Some(other) = other.as_any().downcast_ref::<CypherStringMatchExpr>() {
+        if let Some(other) = other.downcast_ref::<CypherStringMatchExpr>() {
             self == other
         } else {
             false
@@ -2701,7 +2693,7 @@ impl DisplayAs for StructFieldAccessExpr {
 
 impl PartialEq<dyn PhysicalExpr> for StructFieldAccessExpr {
     fn eq(&self, other: &dyn PhysicalExpr) -> bool {
-        if let Some(other) = other.as_any().downcast_ref::<Self>() {
+        if let Some(other) = other.downcast_ref::<Self>() {
             self.field_idx == other.field_idx && self.input.eq(&other.input)
         } else {
             false
@@ -2710,10 +2702,6 @@ impl PartialEq<dyn PhysicalExpr> for StructFieldAccessExpr {
 }
 
 impl PhysicalExpr for StructFieldAccessExpr {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn data_type(
         &self,
         _input_schema: &Schema,
@@ -2936,10 +2924,6 @@ impl DisplayAs for ExistsExecExpr {
 }
 
 impl PhysicalExpr for ExistsExecExpr {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn data_type(
         &self,
         _input_schema: &Schema,
@@ -3470,10 +3454,6 @@ fn comprehension_item_field() -> Arc<Field> {
 }
 
 impl PhysicalExpr for PatternComprehensionSubqueryExpr {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn data_type(
         &self,
         _input_schema: &Schema,

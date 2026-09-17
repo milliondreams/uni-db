@@ -19,7 +19,6 @@
 //! `supports_partial: false`; the adapter respects whatever the
 //! registry entry declares.
 
-use std::any::Any;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
@@ -106,10 +105,6 @@ impl Hash for PluginAggregateUdaf {
 }
 
 impl AggregateUDFImpl for PluginAggregateUdaf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         &self.name
     }

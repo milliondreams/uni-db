@@ -50,7 +50,6 @@
 //!   planner.
 
 use crate::query::df_graph::common::BatchFootprint;
-use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::pin::Pin;
@@ -173,11 +172,7 @@ impl VidLookupJoinExec {
             ProbeSide::Left => &left,
             ProbeSide::Right => &right,
         };
-        if probe_plan
-            .as_any()
-            .downcast_ref::<GraphScanExec>()
-            .is_none()
-        {
+        if probe_plan.downcast_ref::<GraphScanExec>().is_none() {
             return Err(datafusion::error::DataFusionError::Plan(
                 "VidLookupJoinExec: probe-side child must be a GraphScanExec".into(),
             ));
@@ -189,7 +184,6 @@ impl VidLookupJoinExec {
         // it used to be driven through a bespoke helper.
         let probe_filter = Arc::new(DynamicVidFilter::default());
         let probe_scan = probe_plan
-            .as_any()
             .downcast_ref::<GraphScanExec>()
             .expect("probe was checked to be a GraphScanExec above")
             .with_dynamic_vid_filter(probe_filter.clone());
@@ -251,10 +245,6 @@ impl DisplayAs for VidLookupJoinExec {
 impl ExecutionPlan for VidLookupJoinExec {
     fn name(&self) -> &str {
         "VidLookupJoinExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {
@@ -484,7 +474,6 @@ async fn run_join(
     // before it is published or the `_vid` IN-list would exceed the bound that
     // keeps the scalar index earning its keep.
     let probe_scan = probe
-        .as_any()
         .downcast_ref::<GraphScanExec>()
         .expect("planner ensured probe is GraphScanExec");
     let probe_batch = if vid_set.is_empty() {

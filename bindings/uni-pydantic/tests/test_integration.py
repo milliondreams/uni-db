@@ -741,3 +741,23 @@ class TestEagerLoadHydratesModels:
         found = session.query(Author).eager_load("books", "bio").all()
         assert found[0].books == []
         assert found[0].bio is None
+
+
+class TestExplainAndProfileReachTheBuilder:
+    """`UniSession.explain`/`.profile` must route through ``query_with()``.
+
+    Both used to call ``self._db_session.explain(cypher)`` directly, but
+    ``explain``/``profile`` are not on ``uni_db.Session`` at all -- they live on
+    the ``SessionQueryBuilder`` that ``query_with()`` returns. Every call raised
+    ``AttributeError: 'builtins.Session' object has no attribute 'explain'``.
+    Nothing caught it because no test exercised either method.
+    """
+
+    def test_explain_returns_a_plan(self, session):
+        out = session.explain("MATCH (n) RETURN n")
+        assert out is not None
+
+    def test_profile_returns_results_and_stats(self, session):
+        result, stats = session.profile("MATCH (n) RETURN n")
+        assert result is not None
+        assert stats is not None

@@ -21,7 +21,6 @@ use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskCo
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::Stream;
-use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::pin::Pin;
@@ -422,10 +421,6 @@ impl DisplayAs for GraphProcedureCallExec {
 impl ExecutionPlan for GraphProcedureCallExec {
     fn name(&self) -> &str {
         "GraphProcedureCallExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {

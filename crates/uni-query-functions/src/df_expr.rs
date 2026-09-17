@@ -1522,10 +1522,13 @@ fn first_arg(df_args: &[DfExpr]) -> DfExpr {
 
 /// Create a cast expression to the specified data type.
 pub fn cast_expr(expr: DfExpr, data_type: datafusion::arrow::datatypes::DataType) -> DfExpr {
-    DfExpr::Cast(datafusion::logical_expr::Cast {
-        expr: Box::new(expr),
+    // `Cast` carries a `FieldRef`, not a bare `DataType`, as of DataFusion 54.
+    // `Cast::new` is the constructor that derives a nullable field from a type;
+    // building the struct literal by hand would mean picking a nullability here.
+    DfExpr::Cast(datafusion::logical_expr::Cast::new(
+        Box::new(expr),
         data_type,
-    })
+    ))
 }
 
 /// Wrap a `List<T>` or `LargeList<T>` expression as a `LargeBinary` CypherValue.
@@ -2492,10 +2495,6 @@ pub fn dummy_udf_expr(name: &str, args: Vec<DfExpr>) -> DfExpr {
 }
 
 impl datafusion::logical_expr::ScalarUDFImpl for DummyUdf {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &str {
         &self.name
     }
@@ -2817,17 +2816,20 @@ pub fn apply_type_coercion(expr: &DfExpr, schema: &datafusion::common::DFSchema)
         }
         DfExpr::Cast(cast) => {
             let coerced_inner = apply_type_coercion(&cast.expr, schema)?;
-            Ok(DfExpr::Cast(datafusion::logical_expr::Cast::new(
-                Box::new(coerced_inner),
-                cast.data_type.clone(),
-            )))
+            // Reuse the original `field` rather than `Cast::new(.., data_type)`:
+            // coercion only rewrites the *inner* expression, so re-deriving the
+            // field would silently relax a non-nullable cast to nullable.
+            Ok(DfExpr::Cast(datafusion::logical_expr::Cast {
+                expr: Box::new(coerced_inner),
+                field: cast.field.clone(),
+            }))
         }
         DfExpr::TryCast(cast) => {
             let coerced_inner = apply_type_coercion(&cast.expr, schema)?;
-            Ok(DfExpr::TryCast(datafusion::logical_expr::TryCast::new(
-                Box::new(coerced_inner),
-                cast.data_type.clone(),
-            )))
+            Ok(DfExpr::TryCast(datafusion::logical_expr::TryCast {
+                expr: Box::new(coerced_inner),
+                field: cast.field.clone(),
+            }))
         }
         DfExpr::Alias(alias) => {
             let coerced_inner = apply_type_coercion(&alias.expr, schema)?;

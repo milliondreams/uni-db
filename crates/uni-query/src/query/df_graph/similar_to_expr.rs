@@ -183,6 +183,15 @@ fn arrow_to_value_at(col: &dyn Array, row: usize) -> Value {
                 .value(row)
                 .to_string(),
         ),
+        // `Utf8View`: a distinct Arrow type DataFusion 54 returns from more and
+        // more string functions. Unmatched, it lands on the `Value::Null` arm.
+        DataType::Utf8View => Value::String(
+            col.as_any()
+                .downcast_ref::<arrow_array::StringViewArray>()
+                .unwrap()
+                .value(row)
+                .to_string(),
+        ),
         DataType::Int64 => Value::Int(
             col.as_any()
                 .downcast_ref::<Int64Array>()
@@ -266,10 +275,6 @@ enum ScoringMode {
 }
 
 impl PhysicalExpr for SimilarToExecExpr {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn data_type(&self, _input_schema: &Schema) -> datafusion::error::Result<DataType> {
         Ok(DataType::Float64)
     }

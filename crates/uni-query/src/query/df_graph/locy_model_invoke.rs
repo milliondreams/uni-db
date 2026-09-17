@@ -18,7 +18,6 @@
 //! machinery in the codebase.
 
 use crate::query::df_graph::common::{collect_accounted, operator_reservation};
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -254,10 +253,6 @@ impl DisplayAs for LocyModelInvokeExec {
 impl ExecutionPlan for LocyModelInvokeExec {
     fn name(&self) -> &str {
         "LocyModelInvokeExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {

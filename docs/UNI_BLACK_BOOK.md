@@ -1360,6 +1360,24 @@ source table per query — measured at ~0.33 ms on a small traversal, about 5–
 > handle. It does not make the engine generally multi-handle safe: the fork
 > registry, for one, still caches `catalog/fork_registry.json` in memory and a
 > reader will not see a fork another handle created.
+>
+> That last point is a decision, not a gap awaiting a fix (2026-09-15).
+> Multi-handle *fork administration* on one store is outside the supported
+> model: every registry mutation goes through `ForkRegistryHandle`'s 2PC state
+> machine as the single writer, so re-reading the cache on a fork listing has
+> to be reconciled with that protocol rather than bolted onto it, and the
+> scenario is rare enough not to justify that.
+>
+> Two things make this worth stating explicitly rather than leaving implicit.
+> First, it is **asymmetric**: schema additions and property updates by a
+> second handle *are* observed — `second_handle_observes_label_added_elsewhere`
+> and `second_handle_observes_updated_property_value` both pass — so "a second
+> handle sees another's writes" holds everywhere except the fork registry.
+> Second, the failure is **silent**: `Uni::list_forks` returns a shorter list,
+> never an error, so a stale read is indistinguishable from a store with no
+> forks. Callers that would act on the list (create-if-absent, TTL sweeps)
+> should re-open the handle instead. Pinned by the `#[ignore]`d
+> `second_handle_observes_fork_created_elsewhere` in the same test file.
 
 ### AdjacencyDataset (Persistent CSR)
 

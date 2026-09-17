@@ -22,7 +22,6 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 use futures::TryStreamExt;
-use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
@@ -1319,10 +1318,6 @@ impl DisplayAs for MutationExec {
 impl ExecutionPlan for MutationExec {
     fn name(&self) -> &str {
         self.display_name
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {

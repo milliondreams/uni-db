@@ -32,7 +32,6 @@
 
 // Rust guideline compliant
 
-use std::any::Any;
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -133,10 +132,6 @@ impl StorageTableProvider {
 
 #[async_trait]
 impl TableProvider for StorageTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -295,10 +290,6 @@ impl ExecutionPlan for StorageScanExec {
         "StorageScanExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
@@ -384,8 +375,8 @@ impl ExecutionPlan for StorageScanExec {
         )))
     }
 
-    fn partition_statistics(&self, _partition: Option<usize>) -> DfResult<Statistics> {
-        Ok(Statistics::new_unknown(&self.projected_schema))
+    fn partition_statistics(&self, _partition: Option<usize>) -> DfResult<Arc<Statistics>> {
+        Ok(Arc::new(Statistics::new_unknown(&self.projected_schema)))
     }
 }
 

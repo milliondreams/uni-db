@@ -439,11 +439,13 @@ class AsyncUniSession:
 
     async def explain(self, cypher: str) -> Any:
         """Get the query execution plan."""
-        return await self._db_session.explain(cypher)
+        # See the sync twin in session.py: these live on the `query_with()`
+        # builder, not on AsyncSession.
+        return await self._db_session.query_with(cypher).explain()
 
     async def profile(self, cypher: str) -> Any:
         """Run the query with profiling and return results + stats."""
-        return await self._db_session.profile(cypher)
+        return await self._db_session.query_with(cypher).profile()
 
     async def save_schema(self, path: str) -> None:
         """Save the database schema to a file."""

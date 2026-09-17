@@ -4548,11 +4548,7 @@ impl HybridPhysicalPlanner {
         // side is always wrapped. It had been dead since the commit that
         // introduced it.
         let probe_plan = Self::unwrap_optional_scan(probe_plan);
-        if probe_plan
-            .as_any()
-            .downcast_ref::<GraphScanExec>()
-            .is_none()
-        {
+        if probe_plan.downcast_ref::<GraphScanExec>().is_none() {
             return Ok(None);
         }
 
@@ -4575,8 +4571,8 @@ impl HybridPhysicalPlanner {
             let l_phys = left_compiler.compile(l_expr, &left_schema)?;
             let r_phys = right_compiler.compile(r_expr, &right_schema)?;
             let (Some(l_col), Some(r_col)) = (
-                l_phys.as_any().downcast_ref::<Column>(),
-                r_phys.as_any().downcast_ref::<Column>(),
+                l_phys.downcast_ref::<Column>(),
+                r_phys.downcast_ref::<Column>(),
             ) else {
                 // Computed expression on either side → bail to HashJoinExec.
                 return Ok(None);
@@ -4661,7 +4657,7 @@ impl HybridPhysicalPlanner {
     /// loose unwrap would defeat that. Anything that is not precisely
     /// `NLJ(PlaceholderRowExec, _, Left)` with no filter is returned untouched.
     fn unwrap_optional_scan(plan: &Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
-        let Some(nlj) = plan.as_any().downcast_ref::<NestedLoopJoinExec>() else {
+        let Some(nlj) = plan.downcast_ref::<NestedLoopJoinExec>() else {
             return plan.clone();
         };
         if *nlj.join_type() != JoinType::Left || nlj.filter().is_some() {
@@ -4671,8 +4667,7 @@ impl HybridPhysicalPlanner {
         let [left, right] = children.as_slice() else {
             return plan.clone();
         };
-        if left.as_any().downcast_ref::<PlaceholderRowExec>().is_none()
-            || !left.schema().fields().is_empty()
+        if left.downcast_ref::<PlaceholderRowExec>().is_none() || !left.schema().fields().is_empty()
         {
             return plan.clone();
         }
@@ -5821,13 +5816,12 @@ impl HybridPhysicalPlanner {
         }
 
         if plan
-            .as_any()
             .downcast_ref::<crate::query::df_graph::scan::GraphScanExec>()
             .is_some()
         {
             return plan.with_fetch(Some(limit)).unwrap_or(plan);
         }
-        if plan.as_any().downcast_ref::<ProjectionExec>().is_some()
+        if plan.downcast_ref::<ProjectionExec>().is_some()
             && let [child] = plan.children().as_slice()
         {
             let pushed = Self::push_fetch_into_scan(Arc::clone(child), limit);
@@ -5855,10 +5849,10 @@ impl HybridPhysicalPlanner {
             return plan;
         }
 
-        if plan.as_any().downcast_ref::<SortExec>().is_some() {
+        if plan.downcast_ref::<SortExec>().is_some() {
             return plan.with_fetch(Some(limit)).unwrap_or(plan);
         }
-        if plan.as_any().downcast_ref::<ProjectionExec>().is_some()
+        if plan.downcast_ref::<ProjectionExec>().is_some()
             && let [child] = plan.children().as_slice()
         {
             let pushed = Self::push_fetch_into_sort(Arc::clone(child), limit);
@@ -6797,19 +6791,39 @@ impl HybridPhysicalPlanner {
         schema: &SchemaRef,
         state: &SessionState,
     ) -> Result<PhysicalAggregate> {
-        use datafusion::physical_planner::create_aggregate_expr_and_maybe_filter;
+        use datafusion::physical_expr::aggregate::LoweredAggregateBuilder;
 
         // Build a DFSchema from the Arrow schema for the function call
         let df_schema = datafusion::common::DFSchema::try_from(schema.as_ref().clone())?;
 
-        // The function returns (AggregateFunctionExpr, Option<filter>, Vec<ordering>)
-        let (agg_expr, filter, _ordering) = create_aggregate_expr_and_maybe_filter(
+        // `create_aggregate_expr_and_maybe_filter` was deprecated in DataFusion
+        // 54 in favour of this builder. The name/human-display derivation below
+        // reproduces that helper's body exactly: the builder's own defaults pick
+        // a different output name, and the aggregate's name becomes a result
+        // *column* name, so taking the defaults would silently rename columns in
+        // user-visible query output.
+        let (name, human_display) = match expr {
+            DfExpr::Alias(alias) => (Some(alias.name.clone()), expr.human_display().to_string()),
+            DfExpr::AggregateFunction(_) => (
+                Some(expr.schema_name().to_string()),
+                expr.human_display().to_string(),
+            ),
+            _ => (None, String::default()),
+        };
+
+        let mut builder = LoweredAggregateBuilder::new(
             expr,
             &df_schema,
             schema.as_ref(),
             state.execution_props(),
-        )?;
-        Ok((agg_expr, filter))
+        )
+        .with_human_display(human_display);
+        if let Some(name) = name {
+            builder = builder.with_name(name);
+        }
+
+        let lowered = builder.build()?;
+        Ok((lowered.aggregate, lowered.filter))
     }
 
     /// Resolve the source VID column for traversal, adding a struct field extraction

@@ -665,11 +665,13 @@ class UniSession:
 
     def explain(self, cypher: str) -> uni_db.ExplainOutput:
         """Get the query execution plan without running it."""
-        return self._db_session.explain(cypher)
+        # `explain`/`profile` live on the builder `query_with()` returns, not on
+        # Session itself -- calling them on the session raised AttributeError.
+        return self._db_session.query_with(cypher).explain()
 
     def profile(self, cypher: str) -> tuple[uni_db.QueryResult, uni_db.ProfileOutput]:
         """Run the query with profiling and return results + stats."""
-        return self._db_session.profile(cypher)
+        return self._db_session.query_with(cypher).profile()
 
     def save_schema(self, path: str) -> None:
         """Save the database schema to a file."""

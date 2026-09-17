@@ -4,7 +4,7 @@ This document lists every CI job from `.github/workflows/pr.yml` and `.github/wo
 with the **exact command** to run it locally, plus prerequisites, ordering, and the local-only
 gotchas that bite.
 
-> **Source of truth = the workflow YAML.** This runbook mirrors the workflows as of 2026-09-05.
+> **Source of truth = the workflow YAML.** This runbook mirrors the workflows as of 2026-09-16.
 > If a command here disagrees with `.github/workflows/{pr,ci}.yml`, the YAML wins — update this doc.
 > **Bump the date above whenever you add a job or change a command.** The stamp is how drift gets
 > noticed: it sat at 2026-07-26 through four later edits while three PR-blocking jobs went
@@ -273,10 +273,14 @@ crate from the lane.
 # 7 runs only reaches 0.581% for another 4.6 minutes.
 bash scripts/perf/iai_pilot.sh 5
 
-# The gate verifies itself in the same run that trusts it. No lane runs tests
-# under scripts/, so a test file alone would never execute -- which is the shape
-# the gate was found to have.
+# The gate and the collector verify themselves in the same run that trusts them.
+# No lane runs tests under scripts/, so a test file alone would never execute --
+# which is the shape the gate was found to have. The collector needs it more: it
+# decides what every number downstream means, and has reported a confident zero
+# twice (dropping `baseline_noop` from the original pilot; reading a degenerate
+# `summary: 0` as the whole suite's instruction count).
 python3 scripts/perf/test_iai_gate.py
+python3 scripts/perf/test_iai_collect.py
 
 # Thresholds are explicit arguments -- iai_gate.py has no defaults -- so the
 # number a build fails on is visible and traceable to the measurement that
@@ -609,25 +613,86 @@ cargo metadata --format-version=1 --manifest-path bindings/uni-db-cuda/Cargo.tom
   like a code failure. Capture the status and stop if it is non-zero.
 - **Reranker real-ONNX tests** need network (HF). A flaky download is an infra failure, not a code
   failure — re-run before concluding.
-- **The perf gate does not reproduce off a CI runner.** Measured 2026-09-05: every
-  gated target lands **88–97% below** `docs/perf/iai-baseline.json`, which trips
-  `--fail-improve-pct` ("an implausible improvement is a collection failure").
-  Before treating that as a regression in your branch, know what has already been
-  established, so you do not re-derive it:
-  - `baselines::baseline_noop.noop` matches the baseline **exactly** (4 Ir), so
-    collection works and the bench binary is not stripped — `[profile.bench]` in
-    `.cargo/config.toml` is doing its job.
-  - **It reproduces on `origin/main` within ±1.6%**, so it is not introduced by any
-    branch. The meaningful comparison for a PR is branch-vs-main, not
-    branch-vs-baseline.
+- **`docs/perf/iai-baseline.json` is STALE and the gate will fail against it
+  until it is regenerated on CI.** This is expected, not a regression — the
+  metric's definition changed on 2026-09-16 and every number moved.
+
+  `hot_paths_iai.rs` used to bound its measured region with Callgrind's
+  `--toggle-collect` entry point. Collection state is **per-thread**, so work
+  Lance hands to tokio's blocking pool via `lance_core::utils::tokio::spawn_cpu`
+  was never counted. The bench now gates **instrumentation** instead, which is
+  process-global, so every thread is counted for the region under test. What this
+  changed, measured on one box:
+
+  | target | old (toggle) | new (instr-gated) | off-thread share |
+  |---|---:|---:|---:|
+  | `vertex_lookup_by_id` | 789,717 | 8,828,929 | 0.4% |
+  | `expand_batch_one_hop_warm` | 815,662 | 18,799,374 | 0.1% |
+  | `hnsw_top10_search` | 753,718 | 17,830,813 | 7.0% |
+  | `l0_to_l1_flush` | 814,852 | 57,725,521 | **57.6%** |
+
+  Regenerate with the **`perf-qualify.yml`** workflow (`workflow_dispatch`, 5
+  `ubuntu-xlarge` shards), download the `iai-shard-*` artifacts, then:
+
+  `--gate` takes the **fully-qualified** name including the bench id, so
+  `read_paths::vertex_lookup_by_id.by_id`, not `read_paths::vertex_lookup_by_id`
+  — the short form is rejected with "names targets absent from the samples":
+
+  ```bash
+  gh workflow run "Perf Qualify (cross-runner iai)" --ref <branch-with-the-fix>
+  gh run download <run-id> --pattern 'iai-shard-*' --dir shards
+
+  python3 scripts/perf/iai_baseline.py shards/iai-shard-* \
+    --out docs/perf/iai-baseline.json \
+    --gate read_paths::parse_and_plan_cold.cold \
+    --gate read_paths::vertex_lookup_by_id.by_id \
+    --gate read_paths::expand_batch_one_hop_warm.warm \
+    --gate read_paths::property_read_across_l0_l1.l0_over_l1 \
+    --gate read_paths::hnsw_top10_search.top10 \
+    --reason "IO-dominant: rejected by the qualification pilot's wall-clock-correlation leg (2026-08-12), not by variance"
+  ```
+
+  `--reason` is not optional in practice: it is stamped on every non-gated
+  target except the `baselines::` pair (which get their own hardcoded text), and
+  its default is the generic "not qualified by the instruction-count pilot".
+  Omitting it silently replaces the `write_paths::*` entries' explanation — that
+  they were rejected on wall-clock correlation, *not* on variance — which is the
+  one fact stopping someone from "fixing" them by tightening a threshold.
+
+  **The gated set is inherited, not re-derived.** Qualification has two legs,
+  stability and wall-clock correlation. The instrumentation-gating change altered
+  what is measured, so strictly both legs apply to a new metric. Stability has
+  been re-verified (all 9 targets CV < 0.9%); **the correlation leg has not been
+  re-run.** Keeping the same 5 gated targets assumes it still holds. The target
+  whose character changed most is `l0_to_l1_flush` — now 57.9% off-thread — and
+  it is not gated.
+
+  Do **not** generate it from a local run. The committed baseline is
+  CI-measured by definition (`generated_from.runners` records the shard names),
+  and a local one would bake this machine's offset into the gate for everyone.
+
+  Established along the way, so you do not re-derive it:
+  - **The local/CI gap (#230) was mostly this bug.** The old local numbers sat
+    88–97% below a CI-generated baseline; the new ones are within ~2–3x of it.
+    Don't treat the remaining gap as the same phenomenon without re-measuring.
+  - **It did NOT reproduce on `main` within ±1.6% for the lance-11/DF-54
+    branch.** That branch measured a further 39–89% below `main` on one machine
+    because the upgrade moved more work onto the blocking pool. A same-machine
+    branch-vs-main comparison is still the right check; a branch-vs-baseline
+    delta on a foreign machine is not.
   - **The tmpfs theory is falsified.** `Uni::temporary()` honors `TMPDIR`; pointing
     it at a real disk changed nothing (−83.67% either way). Do not re-run that.
   - `--allow-foreign-machine` turns the improvement check off and still fails on
     regressions. It is a **diagnostic**, not the documented command: CI never
     passes it, and a local pass with it means "no regressions on this machine",
     not "the perf gate is green".
-  Why a GitHub runner measures ~10x more instructions for identical code is
-  unresolved and needs a CI run, not another local experiment. See #230.
+  - **`off-thr %` in `iai_cv.py`'s table is now a health check.** It should be
+    non-zero for anything touching Lance. All-zero means the instrumentation gate
+    stopped opening and the numbers are main-thread-only again.
+  - A large *and variable* off-thread share is a stability risk: a background
+    task landing inside the window is nondeterministic even when the work itself
+    is not. That is why `fixture_db` sets `auto_flush_interval: None` — the 5s
+    timer was adding ~700k instructions to 2 runs in 5.
 - **`cargo deny check` can go red with no change to this repo.** The advisory
   database floats, so a new RUSTSEC entry against a pinned transitive dep turns
   the lane red on a commit that passed yesterday. That is a real finding to

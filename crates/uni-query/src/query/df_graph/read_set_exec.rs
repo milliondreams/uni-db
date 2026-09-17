@@ -10,7 +10,6 @@
 //! reflects exactly the rows the query logically depended on rather than the
 //! wider set the scan physically touched. Compiled only with the `ssi` feature.
 
-use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -79,10 +78,6 @@ impl DisplayAs for ReadSetRecordingExec {
 impl ExecutionPlan for ReadSetRecordingExec {
     fn name(&self) -> &str {
         "ReadSetRecordingExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {

@@ -138,10 +138,6 @@ impl PartialEq<dyn Any> for ListComprehensionExecExpr {
 }
 
 impl PhysicalExpr for ListComprehensionExecExpr {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn data_type(&self, _input_schema: &Schema) -> Result<DataType> {
         // Always return LargeBinary (CypherValue encoding).
         // This is consistent with ALL other list-producing operations (reverse(),

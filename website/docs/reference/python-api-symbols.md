@@ -4,7 +4,7 @@
 
 # Python API — Symbol Reference
 
-Complete symbol surface of the `uni_db` Python bindings, **generated from `bindings/uni-db/uni_db/__init__.pyi`** at version 3.4.0.
+Complete symbol surface of the `uni_db` Python bindings, **generated from `bindings/uni-db/uni_db/__init__.pyi`** at version 4.0.0.
 
 This page is exhaustive and always in sync with the type stubs — it is regenerated in CI. For narrative documentation, worked examples and the recommended patterns, start at the [Python API guide](python-api.md).
 
@@ -245,7 +245,7 @@ An async query session with scoped variables.
 | `async pin_to_timestamp(epoch_secs: float) -> None` | — |
 | `async refresh() -> None` | — |
 | `async is_pinned() -> bool` | — |
-| `async add_hook(hook: Any) -> None` | — |
+| `async add_hook(name: str, hook: Any) -> None` | — |
 | `async remove_hook(name: str) -> bool` | — |
 | `async list_hooks() -> list[str]` | — |
 | `async clear_hooks() -> None` | — |
@@ -1313,7 +1313,7 @@ Configuration for Locy program evaluation.
 | `top_k_proofs() -> int` *(property)* | — |
 | `top_k_proofs_training() -> int | None` *(property)* | — |
 | `classifier_aliases() -> list[str]` *(property)* | — |
-| `register_classifier(alias: str, classifier: Callable[..., Any]) -> None` | — |
+| `register_classifier(alias: str, callable: Callable[..., Any]) -> None` | — |
 
 ---
 
@@ -1500,6 +1500,18 @@ A fluent binder for executing a prepared Locy program.
 
 ---
 
+## `PreparedQuery`
+
+A prepared Cypher query that can be executed multiple times.
+
+| Signature | Description |
+|---|---|
+| `execute(params: dict[str, Any] | None=None) -> QueryResult` | — |
+| `query_text() -> str` | — |
+| `bind() -> PreparedQueryBinder` | — |
+
+---
+
 ## `PreparedQueryBinder`
 
 A fluent binder for executing a prepared Cypher query.
@@ -1610,18 +1622,6 @@ Information about a property.
 | `nullable` | `bool` |
 | `is_indexed` | `bool` |
 | `description` | `str | None` |
-
----
-
-## `PyPreparedQuery`
-
-A prepared Cypher query that can be executed multiple times.
-
-| Signature | Description |
-|---|---|
-| `execute(params: dict[str, Any] | None=None) -> QueryResult` | — |
-| `query_text() -> str` | — |
-| `bind() -> PreparedQueryBinder` | — |
 
 ---
 
@@ -1836,7 +1836,7 @@ A query session with scoped variables.
 | `pin_to_timestamp(epoch_secs: float) -> None` | — |
 | `refresh() -> None` | — |
 | `is_pinned() -> bool` | — |
-| `add_hook(hook: Any) -> None` | — |
+| `add_hook(name: str, hook: Any) -> None` | — |
 | `remove_hook(name: str) -> bool` | — |
 | `list_hooks() -> list[str]` | — |
 | `clear_hooks() -> None` | — |
@@ -1953,7 +1953,7 @@ Builder for pre-configured session templates.
 |---|---|
 | `param(key: str, value: Any) -> SessionTemplateBuilder` | — |
 | `rules(program: str) -> SessionTemplateBuilder` | — |
-| `hook(hook: Any) -> SessionTemplateBuilder` | — |
+| `hook(name: str, hook: Any) -> SessionTemplateBuilder` | — |
 | `query_timeout(seconds: float) -> SessionTemplateBuilder` | — |
 | `transaction_timeout(seconds: float) -> SessionTemplateBuilder` | — |
 | `build() -> SessionTemplate` | — |

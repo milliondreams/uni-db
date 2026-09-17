@@ -34,7 +34,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Int64Array, RecordBatch};
+use arrow_array::{BinaryArray, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::execution::context::SessionContext;
@@ -59,7 +59,14 @@ fn pushdown_only_ctx() -> SessionContext {
 }
 
 fn fixture_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]))
+    Arc::new(Schema::new(vec![
+        Field::new("x", DataType::Int64, false),
+        // Exists solely so `explain_keeps_filter_for_inexpressible_predicate`
+        // can build a predicate whose *literal* the SQL unparser rejects
+        // (`ScalarValue::Binary`) while still type-checking. The other tests in
+        // this file project `x` explicitly and are unaffected.
+        Field::new("b", DataType::Binary, true),
+    ]))
 }
 
 async fn seed_storage() -> Arc<dyn Storage> {
@@ -67,7 +74,10 @@ async fn seed_storage() -> Arc<dyn Storage> {
     let schema = fixture_schema();
     let batch = RecordBatch::try_new(
         Arc::clone(&schema),
-        vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4, 5, 6, 7, 8]))],
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4, 5, 6, 7, 8])),
+            Arc::new(BinaryArray::from_opt_vec(vec![None; 8])),
+        ],
     )
     .expect("fixture batch");
     storage
@@ -159,17 +169,28 @@ async fn explain_keeps_filter_for_inexpressible_predicate() {
     let ctx = pushdown_only_ctx();
     register_memtable(&ctx).await;
 
-    // Construct: SELECT x FROM mem_table WHERE x IS DISTINCT FROM 5
-    // — `Operator::IsDistinctFrom` is one of the operators
-    // `datafusion::sql::unparser::expr_to_sql` rejects with
-    // `not_impl_err`, so the `StorageFilterPushdown` marker
-    // classifies the predicate as unencodable.
+    // Construct: SELECT x FROM mem_table WHERE b = <binary literal>.
+    // `datafusion::sql::unparser::expr_to_sql` rejects `ScalarValue::Binary`
+    // with `not_impl_err`, so the `StorageFilterPushdown` marker classifies the
+    // predicate as unencodable. (This used to use `Operator::IsDistinctFrom`,
+    // which DataFusion 54's unparser learned to render -- so the predicate
+    // became encodable, the rule correctly claimed it, and this negative guard
+    // failed with no bug to find. The `expr_to_sql` assertion below makes that
+    // drift loud instead: if upstream ever renders binary literals too, the
+    // test says the premise is stale rather than reporting a phantom
+    // regression.)
     let scan = ctx.table("mem_table").await.expect("mem_table");
-    let unencodable_predicate: Expr = Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr::new(
-        Box::new(col("x")),
-        datafusion::logical_expr::Operator::IsDistinctFrom,
-        Box::new(lit(5_i64)),
-    ));
+    let unencodable_predicate: Expr =
+        col("b").eq(lit(datafusion::common::ScalarValue::Binary(Some(vec![
+            0xDE, 0xAD,
+        ]))));
+
+    assert!(
+        datafusion::sql::unparser::expr_to_sql(&unencodable_predicate).is_err(),
+        "premise of this negative guard: the predicate must be one the SQL \
+         unparser cannot render. It now renders, so pick another predicate \
+         rather than relaxing the assertion below."
+    );
 
     // Build a Filter over the scan and run the optimizer manually so
     // we can inspect the post-rule logical plan without going through
@@ -243,7 +264,10 @@ async fn a_datafusion_memtable_avoids_the_storage_scan_exec() {
     let ctx = pushdown_only_ctx();
     let batch = RecordBatch::try_new(
         fixture_schema(),
-        vec![Arc::new(Int64Array::from(vec![6_i64, 7, 8]))],
+        vec![
+            Arc::new(Int64Array::from(vec![6_i64, 7, 8])),
+            Arc::new(BinaryArray::from_opt_vec(vec![None; 3])),
+        ],
     )
     .expect("fixture batch");
     let mem = datafusion::datasource::MemTable::try_new(fixture_schema(), vec![vec![batch]])

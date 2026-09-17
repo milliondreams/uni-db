@@ -1033,63 +1033,12 @@ async fn repro_19_traverse_target_pred_dropped() {
 // so they are unambiguous; the older repro_NN tests above reuse ad-hoc numbers.
 // ###########################################################################
 
-// ===========================================================================
-// FINDING [4] search_procedures.rs:1578 — run_hybrid_search swallows
-// auto_embed_text errors with unwrap_or_default(), silently dropping the dense
-// arm of a hybrid search when the vector index has no embedding_config.
-// ===========================================================================
-#[tokio::test]
-#[ignore = "repro for [4]: auto_embed error swallowed -> dense arm silently dropped instead of propagated"]
-async fn repro_find04_hybrid_autoembed_swallowed() {
-    use uni_common::core::schema::{
-        DistanceMetric, IndexDefinition, IndexMetadata, IndexStatus, JsonFtsIndexConfig,
-        VectorIndexConfig, VectorIndexType,
-    };
-    let h = Harness::new(|sm| {
-        sm.add_label("Doc").unwrap();
-        sm.add_property("Doc", "emb", DataType::Vector { dimensions: 3 }, true)
-            .unwrap();
-        sm.add_property("Doc", "body", DataType::String, true)
-            .unwrap();
-        // Vector index WITHOUT embedding_config -> auto_embed_text will error.
-        sm.add_index(IndexDefinition::Vector(VectorIndexConfig {
-            name: "doc_emb".into(),
-            label: "Doc".into(),
-            property: "emb".into(),
-            index_type: VectorIndexType::Flat,
-            metric: DistanceMetric::Cosine,
-            embedding_config: None,
-            metadata: IndexMetadata {
-                status: IndexStatus::Online,
-                ..Default::default()
-            },
-            default_refine_factor: None,
-        }))
-        .unwrap();
-        sm.add_index(IndexDefinition::JsonFullText(JsonFtsIndexConfig {
-            name: "doc_fts".into(),
-            label: "Doc".into(),
-            column: "body".into(),
-            paths: vec![],
-            with_positions: true,
-            metadata: Default::default(),
-        }))
-        .unwrap();
-    })
-    .await;
-    h.run_ok("CREATE (:Doc {body:'hello world'})").await;
-    // query_vector = null forces the dense arm through auto_embed_text, which
-    // errors (no embedding_config). Correct behavior: propagate the error.
-    let res = h
-        .run("CALL uni.search('Doc', {vector:'emb', fts:'body'}, 'hello world', null, 10) YIELD node, score RETURN node, score")
-        .await;
-    println!("[4] hybrid-search auto_embed-missing -> {res:?}");
-    // BUG: Ok (FTS-only) instead of Err propagating the auto-embed failure.
-    assert!(
-        res.is_err(),
-        "repro for [4]: dense-arm auto_embed error must propagate"
-    );
-}
+// FINDING [4] search_procedures.rs:1578 — run_hybrid_search swallowed
+// auto_embed_text errors, silently dropping the dense arm. FIXED, and the
+// repro that lived here was deleted 2026-09-15 as redundant: the fixing
+// commit added crates/uni/tests/common/bugs/repro_hybrid_dense_arm_swallow.rs
+// (`hybrid_search_propagates_auto_embed_failure`), which is not ignored, runs
+// in the default lane, and asserts the same thing from the same trigger.
 
 // ===========================================================================
 // FINDING [15] search_procedures.rs:182 — parse_reranker_options computes
@@ -1352,7 +1301,11 @@ async fn repro_find05_optional_var_suffix_eid() {
 // COPY FROM callers skip nulls, so those columns are silently dropped on import.
 // ===========================================================================
 #[tokio::test]
-#[ignore = "repro for [19]: COPY FROM parquet silently drops a Timestamp column (arrow_value_to_json -> Null)"]
+// Finding [19] is FIXED: arrow_value_to_json delegates to arrow_to_value
+// instead of the old StringArray-downcast catch-all. Un-ignored 2026-09-15 --
+// it passed while ignored, and no other test covers COPY FROM preserving a
+// Timestamp column (the fixing commit added tests only for the uni-store
+// sibling findings).
 async fn repro_find19_copy_from_drops_timestamp() {
     use arrow_array::{ArrayRef, RecordBatch, StringArray, TimestampNanosecondArray};
     use arrow_schema::{DataType as ArrowDT, Field, Schema, TimeUnit};
@@ -1685,7 +1638,9 @@ fn build_locy_plan(
 // the HAVING filter entirely. This is observable at the uni-query planner layer.
 // ===========================================================================
 #[tokio::test]
-#[ignore = "repro for [34]: HAVING on the FOLD (non-first) clause is dropped because build_rule reads clause[0].having"]
+// Finding [34] is FIXED: build_rule reads the FOLD-bearing clause rather than
+// clause[0]. Un-ignored 2026-09-15 -- it passed while ignored, and no other
+// test builds the base-clause + FOLD-clause-carrying-HAVING shape it pins.
 async fn repro_find34_having_from_first_clause_only() {
     use uni_query::query::planner::LogicalPlan;
     let h = Harness::new_schemaless().await;

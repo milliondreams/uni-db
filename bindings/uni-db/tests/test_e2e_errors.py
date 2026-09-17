@@ -201,9 +201,15 @@ def test_bulk_writer_commit_after_abort(social_db):
         writer.commit()
 
 
-@pytest.mark.xfail(reason="BulkWriter abort after empty commit does not raise")
 def test_bulk_writer_abort_after_commit(social_db):
-    """Aborting after commit should raise RuntimeError."""
+    """Aborting after commit raises; aborting twice does not.
+
+    Was `xfail`ed: the PyO3 wrapper held `Mutex<Option<BulkWriter>>`, so
+    "already committed" and "already aborted" were the same `None` and abort
+    silently succeeded. The wrapper now tracks which one it is
+    (bindings/uni-db/src/builders.rs::BulkWriterState), which also makes
+    uni-bulk's own "Cannot abort: bulk load already committed" reachable.
+    """
     session = social_db.session()
     tx = session.tx()
     writer = tx.bulk_writer().build()

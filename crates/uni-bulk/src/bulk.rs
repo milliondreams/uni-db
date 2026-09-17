@@ -485,6 +485,19 @@ impl BulkWriter {
             .ok_or_else(|| UniError::LabelNotFound {
                 label: label.to_string(),
             })?;
+
+        // An empty insert is a no-op, and must not mark the label touched.
+        // `flush_vertices_buffer` never creates `vertices_<label>` for an empty
+        // buffer, but `commit` counts rows for every touched label with a hard
+        // `?` -- so marking it here made a zero-row insert fail the whole commit
+        // with `open table 'vertices_<label>'`. It also fed `labels_to_rebuild`,
+        // scheduling an index rebuild for a label with no new rows. The label
+        // check above still runs, so an empty insert against an unknown label
+        // is still an error.
+        if vertices.is_empty() {
+            return Ok(Vec::new());
+        }
+
         // Validate constraints before buffering (if enabled)
         if self.config.validate_constraints {
             self.validate_vertex_batch_constraints(label, &vertices)
@@ -1041,6 +1054,14 @@ impl BulkWriter {
             .ok_or_else(|| UniError::EdgeTypeNotFound {
                 edge_type: edge_type.to_string(),
             })?;
+
+        // Empty insert is a no-op -- see the note in `insert_vertices`. The edge
+        // count loop in `commit` happens to tolerate a missing table (`if let
+        // Ok(count)`) where the vertex loop does not, so this path did not fail
+        // the same way; guarding both keeps `touched_edge_types` honest.
+        if edges.is_empty() {
+            return Ok(Vec::new());
+        }
 
         // Allocate EIDs in one IdAllocator mutex acquisition.
         let eids = {

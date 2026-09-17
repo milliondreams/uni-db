@@ -1069,14 +1069,24 @@ mod tests {
         assert_eq!(rt.block_on(sql_rids(&ds, &sql)).unwrap(), vec![1, 2, 3]);
 
         // What the old fused form did. `"createdAt"` is the string literal
-        // `'createdAt'`, so the clause is a constant: which constant depends on
-        // the operator (`>` matched every row in isolation, this two-sided form
-        // matches none), but it never depends on the data.
+        // `'createdAt'`, never an identifier. On lance 7 that made the clause a
+        // data-independent constant — `>` matched every row in isolation, this
+        // two-sided form matched none — which is exactly how the fusion shipped
+        // a silent wrong answer. Lance 11 rejects it instead: the literal is
+        // typed as a string and fails to cast against the Int64 column.
+        //
+        // The guard still bites either way. If a double quote ever started
+        // meaning "identifier", this would return the real rows [1, 2, 3]
+        // rather than erroring, and the assertion fails.
         let quoted = "\"createdAt\" >= 2 AND \"createdAt\" <= 4";
-        assert_eq!(
-            rt.block_on(sql_rids(&ds, quoted)).unwrap(),
-            Vec::<u64>::new(),
-            "a double-quoted column is a string literal, not an identifier"
+        let err = rt
+            .block_on(sql_rids(&ds, quoted))
+            .expect_err("a double-quoted column is a string literal, not an identifier");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Cast error") && msg.contains("createdAt"),
+            "expected the string literal 'createdAt' to fail its cast to the \
+             Int64 column, got: {msg}"
         );
     }
 }

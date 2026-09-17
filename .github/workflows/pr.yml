@@ -505,8 +505,16 @@ jobs:
       # green check, so it verifies itself in the same job that trusts it. No
       # lane runs tests under scripts/, so a test file alone would never execute
       # — which is the shape the gate was found to have.
-      - name: Self-check the gate
-        run: python3 scripts/perf/test_iai_gate.py
+      #
+      # The collector gets the same treatment, and needs it more: it decides what
+      # every number downstream means, and it has reported a confident zero
+      # twice — once dropping `baseline_noop` from the original pilot, once
+      # reading a degenerate `summary: 0` as the instruction count for the whole
+      # suite. A gate is only as honest as the numbers fed to it.
+      - name: Self-check the gate and the collector
+        run: |
+          python3 scripts/perf/test_iai_gate.py
+          python3 scripts/perf/test_iai_collect.py
 
       # Thresholds are explicit arguments — iai_gate.py has no defaults — so the
       # number a build fails on is visible here and traceable to the measurement
@@ -819,6 +827,28 @@ jobs:
       - name: Run Python tests (uni-db)
         working-directory: bindings/uni-db
         run: uv run pytest tests/ -v -n auto
+
+      # `stubtest` imports the compiled extension and diffs `__init__.pyi`
+      # against it, signatures included. `tests/test_stub_drift.py` checks the
+      # same four directions but builds its stub surface from `ast.ClassDef`
+      # nodes only, so a module-level alias falls outside what it compares --
+      # which is how `PreparedQuery = PyPreparedQuery`, an alias that never
+      # existed at runtime, passed it while `from uni_db import PreparedQuery`
+      # raised ImportError. The two are complementary: keep both.
+      #
+      # `--ignore-unused-allowlist` is required, not cosmetic: ci.yml's
+      # `python-wasm-tests` runs this same allowlist against a
+      # `--features wasm-plugins,extism-plugins` build, where the four
+      # cfg'd-out wasm entries below are present and so go unused.
+      - name: Check stub against built module (stubtest, uni-db)
+        working-directory: bindings/uni-db
+        run: |
+          uv run python -m mypy.stubtest uni_db \
+            --mypy-config-file stubtest-mypy.ini \
+            --allowlist stubtest-allowlist.txt \
+            --ignore-unused-allowlist \
+            --ignore-positional-only \
+            --ignore-disjoint-bases
 
       # The `uni-plugin-pyo3` Rust tests only exist under `--features pyo3`, and
       # every one of its source files is `#![cfg(feature = "pyo3")]`. The

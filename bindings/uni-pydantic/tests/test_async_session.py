@@ -386,3 +386,16 @@ class TestAsyncEagerLoad:
         # Must not raise: with no cache entry the descriptor would fall through
         # to the async lazy path, which raises on principle.
         assert untagged.tags == []
+
+
+class TestAsyncExplainAndProfileReachTheBuilder:
+    """Async twin of ``TestExplainAndProfileReachTheBuilder``; see session.py."""
+
+    async def test_explain_returns_a_plan(self, async_session):
+        out = await async_session.explain("MATCH (n) RETURN n")
+        assert out is not None
+
+    async def test_profile_returns_results_and_stats(self, async_session):
+        result, stats = await async_session.profile("MATCH (n) RETURN n")
+        assert result is not None
+        assert stats is not None

@@ -20,7 +20,6 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Pla
 use datafusion::scalar::ScalarValue;
 use futures::Stream;
 use smol_str::SmolStr;
-use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::pin::Pin;
@@ -370,10 +369,6 @@ impl DisplayAs for FoldExec {
 impl ExecutionPlan for FoldExec {
     fn name(&self) -> &str {
         "FoldExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {
@@ -849,6 +844,10 @@ impl RecordBatchStream for FoldStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the test-local `LocyAggState` impl below still needs `Any`; the
+    // production `ExecutionPlan` impl lost its `as_any` in DataFusion 54.
+    use std::any::Any;
+
     use arrow_array::{Float64Array, Int64Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::datasource::memory::MemorySourceConfig;
@@ -2423,9 +2422,12 @@ mod tests {
     }
 
     impl uni_plugin::traits::locy::LocyAggState for RangeState {
-        fn as_any(&self) -> &dyn std::any::Any {
+        // `LocyAggState` is our own plugin trait and still declares `as_any`;
+        // only DataFusion's traits dropped it in 54.
+        fn as_any(&self) -> &dyn Any {
             self
         }
+
         fn ingest_indices(
             &mut self,
             col: &dyn Array,

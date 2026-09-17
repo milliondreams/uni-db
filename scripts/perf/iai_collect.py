@@ -11,6 +11,13 @@ iai-callgrind's own summary output. Three reasons:
    and comparing the main thread against the rest reveals work that escaped the
    collection toggle — which is the failure mode that made the first Phase 0B
    run report ``Collected: 0`` on every target while exiting successfully.
+
+   The bench is now instrumentation-gated rather than collection-toggled (see
+   ``crates/uni/benches/hot_paths_iai.rs``), so the off-main-thread column
+   should be **non-zero** for any target that touches Lance: lance dispatches
+   onto tokio's blocking pool via ``spawn_cpu``. An ``off-thr %`` of 0.0 across
+   the board means the instrumentation gate stopped working and the numbers are
+   main-thread-only again.
 3. It needs no flags on the bench invocation, so a plain ``cargo bench`` is
    enough.
 
@@ -40,22 +47,67 @@ THREAD_RE = re.compile(r"\.t(\d+)\.p\d+\.out$")
 def parse_out_file(path: Path) -> tuple[int, list[str]]:
     """Returns (instruction count, event names) for one callgrind output file.
 
-    The ``summary:`` line carries space-separated counts positionally matching
-    the preceding ``events:`` line; ``Ir`` (instructions retired) is the metric
-    an instruction-count gate is built on.
+    Both ``totals:`` and ``summary:`` carry space-separated counts positionally
+    matching the preceding ``events:`` line; ``Ir`` (instructions retired) is the
+    metric an instruction-count gate is built on.
+
+    ``totals:`` is preferred, and that preference is load-bearing rather than
+    cosmetic. ``summary:`` is the cost of one dump part while ``totals:`` is the
+    cost of the whole file, and under the instrumentation-gated configuration in
+    ``crates/uni/benches/hot_paths_iai.rs`` callgrind writes a *degenerate*
+    ``summary: 0`` — a single value where ``events:`` declares nine — next to a
+    well-formed ``totals:``. Reading ``summary:`` there yields 0 for every
+    benchmark while the real counts sit in the same file.
+
+    A line is usable only if it is callgrind's bare ``0`` shorthand for a thread
+    that collected nothing, or carries one value per declared event. Anything in
+    between is degenerate and raises rather than being read positionally: the
+    previous ``counts[idx] if idx < len(counts) else 0`` turned exactly that
+    inconsistency into a plausible-looking measurement, which is the one failure
+    mode this whole pipeline is built to make impossible. Note that indexing
+    alone is not a sufficient guard — ``Ir`` is the first event, so
+    ``idx < len(counts)`` holds for *any* non-empty line, including ``0``.
     """
     events: list[str] = []
+    found: dict[str, list[int]] = {}
     with path.open() as fh:
         for line in fh:
             if line.startswith("events:"):
                 events = line.split(":", 1)[1].split()
-            elif line.startswith("summary:"):
-                counts = [int(x) for x in line.split(":", 1)[1].split()]
+                continue
+            for key in ("totals:", "summary:"):
+                if not line.startswith(key):
+                    continue
                 if not events:
-                    raise ValueError(f"{path}: summary before events")
-                idx = events.index("Ir") if "Ir" in events else 0
-                return (counts[idx] if idx < len(counts) else 0), events
-    # A file with no summary line collected nothing.
+                    raise ValueError(f"{path}: {key.rstrip(':')} before events")
+                # Last occurrence wins: callgrind may write one per dump part.
+                found[key] = [int(x) for x in line.split(":", 1)[1].split()]
+
+    idx = events.index("Ir") if "Ir" in events else 0
+    # `totals:` is authoritative for the file, so it is consulted alone when
+    # present. Falling back to `summary:` after an unusable `totals:` would be
+    # the same fail-open in a narrower dress: under instrumentation gating
+    # `summary: 0` is a legitimate all-zero line, so the fallback would quietly
+    # convert a malformed authoritative line into a confident zero.
+    for key in ("totals:", "summary:"):
+        if key not in found:
+            continue
+        counts = found[key]
+        # Callgrind writes a bare `0` as shorthand for "collected nothing" —
+        # real, and common, since most worker threads do no work in the measured
+        # window. Anything else must carry one value per declared event; a
+        # shorter line is degenerate and must not be read positionally.
+        if counts == [0]:
+            return 0, events
+        if len(counts) == len(events):
+            return counts[idx], events
+        raise ValueError(
+            f"{path}: '{key.rstrip(':')}' has {len(counts)} value(s) against "
+            f"{len(events)} declared events {events} — refusing to read it "
+            f"positionally or to report this as zero"
+        )
+
+    # No cost line at all: a thread that genuinely collected nothing.
     return 0, events
 
 

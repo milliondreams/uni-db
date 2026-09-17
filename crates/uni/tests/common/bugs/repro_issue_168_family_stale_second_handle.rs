@@ -129,14 +129,24 @@ async fn second_handle_observes_label_added_elsewhere() -> Result<()> {
 /// `catalog/fork_registry.json`, refreshed only by the local handle's own fork
 /// lifecycle calls.
 ///
-/// CONFIRMED and deliberately left failing-but-ignored: unlike the CSR, whether
-/// this *should* work is a design question rather than a defect. The registry
-/// is documented as single-writer — every mutation goes through
-/// `ForkRegistryHandle`'s 2PC state machine — so reloading the cache from disk
-/// on read would need to be reconciled with that protocol, not just bolted on.
-/// Pinned here so the decision is explicit and the test is ready when it is
-/// made. Follows the repo convention for deferred findings.
-#[ignore = "confirmed; needs a design call on multi-handle fork-registry visibility"]
+/// DECIDED 2026-09-15: not supported, and documented as such on
+/// `Uni::list_forks` (crates/uni/src/api/fork_admin.rs). Multi-handle fork
+/// administration on one store is outside the supported model — every registry
+/// mutation goes through `ForkRegistryHandle`'s 2PC state machine as the single
+/// writer, so refreshing the cache from disk on a read has to be reconciled
+/// with that protocol rather than bolted on, and the scenario is rare enough
+/// not to justify that.
+///
+/// Kept ignored rather than deleted, and kept asserting the *supported*
+/// behaviour rather than flipped to pin the current one. Two reasons: flipping
+/// it would make a green test out of a limitation, and this repo has just had
+/// to retire five bug-pinning labels that rotted exactly that way. If the
+/// decision is ever revisited, the test is already written.
+///
+/// Worth knowing when reading this: the two tests above — schema and property
+/// visibility — have the identical shape and DO pass. The fork registry is the
+/// only one of the three that does not propagate across handles.
+#[ignore = "unsupported by design: multi-handle fork-registry visibility; see Uni::list_forks rustdoc"]
 #[tokio::test]
 async fn second_handle_observes_fork_created_elsewhere() -> Result<()> {
     let dir = tempfile::tempdir()?;

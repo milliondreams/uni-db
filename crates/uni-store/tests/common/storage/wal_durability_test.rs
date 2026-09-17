@@ -986,9 +986,17 @@ async fn unique_constraint_survives_wal_recovery() {
         );
         wal.initialize().await.unwrap();
         let writer = Arc::new(
-            Writer::new_with_config(storage, schema, 1, no_autoflush_config(), Some(wal), None)
-                .await
-                .unwrap(),
+            Writer::new_with_config(
+                storage,
+                schema,
+                1,
+                no_autoflush_config(),
+                Some(wal),
+                None,
+                None,
+            )
+            .await
+            .unwrap(),
         );
 
         // 2. Insert Person { email: "a@x" } inside a transaction and commit so it
@@ -1023,9 +1031,17 @@ async fn unique_constraint_survives_wal_recovery() {
     );
     let wal_max = wal.initialize().await.unwrap();
     let writer = Arc::new(
-        Writer::new_with_config(storage, schema, 1, no_autoflush_config(), Some(wal), None)
-            .await
-            .unwrap(),
+        Writer::new_with_config(
+            storage,
+            schema,
+            1,
+            no_autoflush_config(),
+            Some(wal),
+            None,
+            None,
+        )
+        .await
+        .unwrap(),
     );
     let replayed = writer.replay_wal(0).await.unwrap();
     assert!(
@@ -1108,6 +1124,7 @@ async fn commit_writes_each_mutation_to_wal_exactly_once() -> Result<()> {
             1,
             no_autoflush,
             Some(wal),
+            None,
             None,
         )
         .await?,

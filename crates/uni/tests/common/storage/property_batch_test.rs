@@ -41,6 +41,7 @@ async fn test_property_batch_loading() -> anyhow::Result<()> {
         UniConfig::default(),
         None,
         None,
+        None,
     )
     .await
     .unwrap();

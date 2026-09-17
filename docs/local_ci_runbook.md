@@ -613,86 +613,47 @@ cargo metadata --format-version=1 --manifest-path bindings/uni-db-cuda/Cargo.tom
   like a code failure. Capture the status and stop if it is non-zero.
 - **Reranker real-ONNX tests** need network (HF). A flaky download is an infra failure, not a code
   failure — re-run before concluding.
-- **`docs/perf/iai-baseline.json` is STALE and the gate will fail against it
-  until it is regenerated on CI.** This is expected, not a regression — the
-  metric's definition changed on 2026-09-16 and every number moved.
+- **`docs/perf/iai-baseline.json` was regenerated 2026-09-17 and gates only 3
+  targets.** The bench now bounds its measured region with Callgrind
+  *instrumentation* (process-global) rather than *collection* (per-thread), so
+  work Lance hands to tokio's blocking pool through `spawn_cpu` is counted. Two
+  targets failed the pilot's CV < 1.0% rule under the honest metric and are
+  recorded ungated with their own reasons: `parse_and_plan_cold` (cross-runner
+  CV 1.60%) and `property_read_across_l0_l1` (2.25%, bimodal across runner
+  populations, ~6.5% split).
 
-  `hot_paths_iai.rs` used to bound its measured region with Callgrind's
-  `--toggle-collect` entry point. Collection state is **per-thread**, so work
-  Lance hands to tokio's blocking pool via `lance_core::utils::tokio::spawn_cpu`
-  was never counted. The bench now gates **instrumentation** instead, which is
-  process-global, so every thread is counted for the region under test. What this
-  changed, measured on one box:
-
-  | target | old (toggle) | new (instr-gated) | off-thread share |
-  |---|---:|---:|---:|
-  | `vertex_lookup_by_id` | 789,717 | 8,828,929 | 0.4% |
-  | `expand_batch_one_hop_warm` | 815,662 | 18,799,374 | 0.1% |
-  | `hnsw_top10_search` | 753,718 | 17,830,813 | 7.0% |
-  | `l0_to_l1_flush` | 814,852 | 57,725,521 | **57.6%** |
-
-  Regenerate with the **`perf-qualify.yml`** workflow (`workflow_dispatch`, 5
-  `ubuntu-xlarge` shards), download the `iai-shard-*` artifacts, then:
-
-  `--gate` takes the **fully-qualified** name including the bench id, so
-  `read_paths::vertex_lookup_by_id.by_id`, not `read_paths::vertex_lookup_by_id`
-  — the short form is rejected with "names targets absent from the samples":
+  To regenerate it after a metric change, dispatch **`perf-qualify.yml`** and
+  rebuild from its artifacts. `--gate` takes the **fully-qualified** name
+  including the bench id (`read_paths::vertex_lookup_by_id.by_id`); the short
+  form is rejected. `--reason` is stamped on every non-gated target except the
+  `baselines::` pair, and `--reason-for TARGET=REASON` overrides it per target —
+  demotions have different causes and one shared string misattributes at least
+  one of them.
 
   ```bash
-  gh workflow run "Perf Qualify (cross-runner iai)" --ref <branch-with-the-fix>
-  gh run download <run-id> --pattern 'iai-shard-*' --dir shards
-
-  python3 scripts/perf/iai_baseline.py shards/iai-shard-* \
-    --out docs/perf/iai-baseline.json \
-    --gate read_paths::parse_and_plan_cold.cold \
-    --gate read_paths::vertex_lookup_by_id.by_id \
-    --gate read_paths::expand_batch_one_hop_warm.warm \
-    --gate read_paths::property_read_across_l0_l1.l0_over_l1 \
-    --gate read_paths::hnsw_top10_search.top10 \
-    --reason "IO-dominant: rejected by the qualification pilot's wall-clock-correlation leg (2026-08-12), not by variance"
+  gh workflow run "Perf Qualify (cross-runner iai)" --repo rustic-ai/uni-db --ref main
+  gh run view <run-id> --repo rustic-ai/uni-db   # 5 shards must RUN, not skip
+  gh run download <run-id> --repo rustic-ai/uni-db --pattern 'iai-shard-*' --dir shards
+  python3 scripts/perf/iai_cross_runner.py shards/iai-shard-*   # qualify BEFORE gating
+  python3 scripts/perf/iai_baseline.py shards/iai-shard-* --out docs/perf/iai-baseline.json \
+    --gate ... --reason "..." --reason-for "target=..."
   ```
 
-  `--reason` is not optional in practice: it is stamped on every non-gated
-  target except the `baselines::` pair (which get their own hardcoded text), and
-  its default is the generic "not qualified by the instruction-count pilot".
-  Omitting it silently replaces the `write_paths::*` entries' explanation — that
-  they were rejected on wall-clock correlation, *not* on variance — which is the
-  one fact stopping someone from "fixing" them by tightening a threshold.
+  Never generate it from a local run: the committed baseline is CI-measured by
+  definition, and a local one bakes this machine's offset into the gate for
+  everyone.
 
-  **The gated set is inherited, not re-derived.** Qualification has two legs,
-  stability and wall-clock correlation. The instrumentation-gating change altered
-  what is measured, so strictly both legs apply to a new metric. Stability has
-  been re-verified (all 9 targets CV < 0.9%); **the correlation leg has not been
-  re-run.** Keeping the same 5 gated targets assumes it still holds. The target
-  whose character changed most is `l0_to_l1_flush` — now 57.9% off-thread — and
-  it is not gated.
-
-  Do **not** generate it from a local run. The committed baseline is
-  CI-measured by definition (`generated_from.runners` records the shard names),
-  and a local one would bake this machine's offset into the gate for everyone.
-
-  Established along the way, so you do not re-derive it:
-  - **The local/CI gap (#230) was mostly this bug.** The old local numbers sat
-    88–97% below a CI-generated baseline; the new ones are within ~2–3x of it.
-    Don't treat the remaining gap as the same phenomenon without re-measuring.
-  - **It did NOT reproduce on `main` within ±1.6% for the lance-11/DF-54
-    branch.** That branch measured a further 39–89% below `main` on one machine
-    because the upgrade moved more work onto the blocking pool. A same-machine
-    branch-vs-main comparison is still the right check; a branch-vs-baseline
-    delta on a foreign machine is not.
-  - **The tmpfs theory is falsified.** `Uni::temporary()` honors `TMPDIR`; pointing
-    it at a real disk changed nothing (−83.67% either way). Do not re-run that.
-  - `--allow-foreign-machine` turns the improvement check off and still fails on
-    regressions. It is a **diagnostic**, not the documented command: CI never
-    passes it, and a local pass with it means "no regressions on this machine",
-    not "the perf gate is green".
-  - **`off-thr %` in `iai_cv.py`'s table is now a health check.** It should be
-    non-zero for anything touching Lance. All-zero means the instrumentation gate
-    stopped opening and the numbers are main-thread-only again.
-  - A large *and variable* off-thread share is a stability risk: a background
-    task landing inside the window is nondeterministic even when the work itself
-    is not. That is why `fixture_db` sets `auto_flush_interval: None` — the 5s
-    timer was adding ~700k instructions to 2 runs in 5.
+  Three things worth knowing, so they are not re-derived:
+  - **Qualify on the CROSS-runner column, not the within-runner one.**
+    `iai_cross_runner.py` prints both and says so; the gate compares one
+    runner's run against a baseline pooled across five.
+  - **`off-thr %` is a health check.** Non-zero for anything touching Lance;
+    all-zero means the instrumentation gate stopped opening and the numbers are
+    main-thread-only again.
+  - **The local/CI ~10x gap (#230) was mostly the attribution bug.** This box now
+    lands within 1.0-2.3x of CI, not 88-97% below. Do not treat the residual as
+    the same phenomenon without re-measuring. `--allow-foreign-machine` remains a
+    diagnostic, never the documented command.
 - **`cargo deny check` can go red with no change to this repo.** The advisory
   database floats, so a new RUSTSEC entry against a pinned transitive dep turns
   the lane red on a commit that passed yesterday. That is a real finding to

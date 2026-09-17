@@ -51,8 +51,9 @@ async fn make_writer_with_config(config: UniConfig) -> Result<(Arc<Writer>, Temp
     schema_manager.add_label("Counter")?;
     schema_manager.save().await?;
     let storage = Arc::new(StorageManager::new(path, schema_manager.clone()).await?);
-    let writer =
-        Arc::new(Writer::new_with_config(storage, schema_manager, 1, config, None, None).await?);
+    let writer = Arc::new(
+        Writer::new_with_config(storage, schema_manager, 1, config, None, None, None).await?,
+    );
     Ok((writer, dir))
 }
 
@@ -74,8 +75,9 @@ async fn make_writer_unique(config: UniConfig) -> Result<(Arc<Writer>, TempDir)>
     })?;
     schema_manager.save().await?;
     let storage = Arc::new(StorageManager::new(path, schema_manager.clone()).await?);
-    let writer =
-        Arc::new(Writer::new_with_config(storage, schema_manager, 1, config, None, None).await?);
+    let writer = Arc::new(
+        Writer::new_with_config(storage, schema_manager, 1, config, None, None, None).await?,
+    );
     Ok((writer, dir))
 }
 

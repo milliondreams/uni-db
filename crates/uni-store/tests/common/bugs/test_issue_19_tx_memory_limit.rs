@@ -44,6 +44,7 @@ async fn create_test_writer(config: UniConfig) -> Result<Writer> {
         config,
         Some(wal),
         None,
+        None,
     )
     .await?;
 

@@ -85,6 +85,7 @@ async fn test_overlay_neighbors_via_writer() -> anyhow::Result<()> {
         UniConfig::default(),
         None,
         None,
+        None,
     )
     .await?;
 

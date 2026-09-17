@@ -1806,13 +1806,48 @@ impl UniBuilder {
                     )));
                 }
             } else if has_wal {
-                // WAL exists but no manifests at all — data exists but unrecoverable version
-                return Err(UniError::Internal(anyhow::anyhow!(
-                    "Database has WAL segments but no snapshot manifest. \
-                     Cannot safely determine version counter -- starting at 0 would cause \
-                     version conflicts and data corruption. \
-                     Restore the snapshot manifest or delete WAL to start fresh."
-                )));
+                // WAL and no manifests. Two very different situations share this
+                // shape, and which one it is turns on whether any L1 data exists:
+                //
+                // * **Never flushed** (issue #275). The manifest is written only
+                //   by a flush, so a crash inside the first-flush window — the
+                //   `auto_flush_interval` default is 5s — leaves exactly this.
+                //   There are no tables, so there are no versions on disk for a
+                //   counter starting at 0 to collide with, and the WAL is the
+                //   whole truth. Refusing here made every committed write in a
+                //   brand-new store permanently unreachable, and the error's own
+                //   advice ("delete WAL to start fresh") discarded it.
+                //
+                // * **Lost manifests** (issue #72). L1 holds rows whose versions
+                //   came from a counter this open cannot reconstruct: the WAL is
+                //   truncated at each flush, so its records do not bound what L1
+                //   already used. `replay_mutations` assigns *fresh* versions
+                //   rather than reusing the recorded ones, so replaying from 0
+                //   over existing L1 data collides silently. That still fails.
+                //
+                // `table_names()` is the discriminator the old guard lacked: it
+                // asked "manifests?" and "WAL?" but never "is there any L1 data?".
+                let tables = storage
+                    .backend()
+                    .table_names()
+                    .await
+                    .map_err(UniError::Internal)?;
+                if tables.is_empty() {
+                    tracing::info!(
+                        "No snapshot manifest and no tables: recovering a store that \
+                         crashed before its first flush. Replaying WAL from version 0."
+                    );
+                    (0, 0)
+                } else {
+                    return Err(UniError::Internal(anyhow::anyhow!(
+                        "Database has WAL segments and {} table(s) but no snapshot \
+                         manifest. Cannot safely determine version counter -- starting \
+                         at 0 would reuse versions already present in those tables and \
+                         corrupt data. Restore the snapshot manifest or delete WAL to \
+                         start fresh.",
+                        tables.len()
+                    )));
+                }
             } else {
                 // Truly fresh database
                 (0, 0)
@@ -1854,6 +1889,7 @@ impl UniBuilder {
                 self.config.clone(),
                 wal,
                 Some(allocator),
+                None,
             )
             .await
             .map_err(UniError::Internal)?,

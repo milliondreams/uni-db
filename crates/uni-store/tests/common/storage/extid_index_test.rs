@@ -153,6 +153,7 @@ async fn extid_uniqueness_survives_wal_recovery() -> Result<()> {
                 no_autoflush.clone(),
                 Some(wal),
                 None,
+                None,
             )
             .await?,
         );
@@ -169,7 +170,16 @@ async fn extid_uniqueness_survives_wal_recovery() -> Result<()> {
     let storage = Arc::new(StorageManager::new(path, schema_manager.clone()).await?);
     let wal = Arc::new(WriteAheadLog::new(store, ObjectStorePath::from("wal")));
     let writer = Arc::new(
-        Writer::new_with_config(storage, schema_manager, 1, no_autoflush, Some(wal), None).await?,
+        Writer::new_with_config(
+            storage,
+            schema_manager,
+            1,
+            no_autoflush,
+            Some(wal),
+            None,
+            None,
+        )
+        .await?,
     );
     let replayed = writer.replay_wal(0).await?;
     assert!(

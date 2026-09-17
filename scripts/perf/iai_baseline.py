@@ -62,6 +62,17 @@ def main() -> int:
         help="reason recorded against every non-gated target",
     )
     ap.add_argument(
+        "--reason-for",
+        action="append",
+        default=[],
+        metavar="TARGET=REASON",
+        help="reason for one specific non-gated target, overriding --reason; "
+        "repeatable. Targets are demoted for different causes -- IO-dominance "
+        "versus cross-runner instability, say -- and a single shared string "
+        "would misattribute at least one of them, which is how a demotion "
+        "outlives the condition that caused it.",
+    )
+    ap.add_argument(
         "--allow-unusable",
         action="store_true",
         help="write the baseline even if collection gaps or zero-instruction "
@@ -102,6 +113,27 @@ def main() -> int:
         print(f"--gate names targets absent from the samples: {sorted(unknown)}", file=sys.stderr)
         return 1
 
+    reason_for: dict[str, str] = {}
+    for pair in args.reason_for:
+        target, sep, reason = pair.partition("=")
+        if not sep or not reason:
+            print(f"--reason-for expects TARGET=REASON, got: {pair!r}", file=sys.stderr)
+            return 1
+        reason_for[target] = reason
+    # A typo here would silently fall back to the generic --reason, leaving a
+    # demoted target labelled with someone else's justification.
+    stray = set(reason_for) - set(pooled)
+    if stray:
+        print(f"--reason-for names targets absent from the samples: {sorted(stray)}", file=sys.stderr)
+        return 1
+    contradictory = set(reason_for) & gated
+    if contradictory:
+        print(
+            f"--reason-for names gated targets, which carry no reason: {sorted(contradictory)}",
+            file=sys.stderr,
+        )
+        return 1
+
     targets: dict[str, dict] = {}
     for target in sorted(pooled):
         values = pooled[target]
@@ -114,7 +146,7 @@ def main() -> int:
         if target.startswith(EXCLUDED_PREFIX):
             entry["reason"] = "calibration baseline; too small to gate"
         elif target not in gated:
-            entry["reason"] = args.reason
+            entry["reason"] = reason_for.get(target, args.reason)
         targets[target] = entry
 
     doc = {

@@ -42,7 +42,6 @@ use datafusion::physical_plan::metrics::{
 };
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::Stream;
-use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::pin::Pin;
@@ -511,10 +510,6 @@ impl DisplayAs for GraphScanExec {
 impl ExecutionPlan for GraphScanExec {
     fn name(&self) -> &str {
         "GraphScanExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {
@@ -1080,7 +1075,7 @@ fn extract_vid_from_physical_filter(filter: &Arc<dyn PhysicalExpr>) -> Option<u6
     use datafusion::physical_expr::expressions::BinaryExpr;
 
     // Try to match this expression as `_vid = literal`
-    if let Some(bin) = filter.as_any().downcast_ref::<BinaryExpr>() {
+    if let Some(bin) = filter.downcast_ref::<BinaryExpr>() {
         if bin.op() == &Operator::Eq {
             // Check both directions: col = lit and lit = col
             if let Some(vid) = try_extract_vid_eq(bin.left(), bin.right()) {
@@ -1111,19 +1106,19 @@ fn try_extract_vid_eq(
     use datafusion::physical_expr::expressions::{CastExpr, Column, Literal};
 
     // Check that col_side is Column("_vid") or Column("variable._vid")
-    let col = col_side.as_any().downcast_ref::<Column>()?;
+    let col = col_side.downcast_ref::<Column>()?;
     if col.name() != "_vid" && !col.name().ends_with("._vid") {
         return None;
     }
 
     // Try direct literal
-    if let Some(lit) = val_side.as_any().downcast_ref::<Literal>() {
+    if let Some(lit) = val_side.downcast_ref::<Literal>() {
         return scalar_to_u64(lit.value());
     }
 
     // Try CAST(literal AS UInt64)
-    if let Some(cast) = val_side.as_any().downcast_ref::<CastExpr>()
-        && let Some(lit) = cast.expr().as_any().downcast_ref::<Literal>()
+    if let Some(cast) = val_side.downcast_ref::<CastExpr>()
+        && let Some(lit) = cast.expr().downcast_ref::<Literal>()
     {
         return scalar_to_u64(lit.value());
     }

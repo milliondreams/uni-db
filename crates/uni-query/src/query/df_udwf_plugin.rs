@@ -12,7 +12,6 @@
 //! v1 evaluates over the **whole partition** (each row's frame spans the entire
 //! partition); explicit `ROWS`/`RANGE` frame narrowing is not yet forwarded.
 
-use std::any::Any;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -75,9 +74,6 @@ impl Hash for PluginWindowUdwf {
 }
 
 impl WindowUDFImpl for PluginWindowUdwf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         &self.name
     }

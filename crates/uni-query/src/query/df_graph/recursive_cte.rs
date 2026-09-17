@@ -31,7 +31,6 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Pla
 use datafusion::prelude::SessionContext;
 use futures::Stream;
 use parking_lot::RwLock;
-use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::pin::Pin;
@@ -146,10 +145,6 @@ impl DisplayAs for RecursiveCTEExec {
 impl ExecutionPlan for RecursiveCTEExec {
     fn name(&self) -> &str {
         "RecursiveCTEExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {

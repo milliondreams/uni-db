@@ -33,7 +33,6 @@ use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSe
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::{Stream, StreamExt};
 use rustc_hash::FxHashMap;
-use std::any::Any;
 use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::pin::Pin;
@@ -241,10 +240,6 @@ impl DisplayAs for GraphShortestPathExec {
 impl ExecutionPlan for GraphShortestPathExec {
     fn name(&self) -> &str {
         "GraphShortestPathExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {

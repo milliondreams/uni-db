@@ -134,7 +134,7 @@ fn try_rewrite_filter(
     let LogicalPlan::TableScan(scan) = input.as_ref() else {
         return Ok(Err(plan));
     };
-    let Some(markers) = downcast_markers(scan.source.as_any()) else {
+    let Some(markers) = downcast_markers(scan.source.as_ref()) else {
         return Ok(Err(plan));
     };
     let Some(filter_marker) = markers.filter.as_ref() else {
@@ -193,7 +193,7 @@ fn try_rewrite_projection(
     if projected_schema.inner() != proj_schema.inner() {
         return Ok(Err(plan));
     }
-    let Some(markers) = downcast_markers(source.as_any()) else {
+    let Some(markers) = downcast_markers(source.as_ref()) else {
         return Ok(Err(plan));
     };
     let Some(proj_marker) = markers.projection.as_ref() else {
@@ -243,7 +243,7 @@ fn try_rewrite_limit(
     let LogicalPlan::TableScan(TableScan { source, .. }) = child else {
         return Ok(Err(plan));
     };
-    let Some(markers) = downcast_markers(source.as_any()) else {
+    let Some(markers) = downcast_markers(source.as_ref()) else {
         return Ok(Err(plan));
     };
     let Some(limit_marker) = markers.limit.as_ref() else {
@@ -279,7 +279,7 @@ fn try_rewrite_topn(
     {
         let child = peel_transparent_projection(input.as_ref());
         if let LogicalPlan::TableScan(TableScan { source, .. }) = child
-            && let Some(markers) = downcast_markers(source.as_any())
+            && let Some(markers) = downcast_markers(source.as_ref())
             && let Some(topn_marker) = markers.topn.as_ref()
         {
             let sort = sort_exprs_to_marker(expr);
@@ -313,7 +313,7 @@ fn try_rewrite_topn(
     {
         let child = peel_transparent_projection(input.as_ref());
         if let LogicalPlan::TableScan(TableScan { source, .. }) = child
-            && let Some(markers) = downcast_markers(source.as_any())
+            && let Some(markers) = downcast_markers(source.as_ref())
             && let Some(topn_marker) = markers.topn.as_ref()
         {
             let sort = sort_exprs_to_marker(expr);
@@ -374,7 +374,7 @@ fn try_rewrite_aggregate(
     else {
         return Ok(Err(plan));
     };
-    let Some(markers) = downcast_markers(source.as_any()) else {
+    let Some(markers) = downcast_markers(source.as_ref()) else {
         return Ok(Err(plan));
     };
     let Some(agg_marker) = markers.aggregate.as_ref() else {
@@ -446,7 +446,7 @@ fn peel_transparent_projection(plan: &LogicalPlan) -> &LogicalPlan {
     plan
 }
 
-/// Try to downcast a `&dyn Any` (from `TableSource::as_any`) to a
+/// Try to downcast a `&dyn Any` (upcast from a `TableSource`) to a
 /// [`PushdownAwareTable`] and surface its [`PushdownMarkers`] bundle.
 ///
 /// Path 1: source is itself a `PushdownAwareTable` (rare; users would
@@ -458,7 +458,7 @@ fn downcast_markers(source_any: &dyn std::any::Any) -> Option<&PushdownMarkers> 
     }
     let default = source_any
         .downcast_ref::<datafusion::datasource::default_table_source::DefaultTableSource>()?;
-    let provider_any = default.table_provider.as_any();
+    let provider_any = default.table_provider.as_ref();
     let pa = provider_any.downcast_ref::<PushdownAwareTable>()?;
     Some(&pa.markers)
 }
@@ -511,9 +511,6 @@ impl std::fmt::Debug for PushdownAwareTable {
 
 #[async_trait::async_trait]
 impl datafusion::datasource::TableProvider for PushdownAwareTable {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
     fn schema(&self) -> datafusion::arrow::datatypes::SchemaRef {
         self.inner.schema()
     }

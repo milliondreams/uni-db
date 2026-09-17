@@ -20,7 +20,6 @@
 //! - [`register_plugin_scalar_udfs`] / [`register_plugin_scalar_udfs_pair`]
 //!   and the `PluginScalarUdf` DataFusion adapter (private).
 
-use std::any::Any;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -233,9 +232,6 @@ impl Hash for PluginPredicateUdf {
 }
 
 impl ScalarUDFImpl for PluginPredicateUdf {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
     fn name(&self) -> &str {
         &self.name
     }
@@ -529,10 +525,6 @@ impl Hash for PluginScalarUdf {
 }
 
 impl ScalarUDFImpl for PluginScalarUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         &self.name
     }

@@ -180,10 +180,6 @@ impl PartialEq<dyn Any> for PatternExistsExecExpr {
 }
 
 impl PhysicalExpr for PatternExistsExecExpr {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn data_type(&self, _input_schema: &Schema) -> DFResult<DataType> {
         Ok(DataType::Boolean)
     }

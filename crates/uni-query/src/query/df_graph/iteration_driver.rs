@@ -20,7 +20,6 @@
 //
 // Rust guideline compliant
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -175,9 +174,6 @@ impl DisplayAs for PowerStepExec {
 impl ExecutionPlan for PowerStepExec {
     fn name(&self) -> &str {
         "PowerStepExec"
-    }
-    fn as_any(&self) -> &dyn Any {
-        self
     }
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
@@ -390,9 +386,6 @@ impl DisplayAs for GraphGatherStepExec {
 impl ExecutionPlan for GraphGatherStepExec {
     fn name(&self) -> &str {
         "GraphGatherStepExec"
-    }
-    fn as_any(&self) -> &dyn Any {
-        self
     }
     fn schema(&self) -> SchemaRef {
         self.schema.clone()

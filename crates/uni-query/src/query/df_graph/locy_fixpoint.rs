@@ -35,7 +35,6 @@ use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSe
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::Stream;
 use parking_lot::RwLock;
-use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::pin::Pin;
@@ -4716,6 +4715,10 @@ fn extract_common_value(col: &dyn arrow_array::Array, row_idx: usize) -> uni_com
     if let Some(a) = col.as_any().downcast_ref::<LargeStringArray>() {
         return uni_common::Value::String(a.value(row_idx).to_string());
     }
+    // `Utf8View`. Falls through to `Null` without this arm, silently.
+    if let Some(a) = col.as_any().downcast_ref::<arrow_array::StringViewArray>() {
+        return uni_common::Value::String(a.value(row_idx).to_string());
+    }
     if let Some(b) = col.as_any().downcast_ref::<arrow_array::LargeBinaryArray>() {
         let bytes = b.value(row_idx);
         if bytes.is_empty() {
@@ -4753,6 +4756,10 @@ fn extract_feature_value(col: &dyn arrow_array::Array, row_idx: usize) -> uni_lo
         return uni_locy::FeatureValue::String(a.value(row_idx).to_string());
     }
     if let Some(a) = col.as_any().downcast_ref::<LargeStringArray>() {
+        return uni_locy::FeatureValue::String(a.value(row_idx).to_string());
+    }
+    // `Utf8View`. Falls through to `FeatureValue::Null` without this arm.
+    if let Some(a) = col.as_any().downcast_ref::<arrow_array::StringViewArray>() {
         return uni_locy::FeatureValue::String(a.value(row_idx).to_string());
     }
     // Schema-less property storage: values arrive as LargeBinary
@@ -4873,9 +4880,6 @@ impl DisplayAs for DerivedScanExec {
 impl ExecutionPlan for DerivedScanExec {
     fn name(&self) -> &str {
         "DerivedScanExec"
-    }
-    fn as_any(&self) -> &dyn Any {
-        self
     }
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
@@ -5820,10 +5824,6 @@ impl DisplayAs for FixpointExec {
 impl ExecutionPlan for FixpointExec {
     fn name(&self) -> &str {
         "FixpointExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {

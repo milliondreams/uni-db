@@ -609,6 +609,33 @@ async fn mean_recall(
 /// Number of probe queries the HNSW recall means are averaged over.
 const PROBE_QUERIES: usize = 32;
 
+/// Corpus size for the two `ef_search` recall oracles.
+///
+/// This was 1 000 until the lance 7 -> 11 upgrade. Lance's HNSW search got
+/// markedly better at narrow beams, and at 1 000 docs a beam of 10 already
+/// reached mean recall@10 ≈ 0.972 against a 0.988 plateau — a 0.016 spread,
+/// well under the 0.05 both oracles require, so they failed with the knob
+/// working perfectly. Measured ladder (mean over [`PROBE_QUERIES`] probes,
+/// one build each) that established this is a corpus-size effect and not a
+/// dead knob:
+///
+/// | n      | ef 10  | ef 20  | ef 40  | ef ≥ 80 |
+/// |--------|--------|--------|--------|---------|
+/// |  1 000 | 0.9719 | 0.9812 | 0.9875 | 0.9875  |
+/// |  4 000 | 0.9500 | 0.9781 | 0.9812 | 0.9812  |
+/// | 16 000 | 0.8656 | 0.9375 | 0.9844 | 0.9844  |
+///
+/// Recall rises with the beam at every size, so `ef_search` does reach the
+/// index search; only the *separation* needed the bigger haystack. 16 000 is
+/// the rung that restores margin — 4 000 still only separates by 0.031.
+///
+/// Recalibrated over 6 independent builds at this size:
+/// low (ef 10) ∈ [0.8812, 0.8937], high (ef 512) = 0.9844 constant,
+/// gain ∈ [0.0907, 0.1032] (mean 0.0969, σ 0.0044). The 0.05 threshold is
+/// ~9σ below the minimum observed gain. Cost: each oracle went from ~2-4 s
+/// to ~10 s.
+const RECALL_CORPUS: usize = 16_000;
+
 /// Deterministic random probe queries (NOT planted in the corpus, so a narrow
 /// beam has no trivially reachable exact match to get lucky on).
 fn probe_queries(seed: u64) -> Vec<Dense> {
@@ -632,9 +659,9 @@ async fn dense_hnsw_ef_search_raises_recall() -> anyhow::Result<()> {
         .apply()
         .await?;
 
-    // ~1000 docs: large enough that HNSW with a narrow beam demonstrably misses
-    // neighbors (the regime the recall bench surfaced at recall ≈ 0.6).
-    let corpus = build_corpus(1000, 0xEF5E_A4C8);
+    // Large enough that HNSW with a narrow beam demonstrably misses neighbours;
+    // see [`RECALL_CORPUS`] for the measurements that set the size.
+    let corpus = build_corpus(RECALL_CORPUS, 0xEF5E_A4C8);
     insert_docs(&db, &corpus, true).await?;
     db.indexes().rebuild("Doc", false).await?;
 
@@ -645,9 +672,12 @@ async fn dense_hnsw_ef_search_raises_recall() -> anyhow::Result<()> {
     // knob (minimal `k` vs wide 512): if the option ever stops reaching the
     // index search again, both searches are identical and the gap is exactly 0.
     //
-    // Thresholds calibrated over 30 independent builds (2026-07-01):
-    // low ∈ [0.77, 0.89], high = 0.9875 constant, gap ∈ [0.097, 0.216]
-    // (gap mean 0.163, σ 0.028 → 0.05 is ~4σ safe; high has 0.0375 headroom).
+    // Thresholds recalibrated over 6 independent builds on lance 11 at
+    // [`RECALL_CORPUS`]: low ∈ [0.8812, 0.8937], high = 0.9844 constant,
+    // gap ∈ [0.0907, 0.1032] (gap mean 0.0969, σ 0.0044 → 0.05 is ~9σ safe;
+    // high has 0.0344 headroom over the 0.95 floor).
+    // (Superseded: 30 builds on lance 7 at n=1000 gave low ∈ [0.77, 0.89],
+    // gap ∈ [0.097, 0.216], σ 0.028.)
     let k = 10;
     let queries = probe_queries(0xBEA7_5EED);
     let low = mean_recall(&db, &corpus, &queries, k, "{ef_search: 10}").await?;
@@ -699,8 +729,10 @@ async fn dense_hnsw_recall_is_monotone_in_ef_search() -> anyhow::Result<()> {
     /// Slack allowed between two *adjacent* rungs.
     ///
     /// From the calibration recorded on `dense_hnsw_ef_search_raises_recall`:
-    /// mean-recall σ ≈ 0.028 over 30 builds, so 0.05 is comfortably outside the
-    /// noise while still rejecting a genuine inversion.
+    /// mean-recall σ ≈ 0.004 over 6 builds on lance 11, so 0.05 is far outside
+    /// the noise while still rejecting a genuine inversion. (It was σ ≈ 0.028
+    /// over 30 builds on lance 7; the tolerance is unchanged and now has more
+    /// headroom, not less.)
     const RUNG_TOLERANCE: f64 = 0.05;
     /// End-to-end separation the ladder must achieve, matching the two-point
     /// test's threshold. This is the non-vacuity guard.
@@ -715,7 +747,7 @@ async fn dense_hnsw_recall_is_monotone_in_ef_search() -> anyhow::Result<()> {
         .apply()
         .await?;
 
-    let corpus = build_corpus(1000, 0xEF5E_A4C8);
+    let corpus = build_corpus(RECALL_CORPUS, 0xEF5E_A4C8);
     insert_docs(&db, &corpus, true).await?;
     db.indexes().rebuild("Doc", false).await?;
 

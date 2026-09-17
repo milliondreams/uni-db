@@ -175,10 +175,6 @@ impl PartialEq<dyn Any> for PatternComprehensionExecExpr {
 }
 
 impl PhysicalExpr for PatternComprehensionExecExpr {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn data_type(&self, _input_schema: &Schema) -> DFResult<DataType> {
         Ok(DataType::LargeList(Arc::new(Field::new(
             "item",

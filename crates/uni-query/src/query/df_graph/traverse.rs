@@ -55,7 +55,6 @@ use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSe
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::{Stream, StreamExt};
 use rustc_hash::FxHashSet;
-use std::any::Any;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::pin::Pin;
@@ -610,10 +609,6 @@ impl DisplayAs for GraphTraverseExec {
 impl ExecutionPlan for GraphTraverseExec {
     fn name(&self) -> &str {
         "GraphTraverseExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {
@@ -2494,10 +2489,6 @@ impl ExecutionPlan for GraphTraverseMainExec {
         "GraphTraverseMainExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -3981,10 +3972,6 @@ impl DisplayAs for GraphVariableLengthTraverseExec {
 impl ExecutionPlan for GraphVariableLengthTraverseExec {
     fn name(&self) -> &str {
         "GraphVariableLengthTraverseExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {
@@ -5627,10 +5614,6 @@ impl DisplayAs for GraphVariableLengthTraverseMainExec {
 impl ExecutionPlan for GraphVariableLengthTraverseMainExec {
     fn name(&self) -> &str {
         "GraphVariableLengthTraverseMainExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {

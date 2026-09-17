@@ -79,9 +79,14 @@ resolver = "2"
 [workspace.package]
 version = "4.0.0"
 edition = "2024"
-# edition 2024 requires 1.85+; pin it so a stale toolchain fails fast and
-# cargo can report an actionable error instead of a parse failure.
-rust-version = "1.85"
+# Floor is set by our deps, not by the edition: `lance` declares
+# `rust-version = "1.91.0"` and `datafusion` declares `1.88.0`, so 1.91 is the
+# lowest toolchain that can actually build this workspace. (Edition 2024 alone
+# only needs 1.85, which is what this said before -- a floor the dependency
+# graph had already invalidated, so the advertised MSRV did not hold.)
+# Keep it pinned so a stale toolchain fails fast with an actionable cargo error
+# instead of a parse failure or a mid-build trait error.
+rust-version = "1.91"
 authors = ["Dragonscale Industries Inc. <dev@dragonscale.ai>"]
 license = "Apache-2.0"
 repository = "https://github.com/rustic-ai/uni-db"
@@ -132,7 +137,15 @@ arrow = { version = "58.3.0", features = ["prettyprint"] }
 arrow-array = "58.3.0"
 arrow-schema = "58.3.0"
 arrow-row = "58.3.0"
-lance = { version = "7.0.0", default-features = false, features = ["aws", "azure", "gcp"] }
+lance = { version = "11.0.0", default-features = false, features = ["aws", "azure", "gcp"] }
+# Pinned here, not in the crate that uses them: `lance-index` and `lance-linalg`
+# must move in lockstep with `lance`. Left as bare version strings in
+# `crates/uni-store/Cargo.toml` they resolve independently, and a bump of `lance`
+# alone still produces a clean lockfile carrying TWO complete lance trees (and
+# two datafusions, since lance pins datafusion exactly). That surfaces as
+# "expected `RecordBatch`, found `RecordBatch`", never as a version error.
+lance-index = { version = "11.0.0" }
+lance-linalg = { version = "11.0.0" }
 futures = "0.3"
 async-trait = "0.1"
 tracing = "0.1"
@@ -173,7 +186,7 @@ prettytable-rs = "0.10"
 criterion = "0.8"
 url = "2.5"
 proptest = "1.11"
-datafusion = "53.1.0"
+datafusion = "54.1.0"
 # Floor is 0.18.0, not 0.17.0: `crates/uni` enables `provider-llamacpp` in its
 # default features and that feature does not exist before 0.18.0. Our lock pins
 # 0.18.0 so the workspace never saw it, but the declared range advertised a

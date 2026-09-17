@@ -36,7 +36,6 @@ use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskCo
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::{Stream, StreamExt};
-use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::pin::Pin;
@@ -254,10 +253,6 @@ impl DisplayAs for GraphUnwindExec {
 impl ExecutionPlan for GraphUnwindExec {
     fn name(&self) -> &str {
         "GraphUnwindExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {
@@ -899,6 +894,11 @@ pub(crate) fn arrow_to_json_value(array: &dyn Array, row: usize) -> Value {
         return Value::String(arr.value(row).to_string());
     }
     if let Some(arr) = any.downcast_ref::<LargeStringArray>() {
+        return Value::String(arr.value(row).to_string());
+    }
+    // `Utf8View`. Without this arm the fall-through below reads the column as
+    // `Value::Null` with no diagnostic -- silently, unlike `arrow_to_value`.
+    if let Some(arr) = any.downcast_ref::<arrow_array::StringViewArray>() {
         return Value::String(arr.value(row).to_string());
     }
 

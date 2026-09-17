@@ -37,7 +37,6 @@ use datafusion::logical_expr::{
 };
 use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
-use std::any::Any;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use uni_common::Value;
@@ -93,10 +92,6 @@ macro_rules! cypher_scalar_udf {
         impl_udf_eq_hash!($struct);
 
         impl ScalarUDFImpl for $struct {
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-
             fn name(&self) -> &str {
                 $name
             }
@@ -374,10 +369,6 @@ impl std::fmt::Debug for CustomScalarUdf {
 impl_udf_eq_hash!(CustomScalarUdf);
 
 impl ScalarUDFImpl for CustomScalarUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         &self.name
     }
@@ -429,10 +420,6 @@ impl IdUdf {
 impl_udf_eq_hash!(IdUdf);
 
 impl ScalarUDFImpl for IdUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "id"
     }
@@ -620,10 +607,6 @@ impl SystemTimestampUdf {
 impl_udf_eq_hash!(SystemTimestampUdf);
 
 impl ScalarUDFImpl for SystemTimestampUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         self.name
     }
@@ -684,10 +667,6 @@ impl TypeUdf {
 impl_udf_eq_hash!(TypeUdf);
 
 impl ScalarUDFImpl for TypeUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "type"
     }
@@ -776,10 +755,6 @@ impl KeysUdf {
 impl_udf_eq_hash!(KeysUdf);
 
 impl ScalarUDFImpl for KeysUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "keys"
     }
@@ -882,10 +857,6 @@ impl PropertiesUdf {
 impl_udf_eq_hash!(PropertiesUdf);
 
 impl ScalarUDFImpl for PropertiesUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "properties"
     }
@@ -979,10 +950,6 @@ impl IndexUdf {
 impl_udf_eq_hash!(IndexUdf);
 
 impl ScalarUDFImpl for IndexUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "index"
     }
@@ -1144,10 +1111,6 @@ impl LabelsUdf {
 impl_udf_eq_hash!(LabelsUdf);
 
 impl ScalarUDFImpl for LabelsUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "labels"
     }
@@ -1547,10 +1510,6 @@ impl RangeUdf {
 impl_udf_eq_hash!(RangeUdf);
 
 impl ScalarUDFImpl for RangeUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "range"
     }
@@ -1768,10 +1727,6 @@ macro_rules! define_binary_bitwise_udf {
         impl_udf_eq_hash!($struct_name);
 
         impl ScalarUDFImpl for $struct_name {
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-
             fn name(&self) -> &str {
                 $udf_name
             }
@@ -1812,10 +1767,6 @@ macro_rules! define_unary_bitwise_udf {
         impl_udf_eq_hash!($struct_name);
 
         impl ScalarUDFImpl for $struct_name {
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-
             fn name(&self) -> &str {
                 $udf_name
             }
@@ -1915,10 +1866,6 @@ impl TemporalUdf {
 impl_udf_eq_hash!(TemporalUdf);
 
 impl ScalarUDFImpl for TemporalUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         &self.name
     }
@@ -2014,10 +1961,6 @@ impl SpatialUdf {
 impl_udf_eq_hash!(SpatialUdf);
 
 impl ScalarUDFImpl for SpatialUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         &self.name
     }
@@ -2078,10 +2021,6 @@ impl VectorDistanceUdf {
 impl_udf_eq_hash!(VectorDistanceUdf);
 
 impl ScalarUDFImpl for VectorDistanceUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "vector_distance"
     }
@@ -2147,10 +2086,6 @@ impl DurationPropertyUdf {
 impl_udf_eq_hash!(DurationPropertyUdf);
 
 impl ScalarUDFImpl for DurationPropertyUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "_duration_property"
     }
@@ -2231,10 +2166,6 @@ impl ToStringUdf {
 impl_udf_eq_hash!(ToStringUdf);
 
 impl ScalarUDFImpl for ToStringUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "tostring"
     }
@@ -2284,10 +2215,6 @@ impl TemporalPropertyUdf {
 impl_udf_eq_hash!(TemporalPropertyUdf);
 
 impl ScalarUDFImpl for TemporalPropertyUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "_temporal_property"
     }
@@ -3078,9 +3005,6 @@ impl BticScalarUdf {
 impl_udf_eq_hash!(BticScalarUdf);
 
 impl ScalarUDFImpl for BticScalarUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         &self.name
     }
@@ -3196,9 +3120,6 @@ impl BticMinMaxUdaf {
 impl_udf_eq_hash!(BticMinMaxUdaf);
 
 impl AggregateUDFImpl for BticMinMaxUdaf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         &self.name
     }
@@ -3289,9 +3210,6 @@ impl BticSpanAggUdaf {
 impl_udf_eq_hash!(BticSpanAggUdaf);
 
 impl AggregateUDFImpl for BticSpanAggUdaf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "btic_span_agg"
     }
@@ -3372,9 +3290,6 @@ impl BticCountAtUdaf {
 impl_udf_eq_hash!(BticCountAtUdaf);
 
 impl AggregateUDFImpl for BticCountAtUdaf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "btic_count_at"
     }
@@ -3733,9 +3648,6 @@ macro_rules! define_string_op_udf {
         impl_udf_eq_hash!($struct_name);
 
         impl ScalarUDFImpl for $struct_name {
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
             fn name(&self) -> &str {
                 $udf_name
             }
@@ -4060,9 +3972,6 @@ impl std::hash::Hash for CypherCompareUdf {
 }
 
 impl ScalarUDFImpl for CypherCompareUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         &self.name
     }
@@ -4147,9 +4056,6 @@ impl CypherAbsUdf {
 impl_udf_eq_hash!(CypherAbsUdf);
 
 impl ScalarUDFImpl for CypherAbsUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "_cypher_abs"
     }
@@ -4532,9 +4438,6 @@ impl std::hash::Hash for CypherArithmeticUdf {
 }
 
 impl ScalarUDFImpl for CypherArithmeticUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         &self.name
     }
@@ -4600,9 +4503,6 @@ impl CypherXorUdf {
 impl_udf_eq_hash!(CypherXorUdf);
 
 impl ScalarUDFImpl for CypherXorUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "_cypher_xor"
     }
@@ -4663,9 +4563,6 @@ impl CvToBoolUdf {
 impl_udf_eq_hash!(CvToBoolUdf);
 
 impl ScalarUDFImpl for CvToBoolUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "_cv_to_bool"
     }
@@ -5660,9 +5557,6 @@ impl std::fmt::Debug for CypherToFloat64Udf {
 }
 
 impl ScalarUDFImpl for CypherToFloat64Udf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "_cypher_to_float64"
     }
@@ -5858,9 +5752,6 @@ impl Hash for CypherMinMaxUdaf {
 }
 
 impl AggregateUDFImpl for CypherMinMaxUdaf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         &self.name
     }
@@ -6088,9 +5979,6 @@ impl Hash for CypherSumUdaf {
 }
 
 impl AggregateUDFImpl for CypherSumUdaf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "_cypher_sum"
     }
@@ -6306,9 +6194,6 @@ impl Hash for CypherCollectUdaf {
 }
 
 impl AggregateUDFImpl for CypherCollectUdaf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "_cypher_collect"
     }
@@ -6560,9 +6445,6 @@ impl Hash for CypherPercentileDiscUdaf {
 }
 
 impl AggregateUDFImpl for CypherPercentileDiscUdaf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "percentiledisc"
     }
@@ -6786,9 +6668,6 @@ impl Hash for CypherPercentileContUdaf {
 }
 
 impl AggregateUDFImpl for CypherPercentileContUdaf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         "percentilecont"
     }

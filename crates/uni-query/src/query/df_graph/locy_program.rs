@@ -35,7 +35,6 @@ use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSe
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::Stream;
 use parking_lot::RwLock;
-use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::pin::Pin;
@@ -600,10 +599,6 @@ impl DisplayAs for LocyProgramExec {
 impl ExecutionPlan for LocyProgramExec {
     fn name(&self) -> &str {
         "LocyProgramExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {

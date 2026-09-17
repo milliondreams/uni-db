@@ -36,7 +36,6 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Pla
 use datafusion::prelude::SessionContext;
 use futures::Stream;
 use parking_lot::RwLock;
-use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::pin::Pin;
@@ -172,10 +171,6 @@ impl DisplayAs for GraphApplyExec {
 impl ExecutionPlan for GraphApplyExec {
     fn name(&self) -> &str {
         "GraphApplyExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {

@@ -802,10 +802,9 @@ impl<'a> LocyEngine<'a> {
             timeout_flag,
             incomplete_slot,
             profile_slot,
-        ) = if let Some(program_exec) = exec_plan
-            .as_any()
-            .downcast_ref::<uni_query::query::df_graph::LocyProgramExec>(
-        ) {
+        ) = if let Some(program_exec) =
+            exec_plan.downcast_ref::<uni_query::query::df_graph::LocyProgramExec>()
+        {
             if let Some(ref t) = tracker {
                 program_exec.set_derivation_tracker(Arc::clone(t));
             }
@@ -1104,9 +1103,7 @@ impl<'a> LocyEngine<'a> {
         let exec_plan = planner.plan(&logical).map_err(map_native_df_error)?;
 
         let derived_store_slot = if let Some(program_exec) =
-            exec_plan
-                .as_any()
-                .downcast_ref::<uni_query::query::df_graph::LocyProgramExec>()
+            exec_plan.downcast_ref::<uni_query::query::df_graph::LocyProgramExec>()
         {
             program_exec.derived_store_slot()
         } else {

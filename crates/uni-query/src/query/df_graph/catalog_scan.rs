@@ -44,7 +44,6 @@
 //! exec can populate `_src_vid`/`_dst_vid`. Without them the
 //! constructor errors immediately.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::pin::Pin;
@@ -249,10 +248,6 @@ impl DisplayAs for CatalogVertexScanExec {
 impl ExecutionPlan for CatalogVertexScanExec {
     fn name(&self) -> &str {
         "CatalogVertexScanExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {
@@ -526,9 +521,6 @@ impl DisplayAs for CatalogEdgeScanExec {
 impl ExecutionPlan for CatalogEdgeScanExec {
     fn name(&self) -> &str {
         "CatalogEdgeScanExec"
-    }
-    fn as_any(&self) -> &dyn Any {
-        self
     }
     fn schema(&self) -> SchemaRef {
         self.schema.clone()

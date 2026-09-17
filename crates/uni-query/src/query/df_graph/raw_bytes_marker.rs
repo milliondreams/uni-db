@@ -144,10 +144,6 @@ impl PartialEq<dyn Any> for RawBytesMarkerExpr {
 }
 
 impl PhysicalExpr for RawBytesMarkerExpr {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn data_type(&self, input_schema: &Schema) -> DfResult<DataType> {
         let dt = self.inner.data_type(input_schema)?;
         Ok(if self.on_child {

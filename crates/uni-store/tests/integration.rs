@@ -5,6 +5,13 @@
 // separate binary carrying a crate-level `#![cfg(...)]`):
 //   - storage / fork_recovery require `lance-backend`
 //   - ssi_occ_test requires `ssi`
+// The auto-trait solver walks sqlparser's AST (reached through DataFusion's
+// error type) when checking that a `tokio::spawn`ed future is `Send`. As of
+// sqlparser 0.62 that graph is deep enough to blow the default limit --
+// `overflow evaluating the requirement `Unique<ReplaceSelectElement>: Sync``.
+// Same hoist, same value, as `crates/uni/tests/integration.rs`.
+#![recursion_limit = "256"]
+
 #[path = "common/bugs/mod.rs"]
 mod bugs;
 #[path = "common/cloud/mod.rs"]

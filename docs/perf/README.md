@@ -9,7 +9,7 @@ because the machine it came from turns out to matter more than it looks.
 
 | document | measures | date | machine | gates? |
 |---|---|---|---|---|
-| [iai-baseline.json](iai-baseline.json) | reference instruction counts, 9 targets, 5 gated | 2026-08-25 | **CI** — 5 `ubuntu-xlarge` shards, 25 samples/target | **yes** — `perf-gate` in `pr.yml` |
+| [iai-baseline.json](iai-baseline.json) | reference instruction counts, 9 targets, 5 gated — **STALE, see below** | 2026-08-25 | **CI** — 5 `ubuntu-xlarge` shards, 25 samples/target | **yes** — `perf-gate` in `pr.yml` |
 | [iai-qualification-2026-08-12.md](iai-qualification-2026-08-12.md) | which hot paths *can* honestly be gated on instruction counts; 5 of 7 qualify | 2026-08-12 | Intel Core Ultra 9 185H, 22 cores, Linux 7.1.8 | no — a pilot, gates nothing |
 | [ann-2026-08-25.md](ann-2026-08-25.md) | ANN recall@10 vs QPS on SIFT-1M, against SIFT's own ground truth | 2026-08-25 | Intel Core Ultra 9 185H, 22 cores, Linux 7.1.8 | no |
 | [contention-2026-08-25.md](contention-2026-08-25.md) | SSI throughput **and abort rate** vs Zipf skew × writer count | 2026-08-25 | Intel Core Ultra 9 185H, 22 cores, Linux 7.1.8 | no |
@@ -19,6 +19,19 @@ because the machine it came from turns out to matter more than it looks.
 | [build-baseline-2026-05-19.md](build-baseline-2026-05-19.md) | post-consolidation build wall-time reference | 2026-05-19 | under-recorded — "see `git log`" | no |
 
 ## Reading these safely
+
+**`iai-baseline.json` is stale as of 2026-09-16 and `perf-gate` fails against
+it.** The metric it records changed definition, so every number in it moved and
+the failure is expected rather than a regression. `hot_paths_iai.rs` bounded its
+measured region with Callgrind's `--toggle-collect` entry point; collection state
+is per-thread, so work Lance dispatches to tokio's blocking pool through
+`spawn_cpu` was never counted. `vertex_lookup_by_id` attributed 7,895 Ir to a
+query costing 7.4M, and `l0_to_l1_flush` was 57.6% invisible. The bench now gates
+**instrumentation**, which is process-global, so every thread is counted; the
+gated targets read 8.5–71x higher. Regenerate via `perf-qualify.yml` and
+`scripts/perf/iai_baseline.py` — the recipe, including the fully-qualified
+`--gate` names, is in `docs/local_ci_runbook.md` §5. Until then the lane is
+red for a known reason.
 
 **Only one number in this directory gates anything.** `iai-baseline.json` backs
 the `perf-gate` job; everything else is a characterization. That is deliberate,

@@ -505,8 +505,16 @@ jobs:
       # green check, so it verifies itself in the same job that trusts it. No
       # lane runs tests under scripts/, so a test file alone would never execute
       # — which is the shape the gate was found to have.
-      - name: Self-check the gate
-        run: python3 scripts/perf/test_iai_gate.py
+      #
+      # The collector gets the same treatment, and needs it more: it decides what
+      # every number downstream means, and it has reported a confident zero
+      # twice — once dropping `baseline_noop` from the original pilot, once
+      # reading a degenerate `summary: 0` as the instruction count for the whole
+      # suite. A gate is only as honest as the numbers fed to it.
+      - name: Self-check the gate and the collector
+        run: |
+          python3 scripts/perf/test_iai_gate.py
+          python3 scripts/perf/test_iai_collect.py
 
       # Thresholds are explicit arguments — iai_gate.py has no defaults — so the
       # number a build fails on is visible here and traceable to the measurement

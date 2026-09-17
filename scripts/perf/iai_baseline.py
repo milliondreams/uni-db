@@ -33,8 +33,14 @@ from iai_cross_runner import check_usable, cv_pct, load_runner  # noqa: E402
 
 SCHEMA = 1
 
-# Callgrind counts one instruction of harness overhead as a double-digit
-# percentage of a 4-Ir no-op, so the calibration group is never gate material.
+# The calibration group is never gate material. It exists to make the other
+# numbers interpretable -- `baseline_session_only` is the fixed session-setup
+# floor, and `baseline_noop` is the positive control that says the benchmark's
+# instrumentation gate actually opened -- and neither is a hot path anybody
+# optimizes. (Before the switch to instrumentation gating, `baseline_noop`
+# measured 4 Ir, where a single instruction of harness overhead moved it by a
+# double-digit percentage; it is now a small fixed loop, but it is still not
+# something to gate on.)
 EXCLUDED_PREFIX = "baselines::"
 
 

@@ -24,58 +24,60 @@
     "baselines::baseline_noop.noop": {
       "cv_pct": 0.0,
       "gated": false,
-      "instructions": 4,
+      "instructions": 4002,
       "reason": "calibration baseline; too small to gate",
       "samples": 25
     },
     "baselines::baseline_session_only.session_only": {
-      "cv_pct": 0.495,
+      "cv_pct": 0.246,
       "gated": false,
-      "instructions": 4758656,
+      "instructions": 108047,
       "reason": "calibration baseline; too small to gate",
       "samples": 25
     },
     "read_paths::expand_batch_one_hop_warm.warm": {
-      "cv_pct": 0.308,
+      "cv_pct": 0.52,
       "gated": true,
-      "instructions": 52708611,
+      "instructions": 31073913,
       "samples": 25
     },
     "read_paths::hnsw_top10_search.top10": {
-      "cv_pct": 0.135,
+      "cv_pct": 0.285,
       "gated": true,
-      "instructions": 55525362,
+      "instructions": 27552983,
       "samples": 25
     },
     "read_paths::parse_and_plan_cold.cold": {
-      "cv_pct": 0.364,
-      "gated": true,
-      "instructions": 20794225,
+      "cv_pct": 2.555,
+      "gated": false,
+      "instructions": 20100015,
+      "reason": "cross-runner CV 1.60% against the pilot's 1.0% threshold (2026-09-17, 5 runners x 5 runs), leaving ~1.1% headroom under a 2% gate. Stable per-shard (medians span -0.30%..+0.86%); it is the run-to-run spread that disqualifies it.",
       "samples": 25
     },
     "read_paths::property_read_across_l0_l1.l0_over_l1": {
-      "cv_pct": 0.282,
-      "gated": true,
-      "instructions": 24171868,
+      "cv_pct": 3.153,
+      "gated": false,
+      "instructions": 24029608,
+      "reason": "bimodal across runners (2026-09-17, 5 runners x 5 runs): shards 1-2 cluster at ~22.58M and shards 3-5 at ~24.14M, a ~6.5% split, cross-runner CV 2.25%. It did not fail this run, but a baseline pooled from one population and a PR measured on the other would exceed the 2% gate threefold.",
       "samples": 25
     },
     "read_paths::vertex_lookup_by_id.by_id": {
-      "cv_pct": 0.456,
+      "cv_pct": 0.395,
       "gated": true,
-      "instructions": 21727545,
+      "instructions": 20721018,
       "samples": 25
     },
     "write_paths::l0_to_l1_flush.l0_to_l1": {
-      "cv_pct": 0.232,
+      "cv_pct": 0.459,
       "gated": false,
-      "instructions": 28687502,
+      "instructions": 60832090,
       "reason": "IO-dominant: rejected by the qualification pilot's wall-clock-correlation leg (2026-08-12), not by variance",
       "samples": 25
     },
     "write_paths::transaction_commit_wal_on.wal_on": {
-      "cv_pct": 0.399,
+      "cv_pct": 0.628,
       "gated": false,
-      "instructions": 12406079,
+      "instructions": 10611974,
       "reason": "IO-dominant: rejected by the qualification pilot's wall-clock-correlation leg (2026-08-12), not by variance",
       "samples": 25
     }

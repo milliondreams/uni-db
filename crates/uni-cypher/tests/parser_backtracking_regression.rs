@@ -8,9 +8,31 @@
 //! doubled the work — O(2^N) on N stacked brackets. Factoring the shared
 //! `[ expression` prefix into the `index_or_slice` rule made it linear.
 //!
+//! **A second instance of the same class** turned up in the 2026-09-18 nightly,
+//! in a different rule pair. `primary_expression` offers both
+//! `pattern_expression` (via `node_pattern`) and `"(" ~ expression ~ ")"`, and
+//! both begin with `(`. `node_pattern` reaches arbitrary nested expressions
+//! through `node_predicate` -> `properties` -> `map_literal` -> `map_entry` ->
+//! `expression`, and a pattern expression needs a relationship after that first
+//! node pattern — which the parser only discovers once the whole interior is
+//! parsed. With no relationship there, `"(" ~ expression ~ ")"` then parses the
+//! same characters again, doubling the work per nesting level.
+//!
+//! That one was not confined to malformed input: the **valid** query
+//! `RETURN (a {k: (a {k: ... 1 ...})})` took 197 ms at depth 10 and ~3x more per
+//! level, and it reached `uni_cypher::parse`, so every Cypher query shared the
+//! exposure. Reordering the two alternatives does not fix it — PEG commits to
+//! the first alternative that succeeds and never retries, so the parenthesized
+//! form first makes `RETURN (a)-->(b)` fail outright, while the malformed case
+//! (where both alternatives fail anyway) stays exponential. The fix is the
+//! `&pattern_ahead` guard: one linear scan for the matching `)` and the `-`/`<`
+//! that every `relationship_pattern` alternative starts with, so the parser
+//! never descends into an interior it is about to discard.
+//!
 //! These tests assert the pathological inputs parse near-instantly and that the
-//! index/slice/comprehension surface still parses, so a future grammar edit that
-//! reintroduces the ambiguity fails loudly instead of silently hanging the fuzzer.
+//! index/slice/comprehension and pattern/parenthesis surfaces still parse, so a
+//! future grammar edit that reintroduces either ambiguity fails loudly instead
+//! of silently hanging the fuzzer.
 
 use std::time::{Duration, Instant};
 
@@ -90,6 +112,66 @@ fn index_and_slice_surface_still_parses() {
         assert!(
             uni_cypher::parse_locy(q).is_ok(),
             "expected {q:?} to parse after the index_or_slice factoring"
+        );
+    }
+}
+
+// ── 2026-09-18: pattern_expression vs "(" ~ expression ~ ")" ────────────────
+
+/// The nightly `locy_parse` artifact, trimmed to its repeating core.
+///
+/// `G=({G:` stacks an unclosed `(` and `{` per repetition. The full 942-byte
+/// artifact exceeded 25s locally pre-fix; this shape reached 53s at 12
+/// repetitions.
+#[test]
+fn stacked_paren_brace_map_keys_parse_fast() {
+    let input = format!("set\rE{}", "G=({G:".repeat(40));
+    assert_parses_within(&input, Duration::from_secs(5));
+}
+
+/// The same defect on **valid**, fully-closed input — the reason a guard keyed
+/// on malformed or unclosed text would not have been enough.
+#[test]
+fn deeply_nested_valid_map_patterns_parse_fast() {
+    let mut q = String::from("1");
+    for _ in 0..40 {
+        q = format!("(a {{k: {q}}})");
+    }
+    assert_parses_within(&format!("RETURN {q}"), Duration::from_secs(5));
+}
+
+/// A pattern expression must still be recognised, and the lookahead must find
+/// the *matching* `)` — not the first one it meets.
+#[test]
+fn pattern_and_parenthesis_surface_still_parses() {
+    let queries = [
+        // Pattern expressions: the guard must let these through.
+        "RETURN (a)-->(b)",
+        "RETURN (a)--(b)",
+        "RETURN (a)<--(b)",
+        "RETURN (a)-[r:T*1..2]->(b)",
+        "RETURN (a)-->(b)-->(c)",
+        // Nested parens inside the first node's properties: a scan that stopped
+        // at the first `)` would miss the relationship and reject these.
+        "RETURN (a {k: (1 + 2)})-->(b)",
+        "RETURN (a {k: abs(-1)})-->(b)",
+        "RETURN (a {k: [1, (2)]})-->(b)",
+        // A bracket inside a string literal must not unbalance the scan.
+        "RETURN (a {k: ')'})-->(b)",
+        "RETURN (a {k: '()('})-->(b)",
+        // Trivia between the node pattern and its relationship.
+        "RETURN (a) /* c */ -->(b)",
+        "RETURN (a) // c\n-->(b)",
+        // Parenthesized expressions: the guard must NOT divert these.
+        "RETURN (1 + 2) * 3",
+        "RETURN (a {k: 1})",
+        "RETURN ((a))",
+        "RETURN (a) - (b)",
+    ];
+    for q in queries {
+        assert!(
+            uni_cypher::parse(q).is_ok(),
+            "expected {q:?} to parse after the pattern_ahead guard"
         );
     }
 }

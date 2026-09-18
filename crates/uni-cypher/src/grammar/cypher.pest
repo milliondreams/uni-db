@@ -361,7 +361,42 @@ primary_expression = {
 }
 
 // Pattern used as expression (boolean test): (n)-->(m) returns true if pattern exists
-pattern_expression = { node_pattern ~ (relationship_pattern ~ node_pattern)+ }
+//
+// The `&pattern_ahead` guard is a performance fix, not a semantic one, and
+// without it this rule is the source of exponential parse time.
+//
+// A pattern expression needs AT LEAST one relationship after its first node
+// pattern. The naive rule discovers that only *after* parsing the node
+// pattern's interior — which can hold arbitrarily nested expressions, since
+// `node_predicate` -> `properties` -> `map_literal` -> `map_entry` ->
+// `expression`. When no relationship follows, every character of that interior
+// is then parsed a second time by the `"(" ~ expression ~ ")"` alternative in
+// `primary_expression`, so the work doubles at each nesting level. Measured
+// before this guard: the *valid* query `RETURN (a {k: (a {k: ... 1 ...})})`
+// took 197 ms at depth 10 and ~3x more per level, and an 79-byte malformed
+// input exceeded 40 s. Reordering the two alternatives does not fix it —
+// PEG commits to the first alternative that succeeds and never retries, so
+// putting the parenthesized expression first makes `RETURN (a)-->(b)` fail to
+// parse, and leaves the malformed case (where both alternatives fail anyway)
+// exactly as slow.
+//
+// `pattern_ahead` answers the question up front with one linear scan. It is a
+// *necessary* condition only — the real parse still runs and still decides —
+// so it cannot accept anything this rule would have rejected. It only stops
+// the parser descending into an interior it is about to discard.
+pattern_expression = { &pattern_ahead ~ node_pattern ~ (relationship_pattern ~ node_pattern)+ }
+
+// Scan to the `)` that closes this `(`, then require the `-` or `<` that every
+// `relationship_pattern` alternative begins with. String literals are consumed
+// whole via `string`, so a bracket inside one cannot unbalance the scan, and
+// `string` already handles backslash escapes.
+pattern_ahead = @{ balanced_parens ~ ws_or_comment* ~ ("<" | "-") }
+balanced_parens = @{ "(" ~ (balanced_parens | string | !("(" | ")") ~ ANY)* ~ ")" }
+ws_or_comment = @{
+    " " | "\t" | "\n" | "\r"
+    | "//" ~ (!"\n" ~ ANY)*
+    | "/*" ~ (!"*/" ~ ANY)* ~ "*/"
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // LIST EXPRESSIONS

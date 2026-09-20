@@ -768,6 +768,62 @@ impl Writer {
     }
 
     /// Replay WAL mutations into the current L0 buffer.
+    /// Mirrors every edge in `source` into the `AdjacencyManager` overlay.
+    ///
+    /// Edges live in two places at once and the traversal read path only ever
+    /// looks at one of them. `L0Buffer` holds the authoritative row (endpoints,
+    /// properties, version) and is what the flush drains into L1, but
+    /// `GraphContext::neighbors_for_vid` resolves neighbours from the Main CSR
+    /// plus this overlay plus the caller's *transaction-local* buffer — never
+    /// the main L0 buffer. The Main CSR is built from L1, so an edge that is
+    /// committed but not yet flushed is reachable only through the overlay.
+    ///
+    /// Every writer into main L0 therefore has to mirror here, and a writer
+    /// that forgets does not fail: the edge is durable, the flush will emit it,
+    /// and in the meantime `MATCH (a)-[r]->(b)` simply answers zero rows while
+    /// the vertices it connects are all present (vertex reads go through the L0
+    /// buffers directly). That asymmetry is issues #281 and #282 — WAL recovery
+    /// was the writer that forgot.
+    ///
+    /// `fallback_version` is used for edges with no recorded version; callers
+    /// pass the current version of the buffer the edges are landing in.
+    fn mirror_edges_into_adjacency(&self, source: &L0Buffer, fallback_version: u64) {
+        for (eid, (src, dst, etype)) in &source.edge_endpoints {
+            let edge_version = source
+                .edge_versions
+                .get(eid)
+                .copied()
+                .unwrap_or(fallback_version);
+            if source.tombstones.contains_key(eid) {
+                self.adjacency_manager
+                    .add_tombstone(*eid, *src, *dst, *etype, edge_version);
+            } else {
+                self.adjacency_manager
+                    .insert_edge(*src, *dst, *eid, *etype, edge_version);
+            }
+        }
+
+        // Tombstones for edges whose insert is not in `source` (the edge was
+        // flushed in an earlier window). `apply_edge_deletion` records the
+        // endpoints on the tombstone itself for exactly this case.
+        for (eid, tombstone) in &source.tombstones {
+            if !source.edge_endpoints.contains_key(eid) {
+                let edge_version = source
+                    .edge_versions
+                    .get(eid)
+                    .copied()
+                    .unwrap_or(fallback_version);
+                self.adjacency_manager.add_tombstone(
+                    *eid,
+                    tombstone.src_vid,
+                    tombstone.dst_vid,
+                    tombstone.edge_type,
+                    edge_version,
+                );
+            }
+        }
+    }
+
     pub async fn replay_wal(&self, wal_high_water_mark: u64) -> Result<usize> {
         let l0 = self.l0_manager.get_current();
         let wal = l0.read().wal.clone();
@@ -802,6 +858,15 @@ impl Writer {
                 // on `commit_transaction_l0`). Nulling preserves exactly the pre-fix
                 // flush outcome for these values, with a loud signal.
                 self.sanitize_replayed_vector_dims(&mut l0_guard);
+                // Mirror the recovered edges into the AdjacencyManager overlay
+                // (issues #281, #282). `replay_mutations` restores them into
+                // the L0 buffer only, and the traversal read path does not read
+                // edges from there — see `mirror_edges_into_adjacency`. Without
+                // this, a store that crashed before its first flush, or a second
+                // handle replaying another handle's committed-but-unflushed WAL,
+                // returns every committed vertex and none of the committed edges.
+                let fallback_version = l0_guard.current_version;
+                self.mirror_edges_into_adjacency(&l0_guard, fallback_version);
             }
 
             Ok(count)
@@ -1604,24 +1669,8 @@ impl Writer {
                 }
             }
 
-            // Replay tombstones for edges that only exist in the global L0
-            // (not in this transaction's edge_endpoints).
-            for (eid, tombstone) in &tx_l0.tombstones {
-                if !tx_l0.edge_endpoints.contains_key(eid) {
-                    let edge_version = tx_l0
-                        .edge_versions
-                        .get(eid)
-                        .copied()
-                        .unwrap_or(main_l0.current_version);
-                    self.adjacency_manager.add_tombstone(
-                        *eid,
-                        tombstone.src_vid,
-                        tombstone.dst_vid,
-                        tombstone.edge_type,
-                        edge_version,
-                    );
-                }
-            }
+            // Replay transaction edges into the AdjacencyManager overlay.
+            self.mirror_edges_into_adjacency(&tx_l0, main_l0.current_version);
         }
 
         // Crash-recovery seam: durable AND merged, but the in-memory commit

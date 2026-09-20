@@ -1553,6 +1553,62 @@ pub fn scalar_to_large_binary_expr(expr: DfExpr) -> DfExpr {
     ))
 }
 
+/// The inverse of [`scalar_to_large_binary_expr`]: decode a CypherValue
+/// expression into a concrete Arrow type.
+///
+/// An entity bound natively carries typed property columns, but one that
+/// reached the expression through `collect()` + `UNWIND` is a single
+/// `LargeBinary` CypherValue, and a property read off it is `LargeBinary` too.
+/// This project's own UDFs decode that; DataFusion's built-ins cannot, so
+/// `toUpper(n.name)` and `coalesce(n.name, 'x')` fail on the second encoding
+/// while working on the first.
+///
+/// No new UDF is needed to fix that. `toString` / `toInteger` / `toFloat` /
+/// `toBoolean` are each `Signature::any(1)` over `invoke_cypher_udf`, so each
+/// already accepts a CypherValue and already returns the concrete type. This
+/// picks the right one.
+///
+/// Returns `None` for a target with no such decoder, so a caller leaves the
+/// expression exactly as it found it rather than guessing.
+pub fn large_binary_to_scalar_expr(
+    expr: DfExpr,
+    target: &datafusion::arrow::datatypes::DataType,
+) -> Option<DfExpr> {
+    use datafusion::arrow::datatypes::DataType;
+
+    let udf = match target {
+        DataType::Utf8 | DataType::LargeUtf8 => crate::df_udfs::create_tostring_udf(),
+        DataType::Int64 => crate::df_udfs::create_to_integer_udf(),
+        DataType::Float64 => crate::df_udfs::create_to_float_udf(),
+        DataType::Boolean => crate::df_udfs::create_to_boolean_udf(),
+        _ => return None,
+    };
+    Some(DfExpr::ScalarFunction(
+        datafusion::logical_expr::expr::ScalarFunction::new_udf(Arc::new(udf), vec![expr]),
+    ))
+}
+
+/// Whether `expr` is a CypherValue that may be decoded by
+/// [`large_binary_to_scalar_expr`].
+///
+/// The `uni_raw_bytes` check is the load-bearing half. A raw `Bytes` value and a
+/// CypherValue are **both** `LargeBinary` and are told apart only by that field
+/// metadata. Decoding a raw-bytes column would stringify it — corruption, and
+/// silent, which is a worse defect than the one this exists to fix.
+pub fn is_decodable_cypher_value(expr: &DfExpr, schema: &datafusion::common::DFSchema) -> bool {
+    use datafusion::arrow::datatypes::DataType;
+    use datafusion::logical_expr::ExprSchemable;
+
+    if !matches!(expr.get_type(schema), Ok(DataType::LargeBinary)) {
+        return false;
+    }
+    match expr.metadata(schema) {
+        Ok(md) => !md.inner().contains_key("uni_raw_bytes"),
+        // Unknown provenance: decline rather than risk a raw-bytes column.
+        Err(_) => false,
+    }
+}
+
 /// Build a `BinaryExpr` from left, operator, and right expressions.
 fn binary_expr(left: DfExpr, op: datafusion::logical_expr::Operator, right: DfExpr) -> DfExpr {
     DfExpr::BinaryExpr(datafusion::logical_expr::expr::BinaryExpr::new(
@@ -3618,6 +3674,84 @@ fn coerce_aggregate_function(
 
 #[cfg(test)]
 mod tests {
+
+    mod cypher_value_decoding {
+        use super::super::{is_decodable_cypher_value, large_binary_to_scalar_expr};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::common::DFSchema;
+        use datafusion::logical_expr::{ExprSchemable, col};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        fn schema_with(field: Field) -> DFSchema {
+            DFSchema::try_from(Schema::new(vec![field])).expect("schema")
+        }
+
+        /// Each target maps to the decoder that already returns that type, and
+        /// the returned expression really does report it — the whole point is to
+        /// hand a typed value to a consumer that cannot read a CypherValue.
+        #[test]
+        fn each_supported_target_decodes_to_that_type() {
+            for target in [
+                DataType::Utf8,
+                DataType::Int64,
+                DataType::Float64,
+                DataType::Boolean,
+            ] {
+                let schema = schema_with(Field::new("v", DataType::LargeBinary, true));
+                let decoded = large_binary_to_scalar_expr(col("v"), &target)
+                    .unwrap_or_else(|| panic!("no decoder for {target:?}"));
+                assert_eq!(
+                    decoded.get_type(&schema).expect("type"),
+                    target,
+                    "decoder for {target:?} does not report {target:?}"
+                );
+            }
+        }
+
+        /// A target with no decoder yields `None` so the caller leaves the
+        /// expression alone. Guessing here would be worse than not acting.
+        #[test]
+        fn an_unsupported_target_declines() {
+            assert!(large_binary_to_scalar_expr(col("v"), &DataType::Date32).is_none());
+            assert!(large_binary_to_scalar_expr(col("v"), &DataType::LargeBinary).is_none());
+        }
+
+        /// The guard admits an unmarked CypherValue column.
+        #[test]
+        fn an_unmarked_large_binary_is_decodable() {
+            let schema = schema_with(Field::new("v", DataType::LargeBinary, true));
+            assert!(is_decodable_cypher_value(&col("v"), &schema));
+        }
+
+        /// A raw `Bytes` column is also `LargeBinary` and is told apart only by
+        /// this metadata. Decoding one would stringify it, silently — so the
+        /// guard must refuse. This is the assertion the whole helper rests on.
+        #[test]
+        fn a_raw_bytes_column_is_refused() {
+            let field = Field::new("v", DataType::LargeBinary, true).with_metadata(HashMap::from(
+                [("uni_raw_bytes".to_string(), "true".to_string())],
+            ));
+            let schema = schema_with(field);
+            assert!(
+                !is_decodable_cypher_value(&col("v"), &schema),
+                "a raw-bytes column was admitted for decoding"
+            );
+        }
+
+        /// Anything that is not `LargeBinary` is not this helper's business.
+        #[test]
+        fn a_typed_column_is_not_decodable() {
+            let schema = schema_with(Field::new("v", DataType::Utf8, true));
+            assert!(!is_decodable_cypher_value(&col("v"), &schema));
+        }
+
+        // Silence the unused-import warning when only some paths are exercised.
+        #[allow(dead_code)]
+        fn _arc_used() -> Option<Arc<u8>> {
+            None
+        }
+    }
 
     mod native_entity_scalars {
         use super::super::value_to_scalar;

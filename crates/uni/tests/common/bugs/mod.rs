@@ -138,6 +138,7 @@ pub mod merge_path_binding;
 pub mod merge_per_row_counters;
 pub mod repro_distinct_entity_over_counts;
 pub mod repro_issue_249_add_property_to_existing_label;
+pub mod repro_optional_match_over_unwound_entity;
 pub mod repro_path_element_hydration_after_flush;
 pub mod repro_registry_monotonicity_oracle;
 pub mod repro_schemaless_pattern_comprehension_empty;

@@ -1697,6 +1697,23 @@ fn collect_unmatched_optional_group_rows(
         })
         .collect();
 
+    // With no key column every row keys to the empty vector, so the whole batch
+    // becomes one group and a single matched row suppresses the NULL rows for
+    // every other source. That is how an OPTIONAL MATCH over a `collect()` +
+    // `UNWIND` binding silently dropped source rows: the entity arrives as one
+    // encoded column, with no `._vid` beside it to key on.
+    //
+    // Falling back to per-row makes "cannot group" mean "do not group". That is
+    // also the right answer rather than merely the safe one: grouping exists so
+    // a source fanned out by an earlier traversal is null-filled once, while a
+    // source genuinely repeated in the input must produce a row each time —
+    // `UNWIND [x, x]` against an unmatched `x` yields two rows, not one.
+    if source_vid_indices.is_empty() {
+        return Ok((0..input.num_rows())
+            .filter(|idx| !matched_indices.contains(idx))
+            .collect());
+    }
+
     // Group rows by non-optional VID bindings and preserve group order.
     let mut groups: HashMap<Vec<u8>, (usize, bool)> = HashMap::new(); // (first_row_idx, any_matched)
     let mut group_order: Vec<Vec<u8>> = Vec::new();

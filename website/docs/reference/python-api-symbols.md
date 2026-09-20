@@ -276,6 +276,7 @@ Async fluent builder for Locy evaluation on a session.
 | `params(params: dict[str, Any]) -> AsyncSessionLocyBuilder` | — |
 | `timeout(seconds: float) -> AsyncSessionLocyBuilder` | — |
 | `max_iterations(n: int) -> AsyncSessionLocyBuilder` | — |
+| `max_memory(bytes: int) -> AsyncSessionLocyBuilder` | — |
 | `with_config(config: dict[str, Any] | LocyConfig) -> AsyncSessionLocyBuilder` | — |
 | `cancellation_token(token: CancellationToken) -> AsyncSessionLocyBuilder` | — |
 | `async run() -> LocyResult` | — |
@@ -437,6 +438,7 @@ Async fluent builder for Locy evaluation within a transaction.
 | `param(name: str, value: Any) -> AsyncTxLocyBuilder` | — |
 | `timeout(seconds: float) -> AsyncTxLocyBuilder` | — |
 | `max_iterations(n: int) -> AsyncTxLocyBuilder` | — |
+| `max_memory(bytes: int) -> AsyncTxLocyBuilder` | — |
 | `with_config(config: dict[str, Any] | LocyConfig) -> AsyncTxLocyBuilder` | — |
 | `cancellation_token(token: CancellationToken) -> AsyncTxLocyBuilder` | — |
 | `async run() -> LocyResult` | — |
@@ -1885,6 +1887,7 @@ Fluent builder for Locy evaluation on a session.
 | `params(params: dict[str, Any]) -> SessionLocyBuilder` | — |
 | `timeout(seconds: float) -> SessionLocyBuilder` | — |
 | `max_iterations(n: int) -> SessionLocyBuilder` | — |
+| `max_memory(bytes: int) -> SessionLocyBuilder` | — |
 | `with_config(config: dict[str, Any] | LocyConfig) -> SessionLocyBuilder` | — |
 | `cancellation_token(token: CancellationToken) -> SessionLocyBuilder` | — |
 | `run() -> LocyResult` | — |
@@ -2115,6 +2118,7 @@ Fluent builder for Locy evaluation within a transaction.
 | `param(name: str, value: Any) -> TxLocyBuilder` | — |
 | `timeout(seconds: float) -> TxLocyBuilder` | — |
 | `max_iterations(n: int) -> TxLocyBuilder` | — |
+| `max_memory(bytes: int) -> TxLocyBuilder` | — |
 | `with_config(config: dict[str, Any] | LocyConfig) -> TxLocyBuilder` | — |
 | `cancellation_token(token: CancellationToken) -> TxLocyBuilder` | — |
 | `run() -> LocyResult` | — |

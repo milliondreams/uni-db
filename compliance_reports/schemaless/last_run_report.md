@@ -1,17 +1,19 @@
 # TCK Compliance Report
 
-**Generated:** 2026-09-16 13:57:20
-**Results:** `results_20260916_135719.json`
-**Compared to:** `results_20260914_212258.json`
+**Generated:** 2026-09-20 03:18:28
+**Results:** `results_20260920_031828.json`
+**Compared to:** `results_20260920_030710.json`
 
 ## Summary
 
 | Metric | Current | Previous | Delta |
 |--------|---------|----------|-------|
 | Scenarios | 3926 | 3926 |  |
-| Passed | 3925 | 3925 |  |
-| Failed | 0 | 0 |  |
-| Pass Rate | 100.0% | 100.0% | ➡️ +0.0pp |
+| Passed | 3925 | 3924 | +1 |
+| Failed | 0 | 1 | -1 |
+| Pass Rate | 100.0% | 99.9% | 📈 +0.0pp |
+
+**🟢 Fixed:** 1 scenarios now passing
 
 ## Feature Breakdown
 
@@ -60,7 +62,7 @@
 | ✅ Graph3 | 9 | 9 | 0 | 100% |  |
 | ✅ Graph4 | 11 | 11 | 0 | 100% |  |
 | ✅ Graph5 | 9 | 9 | 0 | 100% |  |
-| ✅ Graph6 | 14 | 14 | 0 | 100% |  |
+| ✅ Graph6 | 14 | 14 | 0 | 100% | +7pp |
 | ✅ Graph7 | 3 | 3 | 0 | 100% |  |
 | ✅ Graph8 | 8 | 8 | 0 | 100% |  |
 | ✅ Graph9 | 7 | 7 | 0 | 100% |  |
@@ -210,6 +212,12 @@
 | ✅ WithWhere5 | 4 | 4 | 0 | 100% |  |
 | ✅ WithWhere6 | 1 | 1 | 0 | 100% |  |
 | ✅ WithWhere7 | 3 | 3 | 0 | 100% |  |
+
+## 🟢 Newly Passing
+
+Scenarios that were failing but are now passing:
+
+- **Graph6** — [6] Statically access a property of a optional non-null relationship (line 111)
 
 ## Failed Scenarios
 

@@ -291,17 +291,30 @@ impl<'a> SchemaBuilder<'a> {
                     // the same schema is the documented "register on every
                     // KB-open" pattern, and rebuilding all indexes per
                     // re-apply is what made KB-open take minutes (issue
-                    // rustic-ai/uni-db#63). The `add_index` call below is
-                    // upsert-by-name, so it stays cheap regardless.
+                    // rustic-ai/uni-db#63).
+                    //
+                    // Compare configuration only. `IndexDefinition`'s derived
+                    // `PartialEq` includes lifecycle `metadata`, which only the
+                    // storage layer sets after a build, while a declaration
+                    // always carries the default. Comparing with `==` therefore
+                    // reported "different" for every index that had actually
+                    // been built, so this guard stopped working the moment it
+                    // mattered and #63's rebuild-per-open came back.
+                    //
+                    // When the config matches, leave the stored definition
+                    // alone: `add_index` is upsert-by-name and would replace it
+                    // with this metadata-less declaration, discarding the
+                    // build status and timestamp that the index-lifecycle
+                    // reporting reads.
                     let already_present = manager
                         .get_index(idx.name())
-                        .is_some_and(|existing| existing == idx);
-                    manager
-                        .add_index(idx.clone())
-                        .map_err(|e| UniError::Schema {
-                            message: e.to_string(),
-                        })?;
+                        .is_some_and(|existing| existing.same_config_as(&idx));
                     if !already_present {
+                        manager
+                            .add_index(idx.clone())
+                            .map_err(|e| UniError::Schema {
+                                message: e.to_string(),
+                            })?;
                         indexes_to_build.push(idx.label().to_string());
                     }
                 }

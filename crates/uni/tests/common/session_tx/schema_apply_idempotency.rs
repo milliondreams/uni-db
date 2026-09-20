@@ -317,3 +317,116 @@ async fn a_new_not_null_property_on_a_populated_label_is_nullable_and_reappliabl
     );
     db.shutdown().await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Re-applying a schema must not rebuild indexes that are already built.
+// ---------------------------------------------------------------------------
+
+/// The `already_present` guard above exists so that re-registering an unchanged
+/// schema does not rebuild every index (issue #63: KB-open took minutes). It
+/// compared the stored definition to the declared one with `==`, and
+/// `IndexDefinition`'s derived `PartialEq` includes lifecycle `metadata` —
+/// status, `last_built_at`, `row_count_at_build` — which only the storage layer
+/// writes, after a build. A declaration always carries the default, so from the
+/// moment an index was actually built the two could never compare equal and the
+/// guard was dead.
+///
+/// `last_built_at` is the witness: it moves if and only if a rebuild ran. The
+/// assertion that the index was built in the first place is the control —
+/// without it this passes trivially on a store where nothing was ever indexed.
+#[tokio::test]
+async fn reapplying_a_schema_does_not_rebuild_an_already_built_index() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = dir.path().join("store");
+    let db = Uni::open(store.to_string_lossy()).build().await.unwrap();
+
+    apply_canonical_schema(&db).await;
+
+    let tx = db.session().tx().await.unwrap();
+    for i in 0..200 {
+        tx.execute_with("CREATE (:Foo {name: $n})")
+            .param("n", format!("n{i}"))
+            .run()
+            .await
+            .unwrap();
+    }
+    tx.commit().await.unwrap();
+    db.flush().await.unwrap();
+
+    let built_at = |db: &Uni| {
+        db.schema_manager()
+            .schema()
+            .indexes
+            .first()
+            .and_then(|i| i.metadata().last_built_at)
+    };
+
+    let before = built_at(&db);
+    assert!(
+        before.is_some(),
+        "control: the index was never built, so a preserved timestamp would \
+         prove nothing"
+    );
+
+    // Any rebuild stamps `Utc::now()`, so give the clock room to differ.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    apply_canonical_schema(&db).await;
+
+    assert_eq!(
+        built_at(&db),
+        before,
+        "re-applying an unchanged schema rebuilt an already-built index; the \
+         guard compares declared-vs-stored and must ignore lifecycle metadata"
+    );
+    assert_eq!(
+        db.schema_manager().schema().indexes.len(),
+        1,
+        "the stored definition should be left alone, not re-upserted"
+    );
+
+    db.shutdown().await.unwrap();
+}
+
+/// The other half: a genuine configuration change must still rebuild. Without
+/// this, "never rebuild" would satisfy the test above.
+#[tokio::test]
+async fn changing_an_index_config_still_rebuilds() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = dir.path().join("store");
+    let db = Uni::open(store.to_string_lossy()).build().await.unwrap();
+
+    apply_canonical_schema(&db).await; // Scalar(Hash)
+
+    let tx = db.session().tx().await.unwrap();
+    tx.execute("CREATE (:Foo {name: 'a'})").await.unwrap();
+    tx.commit().await.unwrap();
+    db.flush().await.unwrap();
+
+    let built_at = |db: &Uni| {
+        db.schema_manager()
+            .schema()
+            .indexes
+            .first()
+            .and_then(|i| i.metadata().last_built_at)
+    };
+    let before = built_at(&db);
+    assert!(before.is_some(), "control: the index was never built");
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    db.schema()
+        .label("Foo")
+        .property("name", DataType::String)
+        .index("name", IndexType::Scalar(ScalarType::BTree)) // was Hash
+        .done()
+        .apply()
+        .await
+        .unwrap();
+
+    assert_ne!(
+        built_at(&db),
+        before,
+        "a changed index configuration must still trigger a rebuild"
+    );
+
+    db.shutdown().await.unwrap();
+}

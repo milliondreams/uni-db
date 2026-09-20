@@ -747,7 +747,24 @@ impl HybridPhysicalPlanner {
         crate::query::planner::relax_count_only_entities(&logical_rewritten, &mut all_properties);
 
         // Delegate to internal planning with properties context
-        self.plan_internal(&logical_rewritten, &all_properties)
+        let plan = self.plan_internal(&logical_rewritten, &all_properties)?;
+        self.guard_deadlines(plan)
+    }
+
+    /// Insert deadline checkpoints beneath pipeline-breaking operators.
+    ///
+    /// Applied to every finished physical plan. A pipeline breaker consumes its
+    /// whole input inside one `poll_next`, so the per-batch check in the
+    /// collecting loop above it fires once and the deadline is only noticed
+    /// after the work is done (issue #283). See
+    /// [`crate::query::df_graph::deadline_guard`].
+    fn guard_deadlines(&self, plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
+        crate::query::df_graph::deadline_guard::insert_deadline_guards(
+            plan,
+            self.graph_ctx.deadline_for_host(),
+            self.graph_ctx.cancellation_token_for_host().as_ref(),
+        )
+        .map_err(Into::into)
     }
 
     /// Plan a LogicalPlan with additional property requirements.
@@ -770,7 +787,8 @@ impl HybridPhysicalPlanner {
         crate::query::planner::mark_dead_unwind_sources(&logical_rewritten, &mut all_properties);
         // `count(n)` needs to know a row exists, not what is in it (#184 family).
         crate::query::planner::relax_count_only_entities(&logical_rewritten, &mut all_properties);
-        self.plan_internal(&logical_rewritten, &all_properties)
+        let plan = self.plan_internal(&logical_rewritten, &all_properties)?;
+        self.guard_deadlines(plan)
     }
 
     /// Wrap a plan with optional semantics.

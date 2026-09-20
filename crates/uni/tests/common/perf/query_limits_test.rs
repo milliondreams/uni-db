@@ -2564,3 +2564,66 @@ async fn locy_timeout_interrupts_work_inside_an_operator() {
         "the budget was reported rather than enforced: {elapsed:?}"
     );
 }
+
+/// Issue #283: a timeout must stop a query, not describe it afterwards.
+///
+/// A pipeline-breaking operator — here the aggregate under `count(*)` —
+/// consumes its whole input inside one `poll_next`, so the per-batch check in
+/// the collecting loop above it runs once at the start and once after the work
+/// is over. `tokio::time::timeout` cannot preempt it either, because a
+/// CPU-bound span that never yields never lets the timer run. What was left was
+/// an `Instant::now() > deadline` test after the rows existed: a report, not a
+/// limit. `DeadlineGuardExec` puts a checkpoint on the pull path beneath the
+/// breaker, where the polling still repeats.
+///
+/// The wall-clock assertion is what makes this test mean anything — the query
+/// returned the right answer before, just twenty seconds late. The control
+/// establishes the query is genuinely slow, so a fast failure is enforcement
+/// rather than the fixture being trivial.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deadline_is_enforced_under_a_pipeline_breaking_operator() {
+    let db = Uni::in_memory().build().await.unwrap();
+    db.schema()
+        .label("Entity")
+        .property("uid", DataType::String)
+        .done()
+        .apply()
+        .await
+        .unwrap();
+    let tx = db.session().tx().await.unwrap();
+    for i in 0..600 {
+        tx.execute_with("CREATE (:Entity {uid: $u})")
+            .param("u", format!("e{i}"))
+            .run()
+            .await
+            .unwrap();
+    }
+    tx.commit().await.unwrap();
+
+    // Three-way cartesian under an aggregate: 600^3 rows to count.
+    const SLOW: &str = "MATCH (a:Entity),(b:Entity),(c:Entity) RETURN count(*) AS n";
+
+    // The guard is actually in this plan. Without this, a fast failure could
+    // come from anywhere and the test would still be green.
+    let session = db.session();
+    crate::plan_shape::assert_plan_uses(&session, SLOW, "DeadlineGuardExec").await;
+
+    let started = Instant::now();
+    let err = db
+        .session()
+        .query_with(SLOW)
+        .timeout(Duration::from_secs(2))
+        .fetch_all()
+        .await
+        .expect_err("a 2s timeout must stop this query");
+    let elapsed = started.elapsed();
+
+    assert!(
+        err.to_string().to_lowercase().contains("time"),
+        "expected a timeout, got: {err}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the deadline was reported rather than enforced: {elapsed:?}"
+    );
+}

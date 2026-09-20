@@ -123,7 +123,7 @@ RETURN a.title, b.title
 // Exactly 2 hops
 MATCH (a)-[:KNOWS*2]->(b)
 
-// Any length (use with caution on large graphs)
+// No written upper bound — the planner caps this at 100 hops
 MATCH (a)-[:KNOWS*]->(b)
 
 // Zero or more hops
@@ -151,6 +151,70 @@ The same is true of `shortestPath` and `allShortestPaths`:
 MATCH p = shortestPath((a:Author {name: 'Alice'})-[r:COAUTHOR*]-(b:Author {name: 'Bob'}))
 RETURN size(r) AS hops, [e IN r | e.paper] AS papers
 ```
+
+#### What a variable-length pattern costs
+
+Two different things happen when a variable-length pattern runs, and knowing
+which one is expensive is usually enough to fix a slow query.
+
+First a breadth-first search explores the graph and records, compactly, which
+vertices reach which. Its cost tracks the **edges explored** — roughly the size
+of the reachable neighbourhood — and no hop bound or `LIMIT` avoids it.
+
+Then, *only if the query asks for paths*, those records are expanded into actual
+paths. This is where cost can explode: on a graph with cycles, the number of
+distinct paths grows combinatorially with the hop bound, even though the search
+that found them was cheap.
+
+So the single most effective change is often to stop asking for paths:
+
+```cypher
+// Expensive: builds every distinct path
+MATCH p = (a:Company {id: 'X'})-[:OWNS*]->(b:Company)
+RETURN p
+
+// Cheap: the search runs, the expansion does not
+MATCH (a:Company {id: 'X'})-[:OWNS*]->(b:Company)
+RETURN DISTINCT b
+```
+
+If you need one path rather than all of them, `shortestPath` stops at the first
+one it finds and is dramatically cheaper than enumerating and discarding.
+
+#### Using LIMIT with an unbounded pattern
+
+A `LIMIT` stops the path expansion rather than trimming its output, so asking
+for a handful of paths costs a handful of paths:
+
+```cypher
+// Returns promptly even though the full path set is combinatorial
+MATCH p = (a:Company {id: 'X'})-[:OWNS*]->(b:Company)
+RETURN length(p) AS hops
+LIMIT 5
+```
+
+Two things to expect:
+
+- **The search still runs in full.** `LIMIT` cannot avoid the breadth-first
+  stage, so there is a floor under the query time set by the size of the
+  reachable neighbourhood, not by the limit.
+- **The limit takes effect a batch at a time.** Anything up to one batch
+  (8192 rows by default) costs the same as `LIMIT 1`; a limit above that costs
+  proportionally more batches.
+
+Measured on a 852-vertex, 1013-edge graph with cycles, where the same query
+without a limit does not complete within a 30-second timeout:
+
+| Query | Result |
+|---|---|
+| `... RETURN p LIMIT 5` | 5 rows, ~4 s |
+| `... RETURN p LIMIT 8192` | 8192 rows, ~4 s |
+| `... RETURN p LIMIT 20000` | 20000 rows, ~16 s |
+| `... RETURN count(p)` (no limit) | times out |
+
+The last row is not a defect: counting *every* path of an unbounded pattern over
+a cyclic graph is unbounded work. Bound the hops, limit the rows, or ask for
+endpoints instead.
 
 ### Quantified Path Patterns
 
@@ -1414,11 +1478,19 @@ RETURN path
 ```
 
 **Hop Constraint Semantics:**
-- `*` or `*1..` — Unlimited hops (default: 1 to ∞)
+- `*` or `*1..` — No *written* upper bound. The planner supplies a default of **100 hops**
 - `*2..6` — Between 2 and 6 hops
 - `*..5` — At most 5 hops (1 to 5)
-- `*3..` — At least 3 hops (3 to ∞)
+- `*3..` — At least 3 hops, up to the 100-hop default
 - `*0..` — Zero or more hops (allows source == target)
+
+!!! warning "An omitted upper bound means 100, not infinity"
+    A pattern with no upper bound is planned with a maximum of 100 hops, and
+    anything beyond that is **not reported** — you get a shorter answer with no
+    warning. On a chain 150 vertices long, `-[:R*]->` finds paths up to length
+    100; writing `-[:R*1..140]->` finds paths up to length 140. An explicit
+    bound above 100 is honoured, so write one whenever the graph might be
+    deeper than that.
 
 ### Degree Counting
 

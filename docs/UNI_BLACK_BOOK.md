@@ -2682,6 +2682,166 @@ A pair with no path is **not** dropped: `shortestPath` emits the row with a NULL
 path (pinned by `cypher_shortest_path::test_all_shortest_paths_no_path`). Filter
 on `length(p) IS NOT NULL` when the distinction matters.
 
+## Variable-length path execution
+
+A variable-length pattern (`-[:T*]->`, `-[:T*1..n]->`) and a QPP both compile to
+`GraphVariableLengthTraverseExec`. It runs in two stages, and almost every
+performance question about these patterns is really a question about which
+stage is doing the work.
+
+### Stage 1 — breadth-first search into a predecessor DAG
+
+The search is NFA-driven (`df_graph/nfa.rs`) and expands one depth at a time,
+deduplicating `(vid, nfa_state)` per depth. It does not record paths. It records,
+for each `(dst_vid, dst_state, depth)`, a linked list of the
+`(src_vid, src_state, eid)` triples that reach it — the **predecessor DAG**
+(`df_graph/pred_dag.rs`). The DAG is a compact `Vec<PredRec>` pool plus a head
+map; it is linear in edges explored, not in paths.
+
+Two safety caps bound this stage: `MAX_FRONTIER_SIZE` (500,000 vertices in one
+frontier) and `MAX_PRED_POOL_SIZE` (2,000,000 predecessor records). Hitting
+either stops the search and pushes a `QueryWarning` — results below are
+**incomplete**, and the warning says so. This is deliberate: an abandoned search
+with a step or group variable bound means *missing rows*, not merely a missed
+endpoint, so it is surfaced rather than returned as a short answer that looks
+complete.
+
+### Stage 2 — enumerating paths out of the DAG
+
+Only run when the query actually needs paths — a path variable, a step variable,
+or a QPP group binding. `VlpOutputMode::EndpointsOnly` skips it entirely and
+verifies reachability with `has_trail_valid_path`, which stops at the first
+valid path. This is why `RETURN count(DISTINCT b)` is cheap on a graph where
+`RETURN p` is not.
+
+Enumeration is a backward depth-first walk from each accepting endpoint. The
+count is **not** bounded by the DAG's size: a DAG with 15,000 accepting entries
+over a cyclic graph holds combinatorially many distinct paths.
+
+### Why enumeration is resumable
+
+`PathEnumerator` holds the DFS stack explicitly rather than recursing, so a
+`ControlFlow::Break` from the consumer is a **pause**, not an abort: `resume`
+returns with every frame intact and the next call continues at the path after
+the one that broke.
+
+This exists because the operator was otherwise a *blocking producer*. It
+enumerated every path a source vertex owns inside a single `poll_next`, so the
+consumer could stop asking but the operator could not stop producing —
+`LIMIT 5` cost exactly what no limit cost. On a cyclic graph that set is
+combinatorial, and the query died on the memory budget or the deadline with five
+rows asked for and none delivered.
+
+`enumerate_paths` is kept as a thin run-to-completion wrapper over the cursor on
+purpose: every existing caller and the openCypher TCK therefore exercise the
+resumable walk, so the two cannot drift apart.
+
+A half-drained row parks in `PausedRowEnumeration` on the stream, holding the
+DAG, the accepting list and the cursor. It takes precedence over `pending_rows`
+— while it is set, every batch the operator emits comes out of that row's own
+chunk — and `resume_state()` must check it first.
+
+The pause only engages for a **single-row chunk with no bound endpoint**.
+Single-row is what `retune_rows_per_chunk` converges to under a large fan-out,
+so it is exactly the exploding case. The bound-endpoint exclusion is a
+correctness requirement, not a heuristic: with a bound endpoint the expansion
+loop filters *after* enumeration, so a pause could hand back fewer rows than the
+pass was asked for. (Narrowing the accepting set by the bound endpoint first
+would make the pause safe there too. It was written and then dropped, because no
+query shape could be found that reaches it: `bound_target_column` is unset even
+for `MATCH (b {..}) WITH b MATCH p=(a)-[*]->(b)`, where the endpoint is enforced
+by a `FilterExec` above this operator.)
+
+### How a LIMIT actually binds
+
+**Not by fetch pushdown.** `push_fetch_into_scan` descends only through
+`ProjectionExec`, and a variable-length pattern with a labelled endpoint always
+plans as
+
+```
+LocalLimitExec -> ProjectionExec -> FilterExec: array_has(b._labels, L)
+                                 -> GraphVariableLengthTraverseExec
+```
+
+A fetch pushed past a row-dropping filter can under-deliver, so the descent
+correctly stops. That `FilterExec` is **not** redundant with the operator's own
+`check_target_label`, which deliberately fails *open* for a vertex it cannot
+resolve from L0 or the `VidLabelsIndex` (`None => true // trust storage`) — the
+filter above it is the authoritative check, and removing it would be a fail-open
+regression (#141).
+
+The limit binds as ordinary **back-pressure** instead: the operator drains at
+most `slice_size` paths per batch, hands the batch downstream, and if nothing
+pulls again the remaining paths are never walked. `slice_size` is DataFusion's
+`SessionConfig::batch_size` — **8192**, not `UniConfig::batch_size` (1024), which
+sizes storage morsels and is a different knob.
+
+So the granularity of a limit is one batch, which is directly measurable. On an
+852-vertex / 1013-edge cyclic graph:
+
+| `LIMIT` | rows | time |
+|---|---|---|
+| 5 / 100 / 8000 / 8192 | as asked | ~4.0 s |
+| 8500 | 8500 | 9.4 s |
+| 20000 | 20000 | 16.3 s |
+| 50000 | — | 30 s timeout |
+| none (`count(p)`) | — | 30 s timeout |
+
+Everything at or below 8192 costs one batch. The ~4 s floor is stage 1: the BFS
+has to finish before any accepting endpoint is known, and no limit can avoid it.
+The no-limit row is the honest one — counting every path of an unbounded pattern
+over a cyclic graph is unbounded work, and a declared limit is what stops it.
+
+### The default hop bound is 100, and truncation is silent
+
+An unbounded `*` is planned with `DEFAULT_MAX_HOPS = 100`
+(`query/planner.rs`). This is a *planning* bound, not a safety cap, so it does
+**not** raise the incomplete-results warning that `MAX_FRONTIER_SIZE` does.
+
+On a 150-vertex chain, `MATCH p=(a {uid:'n0'})-[:R*]->(b)` returns 100 paths with
+a maximum length of 100; the same pattern written `[:R*1..140]` returns 140. An
+explicit bound above 100 is honoured — the default only applies when no upper
+bound is written. A graph deeper than 100 hops therefore gets a silently short
+answer from `[*]`, and that is worth knowing before reaching for it.
+
+### Path modes
+
+`PathMode` has four variants, and mode determines what the enumerator rejects as
+it walks: `Trail` (no repeated edge), `Walk` (no restriction), `Acyclic` (no
+repeated vertex), `Simple` (no repeated vertex except start may equal end).
+
+**Only `Trail` is ever emitted.** Every construction site in `query/planner.rs`
+writes `PathMode::Trail`, which is openCypher's default relationship-uniqueness
+semantics; the other three are reachable only from unit tests. Treat them as
+scaffolding for a future GQL `WALK`/`ACYCLIC` selector rather than as live
+behaviour, and note that a defect in one of them is not a live wrong answer.
+
+Mode bookkeeping is incremental — an `edge_set` for `Trail`, a **counted**
+`node_counts` map for `Acyclic`/`Simple` — pushed on descent and undone on
+backtrack. The count matters: `Simple` admits one repeat, so the same vertex can
+be pushed twice, and with a plain set the first undo erases the entry that the
+seeded target put there, after which every later branch wrongly re-admits it.
+The recursion that `PathEnumerator` replaced had exactly this defect, and it was
+found by the brute-force oracle in `pred_dag.rs`'s tests rather than by any of
+the hand-written fixtures.
+
+### Testing the enumerator
+
+Two kinds of test, because neither alone is sufficient:
+
+- **Pause equivalence** — drive a cursor one path per `resume` and assert the
+  sequence matches the uninterrupted walk exactly. This is the only thing that
+  catches a frame restored wrongly after a `Break`; run-to-completion tests call
+  `resume` once and stay green through such a bug.
+- **A brute-force oracle** — an independent recursion that recomputes membership
+  from the path itself, so there is no incremental set to forget to undo.
+
+The pair is the point. A self-comparison cannot see a bug that both of its arms
+share: sabotaging the `Trail` undo leaves every pause-equivalence assertion
+green, because it corrupts the paused and the uninterrupted walk identically.
+The oracle catches it; the oracle in turn cannot see a pause bug. Both live in
+`crates/uni-query/src/query/df_graph/pred_dag.rs`.
+
 ## Cypher Best Practices
 
 | Practice | Details |
@@ -2702,7 +2862,7 @@ on `length(p) IS NOT NULL` when the distinction matters.
 | Anti-Pattern | Problem | Solution |
 |---|---|---|
 | **Cartesian products** | Unconnected patterns multiply results | Connect patterns or use WITH |
-| **Unbounded VLP** | `[*]` without upper bound → exponential expansion | Always set upper bound: `[*..5]` |
+| **Unbounded VLP returning paths** | `[*]` with a path variable → the path set is combinatorial, not the frontier. `[*]` also caps silently at 100 hops | Set an upper bound `[*..5]`; or add a `LIMIT`, which now stops the enumeration (one batch granularity); or drop the path variable if only endpoints are needed |
 | **COLLECT without DISTINCT** | Duplicate elements in collected list | Use `collect(DISTINCT x)` |
 | **WITH \*** | Materializes everything in pipeline | Explicitly name needed variables |
 | **String concatenation for filters** | Injection risk | Use `$param` parameters |
@@ -5703,6 +5863,47 @@ ceiling, so no successful query can witness one. Each sets a ceiling below what
 the operator holds, requires a refusal naming it, and pairs that with a higher
 ceiling asserting the answer is unchanged.
 
+### Traversal budgets: which limit actually stops a runaway path query
+
+A variable-length pattern is the one place where all three declared limits —
+`max_query_memory`, `query_timeout` and a `LIMIT` — can each be the binding
+constraint, and which one fires says something different about the query.
+
+`PathBudget` (`df_graph/traverse.rs`) charges **every admitted path before it is
+kept**, against the query's pool and the deadline, so both bind as the set
+accrues rather than after it is resident. The distinction matters: the earlier
+implementation reserved after the `Vec` already existed, which meant the pool
+could only refuse what had already been committed. A limit checked after the
+fact is a report, not a limit.
+
+`MAX_FRONTIER_SIZE` and `MAX_PRED_POOL_SIZE` bound the *search* (stage 1).
+`PathBudget` bounds the *enumeration* (stage 2). They are different quantities
+and neither implies the other: a DAG well inside both caps can hold
+combinatorially many paths.
+
+Since enumeration became resumable, a memory ceiling is reached far less often,
+because the operator no longer holds a source vertex's whole path set at once.
+The practical consequence is that an unbounded `count(p)` over a cyclic graph
+now runs to the **deadline** rather than exhausting the pool. Both are refusals
+and both name a declared limit; the clock is the more honest of the two, since
+counting every path of such a pattern is unbounded work rather than a large
+allocation. It is also the slower failure — a query that used to be refused in a
+few seconds now spends the full `query_timeout`.
+
+`max_query_memory` still binds on this operator, which is asserted directly
+rather than assumed: `locy_max_memory_bounds_the_evaluation` trips inside
+`GraphVariableLengthTraverse[enumeration]` and requires the refusal to name the
+pool size the call asked for, so a setter that wrote a field nothing read would
+fail there.
+
+When a path query is refused, the three cases read as:
+
+| Refusal | Meaning | First thing to try |
+|---|---|---|
+| `ResourcesExhausted` naming `GraphVariableLengthTraverse[enumeration]` | One batch of paths does not fit the pool | Raise `max_query_memory`, or drop the path variable if only endpoints are needed |
+| Timeout on an unbounded pattern | The path set is combinatorial; no limit was declared | Add an upper hop bound, or a `LIMIT` — see the batch-granularity table in Part VII |
+| `QueryWarning` about a safety cap, with rows returned | The *search* was abandoned; rows are incomplete | Narrow with a hop bound, a relationship type, or a target label |
+
 ### strict_schema
 
 When enabled, CREATE and MERGE operations that reference a label or edge type not declared in the schema are rejected with an error. This enforces schema-first discipline and catches typos at write time. Properties are not affected — unknown properties still go to overflow.
@@ -6837,7 +7038,7 @@ Quick reference of all anti-patterns from every chapter:
 | Anti-Pattern | Problem | Solution |
 |---|---|---|
 | Cartesian products | Exponential result sets | Connect patterns |
-| Unbounded VLP | Exponential expansion | Set upper bound: `[*..5]` |
+| Unbounded VLP returning paths | Combinatorial path set; `[*]` also caps silently at 100 hops | Bound it `[*..5]`, add a `LIMIT`, or return endpoints instead of `p` |
 | COLLECT without DISTINCT | Duplicate elements | Use `collect(DISTINCT x)` |
 | WITH * | Over-materialization | Name needed variables |
 | String concatenation | Injection risk | Use `$param` parameters |
@@ -6900,16 +7101,20 @@ Quick reference of all anti-patterns from every chapter:
 | **Manifest (Plugin)** | A plugin's self-description (id, version, ABI range, capabilities, hash, signature) — `PluginManifest` |
 | **MVCC** | Multi-Version Concurrency Control — each mutation creates a new version |
 | **ORSet** | Observed-Remove Set CRDT — set supporting add/remove with add-wins semantics |
+| **Path mode** | Which repeats a path may contain: `Trail` (no repeated edge, openCypher's default and the only mode the planner emits), `Walk`, `Acyclic`, `Simple` |
 | **Plugin** | A type implementing the `Plugin` trait — the unit of extension, registered through `PluginRegistrar` |
 | **PluginRegistrar** | The capability-gated, namespace-validating builder a plugin's `register()` uses to stage registrations |
 | **PluginRegistry** | The shared registry (DashMap point-lookups + ArcSwap list surfaces) resolved at call time |
+| **Predecessor DAG** | Compact record of which `(vertex, NFA state, depth)` triples reach which, built by a variable-length BFS and walked backwards to enumerate paths. Linear in edges explored, not in paths |
 | **PropertyManager** | Component handling lazy property loading with LRU cache and L0 overlay |
+| **QPP** | Quantified Path Pattern — GQL's `((x)-[:E]->(y)){2,5}` form; plans as a variable-length traversal with per-hop NFA state |
 | **Rga** | Replicated Growable Array CRDT — ordered sequence for collaborative editing |
 | **RRF** | Reciprocal Rank Fusion — score fusion method for hybrid search |
 | **SimpleGraph** | Custom in-memory graph data structure (in `uni-common`) used for L0 buffer and algorithms |
 | **Snapshot** | JSON manifest capturing a consistent point-in-time view of all datasets |
 | **Stratum** | Group of mutually-recursive Locy rules evaluated together in fixpoint |
 | **Surface Trait** | One of the 26 extension-point traits in `uni-plugin/src/traits/` (ScalarPluginFn, LocyAggregate, LocyGenerator, AlgorithmProvider/GraphCompute, …) |
+| **Trail** | Path semantics forbidding a repeated *relationship* (a vertex may repeat). openCypher's default, and what every Uni variable-length pattern uses |
 | **Trigger** | A `TriggerPlugin` that fires on mutations with phase + outcome (Continue / Reject / Defer) |
 | **UniId** | Content-addressed identifier — SHA3-256 hash of (label, ext_id, properties) |
 | **VCRegister** | Vector-Clock Register CRDT — causally consistent register |
@@ -6917,6 +7122,7 @@ Quick reference of all anti-patterns from every chapter:
 | **VertexDataset** | Per-label Lance tables storing vertex data with typed property columns |
 | **VID** | Vertex ID — 64-bit auto-increment identifier for vertices |
 | **VidLabelsIndex** | In-memory bidirectional index mapping VIDs to labels and labels to VIDs |
+| **VLP** | Variable-Length Path — a `-[:T*]->` or `-[:T*1..n]->` pattern, executed by `GraphVariableLengthTraverseExec` |
 | **WAL** | Write-Ahead Log — durability mechanism recording mutations before they're flushed |
 | **WorkingGraph** | Materialized subgraph loaded from storage for query execution |
 

@@ -84,7 +84,7 @@ Find all products affected by the defective part.
 MATCH (defective:Part {sku: 'RES-10K'})
 
 // Traverse UP the assembly tree (incoming ASSEMBLED_FROM edges)
-// Unbounded traversal: [*] follows all paths (defaults to max 100 hops)
+// No written upper bound — the planner caps this at 100 hops
 MATCH (product:Product)-[:ASSEMBLED_FROM*]->(defective)
 
 // Return unique affected products and their price
@@ -95,14 +95,23 @@ ORDER BY product.price DESC
 ```
 
 !!! tip "Bounded vs Unbounded Paths"
-    Use `[*]` for unbounded traversal (defaults to 100 hops max) or `[*1..20]` to set an explicit bound. For most BOM trees, unbounded traversal is safe since assembly hierarchies are rarely deeper than ~20 levels.
+    `[*]` writes no upper bound, so the planner supplies one: **100 hops**. For
+    most BOM trees that is ample — assembly hierarchies are rarely deeper than
+    ~20 levels — and `[*1..20]` states the intent explicitly. Note that anything
+    beyond the bound is simply not reported, with no warning, so write an
+    explicit bound if a hierarchy could ever exceed 100 levels.
+
+    These queries return *endpoints* (`part`, `affected`) rather than path
+    variables, which keeps them cheap: Uni only expands full paths when a query
+    actually asks for one. See
+    [Variable-Length Paths](../guides/cypher-querying.md#variable-length-paths).
 
 ### 4. Query: Cost Rollup
 
 Calculate the total cost of a product by summing the cost of all its constituent parts.
 
 ```cypher
-// Unbounded path traversal — follows all ASSEMBLED_FROM edges (max 100 hops)
+// No written upper bound — the planner caps this at 100 hops
 MATCH (p:Product {name: 'Smartphone X'})
 MATCH (p)-[:ASSEMBLED_FROM*]->(part:Part)
 RETURN p.name, SUM(part.cost) AS total_bom_cost

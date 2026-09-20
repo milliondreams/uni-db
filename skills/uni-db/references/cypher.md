@@ -185,10 +185,33 @@ MATCH (n:Company) RETURN n.name
 |---|---|
 | `[*1..3]` | 1 to 3 hops |
 | `[*2]` | Exactly 2 hops |
-| `[*]` or `[*1..]` | 1 to infinity (CAUTION: unbounded) |
+| `[*]` or `[*1..]` | No written upper bound — **the planner supplies 100 hops**, and anything deeper is dropped silently |
 | `[*..5]` | 1 to 5 hops |
-| `[*3..]` | At least 3 hops |
+| `[*3..]` | At least 3 hops, up to the 100-hop default |
 | `[*0..]` | Zero or more (source may equal target) |
+
+**Cost model — the single most useful thing to know about these patterns.**
+A variable-length pattern runs a graph search, and *then*, only if the query
+binds a path variable, expands that search into individual paths. Search cost
+tracks edges explored; expansion cost tracks the number of distinct paths, which
+grows combinatorially with the hop bound on a graph with cycles.
+
+```cypher
+// Expensive: materialises every distinct path
+MATCH p = (a:Company {id: 'X'})-[:OWNS*1..6]->(b:Company) RETURN p
+
+// Cheap: identical search, no expansion
+MATCH (a:Company {id: 'X'})-[:OWNS*1..6]->(b:Company) RETURN DISTINCT b
+```
+
+When paths are genuinely needed:
+- `shortestPath` stops at the first path found.
+- A `LIMIT` **stops the expansion** rather than trimming its output, so a small
+  limit costs little. The graph search still runs in full (a floor under the
+  query time), and the limit applies one batch (8192 rows) at a time — so any
+  limit up to 8192 costs the same as `LIMIT 1`.
+- An unbounded `[*]` with no `LIMIT` and a path variable is unbounded work over
+  a cyclic graph, and will hit `query_timeout` or `max_query_memory`.
 
 ### Path Patterns
 
@@ -621,7 +644,7 @@ Output: `total_time_ms`, `rows_scanned`, `peak_memory_bytes`, per-operator `time
 | Anti-Pattern | Problem | Fix |
 |---|---|---|
 | **Cartesian products** | Unconnected patterns multiply results | Connect patterns or use WITH |
-| **Unbounded VLP `[*]`** | Exponential expansion on large graphs | Always set upper bound: `[*..5]` |
+| **Unbounded VLP `[*]` binding a path** | Path *expansion* is combinatorial on cyclic graphs (the search is not). `[*]` also caps silently at 100 hops | Return endpoints instead of `p`; or add a `LIMIT` (stops the expansion); or bound it `[*..5]` |
 | **`collect()` without DISTINCT** | Duplicate elements in collected list | Use `collect(DISTINCT x)` |
 | **`WITH *`** | Materializes everything in pipeline | Explicitly name needed variables |
 | **String concatenation for filters** | Injection risk, no plan caching | Use `$param` parameters |

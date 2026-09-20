@@ -117,6 +117,37 @@ WHERE p1.title = p2.title  // Cartesian join
 RETURN p1, p2
 ```
 
+### 6. Ask for Endpoints, Not Paths
+
+This is the highest-leverage change available on a variable-length pattern.
+
+A `-[:R*1..n]->` pattern runs a graph search and, **only if the query binds a
+path**, expands that search into individual paths. The search cost tracks the
+edges explored. The expansion cost tracks the number of distinct paths, which on
+a graph with cycles grows combinatorially with the hop bound. Dropping the path
+variable removes the second cost entirely:
+
+```cypher
+// Expensive: every distinct path is materialised
+MATCH p = (a:Company {id: 'X'})-[:OWNS*1..6]->(b:Company)
+RETURN p
+
+// Cheap: identical search, no expansion
+MATCH (a:Company {id: 'X'})-[:OWNS*1..6]->(b:Company)
+RETURN DISTINCT b
+```
+
+When you genuinely need paths:
+
+- **`shortestPath`** stops at the first path it finds — use it whenever one path
+  will do.
+- **A `LIMIT` stops the expansion**, rather than trimming its output, so a small
+  limit costs little. Two caveats: the graph search still runs in full, and the
+  limit applies one batch (8192 rows) at a time, so any limit up to 8192 costs
+  the same as `LIMIT 1`.
+- **An omitted upper bound is 100, not infinity**, and results past it are
+  dropped without a warning. Write `[*1..6]` when you know the depth.
+
 ---
 
 ## Index Tuning
@@ -412,7 +443,8 @@ Execution Profile:
 | Profile Pattern | Likely Cause | Solution |
 |-----------------|--------------|----------|
 | High Scan time | No index, large result set | Add index, add filters |
-| High Traverse time | Cold cache, many edges | Warm cache, limit hops |
+| High Traverse time | Cold cache, many edges | Warm cache, bound the hops |
+| High Traverse time on a `*` pattern returning `p` | Path expansion, not the search | Return endpoints instead of the path; or add a `LIMIT` |
 | High Aggregate time | Large group count | Add LIMIT, pre-aggregate |
 | High memory | Large intermediate results | Stream results, limit |
 
@@ -700,6 +732,8 @@ Before deploying to production:
 - [ ] Cache sizes appropriate for working set
 - [ ] Queries use pushable predicates where possible
 - [ ] LIMIT applied early in query patterns
+- [ ] Variable-length patterns return endpoints unless a path is genuinely needed
+- [ ] Variable-length patterns carry an explicit upper hop bound
 - [ ] Only needed properties projected
 - [ ] Memory limits configured
 - [ ] I/O timeouts set for remote storage

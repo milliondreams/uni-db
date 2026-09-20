@@ -160,6 +160,7 @@ fn is_stock_datafusion(name: &str) -> bool {
             | "HashJoinExec"
             | "LocalLimitExec"
             | "NestedLoopJoinExec"
+            | "PlaceholderRowExec"
             | "ProjectionExec"
             | "RepartitionExec"
             | "SortExec"
@@ -183,7 +184,21 @@ fn is_stock_datafusion(name: &str) -> bool {
 /// aggregated by stock operators.
 fn subtree_is_insertable(plan: &Arc<dyn ExecutionPlan>) -> bool {
     let name = plan.name();
-    if !(is_stock_datafusion(name) || name == "GraphScanExec" || name == "DeadlineGuardExec") {
+    let ours_and_safe = matches!(
+        name,
+        // A leaf: no child relationship to disturb.
+        "GraphScanExec"
+            // Idempotent.
+            | "DeadlineGuardExec"
+            // Holds column *indices* resolved against its input schema and
+            // clones them verbatim on rebuild. The guard is a pass-through that
+            // inherits its child's properties exactly, so those indices stay
+            // valid, and nothing outside reasons about what feeds it. Without
+            // this a Locy evaluation gets no checkpoint at all, because the
+            // read-set recorder sits over every clause body under SSI.
+            | "ReadSetRecordingExec"
+    );
+    if !(is_stock_datafusion(name) || ours_and_safe) {
         return false;
     }
     plan.children().iter().all(|c| subtree_is_insertable(c))

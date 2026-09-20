@@ -2627,3 +2627,55 @@ async fn a_deadline_is_enforced_under_a_pipeline_breaking_operator() {
         "the deadline was reported rather than enforced: {elapsed:?}"
     );
 }
+
+/// Issue #283, the Locy half: `locy_with(..).timeout(..)` on the same shape.
+///
+/// Two things kept this unbounded after the Cypher side was fixed. No guard was
+/// inserted, because `ReadSetRecordingExec` sits over every clause body under
+/// SSI and the subtree test refused to insert anywhere beneath one. And the
+/// Locy budget never reached the operators at all, which the engine's
+/// `executor_config` now handles.
+///
+/// The `query_with` sibling above covers the Cypher path; this pins that the
+/// Locy path is bounded on the *same* query, since it was the one that reported
+/// nothing whatsoever — a complete result after sixteen seconds against a
+/// two-second budget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_locy_deadline_is_enforced_on_a_pipeline_breaking_plan() {
+    let db = Uni::in_memory().build().await.unwrap();
+    db.schema()
+        .label("Entity")
+        .property("uid", DataType::String)
+        .done()
+        .apply()
+        .await
+        .unwrap();
+    let tx = db.session().tx().await.unwrap();
+    for i in 0..600 {
+        tx.execute_with("CREATE (:Entity {uid: $u})")
+            .param("u", format!("e{i}"))
+            .run()
+            .await
+            .unwrap();
+    }
+    tx.commit().await.unwrap();
+
+    let started = Instant::now();
+    let err = db
+        .session()
+        .locy_with("MATCH (a:Entity),(b:Entity),(c:Entity) RETURN count(*) AS n")
+        .timeout(Duration::from_secs(2))
+        .run()
+        .await
+        .expect_err("a 2s budget must stop this, not return a complete result");
+    let elapsed = started.elapsed();
+
+    assert!(
+        err.to_string().to_lowercase().contains("time"),
+        "expected a timeout, got: {err}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the budget was ignored rather than enforced: {elapsed:?}"
+    );
+}

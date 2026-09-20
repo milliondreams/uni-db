@@ -334,6 +334,7 @@ impl Transaction {
             max_iterations: None,
             locy_config: None,
             cancellation_token: None,
+            max_memory: None,
         }
     }
 

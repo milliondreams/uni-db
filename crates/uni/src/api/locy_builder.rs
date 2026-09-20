@@ -109,6 +109,7 @@ impl<'a> InnerLocyBuilder<'a> {
             // no session or transaction to inherit a scope from and exposes no
             // token setter.
             cancel: crate::api::impl_query::CancelScope::default(),
+            max_memory: None,
         };
         engine
             .evaluate_with_config(&self.program, &self.config)
@@ -125,6 +126,7 @@ pub struct LocyBuilder<'a> {
     program: String,
     config: LocyConfig,
     cancellation_token: Option<CancellationToken>,
+    max_memory: Option<usize>,
 }
 
 impl<'a> LocyBuilder<'a> {
@@ -134,6 +136,7 @@ impl<'a> LocyBuilder<'a> {
             program: program.to_string(),
             config: LocyConfig::default(),
             cancellation_token: None,
+            max_memory: None,
         }
     }
 
@@ -189,6 +192,17 @@ impl<'a> LocyBuilder<'a> {
         self
     }
 
+    /// Cap the memory this evaluation may use, in bytes.
+    ///
+    /// Parity with `query_with(..).max_memory(..)`. Locy has always been bounded
+    /// by the database-level `max_query_memory` — it runs through the same
+    /// DataFusion planner — but there was no way to set a bound for one program
+    /// (issue #284).
+    pub fn max_memory(mut self, bytes: usize) -> Self {
+        self.max_memory = Some(bytes);
+        self
+    }
+
     /// Apply a fully configured [`LocyConfig`].
     pub fn with_config(mut self, mut config: LocyConfig) -> Self {
         config.params.extend(self.config.params);
@@ -217,6 +231,7 @@ impl<'a> LocyBuilder<'a> {
                 &self.config,
                 self.session.rule_registry(),
                 self.session.cancel_scope(self.cancellation_token.clone()),
+                self.max_memory,
             ),
         )
         .await
@@ -252,6 +267,7 @@ impl<'a> LocyBuilder<'a> {
             self.session.rule_registry(),
             Some(&capture),
             self.session.cancel_scope(self.cancellation_token.clone()),
+            self.max_memory,
         )
         .await?;
         let profile = capture
@@ -276,6 +292,7 @@ pub struct TxLocyBuilder<'a> {
     program: String,
     config: LocyConfig,
     cancellation_token: Option<CancellationToken>,
+    max_memory: Option<usize>,
 }
 
 impl<'a> TxLocyBuilder<'a> {
@@ -285,6 +302,7 @@ impl<'a> TxLocyBuilder<'a> {
             program: program.to_string(),
             config: LocyConfig::default(),
             cancellation_token: None,
+            max_memory: None,
         }
     }
 
@@ -340,6 +358,17 @@ impl<'a> TxLocyBuilder<'a> {
         self
     }
 
+    /// Cap the memory this evaluation may use, in bytes.
+    ///
+    /// Parity with `query_with(..).max_memory(..)`. Locy has always been bounded
+    /// by the database-level `max_query_memory` — it runs through the same
+    /// DataFusion planner — but there was no way to set a bound for one program
+    /// (issue #284).
+    pub fn max_memory(mut self, bytes: usize) -> Self {
+        self.max_memory = Some(bytes);
+        self
+    }
+
     /// Apply a fully configured [`LocyConfig`].
     pub fn with_config(mut self, mut config: LocyConfig) -> Self {
         config.params.extend(self.config.params);
@@ -357,6 +386,7 @@ impl<'a> TxLocyBuilder<'a> {
             collect_derive: false,
             read_snapshot: self.tx.read_snapshot(),
             cancel: self.tx.cancel_scope(self.cancellation_token.clone()),
+            max_memory: self.max_memory,
         };
         engine
             .evaluate_with_config(&self.program, &self.config)
@@ -374,6 +404,7 @@ impl<'a> TxLocyBuilder<'a> {
             collect_derive: false,
             read_snapshot: self.tx.read_snapshot(),
             cancel: self.tx.cancel_scope(self.cancellation_token.clone()),
+            max_memory: self.max_memory,
         };
         let explain = crate::api::locy_result::LocyExplainOutput::from_compiled(
             &engine.compile_only(&self.program)?,

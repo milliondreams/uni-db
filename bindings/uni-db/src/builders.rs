@@ -1267,6 +1267,7 @@ impl Session {
             max_iterations: None,
             locy_config: None,
             cancellation_token: None,
+            max_memory: None,
         }
     }
 
@@ -1486,6 +1487,7 @@ pub struct SessionLocyBuilder {
     pub(crate) max_iterations: Option<usize>,
     pub(crate) locy_config: Option<::uni_locy::LocyConfig>,
     pub(crate) cancellation_token: Option<crate::types::PyCancellationToken>,
+    pub(crate) max_memory: Option<usize>,
 }
 
 #[pymethods]
@@ -1514,6 +1516,14 @@ impl SessionLocyBuilder {
     /// Set maximum fixpoint iterations.
     fn max_iterations(mut slf: PyRefMut<'_, Self>, n: usize) -> PyRefMut<'_, Self> {
         slf.max_iterations = Some(n);
+        slf
+    }
+
+    /// Cap the memory this evaluation may use, in bytes.
+    ///
+    /// Parity with `SessionQueryBuilder.max_memory` (issue #284).
+    fn max_memory(mut slf: PyRefMut<'_, Self>, bytes: usize) -> PyRefMut<'_, Self> {
+        slf.max_memory = Some(bytes);
         slf
     }
 
@@ -1561,6 +1571,9 @@ impl SessionLocyBuilder {
         if let Some(ref ct) = self.cancellation_token {
             builder = builder.cancellation_token(ct.inner.clone());
         }
+        if let Some(m) = self.max_memory {
+            builder = builder.max_memory(m);
+        }
         // Release the GIL across `block_on`: the Locy executor may call
         // back into Python (e.g. a registered neural classifier). Holding
         // the GIL through tokio would deadlock the callback's reacquire.
@@ -1606,6 +1619,9 @@ impl SessionLocyBuilder {
         }
         if let Some(ref ct) = self.cancellation_token {
             builder = builder.cancellation_token(ct.inner.clone());
+        }
+        if let Some(m) = self.max_memory {
+            builder = builder.max_memory(m);
         }
         // Release the GIL across `block_on` (the executor may call back into
         // Python; see `run`).
@@ -1869,6 +1885,7 @@ pub struct PyTxLocyBuilder {
     pub(crate) max_iterations: Option<usize>,
     pub(crate) locy_config: Option<::uni_locy::LocyConfig>,
     pub(crate) cancellation_token: Option<crate::types::PyCancellationToken>,
+    pub(crate) max_memory: Option<usize>,
 }
 
 #[pymethods]
@@ -1888,6 +1905,14 @@ impl PyTxLocyBuilder {
     /// Set maximum fixpoint iterations.
     fn max_iterations(mut slf: PyRefMut<'_, Self>, n: usize) -> PyRefMut<'_, Self> {
         slf.max_iterations = Some(n);
+        slf
+    }
+
+    /// Cap the memory this evaluation may use, in bytes.
+    ///
+    /// Parity with `SessionQueryBuilder.max_memory` (issue #284).
+    fn max_memory(mut slf: PyRefMut<'_, Self>, bytes: usize) -> PyRefMut<'_, Self> {
+        slf.max_memory = Some(bytes);
         slf
     }
 
@@ -1938,6 +1963,9 @@ impl PyTxLocyBuilder {
         if let Some(ref ct) = self.cancellation_token {
             builder = builder.cancellation_token(ct.inner.clone());
         }
+        if let Some(m) = self.max_memory {
+            builder = builder.max_memory(m);
+        }
         // Release the GIL across `block_on`: the Locy executor may call
         // back into Python (e.g. a registered neural classifier). Holding
         // the GIL through tokio would deadlock the callback's reacquire.
@@ -1974,6 +2002,9 @@ impl PyTxLocyBuilder {
         }
         if let Some(ref ct) = self.cancellation_token {
             builder = builder.cancellation_token(ct.inner.clone());
+        }
+        if let Some(m) = self.max_memory {
+            builder = builder.max_memory(m);
         }
         let (result, profile) = py
             .detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(builder.profile()))

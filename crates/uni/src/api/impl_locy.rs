@@ -372,8 +372,18 @@ pub(crate) async fn evaluate_with_db_and_config(
     config: &LocyConfig,
     rule_registry: &std::sync::RwLock<LocyRuleRegistry>,
     cancel: crate::api::impl_query::CancelScope,
+    max_memory: Option<usize>,
 ) -> Result<LocyResult> {
-    evaluate_with_db_and_config_capturing(db, program, config, rule_registry, None, cancel).await
+    evaluate_with_db_and_config_capturing(
+        db,
+        program,
+        config,
+        rule_registry,
+        None,
+        cancel,
+        max_memory,
+    )
+    .await
 }
 
 /// Like [`evaluate_with_db_and_config`], but optionally captures a structured
@@ -385,6 +395,7 @@ pub(crate) async fn evaluate_with_db_and_config_capturing(
     rule_registry: &std::sync::RwLock<LocyRuleRegistry>,
     profile_capture: Option<&Arc<std::sync::Mutex<Option<uni_query::LocyExecProfile>>>>,
     cancel: crate::api::impl_query::CancelScope,
+    max_memory: Option<usize>,
 ) -> Result<LocyResult> {
     // Compile with the given registry
     let ast = match uni_cypher::parse_locy(program) {
@@ -439,6 +450,7 @@ pub(crate) async fn evaluate_with_db_and_config_capturing(
         collect_derive: true,
         read_snapshot: None,
         cancel,
+        max_memory,
     };
     engine
         .evaluate_compiled_capturing(compiled, config, profile_capture)
@@ -496,6 +508,29 @@ pub struct LocyEngine<'a> {
     /// cancelled a Locy query — which the Python bindings expose and call —
     /// observed it run to completion.
     pub(crate) cancel: crate::api::impl_query::CancelScope,
+    /// Per-evaluation override for the DataFusion memory pool bound.
+    ///
+    /// Locy already runs through `create_datafusion_planner`, so it has always
+    /// been bounded by the database-level `max_query_memory`. What it lacked
+    /// was the per-call knob `query_with(..).max_memory(..)` gives Cypher — the
+    /// builder had no way to raise or lower the bound for one program
+    /// (issue #284). `None` keeps the database setting.
+    pub(crate) max_memory: Option<usize>,
+}
+
+impl LocyEngine<'_> {
+    /// The database config with this evaluation's memory override applied.
+    ///
+    /// `create_datafusion_planner` turns `max_query_memory` into the pool that
+    /// bounds every operator, so overriding it here is what gives the Locy
+    /// builder the same per-call bound Cypher has had.
+    fn memory_bounded_config(&self) -> uni_common::UniConfig {
+        let mut config = self.db.config.clone();
+        if let Some(bytes) = self.max_memory {
+            config.max_query_memory = bytes;
+        }
+        config
+    }
 }
 
 impl<'a> LocyEngine<'a> {
@@ -728,7 +763,7 @@ impl<'a> LocyEngine<'a> {
 
         // 2. Create executor + physical planner
         let mut df_executor = uni_query::Executor::new(self.db.storage.clone());
-        df_executor.set_config(self.db.config.clone());
+        df_executor.set_config(self.memory_bounded_config());
         df_executor.set_counters(self.counters.clone());
         if let Some(ref w) = self.db.writer {
             df_executor.set_writer(w.clone());
@@ -1083,7 +1118,7 @@ impl<'a> LocyEngine<'a> {
             })?;
 
         let mut df_executor = uni_query::Executor::new(self.db.storage.clone());
-        df_executor.set_config(self.db.config.clone());
+        df_executor.set_config(self.memory_bounded_config());
         df_executor.set_counters(self.counters.clone());
         if let Some(ref w) = self.db.writer {
             df_executor.set_writer(w.clone());
@@ -1615,6 +1650,9 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
             collect_derive: false,
             read_snapshot: None,
             cancel: self.cancel.clone(),
+            // The adapter carries no override of its own; the bound for this
+            // re-entry comes from the database config, as it did before.
+            max_memory: None,
         };
         let native_store = engine
             .run_strata_native(&strata_only, config)

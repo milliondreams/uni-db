@@ -2473,3 +2473,53 @@ async fn unbounded_variable_length_path_is_bounded_by_max_memory() {
         "the failure must name the resource limit, not surface as something else: {msg}"
     );
 }
+
+/// Issue #284: `locy_with` had no `max_memory`, while `query_with` did.
+///
+/// Locy has always run through the same DataFusion planner and so has always
+/// been bounded by the database-level `max_query_memory` — what it lacked was
+/// the per-evaluation knob. A setter that writes a field nothing reads would
+/// satisfy an API-surface check while changing nothing, which has happened on
+/// this builder before (its `cancellation_token` did exactly that), so this
+/// asserts the bound actually binds: the error must name the pool size that was
+/// asked for, not the database default.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn locy_max_memory_bounds_the_evaluation() {
+    let db = Uni::in_memory().build().await.unwrap();
+    cyclic_graph(&db, 30, 3).await;
+
+    let err = db
+        .session()
+        .locy_with("MATCH p=(a:Entity)-[:OWNS*]->(b:Entity) RETURN count(p) AS n")
+        .max_memory(32 * 1024 * 1024)
+        .run()
+        .await
+        .expect_err("an unbounded path query must hit the configured memory bound");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("32.0 MB"),
+        "the evaluation was bounded by something other than the requested 32 MB \
+         — a setter that is not read would fail exactly here: {msg}"
+    );
+}
+
+/// Control for the above: the same limit on a program that fits must succeed,
+/// so the test above cannot pass merely because the limit breaks everything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn locy_max_memory_leaves_a_fitting_program_alone() {
+    let db = Uni::in_memory().build().await.unwrap();
+    cyclic_graph(&db, 30, 3).await;
+
+    let result = db
+        .session()
+        .locy_with("MATCH (a:Entity) RETURN count(a) AS n")
+        .max_memory(32 * 1024 * 1024)
+        .run()
+        .await;
+    assert!(
+        result.is_ok(),
+        "a program that fits within the bound must still run: {:?}",
+        result.err()
+    );
+}

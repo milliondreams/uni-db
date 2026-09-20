@@ -1669,6 +1669,7 @@ impl AsyncTransaction {
             max_iterations: None,
             locy_config: None,
             cancellation_token: None,
+            max_memory: None,
         }
     }
 
@@ -2820,6 +2821,7 @@ impl AsyncSession {
             max_iterations: None,
             locy_config: None,
             cancellation_token: None,
+            max_memory: None,
         }
     }
 
@@ -3557,6 +3559,7 @@ pub struct AsyncSessionLocyBuilder {
     max_iterations: Option<usize>,
     locy_config: Option<::uni_locy::LocyConfig>,
     cancellation_token: Option<crate::types::PyCancellationToken>,
+    pub(crate) max_memory: Option<usize>,
 }
 
 #[pymethods]
@@ -3585,6 +3588,14 @@ impl AsyncSessionLocyBuilder {
     /// Set maximum fixpoint iterations.
     fn max_iterations(mut slf: PyRefMut<'_, Self>, n: usize) -> PyRefMut<'_, Self> {
         slf.max_iterations = Some(n);
+        slf
+    }
+
+    /// Cap the memory this evaluation may use, in bytes.
+    ///
+    /// Parity with `AsyncSessionQueryBuilder.max_memory` (issue #284).
+    fn max_memory(mut slf: PyRefMut<'_, Self>, bytes: usize) -> PyRefMut<'_, Self> {
+        slf.max_memory = Some(bytes);
         slf
     }
 
@@ -3619,6 +3630,7 @@ impl AsyncSessionLocyBuilder {
         let program = self.program.clone();
         let timeout_secs = self.timeout_secs;
         let max_iterations = self.max_iterations;
+        let max_memory = self.max_memory;
         let locy_config = self.locy_config.clone();
         let cancel_token = self.cancellation_token.as_ref().map(|ct| ct.inner.clone());
         // Locy future is !Send — use spawn_blocking
@@ -3635,6 +3647,9 @@ impl AsyncSessionLocyBuilder {
                     }
                     if let Some(n) = max_iterations {
                         builder = builder.max_iterations(n);
+                    }
+                    if let Some(mm) = max_memory {
+                        builder = builder.max_memory(mm);
                     }
                     if let Some(c) = locy_config {
                         builder = builder.with_config(c);
@@ -3680,6 +3695,7 @@ impl AsyncSessionLocyBuilder {
         let program = self.program.clone();
         let timeout_secs = self.timeout_secs;
         let max_iterations = self.max_iterations;
+        let max_memory = self.max_memory;
         let locy_config = self.locy_config.clone();
         let cancel_token = self.cancellation_token.as_ref().map(|ct| ct.inner.clone());
         // Locy future is !Send — use spawn_blocking
@@ -3696,6 +3712,9 @@ impl AsyncSessionLocyBuilder {
                     }
                     if let Some(n) = max_iterations {
                         builder = builder.max_iterations(n);
+                    }
+                    if let Some(mm) = max_memory {
+                        builder = builder.max_memory(mm);
                     }
                     if let Some(c) = locy_config {
                         builder = builder.with_config(c);
@@ -3977,6 +3996,7 @@ pub struct AsyncTxLocyBuilder {
     max_iterations: Option<usize>,
     locy_config: Option<::uni_locy::LocyConfig>,
     cancellation_token: Option<crate::types::PyCancellationToken>,
+    pub(crate) max_memory: Option<usize>,
 }
 
 #[pymethods]
@@ -3996,6 +4016,14 @@ impl AsyncTxLocyBuilder {
     /// Set maximum fixpoint iterations.
     fn max_iterations(mut slf: PyRefMut<'_, Self>, n: usize) -> PyRefMut<'_, Self> {
         slf.max_iterations = Some(n);
+        slf
+    }
+
+    /// Cap the memory this evaluation may use, in bytes.
+    ///
+    /// Parity with `AsyncSessionQueryBuilder.max_memory` (issue #284).
+    fn max_memory(mut slf: PyRefMut<'_, Self>, bytes: usize) -> PyRefMut<'_, Self> {
+        slf.max_memory = Some(bytes);
         slf
     }
 
@@ -4030,6 +4058,7 @@ impl AsyncTxLocyBuilder {
         let program = self.program.clone();
         let timeout_secs = self.timeout_secs;
         let max_iterations = self.max_iterations;
+        let max_memory = self.max_memory;
         let locy_config = self.locy_config.clone();
         let cancel_token = self.cancellation_token.as_ref().map(|ct| ct.inner.clone());
         // Locy future is !Send — use spawn_blocking
@@ -4047,6 +4076,9 @@ impl AsyncTxLocyBuilder {
                     }
                     if let Some(n) = max_iterations {
                         builder = builder.max_iterations(n);
+                    }
+                    if let Some(mm) = max_memory {
+                        builder = builder.max_memory(mm);
                     }
                     if let Some(c) = locy_config {
                         builder = builder.with_config(c);
@@ -4075,6 +4107,7 @@ impl AsyncTxLocyBuilder {
         let program = self.program.clone();
         let timeout_secs = self.timeout_secs;
         let max_iterations = self.max_iterations;
+        let max_memory = self.max_memory;
         let locy_config = self.locy_config.clone();
         let cancel_token = self.cancellation_token.as_ref().map(|ct| ct.inner.clone());
         // Locy future is !Send — use spawn_blocking
@@ -4092,6 +4125,9 @@ impl AsyncTxLocyBuilder {
                     }
                     if let Some(n) = max_iterations {
                         builder = builder.max_iterations(n);
+                    }
+                    if let Some(mm) = max_memory {
+                        builder = builder.max_memory(mm);
                     }
                     if let Some(c) = locy_config {
                         builder = builder.with_config(c);

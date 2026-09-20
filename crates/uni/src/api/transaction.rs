@@ -985,6 +985,9 @@ impl Transaction {
             collect_derive: false,
             read_snapshot: self.read_snapshot(),
             cancel: self.cancel_scope(None),
+            // No per-call override on this path; the database
+            // setting applies.
+            max_memory: None,
         };
         engine.evaluate(program).await
     }

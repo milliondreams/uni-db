@@ -875,13 +875,17 @@ impl L0Buffer {
         self.edge_types.insert(eid, edge_type);
     }
 
-    pub fn delete_vertex(&mut self, vid: Vid) -> Result<()> {
+    /// Returns the edge tombstones the cascade produced, so a caller holding
+    /// the `AdjacencyManager` can mirror them (see
+    /// `Writer::mirror_cascaded_tombstones`). Callers that only need the L0
+    /// effect may discard the value.
+    pub fn delete_vertex(&mut self, vid: Vid) -> Result<Vec<TombstoneEntry>> {
         self.delete_vertex_impl(vid, false)
     }
 
     /// Core vertex deletion. When `skip_wal` is true, skips WAL append
     /// (used during merge where the caller already wrote to WAL).
-    fn delete_vertex_impl(&mut self, vid: Vid, skip_wal: bool) -> Result<()> {
+    fn delete_vertex_impl(&mut self, vid: Vid, skip_wal: bool) -> Result<Vec<TombstoneEntry>> {
         self.current_version += 1;
 
         if !skip_wal && let Some(wal) = &mut self.wal {
@@ -889,14 +893,20 @@ impl L0Buffer {
             wal.append(Mutation::DeleteVertex { vid, labels })?;
         }
 
-        self.apply_vertex_deletion(vid);
-        Ok(())
+        Ok(self.apply_vertex_deletion(vid))
     }
 
     /// Cascade-delete a vertex: tombstone all connected edges and remove the vertex.
     ///
     /// Shared between `delete_vertex` (live mutations) and `replay_mutations` (WAL recovery).
-    fn apply_vertex_deletion(&mut self, vid: Vid) {
+    ///
+    /// Returns the edge tombstones created by the cascade. They are the L0 half
+    /// of a two-place write: the adjacency overlay holds the other half, and a
+    /// caller with access to the `AdjacencyManager` must mirror these or the
+    /// deleted vertex's edges stay live in traversals until the next flush.
+    /// Returning them is what keeps that caller from re-deriving the incident
+    /// set and drifting from this one.
+    fn apply_vertex_deletion(&mut self, vid: Vid) -> Vec<TombstoneEntry> {
         let version = self.current_version;
 
         // Collect edges to delete using O(degree) neighbors() instead of O(E) scan
@@ -913,20 +923,20 @@ impl L0Buffer {
         }
 
         let cascaded_edges_count = edges_to_remove.len();
+        let mut cascaded = Vec::with_capacity(cascaded_edges_count);
 
         // Tombstone and remove all collected edges
         for eid in edges_to_remove {
             // Retrieve edge endpoints from the map to create tombstone
             if let Some((src, dst, etype)) = self.edge_endpoints.get(&eid) {
-                self.tombstones.insert(
+                let entry = TombstoneEntry {
                     eid,
-                    TombstoneEntry {
-                        eid,
-                        src_vid: *src,
-                        dst_vid: *dst,
-                        edge_type: *etype,
-                    },
-                );
+                    src_vid: *src,
+                    dst_vid: *dst,
+                    edge_type: *etype,
+                };
+                cascaded.push(entry.clone());
+                self.tombstones.insert(eid, entry);
                 self.edge_versions.insert(eid, version);
                 self.edge_endpoints.remove(&eid);
                 self.edge_properties.remove(&eid);
@@ -962,6 +972,8 @@ impl L0Buffer {
 
         // 64 bytes per edge tombstone + 8 for vertex tombstone
         self.estimated_size += cascaded_edges_count * 72 + 8;
+
+        cascaded
     }
 
     pub fn insert_edge(
@@ -1449,7 +1461,8 @@ impl L0Buffer {
         Ok(())
     }
 
-    pub fn merge(&mut self, other: &L0Buffer) -> Result<()> {
+    /// Returns the cascaded edge tombstones; see [`L0Buffer::merge_take`].
+    pub fn merge(&mut self, other: &L0Buffer) -> Result<Vec<TombstoneEntry>> {
         // Validate-then-apply: reject a merge that would bail on a tombstoned
         // edge endpoint before mutating anything, so a failed merge can never
         // leave a partially-applied (non-atomic) commit.
@@ -1469,7 +1482,11 @@ impl L0Buffer {
     /// merge. The caller must not rely on `other.vertex_properties` /
     /// `other.edge_properties` afterwards, which is safe on the commit path
     /// because committing consumes the transaction.
-    pub fn merge_take(&mut self, other: &mut L0Buffer) -> Result<()> {
+    /// Returns the edge tombstones produced by cascading deletes against
+    /// `self`. These are edges that live in the main buffer and were never
+    /// touched by `other`, so the caller's tx-scoped adjacency mirror cannot
+    /// see them — it must mirror these separately.
+    pub fn merge_take(&mut self, other: &mut L0Buffer) -> Result<Vec<TombstoneEntry>> {
         // Validate BEFORE draining: the endpoint check consults
         // `other.vertex_properties` (the "re-inserted by other" exemption).
         self.validate_merge_edge_endpoints(other)?;
@@ -1486,7 +1503,7 @@ impl L0Buffer {
         other: &L0Buffer,
         vertex_props: HashMap<Vid, Properties>,
         mut edge_props: HashMap<Eid, Properties>,
-    ) -> Result<()> {
+    ) -> Result<Vec<TombstoneEntry>> {
         trace!(
             other_mutation_count = other.mutation_count,
             "Merging L0 buffer"
@@ -1495,8 +1512,9 @@ impl L0Buffer {
         // wrote every one of these mutations to WAL before invoking merge —
         // re-appending here would double the WAL volume per commit.
         // Merge Vertices
+        let mut cascaded = Vec::new();
         for &vid in &other.vertex_tombstones {
-            self.delete_vertex_impl(vid, true)?;
+            cascaded.extend(self.delete_vertex_impl(vid, true)?);
         }
 
         for (vid, props) in vertex_props {
@@ -1611,7 +1629,7 @@ impl L0Buffer {
             self.pending_embeddings.insert(*vid, label.clone());
         }
 
-        Ok(())
+        Ok(cascaded)
     }
 
     /// Replay mutations from WAL without re-logging them.

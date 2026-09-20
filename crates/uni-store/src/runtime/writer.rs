@@ -10,7 +10,7 @@ use crate::runtime::flush_coordinator::{
     FinalizeFn, FlushCoordinator, FlushOutcome as AsyncFlushOutcome, RotatedFlush, SharedFlushCtx,
 };
 use crate::runtime::id_allocator::IdAllocator;
-use crate::runtime::l0::{L0Buffer, serialize_constraint_key};
+use crate::runtime::l0::{L0Buffer, TombstoneEntry, serialize_constraint_key};
 use crate::runtime::l0_manager::L0Manager;
 use crate::runtime::property_manager::PropertyManager;
 use crate::runtime::wal::WriteAheadLog;
@@ -768,6 +768,40 @@ impl Writer {
     }
 
     /// Replay WAL mutations into the current L0 buffer.
+    /// Mirrors the edge tombstones produced by a vertex-delete cascade into the
+    /// `AdjacencyManager` overlay.
+    ///
+    /// `apply_vertex_deletion` tombstones every edge incident to a deleted
+    /// vertex directly in the L0 buffer, bypassing `delete_edge` and therefore
+    /// the mirror that path performs. Left unmirrored, the edge is correctly
+    /// dropped at the next flush but stays live in the overlay until then, so a
+    /// traversal keeps returning a relationship whose endpoint is gone — the
+    /// exact inverse of issues #281/#282, which lost edges that were present.
+    ///
+    /// In practice the executor's DETACH DELETE pre-pass deletes each incident
+    /// edge through the mirrored `delete_edge` first, so the cascade usually
+    /// finds nothing left to do and this is a no-op; attempts to observe a ghost
+    /// edge through Cypher did not produce one. It is kept as defense in depth,
+    /// because nothing enforces that ordering: a caller reaching
+    /// `Writer::delete_vertex` directly, or a pre-pass that misses an edge
+    /// type, would land here with real work to do.
+    fn mirror_cascaded_tombstones(&self, cascaded: &[TombstoneEntry], source: &L0Buffer) {
+        for entry in cascaded {
+            let version = source
+                .edge_versions
+                .get(&entry.eid)
+                .copied()
+                .unwrap_or(source.current_version);
+            self.adjacency_manager.add_tombstone(
+                entry.eid,
+                entry.src_vid,
+                entry.dst_vid,
+                entry.edge_type,
+                version,
+            );
+        }
+    }
+
     /// Mirrors every edge in `source` into the `AdjacencyManager` overlay.
     ///
     /// Edges live in two places at once and the traversal read path only ever
@@ -1658,23 +1692,11 @@ impl Writer {
             // overlay value for each CRDT property the tx writes that current
             // lacks, so the merge below merges instead of replaces.
             self.seed_crdt_state_from_chain(&tx_l0, &mut main_l0);
-            main_l0.merge_take(&mut tx_l0)?;
-
-            // Replay transaction edges into the AdjacencyManager overlay
-            for (eid, (src, dst, etype)) in &tx_l0.edge_endpoints {
-                let edge_version = tx_l0
-                    .edge_versions
-                    .get(eid)
-                    .copied()
-                    .unwrap_or(main_l0.current_version);
-                if tx_l0.tombstones.contains_key(eid) {
-                    self.adjacency_manager
-                        .add_tombstone(*eid, *src, *dst, *etype, edge_version);
-                } else {
-                    self.adjacency_manager
-                        .insert_edge(*src, *dst, *eid, *etype, edge_version);
-                }
-            }
+            let cascaded = main_l0.merge_take(&mut tx_l0)?;
+            // Edges cascaded off a deleted vertex that live in MAIN L0 — the
+            // transaction never touched them, so the tx-scoped mirror below
+            // cannot see them.
+            self.mirror_cascaded_tombstones(&cascaded, &main_l0);
 
             // Replay transaction edges into the AdjacencyManager overlay.
             self.mirror_edges_into_adjacency(&tx_l0, main_l0.current_version);
@@ -3841,7 +3863,8 @@ impl Writer {
             if let Some(found_labels) = backfill_labels {
                 guard.vertex_labels.insert(vid, found_labels);
             }
-            guard.delete_vertex(vid)?;
+            let cascaded = guard.delete_vertex(vid)?;
+            self.mirror_cascaded_tombstones(&cascaded, &guard);
         } else {
             let l0 = self.resolve_l0(tx_l0);
             let mut guard = l0.write();
@@ -6690,6 +6713,70 @@ mod tests {
 
     /// Test that estimated_size tracks mutations correctly and approximates size_bytes().
     /// This verifies fix for issue #147 (O(V+E) size_bytes() in metrics).
+    /// A vertex-delete cascade must retract its edges from the adjacency
+    /// overlay, not just from the L0 buffer.
+    ///
+    /// This drives `Writer::delete_vertex` directly rather than through Cypher.
+    /// That is deliberate: the executor's DETACH DELETE pre-pass deletes each
+    /// incident edge through the mirrored `delete_edge` first, so the cascade
+    /// normally has nothing left to retract and a query-level test would pass
+    /// whether or not the mirror exists. Going straight at the Writer is the
+    /// only way to exercise the path this guard protects.
+    #[tokio::test]
+    async fn vertex_delete_cascade_retracts_edges_from_the_adjacency_overlay() -> Result<()> {
+        use crate::storage::direction::Direction;
+        use crate::storage::manager::StorageManager;
+        use object_store::local::LocalFileSystem;
+        use object_store::path::Path as ObjectStorePath;
+        use uni_common::core::schema::SchemaManager;
+
+        let dir = tempdir()?;
+        let path = dir.path().to_str().unwrap();
+        let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path())?);
+        let schema_path = ObjectStorePath::from("schema.json");
+
+        let schema_manager =
+            Arc::new(SchemaManager::load_from_store(store.clone(), &schema_path).await?);
+        schema_manager.add_label("Test")?;
+        let etype =
+            schema_manager.add_edge_type("LINK", vec!["Test".into()], vec!["Test".into()])?;
+        schema_manager.save().await?;
+
+        let storage = Arc::new(StorageManager::new(path, schema_manager.clone()).await?);
+        let writer = Writer::new(storage.clone(), schema_manager.clone(), 1).await?;
+
+        let (src, dst, eid) = (Vid::new(1), Vid::new(2), Eid::new(10));
+        writer.insert_vertex(src, HashMap::new(), None).await?;
+        writer.insert_vertex(dst, HashMap::new(), None).await?;
+        writer
+            .insert_edge(src, dst, etype, eid, HashMap::new(), None, None)
+            .await?;
+
+        let adjacency = storage.adjacency_manager();
+        assert_eq!(
+            adjacency
+                .get_neighbors(src, etype, Direction::Outgoing)
+                .len(),
+            1,
+            "control: the edge was never mirrored in the first place, so this \
+             run says nothing about the cascade"
+        );
+
+        // Cascade: no prior `delete_edge`, so the edge is retracted only by the
+        // vertex deletion.
+        writer.delete_vertex(dst, None, None).await?;
+
+        assert!(
+            adjacency
+                .get_neighbors(src, etype, Direction::Outgoing)
+                .is_empty(),
+            "the cascade tombstoned the edge in L0 but left it live in the \
+             adjacency overlay, so a traversal would still return a \
+             relationship whose endpoint is gone"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_estimated_size_tracks_mutations() -> Result<()> {
         use crate::storage::manager::StorageManager;

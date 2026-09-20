@@ -112,21 +112,29 @@ impl BuildOutcome {
     /// falsifiable: before this, an index registered by any of the
     /// `IndexManager` paths reported `Online` with `last_built_at: None` and
     /// there was no way to tell it apart from one that had genuinely built.
-    pub(crate) fn into_metadata(self) -> uni_common::core::schema::IndexMetadata {
+    pub(crate) fn into_metadata(
+        self,
+        row_count: Option<u64>,
+    ) -> uni_common::core::schema::IndexMetadata {
         use uni_common::core::schema::{IndexMetadata, IndexStatus};
         match self {
             BuildOutcome::Built => IndexMetadata {
                 status: IndexStatus::Online,
                 last_built_at: Some(Utc::now()),
-                // Left to the rebuild manager, which is the only path that
-                // counts rows; see `index_rebuild.rs:433`.
-                row_count_at_build: None,
+                // Supplied by the caller (`IndexManager::built_row_count`).
+                // This used to be left `None` for the rebuild manager to fill
+                // in, but the rebuild manager is not on this path, so it never
+                // did — and the growth trigger that reads it silently never
+                // fired for anything built here.
+                row_count_at_build: row_count,
             },
             // Online, but with no `last_built_at`: nothing was built, and
             // claiming a build timestamp would be the same lie in a new field.
             // `NotRequired` is correct to be Online permanently; `NotAttempted`
             // is Online only because demoting it is not yet safe — see the
             // variant's docs.
+            // No count for these: nothing was indexed, and a row count would
+            // imply a build that did not happen.
             BuildOutcome::NotRequired | BuildOutcome::NotAttempted => IndexMetadata {
                 status: IndexStatus::Online,
                 last_built_at: None,
@@ -313,6 +321,43 @@ impl std::fmt::Debug for IndexManager {
 }
 
 impl IndexManager {
+    /// The row count to stamp on a freshly built index.
+    ///
+    /// `row_count_at_build` has exactly one consumer: the growth trigger in
+    /// `IndexRebuildManager::labels_needing_rebuild`, which is gated on the
+    /// value being present. Every `IndexManager` path used to leave it `None`
+    /// and defer to the rebuild manager — but `apply()`'s synchronous rebuild
+    /// and the flush-time build both come through here and never reach that
+    /// manager, so the field stayed empty and the trigger could not fire.
+    /// Growth is the only size-based trigger enabled by default
+    /// (`growth_trigger_ratio: 0.5`; `max_index_age` is `None`), so an index
+    /// built here could grow without bound and never be picked up.
+    ///
+    /// Counted only for `Built`, and only when a backend is available; a
+    /// failure to count is not a build failure, so it warns and leaves the
+    /// field empty rather than failing the build.
+    #[cfg(feature = "lance-backend")]
+    async fn built_row_count(&self, label: &str, outcome: BuildOutcome) -> Option<u64> {
+        if outcome != BuildOutcome::Built {
+            return None;
+        }
+        let backend = self.backend.as_ref()?;
+        let table = table_names::vertex_table_name(label);
+        match backend.count_rows(&table, None).await {
+            Ok(count) => Some(count as u64),
+            Err(e) => {
+                tracing::warn!(
+                    %label,
+                    %table,
+                    error = %e,
+                    "index built, but its row count could not be read; the growth \
+                     trigger stays disabled for this index"
+                );
+                None
+            }
+        }
+    }
+
     /// Create a new `IndexManager` bound to `base_uri` and the given schema, without a
     /// storage backend (MUVERA backfill over pre-existing rows is unavailable).
     pub fn new(base_uri: &str, schema_manager: Arc<SchemaManager>) -> Self {
@@ -453,7 +498,8 @@ impl IndexManager {
         } else {
             self.build_physical_vector_index(&config).await?
         };
-        config.metadata = outcome.into_metadata();
+        let row_count = self.built_row_count(&config.label, outcome).await;
+        config.metadata = outcome.into_metadata(row_count);
         // Turn `AUTO_SUB_VECTORS` into a real, dimension-aware value and attach a
         // refine default before the definition is persisted, so a stored schema
         // never contains the sentinel.
@@ -781,7 +827,8 @@ impl IndexManager {
             );
             BuildOutcome::NotAttempted
         };
-        config.metadata = outcome.into_metadata();
+        let row_count = self.built_row_count(&config.label, outcome).await;
+        config.metadata = outcome.into_metadata(row_count);
 
         self.schema_manager
             .add_index(IndexDefinition::Scalar(config))?;
@@ -932,7 +979,8 @@ impl IndexManager {
             );
             BuildOutcome::NotAttempted
         };
-        config.metadata = outcome.into_metadata();
+        let row_count = self.built_row_count(&config.label, outcome).await;
+        config.metadata = outcome.into_metadata(row_count);
 
         self.schema_manager
             .add_index(IndexDefinition::FullText(config))?;
@@ -1004,7 +1052,8 @@ impl IndexManager {
             );
             BuildOutcome::NotAttempted
         };
-        config.metadata = outcome.into_metadata();
+        let row_count = self.built_row_count(&config.label, outcome).await;
+        config.metadata = outcome.into_metadata(row_count);
 
         self.schema_manager
             .add_index(IndexDefinition::JsonFullText(config))?;
@@ -1112,13 +1161,14 @@ impl IndexManager {
                     BuildOutcome::Built
                 };
 
+                let row_count = self.built_row_count(label, outcome).await;
                 let config = ScalarIndexConfig {
                     name: index_name,
                     label: label.to_string(),
                     properties: properties.to_vec(),
                     index_type: uni_common::core::schema::ScalarIndexType::BTree,
                     where_clause: None,
-                    metadata: outcome.into_metadata(),
+                    metadata: outcome.into_metadata(row_count),
                 };
                 self.schema_manager
                     .add_index(IndexDefinition::Scalar(config))?;

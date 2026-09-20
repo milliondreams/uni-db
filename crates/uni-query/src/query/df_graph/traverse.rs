@@ -1680,39 +1680,7 @@ fn collect_unmatched_optional_group_rows(
             .collect());
     }
 
-    let source_vid_indices: Vec<usize> = schema
-        .fields()
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, field)| {
-            if idx >= input.num_columns() {
-                return None;
-            }
-            let name = field.name();
-            if !is_optional_column_for_vars(name, optional_vars) && name.ends_with("._vid") {
-                Some(idx)
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    // With no key column every row keys to the empty vector, so the whole batch
-    // becomes one group and a single matched row suppresses the NULL rows for
-    // every other source. That is how an OPTIONAL MATCH over a `collect()` +
-    // `UNWIND` binding silently dropped source rows: the entity arrives as one
-    // encoded column, with no `._vid` beside it to key on.
-    //
-    // Falling back to per-row makes "cannot group" mean "do not group". That is
-    // also the right answer rather than merely the safe one: grouping exists so
-    // a source fanned out by an earlier traversal is null-filled once, while a
-    // source genuinely repeated in the input must produce a row each time —
-    // `UNWIND [x, x]` against an unmatched `x` yields two rows, not one.
-    if source_vid_indices.is_empty() {
-        return Ok((0..input.num_rows())
-            .filter(|idx| !matched_indices.contains(idx))
-            .collect());
-    }
+    let source_vid_indices = source_group_key_columns(input, schema, optional_vars);
 
     // Group rows by non-optional VID bindings and preserve group order.
     let mut groups: HashMap<Vec<u8>, (usize, bool)> = HashMap::new(); // (first_row_idx, any_matched)
@@ -1740,20 +1708,96 @@ fn collect_unmatched_optional_group_rows(
         .collect())
 }
 
+/// How a non-optional source column contributes to the grouping key.
+///
+/// Rows are grouped so a source fanned out by an earlier traversal is
+/// null-filled once. A source variable carries its identity as a flat
+/// `{var}._vid` column when bound natively, but as a single encoded entity
+/// column — with no `_vid` anywhere beside it — when it came through
+/// `collect()` + `UNWIND`. Keying only on the first made every such row key to
+/// the empty vector, so the whole batch became one group and one matched row
+/// suppressed the NULL rows for every other source.
+///
+/// An empty result stays meaningful and must: a pattern with no bound source at
+/// all — `OPTIONAL MATCH ()-[r]->()` — genuinely is one group, and treating each
+/// input row as its own there produces a spurious second row. The openCypher TCK
+/// says so directly, in `Graph6[6]`.
+enum OptionalGroupKeyColumn {
+    FlatVid(usize),
+    EncodedEntity(usize),
+}
+
+fn source_group_key_columns(
+    input: &RecordBatch,
+    schema: &SchemaRef,
+    optional_vars: &HashSet<String>,
+) -> Vec<OptionalGroupKeyColumn> {
+    let mut cols = Vec::new();
+    let mut covered: HashSet<String> = HashSet::new();
+
+    for (idx, field) in schema.fields().iter().enumerate() {
+        if idx >= input.num_columns() || is_optional_column_for_vars(field.name(), optional_vars) {
+            continue;
+        }
+        if let Some(var) = field.name().strip_suffix("._vid") {
+            cols.push(OptionalGroupKeyColumn::FlatVid(idx));
+            covered.insert(var.to_string());
+        }
+    }
+
+    // A bound source variable with no `_vid` beside it: key on its encoded
+    // bytes. Two encodings of one entity would key apart, which splits a group
+    // rather than merging two — the direction that emits a spare NULL row
+    // rather than dropping a real one.
+    for (idx, field) in schema.fields().iter().enumerate() {
+        if idx >= input.num_columns() || is_optional_column_for_vars(field.name(), optional_vars) {
+            continue;
+        }
+        let name = field.name();
+        if *field.data_type() == DataType::LargeBinary
+            && !name.contains('.')
+            && !name.starts_with("__")
+            && !covered.contains(name)
+        {
+            cols.push(OptionalGroupKeyColumn::EncodedEntity(idx));
+        }
+    }
+
+    cols
+}
+
 fn compute_optional_group_key(
     batch: &RecordBatch,
     row_idx: usize,
-    source_vid_indices: &[usize],
+    source_vid_indices: &[OptionalGroupKeyColumn],
 ) -> DFResult<Vec<u8>> {
     let mut key = Vec::with_capacity(source_vid_indices.len() * std::mem::size_of::<u64>());
-    for &col_idx in source_vid_indices {
-        let col = batch.column(col_idx);
-        let vid_cow = column_as_vid_array(col.as_ref())?;
-        let arr: &UInt64Array = &vid_cow;
-        if arr.is_null(row_idx) {
-            key.extend_from_slice(&u64::MAX.to_le_bytes());
-        } else {
-            key.extend_from_slice(&arr.value(row_idx).to_le_bytes());
+    for col in source_vid_indices {
+        match *col {
+            OptionalGroupKeyColumn::FlatVid(idx) => {
+                let vid_cow = column_as_vid_array(batch.column(idx).as_ref())?;
+                let arr: &UInt64Array = &vid_cow;
+                if arr.is_null(row_idx) {
+                    key.extend_from_slice(&u64::MAX.to_le_bytes());
+                } else {
+                    key.extend_from_slice(&arr.value(row_idx).to_le_bytes());
+                }
+            }
+            OptionalGroupKeyColumn::EncodedEntity(idx) => {
+                match batch
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<arrow_array::LargeBinaryArray>()
+                {
+                    Some(ba) if ba.is_valid(row_idx) => {
+                        // Length-prefixed so concatenation stays unambiguous.
+                        let bytes = ba.value(row_idx);
+                        key.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                        key.extend_from_slice(bytes);
+                    }
+                    _ => key.extend_from_slice(&u64::MAX.to_le_bytes()),
+                }
+            }
         }
     }
     Ok(key)

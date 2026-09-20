@@ -78,6 +78,18 @@ pub struct GraphUnwindExec {
     /// listed belongs to a consumed UNWIND source and is dropped.
     kept: Vec<usize>,
 
+    /// The consumed source variable whose columns `kept` excludes, if the
+    /// planner proved nothing above reads them.
+    ///
+    /// Stored because `kept` cannot be recovered from the other fields, and
+    /// `with_new_children` must rebuild it. Rebuilding through the plain
+    /// constructor instead silently restored every column: the #184 pruning
+    /// turned itself off, and — because the output schema changed with it —
+    /// `collect(DISTINCT n)` began reporting two vertices where there was one.
+    /// DataFusion rebuilds plans for its own reasons, so this was reachable
+    /// without anyone inserting anything.
+    drop_source: Option<String>,
+
     /// Cached plan properties.
     properties: Arc<PlanProperties>,
 
@@ -157,6 +169,7 @@ impl GraphUnwindExec {
             params,
             schema,
             kept,
+            drop_source: drop_source.map(str::to_string),
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -277,11 +290,16 @@ impl ExecutionPlan for GraphUnwindExec {
             ));
         }
 
-        Ok(Arc::new(Self::new(
+        // Through `new_dropping_source`, not `new`: the plain constructor keeps
+        // every input column, so rebuilding through it would discard this
+        // operator's pruning and change its output schema. Recomputed against
+        // the new child rather than copied, so a reshaped child is handled.
+        Ok(Arc::new(Self::new_dropping_source(
             Arc::clone(&children[0]),
             self.expr.clone(),
             self.variable.clone(),
             self.params.clone(),
+            self.drop_source.as_deref(),
         )))
     }
 
@@ -1601,5 +1619,59 @@ mod tests {
         .await;
         assert!(sizes.is_empty(), "got batches: {sizes:?}");
         assert!(rows.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod rebuild_tests {
+    use super::*;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::physical_plan::empty::EmptyExec;
+
+    /// `with_new_children` must preserve the consumed-source pruning.
+    ///
+    /// DataFusion rebuilds plans for its own reasons, and this operator rebuilt
+    /// through the plain constructor — which keeps every input column. The
+    /// pruning silently turned itself off, and because the output schema went
+    /// with it, `collect(DISTINCT n)` reported two vertices where there was one.
+    /// Nothing failed loudly; the query simply answered differently depending on
+    /// whether anything had rebuilt the plan.
+    #[test]
+    fn rebuilding_preserves_the_dropped_source() {
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("xs", DataType::Utf8, true),
+            Field::new("xs._vid", DataType::UInt64, true),
+        ]));
+        let input = Arc::new(EmptyExec::new(Arc::clone(&input_schema)));
+
+        let exec = GraphUnwindExec::new_dropping_source(
+            input.clone(),
+            Expr::Variable("xs".to_string()),
+            "n",
+            HashMap::new(),
+            Some("xs"),
+        );
+        let before_schema = exec.schema();
+        let before_kept = exec.kept.clone();
+        assert_eq!(
+            before_kept,
+            vec![0],
+            "control: the source and its dotted columns should have been dropped, \
+             so a preserved `kept` afterwards would prove nothing"
+        );
+
+        let rebuilt = Arc::new(exec)
+            .with_new_children(vec![input])
+            .expect("rebuild");
+
+        // The output schema is derived from `kept`, so schema equality is what
+        // says the pruning survived. DF 54 removed `as_any` from
+        // `ExecutionPlan`, so the field itself is not reachable from here.
+        assert_eq!(
+            rebuilt.schema(),
+            before_schema,
+            "a rebuild restored the dropped source's columns"
+        );
     }
 }

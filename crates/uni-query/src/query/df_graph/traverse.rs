@@ -40,7 +40,7 @@ use crate::query::df_graph::common::{
 use crate::query::df_graph::nfa::{
     NfaStateId, PathNfa, PathSelector, QppGroupBinding, QppGroupKind, VlpOutputMode,
 };
-use crate::query::df_graph::pred_dag::PredecessorDag;
+use crate::query::df_graph::pred_dag::{PathEnumerator, PredecessorDag};
 use crate::query::df_graph::scan::{
     PrefetchedProps, build_property_column_static, property_field, resolve_property_type,
 };
@@ -4187,6 +4187,7 @@ impl ExecutionPlan for GraphVariableLengthTraverseExec {
             // once whatever the chunking, so the ramp adds per-call overhead
             // over `O(log n)` passes rather than repeating any work.
             rows_per_chunk: 1,
+            paused_row: None,
             pending_rows: None,
         }))
     }
@@ -4487,19 +4488,23 @@ impl GraphVariableLengthTraverseExecData {
         results
     }
 
-    /// NFA-driven BFS with predecessor DAG for full path enumeration (Mode B).
+    /// NFA-driven BFS building the predecessor DAG for full path enumeration
+    /// (Mode B), returning it with the accepting `(target, state, depth)`
+    /// triples the search reached.
     ///
-    /// Returns BFS results in the same format as the old bfs() for compatibility
-    /// with build_output_batch.
-    fn bfs_with_dag(
+    /// The enumeration that turns this into paths is deliberately *not* done
+    /// here. One source vertex in a cyclic graph can own more paths than any
+    /// batch should hold, so the caller walks the DAG through a
+    /// [`PathEnumerator`] it can pause -- which means the DAG has to outlive a
+    /// single call.
+    fn build_path_dag(
         &self,
         source: Vid,
         eid_filters: &[EidFilter],
         vertex_filters: &[VidFilter],
         used_eids: &FxHashSet<u64>,
         vid_filter: &VidFilter,
-        budget: &mut PathBudget,
-    ) -> DFResult<Vec<BfsResult>> {
+    ) -> (PredecessorDag, Vec<(Vid, NfaStateId, u32)>) {
         let nfa = &self.nfa;
         let selector = PathSelector::All;
         let mut dag = PredecessorDag::new(selector);
@@ -4556,11 +4561,27 @@ impl GraphVariableLengthTraverseExecData {
             frontier = next_frontier;
         }
 
-        // Enumerate paths from DAG to produce BfsResult tuples.
-        //
-        // Every admitted path is charged to `budget` before it is kept, so the
-        // memory limit and the deadline both bind here rather than after the
-        // whole set is resident. See `PathBudget`.
+        (dag, accepting)
+    }
+
+    /// Build the DAG and enumerate every path out of it, in one call.
+    ///
+    /// The run-to-completion form, kept for callers that expand a whole chunk
+    /// of input rows at once. Every admitted path is charged to `budget` before
+    /// it is kept, so the memory limit and the deadline bind as the set accrues
+    /// rather than after it is resident. See [`PathBudget`].
+    fn bfs_with_dag(
+        &self,
+        source: Vid,
+        eid_filters: &[EidFilter],
+        vertex_filters: &[VidFilter],
+        used_eids: &FxHashSet<u64>,
+        vid_filter: &VidFilter,
+        budget: &mut PathBudget,
+    ) -> DFResult<Vec<BfsResult>> {
+        let (dag, accepting) =
+            self.build_path_dag(source, eid_filters, vertex_filters, used_eids, vid_filter);
+
         let mut results: Vec<BfsResult> = Vec::new();
         for &(target, state, depth) in &accepting {
             if budget.tripped() {
@@ -4660,6 +4681,31 @@ impl GraphVariableLengthTraverseExecData {
     }
 }
 
+/// One input row whose path enumeration stopped part-way through.
+///
+/// A single source vertex in a cyclic graph can own more paths than any batch
+/// should hold, and the enumeration used to be all-or-nothing: the operator
+/// built every path before it could hand the first row downstream. That is why
+/// an unbounded pattern cost the same with a `LIMIT` as without one (#285) --
+/// the consumer could stop asking, but this could not stop producing.
+///
+/// Parking the DAG and the cursor here makes it ordinary back-pressure. The
+/// operator emits one batch out of a row; if nothing pulls again, the rest of
+/// that row's paths are never walked.
+struct PausedRowEnumeration {
+    /// The one-row input slice these paths expand from, re-emitted with every
+    /// batch drained out of it. Expansions therefore always carry row index 0.
+    chunk: RecordBatch,
+    source: Vid,
+    dag: PredecessorDag,
+    accepting: Vec<(Vid, NfaStateId, u32)>,
+    /// Next entry of `accepting` to open a cursor on.
+    accept_idx: usize,
+    /// The open cursor and the `(target, hops)` it is enumerating, if the last
+    /// pass stopped inside an accepting entry rather than between two.
+    cursor: Option<(PathEnumerator, Vid, usize)>,
+}
+
 /// State machine for variable-length traverse stream.
 enum VarLengthStreamState {
     /// Warming adjacency CSRs before first batch. Resolves to the prebuilt
@@ -4741,6 +4787,13 @@ struct GraphVariableLengthTraverseStream {
     /// second, so this tracks what the last pass actually produced. Same shape
     /// as the scan's `retune_range_width` (#214).
     rows_per_chunk: usize,
+
+    /// A row whose path enumeration is part-done, and the DAG it is walking.
+    ///
+    /// Takes precedence over `pending_rows`: while this is set, every batch the
+    /// operator emits comes out of the parked row's own chunk. See
+    /// [`PausedRowEnumeration`].
+    paused_row: Option<Box<PausedRowEnumeration>>,
 
     /// The input batch being consumed a row-chunk at a time, and where to
     /// resume in it.
@@ -4824,20 +4877,42 @@ impl Stream for GraphVariableLengthTraverseStream {
                     if let Err(e) = self.exec.graph_ctx.check_timeout() {
                         return Poll::Ready(Some(Err(exec_err(e))));
                     }
-                    let Some((held, offset)) = self.pending_rows.take() else {
-                        self.state = VarLengthStreamState::Reading;
-                        continue;
-                    };
-                    if offset >= held.num_rows() {
-                        self.state = VarLengthStreamState::Reading;
-                        continue;
-                    }
-                    let take_rows = self.rows_per_chunk.min(held.num_rows() - offset);
-                    let chunk = held.slice(offset, take_rows);
-                    self.pending_rows = Some((held, offset + take_rows));
 
-                    {
-                        {
+                    // A row parked mid-enumeration outranks fresh input: its
+                    // chunk is still the batch being emitted from, and pulling
+                    // new rows first would strand it.
+                    let (take_rows, input, expansions) =
+                        if let Some(mut parked) = self.paused_row.take() {
+                            let mut budget = PathBudget::new(&self.memory_pool);
+                            let mut expansions: Vec<VarLengthExpansion> = Vec::new();
+                            let exhausted = self.drain_paused_row(
+                                &mut parked,
+                                self.slice_size,
+                                &mut budget,
+                                &mut expansions,
+                            );
+                            if let Some(e) = budget.take_error() {
+                                self.state = VarLengthStreamState::Done;
+                                return Poll::Ready(Some(Err(e)));
+                            }
+                            let chunk = parked.chunk.clone();
+                            if !exhausted {
+                                self.paused_row = Some(parked);
+                            }
+                            (1, chunk, expansions)
+                        } else {
+                            let Some((held, offset)) = self.pending_rows.take() else {
+                                self.state = VarLengthStreamState::Reading;
+                                continue;
+                            };
+                            if offset >= held.num_rows() {
+                                self.state = VarLengthStreamState::Reading;
+                                continue;
+                            }
+                            let take_rows = self.rows_per_chunk.min(held.num_rows() - offset);
+                            let chunk = held.slice(offset, take_rows);
+                            self.pending_rows = Some((held, offset + take_rows));
+
                             // Build base batch synchronously (BFS + expand).
                             // The per-hop filters were built during warming and
                             // gate flushed edges/vertices by their properties.
@@ -4851,14 +4926,20 @@ impl Stream for GraphVariableLengthTraverseStream {
                                 &self.vertex_property_filters,
                                 &accepting_vid_filter,
                             );
-                            let (input, expansions) = match expanded {
-                                Ok(pair) => pair,
+                            match expanded {
+                                Ok((input, expansions, parked)) => {
+                                    self.paused_row = parked;
+                                    (take_rows, input, expansions)
+                                }
                                 Err(e) => {
                                     self.state = VarLengthStreamState::Reading;
                                     return Poll::Ready(Some(Err(e)));
                                 }
-                            };
+                            }
+                        };
 
+                    {
+                        {
                             // Aim the next pass at one batch's worth of
                             // expansions, from what this pass actually produced.
                             self.rows_per_chunk =
@@ -4975,6 +5056,77 @@ impl Stream for GraphVariableLengthTraverseStream {
 }
 
 impl GraphVariableLengthTraverseStream {
+    /// Take up to `cap` more paths out of a paused row.
+    ///
+    /// Returns `true` when the row has no paths left, so the caller can drop
+    /// the parked state. A `false` means the cap or the budget stopped it and
+    /// the cursor is positioned exactly after the last path handed over --
+    /// never before it, which would duplicate a row, and never after the next,
+    /// which would drop one.
+    fn drain_paused_row(
+        &self,
+        st: &mut PausedRowEnumeration,
+        cap: usize,
+        budget: &mut PathBudget,
+        out: &mut Vec<VarLengthExpansion>,
+    ) -> bool {
+        loop {
+            if out.len() >= cap || budget.tripped() {
+                return false;
+            }
+            let (mut cursor, target, hops) = match st.cursor.take() {
+                Some(open) => open,
+                None => {
+                    let Some(&(target, state, depth)) = st.accepting.get(st.accept_idx) else {
+                        return true;
+                    };
+                    st.accept_idx += 1;
+                    let cursor = PathEnumerator::new(
+                        &st.dag,
+                        st.source,
+                        target,
+                        state,
+                        depth,
+                        depth,
+                        self.exec.path_mode.clone(),
+                    );
+                    (cursor, target, depth as usize)
+                }
+            };
+
+            let mut stopped_short = false;
+            // The stop reason is tracked by `stopped_short`: a `Break` from the
+            // callback and a cursor that simply ran out mean different things
+            // to the caller, and only the callback knows which happened.
+            let _ = cursor.resume(&st.dag, &mut |nodes, edges| match budget.admit(
+                nodes,
+                edges,
+                &self.exec.graph_ctx,
+            ) {
+                ControlFlow::Continue(()) => {
+                    out.push((0, target, hops, nodes.to_vec(), edges.to_vec()));
+                    if out.len() >= cap {
+                        stopped_short = true;
+                        ControlFlow::Break(())
+                    } else {
+                        ControlFlow::Continue(())
+                    }
+                }
+                ControlFlow::Break(()) => {
+                    stopped_short = true;
+                    ControlFlow::Break(())
+                }
+            });
+
+            if !cursor.is_finished() {
+                st.cursor = Some((cursor, target, hops));
+            }
+            if stopped_short {
+                return false;
+            }
+        }
+    }
+
     /// Run the BFS for one input batch and return it alongside the expansions.
     ///
     /// Column materialization is deliberately *not* done here: entity structs
@@ -4987,7 +5139,11 @@ impl GraphVariableLengthTraverseStream {
         eid_filters: &[EidFilter],
         vertex_filters: &[VidFilter],
         vid_filter: &VidFilter,
-    ) -> DFResult<(RecordBatch, Vec<VarLengthExpansion>)> {
+    ) -> DFResult<(
+        RecordBatch,
+        Vec<VarLengthExpansion>,
+        Option<Box<PausedRowEnumeration>>,
+    )> {
         let source_col = batch
             .column_by_name(&self.exec.source_column)
             .ok_or_else(|| {
@@ -5018,6 +5174,7 @@ impl GraphVariableLengthTraverseStream {
         // on what this pass holds, not on any single source vertex, and one
         // source in a cyclic graph can exhaust it on its own.
         let mut expansions: Vec<VarLengthExpansion> = Vec::new();
+        let mut paused: Option<Box<PausedRowEnumeration>> = None;
         let mut budget = PathBudget::new(&self.memory_pool);
 
         for (row_idx, source_vid) in source_vids.iter().enumerate() {
@@ -5062,6 +5219,53 @@ impl GraphVariableLengthTraverseStream {
                             emitted_for_row = true;
                         }
                     }
+                    // A lone source row whose endpoint is not already bound:
+                    // the one shape where a pause is both useful and safe.
+                    //
+                    // Useful, because a chunk this narrow is what
+                    // `retune_rows_per_chunk` converges to under a large
+                    // fan-out, so it is exactly the exploding case. Safe,
+                    // because nothing between here and the emitted batch drops
+                    // a row -- with a bound endpoint the loop below filters
+                    // *after* enumeration, so a pause could hand back fewer
+                    // rows than the pass was asked for.
+                    //
+                    // Narrowing the accepting set by the bound endpoint instead
+                    // would make the pause safe there too, and was written and
+                    // then dropped: no query shape could be found that reaches
+                    // it. `bound_target_column` is unset even for
+                    // `MATCH (b {..}) WITH b MATCH p=(a)-[*]->(b)`, where the
+                    // endpoint is enforced by a filter above this operator.
+                    _ if batch.num_rows() == 1 && expected_targets.is_none() => {
+                        let (dag, accepting) = self.exec.build_path_dag(
+                            vid,
+                            eid_filters,
+                            vertex_filters,
+                            &used_eids,
+                            vid_filter,
+                        );
+                        let mut state = Box::new(PausedRowEnumeration {
+                            chunk: batch.clone(),
+                            source: vid,
+                            dag,
+                            accepting,
+                            accept_idx: 0,
+                            cursor: None,
+                        });
+                        let exhausted = self.drain_paused_row(
+                            &mut state,
+                            self.slice_size,
+                            &mut budget,
+                            &mut expansions,
+                        );
+                        if let Some(e) = budget.take_error() {
+                            return Err(e);
+                        }
+                        emitted_for_row = !expansions.is_empty();
+                        if !exhausted {
+                            paused = Some(state);
+                        }
+                    }
                     _ => {
                         // FullPath, StepVariable, CountOnly, etc.
                         let bfs_results = self.exec.bfs_with_dag(
@@ -5096,7 +5300,7 @@ impl GraphVariableLengthTraverseStream {
             }
         }
 
-        Ok((batch, expansions))
+        Ok((batch, expansions, paused))
     }
 
     /// Whether this batch materializes entity structs (path or step-variable
@@ -5116,7 +5320,7 @@ impl GraphVariableLengthTraverseStream {
     /// hydration all end by asking the same question, and answering it
     /// independently in each is how a half-consumed input batch gets dropped.
     fn resume_state(&self) -> VarLengthStreamState {
-        if self.pending_rows.is_some() {
+        if self.paused_row.is_some() || self.pending_rows.is_some() {
             VarLengthStreamState::RowChunking
         } else {
             VarLengthStreamState::Reading

@@ -146,3 +146,4 @@ pub mod repro_schemaless_pattern_comprehension_empty;
 pub mod repro_stream_error_loses_abort_type;
 pub mod vid_lookup_join_payoff;
 pub mod vid_lookup_join_reachability;
+pub mod vlp_limit_stops_enumeration;

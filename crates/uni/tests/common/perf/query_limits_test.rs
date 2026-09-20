@@ -2465,13 +2465,63 @@ async fn unbounded_variable_length_path_is_bounded_by_max_memory() {
         .max_memory(64 * 1024 * 1024)
         .fetch_all()
         .await
-        .expect_err("an unbounded path query over a cyclic graph must hit its memory limit");
+        .expect_err("an unbounded path query over a cyclic graph must hit a limit");
 
+    // Which limit stops it changed with #285, and the change was the point.
+    //
+    // This used to exhaust the pool, because the operator built a source
+    // vertex's entire path set before it could emit anything. It now
+    // enumerates in bounded batches, so memory stays inside the budget and the
+    // deadline is what stops it. Counting every path of an unbounded pattern
+    // over a cyclic graph is unbounded *work*, so a clock bound is the honest
+    // one; the assertion is that some declared limit stops it, which is the
+    // guarantee that matters. That `max_memory` still binds on this operator
+    // is asserted directly by `locy_max_memory_bounds_the_evaluation` (which
+    // trips inside `GraphVariableLengthTraverse[enumeration]`) and by
+    // `a_chunking_traversal_accounts_for_its_retained_expansions`.
     let msg = err.to_string();
+    let lowered = msg.to_lowercase();
     assert!(
-        msg.contains("Resources exhausted") || msg.to_lowercase().contains("memory"),
-        "the failure must name the resource limit, not surface as something else: {msg}"
+        msg.contains("Resources exhausted")
+            || lowered.contains("memory")
+            || lowered.contains("timed out"),
+        "the failure must name a declared limit, not surface as something else: {msg}"
     );
+}
+
+/// Issue #285, the other half: the same unbounded pattern under a `LIMIT`
+/// must *answer*, not hit a limit at all.
+///
+/// Before the enumeration could be paused, a `LIMIT` bought nothing — the
+/// operator built every path a source vertex owned inside a single poll, so
+/// `LIMIT 5` cost exactly what no limit cost and died the same way. Measured on
+/// a 852-entity sanctions-shaped graph: a 30s timeout before, ~4s and five rows
+/// after.
+///
+/// This is the arm that would catch the fix regressing. The arm above only says
+/// the query is *stopped* by something, which a build with no laziness at all
+/// still satisfies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unbounded_path_query_under_a_limit_answers() {
+    let db = Uni::in_memory().build().await.unwrap();
+    cyclic_graph(&db, 30, 3).await;
+
+    for limit in [1usize, 7, 40] {
+        let rows = db
+            .session()
+            .query_with(&format!(
+                "MATCH p=(a:Entity)-[:OWNS*]->(b:Entity) RETURN length(p) AS hops LIMIT {limit}"
+            ))
+            .max_memory(64 * 1024 * 1024)
+            .fetch_all()
+            .await
+            .unwrap_or_else(|e| panic!("unbounded pattern with LIMIT {limit} must answer: {e}"));
+        assert_eq!(
+            rows.rows().len(),
+            limit,
+            "LIMIT {limit} over an unbounded pattern returned the wrong row count"
+        );
+    }
 }
 
 /// Issue #284: `locy_with` had no `max_memory`, while `query_with` did.
@@ -2483,6 +2533,13 @@ async fn unbounded_variable_length_path_is_bounded_by_max_memory() {
 /// this builder before (its `cancellation_token` did exactly that), so this
 /// asserts the bound actually binds: the error must name the pool size that was
 /// asked for, not the database default.
+///
+/// The bound is 2 MB rather than the 32 MB this was first written with. Since
+/// #285 the variable-length operator enumerates paths in bounded batches
+/// instead of building a source vertex's whole path set at once, so this shape
+/// no longer *reaches* 32 MB — it is the same knob, asked at a size the work
+/// still exceeds. What the assertion checks is unchanged: the figure in the
+/// error is the one this call asked for, not the database default.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn locy_max_memory_bounds_the_evaluation() {
     let db = Uni::in_memory().build().await.unwrap();
@@ -2491,15 +2548,15 @@ async fn locy_max_memory_bounds_the_evaluation() {
     let err = db
         .session()
         .locy_with("MATCH p=(a:Entity)-[:OWNS*]->(b:Entity) RETURN count(p) AS n")
-        .max_memory(32 * 1024 * 1024)
+        .max_memory(2 * 1024 * 1024)
         .run()
         .await
         .expect_err("an unbounded path query must hit the configured memory bound");
 
     let msg = err.to_string();
     assert!(
-        msg.contains("32.0 MB"),
-        "the evaluation was bounded by something other than the requested 32 MB \
+        msg.contains("2.0 MB"),
+        "the evaluation was bounded by something other than the requested 2 MB \
          — a setter that is not read would fail exactly here: {msg}"
     );
 }

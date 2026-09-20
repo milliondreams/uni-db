@@ -49,7 +49,9 @@ use arrow::compute::take;
 use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::Result as DFResult;
-use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use std::ops::ControlFlow;
+
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
@@ -4028,6 +4030,7 @@ impl ExecutionPlan for GraphVariableLengthTraverseExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
+        let pool_for_budget = Arc::clone(context.memory_pool());
         let reservation =
             MemoryConsumer::new(format!("GraphVariableLengthTraverseExec[{partition}]"))
                 .register(context.memory_pool());
@@ -4098,6 +4101,7 @@ impl ExecutionPlan for GraphVariableLengthTraverseExec {
             });
 
         Ok(Box::pin(GraphVariableLengthTraverseStream {
+            memory_pool: pool_for_budget,
             reservation,
             input: input_stream,
             exec: Arc::new(self.clone_for_stream()),
@@ -4199,6 +4203,92 @@ struct GraphVariableLengthTraverseExecData {
 const MAX_FRONTIER_SIZE: usize = 500_000;
 /// Safety cap for predecessor pool size.
 const MAX_PRED_POOL_SIZE: usize = 2_000_000;
+
+/// Bounds path enumeration *while* it runs, instead of after it has finished.
+///
+/// `bfs_with_dag` keeps a node path and an edge path per enumerated path. Under
+/// trail semantics on a cyclic graph that set is combinatorial: issue #285
+/// reached 3 GB from a 30-vertex, 90-edge store, and over 180 GB on a real
+/// 852-entity ownership graph with 39 cycles. The BFS itself is cheap and
+/// terminates — `MAX_FRONTIER_SIZE` and `MAX_PRED_POOL_SIZE` see to that — but
+/// they bound the search, not the enumeration that follows it.
+///
+/// The stream already reserves for the result of this work, and that is exactly
+/// why it could not help: a reservation taken afterwards can only be refused for
+/// memory the process has already committed, which is also why `max_memory`
+/// overshot its limit twelvefold (issue #284). Growing the reservation from
+/// inside the enumeration callback is what makes the limit bind — the pool
+/// refuses, enumeration stops, and the query fails with a memory error instead
+/// of the OS killing the process.
+///
+/// Both checks are amortized, because the callback runs once per path and a
+/// pool round-trip or clock read per path would dominate the enumeration it is
+/// meant to guard.
+struct PathBudget {
+    reservation: MemoryReservation,
+    /// Bytes admitted since the last `try_grow`.
+    pending: usize,
+    /// Paths admitted since the last deadline check.
+    since_deadline_check: u32,
+    /// Set when the pool refused or the deadline passed; enumeration then stops
+    /// and the caller turns this into the query's error.
+    error: Option<datafusion::error::DataFusionError>,
+}
+
+/// Grow the reservation once per this many bytes of admitted paths.
+const BUDGET_GROW_BYTES: usize = 1 << 20;
+/// Check the deadline once per this many admitted paths.
+const BUDGET_DEADLINE_STRIDE: u32 = 4096;
+
+impl PathBudget {
+    fn new(pool: &Arc<dyn MemoryPool>) -> Self {
+        Self {
+            reservation: MemoryConsumer::new("GraphVariableLengthTraverse[enumeration]")
+                .register(pool),
+            pending: 0,
+            since_deadline_check: 0,
+            error: None,
+        }
+    }
+
+    /// Accounts one enumerated path and says whether enumeration may continue.
+    fn admit(
+        &mut self,
+        nodes: &[Vid],
+        edges: &[Eid],
+        graph_ctx: &GraphExecutionContext,
+    ) -> ControlFlow<()> {
+        self.pending += std::mem::size_of::<BfsResult>()
+            + std::mem::size_of_val(nodes)
+            + std::mem::size_of_val(edges);
+        if self.pending >= BUDGET_GROW_BYTES {
+            if let Err(e) = self.reservation.try_grow(self.pending) {
+                self.error = Some(e);
+                return ControlFlow::Break(());
+            }
+            self.pending = 0;
+        }
+
+        self.since_deadline_check += 1;
+        if self.since_deadline_check >= BUDGET_DEADLINE_STRIDE {
+            self.since_deadline_check = 0;
+            if let Err(e) = graph_ctx.check_timeout() {
+                self.error = Some(exec_err(e));
+                return ControlFlow::Break(());
+            }
+        }
+
+        ControlFlow::Continue(())
+    }
+
+    fn tripped(&self) -> bool {
+        self.error.is_some()
+    }
+
+    fn take_error(&mut self) -> Option<datafusion::error::DataFusionError> {
+        self.error.take()
+    }
+}
 
 impl GraphVariableLengthTraverseExecData {
     /// Report that the variable-length search hit a safety cap and stopped
@@ -4347,7 +4437,8 @@ impl GraphVariableLengthTraverseExecData {
         vertex_filters: &[VidFilter],
         used_eids: &FxHashSet<u64>,
         vid_filter: &VidFilter,
-    ) -> Vec<BfsResult> {
+        budget: &mut PathBudget,
+    ) -> DFResult<Vec<BfsResult>> {
         let nfa = &self.nfa;
         let selector = PathSelector::All;
         let mut dag = PredecessorDag::new(selector);
@@ -4404,9 +4495,16 @@ impl GraphVariableLengthTraverseExecData {
             frontier = next_frontier;
         }
 
-        // Enumerate paths from DAG to produce BfsResult tuples
+        // Enumerate paths from DAG to produce BfsResult tuples.
+        //
+        // Every admitted path is charged to `budget` before it is kept, so the
+        // memory limit and the deadline both bind here rather than after the
+        // whole set is resident. See `PathBudget`.
         let mut results: Vec<BfsResult> = Vec::new();
         for &(target, state, depth) in &accepting {
+            if budget.tripped() {
+                break;
+            }
             dag.enumerate_paths(
                 source,
                 target,
@@ -4414,14 +4512,20 @@ impl GraphVariableLengthTraverseExecData {
                 depth,
                 depth,
                 &self.path_mode,
-                &mut |nodes, edges| {
-                    results.push((target, depth as usize, nodes.to_vec(), edges.to_vec()));
-                    std::ops::ControlFlow::Continue(())
+                &mut |nodes, edges| match budget.admit(nodes, edges, &self.graph_ctx) {
+                    ControlFlow::Continue(()) => {
+                        results.push((target, depth as usize, nodes.to_vec(), edges.to_vec()));
+                        ControlFlow::Continue(())
+                    }
+                    ControlFlow::Break(()) => ControlFlow::Break(()),
                 },
             );
         }
 
-        results
+        if let Some(e) = budget.take_error() {
+            return Err(e);
+        }
+        Ok(results)
     }
 
     /// NFA-driven BFS returning only endpoints and depths (Mode A).
@@ -4550,6 +4654,11 @@ fn retune_rows_per_chunk(rows: usize, expansions: usize, target: usize) -> usize
 struct GraphVariableLengthTraverseStream {
     input: SendableRecordBatchStream,
     exec: Arc<GraphVariableLengthTraverseExecData>,
+    /// Pool the per-batch enumeration budget registers against. Held separately
+    /// from `reservation` because enumeration happens under `&self`, and its
+    /// peak has to be bounded as it accrues rather than after (see
+    /// [`PathBudget`]).
+    memory_pool: Arc<dyn MemoryPool>,
     schema: SchemaRef,
     state: VarLengthStreamState,
     /// Edge-property allow-set built during warming (see [`VarLengthStreamState::Warming`]).
@@ -4844,8 +4953,11 @@ impl GraphVariableLengthTraverseStream {
         let used_edge_arrays: Vec<&UInt64Array> =
             super::common::used_edge_id_arrays(&batch, &self.exec.used_edge_columns)?;
 
-        // Collect all BFS results
+        // Collect all BFS results. `budget` spans the whole batch: the limit is
+        // on what this pass holds, not on any single source vertex, and one
+        // source in a cyclic graph can exhaust it on its own.
         let mut expansions: Vec<VarLengthExpansion> = Vec::new();
+        let mut budget = PathBudget::new(&self.memory_pool);
 
         for (row_idx, source_vid) in source_vids.iter().enumerate() {
             let mut emitted_for_row = false;
@@ -4897,7 +5009,8 @@ impl GraphVariableLengthTraverseStream {
                             vertex_filters,
                             &used_eids,
                             vid_filter,
-                        );
+                            &mut budget,
+                        )?;
                         for (target, hop_count, node_path, edge_path) in bfs_results {
                             // Filter by bound target VID
                             if let Some(targets) = expected_targets {

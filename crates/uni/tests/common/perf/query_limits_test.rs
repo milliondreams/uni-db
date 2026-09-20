@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 use std::time::Duration;
-use uni_db::Uni;
+use uni_db::{DataType, Uni};
 
 #[tokio::test]
 async fn test_query_timeout() -> Result<()> {
@@ -2383,4 +2383,93 @@ async fn a_traversal_reserves_the_target_read_it_shares() -> Result<()> {
     assert_eq!(ok.rows().len(), 1, "the control query must answer");
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Issue #285 / #284 — bounding variable-length path enumeration.
+// ---------------------------------------------------------------------------
+
+/// Builds a small strongly-connected graph: `n` entities, each with `out`
+/// outgoing edges. Cycles are the point — trail counts explode with them, and
+/// mutual cross-holdings are ordinary in the corporate-ownership data this came
+/// from.
+async fn cyclic_graph(db: &Uni, n: usize, out: usize) {
+    db.schema()
+        .label("Entity")
+        .property("uid", DataType::String)
+        .done()
+        .edge_type("OWNS", &["Entity"], &["Entity"])
+        .done()
+        .apply()
+        .await
+        .unwrap();
+
+    let tx = db.session().tx().await.unwrap();
+    for i in 0..n {
+        tx.execute_with("CREATE (:Entity {uid: $u})")
+            .param("u", format!("e{i}"))
+            .run()
+            .await
+            .unwrap();
+    }
+    for i in 0..n {
+        for k in 0..out {
+            let dst = (i * 7 + k * 13 + 1) % n;
+            tx.execute_with(
+                "MATCH (a:Entity {uid: $a}), (b:Entity {uid: $b}) CREATE (a)-[:OWNS]->(b)",
+            )
+            .param("a", format!("e{i}"))
+            .param("b", format!("e{dst}"))
+            .run()
+            .await
+            .unwrap();
+        }
+    }
+    tx.commit().await.unwrap();
+}
+
+/// An unbounded variable-length path over a cyclic graph must fail against its
+/// memory limit rather than growing until the OS intervenes (issue #285).
+///
+/// The BFS is cheap and terminates; the cost is the enumeration that follows
+/// it, which keeps a node path and an edge path per trail. The stream reserved
+/// for that set only *after* building it, so the pool could never refuse it —
+/// which is also why `max_memory` overshot by 12x (issue #284). The budget
+/// inside the enumeration is what makes the limit bind.
+///
+/// The bounded arm is the control: same graph, same query shape, an upper hop
+/// bound. It must still succeed, or this test would pass on a build that simply
+/// refused all variable-length queries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unbounded_variable_length_path_is_bounded_by_max_memory() {
+    let db = Uni::in_memory().build().await.unwrap();
+    cyclic_graph(&db, 30, 3).await;
+
+    let bounded = db
+        .session()
+        .query_with("MATCH p=(a:Entity)-[:OWNS*1..4]->(b:Entity) RETURN count(p) AS n")
+        .max_memory(256 * 1024 * 1024)
+        .fetch_all()
+        .await;
+    let bounded = bounded.expect("control: a hop-bounded path query must still succeed");
+    let counted: i64 = bounded.rows()[0].get("n").unwrap();
+    assert!(
+        counted > 0,
+        "control: the bounded query found no paths, so the graph is not cyclic \
+         enough for the unbounded arm to mean anything"
+    );
+
+    let err = db
+        .session()
+        .query_with("MATCH p=(a:Entity)-[:OWNS*]->(b:Entity) RETURN count(p) AS n")
+        .max_memory(64 * 1024 * 1024)
+        .fetch_all()
+        .await
+        .expect_err("an unbounded path query over a cyclic graph must hit its memory limit");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Resources exhausted") || msg.to_lowercase().contains("memory"),
+        "the failure must name the resource limit, not surface as something else: {msg}"
+    );
 }

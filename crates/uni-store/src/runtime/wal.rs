@@ -180,6 +180,16 @@ pub enum Mutation {
         /// Edge type name for metadata recovery. Optional for backward compatibility.
         #[serde(default)]
         edge_type_name: Option<String>,
+        /// Wall-clock creation time (nanos) as the live write path stamped it.
+        /// `None` in segments written before this field existed, which replay
+        /// treats exactly as it always did — the timestamp stays unset. See
+        /// the note on `InsertVertex::created_at`.
+        #[serde(default)]
+        created_at: Option<i64>,
+        /// Wall-clock update time (nanos). Same compatibility rules as
+        /// `created_at`.
+        #[serde(default)]
+        updated_at: Option<i64>,
     },
     DeleteEdge {
         eid: Eid,
@@ -194,6 +204,25 @@ pub enum Mutation {
         properties: Properties,
         #[serde(default)]
         labels: Vec<String>,
+        /// Wall-clock creation time (nanos) as the live write path stamped it.
+        ///
+        /// `created_at`/`updated_at` are user-visible (`RETURN n.created_at`),
+        /// but nothing else in the record can reconstruct them: a WAL replay
+        /// happens at an arbitrary later time, so `now()` at recovery would
+        /// invent a value rather than restore one. Carrying the original is the
+        /// only honest option, and the alternative — leaving them unset — bakes
+        /// a permanent null into L1 at the next flush.
+        ///
+        /// Externally-tagged serde with `#[serde(default)]`, so segments
+        /// written before this field deserialize to `None` and replay exactly
+        /// as they did before: unset, as today. Same mechanism as `labels` and
+        /// `InsertEdge::edge_type_name`.
+        #[serde(default)]
+        created_at: Option<i64>,
+        /// Wall-clock update time (nanos). Same compatibility rules as
+        /// `created_at`.
+        #[serde(default)]
+        updated_at: Option<i64>,
     },
     DeleteVertex {
         vid: Vid,
@@ -717,6 +746,8 @@ mod tests {
             vid: Vid::new(1),
             properties: HashMap::new(),
             labels: vec![],
+            created_at: None,
+            updated_at: None,
         };
 
         wal.append(mutation)?;
@@ -750,16 +781,22 @@ mod tests {
             vid: Vid::new(1),
             properties: HashMap::new(),
             labels: vec![],
+            created_at: None,
+            updated_at: None,
         };
         let mutation2 = Mutation::InsertVertex {
             vid: Vid::new(2),
             properties: HashMap::new(),
             labels: vec![],
+            created_at: None,
+            updated_at: None,
         };
         let mutation3 = Mutation::InsertVertex {
             vid: Vid::new(3),
             properties: HashMap::new(),
             labels: vec![],
+            created_at: None,
+            updated_at: None,
         };
 
         // First flush
@@ -800,6 +837,8 @@ mod tests {
             vid: Vid::new(1),
             properties: HashMap::new(),
             labels: vec![],
+            created_at: None,
+            updated_at: None,
         })?;
 
         // Force the next segment fsync to fail.
@@ -892,6 +931,8 @@ mod tests {
                 vid: Vid::new(i),
                 properties: HashMap::new(),
                 labels: vec![],
+                created_at: None,
+                updated_at: None,
             };
             wal.append(mutation)?;
             wal.flush().await?;
@@ -929,6 +970,8 @@ mod tests {
             vid: Vid::new(1),
             properties: HashMap::new(),
             labels: vec![],
+            created_at: None,
+            updated_at: None,
         })?;
         let lsn1 = wal.flush().await?;
         assert_eq!(lsn1, 1);
@@ -938,6 +981,8 @@ mod tests {
             vid: Vid::new(2),
             properties: HashMap::new(),
             labels: vec![],
+            created_at: None,
+            updated_at: None,
         })?;
         let lsn2 = wal.flush().await?;
         assert_eq!(lsn2, 2);
@@ -952,6 +997,8 @@ mod tests {
             vid: Vid::new(3),
             properties: HashMap::new(),
             labels: vec![],
+            created_at: None,
+            updated_at: None,
         })?;
 
         // Now flush mutation 4
@@ -959,6 +1006,8 @@ mod tests {
             vid: Vid::new(4),
             properties: HashMap::new(),
             labels: vec![],
+            created_at: None,
+            updated_at: None,
         })?;
         let lsn4 = wal.flush().await?;
 
@@ -990,6 +1039,8 @@ mod tests {
                 vid: Vid::new(i),
                 properties: HashMap::new(),
                 labels: vec![],
+                created_at: None,
+                updated_at: None,
             })?;
             let lsn = wal.flush().await?;
 
@@ -1024,6 +1075,8 @@ mod tests {
                 vid: Vid::new(i),
                 properties: HashMap::new(),
                 labels: vec![],
+                created_at: None,
+                updated_at: None,
             };
             wal.append(mutation)?;
             wal.flush().await?;
@@ -1067,6 +1120,8 @@ mod tests {
                 vid: Vid::new(i),
                 properties: HashMap::new(),
                 labels: vec![],
+                created_at: None,
+                updated_at: None,
             };
             wal.append(mutation)?;
             wal.flush().await?;
@@ -1111,6 +1166,8 @@ mod tests {
                 props
             },
             labels: vec!["Person".to_string(), "User".to_string()],
+            created_at: None,
+            updated_at: None,
         })?;
 
         // Flush to WAL
@@ -1190,6 +1247,8 @@ mod tests {
                 props
             },
             edge_type_name: Some("KNOWS".to_string()),
+            created_at: None,
+            updated_at: None,
         })?;
 
         // Flush to WAL
@@ -1270,6 +1329,8 @@ mod tests {
                 vid: Vid::new(1),
                 properties: props,
                 labels: vec!["L".to_string()],
+                created_at: None,
+                updated_at: None,
             },
             Mutation::DeleteEdge {
                 eid: Eid::new(2),
@@ -1391,6 +1452,8 @@ mod tests {
                 vid: Vid::new(i),
                 properties: HashMap::new(),
                 labels: vec![],
+                created_at: None,
+                updated_at: None,
             })
             .unwrap();
             wal.flush().await.unwrap();

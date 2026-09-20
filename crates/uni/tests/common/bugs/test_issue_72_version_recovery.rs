@@ -207,6 +207,8 @@ async fn test_wal_has_segments() -> Result<()> {
         vid: Vid::new(1),
         properties: HashMap::new(),
         labels: vec!["Test".to_string()],
+        created_at: None,
+        updated_at: None,
     })?;
     wal.flush().await?;
 

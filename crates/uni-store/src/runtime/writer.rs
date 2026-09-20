@@ -1534,6 +1534,11 @@ impl Writer {
                             vid: *vid,
                             properties: properties.clone(),
                             labels,
+                            // The tx buffer already holds the `now` its own
+                            // writes stamped; carry those rather than taking a
+                            // fresh clock reading at commit time.
+                            created_at: tx_l0.vertex_created_at.get(vid).copied(),
+                            updated_at: tx_l0.vertex_updated_at.get(vid).copied(),
                         })?;
                     }
                 }
@@ -1587,6 +1592,8 @@ impl Writer {
                             version,
                             properties,
                             edge_type_name,
+                            created_at: tx_l0.edge_created_at.get(eid).copied(),
+                            updated_at: tx_l0.edge_updated_at.get(eid).copied(),
                         })?;
                     }
                 }

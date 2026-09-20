@@ -334,6 +334,92 @@ async fn crash_before_first_flush_vertices_only_control() {
     assert_eq!(edges, 0, "no edges were ever written");
 }
 
+// ---------------------------------------------------------------------------
+// Timestamps across recovery.
+// ---------------------------------------------------------------------------
+
+/// Reads a `Temporal` value's nanos, or `None` if the column came back NULL.
+fn nanos(v: Option<&uni_common::Value>) -> Option<i64> {
+    use uni_common::Value;
+    use uni_common::value::TemporalValue;
+    match v? {
+        Value::Temporal(TemporalValue::DateTime {
+            nanos_since_epoch, ..
+        })
+        | Value::Temporal(TemporalValue::LocalDateTime {
+            nanos_since_epoch, ..
+        }) => Some(*nanos_since_epoch),
+        _ => None,
+    }
+}
+
+fn wall_nanos() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock before epoch")
+        .as_nanos() as i64
+}
+
+/// `created_at` / `updated_at` are stamped by the live write path and are
+/// user-visible through the `created_at(n)` Cypher function. Nothing else in a
+/// WAL record can reconstruct them, so before they were carried in the record
+/// a recovered row came back NULL and the next flush made that permanent.
+///
+/// The bound that makes this test mean something is the upper one: recovery
+/// runs strictly after the child process has exited, so a timestamp invented at
+/// recovery time — rather than restored from the WAL — lands above
+/// `child_exited` and fails. Asserting merely "not null" would pass against a
+/// `now()` fabricated during replay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn crash_before_first_flush_keeps_timestamps() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = dir.path().join("store");
+
+    let before_child = wall_nanos();
+    crash_harness::run_child_async(EDGE_ENTRY, "with_edges", &store).await;
+    let child_exited = wall_nanos();
+
+    let db = Uni::open(store.to_string_lossy())
+        .build()
+        .await
+        .expect("reopen");
+    let session = db.session();
+
+    let vertex = session
+        .query("MATCH (e:Entity {name: 'N6'}) RETURN created_at(e) AS c, updated_at(e) AS u")
+        .await
+        .expect("query vertex timestamps");
+    let edge = session
+        .query(
+            "MATCH (:Entity)-[r:OWNS]->(:Entity) \
+             RETURN created_at(r) AS c, updated_at(r) AS u LIMIT 1",
+        )
+        .await
+        .expect("query edge timestamps");
+
+    for (what, rows) in [("vertex", &vertex), ("edge", &edge)] {
+        let row = rows.rows().first().unwrap_or_else(|| {
+            panic!(
+                "control: no {what} row came back at all, so this run says nothing about timestamps"
+            )
+        });
+        for field in ["c", "u"] {
+            let ts = nanos(row.value(field)).unwrap_or_else(|| {
+                panic!(
+                    "{what} {field} came back NULL after recovery — the WAL record did not carry it"
+                )
+            });
+            assert!(
+                ts >= before_child && ts <= child_exited,
+                "{what} {field} = {ts} is outside the child's lifetime \
+                 [{before_child}, {child_exited}] — it was invented at recovery \
+                 time rather than restored from the WAL"
+            );
+        }
+    }
+}
+
 /// Recovery must MERGE the two sides, not double-count them.
 ///
 /// `mirror_edges_into_adjacency` pushes every edge in the recovered L0 buffer

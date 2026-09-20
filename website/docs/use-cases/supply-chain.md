@@ -97,9 +97,9 @@ ORDER BY product.price DESC
 !!! tip "Bounded vs Unbounded Paths"
     `[*]` writes no upper bound, so the planner supplies one: **100 hops**. For
     most BOM trees that is ample — assembly hierarchies are rarely deeper than
-    ~20 levels — and `[*1..20]` states the intent explicitly. Note that anything
-    beyond the bound is simply not reported, with no warning, so write an
-    explicit bound if a hierarchy could ever exceed 100 levels.
+    ~20 levels — and `[*1..20]` states the intent explicitly. If a hierarchy
+    ever does exceed 100 levels the query warns that its results are incomplete,
+    so write an explicit bound rather than relying on the default.
 
     These queries return *endpoints* (`part`, `affected`) rather than path
     variables, which keeps them cheap: Uni only expands full paths when a query

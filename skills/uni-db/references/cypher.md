@@ -185,7 +185,7 @@ MATCH (n:Company) RETURN n.name
 |---|---|
 | `[*1..3]` | 1 to 3 hops |
 | `[*2]` | Exactly 2 hops |
-| `[*]` or `[*1..]` | No written upper bound — **the planner supplies 100 hops**, and anything deeper is dropped silently |
+| `[*]` or `[*1..]` | No written upper bound — **the planner supplies 100 hops**; truncating there returns a warning that results are incomplete |
 | `[*..5]` | 1 to 5 hops |
 | `[*3..]` | At least 3 hops, up to the 100-hop default |
 | `[*0..]` | Zero or more (source may equal target) |
@@ -644,7 +644,7 @@ Output: `total_time_ms`, `rows_scanned`, `peak_memory_bytes`, per-operator `time
 | Anti-Pattern | Problem | Fix |
 |---|---|---|
 | **Cartesian products** | Unconnected patterns multiply results | Connect patterns or use WITH |
-| **Unbounded VLP `[*]` binding a path** | Path *expansion* is combinatorial on cyclic graphs (the search is not). `[*]` also caps silently at 100 hops | Return endpoints instead of `p`; or add a `LIMIT` (stops the expansion); or bound it `[*..5]` |
+| **Unbounded VLP `[*]` binding a path** | Path *expansion* is combinatorial on cyclic graphs (the search is not). `[*]` also caps at 100 hops, with a warning when it truncates | Return endpoints instead of `p`; or add a `LIMIT` (stops the expansion); or bound it `[*..5]` |
 | **`collect()` without DISTINCT** | Duplicate elements in collected list | Use `collect(DISTINCT x)` |
 | **`WITH *`** | Materializes everything in pipeline | Explicitly name needed variables |
 | **String concatenation for filters** | Injection risk, no plan caching | Use `$param` parameters |

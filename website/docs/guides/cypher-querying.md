@@ -1485,9 +1485,11 @@ RETURN path
 - `*0..` — Zero or more hops (allows source == target)
 
 !!! warning "An omitted upper bound means 100, not infinity"
-    A pattern with no upper bound is planned with a maximum of 100 hops, and
-    anything beyond that is **not reported** — you get a shorter answer with no
-    warning. On a chain 150 vertices long, `-[:R*]->` finds paths up to length
+    A pattern with no upper bound is planned with a maximum of 100 hops. If
+    the traversal actually reaches that ceiling with more graph left, the query
+    returns a **warning** saying the results are incomplete — check
+    `result.warnings` when a `[*]` answer looks short. On a chain 150 vertices
+    long, `-[:R*]->` finds paths up to length
     100; writing `-[:R*1..140]->` finds paths up to length 140. An explicit
     bound above 100 is honoured, so write one whenever the graph might be
     deeper than that.

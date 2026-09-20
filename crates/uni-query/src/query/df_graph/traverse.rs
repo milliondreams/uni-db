@@ -4262,6 +4262,21 @@ struct GraphVariableLengthTraverseExecData {
 }
 
 /// Safety cap for frontier size to prevent OOM on pathological graphs.
+/// Hop ceiling the planner supplies when a variable-length pattern writes no
+/// upper bound (`[*]`, `[*2..]`).
+///
+/// Public because the traversal has to recognise its own default: a search that
+/// stops here with more graph left has been truncated by a limit the *user did
+/// not write*, and that is worth saying out loud. An explicitly written bound
+/// is the user getting what they asked for and is not reported.
+///
+/// A pattern written `[*1..100]` is indistinguishable from `[*]` at this point
+/// — the "was it written" bit does not survive the `LogicalPlan` boundary — so
+/// such a query is reported as though the bound were the default. The warning
+/// is true either way; only its framing is slightly off, and an explicit `..100`
+/// is rare enough that threading a flag through the plan is not worth it.
+pub const DEFAULT_MAX_HOPS: usize = 100;
+
 const MAX_FRONTIER_SIZE: usize = 500_000;
 /// Safety cap for predecessor pool size.
 const MAX_PRED_POOL_SIZE: usize = 2_000_000;
@@ -4362,6 +4377,26 @@ impl GraphVariableLengthTraverseExecData {
                  (frontier {frontier}/{MAX_FRONTIER_SIZE}, predecessor pool \
                  {pool}/{MAX_PRED_POOL_SIZE}); results are incomplete. Narrow the pattern with a \
                  smaller upper bound, a relationship type, or a label on the target."
+            )));
+    }
+
+    /// Report that the search stopped at the *default* hop ceiling with more of
+    /// the graph still reachable, so the rows below are incomplete.
+    ///
+    /// The safety caps already report their own truncation
+    /// ([`Self::warn_search_truncated`]). This is the same consequence —
+    /// results that look complete and are not — arriving through a different
+    /// door, and it was silent until now: a 150-vertex chain answered
+    /// `MATCH p=(a)-[:R*]->(b)` with 100 paths, a longest length of 100, and an
+    /// empty warnings list.
+    fn warn_default_hop_bound(&self, frontier: usize) {
+        self.graph_ctx
+            .push_warning(crate::types::QueryWarning::Other(format!(
+                "Variable-length pattern has no upper bound, so the default of \
+                 {DEFAULT_MAX_HOPS} hops applied, and {frontier} vertices were still \
+                 reachable at that depth; results are incomplete. Write an explicit \
+                 upper bound (for example `*1..{DEFAULT_MAX_HOPS}`) to state the depth \
+                 you want."
             )));
     }
 
@@ -4561,6 +4596,18 @@ impl GraphVariableLengthTraverseExecData {
             frontier = next_frontier;
         }
 
+        // The loop can exit three ways: the frontier emptied (the search is
+        // complete), a safety cap tripped (already reported), or the hop
+        // ceiling was reached with work left. Only the third is silent, and
+        // only when the ceiling is the one the planner supplied rather than one
+        // the user wrote.
+        if !frontier.is_empty()
+            && depth >= self.max_hops as u32
+            && self.max_hops == DEFAULT_MAX_HOPS
+        {
+            self.warn_default_hop_bound(frontier.len());
+        }
+
         (dag, accepting)
     }
 
@@ -4675,6 +4722,18 @@ impl GraphVariableLengthTraverseExecData {
             }
 
             frontier = next_frontier;
+        }
+
+        // The loop can exit three ways: the frontier emptied (the search is
+        // complete), a safety cap tripped (already reported), or the hop
+        // ceiling was reached with work left. Only the third is silent, and
+        // only when the ceiling is the one the planner supplied rather than one
+        // the user wrote.
+        if !frontier.is_empty()
+            && depth >= self.max_hops as u32
+            && self.max_hops == DEFAULT_MAX_HOPS
+        {
+            self.warn_default_hop_bound(frontier.len());
         }
 
         results

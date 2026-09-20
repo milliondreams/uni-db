@@ -145,8 +145,10 @@ When you genuinely need paths:
   limit costs little. Two caveats: the graph search still runs in full, and the
   limit applies one batch (8192 rows) at a time, so any limit up to 8192 costs
   the same as `LIMIT 1`.
-- **An omitted upper bound is 100, not infinity**, and results past it are
-  dropped without a warning. Write `[*1..6]` when you know the depth.
+- **An omitted upper bound is 100, not infinity.** If a traversal actually hits
+  that ceiling the query warns that its results are incomplete, so check
+  `result.warnings` when a `[*]` answer looks short. Write `[*1..6]` when you
+  know the depth.
 
 ---
 

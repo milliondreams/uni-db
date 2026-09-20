@@ -2792,11 +2792,25 @@ has to finish before any accepting endpoint is known, and no limit can avoid it.
 The no-limit row is the honest one — counting every path of an unbounded pattern
 over a cyclic graph is unbounded work, and a declared limit is what stops it.
 
-### The default hop bound is 100, and truncation is silent
+### The default hop bound is 100, and truncating at it is reported
 
-An unbounded `*` is planned with `DEFAULT_MAX_HOPS = 100`
-(`query/planner.rs`). This is a *planning* bound, not a safety cap, so it does
-**not** raise the incomplete-results warning that `MAX_FRONTIER_SIZE` does.
+An unbounded `*` is planned with `DEFAULT_MAX_HOPS = 100`, which lives on the
+traversal (`df_graph/traverse.rs`) and is imported by the planner so the two
+cannot drift.
+
+This is a *planning* bound rather than a safety cap, and it used to be silent —
+the frontier and pool caps reported their truncation while this one did not,
+though the consequence is identical. It now warns on the same terms, but only
+when it actually truncated: the search must stop at the ceiling with a non-empty
+frontier. A pattern that completes inside 100 hops stays quiet, which is the
+overwhelming majority of them, and an explicitly written bound is never reported
+because that is the user getting what they asked for.
+
+A bound written as `[*1..100]` is indistinguishable from `[*]` here — the "was
+it written" bit does not survive the `LogicalPlan` boundary — so such a query is
+reported as though the bound were the default. The warning is true either way.
+Pinned by `crates/uni/tests/common/bugs/vlp_default_hop_bound_warns.rs`, whose
+quiet cases are asserted as hard as its loud one.
 
 On a 150-vertex chain, `MATCH p=(a {uid:'n0'})-[:R*]->(b)` returns 100 paths with
 a maximum length of 100; the same pattern written `[:R*1..140]` returns 140. An
@@ -2862,7 +2876,7 @@ The oracle catches it; the oracle in turn cannot see a pause bug. Both live in
 | Anti-Pattern | Problem | Solution |
 |---|---|---|
 | **Cartesian products** | Unconnected patterns multiply results | Connect patterns or use WITH |
-| **Unbounded VLP returning paths** | `[*]` with a path variable → the path set is combinatorial, not the frontier. `[*]` also caps silently at 100 hops | Set an upper bound `[*..5]`; or add a `LIMIT`, which now stops the enumeration (one batch granularity); or drop the path variable if only endpoints are needed |
+| **Unbounded VLP returning paths** | `[*]` with a path variable → the path set is combinatorial, not the frontier. `[*]` also caps at 100 hops (reported via a warning) | Set an upper bound `[*..5]`; or add a `LIMIT`, which now stops the enumeration (one batch granularity); or drop the path variable if only endpoints are needed |
 | **COLLECT without DISTINCT** | Duplicate elements in collected list | Use `collect(DISTINCT x)` |
 | **WITH \*** | Materializes everything in pipeline | Explicitly name needed variables |
 | **String concatenation for filters** | Injection risk | Use `$param` parameters |
@@ -7038,7 +7052,7 @@ Quick reference of all anti-patterns from every chapter:
 | Anti-Pattern | Problem | Solution |
 |---|---|---|
 | Cartesian products | Exponential result sets | Connect patterns |
-| Unbounded VLP returning paths | Combinatorial path set; `[*]` also caps silently at 100 hops | Bound it `[*..5]`, add a `LIMIT`, or return endpoints instead of `p` |
+| Unbounded VLP returning paths | Combinatorial path set; `[*]` also caps at 100 hops (warned) | Bound it `[*..5]`, add a `LIMIT`, or return endpoints instead of `p` |
 | COLLECT without DISTINCT | Duplicate elements | Use `collect(DISTINCT x)` |
 | WITH * | Over-materialization | Name needed variables |
 | String concatenation | Injection risk | Use `$param` parameters |

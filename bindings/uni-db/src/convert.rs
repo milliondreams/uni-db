@@ -1578,16 +1578,74 @@ pub fn extract_cloud_config(
     }
 }
 
-/// Extract a UniConfig from a Python dict.
+/// Every key `apply_uni_config` understands.
 ///
-/// Supports: `query_timeout` (float, seconds), `max_query_memory` (int, bytes),
-/// `parallelism` (int), `cache_size` (int, bytes), `max_transaction_memory` (int, bytes),
-/// `batch_size` (int), `wal_enabled` (bool).
+/// The single source of truth for what `Uni.builder().config({...})` accepts.
+/// `apply_uni_config` rejects anything not in this list, and
+/// `scripts/ci/check_rust_python_parity.py` reads it to decide which
+/// `UniConfig` fields are reachable from Python, so a key added to one and not
+/// the other fails a build rather than going quiet.
+pub const UNI_CONFIG_KEYS: &[&str] = &[
+    "query_timeout",
+    "max_query_memory",
+    "parallelism",
+    "cache_size",
+    "max_transaction_memory",
+    "batch_size",
+    "wal_enabled",
+    "strict_schema",
+    "max_forks",
+    "fork_default_ttl",
+    "fork_sweeper_interval",
+    "disable_fork_sweeper",
+];
+
+/// Build a fresh [`uni_common::UniConfig`] from a Python dict.
+///
+/// Prefer [`apply_uni_config`] when a config already exists: this starts from
+/// `UniConfig::default()`, so anything set through a dedicated builder method
+/// beforehand is lost.
 pub fn extract_uni_config(
     py: Python,
     config: &HashMap<String, Py<PyAny>>,
 ) -> PyResult<uni_common::UniConfig> {
     let mut uni_config = uni_common::UniConfig::default();
+    apply_uni_config(py, &mut uni_config, config)?;
+    Ok(uni_config)
+}
+
+/// Merge a Python dict into an existing [`uni_common::UniConfig`].
+///
+/// Two behaviours worth stating, because the previous code had neither.
+///
+/// **It merges.** `config()` used to assign a value built from
+/// `UniConfig::default()`, so `.batch_size(4096).config({"query_timeout": 11})`
+/// silently put `batch_size` back to its default. Only the keys actually
+/// present in the dict are touched now, so builder methods and `config()`
+/// compose in either order and the last write to a given setting wins.
+///
+/// **It rejects a key it does not understand.** A misspelled `quer_timeout`, or
+/// a real `UniConfig` field that has no Python binding such as `ssi_enabled`,
+/// used to be accepted and ignored: the caller asked for a setting, got no
+/// error, and got the default. Silently discarding a request is worse than
+/// refusing it, so an unknown key is now a `ValueError` naming the key and
+/// listing what is accepted.
+pub fn apply_uni_config(
+    py: Python,
+    uni_config: &mut uni_common::UniConfig,
+    config: &HashMap<String, Py<PyAny>>,
+) -> PyResult<()> {
+    if let Some(unknown) = config
+        .keys()
+        .find(|k| !UNI_CONFIG_KEYS.contains(&k.as_str()))
+    {
+        let mut accepted: Vec<&str> = UNI_CONFIG_KEYS.to_vec();
+        accepted.sort_unstable();
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "unknown config key '{unknown}'; accepted keys are: {}",
+            accepted.join(", ")
+        )));
+    }
     if let Some(v) = config.get("query_timeout") {
         uni_config.query_timeout = std::time::Duration::from_secs_f64(v.extract::<f64>(py)?);
     }
@@ -1634,7 +1692,7 @@ pub fn extract_uni_config(
     if let Some(v) = config.get("disable_fork_sweeper") {
         uni_config.disable_fork_sweeper = v.extract::<bool>(py)?;
     }
-    Ok(uni_config)
+    Ok(())
 }
 
 /// Convert a SnapshotManifest to a Python SnapshotInfo object.

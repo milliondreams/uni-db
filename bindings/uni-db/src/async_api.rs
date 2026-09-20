@@ -1173,7 +1173,13 @@ impl AsyncDatabaseBuilder {
         config: std::collections::HashMap<String, Py<PyAny>>,
     ) -> PyResult<PyRefMut<'_, Self>> {
         let py = slf.py();
-        slf.uni_config = Some(crate::convert::extract_uni_config(py, &config)?);
+        // Merge, never replace -- see the sync builder's `config` for why.
+        let mut merged = slf
+            .uni_config
+            .take()
+            .unwrap_or_else(uni_common::UniConfig::default);
+        crate::convert::apply_uni_config(py, &mut merged, &config)?;
+        slf.uni_config = Some(merged);
         Ok(slf)
     }
 

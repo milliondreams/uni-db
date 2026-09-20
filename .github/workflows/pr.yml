@@ -129,6 +129,15 @@ jobs:
       - name: Check documented Python symbols exist
         run: python3 scripts/ci/check_doc_symbols.py
 
+      # The four guards above this one all compare Python to Python, so a Rust
+      # field or error variant that never got bound is invisible to them --
+      # which is how `config({"ssi_enabled": False})` came to be accepted and
+      # ignored. This one compares Rust to Python and requires every gap to be
+      # allowlisted with a reason, so a new one is a decision rather than an
+      # omission.
+      - name: Check Rust <-> Python parity
+        run: python3 scripts/ci/check_rust_python_parity.py
+
   supply-chain:
     if: github.repository == 'rustic-ai/uni-db'
     name: Supply Chain (cargo-deny)

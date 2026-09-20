@@ -301,7 +301,14 @@ impl DatabaseBuilder {
         config: HashMap<String, Py<PyAny>>,
     ) -> PyResult<PyRefMut<'_, Self>> {
         let py = slf.py();
-        slf.uni_config = Some(convert::extract_uni_config(py, &config)?);
+        // Merge, never replace: a dedicated setter may already have written
+        // here, and assigning a freshly-defaulted config would discard it.
+        let mut merged = slf
+            .uni_config
+            .take()
+            .unwrap_or_else(uni_common::UniConfig::default);
+        convert::apply_uni_config(py, &mut merged, &config)?;
+        slf.uni_config = Some(merged);
         Ok(slf)
     }
 

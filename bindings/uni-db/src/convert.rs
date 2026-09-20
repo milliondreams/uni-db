@@ -1110,7 +1110,11 @@ pub fn locy_result_to_py_class(
     py: Python,
     result: uni_db::locy::LocyResult,
 ) -> PyResult<crate::types::PyLocyResult> {
-    let result = result.into_inner();
+    // `into_parts`, not `into_inner`: the latter discards the metrics the
+    // wrapper carries, which is why a Python `LocyResult` had no timing or scan
+    // counters while the Cypher `QueryResult` beside it did.
+    let (result, metrics) = result.into_parts();
+    let metrics = query_metrics_to_py_class(py, &metrics)?;
     // Capture before the by-value field moves below — `timed_out()`
     // borrows `&result`, which would conflict afterwards.
     let timed_out = result.timed_out();
@@ -1186,6 +1190,7 @@ pub fn locy_result_to_py_class(
         derived_fact_set,
         timed_out,
         incomplete,
+        metrics,
     })
 }
 

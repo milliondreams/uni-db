@@ -303,10 +303,7 @@ impl DatabaseBuilder {
         let py = slf.py();
         // Merge, never replace: a dedicated setter may already have written
         // here, and assigning a freshly-defaulted config would discard it.
-        let mut merged = slf
-            .uni_config
-            .take()
-            .unwrap_or_else(uni_common::UniConfig::default);
+        let mut merged = slf.uni_config.take().unwrap_or_default();
         convert::apply_uni_config(py, &mut merged, &config)?;
         slf.uni_config = Some(merged);
         Ok(slf)
@@ -1475,6 +1472,18 @@ impl SessionQueryBuilder {
             let val = convert::py_object_to_value(py, v)?;
             builder = builder.param(k, val);
         }
+        // Forwarded, not dropped: `profile()` accepting `.timeout(..)` /
+        // `.max_memory(..)` and ignoring them is a setter that writes a field
+        // nothing reads, which is what #284 was about.
+        if let Some(t) = self.timeout_secs {
+            builder = builder.timeout(std::time::Duration::from_secs_f64(t));
+        }
+        if let Some(m) = self.max_memory {
+            builder = builder.max_memory(m);
+        }
+        if let Some(ref ct) = self.cancellation_token {
+            builder = builder.cancellation_token(ct.inner.clone());
+        }
         let (results, profile) = py
             .detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(builder.profile()))
             .map_err(crate::exceptions::uni_error_to_pyerr)?;
@@ -1702,6 +1711,7 @@ pub struct PyTxQueryBuilder {
     pub(crate) cypher: String,
     pub(crate) params: HashMap<String, Py<PyAny>>,
     pub(crate) timeout_secs: Option<f64>,
+    pub(crate) max_memory: Option<usize>,
     /// Mirrors `SessionQueryBuilder`. Its absence made the whole transaction
     /// surface uncancellable from Python even though the Rust builder this
     /// wraps has carried the field all along.
@@ -1722,6 +1732,12 @@ impl PyTxQueryBuilder {
         slf
     }
 
+    /// Cap the memory this query may use, in bytes.
+    fn max_memory(mut slf: PyRefMut<'_, Self>, bytes: usize) -> PyRefMut<'_, Self> {
+        slf.max_memory = Some(bytes);
+        slf
+    }
+
     /// Attach a cancellation token for cooperative query cancellation.
     fn cancellation_token(
         mut slf: PyRefMut<'_, Self>,
@@ -1729,6 +1745,37 @@ impl PyTxQueryBuilder {
     ) -> PyRefMut<'_, Self> {
         slf.cancellation_token = Some(token);
         slf
+    }
+
+    /// Profile the query execution, returning results with profiling output.
+    fn profile(
+        &self,
+        py: Python,
+    ) -> PyResult<(crate::types::PyQueryResult, crate::types::PyProfileOutput)> {
+        let tx_ref = self.tx.borrow(py);
+        let tx = tx_ref.inner.as_ref().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Transaction already completed")
+        })?;
+        let mut builder = tx.query_with(&self.cypher);
+        for (k, v) in &self.params {
+            let val = convert::py_object_to_value(py, v)?;
+            builder = builder.param(k, val);
+        }
+        if let Some(t) = self.timeout_secs {
+            builder = builder.timeout(std::time::Duration::from_secs_f64(t));
+        }
+        if let Some(m) = self.max_memory {
+            builder = builder.max_memory(m);
+        }
+        if let Some(ref ct) = self.cancellation_token {
+            builder = builder.cancellation_token(ct.inner.clone());
+        }
+        let (results, profile) = py
+            .detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(builder.profile()))
+            .map_err(crate::exceptions::uni_error_to_pyerr)?;
+        let query_result = convert::query_result_to_py_class(py, results)?;
+        let profile_output = convert::profile_output_to_py_class(py, profile)?;
+        Ok((query_result, profile_output))
     }
 
     /// Fetch all results as a `QueryResult`.
@@ -1744,6 +1791,9 @@ impl PyTxQueryBuilder {
         }
         if let Some(t) = self.timeout_secs {
             builder = builder.timeout(std::time::Duration::from_secs_f64(t));
+        }
+        if let Some(m) = self.max_memory {
+            builder = builder.max_memory(m);
         }
         if let Some(ref ct) = self.cancellation_token {
             builder = builder.cancellation_token(ct.inner.clone());

@@ -235,6 +235,7 @@ impl PreparedQuery {
                     Some(tx.id_reservoir.clone()),
                     snapshot,
                     self.cancel.clone(),
+                    None,
                 )
                 .await;
         }

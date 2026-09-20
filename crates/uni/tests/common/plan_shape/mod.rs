@@ -148,7 +148,9 @@ pub async fn assert_locy_plan_avoids(session: &Session, program: &str, op: &str)
 /// operator has to be profiled through `tx.query_with(..).profile()`.
 ///
 /// The write-path profiler is `Transaction::execute_with(..).profile()` — on
-/// `ExecuteBuilder`, not the `TxQueryBuilder` that `query_with` returns.
+/// `ExecuteBuilder`. `TxQueryBuilder::profile()` now exists too and is the
+/// read-path counterpart, returning `(QueryResult, ProfileOutput)`; use that
+/// one when the statement returns rows rather than mutating.
 ///
 /// Callers pass the result to `uni_query::plan_shape::assert_uses` directly
 /// rather than through a wrapper, so that the operator literal appears as an

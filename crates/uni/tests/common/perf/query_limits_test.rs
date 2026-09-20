@@ -75,6 +75,100 @@ async fn test_query_memory_limit() -> Result<()> {
     Ok(())
 }
 
+/// The transaction Cypher builder honours `.max_memory()`.
+///
+/// It was the only one of {session, tx} x {Cypher, Locy} without the knob,
+/// which left the shape that needs a ceiling most -- a long-running read inside
+/// a write transaction -- with no way to set one. The assertion follows
+/// `test_query_memory_limit` in requiring the operator's own reservation to
+/// refuse, rather than accepting the post-hoc materialized-result message: a
+/// ceiling that only bites after the rows exist is a report, not a limit.
+#[tokio::test]
+async fn test_tx_query_builder_honours_max_memory() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema().label("Node").apply().await?;
+
+    let tx = db.session().tx().await?;
+    for _ in 0..100 {
+        tx.execute("CREATE (:Node)").await?;
+    }
+    tx.commit().await?;
+
+    let session = db.session();
+    let tx = session.tx().await?;
+    let res = tx
+        .query_with("MATCH (n:Node) RETURN n")
+        .max_memory(100)
+        .fetch_all()
+        .await;
+
+    assert!(res.is_err(), "a 100-byte ceiling must refuse this query");
+    let err_msg = res.err().unwrap().to_string();
+    assert!(
+        err_msg.contains("GraphScanExec"),
+        "expected the scan's own reservation to refuse: {err_msg}"
+    );
+
+    Ok(())
+}
+
+/// Control for the above: the same query under a workable ceiling must succeed.
+///
+/// Without it, a build that refused every transaction read would satisfy the
+/// test above.
+#[tokio::test]
+async fn test_tx_query_builder_max_memory_leaves_a_fitting_query_alone() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema().label("Node").apply().await?;
+
+    let tx = db.session().tx().await?;
+    for _ in 0..100 {
+        tx.execute("CREATE (:Node)").await?;
+    }
+    tx.commit().await?;
+
+    let session = db.session();
+    let tx = session.tx().await?;
+    let rows = tx
+        .query_with("MATCH (n:Node) RETURN n")
+        .max_memory(256 * 1024 * 1024)
+        .fetch_all()
+        .await?;
+
+    assert_eq!(rows.rows().len(), 100);
+    Ok(())
+}
+
+/// `TxQueryBuilder::profile()` -- the read-path counterpart of
+/// `ExecuteBuilder::profile()`, which only ever covered writes.
+#[tokio::test]
+async fn test_tx_query_builder_profiles_a_read() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema().label("Node").apply().await?;
+
+    let tx = db.session().tx().await?;
+    for _ in 0..10 {
+        tx.execute("CREATE (:Node)").await?;
+    }
+    tx.commit().await?;
+
+    let session = db.session();
+    let tx = session.tx().await?;
+    let (result, profile) = tx
+        .query_with("MATCH (n:Node) RETURN count(n) AS c")
+        .profile()
+        .await?;
+
+    let count: i64 = result.rows()[0].get("c")?;
+    assert_eq!(count, 10);
+    assert!(
+        !profile.runtime_stats.is_empty(),
+        "a profile with no operator stats is not a profile"
+    );
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Cursor parity — the streaming path must enforce the same limits
 // ---------------------------------------------------------------------------
@@ -317,8 +411,10 @@ async fn test_tx_cursor_honours_cancellation_token() -> Result<()> {
 
 #[tokio::test]
 async fn test_tx_cursor_enforces_configured_memory_limit() -> Result<()> {
-    // `TxQueryBuilder` has no `.max_memory()`, so the ceiling comes from
-    // `UniConfig`. It was inert on both tx terminals.
+    // The ceiling here comes from `UniConfig` rather than the builder. That is
+    // now a choice rather than the only option -- `TxQueryBuilder` has gained
+    // `.max_memory()` -- and the config route is worth keeping covered, since
+    // it is what a caller who never touches the builder relies on.
     let mut config = uni_db::UniConfig::default();
     config.max_query_memory = 100;
     let db = seeded_db_with_config(config).await?;

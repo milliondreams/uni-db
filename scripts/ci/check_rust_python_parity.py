@@ -33,6 +33,41 @@ CONVERT_RS = ROOT / "bindings/uni-db/src/convert.rs"
 ERROR_RS = ROOT / "crates/uni-common/src/api/error.rs"
 EXCEPTIONS_RS = ROOT / "bindings/uni-db/src/exceptions.rs"
 
+# Builder / result parity (third axis).
+RUST_BUILDER_SRC = [
+    ROOT / "crates/uni/src/api/session.rs",
+    ROOT / "crates/uni/src/api/transaction.rs",
+    ROOT / "crates/uni/src/api/locy_builder.rs",
+]
+# `QueryResult` and `LocyResult` live outside the api/ builder files. Both
+# `LocyResult` impls are included deliberately: `uni::api::locy_result` is the
+# wrapper Python is handed and `uni_locy::result` is what it delegates to, so
+# the surface a caller sees is the union.
+RUST_RESULT_SRC = [
+    ROOT / "crates/uni-query/src/types.rs",
+    ROOT / "crates/uni/src/api/locy_result.rs",
+    ROOT / "crates/uni-locy/src/result.rs",
+]
+PY_BINDING_SRC = [
+    ROOT / "bindings/uni-db/src/builders.rs",
+    ROOT / "bindings/uni-db/src/sync_api.rs",
+    ROOT / "bindings/uni-db/src/types.rs",
+]
+
+# Rust type -> Python (sync) pyclass. The async twin is covered by
+# `test_sync_async_parity.py`, which asserts exact method-set equality against
+# the sync class, so checking both here would only double the allowlist.
+BUILDER_PARITY = {
+    "QueryBuilder": "SessionQueryBuilder",
+    "TxQueryBuilder": "TxQueryBuilder",
+    "LocyBuilder": "SessionLocyBuilder",
+    "TxLocyBuilder": "TxLocyBuilder",
+}
+RESULT_PARITY = {
+    "QueryResult": "QueryResult",
+    "LocyResult": "LocyResult",
+}
+
 # ---------------------------------------------------------------------------
 # Allowlists: a Rust item deliberately not reachable from Python.
 #
@@ -82,6 +117,34 @@ ERROR_NO_DEDICATED_EXCEPTION = {
     "ForkNameInvalid": "collapses to UniError; message carries the reason",
     "PendingFlushTimeout": "not bound yet; the only fork-lifecycle variant without one",
     "ForkWritesNotYetSupported": "explicitly routed to base UniError",
+}
+
+
+# Keyed "RustType.method". Same contract as the two above: a gap has to be
+# written down with a reason, and a stale or phantom entry is reported.
+BUILDER_NOT_BOUND = {
+    # --- Locy builders -------------------------------------------------------
+    # Reachable from Python, just not as a chainable method.
+    "LocyBuilder.allow_partial": "reachable via with_config(LocyConfig(allow_partial=...))",
+    "TxLocyBuilder.allow_partial": "reachable via with_config(LocyConfig(allow_partial=...))",
+    "LocyBuilder.params_map": "Rust convenience over `params`; Python `params` already takes a dict",
+    "TxLocyBuilder.params_map": "Rust convenience over `params`; Python `params` already takes a dict",
+    "TxLocyBuilder.params": "bulk params is session-only on the Locy arm; not bound yet",
+    # --- QueryResult ---------------------------------------------------------
+    # Python's QueryResult is a data class: Rust's constructors, internal
+    # mutators and iterator adaptors have no counterpart by design.
+    "QueryResult.new": "constructor",
+    "QueryResult.set_counters": "internal; populated inside the executor",
+    "QueryResult.set_frontend_timing": "internal; populated inside the executor",
+    "QueryResult.update_parse_timing": "internal; populated inside the executor",
+    "QueryResult.into_rows": "by-value Rust accessor; Python `rows` already owns its list",
+    "QueryResult.iter": "Rust iterator; Python iterates the `rows` list",
+    "QueryResult.len": "Python uses __len__",
+    "QueryResult.is_empty": "Python uses __bool__",
+    "QueryResult.has_warnings": "Python uses `bool(result.warnings)`",
+    # --- LocyResult ----------------------------------------------------------
+    "LocyResult.into_inner": "Rust unwrap; Python receives the converted fields",
+    "LocyResult.into_parts": "Rust unwrap; Python receives the converted fields",
 }
 
 
@@ -152,6 +215,83 @@ def mapped_error_variants() -> set[str]:
     # and its type are both gone. `ForkWritesNotYetSupported` is written as an
     # explicit arm and is one of these.
     return {variant for variant, target in arms if target != "UniError"}
+
+
+def _read(paths: list[Path]) -> str:
+    return "\n".join(f.read_text() for f in paths)
+
+
+def rust_type_methods(name: str) -> list[str]:
+    """Public method names of the inherent `impl` block for `name`.
+
+    Three shapes have to be tolerated, all present in these files: the impl
+    carries lifetimes on both sides (`impl<'a> TxQueryBuilder<'a> {`), trait
+    impls exist for the same types (`impl Drop for Transaction`), and a
+    `#[cfg(test)] mod tests` sits at the end of the file. Requiring the opening
+    brace on the impl line rejects the trait impls, and bounding the body at the
+    first column-zero `}` keeps the test module out.
+
+    `pub ` with the trailing space excludes `pub(crate)`, which is deliberate:
+    a crate-internal method is not part of the surface Python should mirror.
+    """
+    src = _read(RUST_BUILDER_SRC + RUST_RESULT_SRC)
+    pattern = (
+        r"^impl(?:<[^>]*>)?\s+" + re.escape(name) + r"(?:<[^>]*>)?\s*\{(.*?)\n\}"
+    )
+    out: list[str] = []
+    for body in re.findall(pattern, src, re.S | re.M):
+        out += re.findall(r"^    pub (?:async )?fn ([a-z_0-9]+)", body, re.M)
+    return out
+
+
+def _pyclass_names() -> dict[str, str]:
+    """Map a binding struct ident to the name Python sees.
+
+    `#[pyclass(name = "X")]` sits on the *struct*, not on the `#[pymethods]`
+    impl, and the renames are not cosmetic: `Database` is `Uni`,
+    `PyTxQueryBuilder` is `TxQueryBuilder`. Without this map every rename reads
+    as a missing class.
+    """
+    src = _read(PY_BINDING_SRC)
+    mapping: dict[str, str] = {}
+    for attrs, ident in re.findall(
+        r"#\[pyclass([^\]]*)\][^\n]*\n(?:[^\n]*\n)??pub struct (\w+)", src
+    ):
+        rename = re.search(r'name\s*=\s*"([^"]+)"', attrs)
+        mapping[ident] = rename.group(1) if rename else ident
+    return mapping
+
+
+def python_type_members(py_name: str) -> set[str]:
+    """Methods and public fields Python sees on `py_name`.
+
+    Result types are `#[pyclass(get_all)]` structs, so a Rust accessor may be
+    mirrored by a *field* rather than a method; both count. Methods here are
+    bare `fn`, not `pub fn` -- pymethods do not use `pub`. Anchoring on
+    `#[pymethods]` is required, not tidiness: `sync_api.rs` has a plain
+    `impl Transaction` of Rust-only helpers directly above the pymethods one.
+    """
+    src = _read(PY_BINDING_SRC)
+    idents = [i for i, n in _pyclass_names().items() if n == py_name]
+    members: set[str] = set()
+    for ident in idents:
+        for body in re.findall(
+            r"^#\[pymethods\]\nimpl " + re.escape(ident) + r"\s*\{(.*?)\n\}",
+            src,
+            re.S | re.M,
+        ):
+            for attrs, fn in re.findall(
+                r"((?:^    #\[[^\n]*\]\n)*)^    (?:pub )?(?:async )?fn ([a-z_0-9]+)",
+                body,
+                re.M,
+            ):
+                rename = re.search(r'#\[pyo3\(name\s*=\s*"([^"]+)"\)\]', attrs)
+                members.add(rename.group(1) if rename else fn)
+        for body in re.findall(
+            r"^pub struct " + re.escape(ident) + r"\s*\{(.*?)\n\}", src, re.S | re.M
+        ):
+            members |= set(re.findall(r"^    pub ([a-z_0-9]+):", body, re.M))
+    return {m for m in members if not m.startswith("__")}
 
 
 def check(kind: str, rust_items: list[str], bound: set[str],
@@ -229,6 +369,32 @@ def main() -> int:
     problems += check("config", fields, set(keys), CONFIG_NOT_BOUND)
     problems += check("error", variants, mapped, ERROR_NO_DEDICATED_EXCEPTION)
 
+    # Third axis: named builders and result types, qualified "Type.method".
+    # A curated set rather than every builder in the crate -- the allowlist is
+    # the cost of coverage, and a list nobody maintains is a rubber stamp.
+    rust_members: list[str] = []
+    bound_members: set[str] = set()
+    for rust_ty, py_ty in {**BUILDER_PARITY, **RESULT_PARITY}.items():
+        methods = rust_type_methods(rust_ty)
+        if not methods:
+            fail([
+                f"parity check found no public methods on Rust `{rust_ty}` and "
+                "would pass vacuously for it.",
+                "Its impl block moved, was renamed, or the regex stopped "
+                "matching. Fix the parser rather than dropping the type.",
+            ])
+        members = python_type_members(py_ty)
+        if not members:
+            fail([
+                f"parity check found no Python members on `{py_ty}` and would "
+                "pass vacuously for it.",
+                "Check the #[pyclass(name = ...)] mapping before anything else "
+                "-- a rename is the usual cause.",
+            ])
+        rust_members += [f"{rust_ty}.{m}" for m in methods]
+        bound_members |= {f"{rust_ty}.{m}" for m in methods if m in members}
+    problems += check("builder", rust_members, bound_members, BUILDER_NOT_BOUND)
+
     if problems:
         fail(["Rust <-> Python parity drift:", ""] + problems)
 
@@ -236,7 +402,10 @@ def main() -> int:
         f"OK: {len(keys)}/{len(fields)} UniConfig fields reachable from Python "
         f"({len(CONFIG_NOT_BOUND)} allowlisted); "
         f"{len(mapped)}/{len(variants)} UniError variants mapped to a dedicated "
-        f"exception ({len(ERROR_NO_DEDICATED_EXCEPTION)} allowlisted)."
+        f"exception ({len(ERROR_NO_DEDICATED_EXCEPTION)} allowlisted); "
+        f"{len(bound_members)}/{len(rust_members)} methods on "
+        f"{len(BUILDER_PARITY) + len(RESULT_PARITY)} builder/result types bound "
+        f"({len(BUILDER_NOT_BOUND)} allowlisted)."
     )
     return 0
 

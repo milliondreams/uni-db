@@ -454,7 +454,9 @@ Async fluent builder for read queries within a transaction.
 |---|---|
 | `param(name: str, value: Any) -> AsyncTxQueryBuilder` | — |
 | `timeout(seconds: float) -> AsyncTxQueryBuilder` | — |
+| `max_memory(bytes: int) -> AsyncTxQueryBuilder` | — |
 | `cancellation_token(token: CancellationToken) -> AsyncTxQueryBuilder` | — |
+| `async profile() -> tuple[QueryResult, ProfileOutput]` | — |
 | `async fetch_all() -> QueryResult` | — |
 | `async fetch_one() -> dict[str, Any] | None` | — |
 | `async execute() -> ExecuteResult` | — |
@@ -1377,6 +1379,7 @@ Result of a Locy program evaluation.
 | `compile_warnings` | `list[dict[str, str]]` |
 | `approximate_groups` | `Any` |
 | `derived_fact_set` | `Any` |
+| `metrics` | `QueryMetrics` |
 
 ---
 
@@ -2134,7 +2137,9 @@ Fluent builder for read queries within a transaction.
 |---|---|
 | `param(name: str, value: Any) -> TxQueryBuilder` | — |
 | `timeout(seconds: float) -> TxQueryBuilder` | — |
+| `max_memory(bytes: int) -> TxQueryBuilder` | — |
 | `cancellation_token(token: CancellationToken) -> TxQueryBuilder` | — |
+| `profile() -> tuple[QueryResult, ProfileOutput]` | — |
 | `fetch_all() -> QueryResult` | — |
 | `fetch_one() -> dict[str, Any] | None` | — |
 | `execute() -> ExecuteResult` | — |

@@ -1071,6 +1071,18 @@ pub struct PyLocyResult {
     /// `total_strata`, `incomplete_rules`, `skipped_rules`,
     /// `complement_rules_affected`.
     pub incomplete: Py<PyAny>,
+    /// Timing and scan counters for the evaluation, the same `QueryMetrics`
+    /// type a Cypher `QueryResult` carries.
+    ///
+    /// Not every field is populated on this path. Locy assembles its metrics
+    /// from the evaluation's own totals plus the execution counters, so
+    /// `total_time_ms`, `exec_time_ms`, `rows_returned` and the counter-derived
+    /// fields are real, while **`parse_time_ms` and `plan_time_ms` are always
+    /// `0.0` and `plan_cache_hit` is always `False`** -- Locy does not go
+    /// through the Cypher parse/plan/cache path those measure. A zero that
+    /// means "not measured" is indistinguishable from one that means "fast",
+    /// hence this note.
+    pub metrics: Py<PyQueryMetrics>,
 }
 
 #[pymethods]

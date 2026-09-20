@@ -1707,7 +1707,9 @@ impl<'a> QueryBuilder<'a> {
         uni_query::scoped_with_session_context(
             session_pr,
             session_principal,
-            self.session.db.profile_internal(&self.cypher, params),
+            self.session
+                .db
+                .profile_internal(&self.cypher, params, self.max_memory),
         )
         .await
     }

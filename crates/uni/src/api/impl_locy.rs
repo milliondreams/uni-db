@@ -519,16 +519,32 @@ pub struct LocyEngine<'a> {
 }
 
 impl LocyEngine<'_> {
-    /// The database config with this evaluation's memory override applied.
+    /// The database config with this evaluation's overrides applied, as handed
+    /// to the executor that runs the program's Cypher clauses.
     ///
-    /// `create_datafusion_planner` turns `max_query_memory` into the pool that
-    /// bounds every operator, so overriding it here is what gives the Locy
-    /// builder the same per-call bound Cypher has had.
-    fn memory_bounded_config(&self) -> uni_common::UniConfig {
+    /// Two things ride on it. `create_datafusion_planner` turns
+    /// `max_query_memory` into the pool that bounds every operator, so
+    /// overriding it is what gives the Locy builder the same per-call bound
+    /// Cypher has had.
+    ///
+    /// And `query_timeout` is what `Executor::get_context` turns into the
+    /// deadline every operator checks. This used to be the database setting
+    /// alone, so `locy_with(..).timeout(2s)` had no representation in any
+    /// operator check at all: the Locy budget was consulted only between
+    /// strata, between fixpoint iterations and in the SLG loop, and a program
+    /// that crossed none of those boundaries ran to completion and reported
+    /// nothing (issue #283).
+    ///
+    /// The two are combined with `min` rather than letting the Locy value win
+    /// outright. `LocyConfig::timeout` defaults to 300s against a 30s database
+    /// default, so overriding unconditionally would *loosen* the deadline for
+    /// anyone who never set a Locy timeout.
+    fn executor_config(&self, locy: &LocyConfig) -> uni_common::UniConfig {
         let mut config = self.db.config.clone();
         if let Some(bytes) = self.max_memory {
             config.max_query_memory = bytes;
         }
+        config.query_timeout = config.query_timeout.min(locy.timeout);
         config
     }
 }
@@ -763,7 +779,7 @@ impl<'a> LocyEngine<'a> {
 
         // 2. Create executor + physical planner
         let mut df_executor = uni_query::Executor::new(self.db.storage.clone());
-        df_executor.set_config(self.memory_bounded_config());
+        df_executor.set_config(self.executor_config(config));
         df_executor.set_counters(self.counters.clone());
         if let Some(ref w) = self.db.writer {
             df_executor.set_writer(w.clone());
@@ -1118,7 +1134,7 @@ impl<'a> LocyEngine<'a> {
             })?;
 
         let mut df_executor = uni_query::Executor::new(self.db.storage.clone());
-        df_executor.set_config(self.memory_bounded_config());
+        df_executor.set_config(self.executor_config(config));
         df_executor.set_counters(self.counters.clone());
         if let Some(ref w) = self.db.writer {
             df_executor.set_writer(w.clone());

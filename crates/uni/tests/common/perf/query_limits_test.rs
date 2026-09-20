@@ -2,7 +2,7 @@
 // Copyright 2024-2026 Dragonscale Team
 
 use anyhow::Result;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uni_db::{DataType, Uni};
 
 #[tokio::test]
@@ -2521,5 +2521,46 @@ async fn locy_max_memory_leaves_a_fitting_program_alone() {
         result.is_ok(),
         "a program that fits within the bound must still run: {:?}",
         result.err()
+    );
+}
+
+/// Issue #283: `locy_with(..).timeout(..)` did not bound execution.
+///
+/// The Locy budget was consulted only between strata, between fixpoint
+/// iterations and in the SLG loop. A program that crossed none of those
+/// boundaries ran to completion and reported nothing — a complete result and no
+/// error, which is worse than a slow one. The budget also never reached the
+/// operators: `LocyEngine` handed the executor the *database* config, so the
+/// deadline every operator checks was `db.query_timeout` and a 2s Locy budget
+/// was invisible to all of them.
+///
+/// This drives work that lives inside a graph operator — path enumeration — so
+/// the deadline has somewhere to be observed. The wall-clock bound is generous
+/// relative to the 2s budget because the check is amortized across a stride of
+/// enumerated paths; it is still far below the several seconds the same query
+/// takes unbounded, which the control establishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn locy_timeout_interrupts_work_inside_an_operator() {
+    let db = Uni::in_memory().build().await.unwrap();
+    cyclic_graph(&db, 30, 3).await;
+
+    let started = Instant::now();
+    let err = db
+        .session()
+        .locy_with("MATCH p=(a:Entity)-[:OWNS*]->(b:Entity) RETURN count(p) AS n")
+        .timeout(Duration::from_secs(2))
+        .run()
+        .await
+        .expect_err("a 2s budget must stop this, not describe it afterwards");
+    let elapsed = started.elapsed();
+
+    let msg = err.to_string();
+    assert!(
+        msg.to_lowercase().contains("timed out") || msg.to_lowercase().contains("timeout"),
+        "expected a timeout, got: {msg}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the budget was reported rather than enforced: {elapsed:?}"
     );
 }

@@ -3393,6 +3393,10 @@ async fn build_edge_adjacency_and_target_props(
 pub(super) struct WarmedFilters {
     pub edges: Vec<EidFilter>,
     pub vertices: Vec<VidFilter>,
+    /// Narrows the accepting endpoints from the target's inline property
+    /// map. `AllAllowed` whenever the pattern has no such map, or whenever the
+    /// narrowing could not be established conservatively.
+    pub accepting: VidFilter,
 }
 
 /// One quantified-path-pattern hop's filter inputs.
@@ -3504,6 +3508,105 @@ pub(super) async fn build_vertex_property_filter(
         {
             passing.push(raw);
         }
+    }
+    Ok(VidFilter::from_vids(passing, max_vid as usize + 1))
+}
+
+/// Build a filter over the *accepting* vertices of a variable-length pattern
+/// from the target node's inline property map.
+///
+/// Deliberately not [`build_vertex_property_filter`], which is fail-*closed*:
+/// it drops a candidate whose properties could not be read. That polarity is
+/// right where the filter is the authoritative check, and wrong here. This one
+/// only ever narrows the search; the `FilterExec` the planner puts above the
+/// traversal still applies the predicate and is what makes the answer correct.
+/// A vertex wrongly excluded here is a row that no later stage can put back —
+/// a missing result rather than a slow one — so anything unknown is admitted.
+///
+/// The payoff is real on a cyclic graph: without it every reachable vertex is
+/// an accepting endpoint, so the enumeration walks paths to all of them and a
+/// `LIMIT` on a pinned endpoint waits for paths it will discard. With it the
+/// accepting set is the handful of vertices that can actually match.
+pub(super) async fn build_accepting_vid_filter(
+    graph_ctx: &Arc<GraphExecutionContext>,
+    edge_type_ids: &[u32],
+    direction: Direction,
+    target_label: Option<&str>,
+    conditions: &[(String, UniValue)],
+) -> DFResult<VidFilter> {
+    if conditions.is_empty() {
+        return Ok(VidFilter::AllAllowed);
+    }
+
+    let uni_schema = graph_ctx.storage().schema_manager().schema();
+    let type_names: Vec<String> = edge_type_ids
+        .iter()
+        .filter_map(|id| uni_schema.edge_type_name_by_id_unified(*id))
+        .collect();
+    if type_names.is_empty() {
+        return Ok(VidFilter::AllAllowed);
+    }
+
+    // Candidates are every vertex reachable by one of these edge types. An
+    // accepting vertex at depth >= 1 is by construction one of them.
+    let adjacency = build_edge_adjacency_map(graph_ctx, &type_names, direction, None).await?;
+    let mut candidates: Vec<Vid> = Vec::new();
+    let mut seen: FxHashSet<u64> = FxHashSet::default();
+    for entries in adjacency.values() {
+        for (neighbor, _eid, _etype, _props, _fwd) in entries {
+            if seen.insert(neighbor.as_u64()) {
+                candidates.push(*neighbor);
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(VidFilter::AllAllowed);
+    }
+
+    let query_ctx = graph_ctx.query_context();
+    let wanted: Vec<String> = conditions.iter().map(|(name, _)| name.clone()).collect();
+    let props_by_vid = if let Some(label) = target_label {
+        graph_ctx
+            .property_manager()
+            .get_batch_vertex_props_for_label_projected(
+                &candidates,
+                label,
+                Some(&query_ctx),
+                Some(&wanted),
+            )
+            .await
+    } else {
+        let wanted_refs: Vec<&str> = wanted.iter().map(String::as_str).collect();
+        graph_ctx
+            .property_manager()
+            .get_batch_vertex_props(&candidates, &wanted_refs, Some(&query_ctx))
+            .await
+    }
+    .map_err(exec_err)?;
+
+    let mut passing: Vec<u64> = Vec::new();
+    let mut max_vid: u64 = 0;
+    for vid in &candidates {
+        let raw = vid.as_u64();
+        max_vid = max_vid.max(raw);
+        let admit = match props_by_vid.get(vid) {
+            // Every condition has to be present *and* equal. A property the
+            // read did not return is unknown, not absent, so it admits.
+            Some(props) => conditions
+                .iter()
+                .all(|(name, expected)| props.get(name).is_none_or(|actual| actual == expected)),
+            // Nothing known about this vertex at all: admit and let the
+            // FilterExec above decide.
+            None => true,
+        };
+        if admit {
+            passing.push(raw);
+        }
+    }
+
+    // Narrowing nothing is the same as no filter, and cheaper to check.
+    if passing.len() == candidates.len() {
+        return Ok(VidFilter::AllAllowed);
     }
     Ok(VidFilter::from_vids(passing, max_vid as usize + 1))
 }
@@ -3791,6 +3894,10 @@ pub struct GraphVariableLengthTraverseExec {
     /// Simple property equality conditions for per-edge L0 checking during BFS.
     /// Each entry is (property_name, expected_value).
     edge_property_conditions: Vec<(String, UniValue)>,
+    /// Conditions from the target node's inline property map, used to narrow
+    /// the accepting set. Purely a pruning input -- the planner's `FilterExec`
+    /// above this operator is what makes the predicate authoritative.
+    target_property_conditions: Vec<(String, UniValue)>,
 
     /// Edge ID columns from previous hops for cross-pattern relationship uniqueness.
     used_edge_columns: Vec<String>,
@@ -3870,6 +3977,7 @@ impl GraphVariableLengthTraverseExec {
         bound_target_column: Option<String>,
         edge_lance_filter: Option<String>,
         edge_property_conditions: Vec<(String, UniValue)>,
+        target_property_conditions: Vec<(String, UniValue)>,
         used_edge_columns: Vec<String>,
         path_mode: super::nfa::PathMode,
         output_mode: super::nfa::VlpOutputMode,
@@ -3919,6 +4027,7 @@ impl GraphVariableLengthTraverseExec {
             bound_target_column,
             edge_lance_filter,
             edge_property_conditions,
+            target_property_conditions,
             used_edge_columns,
             path_mode,
             output_mode,
@@ -4077,6 +4186,7 @@ impl ExecutionPlan for GraphVariableLengthTraverseExec {
             self.bound_target_column.clone(),
             self.edge_lance_filter.clone(),
             self.edge_property_conditions.clone(),
+            self.target_property_conditions.clone(),
             self.used_edge_columns.clone(),
             self.path_mode.clone(),
             self.output_mode.clone(),
@@ -4109,6 +4219,8 @@ impl ExecutionPlan for GraphVariableLengthTraverseExec {
         let edge_type_ids = self.edge_type_ids.clone();
         let direction = self.direction;
         let edge_property_conditions = self.edge_property_conditions.clone();
+        let target_property_conditions = self.target_property_conditions.clone();
+        let target_label_for_accepting = self.target_label_name.clone();
         let qpp_step_filters = self.qpp_step_filters.clone();
         let warm_fut: Pin<Box<dyn std::future::Future<Output = DFResult<WarmedFilters>> + Send>> =
             Box::pin(async move {
@@ -4116,6 +4228,15 @@ impl ExecutionPlan for GraphVariableLengthTraverseExec {
                     .ensure_adjacency_warmed(&edge_type_ids, direction)
                     .await
                     .map_err(exec_err)?;
+
+                let accepting = build_accepting_vid_filter(
+                    &graph_ctx,
+                    &edge_type_ids,
+                    direction,
+                    target_label_for_accepting.as_deref(),
+                    &target_property_conditions,
+                )
+                .await?;
 
                 if qpp_step_filters.is_empty() {
                     // Simple VLP: one step, one slot. Same single filter as before.
@@ -4129,6 +4250,7 @@ impl ExecutionPlan for GraphVariableLengthTraverseExec {
                     return Ok(WarmedFilters {
                         edges: vec![edges],
                         vertices: vec![VidFilter::AllAllowed],
+                        accepting,
                     });
                 }
 
@@ -4158,7 +4280,11 @@ impl ExecutionPlan for GraphVariableLengthTraverseExec {
                         .await?,
                     );
                 }
-                Ok(WarmedFilters { edges, vertices })
+                Ok(WarmedFilters {
+                    edges,
+                    vertices,
+                    accepting,
+                })
             });
 
         Ok(Box::pin(GraphVariableLengthTraverseStream {
@@ -4171,6 +4297,7 @@ impl ExecutionPlan for GraphVariableLengthTraverseExec {
             // Replaced by the warming result before any batch is read.
             edge_property_filters: vec![EidFilter::AllAllowed],
             vertex_property_filters: vec![VidFilter::AllAllowed],
+            accepting_vid_filter: VidFilter::AllAllowed,
             metrics,
             slice_size,
             // Starts at one row, not at `slice_size`, and the difference is the
@@ -4545,11 +4672,16 @@ impl GraphVariableLengthTraverseExecData {
         let mut dag = PredecessorDag::new(selector);
         let mut accepting: Vec<(Vid, NfaStateId, u32)> = Vec::new();
 
-        // Handle zero-length paths (min_hops == 0)
-        if nfa.is_accepting(nfa.start_state())
-            && self.check_target_label(source)
-            && vid_filter.contains(source)
-        {
+        // Handle zero-length paths (min_hops == 0).
+        //
+        // `vid_filter` is deliberately NOT consulted here. It is built from the
+        // vertices reachable over this pattern's edge types, and the source of
+        // a zero-length path need not be one of them -- an isolated vertex is
+        // its own zero-length path and appears in no adjacency list, so
+        // filtering on it would drop a row nothing downstream can restore. The
+        // `FilterExec` above still applies the target predicate, so the row is
+        // checked, just not here.
+        if nfa.is_accepting(nfa.start_state()) && self.check_target_label(source) {
             accepting.push((source, nfa.start_state(), 0));
         }
 
@@ -4674,11 +4806,10 @@ impl GraphVariableLengthTraverseExecData {
         let mut dag = PredecessorDag::new(selector);
         let mut results: Vec<(Vid, u32)> = Vec::new();
 
-        // Handle zero-length paths
-        if nfa.is_accepting(nfa.start_state())
-            && self.check_target_label(source)
-            && vid_filter.contains(source)
-        {
+        // Handle zero-length paths. `vid_filter` is skipped for the same reason
+        // as in `build_path_dag`: it cannot speak for a vertex that appears in
+        // no adjacency list.
+        if nfa.is_accepting(nfa.start_state()) && self.check_target_label(source) {
             results.push((source, 0));
         }
 
@@ -4832,6 +4963,8 @@ struct GraphVariableLengthTraverseStream {
     /// conditions).
     edge_property_filters: Vec<EidFilter>,
     vertex_property_filters: Vec<VidFilter>,
+    /// Narrows the accepting endpoints; `AllAllowed` until warming completes.
+    accepting_vid_filter: VidFilter,
     metrics: BaselineMetrics,
 
     /// Target rows per output batch, and the expansion budget per pass.
@@ -4892,6 +5025,7 @@ impl Stream for GraphVariableLengthTraverseStream {
                     Poll::Ready(Ok(warmed)) => {
                         self.edge_property_filters = warmed.edges;
                         self.vertex_property_filters = warmed.vertices;
+                        self.accepting_vid_filter = warmed.accepting;
                         self.state = VarLengthStreamState::Reading;
                         // Continue loop to start reading
                     }
@@ -4976,14 +5110,13 @@ impl Stream for GraphVariableLengthTraverseStream {
                             // The per-hop filters were built during warming and
                             // gate flushed edges/vertices by their properties.
                             // `accepting_vid_filter` is a different thing — it
-                            // constrains the *final* vertex and is still
-                            // unconstrained (TODO: source pre-scan).
-                            let accepting_vid_filter = VidFilter::AllAllowed;
+                            // constrains the *final* vertex, and is built during
+                            // warming from the target's inline property map.
                             let expanded = self.expand_batch(
                                 chunk,
                                 &self.edge_property_filters,
                                 &self.vertex_property_filters,
-                                &accepting_vid_filter,
+                                &self.accepting_vid_filter,
                             );
                             match expanded {
                                 Ok((input, expansions, parked)) => {

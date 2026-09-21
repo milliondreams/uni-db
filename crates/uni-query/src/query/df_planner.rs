@@ -3676,6 +3676,16 @@ impl HybridPhysicalPlanner {
                     .map(Self::extract_edge_property_conditions)
                     .unwrap_or_default();
 
+                // The same extraction applied to the *target* node's predicate,
+                // so the traversal can narrow its accepting set instead of
+                // treating every reachable vertex as an endpoint. Pruning only:
+                // the `FilterExec` this planner puts above the traversal still
+                // applies `target_filter` and remains the authoritative check,
+                // which is what lets the narrowing be conservative.
+                let target_property_conditions = target_filter
+                    .map(Self::extract_edge_property_conditions)
+                    .unwrap_or_default();
+
                 // VLP: collect used edge columns for cross-pattern relationship uniqueness
                 let used_edge_columns = Self::collect_used_edge_columns(
                     &input_plan.schema(),
@@ -3783,6 +3793,7 @@ impl HybridPhysicalPlanner {
                     bound_target_column,
                     edge_lance_filter,
                     edge_property_conditions,
+                    target_property_conditions,
                     used_edge_columns,
                     path_mode.clone(),
                     output_mode,

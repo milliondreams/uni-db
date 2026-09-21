@@ -210,6 +210,8 @@ fn mutation_strategy() -> impl Strategy<Value = Mutation> {
                 vid,
                 properties: props,
                 labels: vec![],
+                created_at: None,
+                updated_at: None,
             }),
         // DeleteVertex
         small_vid_strategy().prop_map(|vid| Mutation::DeleteVertex {
@@ -237,6 +239,8 @@ fn mutation_strategy() -> impl Strategy<Value = Mutation> {
                 version: ver,
                 properties: props,
                 edge_type_name: None,
+                created_at: None,
+                updated_at: None,
             }),
         // DeleteEdge
         (
@@ -283,6 +287,8 @@ fn mutations_equal(a: &Mutation, b: &Mutation) -> bool {
                 version: v1,
                 properties: p1,
                 edge_type_name: _,
+                created_at: c1,
+                updated_at: u1,
             },
             Mutation::InsertEdge {
                 src_vid: s2,
@@ -292,6 +298,8 @@ fn mutations_equal(a: &Mutation, b: &Mutation) -> bool {
                 version: v2,
                 properties: p2,
                 edge_type_name: _,
+                created_at: c2,
+                updated_at: u2,
             },
         ) => {
             s1.as_u64() == s2.as_u64()
@@ -300,6 +308,10 @@ fn mutations_equal(a: &Mutation, b: &Mutation) -> bool {
                 && e1.as_u64() == e2.as_u64()
                 && v1 == v2
                 && p1 == p2
+                // Timestamps are part of the record, so a round-trip that
+                // dropped them is not an equal round-trip.
+                && c1 == c2
+                && u1 == u2
         }
         (
             Mutation::DeleteEdge {

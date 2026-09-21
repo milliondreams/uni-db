@@ -1553,6 +1553,62 @@ pub fn scalar_to_large_binary_expr(expr: DfExpr) -> DfExpr {
     ))
 }
 
+/// The inverse of [`scalar_to_large_binary_expr`]: decode a CypherValue
+/// expression into a concrete Arrow type.
+///
+/// An entity bound natively carries typed property columns, but one that
+/// reached the expression through `collect()` + `UNWIND` is a single
+/// `LargeBinary` CypherValue, and a property read off it is `LargeBinary` too.
+/// This project's own UDFs decode that; DataFusion's built-ins cannot, so
+/// `toUpper(n.name)` and `coalesce(n.name, 'x')` fail on the second encoding
+/// while working on the first.
+///
+/// No new UDF is needed to fix that. `toString` / `toInteger` / `toFloat` /
+/// `toBoolean` are each `Signature::any(1)` over `invoke_cypher_udf`, so each
+/// already accepts a CypherValue and already returns the concrete type. This
+/// picks the right one.
+///
+/// Returns `None` for a target with no such decoder, so a caller leaves the
+/// expression exactly as it found it rather than guessing.
+pub fn large_binary_to_scalar_expr(
+    expr: DfExpr,
+    target: &datafusion::arrow::datatypes::DataType,
+) -> Option<DfExpr> {
+    use datafusion::arrow::datatypes::DataType;
+
+    let udf = match target {
+        DataType::Utf8 | DataType::LargeUtf8 => crate::df_udfs::create_tostring_udf(),
+        DataType::Int64 => crate::df_udfs::create_to_integer_udf(),
+        DataType::Float64 => crate::df_udfs::create_to_float_udf(),
+        DataType::Boolean => crate::df_udfs::create_to_boolean_udf(),
+        _ => return None,
+    };
+    Some(DfExpr::ScalarFunction(
+        datafusion::logical_expr::expr::ScalarFunction::new_udf(Arc::new(udf), vec![expr]),
+    ))
+}
+
+/// Whether `expr` is a CypherValue that may be decoded by
+/// [`large_binary_to_scalar_expr`].
+///
+/// The `uni_raw_bytes` check is the load-bearing half. A raw `Bytes` value and a
+/// CypherValue are **both** `LargeBinary` and are told apart only by that field
+/// metadata. Decoding a raw-bytes column would stringify it — corruption, and
+/// silent, which is a worse defect than the one this exists to fix.
+pub fn is_decodable_cypher_value(expr: &DfExpr, schema: &datafusion::common::DFSchema) -> bool {
+    use datafusion::arrow::datatypes::DataType;
+    use datafusion::logical_expr::ExprSchemable;
+
+    if !matches!(expr.get_type(schema), Ok(DataType::LargeBinary)) {
+        return false;
+    }
+    match expr.metadata(schema) {
+        Ok(md) => !md.inner().contains_key("uni_raw_bytes"),
+        // Unknown provenance: decline rather than risk a raw-bytes column.
+        Err(_) => false,
+    }
+}
+
 /// Build a `BinaryExpr` from left, operator, and right expressions.
 fn binary_expr(left: DfExpr, op: datafusion::logical_expr::Operator, right: DfExpr) -> DfExpr {
     DfExpr::BinaryExpr(datafusion::logical_expr::expr::BinaryExpr::new(
@@ -3499,12 +3555,154 @@ fn coerce_scalar_function(
         }
     }
 
+    let coerced_args = decode_cypher_value_arguments(func, coerced_args, schema);
+
     Ok(DfExpr::ScalarFunction(
         datafusion::logical_expr::expr::ScalarFunction {
             func: func.func.clone(),
             args: coerced_args,
         },
     ))
+}
+
+/// What a callee would coerce these argument types to, or an error if it
+/// rejects them.
+///
+/// Thin wrapper over DataFusion's `fields_with_udf` so the callee's own
+/// signature stays the authority on argument types and nothing here keys off a
+/// function name.
+fn coerced_arg_types(
+    arg_types: &[datafusion::arrow::datatypes::DataType],
+    func: &datafusion::logical_expr::ScalarUDF,
+) -> Result<Vec<datafusion::arrow::datatypes::DataType>> {
+    use datafusion::arrow::datatypes::Field;
+    use datafusion::logical_expr::type_coercion::functions::fields_with_udf;
+
+    let fields: Vec<_> = arg_types
+        .iter()
+        .map(|dt| Arc::new(Field::new("f", dt.clone(), true)))
+        .collect();
+    Ok(fields_with_udf(&fields, func)?
+        .iter()
+        .map(|f| f.data_type().clone())
+        .collect())
+}
+
+/// Decode CypherValue arguments that the callee cannot read as-is.
+///
+/// A property of an entity that arrived through `collect()` + `UNWIND` is a
+/// `LargeBinary` CypherValue. This project's own UDFs take those — they are
+/// `Signature::any` over `invoke_cypher_udf` — but DataFusion's built-ins do
+/// not, so `toUpper(n.name)` and `left(n.name, 1)` fail at planning while the
+/// same query over a natively-bound entity succeeds.
+///
+/// DataFusion itself is the authority on what a callee wants: its signature
+/// already answers "what would you coerce these arguments to", and asking it
+/// keeps this off a table of function names, which this project deliberately
+/// moved away from. A name table is consulted nowhere here.
+///
+/// Inert unless an argument is actually a decodable CypherValue, which is the
+/// overwhelmingly common case, and inert for our own `Signature::any` UDFs even
+/// then, because the coercion returns their arguments unchanged.
+fn decode_cypher_value_arguments(
+    func: &datafusion::logical_expr::expr::ScalarFunction,
+    args: Vec<DfExpr>,
+    schema: &datafusion::common::DFSchema,
+) -> Vec<DfExpr> {
+    use datafusion::arrow::datatypes::DataType;
+    use datafusion::logical_expr::ExprSchemable;
+
+    let decodable: Vec<usize> = args
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| is_decodable_cypher_value(a, schema))
+        .map(|(i, _)| i)
+        .collect();
+    if decodable.is_empty() {
+        return args;
+    }
+
+    let Ok(arg_types) = args
+        .iter()
+        .map(|a| a.get_type(schema))
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return args;
+    };
+
+    // What the callee would coerce these to. `Ok` with a concrete target for a
+    // CypherValue argument means DataFusion intends to cast it — and casting
+    // msgpack-tagged bytes is the bug, so decode instead. `Ok` leaving it
+    // `LargeBinary` means the callee reads CypherValue natively; leave it be.
+    let targets = match coerced_arg_types(&arg_types, &func.func) {
+        Ok(targets) => targets,
+        // The callee rejects `LargeBinary` outright. Ask it what it would
+        // accept instead, one decodable type at a time, rather than assuming.
+        Err(_) => match probe_decodable_signature(func, &arg_types, &decodable) {
+            Some(targets) => targets,
+            // Nothing fits: leave the arguments alone so the callee's own error
+            // surfaces unchanged rather than being replaced by a worse one.
+            None => return args,
+        },
+    };
+
+    let mut args = args;
+    for i in decodable {
+        let Some(target) = targets.get(i) else {
+            continue;
+        };
+        if matches!(target, DataType::LargeBinary) {
+            continue;
+        }
+        if let Some(decoded) = large_binary_to_scalar_expr(args[i].clone(), target) {
+            args[i] = decoded;
+        }
+    }
+    args
+}
+
+/// Find a decodable substitution the callee's signature accepts.
+///
+/// Only ever runs on a call that already fails to plan, so its cost is paid
+/// exclusively by queries that are broken today.
+fn probe_decodable_signature(
+    func: &datafusion::logical_expr::expr::ScalarFunction,
+    arg_types: &[datafusion::arrow::datatypes::DataType],
+    decodable: &[usize],
+) -> Option<Vec<datafusion::arrow::datatypes::DataType>> {
+    use datafusion::arrow::datatypes::DataType;
+
+    // Bound the search. More than a couple of CypherValue arguments to a
+    // built-in does not occur in practice, and the product would grow.
+    if decodable.len() > 2 {
+        return None;
+    }
+    const CANDIDATES: [DataType; 4] = [
+        DataType::Utf8,
+        DataType::Int64,
+        DataType::Float64,
+        DataType::Boolean,
+    ];
+
+    let mut best: Option<Vec<DataType>> = None;
+    let total = CANDIDATES.len().pow(decodable.len() as u32);
+    for n in 0..total {
+        let mut probe = arg_types.to_vec();
+        let mut n = n;
+        for &i in decodable {
+            probe[i] = CANDIDATES[n % CANDIDATES.len()].clone();
+            n /= CANDIDATES.len();
+        }
+        if let Ok(targets) = coerced_arg_types(&probe, &func.func) {
+            // Prefer a substitution the callee accepts without a further cast.
+            let exact = decodable.iter().all(|&i| targets.get(i) == probe.get(i));
+            if exact {
+                return Some(targets);
+            }
+            best.get_or_insert(targets);
+        }
+    }
+    best
 }
 
 /// Coerce CASE expression: recurse into sub-expressions, rewrite simple CASE to generic,
@@ -3618,6 +3816,84 @@ fn coerce_aggregate_function(
 
 #[cfg(test)]
 mod tests {
+
+    mod cypher_value_decoding {
+        use super::super::{is_decodable_cypher_value, large_binary_to_scalar_expr};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::common::DFSchema;
+        use datafusion::logical_expr::{ExprSchemable, col};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        fn schema_with(field: Field) -> DFSchema {
+            DFSchema::try_from(Schema::new(vec![field])).expect("schema")
+        }
+
+        /// Each target maps to the decoder that already returns that type, and
+        /// the returned expression really does report it — the whole point is to
+        /// hand a typed value to a consumer that cannot read a CypherValue.
+        #[test]
+        fn each_supported_target_decodes_to_that_type() {
+            for target in [
+                DataType::Utf8,
+                DataType::Int64,
+                DataType::Float64,
+                DataType::Boolean,
+            ] {
+                let schema = schema_with(Field::new("v", DataType::LargeBinary, true));
+                let decoded = large_binary_to_scalar_expr(col("v"), &target)
+                    .unwrap_or_else(|| panic!("no decoder for {target:?}"));
+                assert_eq!(
+                    decoded.get_type(&schema).expect("type"),
+                    target,
+                    "decoder for {target:?} does not report {target:?}"
+                );
+            }
+        }
+
+        /// A target with no decoder yields `None` so the caller leaves the
+        /// expression alone. Guessing here would be worse than not acting.
+        #[test]
+        fn an_unsupported_target_declines() {
+            assert!(large_binary_to_scalar_expr(col("v"), &DataType::Date32).is_none());
+            assert!(large_binary_to_scalar_expr(col("v"), &DataType::LargeBinary).is_none());
+        }
+
+        /// The guard admits an unmarked CypherValue column.
+        #[test]
+        fn an_unmarked_large_binary_is_decodable() {
+            let schema = schema_with(Field::new("v", DataType::LargeBinary, true));
+            assert!(is_decodable_cypher_value(&col("v"), &schema));
+        }
+
+        /// A raw `Bytes` column is also `LargeBinary` and is told apart only by
+        /// this metadata. Decoding one would stringify it, silently — so the
+        /// guard must refuse. This is the assertion the whole helper rests on.
+        #[test]
+        fn a_raw_bytes_column_is_refused() {
+            let field = Field::new("v", DataType::LargeBinary, true).with_metadata(HashMap::from(
+                [("uni_raw_bytes".to_string(), "true".to_string())],
+            ));
+            let schema = schema_with(field);
+            assert!(
+                !is_decodable_cypher_value(&col("v"), &schema),
+                "a raw-bytes column was admitted for decoding"
+            );
+        }
+
+        /// Anything that is not `LargeBinary` is not this helper's business.
+        #[test]
+        fn a_typed_column_is_not_decodable() {
+            let schema = schema_with(Field::new("v", DataType::Utf8, true));
+            assert!(!is_decodable_cypher_value(&col("v"), &schema));
+        }
+
+        // Silence the unused-import warning when only some paths are exercised.
+        #[allow(dead_code)]
+        fn _arc_used() -> Option<Arc<u8>> {
+            None
+        }
+    }
 
     mod native_entity_scalars {
         use super::super::value_to_scalar;

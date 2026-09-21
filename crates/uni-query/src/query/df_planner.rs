@@ -747,7 +747,24 @@ impl HybridPhysicalPlanner {
         crate::query::planner::relax_count_only_entities(&logical_rewritten, &mut all_properties);
 
         // Delegate to internal planning with properties context
-        self.plan_internal(&logical_rewritten, &all_properties)
+        let plan = self.plan_internal(&logical_rewritten, &all_properties)?;
+        self.guard_deadlines(plan)
+    }
+
+    /// Insert deadline checkpoints beneath pipeline-breaking operators.
+    ///
+    /// Applied to every finished physical plan. A pipeline breaker consumes its
+    /// whole input inside one `poll_next`, so the per-batch check in the
+    /// collecting loop above it fires once and the deadline is only noticed
+    /// after the work is done (issue #283). See
+    /// [`crate::query::df_graph::deadline_guard`].
+    fn guard_deadlines(&self, plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
+        crate::query::df_graph::deadline_guard::insert_deadline_guards(
+            plan,
+            self.graph_ctx.deadline_for_host(),
+            self.graph_ctx.cancellation_token_for_host().as_ref(),
+        )
+        .map_err(Into::into)
     }
 
     /// Plan a LogicalPlan with additional property requirements.
@@ -770,7 +787,8 @@ impl HybridPhysicalPlanner {
         crate::query::planner::mark_dead_unwind_sources(&logical_rewritten, &mut all_properties);
         // `count(n)` needs to know a row exists, not what is in it (#184 family).
         crate::query::planner::relax_count_only_entities(&logical_rewritten, &mut all_properties);
-        self.plan_internal(&logical_rewritten, &all_properties)
+        let plan = self.plan_internal(&logical_rewritten, &all_properties)?;
+        self.guard_deadlines(plan)
     }
 
     /// Wrap a plan with optional semantics.
@@ -2502,6 +2520,24 @@ impl HybridPhysicalPlanner {
         {
             return Some(target_variable.to_string());
         }
+        // A target already in scope is traversed into a temporary
+        // `__rebound_{var}` and reconciled afterwards by a
+        // `{var}._vid = __rebound_{var}._vid` filter, so the bound column is
+        // under the *original* name and the two lookups above both miss it.
+        //
+        // Missing it is not merely a lost optimisation. Without the bound
+        // column the traversal has no endpoint to aim at, so every reachable
+        // vertex is an accepting endpoint and
+        // `MATCH (b {..}) WITH b MATCH p = (a)-[:R*]->(b)` enumerates paths to
+        // all of them -- measured at 23-46 s on a 30-vertex cyclic graph, while
+        // the same pattern with the predicate written inline answers in under a
+        // second.
+        if let Some(original) = target_variable.strip_prefix("__rebound_") {
+            let col = format!("{original}._vid");
+            if input_schema.column_with_name(&col).is_some() {
+                return Some(col);
+            }
+        }
         None
     }
 
@@ -3658,6 +3694,16 @@ impl HybridPhysicalPlanner {
                     .map(Self::extract_edge_property_conditions)
                     .unwrap_or_default();
 
+                // The same extraction applied to the *target* node's predicate,
+                // so the traversal can narrow its accepting set instead of
+                // treating every reachable vertex as an endpoint. Pruning only:
+                // the `FilterExec` this planner puts above the traversal still
+                // applies `target_filter` and remains the authoritative check,
+                // which is what lets the narrowing be conservative.
+                let target_property_conditions = target_filter
+                    .map(Self::extract_edge_property_conditions)
+                    .unwrap_or_default();
+
                 // VLP: collect used edge columns for cross-pattern relationship uniqueness
                 let used_edge_columns = Self::collect_used_edge_columns(
                     &input_plan.schema(),
@@ -3765,6 +3811,7 @@ impl HybridPhysicalPlanner {
                     bound_target_column,
                     edge_lance_filter,
                     edge_property_conditions,
+                    target_property_conditions,
                     used_edge_columns,
                     path_mode.clone(),
                     output_mode,

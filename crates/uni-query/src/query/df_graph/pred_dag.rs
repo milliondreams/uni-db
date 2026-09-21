@@ -101,6 +101,12 @@ impl PredecessorDag {
     /// Iterates over depths in `[min_depth, max_depth]`, performing backward DFS
     /// through predecessor chains. Applies mode-specific filtering (Trail/Acyclic/Simple).
     /// The callback can return `ControlFlow::Break(())` to stop enumeration early.
+    ///
+    /// This is the run-to-completion form. It is a thin wrapper over
+    /// [`PathEnumerator`], which is the same walk with its stack made explicit
+    /// so a caller that needs to stop and continue later can. Keeping this
+    /// wrapper is deliberate: it means every existing caller and test exercises
+    /// the resumable walk, so the two cannot drift apart.
     #[expect(
         clippy::too_many_arguments,
         reason = "path enumeration requires full traversal context"
@@ -117,51 +123,16 @@ impl PredecessorDag {
     ) where
         F: FnMut(&[Vid], &[Eid]) -> ControlFlow<()>,
     {
-        for depth in min_depth..=max_depth {
-            // Special case: zero-length path.
-            if depth == 0 {
-                if source == target && yield_path(&[source], &[]).is_break() {
-                    return;
-                }
-                continue;
-            }
-
-            if !self
-                .pred_head
-                .contains_key(&(target, accepting_state, depth))
-            {
-                continue;
-            }
-
-            let mut nodes = Vec::with_capacity(depth as usize + 1);
-            let mut edges = Vec::with_capacity(depth as usize);
-            let mut node_set = FxHashSet::default();
-            let mut edge_set = FxHashSet::default();
-
-            // Start backward DFS from target.
-            nodes.push(target);
-            if matches!(mode, PathMode::Acyclic | PathMode::Simple) {
-                node_set.insert(target);
-            }
-
-            if self
-                .dfs_backward(
-                    source,
-                    target,
-                    accepting_state,
-                    depth,
-                    &mut nodes,
-                    &mut edges,
-                    &mut node_set,
-                    &mut edge_set,
-                    mode,
-                    yield_path,
-                )
-                .is_break()
-            {
-                return;
-            }
-        }
+        let mut cursor = PathEnumerator::new(
+            self,
+            source,
+            target,
+            accepting_state,
+            min_depth,
+            max_depth,
+            mode.clone(),
+        );
+        let _ = cursor.resume(self, yield_path);
     }
 
     /// Check if at least one Trail-valid path exists from source to target.
@@ -189,109 +160,6 @@ impl PredecessorDag {
             },
         );
         found
-    }
-
-    /// Internal backward DFS through predecessor chains.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "recursive DFS carries full path state"
-    )]
-    fn dfs_backward<F>(
-        &self,
-        source: Vid,
-        current_vid: Vid,
-        current_state: NfaStateId,
-        remaining_depth: u32,
-        nodes: &mut Vec<Vid>,
-        edges: &mut Vec<Eid>,
-        node_set: &mut FxHashSet<Vid>,
-        edge_set: &mut FxHashSet<Eid>,
-        mode: &PathMode,
-        yield_path: &mut F,
-    ) -> ControlFlow<()>
-    where
-        F: FnMut(&[Vid], &[Eid]) -> ControlFlow<()>,
-    {
-        if remaining_depth == 0 {
-            if current_vid == source {
-                // Reverse stacks to get forward path order.
-                let fwd_nodes: Vec<Vid> = nodes.iter().rev().copied().collect();
-                let fwd_edges: Vec<Eid> = edges.iter().rev().copied().collect();
-                return yield_path(&fwd_nodes, &fwd_edges);
-            }
-            return ControlFlow::Continue(());
-        }
-
-        let key = (current_vid, current_state, remaining_depth);
-        let Some(&head) = self.pred_head.get(&key) else {
-            return ControlFlow::Continue(());
-        };
-
-        let mut idx = head;
-        while idx >= 0 {
-            let pred = &self.pred_pool[idx as usize];
-
-            // Mode-specific filtering.
-            let skip = match mode {
-                PathMode::Walk => false,
-                PathMode::Trail => edge_set.contains(&pred.eid),
-                PathMode::Acyclic => node_set.contains(&pred.src_vid),
-                PathMode::Simple => {
-                    // No repeated nodes except source may equal target.
-                    node_set.contains(&pred.src_vid)
-                        && !(remaining_depth == 1 && pred.src_vid == source)
-                }
-            };
-
-            if skip {
-                idx = pred.next;
-                continue;
-            }
-
-            // Push to stacks.
-            nodes.push(pred.src_vid);
-            edges.push(pred.eid);
-
-            if matches!(mode, PathMode::Trail) {
-                edge_set.insert(pred.eid);
-            }
-            if matches!(mode, PathMode::Acyclic | PathMode::Simple) {
-                node_set.insert(pred.src_vid);
-            }
-
-            // Recurse.
-            let result = self.dfs_backward(
-                source,
-                pred.src_vid,
-                pred.src_state,
-                remaining_depth - 1,
-                nodes,
-                edges,
-                node_set,
-                edge_set,
-                mode,
-                yield_path,
-            );
-
-            // Pop from stacks.
-            nodes.pop();
-            edges.pop();
-
-            if matches!(mode, PathMode::Trail) {
-                edge_set.remove(&pred.eid);
-            }
-            if matches!(mode, PathMode::Acyclic | PathMode::Simple) {
-                node_set.remove(&pred.src_vid);
-            }
-
-            if result.is_break() {
-                return ControlFlow::Break(());
-            }
-
-            idx = pred.next;
-        }
-
-        ControlFlow::Continue(())
     }
 
     /// Get the number of records in the predecessor pool.
@@ -340,6 +208,297 @@ mod tests {
             },
         );
         paths
+    }
+
+    /// An independent enumerator, written as the obvious recursion directly
+    /// over the DAG, used as an oracle for [`PathEnumerator`].
+    ///
+    /// Deliberately not a refactor of the real one: the explicit-stack walk
+    /// replaced a recursion, and a self-comparison cannot see a bug that the
+    /// stack machine and its own pause path share. Its job is to be slow,
+    /// obvious and wrong in different ways.
+    fn brute_force_paths(
+        dag: &PredecessorDag,
+        source: Vid,
+        target: Vid,
+        accepting_state: NfaStateId,
+        min_depth: u32,
+        max_depth: u32,
+        mode: &PathMode,
+    ) -> Vec<(Vec<Vid>, Vec<Eid>)> {
+        #[expect(
+            clippy::too_many_arguments,
+            reason = "oracle mirrors the walk's context"
+        )]
+        fn walk(
+            dag: &PredecessorDag,
+            source: Vid,
+            at: Vid,
+            state: NfaStateId,
+            remaining: u32,
+            nodes: &mut Vec<Vid>,
+            edges: &mut Vec<Eid>,
+            mode: &PathMode,
+            out: &mut Vec<(Vec<Vid>, Vec<Eid>)>,
+        ) {
+            if remaining == 0 {
+                if at == source {
+                    out.push((
+                        nodes.iter().rev().copied().collect(),
+                        edges.iter().rev().copied().collect(),
+                    ));
+                }
+                return;
+            }
+            let mut idx = dag
+                .pred_head
+                .get(&(at, state, remaining))
+                .copied()
+                .unwrap_or(-1);
+            while idx >= 0 {
+                let pred = dag.pred_pool[idx as usize].clone();
+                // Membership is recomputed from the path itself every time,
+                // so there is no incremental set to forget to undo -- which is
+                // exactly the class of bug this oracle exists to catch.
+                let skip = match mode {
+                    PathMode::Walk => false,
+                    PathMode::Trail => edges.contains(&pred.eid),
+                    PathMode::Acyclic => nodes.contains(&pred.src_vid),
+                    PathMode::Simple => {
+                        nodes.contains(&pred.src_vid) && !(remaining == 1 && pred.src_vid == source)
+                    }
+                };
+                if !skip {
+                    nodes.push(pred.src_vid);
+                    edges.push(pred.eid);
+                    walk(
+                        dag,
+                        source,
+                        pred.src_vid,
+                        pred.src_state,
+                        remaining - 1,
+                        nodes,
+                        edges,
+                        mode,
+                        out,
+                    );
+                    nodes.pop();
+                    edges.pop();
+                }
+                idx = pred.next;
+            }
+        }
+
+        let mut out = Vec::new();
+        for depth in min_depth..=max_depth {
+            if depth == 0 {
+                if source == target {
+                    out.push((vec![source], vec![]));
+                }
+                continue;
+            }
+            let mut nodes = vec![target];
+            let mut edges = Vec::new();
+            walk(
+                dag,
+                source,
+                target,
+                accepting_state,
+                depth,
+                &mut nodes,
+                &mut edges,
+                mode,
+                &mut out,
+            );
+        }
+        out
+    }
+
+    /// The rewritten walk must agree with the oracle on every mode and depth.
+    ///
+    /// This is the absolute check; [`assert_pause_equivalent`] is the relative
+    /// one. Both are needed: the oracle cannot see a pause bug, and the
+    /// equivalence cannot see a bug the walk has whether it pauses or not.
+    #[test]
+    fn explicit_stack_walk_matches_the_brute_force_oracle() {
+        let dag = mesh_dag(4);
+        for mode in [
+            PathMode::Walk,
+            PathMode::Trail,
+            PathMode::Acyclic,
+            PathMode::Simple,
+        ] {
+            for max_depth in 1..=4 {
+                for target in [vid(0), vid(1), vid(3)] {
+                    let expected = brute_force_paths(&dag, vid(0), target, 0, 0, max_depth, &mode);
+                    let actual = collect_paths(&dag, vid(0), target, 0, 0, max_depth, &mode);
+                    assert_eq!(
+                        actual, expected,
+                        "walk diverged from the oracle ({mode:?}, depth<={max_depth}, target {target:?})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Drive a [`PathEnumerator`] one path per `resume` call.
+    fn collect_paths_paused(
+        dag: &PredecessorDag,
+        source: Vid,
+        target: Vid,
+        accepting_state: NfaStateId,
+        min_depth: u32,
+        max_depth: u32,
+        mode: &PathMode,
+    ) -> Vec<(Vec<Vid>, Vec<Eid>)> {
+        let mut cursor = PathEnumerator::new(
+            dag,
+            source,
+            target,
+            accepting_state,
+            min_depth,
+            max_depth,
+            mode.clone(),
+        );
+        let mut paths = Vec::new();
+        // One path per call, so every path in the set is produced across a
+        // pause boundary rather than within a single uninterrupted walk.
+        while !cursor.is_finished() {
+            let mut got = None;
+            let _ = cursor.resume(dag, &mut |nodes, edges| {
+                got = Some((nodes.to_vec(), edges.to_vec()));
+                ControlFlow::Break(())
+            });
+            match got {
+                Some(path) => paths.push(path),
+                // `resume` ran out without yielding: the range is exhausted.
+                None => break,
+            }
+            // A thousand paths is far above any fixture here; a cursor that
+            // fails to advance would otherwise hang the suite instead of
+            // failing it.
+            assert!(paths.len() < 1000, "cursor is not advancing");
+        }
+        paths
+    }
+
+    /// A walk paused after every single path must produce exactly the sequence
+    /// the uninterrupted walk produces -- same paths, same order, no repeats
+    /// and none dropped at a pause boundary.
+    ///
+    /// This is the property the run-to-completion tests cannot see: they only
+    /// ever call `resume` once, so a frame restored wrongly after a `Break`
+    /// would leave every one of them green.
+    fn assert_pause_equivalent(
+        dag: &PredecessorDag,
+        source: Vid,
+        target: Vid,
+        accepting_state: NfaStateId,
+        min_depth: u32,
+        max_depth: u32,
+        mode: &PathMode,
+    ) {
+        let whole = collect_paths(
+            dag,
+            source,
+            target,
+            accepting_state,
+            min_depth,
+            max_depth,
+            mode,
+        );
+        let paused = collect_paths_paused(
+            dag,
+            source,
+            target,
+            accepting_state,
+            min_depth,
+            max_depth,
+            mode,
+        );
+        assert_eq!(
+            whole, paused,
+            "paused enumeration diverged from the uninterrupted walk ({mode:?})"
+        );
+    }
+
+    /// Fully-connected triangle with both directions on every pair, which is
+    /// the shape that makes an unbounded pattern explode: every mode's
+    /// bookkeeping (`edge_set` for Trail, `node_counts` for Acyclic/Simple) has to
+    /// survive a pause, and a cycle means a mis-restored set shows up as a
+    /// wrong path rather than a missing one.
+    fn mesh_dag(max_depth: u32) -> PredecessorDag {
+        let mut dag = PredecessorDag::new(PathSelector::All);
+        let n = 4u64;
+        for depth in 1..=max_depth {
+            for src in 0..n {
+                for dst in 0..n {
+                    if src == dst {
+                        continue;
+                    }
+                    dag.add_predecessor(vid(dst), 0, vid(src), 0, eid(src * n + dst), depth);
+                }
+            }
+        }
+        dag
+    }
+
+    #[test]
+    fn pause_after_every_path_matches_uninterrupted_walk() {
+        let dag = mesh_dag(4);
+        for mode in [
+            PathMode::Walk,
+            PathMode::Trail,
+            PathMode::Acyclic,
+            PathMode::Simple,
+        ] {
+            for max_depth in 1..=4 {
+                assert_pause_equivalent(&dag, vid(0), vid(3), 0, 1, max_depth, &mode);
+            }
+        }
+    }
+
+    #[test]
+    fn pause_equivalence_holds_across_a_depth_range() {
+        // `min_depth < max_depth` makes `resume` cross a depth boundary, where
+        // the stack is re-seeded. A pause landing on that boundary is the case
+        // a single-depth fixture never reaches.
+        let dag = mesh_dag(3);
+        for mode in [PathMode::Walk, PathMode::Trail, PathMode::Acyclic] {
+            assert_pause_equivalent(&dag, vid(0), vid(1), 0, 1, 3, &mode);
+        }
+    }
+
+    #[test]
+    fn pause_equivalence_covers_the_zero_length_path() {
+        // depth 0 with source == target yields the single empty path, and it is
+        // produced by a different branch of `resume` than every other path.
+        let dag = mesh_dag(2);
+        let paused = collect_paths_paused(&dag, vid(0), vid(0), 0, 0, 0, &PathMode::Trail);
+        assert_eq!(paused, vec![(vec![vid(0)], vec![])]);
+        assert_pause_equivalent(&dag, vid(0), vid(0), 0, 0, 2, &PathMode::Trail);
+    }
+
+    #[test]
+    fn a_cursor_stopped_early_leaves_the_rest_unproduced() {
+        // The point of the whole cursor: taking 3 paths must not walk the set.
+        let dag = mesh_dag(4);
+        let all = collect_paths(&dag, vid(0), vid(3), 0, 1, 4, &PathMode::Trail);
+        assert!(all.len() > 3, "fixture too small to show early stop");
+
+        let mut cursor = PathEnumerator::new(&dag, vid(0), vid(3), 0, 1, 4, PathMode::Trail);
+        let mut taken = Vec::new();
+        let _ = cursor.resume(&dag, &mut |nodes, edges| {
+            taken.push((nodes.to_vec(), edges.to_vec()));
+            if taken.len() == 3 {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        });
+        assert_eq!(taken.len(), 3);
+        assert!(!cursor.is_finished());
+        assert_eq!(taken, all[..3].to_vec());
     }
 
     // ── Pool Storage Tests (23-26) ─────────────────────────────────────
@@ -739,5 +898,275 @@ mod tests {
         assert_eq!(edges[0], eid(100)); // A→B
         assert_eq!(edges[1], eid(200)); // B→C
         assert_eq!(edges[2], eid(300)); // C→D
+    }
+}
+
+/// One level of the backward DFS, made explicit.
+///
+/// `idx` is the position in the predecessor chain of this level's
+/// `(vid, state, remaining)` key that it is currently considering; `descended` records that the
+/// child for `idx` is on the stack, so the undo happens exactly once when
+/// control comes back.
+#[derive(Debug, Clone)]
+struct DfsFrame {
+    vid: Vid,
+    remaining: u32,
+    idx: i32,
+    descended: bool,
+}
+
+/// A resumable backward DFS over a [`PredecessorDag`].
+///
+/// The recursive enumerator it replaces could only run to completion: a
+/// `ControlFlow::Break` from the callback unwound the Rust stack and threw the
+/// position away, so a consumer that wanted the first `n` paths of a large set
+/// had to enumerate all of them and discard the rest. That is why `LIMIT 5`
+/// over an unbounded pattern on a cyclic graph cost exactly what no limit cost
+/// (#285): the operator above could stop asking, but this could not stop
+/// producing.
+///
+/// Holding the DFS stack in a struct makes `Break` a pause instead of an abort.
+/// `resume` returns `ControlFlow::Break(())` with every frame intact, and the
+/// next call picks up at the path after the one that broke.
+///
+/// The DAG is passed to each call rather than borrowed by the struct so the
+/// cursor can be parked in an operator's state alongside the DAG it walks,
+/// which a self-referential borrow would not allow.
+pub struct PathEnumerator {
+    source: Vid,
+    target: Vid,
+    accepting_state: NfaStateId,
+    /// Depth currently being walked, and the inclusive bound it stops at.
+    depth: u32,
+    max_depth: u32,
+    mode: PathMode,
+    stack: Vec<DfsFrame>,
+    /// Path under construction, in backward order (target first).
+    nodes: Vec<Vid>,
+    edges: Vec<Eid>,
+    /// How many times each vid appears on the path under construction.
+    ///
+    /// A count, not a set. `Simple` admits one repeat -- the source may equal
+    /// the target -- so the same vid can be pushed twice, and with a set the
+    /// first undo erases the seeded target entry, after which every later
+    /// branch wrongly re-admits it. The recursion this replaced had the same
+    /// defect; it is unreachable from Cypher (the planner only ever emits
+    /// `Trail`) but wrong all the same, and the brute-force oracle in the
+    /// tests is what surfaced it.
+    node_counts: FxHashMap<Vid, u32>,
+    edge_set: FxHashSet<Eid>,
+    /// A zero-length path is owed for the current depth (`depth == 0` and
+    /// `source == target`), and has not been handed over yet.
+    zero_pending: bool,
+    /// The current depth's stack has been seeded.
+    seeded: bool,
+    finished: bool,
+}
+
+impl PathEnumerator {
+    /// Start a cursor over paths of every depth in `[min_depth, max_depth]`.
+    pub fn new(
+        dag: &PredecessorDag,
+        source: Vid,
+        target: Vid,
+        accepting_state: NfaStateId,
+        min_depth: u32,
+        max_depth: u32,
+        mode: PathMode,
+    ) -> Self {
+        let mut this = Self {
+            source,
+            target,
+            accepting_state,
+            depth: min_depth,
+            max_depth,
+            mode,
+            stack: Vec::new(),
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            node_counts: FxHashMap::default(),
+            edge_set: FxHashSet::default(),
+            zero_pending: false,
+            seeded: false,
+            finished: min_depth > max_depth,
+        };
+        if !this.finished {
+            this.seed(dag);
+        }
+        this
+    }
+
+    /// True once every path in the depth range has been handed over.
+    pub fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    /// Prepare the walk for `self.depth`, leaving `seeded` true.
+    fn seed(&mut self, dag: &PredecessorDag) {
+        self.stack.clear();
+        self.nodes.clear();
+        self.edges.clear();
+        self.node_counts.clear();
+        self.edge_set.clear();
+        self.zero_pending = false;
+        self.seeded = true;
+
+        if self.depth == 0 {
+            self.zero_pending = self.source == self.target;
+            return;
+        }
+
+        let key = (self.target, self.accepting_state, self.depth);
+        let Some(&head) = dag.pred_head.get(&key) else {
+            return;
+        };
+
+        self.nodes.push(self.target);
+        if matches!(self.mode, PathMode::Acyclic | PathMode::Simple) {
+            *self.node_counts.entry(self.target).or_insert(0) += 1;
+        }
+        self.stack.push(DfsFrame {
+            vid: self.target,
+            remaining: self.depth,
+            idx: head,
+            descended: false,
+        });
+    }
+
+    /// Advance to the next depth, or finish.
+    fn next_depth(&mut self, dag: &PredecessorDag) {
+        if self.depth >= self.max_depth {
+            self.finished = true;
+            return;
+        }
+        self.depth += 1;
+        self.seed(dag);
+    }
+
+    /// Hand paths to `yield_path` until the range is exhausted, or until the
+    /// callback breaks.
+    ///
+    /// Returns `Continue` when there is nothing left (and [`Self::is_finished`]
+    /// is then true), or `Break` with the walk paused exactly after the path
+    /// the callback rejected.
+    pub fn resume<F>(&mut self, dag: &PredecessorDag, yield_path: &mut F) -> ControlFlow<()>
+    where
+        F: FnMut(&[Vid], &[Eid]) -> ControlFlow<()>,
+    {
+        loop {
+            if self.finished {
+                return ControlFlow::Continue(());
+            }
+            if !self.seeded {
+                self.seed(dag);
+            }
+
+            if self.zero_pending {
+                self.zero_pending = false;
+                let src = self.source;
+                if yield_path(&[src], &[]).is_break() {
+                    return ControlFlow::Break(());
+                }
+            }
+
+            let Some(li) = self.stack.len().checked_sub(1) else {
+                self.next_depth(dag);
+                continue;
+            };
+
+            if self.stack[li].descended {
+                // The child for the current `idx` has finished; undo what was
+                // pushed for it, then step past it in the chain.
+                self.stack[li].descended = false;
+                let node = self.nodes.pop().expect("node pushed with the child frame");
+                let edge = self.edges.pop().expect("edge pushed with the child frame");
+                match self.mode {
+                    PathMode::Trail => {
+                        self.edge_set.remove(&edge);
+                    }
+                    PathMode::Acyclic | PathMode::Simple => {
+                        if let Some(count) = self.node_counts.get_mut(&node) {
+                            *count -= 1;
+                            if *count == 0 {
+                                self.node_counts.remove(&node);
+                            }
+                        }
+                    }
+                    PathMode::Walk => {}
+                }
+                let idx = self.stack[li].idx;
+                self.stack[li].idx = dag.pred_pool[idx as usize].next;
+            }
+
+            let remaining = self.stack[li].remaining;
+            if remaining == 0 {
+                let vid = self.stack[li].vid;
+                self.stack.pop();
+                if vid == self.source {
+                    let fwd_nodes: Vec<Vid> = self.nodes.iter().rev().copied().collect();
+                    let fwd_edges: Vec<Eid> = self.edges.iter().rev().copied().collect();
+                    if yield_path(&fwd_nodes, &fwd_edges).is_break() {
+                        return ControlFlow::Break(());
+                    }
+                }
+                continue;
+            }
+
+            // Walk the chain forward past predecessors the mode rejects.
+            loop {
+                let idx = self.stack[li].idx;
+                if idx < 0 {
+                    break;
+                }
+                let pred = &dag.pred_pool[idx as usize];
+                let skip = match self.mode {
+                    PathMode::Walk => false,
+                    PathMode::Trail => self.edge_set.contains(&pred.eid),
+                    PathMode::Acyclic => self.node_counts.contains_key(&pred.src_vid),
+                    PathMode::Simple => {
+                        // No repeated nodes except source may equal target.
+                        self.node_counts.contains_key(&pred.src_vid)
+                            && !(remaining == 1 && pred.src_vid == self.source)
+                    }
+                };
+                if skip {
+                    self.stack[li].idx = pred.next;
+                } else {
+                    break;
+                }
+            }
+
+            let idx = self.stack[li].idx;
+            if idx < 0 {
+                self.stack.pop();
+                continue;
+            }
+
+            let pred = dag.pred_pool[idx as usize].clone();
+            self.nodes.push(pred.src_vid);
+            self.edges.push(pred.eid);
+            match self.mode {
+                PathMode::Trail => {
+                    self.edge_set.insert(pred.eid);
+                }
+                PathMode::Acyclic | PathMode::Simple => {
+                    *self.node_counts.entry(pred.src_vid).or_insert(0) += 1;
+                }
+                PathMode::Walk => {}
+            }
+            self.stack[li].descended = true;
+
+            let child_head = dag
+                .pred_head
+                .get(&(pred.src_vid, pred.src_state, remaining - 1))
+                .copied()
+                .unwrap_or(-1);
+            self.stack.push(DfsFrame {
+                vid: pred.src_vid,
+                remaining: remaining - 1,
+                idx: child_head,
+                descended: false,
+            });
+        }
     }
 }

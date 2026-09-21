@@ -235,6 +235,7 @@ impl PreparedQuery {
                     Some(tx.id_reservoir.clone()),
                     snapshot,
                     self.cancel.clone(),
+                    None,
                 )
                 .await;
         }
@@ -428,6 +429,9 @@ impl PreparedLocy {
             // has no enclosing scope to inherit; `PreparedLocyBinder` is where
             // a per-execution token would attach.
             cancel: crate::api::impl_query::CancelScope::default(),
+            // No per-call override on this path; the database
+            // setting applies.
+            max_memory: None,
         };
         engine
             .evaluate_compiled_with_config(compiled, &config)

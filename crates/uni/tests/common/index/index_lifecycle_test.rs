@@ -473,3 +473,65 @@ async fn the_flush_time_index_build_does_not_repeat() -> Result<()> {
 
     Ok(())
 }
+
+/// `row_count_at_build` must be populated by the paths that actually build
+/// indexes, not only by the rebuild manager.
+///
+/// It has exactly one consumer: the growth trigger in
+/// `IndexRebuildManager::labels_needing_rebuild`, gated on `Some(..)`. Every
+/// `IndexManager` path used to leave it `None` and defer to the rebuild
+/// manager, but `apply()`'s synchronous rebuild and the flush-time build both
+/// go through `IndexManager` and never reach that manager — so the field stayed
+/// empty and the trigger silently never fired. Growth is the only size-based
+/// trigger enabled by default (`growth_trigger_ratio: 0.5`, `max_index_age:
+/// None`), so an index built this way could grow without bound unnoticed.
+///
+/// `last_built_at` is the control: it was already being set on this path, so if
+/// it is missing the index never built and a missing row count would prove
+/// nothing.
+#[tokio::test]
+async fn index_build_records_the_row_count_it_indexed() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = dir.path().join("store");
+    let db = Uni::open(store.to_string_lossy()).build().await?;
+
+    db.schema()
+        .label("Foo")
+        .property("name", uni_db::DataType::String)
+        .index("name", uni_db::IndexType::Scalar(uni_db::ScalarType::BTree))
+        .done()
+        .apply()
+        .await?;
+
+    let tx = db.session().tx().await?;
+    for i in 0..200 {
+        tx.execute_with("CREATE (:Foo {name: $n})")
+            .param("n", format!("n{i}"))
+            .run()
+            .await?;
+    }
+    tx.commit().await?;
+    db.flush().await?;
+
+    let meta = db
+        .schema_manager()
+        .schema()
+        .indexes
+        .first()
+        .map(|i| i.metadata().clone())
+        .expect("one index");
+
+    assert!(
+        meta.last_built_at.is_some(),
+        "control: the index never built, so a missing row count would say nothing"
+    );
+    assert_eq!(
+        meta.row_count_at_build,
+        Some(200),
+        "a built index must record the number of rows it indexed, or the growth \
+         trigger that reads this field can never fire for it"
+    );
+
+    db.shutdown().await?;
+    Ok(())
+}

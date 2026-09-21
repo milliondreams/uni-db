@@ -5868,7 +5868,7 @@ impl QueryPlanner {
 
                         // Compute iteration bounds from range
                         let hops_per_iter = qpp_step_infos.len();
-                        const QPP_DEFAULT_MAX_HOPS: usize = 100;
+                        use crate::query::df_graph::traverse::DEFAULT_MAX_HOPS as QPP_DEFAULT_MAX_HOPS;
                         let (min_iter, max_iter) = if let Some(range) = range {
                             let min = range.min.unwrap_or(1) as usize;
                             let max = range
@@ -6324,7 +6324,7 @@ impl QueryPlanner {
 
             let is_variable_length = params.rel.range.is_some();
 
-            const DEFAULT_MAX_HOPS: usize = 100;
+            use crate::query::df_graph::traverse::DEFAULT_MAX_HOPS;
             let (min_hops, max_hops) = if let Some(range) = &params.rel.range {
                 let min = range.min.unwrap_or(1) as usize;
                 let max = range.max.map(|m| m as usize).unwrap_or(DEFAULT_MAX_HOPS);

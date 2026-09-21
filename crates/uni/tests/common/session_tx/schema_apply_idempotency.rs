@@ -146,3 +146,287 @@ async fn load_dedups_legacy_bloated_catalog() {
         db.shutdown().await.unwrap();
     }
 }
+
+// ---------------------------------------------------------------------------
+// Issue #286 — re-applying an unchanged schema once the entity holds rows.
+// ---------------------------------------------------------------------------
+
+/// The suite above re-applies schemas but never writes a row, which is why
+/// #286 shipped: the guard it trips only runs when the entity is populated.
+///
+/// `SchemaBuilder::property` defaults to NOT NULL, and a NOT NULL property
+/// declared on a populated entity is deliberately recorded as nullable, since
+/// existing rows have no value for it. That adjustment used to run on every
+/// declaration, including for a property already in the catalog — so a label
+/// declared while empty recorded NOT NULL, and the next identical `apply()`
+/// rewrote the declaration to nullable and collided with the recorded value.
+/// A store could not be reopened by an app that re-registers its schema, which
+/// is the documented pattern.
+///
+/// The empty-label control is what isolates the row count as the trigger
+/// rather than re-declaration itself.
+async fn declare_person(db: &Uni) -> Result<(), uni_db::UniError> {
+    db.schema()
+        .label("Person")
+        .property("name", DataType::String) // NOT NULL by default
+        .done()
+        .apply()
+        .await
+        .map(|_| ())
+}
+
+#[tokio::test]
+async fn reapplying_an_unchanged_schema_after_writing_rows_succeeds() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = dir.path().join("store");
+
+    {
+        let db = Uni::open(store.to_string_lossy()).build().await.unwrap();
+        declare_person(&db).await.expect("first apply");
+        let tx = db.session().tx().await.unwrap();
+        tx.execute("CREATE (p:Person {name: 'ada'})").await.unwrap();
+        tx.commit().await.unwrap();
+        db.shutdown().await.unwrap();
+    }
+
+    let db = Uni::open(store.to_string_lossy()).build().await.unwrap();
+    declare_person(&db)
+        .await
+        .expect("re-applying an unchanged schema to a populated label (issue #286)");
+
+    assert!(
+        !db.schema_manager().schema().properties["Person"]["name"].nullable,
+        "the recorded declaration must survive re-registration unchanged"
+    );
+    db.shutdown().await.unwrap();
+}
+
+/// Control for the above: identical flow, no rows. Passed pre-fix, so it is
+/// what distinguishes "populated" from "re-declaration" as the trigger.
+#[tokio::test]
+async fn reapplying_an_unchanged_schema_on_an_empty_label_succeeds() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = dir.path().join("store");
+
+    {
+        let db = Uni::open(store.to_string_lossy()).build().await.unwrap();
+        declare_person(&db).await.expect("first apply");
+        db.shutdown().await.unwrap();
+    }
+
+    let db = Uni::open(store.to_string_lossy()).build().await.unwrap();
+    declare_person(&db)
+        .await
+        .expect("re-apply on an empty label");
+    db.shutdown().await.unwrap();
+}
+
+/// Edge-type properties go through the same declaration path — the code keys
+/// on a single `label_or_type` — so they need the same guarantee.
+#[tokio::test]
+async fn reapplying_an_unchanged_edge_type_after_writing_rows_succeeds() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = dir.path().join("store");
+
+    async fn declare(db: &Uni) -> Result<(), uni_db::UniError> {
+        db.schema()
+            .label("Person")
+            .property("name", DataType::String)
+            .done()
+            .edge_type("KNOWS", &["Person"], &["Person"])
+            .property("since", DataType::String) // NOT NULL by default
+            .done()
+            .apply()
+            .await
+            .map(|_| ())
+    }
+
+    {
+        let db = Uni::open(store.to_string_lossy()).build().await.unwrap();
+        declare(&db).await.expect("first apply");
+        let tx = db.session().tx().await.unwrap();
+        tx.execute(
+            "CREATE (a:Person {name: 'ada'}), (b:Person {name: 'bob'}), \
+             (a)-[:KNOWS {since: '2020'}]->(b)",
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        db.shutdown().await.unwrap();
+    }
+
+    let db = Uni::open(store.to_string_lossy()).build().await.unwrap();
+    declare(&db)
+        .await
+        .expect("re-applying an unchanged edge-type property to a populated edge type");
+    db.shutdown().await.unwrap();
+}
+
+/// The adjustment itself must survive: a genuinely NEW NOT NULL property on a
+/// populated label is still recorded as nullable, and re-applying that same
+/// schema is still a no-op rather than a conflict against the value it just
+/// recorded. This is the case that worked before the fix and must keep working
+/// — narrowing the guard to new properties could easily have broken it.
+#[tokio::test]
+async fn a_new_not_null_property_on_a_populated_label_is_nullable_and_reappliable() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = dir.path().join("store");
+
+    async fn declare_two(db: &Uni) -> Result<(), uni_db::UniError> {
+        db.schema()
+            .label("Person")
+            .property("name", DataType::String)
+            .property("email", DataType::String) // added later, NOT NULL by default
+            .done()
+            .apply()
+            .await
+            .map(|_| ())
+    }
+
+    {
+        let db = Uni::open(store.to_string_lossy()).build().await.unwrap();
+        declare_person(&db).await.expect("first apply");
+        let tx = db.session().tx().await.unwrap();
+        tx.execute("CREATE (p:Person {name: 'ada'})").await.unwrap();
+        tx.commit().await.unwrap();
+        // The flush is load-bearing, not incidental. The guard consults
+        // `materialized_row_count`, which counts L1 rows only — a committed but
+        // unflushed row leaves the label looking empty, and the property is
+        // then recorded NOT NULL. So whether this adjustment fires depends on
+        // flush timing, which is worth knowing but is not what this test pins.
+        db.flush().await.unwrap();
+        // `email` is new, and the label already has a materialized row with no
+        // value for it.
+        declare_two(&db)
+            .await
+            .expect("add a property to a populated label");
+        assert!(
+            db.schema_manager().schema().properties["Person"]["email"].nullable,
+            "a NOT NULL property added to a populated label is recorded nullable"
+        );
+        db.shutdown().await.unwrap();
+    }
+
+    let db = Uni::open(store.to_string_lossy()).build().await.unwrap();
+    declare_two(&db)
+        .await
+        .expect("re-declaring NOT NULL over the nullable value this path recorded");
+    assert!(
+        db.schema_manager().schema().properties["Person"]["email"].nullable,
+        "re-registration must not flip the recorded value"
+    );
+    db.shutdown().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Re-applying a schema must not rebuild indexes that are already built.
+// ---------------------------------------------------------------------------
+
+/// The `already_present` guard above exists so that re-registering an unchanged
+/// schema does not rebuild every index (issue #63: KB-open took minutes). It
+/// compared the stored definition to the declared one with `==`, and
+/// `IndexDefinition`'s derived `PartialEq` includes lifecycle `metadata` —
+/// status, `last_built_at`, `row_count_at_build` — which only the storage layer
+/// writes, after a build. A declaration always carries the default, so from the
+/// moment an index was actually built the two could never compare equal and the
+/// guard was dead.
+///
+/// `last_built_at` is the witness: it moves if and only if a rebuild ran. The
+/// assertion that the index was built in the first place is the control —
+/// without it this passes trivially on a store where nothing was ever indexed.
+#[tokio::test]
+async fn reapplying_a_schema_does_not_rebuild_an_already_built_index() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = dir.path().join("store");
+    let db = Uni::open(store.to_string_lossy()).build().await.unwrap();
+
+    apply_canonical_schema(&db).await;
+
+    let tx = db.session().tx().await.unwrap();
+    for i in 0..200 {
+        tx.execute_with("CREATE (:Foo {name: $n})")
+            .param("n", format!("n{i}"))
+            .run()
+            .await
+            .unwrap();
+    }
+    tx.commit().await.unwrap();
+    db.flush().await.unwrap();
+
+    let built_at = |db: &Uni| {
+        db.schema_manager()
+            .schema()
+            .indexes
+            .first()
+            .and_then(|i| i.metadata().last_built_at)
+    };
+
+    let before = built_at(&db);
+    assert!(
+        before.is_some(),
+        "control: the index was never built, so a preserved timestamp would \
+         prove nothing"
+    );
+
+    // Any rebuild stamps `Utc::now()`, so give the clock room to differ.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    apply_canonical_schema(&db).await;
+
+    assert_eq!(
+        built_at(&db),
+        before,
+        "re-applying an unchanged schema rebuilt an already-built index; the \
+         guard compares declared-vs-stored and must ignore lifecycle metadata"
+    );
+    assert_eq!(
+        db.schema_manager().schema().indexes.len(),
+        1,
+        "the stored definition should be left alone, not re-upserted"
+    );
+
+    db.shutdown().await.unwrap();
+}
+
+/// The other half: a genuine configuration change must still rebuild. Without
+/// this, "never rebuild" would satisfy the test above.
+#[tokio::test]
+async fn changing_an_index_config_still_rebuilds() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = dir.path().join("store");
+    let db = Uni::open(store.to_string_lossy()).build().await.unwrap();
+
+    apply_canonical_schema(&db).await; // Scalar(Hash)
+
+    let tx = db.session().tx().await.unwrap();
+    tx.execute("CREATE (:Foo {name: 'a'})").await.unwrap();
+    tx.commit().await.unwrap();
+    db.flush().await.unwrap();
+
+    let built_at = |db: &Uni| {
+        db.schema_manager()
+            .schema()
+            .indexes
+            .first()
+            .and_then(|i| i.metadata().last_built_at)
+    };
+    let before = built_at(&db);
+    assert!(before.is_some(), "control: the index was never built");
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    db.schema()
+        .label("Foo")
+        .property("name", DataType::String)
+        .index("name", IndexType::Scalar(ScalarType::BTree)) // was Hash
+        .done()
+        .apply()
+        .await
+        .unwrap();
+
+    assert_ne!(
+        built_at(&db),
+        before,
+        "a changed index configuration must still trigger a rebuild"
+    );
+
+    db.shutdown().await.unwrap();
+}

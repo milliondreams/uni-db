@@ -199,24 +199,57 @@ impl<'a> SchemaBuilder<'a> {
                     // then matches what the data can actually support, rather
                     // than asserting a constraint every existing row violates.
                     // (NOT NULL is enforced forward, at write time, either way.)
-                    let rows = self
-                        .db
-                        .inner
-                        .storage
-                        .materialized_row_count(&label_or_type)
-                        .await
-                        .map_err(UniError::Internal)?;
-                    let effective_nullable = if nullable || rows == 0 {
-                        nullable
-                    } else {
-                        tracing::warn!(
-                            entity = %label_or_type,
-                            property = %name,
-                            rows,
-                            "declaring a NOT NULL property on a populated entity; \
-                             recording it as nullable because existing rows have no value"
-                        );
-                        true
+                    //
+                    // That adjustment applies only to a property being added.
+                    // Applying it to one already in the catalog was issue #286:
+                    // a label declared while empty recorded NOT NULL, and every
+                    // later re-declaration of the same unchanged schema was
+                    // rewritten to nullable and then collided with the recorded
+                    // value, so a store could not be reopened once it held rows.
+                    // `declare_property` decides idempotency by comparing the
+                    // declaration against the stored one, so anything that
+                    // rewrites the declaration first defeats that check.
+                    let existing_nullable = manager
+                        .schema()
+                        .properties
+                        .get(&label_or_type)
+                        .and_then(|props| props.get(&name))
+                        .map(|meta| meta.nullable);
+                    let effective_nullable = match existing_nullable {
+                        // Recorded nullable, now re-declared NOT NULL: this is
+                        // the adjustment below, already applied on an earlier
+                        // open. Keep the recorded value so re-registering the
+                        // same schema stays a no-op.
+                        Some(true) if !nullable => true,
+                        // Otherwise pass the declaration through untouched and
+                        // let `declare_property` judge it — identical is a
+                        // no-op, a genuine change still errors (issue #137).
+                        Some(_) => nullable,
+                        // New property: relax NOT NULL only if rows exist that
+                        // cannot satisfy it. Counting rows here rather than
+                        // above also keeps re-registration off the row-count
+                        // path entirely.
+                        None => {
+                            let rows = self
+                                .db
+                                .inner
+                                .storage
+                                .materialized_row_count(&label_or_type)
+                                .await
+                                .map_err(UniError::Internal)?;
+                            if nullable || rows == 0 {
+                                nullable
+                            } else {
+                                tracing::warn!(
+                                    entity = %label_or_type,
+                                    property = %name,
+                                    rows,
+                                    "declaring a NOT NULL property on a populated entity; \
+                                     recording it as nullable because existing rows have no value"
+                                );
+                                true
+                            }
+                        }
                     };
                     manager
                         .declare_property(
@@ -258,17 +291,30 @@ impl<'a> SchemaBuilder<'a> {
                     // the same schema is the documented "register on every
                     // KB-open" pattern, and rebuilding all indexes per
                     // re-apply is what made KB-open take minutes (issue
-                    // rustic-ai/uni-db#63). The `add_index` call below is
-                    // upsert-by-name, so it stays cheap regardless.
+                    // rustic-ai/uni-db#63).
+                    //
+                    // Compare configuration only. `IndexDefinition`'s derived
+                    // `PartialEq` includes lifecycle `metadata`, which only the
+                    // storage layer sets after a build, while a declaration
+                    // always carries the default. Comparing with `==` therefore
+                    // reported "different" for every index that had actually
+                    // been built, so this guard stopped working the moment it
+                    // mattered and #63's rebuild-per-open came back.
+                    //
+                    // When the config matches, leave the stored definition
+                    // alone: `add_index` is upsert-by-name and would replace it
+                    // with this metadata-less declaration, discarding the
+                    // build status and timestamp that the index-lifecycle
+                    // reporting reads.
                     let already_present = manager
                         .get_index(idx.name())
-                        .is_some_and(|existing| existing == idx);
-                    manager
-                        .add_index(idx.clone())
-                        .map_err(|e| UniError::Schema {
-                            message: e.to_string(),
-                        })?;
+                        .is_some_and(|existing| existing.same_config_as(&idx));
                     if !already_present {
+                        manager
+                            .add_index(idx.clone())
+                            .map_err(|e| UniError::Schema {
+                                message: e.to_string(),
+                            })?;
                         indexes_to_build.push(idx.label().to_string());
                     }
                 }

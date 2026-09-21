@@ -5293,7 +5293,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b1e4910d3a9137442723dfb772c32dc10674c4181ca078d2fd227cd5dce9db0"
 dependencies = [
  "bincode",
- "derive_more 2.1.1",
+ "derive_more 0.99.20",
  "iai-callgrind-macros",
  "iai-callgrind-runner",
 ]
@@ -5304,7 +5304,7 @@ version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4d03775318d3f9f01b39ac6612b01464006dc397a654a89dd57df2fd34fb68c3"
 dependencies = [
- "derive_more 2.1.1",
+ "derive_more 0.99.20",
  "proc-macro-error2",
  "proc-macro2",
  "quote",
@@ -9042,8 +9042,8 @@ version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
- "heck 0.5.0",
- "itertools 0.14.0",
+ "heck 0.4.1",
+ "itertools 0.13.0",
  "log",
  "multimap",
  "petgraph 0.8.3",
@@ -9062,7 +9062,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -11025,7 +11025,7 @@ version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5f103c50866b8743da9429b8a581d81a27c2d3a9c4ac7df8f8571c1dd7896eda"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -12483,7 +12483,7 @@ checksum = "eeba86d422ce181a719445e51872fa30f1f7413b62becb52e95ec91aa262d85c"
 
 [[package]]
 name = "uni-algo"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -12503,7 +12503,7 @@ dependencies = [
 
 [[package]]
 name = "uni-btic"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "chrono",
  "proptest",
@@ -12513,7 +12513,7 @@ dependencies = [
 
 [[package]]
 name = "uni-bulk"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -12533,7 +12533,7 @@ dependencies = [
 
 [[package]]
 name = "uni-cli"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -12553,7 +12553,7 @@ dependencies = [
 
 [[package]]
 name = "uni-common"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "anyhow",
  "arrow-schema",
@@ -12576,7 +12576,7 @@ dependencies = [
 
 [[package]]
 name = "uni-crdt"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "proptest",
  "rmp-serde",
@@ -12591,7 +12591,7 @@ dependencies = [
 
 [[package]]
 name = "uni-cypher"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "pest",
  "pest_derive",
@@ -12603,7 +12603,7 @@ dependencies = [
 
 [[package]]
 name = "uni-db"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -12672,7 +12672,7 @@ dependencies = [
 
 [[package]]
 name = "uni-fork"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -12692,7 +12692,7 @@ dependencies = [
 
 [[package]]
 name = "uni-locy"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "async-trait",
  "candle-core",
@@ -12708,7 +12708,7 @@ dependencies = [
 
 [[package]]
 name = "uni-locy-oracle"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "anyhow",
  "proptest",
@@ -12719,7 +12719,7 @@ dependencies = [
 
 [[package]]
 name = "uni-locy-tck"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -12746,7 +12746,7 @@ dependencies = [
 
 [[package]]
 name = "uni-plugin"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -12784,7 +12784,7 @@ dependencies = [
 
 [[package]]
 name = "uni-plugin-apoc-core"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -12805,7 +12805,7 @@ dependencies = [
 
 [[package]]
 name = "uni-plugin-builtin"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -12834,7 +12834,7 @@ dependencies = [
 
 [[package]]
 name = "uni-plugin-conformance"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "semver",
  "serde",
@@ -12846,7 +12846,7 @@ dependencies = [
 
 [[package]]
 name = "uni-plugin-custom"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -12869,7 +12869,7 @@ dependencies = [
 
 [[package]]
 name = "uni-plugin-extism"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -12897,7 +12897,7 @@ dependencies = [
 
 [[package]]
 name = "uni-plugin-host"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -12934,7 +12934,7 @@ dependencies = [
 
 [[package]]
 name = "uni-plugin-pyo3"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -12960,7 +12960,7 @@ dependencies = [
 
 [[package]]
 name = "uni-plugin-rhai"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -12991,7 +12991,7 @@ dependencies = [
 
 [[package]]
 name = "uni-plugin-wasm"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -13021,7 +13021,7 @@ dependencies = [
 
 [[package]]
 name = "uni-plugin-wasm-rt"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -13034,7 +13034,7 @@ dependencies = [
 
 [[package]]
 name = "uni-python"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -13060,7 +13060,7 @@ dependencies = [
 
 [[package]]
 name = "uni-python-cuda"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -13083,7 +13083,7 @@ dependencies = [
 
 [[package]]
 name = "uni-python-metal"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -13106,7 +13106,7 @@ dependencies = [
 
 [[package]]
 name = "uni-python-onnx"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -13129,7 +13129,7 @@ dependencies = [
 
 [[package]]
 name = "uni-python-onnx-cuda"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -13152,7 +13152,7 @@ dependencies = [
 
 [[package]]
 name = "uni-python-onnx-metal"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -13175,7 +13175,7 @@ dependencies = [
 
 [[package]]
 name = "uni-query"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -13225,7 +13225,7 @@ dependencies = [
 
 [[package]]
 name = "uni-query-functions"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -13257,7 +13257,7 @@ dependencies = [
 
 [[package]]
 name = "uni-sidecar"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -13267,7 +13267,7 @@ dependencies = [
 
 [[package]]
 name = "uni-sparse-vector"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "proptest",
  "serde",
@@ -13276,7 +13276,7 @@ dependencies = [
 
 [[package]]
 name = "uni-store"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -13321,7 +13321,7 @@ dependencies = [
 
 [[package]]
 name = "uni-tck"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -13345,9 +13345,9 @@ dependencies = [
 
 [[package]]
 name = "uni-xervo"
-version = "0.18.0"
+version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df6aa243c90ef296663188ba67a8802a24a16d7c00ca25b664b4727f7399e862"
+checksum = "9dc8809e7480c10fbf97746161e3adbb8af1271de69d8438fec1bda1deee3201"
 dependencies = [
  "anyhow",
  "async-trait",

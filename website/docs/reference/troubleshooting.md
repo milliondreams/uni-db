@@ -465,6 +465,50 @@ uni query "PROFILE MATCH (p:Paper)-[:CITES]->(c) RETURN COUNT(c)" --path ./stora
    LIMIT 1000
    ```
 
+4. **Stop asking for whole paths.** A variable-length pattern only expands
+   individual paths when the query binds one. Returning endpoints skips that
+   work entirely, and on a graph with cycles the difference is not marginal —
+   the number of distinct paths grows combinatorially with the hop bound while
+   the underlying search does not.
+
+   ```cypher
+   // Expensive: every distinct path is built
+   MATCH p = (a:Paper)-[:CITES*1..6]->(b) RETURN p
+
+   // Cheap: same search, no path expansion
+   MATCH (a:Paper)-[:CITES*1..6]->(b) RETURN DISTINCT b
+   ```
+
+   If you want *one* path rather than all of them, use `shortestPath`, which
+   stops at the first one it finds.
+
+#### A Path Query Times Out or Exhausts Memory
+
+**Symptom:** `MATCH p = (a)-[:R*]->(b) RETURN p` (or `count(p)`) fails with a
+timeout or a `ResourcesExhausted` error, while the same pattern returning
+endpoints succeeds.
+
+**Cause:** This is path *expansion*, not the graph search. Over a cyclic graph
+the set of distinct paths is combinatorial, so the query is asking for an
+unbounded amount of work. The error names whichever declared limit stopped it.
+
+**Solutions, in order of effectiveness:**
+
+1. **Return endpoints instead of `p`** — see above. Usually this is the whole fix.
+2. **Add a `LIMIT`.** It stops the expansion rather than trimming its output, so
+   a small limit costs a small amount of work. Note the floor: the graph search
+   still runs in full, and the limit applies a batch (8192 rows) at a time, so
+   any limit up to 8192 costs the same.
+3. **Write an upper hop bound** — `[*1..6]` rather than `[*]`. Remember an
+   omitted bound means 100, not infinity.
+4. **Raise the ceiling** only once the above are exhausted:
+   `query_with(...).max_memory(...)` / `.timeout(...)`.
+
+**If rows come back with a warning** about a safety cap instead, that is a
+different condition: the *search* was abandoned and the results are incomplete.
+Narrow the pattern with a hop bound, a relationship type, or a label on the
+target.
+
 #### High Memory Usage
 
 **Symptom:** Process using more memory than expected.

@@ -625,6 +625,7 @@ impl crate::api::UniInner {
         &self,
         cypher: &str,
         params: HashMap<String, ApiValue>,
+        max_memory: Option<usize>,
     ) -> Result<(QueryResult, ProfileOutput)> {
         let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
         let (ast, tt_spec) = split_time_travel(ast);
@@ -637,12 +638,13 @@ impl crate::api::UniInner {
             return Box::pin(
                 self.pinned_at(&spec)
                     .await?
-                    .profile_ast_internal(ast, cypher, params),
+                    .profile_ast_internal(ast, cypher, params, max_memory),
             )
             .await;
         }
 
-        self.profile_ast_internal(ast, cypher, params).await
+        self.profile_ast_internal(ast, cypher, params, max_memory)
+            .await
     }
 
     async fn profile_ast_internal(
@@ -650,12 +652,24 @@ impl crate::api::UniInner {
         ast: uni_cypher::ast::Query,
         cypher: &str,
         params: HashMap<String, ApiValue>,
+        max_memory: Option<usize>,
     ) -> Result<(QueryResult, ProfileOutput)> {
         let planner = self.base_planner();
         let logical_plan = self.plan_and_rewrite(&planner, ast, cypher)?;
 
         let mut executor = uni_query::Executor::new(self.storage.clone());
-        executor.set_config(self.config.clone());
+        // A profile that accepted `.max_memory(..)` and ignored it would be a
+        // setter that writes a field nothing reads -- the defect class #284 was
+        // about. Both profile paths took the database config unconditionally
+        // until now.
+        executor.set_config(match max_memory {
+            Some(limit) => {
+                let mut cfg = self.config.clone();
+                cfg.max_query_memory = limit;
+                cfg
+            }
+            None => self.config.clone(),
+        });
         self.apply_session_executor_state(&mut executor);
 
         let projection_order = extract_projection_order(&logical_plan);
@@ -939,6 +953,16 @@ impl crate::api::UniInner {
     /// Execute a Cypher query with a private transaction L0 buffer.
     /// The tx_l0 is installed on the executor so both reads and mutations
     /// are routed through the caller's private L0 (commit-time serialization).
+    /// `max_memory` overrides `UniConfig::max_query_memory` for this query
+    /// alone, which is how `TxQueryBuilder::max_memory` binds. `None` keeps the
+    /// database-wide ceiling. The session path carries a whole `UniConfig` for
+    /// the same purpose; an `Option<usize>` is enough here because nothing else
+    /// on this path is overridable, and it keeps the executor-template fast
+    /// path — the reason this entry point exists — untouched when unset.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "transaction read path already carries the full tx context"
+    )]
     pub(crate) async fn execute_internal_with_tx_l0(
         &self,
         cypher: &str,
@@ -947,6 +971,7 @@ impl crate::api::UniInner {
         id_reservoir: Option<Arc<uni_store::runtime::TxIdReservoir>>,
         read_snapshot: Option<uni_store::runtime::SnapshotView>,
         cancel: CancelScope,
+        max_memory: Option<usize>,
     ) -> Result<QueryResult> {
         let total_start = Instant::now();
 
@@ -1034,6 +1059,16 @@ impl crate::api::UniInner {
         // The manual `Clone` impl installs a fresh `warnings` Mutex so
         // each query gets its own warnings accumulator.
         let mut executor = (*self.executor_template).clone();
+        // A per-query memory ceiling has to reach the executor's config before
+        // execution: the DataFusion pool is built from
+        // `config.max_query_memory` at plan time, so setting it afterwards
+        // would bound nothing. Only done when overridden, so the common path
+        // keeps the template's config untouched.
+        if let Some(limit) = max_memory {
+            let mut cfg = self.config.clone();
+            cfg.max_query_memory = limit;
+            executor.set_config(cfg);
+        }
         // Per-query state.
         if let Ok(reg) = self.custom_functions.read()
             && !reg.is_empty()
@@ -1087,7 +1122,11 @@ impl crate::api::UniInner {
         // Adding it to the cursor without adding it here would have handed the
         // transaction surface a fresh asymmetry — streaming stricter than
         // materializing — which is the shape of defect this work removes.
-        enforce_memory_limit(&results, self.config.max_query_memory, cypher)?;
+        enforce_memory_limit(
+            &results,
+            max_memory.unwrap_or(self.config.max_query_memory),
+            cypher,
+        )?;
 
         let columns = columns_for_results(&results, projection_order)?;
         let rows = rows_for_results(results, &columns, true);
@@ -1122,6 +1161,7 @@ impl crate::api::UniInner {
         tx_l0: std::sync::Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>,
         id_reservoir: Option<Arc<uni_store::runtime::TxIdReservoir>>,
         read_snapshot: Option<uni_store::runtime::SnapshotView>,
+        max_memory: Option<usize>,
     ) -> Result<(QueryResult, ProfileOutput)> {
         let ast = uni_cypher::parse(cypher).map_err(into_parse_error)?;
 
@@ -1138,7 +1178,18 @@ impl crate::api::UniInner {
         let logical_plan = self.plan_and_rewrite(&planner, ast, cypher)?;
 
         let mut executor = uni_query::Executor::new(self.storage.clone());
-        executor.set_config(self.config.clone());
+        // A profile that accepted `.max_memory(..)` and ignored it would be a
+        // setter that writes a field nothing reads -- the defect class #284 was
+        // about. Both profile paths took the database config unconditionally
+        // until now.
+        executor.set_config(match max_memory {
+            Some(limit) => {
+                let mut cfg = self.config.clone();
+                cfg.max_query_memory = limit;
+                cfg
+            }
+            None => self.config.clone(),
+        });
         self.apply_session_executor_state(&mut executor);
         executor.set_transaction_l0(tx_l0);
         executor.set_read_snapshot(read_snapshot);

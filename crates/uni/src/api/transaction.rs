@@ -448,6 +448,7 @@ impl Transaction {
             Some(self.id_reservoir.clone()),
             self.read_snapshot(),
             self.cancel_scope(None),
+            None,
         );
         uni_query::maybe_scope_with_principal(principal, fut).await
     }
@@ -550,6 +551,7 @@ impl Transaction {
             params: HashMap::new(),
             cancellation_token: None,
             timeout: None,
+            max_memory: None,
         }
     }
 
@@ -985,6 +987,9 @@ impl Transaction {
             collect_derive: false,
             read_snapshot: self.read_snapshot(),
             cancel: self.cancel_scope(None),
+            // No per-call override on this path; the database
+            // setting applies.
+            max_memory: None,
         };
         engine.evaluate(program).await
     }
@@ -1631,6 +1636,7 @@ impl Transaction {
             Some(self.id_reservoir.clone()),
             self.read_snapshot(),
             cancel,
+            None,
         );
         let result = with_optional_timeout(timeout, fut).await?;
         let after = self.snapshot_l0();
@@ -1828,6 +1834,7 @@ impl<'a> ExecuteBuilder<'a> {
             self.tx.tx_l0.clone(),
             Some(self.tx.id_reservoir.clone()),
             self.tx.read_snapshot(),
+            None,
         );
         let (result, profile) = with_optional_timeout(self.timeout, fut).await?;
         let after = self.tx.snapshot_l0();
@@ -1845,6 +1852,7 @@ pub struct TxQueryBuilder<'a> {
     params: HashMap<String, Value>,
     cancellation_token: Option<CancellationToken>,
     timeout: Option<Duration>,
+    max_memory: Option<usize>,
 }
 
 impl<'a> TxQueryBuilder<'a> {
@@ -1863,6 +1871,18 @@ impl<'a> TxQueryBuilder<'a> {
     /// Set maximum execution time for this query.
     pub fn timeout(mut self, duration: Duration) -> Self {
         self.timeout = Some(duration);
+        self
+    }
+
+    /// Cap the memory this query may use, overriding
+    /// `UniConfig::max_query_memory` for this call alone.
+    ///
+    /// The session builder has had this since #284; the transaction one was the
+    /// only combination of {session, tx} x {Cypher, Locy} without it, which
+    /// left the shape that needs a ceiling most — a long-running read inside a
+    /// write transaction — with no way to set one.
+    pub fn max_memory(mut self, bytes: usize) -> Self {
+        self.max_memory = Some(bytes);
         self
     }
 
@@ -1891,6 +1911,36 @@ impl<'a> TxQueryBuilder<'a> {
         tx.mark_on_err(self.fetch_all_inner().await)
     }
 
+    /// Run the query with profiling, returning the rows together with
+    /// per-operator timings and memory.
+    ///
+    /// The read-path counterpart of [`ExecuteBuilder::profile`], and the
+    /// transaction counterpart of `Session::query_with(..).profile()`. Until
+    /// this existed the only transaction profiler was on `ExecuteBuilder`, so a
+    /// *read* inside a transaction could not be profiled at all.
+    ///
+    /// Honours `timeout` and `max_memory` set on this builder.
+    pub async fn profile(self) -> Result<(QueryResult, ProfileOutput)> {
+        let tx = self.tx;
+        tx.mark_on_err(self.profile_inner().await)
+    }
+
+    /// Inner body of [`Self::profile`]; the public method wraps the result in
+    /// `mark_on_err` so any failure poisons the transaction (bug #15).
+    async fn profile_inner(self) -> Result<(QueryResult, ProfileOutput)> {
+        self.tx.check_completed()?;
+        self.tx.run_exec_guards(&self.cypher, &self.params).await?;
+        let fut = self.tx.db.profile_internal_with_tx_l0(
+            &self.cypher,
+            self.params,
+            self.tx.tx_l0.clone(),
+            Some(self.tx.id_reservoir.clone()),
+            self.tx.read_snapshot(),
+            self.max_memory,
+        );
+        with_optional_timeout(self.timeout, fut).await
+    }
+
     /// Inner body of [`Self::fetch_all`]; the public method wraps the result in
     /// `mark_on_err` so any failure poisons the transaction (bug #15).
     async fn fetch_all_inner(self) -> Result<QueryResult> {
@@ -1904,6 +1954,7 @@ impl<'a> TxQueryBuilder<'a> {
             Some(self.tx.id_reservoir.clone()),
             self.tx.read_snapshot(),
             cancel,
+            self.max_memory,
         );
         with_optional_timeout(self.timeout, fut).await
     }
@@ -1936,6 +1987,9 @@ impl<'a> TxQueryBuilder<'a> {
         let mut config = self.tx.db.config.clone();
         if let Some(t) = self.timeout {
             config.query_timeout = t;
+        }
+        if let Some(m) = self.max_memory {
+            config.max_query_memory = m;
         }
 
         self.tx

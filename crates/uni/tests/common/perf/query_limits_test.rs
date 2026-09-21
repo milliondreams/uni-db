@@ -2,8 +2,8 @@
 // Copyright 2024-2026 Dragonscale Team
 
 use anyhow::Result;
-use std::time::Duration;
-use uni_db::Uni;
+use std::time::{Duration, Instant};
+use uni_db::{DataType, Uni};
 
 #[tokio::test]
 async fn test_query_timeout() -> Result<()> {
@@ -70,6 +70,100 @@ async fn test_query_memory_limit() -> Result<()> {
     assert!(
         err_msg.contains("GraphScanExec"),
         "expected the scan's own reservation to refuse: {err_msg}"
+    );
+
+    Ok(())
+}
+
+/// The transaction Cypher builder honours `.max_memory()`.
+///
+/// It was the only one of {session, tx} x {Cypher, Locy} without the knob,
+/// which left the shape that needs a ceiling most -- a long-running read inside
+/// a write transaction -- with no way to set one. The assertion follows
+/// `test_query_memory_limit` in requiring the operator's own reservation to
+/// refuse, rather than accepting the post-hoc materialized-result message: a
+/// ceiling that only bites after the rows exist is a report, not a limit.
+#[tokio::test]
+async fn test_tx_query_builder_honours_max_memory() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema().label("Node").apply().await?;
+
+    let tx = db.session().tx().await?;
+    for _ in 0..100 {
+        tx.execute("CREATE (:Node)").await?;
+    }
+    tx.commit().await?;
+
+    let session = db.session();
+    let tx = session.tx().await?;
+    let res = tx
+        .query_with("MATCH (n:Node) RETURN n")
+        .max_memory(100)
+        .fetch_all()
+        .await;
+
+    assert!(res.is_err(), "a 100-byte ceiling must refuse this query");
+    let err_msg = res.err().unwrap().to_string();
+    assert!(
+        err_msg.contains("GraphScanExec"),
+        "expected the scan's own reservation to refuse: {err_msg}"
+    );
+
+    Ok(())
+}
+
+/// Control for the above: the same query under a workable ceiling must succeed.
+///
+/// Without it, a build that refused every transaction read would satisfy the
+/// test above.
+#[tokio::test]
+async fn test_tx_query_builder_max_memory_leaves_a_fitting_query_alone() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema().label("Node").apply().await?;
+
+    let tx = db.session().tx().await?;
+    for _ in 0..100 {
+        tx.execute("CREATE (:Node)").await?;
+    }
+    tx.commit().await?;
+
+    let session = db.session();
+    let tx = session.tx().await?;
+    let rows = tx
+        .query_with("MATCH (n:Node) RETURN n")
+        .max_memory(256 * 1024 * 1024)
+        .fetch_all()
+        .await?;
+
+    assert_eq!(rows.rows().len(), 100);
+    Ok(())
+}
+
+/// `TxQueryBuilder::profile()` -- the read-path counterpart of
+/// `ExecuteBuilder::profile()`, which only ever covered writes.
+#[tokio::test]
+async fn test_tx_query_builder_profiles_a_read() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema().label("Node").apply().await?;
+
+    let tx = db.session().tx().await?;
+    for _ in 0..10 {
+        tx.execute("CREATE (:Node)").await?;
+    }
+    tx.commit().await?;
+
+    let session = db.session();
+    let tx = session.tx().await?;
+    let (result, profile) = tx
+        .query_with("MATCH (n:Node) RETURN count(n) AS c")
+        .profile()
+        .await?;
+
+    let count: i64 = result.rows()[0].get("c")?;
+    assert_eq!(count, 10);
+    assert!(
+        !profile.runtime_stats.is_empty(),
+        "a profile with no operator stats is not a profile"
     );
 
     Ok(())
@@ -317,8 +411,10 @@ async fn test_tx_cursor_honours_cancellation_token() -> Result<()> {
 
 #[tokio::test]
 async fn test_tx_cursor_enforces_configured_memory_limit() -> Result<()> {
-    // `TxQueryBuilder` has no `.max_memory()`, so the ceiling comes from
-    // `UniConfig`. It was inert on both tx terminals.
+    // The ceiling here comes from `UniConfig` rather than the builder. That is
+    // now a choice rather than the only option -- `TxQueryBuilder` has gained
+    // `.max_memory()` -- and the config route is worth keeping covered, since
+    // it is what a caller who never touches the builder relies on.
     let mut config = uni_db::UniConfig::default();
     config.max_query_memory = 100;
     let db = seeded_db_with_config(config).await?;
@@ -2383,4 +2479,356 @@ async fn a_traversal_reserves_the_target_read_it_shares() -> Result<()> {
     assert_eq!(ok.rows().len(), 1, "the control query must answer");
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Issue #285 / #284 — bounding variable-length path enumeration.
+// ---------------------------------------------------------------------------
+
+/// Builds a small strongly-connected graph: `n` entities, each with `out`
+/// outgoing edges. Cycles are the point — trail counts explode with them, and
+/// mutual cross-holdings are ordinary in the corporate-ownership data this came
+/// from.
+async fn cyclic_graph(db: &Uni, n: usize, out: usize) {
+    db.schema()
+        .label("Entity")
+        .property("uid", DataType::String)
+        .done()
+        .edge_type("OWNS", &["Entity"], &["Entity"])
+        .done()
+        .apply()
+        .await
+        .unwrap();
+
+    let tx = db.session().tx().await.unwrap();
+    for i in 0..n {
+        tx.execute_with("CREATE (:Entity {uid: $u})")
+            .param("u", format!("e{i}"))
+            .run()
+            .await
+            .unwrap();
+    }
+    for i in 0..n {
+        for k in 0..out {
+            let dst = (i * 7 + k * 13 + 1) % n;
+            tx.execute_with(
+                "MATCH (a:Entity {uid: $a}), (b:Entity {uid: $b}) CREATE (a)-[:OWNS]->(b)",
+            )
+            .param("a", format!("e{i}"))
+            .param("b", format!("e{dst}"))
+            .run()
+            .await
+            .unwrap();
+        }
+    }
+    tx.commit().await.unwrap();
+}
+
+/// An unbounded variable-length path over a cyclic graph must fail against its
+/// memory limit rather than growing until the OS intervenes (issue #285).
+///
+/// The BFS is cheap and terminates; the cost is the enumeration that follows
+/// it, which keeps a node path and an edge path per trail. The stream reserved
+/// for that set only *after* building it, so the pool could never refuse it —
+/// which is also why `max_memory` overshot by 12x (issue #284). The budget
+/// inside the enumeration is what makes the limit bind.
+///
+/// The bounded arm is the control: same graph, same query shape, an upper hop
+/// bound. It must still succeed, or this test would pass on a build that simply
+/// refused all variable-length queries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unbounded_variable_length_path_is_bounded_by_max_memory() {
+    let db = Uni::in_memory().build().await.unwrap();
+    cyclic_graph(&db, 30, 3).await;
+
+    let bounded = db
+        .session()
+        .query_with("MATCH p=(a:Entity)-[:OWNS*1..4]->(b:Entity) RETURN count(p) AS n")
+        .max_memory(256 * 1024 * 1024)
+        .fetch_all()
+        .await;
+    let bounded = bounded.expect("control: a hop-bounded path query must still succeed");
+    let counted: i64 = bounded.rows()[0].get("n").unwrap();
+    assert!(
+        counted > 0,
+        "control: the bounded query found no paths, so the graph is not cyclic \
+         enough for the unbounded arm to mean anything"
+    );
+
+    let err = db
+        .session()
+        .query_with("MATCH p=(a:Entity)-[:OWNS*]->(b:Entity) RETURN count(p) AS n")
+        .max_memory(64 * 1024 * 1024)
+        .fetch_all()
+        .await
+        .expect_err("an unbounded path query over a cyclic graph must hit a limit");
+
+    // Which limit stops it changed with #285, and the change was the point.
+    //
+    // This used to exhaust the pool, because the operator built a source
+    // vertex's entire path set before it could emit anything. It now
+    // enumerates in bounded batches, so memory stays inside the budget and the
+    // deadline is what stops it. Counting every path of an unbounded pattern
+    // over a cyclic graph is unbounded *work*, so a clock bound is the honest
+    // one; the assertion is that some declared limit stops it, which is the
+    // guarantee that matters. That `max_memory` still binds on this operator
+    // is asserted directly by `locy_max_memory_bounds_the_evaluation` (which
+    // trips inside `GraphVariableLengthTraverse[enumeration]`) and by
+    // `a_chunking_traversal_accounts_for_its_retained_expansions`.
+    let msg = err.to_string();
+    let lowered = msg.to_lowercase();
+    assert!(
+        msg.contains("Resources exhausted")
+            || lowered.contains("memory")
+            || lowered.contains("timed out"),
+        "the failure must name a declared limit, not surface as something else: {msg}"
+    );
+}
+
+/// Issue #285, the other half: the same unbounded pattern under a `LIMIT`
+/// must *answer*, not hit a limit at all.
+///
+/// Before the enumeration could be paused, a `LIMIT` bought nothing — the
+/// operator built every path a source vertex owned inside a single poll, so
+/// `LIMIT 5` cost exactly what no limit cost and died the same way. Measured on
+/// a 852-entity sanctions-shaped graph: a 30s timeout before, ~4s and five rows
+/// after.
+///
+/// This is the arm that would catch the fix regressing. The arm above only says
+/// the query is *stopped* by something, which a build with no laziness at all
+/// still satisfies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unbounded_path_query_under_a_limit_answers() {
+    let db = Uni::in_memory().build().await.unwrap();
+    cyclic_graph(&db, 30, 3).await;
+
+    for limit in [1usize, 7, 40] {
+        let rows = db
+            .session()
+            .query_with(&format!(
+                "MATCH p=(a:Entity)-[:OWNS*]->(b:Entity) RETURN length(p) AS hops LIMIT {limit}"
+            ))
+            .max_memory(64 * 1024 * 1024)
+            .fetch_all()
+            .await
+            .unwrap_or_else(|e| panic!("unbounded pattern with LIMIT {limit} must answer: {e}"));
+        assert_eq!(
+            rows.rows().len(),
+            limit,
+            "LIMIT {limit} over an unbounded pattern returned the wrong row count"
+        );
+    }
+}
+
+/// Issue #284: `locy_with` had no `max_memory`, while `query_with` did.
+///
+/// Locy has always run through the same DataFusion planner and so has always
+/// been bounded by the database-level `max_query_memory` — what it lacked was
+/// the per-evaluation knob. A setter that writes a field nothing reads would
+/// satisfy an API-surface check while changing nothing, which has happened on
+/// this builder before (its `cancellation_token` did exactly that), so this
+/// asserts the bound actually binds: the error must name the pool size that was
+/// asked for, not the database default.
+///
+/// The bound is 2 MB rather than the 32 MB this was first written with. Since
+/// #285 the variable-length operator enumerates paths in bounded batches
+/// instead of building a source vertex's whole path set at once, so this shape
+/// no longer *reaches* 32 MB — it is the same knob, asked at a size the work
+/// still exceeds. What the assertion checks is unchanged: the figure in the
+/// error is the one this call asked for, not the database default.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn locy_max_memory_bounds_the_evaluation() {
+    let db = Uni::in_memory().build().await.unwrap();
+    cyclic_graph(&db, 30, 3).await;
+
+    let err = db
+        .session()
+        .locy_with("MATCH p=(a:Entity)-[:OWNS*]->(b:Entity) RETURN count(p) AS n")
+        .max_memory(2 * 1024 * 1024)
+        .run()
+        .await
+        .expect_err("an unbounded path query must hit the configured memory bound");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("2.0 MB"),
+        "the evaluation was bounded by something other than the requested 2 MB \
+         — a setter that is not read would fail exactly here: {msg}"
+    );
+}
+
+/// Control for the above: the same limit on a program that fits must succeed,
+/// so the test above cannot pass merely because the limit breaks everything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn locy_max_memory_leaves_a_fitting_program_alone() {
+    let db = Uni::in_memory().build().await.unwrap();
+    cyclic_graph(&db, 30, 3).await;
+
+    let result = db
+        .session()
+        .locy_with("MATCH (a:Entity) RETURN count(a) AS n")
+        .max_memory(32 * 1024 * 1024)
+        .run()
+        .await;
+    assert!(
+        result.is_ok(),
+        "a program that fits within the bound must still run: {:?}",
+        result.err()
+    );
+}
+
+/// Issue #283: `locy_with(..).timeout(..)` did not bound execution.
+///
+/// The Locy budget was consulted only between strata, between fixpoint
+/// iterations and in the SLG loop. A program that crossed none of those
+/// boundaries ran to completion and reported nothing — a complete result and no
+/// error, which is worse than a slow one. The budget also never reached the
+/// operators: `LocyEngine` handed the executor the *database* config, so the
+/// deadline every operator checks was `db.query_timeout` and a 2s Locy budget
+/// was invisible to all of them.
+///
+/// This drives work that lives inside a graph operator — path enumeration — so
+/// the deadline has somewhere to be observed. The wall-clock bound is generous
+/// relative to the 2s budget because the check is amortized across a stride of
+/// enumerated paths; it is still far below the several seconds the same query
+/// takes unbounded, which the control establishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn locy_timeout_interrupts_work_inside_an_operator() {
+    let db = Uni::in_memory().build().await.unwrap();
+    cyclic_graph(&db, 30, 3).await;
+
+    let started = Instant::now();
+    let err = db
+        .session()
+        .locy_with("MATCH p=(a:Entity)-[:OWNS*]->(b:Entity) RETURN count(p) AS n")
+        .timeout(Duration::from_secs(2))
+        .run()
+        .await
+        .expect_err("a 2s budget must stop this, not describe it afterwards");
+    let elapsed = started.elapsed();
+
+    let msg = err.to_string();
+    assert!(
+        msg.to_lowercase().contains("timed out") || msg.to_lowercase().contains("timeout"),
+        "expected a timeout, got: {msg}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the budget was reported rather than enforced: {elapsed:?}"
+    );
+}
+
+/// Issue #283: a timeout must stop a query, not describe it afterwards.
+///
+/// A pipeline-breaking operator — here the aggregate under `count(*)` —
+/// consumes its whole input inside one `poll_next`, so the per-batch check in
+/// the collecting loop above it runs once at the start and once after the work
+/// is over. `tokio::time::timeout` cannot preempt it either, because a
+/// CPU-bound span that never yields never lets the timer run. What was left was
+/// an `Instant::now() > deadline` test after the rows existed: a report, not a
+/// limit. `DeadlineGuardExec` puts a checkpoint on the pull path beneath the
+/// breaker, where the polling still repeats.
+///
+/// The wall-clock assertion is what makes this test mean anything — the query
+/// returned the right answer before, just twenty seconds late. The control
+/// establishes the query is genuinely slow, so a fast failure is enforcement
+/// rather than the fixture being trivial.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deadline_is_enforced_under_a_pipeline_breaking_operator() {
+    let db = Uni::in_memory().build().await.unwrap();
+    db.schema()
+        .label("Entity")
+        .property("uid", DataType::String)
+        .done()
+        .apply()
+        .await
+        .unwrap();
+    let tx = db.session().tx().await.unwrap();
+    for i in 0..600 {
+        tx.execute_with("CREATE (:Entity {uid: $u})")
+            .param("u", format!("e{i}"))
+            .run()
+            .await
+            .unwrap();
+    }
+    tx.commit().await.unwrap();
+
+    // Three-way cartesian under an aggregate: 600^3 rows to count.
+    const SLOW: &str = "MATCH (a:Entity),(b:Entity),(c:Entity) RETURN count(*) AS n";
+
+    // The guard is actually in this plan. Without this, a fast failure could
+    // come from anywhere and the test would still be green.
+    let session = db.session();
+    crate::plan_shape::assert_plan_uses(&session, SLOW, "DeadlineGuardExec").await;
+
+    let started = Instant::now();
+    let err = db
+        .session()
+        .query_with(SLOW)
+        .timeout(Duration::from_secs(2))
+        .fetch_all()
+        .await
+        .expect_err("a 2s timeout must stop this query");
+    let elapsed = started.elapsed();
+
+    assert!(
+        err.to_string().to_lowercase().contains("time"),
+        "expected a timeout, got: {err}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the deadline was reported rather than enforced: {elapsed:?}"
+    );
+}
+
+/// Issue #283, the Locy half: `locy_with(..).timeout(..)` on the same shape.
+///
+/// Two things kept this unbounded after the Cypher side was fixed. No guard was
+/// inserted, because `ReadSetRecordingExec` sits over every clause body under
+/// SSI and the subtree test refused to insert anywhere beneath one. And the
+/// Locy budget never reached the operators at all, which the engine's
+/// `executor_config` now handles.
+///
+/// The `query_with` sibling above covers the Cypher path; this pins that the
+/// Locy path is bounded on the *same* query, since it was the one that reported
+/// nothing whatsoever — a complete result after sixteen seconds against a
+/// two-second budget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_locy_deadline_is_enforced_on_a_pipeline_breaking_plan() {
+    let db = Uni::in_memory().build().await.unwrap();
+    db.schema()
+        .label("Entity")
+        .property("uid", DataType::String)
+        .done()
+        .apply()
+        .await
+        .unwrap();
+    let tx = db.session().tx().await.unwrap();
+    for i in 0..600 {
+        tx.execute_with("CREATE (:Entity {uid: $u})")
+            .param("u", format!("e{i}"))
+            .run()
+            .await
+            .unwrap();
+    }
+    tx.commit().await.unwrap();
+
+    let started = Instant::now();
+    let err = db
+        .session()
+        .locy_with("MATCH (a:Entity),(b:Entity),(c:Entity) RETURN count(*) AS n")
+        .timeout(Duration::from_secs(2))
+        .run()
+        .await
+        .expect_err("a 2s budget must stop this, not return a complete result");
+    let elapsed = started.elapsed();
+
+    assert!(
+        err.to_string().to_lowercase().contains("time"),
+        "expected a timeout, got: {err}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the budget was ignored rather than enforced: {elapsed:?}"
+    );
 }

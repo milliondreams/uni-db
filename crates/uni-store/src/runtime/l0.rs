@@ -659,6 +659,11 @@ impl L0Buffer {
                 vid,
                 properties: properties.clone(),
                 labels: labels.to_vec(),
+                // Both stamped with this write's `now`; replay applies
+                // `or_insert` to `created_at`, reproducing the live
+                // "oldest wins" rule in `apply_vertex_write`.
+                created_at: Some(now),
+                updated_at: Some(now),
             });
         }
 
@@ -767,6 +772,11 @@ impl L0Buffer {
                 vid,
                 properties: properties.clone(),
                 labels: labels.to_vec(),
+                // Both stamped with this write's `now`; replay applies
+                // `or_insert` to `created_at`, reproducing the live
+                // "oldest wins" rule in `apply_vertex_write`.
+                created_at: Some(now),
+                updated_at: Some(now),
             });
         }
 
@@ -865,13 +875,17 @@ impl L0Buffer {
         self.edge_types.insert(eid, edge_type);
     }
 
-    pub fn delete_vertex(&mut self, vid: Vid) -> Result<()> {
+    /// Returns the edge tombstones the cascade produced, so a caller holding
+    /// the `AdjacencyManager` can mirror them (see
+    /// `Writer::mirror_cascaded_tombstones`). Callers that only need the L0
+    /// effect may discard the value.
+    pub fn delete_vertex(&mut self, vid: Vid) -> Result<Vec<TombstoneEntry>> {
         self.delete_vertex_impl(vid, false)
     }
 
     /// Core vertex deletion. When `skip_wal` is true, skips WAL append
     /// (used during merge where the caller already wrote to WAL).
-    fn delete_vertex_impl(&mut self, vid: Vid, skip_wal: bool) -> Result<()> {
+    fn delete_vertex_impl(&mut self, vid: Vid, skip_wal: bool) -> Result<Vec<TombstoneEntry>> {
         self.current_version += 1;
 
         if !skip_wal && let Some(wal) = &mut self.wal {
@@ -879,14 +893,20 @@ impl L0Buffer {
             wal.append(Mutation::DeleteVertex { vid, labels })?;
         }
 
-        self.apply_vertex_deletion(vid);
-        Ok(())
+        Ok(self.apply_vertex_deletion(vid))
     }
 
     /// Cascade-delete a vertex: tombstone all connected edges and remove the vertex.
     ///
     /// Shared between `delete_vertex` (live mutations) and `replay_mutations` (WAL recovery).
-    fn apply_vertex_deletion(&mut self, vid: Vid) {
+    ///
+    /// Returns the edge tombstones created by the cascade. They are the L0 half
+    /// of a two-place write: the adjacency overlay holds the other half, and a
+    /// caller with access to the `AdjacencyManager` must mirror these or the
+    /// deleted vertex's edges stay live in traversals until the next flush.
+    /// Returning them is what keeps that caller from re-deriving the incident
+    /// set and drifting from this one.
+    fn apply_vertex_deletion(&mut self, vid: Vid) -> Vec<TombstoneEntry> {
         let version = self.current_version;
 
         // Collect edges to delete using O(degree) neighbors() instead of O(E) scan
@@ -903,20 +923,20 @@ impl L0Buffer {
         }
 
         let cascaded_edges_count = edges_to_remove.len();
+        let mut cascaded = Vec::with_capacity(cascaded_edges_count);
 
         // Tombstone and remove all collected edges
         for eid in edges_to_remove {
             // Retrieve edge endpoints from the map to create tombstone
             if let Some((src, dst, etype)) = self.edge_endpoints.get(&eid) {
-                self.tombstones.insert(
+                let entry = TombstoneEntry {
                     eid,
-                    TombstoneEntry {
-                        eid,
-                        src_vid: *src,
-                        dst_vid: *dst,
-                        edge_type: *etype,
-                    },
-                );
+                    src_vid: *src,
+                    dst_vid: *dst,
+                    edge_type: *etype,
+                };
+                cascaded.push(entry.clone());
+                self.tombstones.insert(eid, entry);
                 self.edge_versions.insert(eid, version);
                 self.edge_endpoints.remove(&eid);
                 self.edge_properties.remove(&eid);
@@ -952,6 +972,8 @@ impl L0Buffer {
 
         // 64 bytes per edge tombstone + 8 for vertex tombstone
         self.estimated_size += cascaded_edges_count * 72 + 8;
+
+        cascaded
     }
 
     pub fn insert_edge(
@@ -999,6 +1021,8 @@ impl L0Buffer {
                 version: self.current_version,
                 properties: properties.clone(),
                 edge_type_name: edge_type_name.clone(),
+                created_at: Some(now),
+                updated_at: Some(now),
             })?;
         }
 
@@ -1053,6 +1077,8 @@ impl L0Buffer {
                 version: self.current_version,
                 properties: properties.clone(),
                 edge_type_name: edge_type_name.clone(),
+                created_at: Some(now),
+                updated_at: Some(now),
             })?;
         }
 
@@ -1435,7 +1461,8 @@ impl L0Buffer {
         Ok(())
     }
 
-    pub fn merge(&mut self, other: &L0Buffer) -> Result<()> {
+    /// Returns the cascaded edge tombstones; see [`L0Buffer::merge_take`].
+    pub fn merge(&mut self, other: &L0Buffer) -> Result<Vec<TombstoneEntry>> {
         // Validate-then-apply: reject a merge that would bail on a tombstoned
         // edge endpoint before mutating anything, so a failed merge can never
         // leave a partially-applied (non-atomic) commit.
@@ -1455,7 +1482,11 @@ impl L0Buffer {
     /// merge. The caller must not rely on `other.vertex_properties` /
     /// `other.edge_properties` afterwards, which is safe on the commit path
     /// because committing consumes the transaction.
-    pub fn merge_take(&mut self, other: &mut L0Buffer) -> Result<()> {
+    /// Returns the edge tombstones produced by cascading deletes against
+    /// `self`. These are edges that live in the main buffer and were never
+    /// touched by `other`, so the caller's tx-scoped adjacency mirror cannot
+    /// see them — it must mirror these separately.
+    pub fn merge_take(&mut self, other: &mut L0Buffer) -> Result<Vec<TombstoneEntry>> {
         // Validate BEFORE draining: the endpoint check consults
         // `other.vertex_properties` (the "re-inserted by other" exemption).
         self.validate_merge_edge_endpoints(other)?;
@@ -1472,7 +1503,7 @@ impl L0Buffer {
         other: &L0Buffer,
         vertex_props: HashMap<Vid, Properties>,
         mut edge_props: HashMap<Eid, Properties>,
-    ) -> Result<()> {
+    ) -> Result<Vec<TombstoneEntry>> {
         trace!(
             other_mutation_count = other.mutation_count,
             "Merging L0 buffer"
@@ -1481,8 +1512,9 @@ impl L0Buffer {
         // wrote every one of these mutations to WAL before invoking merge —
         // re-appending here would double the WAL volume per commit.
         // Merge Vertices
+        let mut cascaded = Vec::new();
         for &vid in &other.vertex_tombstones {
-            self.delete_vertex_impl(vid, true)?;
+            cascaded.extend(self.delete_vertex_impl(vid, true)?);
         }
 
         for (vid, props) in vertex_props {
@@ -1597,7 +1629,7 @@ impl L0Buffer {
             self.pending_embeddings.insert(*vid, label.clone());
         }
 
-        Ok(())
+        Ok(cascaded)
     }
 
     /// Replay mutations from WAL without re-logging them.
@@ -1612,8 +1644,31 @@ impl L0Buffer {
                     vid,
                     properties,
                     labels,
+                    created_at,
+                    updated_at,
                 } => {
-                    // Apply without WAL logging, with CRDT merge semantics
+                    // Apply without WAL logging, with CRDT merge semantics.
+                    //
+                    // This is a hand-written twin of `apply_vertex_write`, not
+                    // a call to it, and the divergence is deliberate but narrow.
+                    // Everything that determines *state* is identical — and is
+                    // pinned by `replay_reconstructs_what_the_live_vertex_write_produced`,
+                    // because this arm has already drifted once: it dropped the
+                    // timestamps, so recovered rows flushed to L1 with a null
+                    // `created_at`. What it deliberately omits is accounting
+                    // that describes work done *by a caller*:
+                    //
+                    //   * `mutation_stats.properties_set` / `labels_added` —
+                    //     these report what a query did; a replayed mutation
+                    //     was performed by a previous process, and counting it
+                    //     here would attribute it to whoever opens the store.
+                    //   * `estimated_size` — feeds the `l0_buffer_size_bytes`
+                    //     gauge and the per-transaction memory cap, neither of
+                    //     which applies to a recovered main buffer. (The flush
+                    //     trigger reads `mutation_count`, which IS incremented
+                    //     below, so recovery still flushes on schedule.)
+                    //
+                    // Anything beyond those two is drift, not design.
                     self.current_version += 1;
                     let version = self.current_version;
 
@@ -1633,6 +1688,17 @@ impl L0Buffer {
                         self.sync_extid_index(vid, old_extid, new_extid);
                     }
                     self.vertex_versions.insert(vid, version);
+                    // Restore the write-time timestamps. `or_insert` on
+                    // `created_at` mirrors `apply_vertex_write` exactly, so
+                    // replaying a create followed by an update keeps the
+                    // creation time. A pre-timestamp WAL segment carries
+                    // `None` and leaves both unset, as before.
+                    if let Some(ts) = created_at {
+                        self.vertex_created_at.entry(vid).or_insert(ts);
+                    }
+                    if let Some(ts) = updated_at {
+                        self.vertex_updated_at.insert(vid, ts);
+                    }
                     self.graph.add_vertex(vid);
                     self.mutation_count += 1;
 
@@ -1687,6 +1753,8 @@ impl L0Buffer {
                     version: _,
                     properties,
                     edge_type_name,
+                    created_at,
+                    updated_at,
                 } => {
                     self.current_version += 1;
                     // Skip-and-warn on the issue-#77 endpoint bail: a pre-fix
@@ -1698,6 +1766,16 @@ impl L0Buffer {
                             // Restore edge type name metadata if present
                             if let Some(name) = edge_type_name {
                                 self.edge_types.insert(eid, name);
+                            }
+                            // Restore the write-time timestamps, mirroring
+                            // `insert_edge_impl`'s `or_insert`/`insert` pair.
+                            // Only on the Ok path: an edge skipped for the
+                            // issue-#77 endpoint bail must leave no trace.
+                            if let Some(ts) = created_at {
+                                self.edge_created_at.entry(eid).or_insert(ts);
+                            }
+                            if let Some(ts) = updated_at {
+                                self.edge_updated_at.insert(eid, ts);
                             }
                         }
                         Err(e) => {
@@ -1730,6 +1808,124 @@ impl L0Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `InsertVertex` replay arm is a hand-written twin of
+    /// `apply_vertex_write` rather than a call to it, so it can drift — and it
+    /// had: the timestamps were dropped, so a vertex recovered from the WAL
+    /// came back with a null `created_at`/`updated_at` that the next flush
+    /// baked into L1. This pins the fields the two paths must agree on, so the
+    /// next field added to one and forgotten in the other fails here instead of
+    /// silently reaching users.
+    #[test]
+    fn replay_reconstructs_what_the_live_vertex_write_produced() -> Result<()> {
+        let vid = Vid::new(1);
+        let mut props = HashMap::new();
+        props.insert("name".to_string(), "ada".into());
+        let labels = vec!["Person".to_string()];
+
+        let mut live = L0Buffer::new(0, None);
+        live.insert_vertex_with_labels(vid, props.clone(), &labels);
+
+        // Fed the record the live path appends, replay must land in the same
+        // place. The timestamps come from `live` because that is exactly what
+        // the WAL now carries.
+        let mut replayed = L0Buffer::new(0, None);
+        replayed.replay_mutations(vec![Mutation::InsertVertex {
+            vid,
+            properties: props,
+            labels,
+            created_at: live.vertex_created_at.get(&vid).copied(),
+            updated_at: live.vertex_updated_at.get(&vid).copied(),
+        }])?;
+
+        assert_eq!(
+            replayed.vertex_properties.get(&vid),
+            live.vertex_properties.get(&vid)
+        );
+        assert_eq!(
+            replayed.vertex_labels.get(&vid),
+            live.vertex_labels.get(&vid)
+        );
+        assert_eq!(
+            replayed.vertex_versions.get(&vid),
+            live.vertex_versions.get(&vid)
+        );
+        assert_eq!(
+            replayed.vertex_created_at.get(&vid),
+            live.vertex_created_at.get(&vid),
+            "replay dropped created_at"
+        );
+        assert_eq!(
+            replayed.vertex_updated_at.get(&vid),
+            live.vertex_updated_at.get(&vid),
+            "replay dropped updated_at"
+        );
+        assert_eq!(
+            replayed.label_to_vids.get("Person"),
+            live.label_to_vids.get("Person")
+        );
+        assert!(replayed.graph.contains_vertex(vid));
+        Ok(())
+    }
+
+    /// Edge counterpart of the above. The edge replay arm *does* share
+    /// `apply_edge_insertion` with the live path, so only what sits outside
+    /// that helper can drift — which is precisely where the timestamps live.
+    #[test]
+    fn replay_reconstructs_what_the_live_edge_write_produced() -> Result<()> {
+        let (src, dst, eid) = (Vid::new(1), Vid::new(2), Eid::new(10));
+
+        let mut live = L0Buffer::new(0, None);
+        live.insert_vertex(src, HashMap::new());
+        live.insert_vertex(dst, HashMap::new());
+        live.insert_edge(src, dst, 0, eid, HashMap::new(), Some("KNOWS".to_string()))?;
+
+        let mut replayed = L0Buffer::new(0, None);
+        replayed.replay_mutations(vec![
+            Mutation::InsertVertex {
+                vid: src,
+                properties: HashMap::new(),
+                labels: vec![],
+                created_at: live.vertex_created_at.get(&src).copied(),
+                updated_at: live.vertex_updated_at.get(&src).copied(),
+            },
+            Mutation::InsertVertex {
+                vid: dst,
+                properties: HashMap::new(),
+                labels: vec![],
+                created_at: live.vertex_created_at.get(&dst).copied(),
+                updated_at: live.vertex_updated_at.get(&dst).copied(),
+            },
+            Mutation::InsertEdge {
+                src_vid: src,
+                dst_vid: dst,
+                edge_type: 0,
+                eid,
+                version: live.edge_versions.get(&eid).copied().unwrap_or(0),
+                properties: HashMap::new(),
+                edge_type_name: Some("KNOWS".to_string()),
+                created_at: live.edge_created_at.get(&eid).copied(),
+                updated_at: live.edge_updated_at.get(&eid).copied(),
+            },
+        ])?;
+
+        assert_eq!(
+            replayed.edge_endpoints.get(&eid),
+            live.edge_endpoints.get(&eid)
+        );
+        assert_eq!(replayed.edge_types.get(&eid), live.edge_types.get(&eid));
+        assert_eq!(
+            replayed.edge_created_at.get(&eid),
+            live.edge_created_at.get(&eid),
+            "replay dropped created_at"
+        );
+        assert_eq!(
+            replayed.edge_updated_at.get(&eid),
+            live.edge_updated_at.get(&eid),
+            "replay dropped updated_at"
+        );
+        Ok(())
+    }
 
     #[test]
     fn test_l0_buffer_ops() -> Result<()> {
@@ -1961,6 +2157,8 @@ mod tests {
             vid,
             properties: props1,
             labels: vec![],
+            created_at: None,
+            updated_at: None,
         }])?;
 
         // Second mutation: insert same vertex with counter2 (should merge)
@@ -1970,6 +2168,8 @@ mod tests {
             vid,
             properties: props2,
             labels: vec![],
+            created_at: None,
+            updated_at: None,
         }])?;
 
         // Verify CRDT was merged (both node1 and node2 counts present)
@@ -2140,6 +2340,8 @@ mod tests {
                 props
             },
             labels: vec!["Person".to_string(), "User".to_string()],
+            created_at: None,
+            updated_at: None,
         }];
 
         // Replay mutations
@@ -2233,6 +2435,8 @@ mod tests {
                 props
             },
             edge_type_name: Some("KNOWS".to_string()),
+            created_at: None,
+            updated_at: None,
         }];
 
         // Replay mutations
@@ -2270,6 +2474,8 @@ mod tests {
                 version: 1,
                 properties: HashMap::new(),
                 edge_type_name: Some("KNOWS".to_string()),
+                created_at: None,
+                updated_at: None,
             },
             Mutation::InsertEdge {
                 src_vid: Vid::new(2),
@@ -2279,6 +2485,8 @@ mod tests {
                 version: 2,
                 properties: HashMap::new(),
                 edge_type_name: Some("LIKES".to_string()),
+                created_at: None,
+                updated_at: None,
             },
             Mutation::InsertEdge {
                 src_vid: Vid::new(3),
@@ -2288,6 +2496,8 @@ mod tests {
                 version: 3,
                 properties: HashMap::new(),
                 edge_type_name: Some("KNOWS".to_string()),
+                created_at: None,
+                updated_at: None,
             },
         ];
 
@@ -2335,6 +2545,8 @@ mod tests {
                     props
                 },
                 labels: vec!["Person".to_string()],
+                created_at: None,
+                updated_at: None,
             },
             // Insert Bob with Person label
             Mutation::InsertVertex {
@@ -2348,6 +2560,8 @@ mod tests {
                     props
                 },
                 labels: vec!["Person".to_string()],
+                created_at: None,
+                updated_at: None,
             },
             // Create KNOWS edge between them
             Mutation::InsertEdge {
@@ -2358,6 +2572,8 @@ mod tests {
                 version: 3,
                 properties: HashMap::new(),
                 edge_type_name: Some("KNOWS".to_string()),
+                created_at: None,
+                updated_at: None,
             },
         ];
 
@@ -2395,6 +2611,8 @@ mod tests {
             vid,
             properties: HashMap::new(),
             labels: vec![], // Empty labels (old format compatibility)
+            created_at: None,
+            updated_at: None,
         }];
 
         l0.replay_mutations(mutations)?;

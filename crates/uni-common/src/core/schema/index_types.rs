@@ -113,6 +113,27 @@ macro_rules! index_field_accessor {
             pub fn metadata_mut(&mut self) -> &mut IndexMetadata {
                 match self { $(IndexDefinition::$variant(c) => &mut c.metadata,)* }
             }
+
+            /// Compares two definitions by configuration alone, ignoring the
+            /// lifecycle `metadata`.
+            ///
+            /// Use this, not `==`, whenever one side is a *declaration* and the
+            /// other is what is *stored*. `metadata` (status, `last_built_at`,
+            /// `row_count_at_build`) is written only by the storage layer after
+            /// a build, and is part of the derived `PartialEq`. A declaration
+            /// from the schema builder always carries
+            /// `IndexMetadata::default()`, so `==` against a stored definition
+            /// reports "different" for every index that has actually been
+            /// built — which silently defeated the guard that exists to stop
+            /// `apply()` rebuilding every index on every open (issue #63).
+            #[must_use]
+            pub fn same_config_as(&self, other: &Self) -> bool {
+                let mut a = self.clone();
+                let mut b = other.clone();
+                *a.metadata_mut() = IndexMetadata::default();
+                *b.metadata_mut() = IndexMetadata::default();
+                a == b
+            }
         }
     };
 }
@@ -580,4 +601,45 @@ pub enum ScalarIndexType {
     Hash,
     Bitmap,
     LabelList,
+}
+
+#[cfg(test)]
+mod same_config_tests {
+    use super::*;
+
+    fn scalar(name: &str, property: &str) -> IndexDefinition {
+        IndexDefinition::Scalar(ScalarIndexConfig {
+            name: name.to_string(),
+            label: "Foo".to_string(),
+            properties: vec![property.to_string()],
+            index_type: ScalarIndexType::Hash,
+            where_clause: None,
+            metadata: IndexMetadata::default(),
+        })
+    }
+
+    /// Lifecycle metadata is written by the storage layer only, so a stored
+    /// definition that has been built must still match the declaration it came
+    /// from. `==` does not, which is the whole reason this method exists.
+    #[test]
+    fn metadata_differences_are_ignored() {
+        let declared = scalar("idx", "name");
+        let mut stored = declared.clone();
+        stored.metadata_mut().status = IndexStatus::Online;
+        stored.metadata_mut().last_built_at = Some(Utc::now());
+        stored.metadata_mut().row_count_at_build = Some(200);
+
+        assert_ne!(stored, declared, "guard: PartialEq still includes metadata");
+        assert!(stored.same_config_as(&declared));
+        assert!(declared.same_config_as(&stored));
+    }
+
+    /// A real configuration change must still register as different, or the
+    /// rebuild that change requires would never be triggered.
+    #[test]
+    fn configuration_differences_are_reported() {
+        let a = scalar("idx", "name");
+        let b = scalar("idx", "other");
+        assert!(!a.same_config_as(&b));
+    }
 }

@@ -33,6 +33,8 @@ async fn test_wal_lsn_ordering() -> Result<()> {
         vid: Vid::new(100),
         properties: HashMap::new(),
         labels: vec![],
+        created_at: None,
+        updated_at: None,
     })?;
     let lsn1 = wal.flush().await?;
 
@@ -40,6 +42,8 @@ async fn test_wal_lsn_ordering() -> Result<()> {
         vid: Vid::new(101),
         properties: HashMap::new(),
         labels: vec![],
+        created_at: None,
+        updated_at: None,
     })?;
     let lsn2 = wal.flush().await?;
 
@@ -47,6 +51,8 @@ async fn test_wal_lsn_ordering() -> Result<()> {
         vid: Vid::new(102),
         properties: HashMap::new(),
         labels: vec![],
+        created_at: None,
+        updated_at: None,
     })?;
     let lsn3 = wal.flush().await?;
 
@@ -67,6 +73,8 @@ async fn test_wal_replay_since_high_water_mark() -> Result<()> {
         vid: Vid::new(100),
         properties: HashMap::new(),
         labels: vec![],
+        created_at: None,
+        updated_at: None,
     })?;
     let lsn1 = wal.flush().await?;
 
@@ -74,6 +82,8 @@ async fn test_wal_replay_since_high_water_mark() -> Result<()> {
         vid: Vid::new(101),
         properties: HashMap::new(),
         labels: vec![],
+        created_at: None,
+        updated_at: None,
     })?;
     let lsn2 = wal.flush().await?;
 
@@ -81,6 +91,8 @@ async fn test_wal_replay_since_high_water_mark() -> Result<()> {
         vid: Vid::new(102),
         properties: HashMap::new(),
         labels: vec![],
+        created_at: None,
+        updated_at: None,
     })?;
     wal.flush().await?;
 
@@ -113,6 +125,8 @@ async fn test_wal_empty_flush() -> Result<()> {
         vid: Vid::new(100),
         properties: HashMap::new(),
         labels: vec![],
+        created_at: None,
+        updated_at: None,
     })?;
     let lsn1 = wal.flush().await?;
     assert!(lsn1 > 0, "LSN should be positive after flush");
@@ -135,6 +149,8 @@ async fn test_wal_truncate_before_high_water_mark() -> Result<()> {
             vid: Vid::new(100 + i),
             properties: HashMap::new(),
             labels: vec![],
+            created_at: None,
+            updated_at: None,
         })?;
         wal.flush().await?;
     }
@@ -173,6 +189,8 @@ async fn test_wal_initialize_from_existing() -> Result<()> {
                 vid: Vid::new(100 + i),
                 properties: HashMap::new(),
                 labels: vec![],
+                created_at: None,
+                updated_at: None,
             })?;
             wal.flush().await?;
         }
@@ -193,6 +211,8 @@ async fn test_wal_initialize_from_existing() -> Result<()> {
         vid: Vid::new(105),
         properties: HashMap::new(),
         labels: vec![],
+        created_at: None,
+        updated_at: None,
     })?;
     let next_lsn = wal2.flush().await?;
     assert_eq!(next_lsn, 6, "Next LSN should continue from max");
@@ -220,6 +240,8 @@ async fn test_wal_edge_mutations() -> Result<()> {
             .into_iter()
             .collect(),
         edge_type_name: None,
+        created_at: None,
+        updated_at: None,
     })?;
 
     // Delete edge
@@ -279,6 +301,8 @@ async fn test_wal_delete_vertex_mutation() -> Result<()> {
         .into_iter()
         .collect(),
         labels: vec![],
+        created_at: None,
+        updated_at: None,
     })?;
 
     wal.append(Mutation::DeleteVertex {
@@ -312,6 +336,8 @@ async fn test_wal_concurrent_flushes() -> Result<()> {
             vid: Vid::new(100 + i),
             properties: HashMap::new(),
             labels: vec![],
+            created_at: None,
+            updated_at: None,
         })?;
     }
 
@@ -354,6 +380,8 @@ async fn test_wal_flushed_lsn_tracking() -> Result<()> {
         vid: Vid::new(100),
         properties: HashMap::new(),
         labels: vec![],
+        created_at: None,
+        updated_at: None,
     })?;
     wal.flush().await?;
 
@@ -364,6 +392,8 @@ async fn test_wal_flushed_lsn_tracking() -> Result<()> {
         vid: Vid::new(101),
         properties: HashMap::new(),
         labels: vec![],
+        created_at: None,
+        updated_at: None,
     })?;
     wal.flush().await?;
 
@@ -383,6 +413,8 @@ async fn test_wal_full_truncate() -> Result<()> {
             vid: Vid::new(100 + i),
             properties: HashMap::new(),
             labels: vec![],
+            created_at: None,
+            updated_at: None,
         })?;
         wal.flush().await?;
     }
@@ -415,11 +447,15 @@ async fn test_replay_restores_vertex_labels() -> Result<()> {
             vid: Vid::new(100),
             properties: HashMap::new(),
             labels: vec!["Person".to_string(), "User".to_string()],
+            created_at: None,
+            updated_at: None,
         },
         Mutation::InsertVertex {
             vid: Vid::new(101),
             properties: HashMap::new(),
             labels: vec!["Person".to_string()],
+            created_at: None,
+            updated_at: None,
         },
     ];
 
@@ -461,6 +497,8 @@ async fn test_replay_delete_preserves_labels_for_flush() -> Result<()> {
             vid: Vid::new(100),
             properties: HashMap::new(),
             labels: vec!["Person".to_string()],
+            created_at: None,
+            updated_at: None,
         },
         Mutation::DeleteVertex {
             vid: Vid::new(100),
@@ -516,6 +554,148 @@ async fn test_wal_serde_backward_compat_missing_labels() -> Result<()> {
     Ok(())
 }
 
+/// A WAL segment written before `created_at`/`updated_at` existed must still
+/// replay, with both timestamps unset — exactly the behaviour those segments
+/// already had. `#[serde(default)]` is what makes the field additive rather
+/// than a format break; this pins it, as the `labels` test above does.
+#[tokio::test]
+async fn test_wal_serde_backward_compat_missing_timestamps() -> Result<()> {
+    use uni_store::runtime::L0Buffer;
+
+    let old_vertex = r#"{"InsertVertex":{"vid":100,"properties":{},"labels":["Person"]}}"#;
+    let old_edge = r#"{"InsertEdge":{"src_vid":100,"dst_vid":101,"edge_type":0,"eid":1,"version":1,"properties":{}}}"#;
+
+    let vertex: Mutation = serde_json::from_str(old_vertex)?;
+    match &vertex {
+        Mutation::InsertVertex {
+            vid,
+            created_at,
+            updated_at,
+            ..
+        } => {
+            assert_eq!(vid.as_u64(), 100);
+            assert!(
+                created_at.is_none(),
+                "pre-timestamp segment must decode to None"
+            );
+            assert!(
+                updated_at.is_none(),
+                "pre-timestamp segment must decode to None"
+            );
+        }
+        _ => panic!("Expected InsertVertex"),
+    }
+
+    let edge: Mutation = serde_json::from_str(old_edge)?;
+    match &edge {
+        Mutation::InsertEdge {
+            eid,
+            created_at,
+            updated_at,
+            ..
+        } => {
+            assert_eq!(eid.as_u64(), 1);
+            assert!(
+                created_at.is_none(),
+                "pre-timestamp segment must decode to None"
+            );
+            assert!(
+                updated_at.is_none(),
+                "pre-timestamp segment must decode to None"
+            );
+        }
+        _ => panic!("Expected InsertEdge"),
+    }
+
+    // And replay must accept them rather than, say, unwrapping the Option.
+    let mut l0 = L0Buffer::new(0, None);
+    l0.replay_mutations(vec![vertex, edge])?;
+    assert!(
+        !l0.vertex_created_at.contains_key(&Vid::new(100)),
+        "a timestamp-less record must leave the timestamp unset, not invent one"
+    );
+    assert!(
+        !l0.edge_created_at.contains_key(&Eid::new(1)),
+        "a timestamp-less record must leave the timestamp unset, not invent one"
+    );
+
+    Ok(())
+}
+
+/// Timestamps stamped by the live write path must survive a WAL round-trip.
+/// Without this the recovered row carries `None` and the next flush bakes a
+/// permanent null into L1 — silent, and user-visible via `created_at(n)`.
+#[tokio::test]
+async fn test_wal_timestamps_round_trip() -> Result<()> {
+    use uni_store::runtime::L0Buffer;
+
+    let vid = Vid::new(7);
+    let eid = Eid::new(8);
+    let created = 1_700_000_000_000_000_000_i64;
+    let updated = created + 5_000_000_000;
+
+    let mutations = [
+        Mutation::InsertVertex {
+            vid,
+            properties: HashMap::new(),
+            labels: vec!["Person".to_string()],
+            created_at: Some(created),
+            updated_at: Some(updated),
+        },
+        Mutation::InsertVertex {
+            vid: Vid::new(9),
+            properties: HashMap::new(),
+            labels: vec!["Person".to_string()],
+            created_at: Some(created),
+            updated_at: Some(updated),
+        },
+        Mutation::InsertEdge {
+            src_vid: vid,
+            dst_vid: Vid::new(9),
+            edge_type: 0,
+            eid,
+            version: 1,
+            properties: HashMap::new(),
+            edge_type_name: Some("KNOWS".to_string()),
+            created_at: Some(created),
+            updated_at: Some(updated),
+        },
+    ];
+
+    // Through serde, not just in memory: the point is that the WAL carries them.
+    let round_tripped: Vec<Mutation> = mutations
+        .iter()
+        .map(|m| serde_json::to_string(m).and_then(|s| serde_json::from_str(&s)))
+        .collect::<std::result::Result<_, _>>()?;
+
+    let mut l0 = L0Buffer::new(0, None);
+    l0.replay_mutations(round_tripped)?;
+
+    assert_eq!(l0.vertex_created_at.get(&vid).copied(), Some(created));
+    assert_eq!(l0.vertex_updated_at.get(&vid).copied(), Some(updated));
+    assert_eq!(l0.edge_created_at.get(&eid).copied(), Some(created));
+    assert_eq!(l0.edge_updated_at.get(&eid).copied(), Some(updated));
+
+    // `created_at` keeps the oldest value across a re-write of the same vid,
+    // mirroring `apply_vertex_write`'s `or_insert`; `updated_at` takes the newest.
+    let later = updated + 60_000_000_000;
+    l0.replay_mutations(vec![Mutation::InsertVertex {
+        vid,
+        properties: HashMap::new(),
+        labels: vec![],
+        created_at: Some(later),
+        updated_at: Some(later),
+    }])?;
+    assert_eq!(
+        l0.vertex_created_at.get(&vid).copied(),
+        Some(created),
+        "a later write must not move created_at"
+    );
+    assert_eq!(l0.vertex_updated_at.get(&vid).copied(), Some(later));
+
+    Ok(())
+}
+
 /// Test full WAL cycle: append DeleteVertex with labels, flush, replay
 #[tokio::test]
 async fn test_wal_delete_vertex_labels_round_trip() -> Result<()> {
@@ -566,6 +746,8 @@ async fn test_wal_set_vertex_labels_round_trip_replace() -> Result<()> {
         vid,
         properties: HashMap::new(),
         labels: vec!["Person".to_string(), "Admin".to_string()],
+        created_at: None,
+        updated_at: None,
     })?;
     wal.append(Mutation::SetVertexLabels {
         vid,
@@ -627,6 +809,8 @@ async fn test_edge_type_name_wal_roundtrip() -> Result<()> {
         version: 1,
         properties: HashMap::new(),
         edge_type_name: Some("KNOWS".to_string()),
+        created_at: None,
+        updated_at: None,
     })?;
     wal.flush().await?;
 
@@ -692,6 +876,8 @@ async fn test_wal_truncated_tail_segment_skipped() {
         vid: Vid::new(1),
         labels: vec!["Person".to_string()],
         properties: HashMap::new(),
+        created_at: None,
+        updated_at: None,
     })
     .unwrap();
     wal.flush().await.unwrap();
@@ -760,6 +946,8 @@ async fn test_wal_corrupt_middle_segment_fails_recovery() {
         vid: Vid::new(1),
         labels: vec!["Person".to_string()],
         properties: HashMap::new(),
+        created_at: None,
+        updated_at: None,
     })
     .unwrap();
     wal.flush().await.unwrap();
@@ -777,6 +965,8 @@ async fn test_wal_corrupt_middle_segment_fails_recovery() {
         vid: Vid::new(3),
         labels: vec!["Person".to_string()],
         properties: HashMap::new(),
+        created_at: None,
+        updated_at: None,
     })
     .unwrap();
     wal.flush().await.unwrap();
@@ -784,6 +974,8 @@ async fn test_wal_corrupt_middle_segment_fails_recovery() {
         vid: Vid::new(4),
         labels: vec!["Person".to_string()],
         properties: HashMap::new(),
+        created_at: None,
+        updated_at: None,
     })
     .unwrap();
     wal.flush().await.unwrap();
@@ -818,6 +1010,8 @@ async fn test_wal_checksum_mismatch_detected() {
         vid: Vid::new(1),
         labels: vec!["Person".to_string()],
         properties: HashMap::new(),
+        created_at: None,
+        updated_at: None,
     })
     .unwrap();
     wal.flush().await.unwrap();

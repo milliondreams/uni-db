@@ -4,7 +4,7 @@
 
 # Python API — Symbol Reference
 
-Complete symbol surface of the `uni_db` Python bindings, **generated from `bindings/uni-db/uni_db/__init__.pyi`** at version 4.0.0.
+Complete symbol surface of the `uni_db` Python bindings, **generated from `bindings/uni-db/uni_db/__init__.pyi`** at version 4.1.0.
 
 This page is exhaustive and always in sync with the type stubs — it is regenerated in CI. For narrative documentation, worked examples and the recommended patterns, start at the [Python API guide](python-api.md).
 
@@ -276,6 +276,7 @@ Async fluent builder for Locy evaluation on a session.
 | `params(params: dict[str, Any]) -> AsyncSessionLocyBuilder` | — |
 | `timeout(seconds: float) -> AsyncSessionLocyBuilder` | — |
 | `max_iterations(n: int) -> AsyncSessionLocyBuilder` | — |
+| `max_memory(bytes: int) -> AsyncSessionLocyBuilder` | — |
 | `with_config(config: dict[str, Any] | LocyConfig) -> AsyncSessionLocyBuilder` | — |
 | `cancellation_token(token: CancellationToken) -> AsyncSessionLocyBuilder` | — |
 | `async run() -> LocyResult` | — |
@@ -437,6 +438,7 @@ Async fluent builder for Locy evaluation within a transaction.
 | `param(name: str, value: Any) -> AsyncTxLocyBuilder` | — |
 | `timeout(seconds: float) -> AsyncTxLocyBuilder` | — |
 | `max_iterations(n: int) -> AsyncTxLocyBuilder` | — |
+| `max_memory(bytes: int) -> AsyncTxLocyBuilder` | — |
 | `with_config(config: dict[str, Any] | LocyConfig) -> AsyncTxLocyBuilder` | — |
 | `cancellation_token(token: CancellationToken) -> AsyncTxLocyBuilder` | — |
 | `async run() -> LocyResult` | — |
@@ -452,7 +454,9 @@ Async fluent builder for read queries within a transaction.
 |---|---|
 | `param(name: str, value: Any) -> AsyncTxQueryBuilder` | — |
 | `timeout(seconds: float) -> AsyncTxQueryBuilder` | — |
+| `max_memory(bytes: int) -> AsyncTxQueryBuilder` | — |
 | `cancellation_token(token: CancellationToken) -> AsyncTxQueryBuilder` | — |
+| `async profile() -> tuple[QueryResult, ProfileOutput]` | — |
 | `async fetch_all() -> QueryResult` | — |
 | `async fetch_one() -> dict[str, Any] | None` | — |
 | `async execute() -> ExecuteResult` | — |
@@ -1375,6 +1379,7 @@ Result of a Locy program evaluation.
 | `compile_warnings` | `list[dict[str, str]]` |
 | `approximate_groups` | `Any` |
 | `derived_fact_set` | `Any` |
+| `metrics` | `QueryMetrics` |
 
 ---
 
@@ -1885,6 +1890,7 @@ Fluent builder for Locy evaluation on a session.
 | `params(params: dict[str, Any]) -> SessionLocyBuilder` | — |
 | `timeout(seconds: float) -> SessionLocyBuilder` | — |
 | `max_iterations(n: int) -> SessionLocyBuilder` | — |
+| `max_memory(bytes: int) -> SessionLocyBuilder` | — |
 | `with_config(config: dict[str, Any] | LocyConfig) -> SessionLocyBuilder` | — |
 | `cancellation_token(token: CancellationToken) -> SessionLocyBuilder` | — |
 | `run() -> LocyResult` | — |
@@ -2115,6 +2121,7 @@ Fluent builder for Locy evaluation within a transaction.
 | `param(name: str, value: Any) -> TxLocyBuilder` | — |
 | `timeout(seconds: float) -> TxLocyBuilder` | — |
 | `max_iterations(n: int) -> TxLocyBuilder` | — |
+| `max_memory(bytes: int) -> TxLocyBuilder` | — |
 | `with_config(config: dict[str, Any] | LocyConfig) -> TxLocyBuilder` | — |
 | `cancellation_token(token: CancellationToken) -> TxLocyBuilder` | — |
 | `run() -> LocyResult` | — |
@@ -2130,7 +2137,9 @@ Fluent builder for read queries within a transaction.
 |---|---|
 | `param(name: str, value: Any) -> TxQueryBuilder` | — |
 | `timeout(seconds: float) -> TxQueryBuilder` | — |
+| `max_memory(bytes: int) -> TxQueryBuilder` | — |
 | `cancellation_token(token: CancellationToken) -> TxQueryBuilder` | — |
+| `profile() -> tuple[QueryResult, ProfileOutput]` | — |
 | `fetch_all() -> QueryResult` | — |
 | `fetch_one() -> dict[str, Any] | None` | — |
 | `execute() -> ExecuteResult` | — |

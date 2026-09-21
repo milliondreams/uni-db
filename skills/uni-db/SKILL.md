@@ -372,7 +372,7 @@ ON MATCH SET n.last_seen = datetime()
 RETURN n
 ```
 
-**6. Variable-length path:**
+**6. Variable-length path:** (bounded hops, endpoints not `p` -- see gotcha 10)
 ```cypher
 MATCH (a:Person)-[:KNOWS*1..3]->(b:Person)
 WHERE a.name = 'Alice'
@@ -441,7 +441,7 @@ MATCH (a)-[r:KNOWS]->(b) RETURN r, created_at(r), updated_at(r)
 
 9. **Locy rules are NOT standard Datalog** -- Locy has `ALONG`, `FOLD`, `BEST BY`, `PROB`, `DERIVE`, `ASSUME`, `ABDUCE` which do not exist in standard Datalog. IS/IS NOT references invoke other rules. A recursive `FOLD` rolls up **per KEY, one level at a time** -- a self-reference reads the target's folded value, not the derivations behind it. Use `ALONG` for per-path accumulation.
 
-10. **Unbounded variable-length paths** -- `[*]` without an upper bound causes exponential expansion. Always set an upper bound: `[*..5]`.
+10. **Variable-length paths: the cost is *path expansion*, not the search** -- A `[*1..n]` pattern searches the graph, then expands that search into individual paths **only if the query binds a path variable**. On a cyclic graph the number of distinct paths grows combinatorially with the hop bound while the search does not, so `RETURN DISTINCT b` is cheap where `RETURN p` is not. Prefer endpoints; use `shortestPath` when one path will do; a `LIMIT` stops the expansion (but the search still runs in full, and the limit applies one 8192-row batch at a time, so any limit up to 8192 costs the same). Two traps: `[*]` writes no upper bound, so **the planner supplies 100 hops**, and truncating there warns that results are incomplete -- write `[*..5]` when you know the depth; and an unbounded `[*]` binding a path with no `LIMIT` is unbounded work that will hit `query_timeout` or `max_query_memory`.
 
 11. **Always use $param parameters** -- String concatenation in Cypher causes injection risk and prevents plan caching.
 

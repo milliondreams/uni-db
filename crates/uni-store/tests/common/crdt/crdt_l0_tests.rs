@@ -572,12 +572,16 @@ mod wal_replay {
             vid,
             properties: [("counter".to_string(), gcounter_val(&[("node1", 5)]))].into(),
             labels: vec![],
+            created_at: None,
+            updated_at: None,
         }])?;
 
         l0.replay_mutations(vec![Mutation::InsertVertex {
             vid,
             properties: [("counter".to_string(), gcounter_val(&[("node2", 3)]))].into(),
             labels: vec![],
+            created_at: None,
+            updated_at: None,
         }])?;
 
         let stored = l0.vertex_properties.get(&vid).expect("vertex should exist");

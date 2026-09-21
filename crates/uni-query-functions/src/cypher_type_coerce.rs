@@ -498,7 +498,12 @@ pub fn is_entity_struct(t: &DataType) -> bool {
 /// Uses a UDF-based conversion when Arrow cannot perform the cast natively
 /// (e.g., `List<T>` / `LargeList<T>` → `LargeBinary`). Falls back to a
 /// standard Arrow cast for all other type pairs.
-fn coerce_branch_to(expr: DfExpr, from_type: &DataType, target_type: &DataType) -> DfExpr {
+fn coerce_branch_to(
+    expr: DfExpr,
+    from_type: &DataType,
+    target_type: &DataType,
+    schema: &datafusion::common::DFSchema,
+) -> DfExpr {
     if matches!(target_type, DataType::LargeBinary) && !matches!(from_type, DataType::LargeBinary) {
         if matches!(from_type, DataType::List(_) | DataType::LargeList(_)) {
             return super::df_expr::list_to_large_binary_expr(expr);
@@ -506,6 +511,28 @@ fn coerce_branch_to(expr: DfExpr, from_type: &DataType, target_type: &DataType) 
         // Scalar types (Int64, Float64, Utf8, Boolean, etc.) → CypherValue
         return super::df_expr::scalar_to_large_binary_expr(expr);
     }
+
+    // The symmetric direction, which was missing. `find_common_result_type`
+    // applies "any string → Utf8" (Rule 3) before "any LargeBinary →
+    // LargeBinary" (Rule 6), so branches of `[LargeBinary, Utf8]` — which is
+    // what `coalesce(n.name, 'x')` and `CASE … THEN n.name ELSE 'z' END` are
+    // once the entity came through `collect()` + `UNWIND` — resolve to `Utf8`
+    // and then fell through to the Arrow cast below. Casting msgpack-tagged
+    // CypherValue bytes to `Utf8` is exactly the "Encountered non UTF-8 data"
+    // error users saw; decoding them is what the native-bound query effectively
+    // does, so this makes the two encodings agree.
+    //
+    // The up direction above converts through UDFs for the same reason: Arrow
+    // cannot do it natively. Neither can it do this one.
+    if matches!(from_type, DataType::LargeBinary)
+        && !matches!(target_type, DataType::LargeBinary)
+        && super::df_expr::is_decodable_cypher_value(&expr, schema)
+        && let Some(decoded) =
+            super::df_expr::large_binary_to_scalar_expr(expr.clone(), target_type)
+    {
+        return decoded;
+    }
+
     super::df_expr::cast_expr(expr, target_type.clone())
 }
 
@@ -541,7 +568,7 @@ pub(crate) fn coerce_case_results(
             .get_type(schema)
             .map_err(|e| anyhow!("Failed to get THEN type for cast: {}", e))?;
         if then_type != common_type {
-            **then_expr = coerce_branch_to((**then_expr).clone(), &then_type, &common_type);
+            **then_expr = coerce_branch_to((**then_expr).clone(), &then_type, &common_type, schema);
         }
     }
 
@@ -551,7 +578,7 @@ pub(crate) fn coerce_case_results(
             .get_type(schema)
             .map_err(|e| anyhow!("Failed to get ELSE type for cast: {}", e))?;
         if else_type != common_type {
-            **else_expr = coerce_branch_to((**else_expr).clone(), &else_type, &common_type);
+            **else_expr = coerce_branch_to((**else_expr).clone(), &else_type, &common_type, schema);
         }
     }
 

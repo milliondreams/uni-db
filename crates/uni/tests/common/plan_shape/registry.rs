@@ -74,6 +74,15 @@ pub struct Operator {
 pub const MAX_UNPROVEN: usize = 0;
 
 pub const OPERATORS: &[Operator] = &[
+    // ── Measured 2026-09-20 ────────────────────────────────────────────────
+    Operator {
+        ty: "DeadlineGuardExec",
+        runtime_name: "DeadlineGuardExec",
+        status: Status::Proven {
+            by: "a_deadline_is_enforced_under_a_pipeline_breaking_operator",
+            in_file: "crates/uni/tests/common/perf/query_limits_test.rs",
+        },
+    },
     // ── Measured 2026-08-14 ────────────────────────────────────────────────
     Operator {
         ty: "VidLookupJoinExec",

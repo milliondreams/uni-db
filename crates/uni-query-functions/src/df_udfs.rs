@@ -2146,7 +2146,7 @@ impl ScalarUDFImpl for DurationPropertyUdf {
 ///
 /// Converts any Value to its string representation. For temporals,
 /// uses the canonical Display format. For other types, uses natural formatting.
-fn create_tostring_udf() -> ScalarUDF {
+pub fn create_tostring_udf() -> ScalarUDF {
     ScalarUDF::new_from_impl(ToStringUdf::new())
 }
 

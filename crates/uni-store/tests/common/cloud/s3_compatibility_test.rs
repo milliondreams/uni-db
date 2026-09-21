@@ -108,6 +108,8 @@ async fn test_wal_with_object_store() -> Result<()> {
         .into_iter()
         .collect(),
         labels: vec![],
+        created_at: None,
+        updated_at: None,
     };
     wal.append(entry1)?;
 
@@ -120,6 +122,8 @@ async fn test_wal_with_object_store() -> Result<()> {
         .into_iter()
         .collect(),
         labels: vec![],
+        created_at: None,
+        updated_at: None,
     };
     wal.append(entry2)?;
 
@@ -324,6 +328,8 @@ async fn test_wal_large_entries() -> Result<()> {
         .into_iter()
         .collect(),
         labels: vec![],
+        created_at: None,
+        updated_at: None,
     };
 
     wal.append(entry)?;
@@ -359,6 +365,8 @@ async fn test_wal_truncate() -> Result<()> {
             vid: Vid::new(100 + i),
             properties: HashMap::new(),
             labels: vec![],
+            created_at: None,
+            updated_at: None,
         };
         wal.append(entry)?;
     }

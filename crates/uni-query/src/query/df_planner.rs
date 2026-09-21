@@ -2520,6 +2520,24 @@ impl HybridPhysicalPlanner {
         {
             return Some(target_variable.to_string());
         }
+        // A target already in scope is traversed into a temporary
+        // `__rebound_{var}` and reconciled afterwards by a
+        // `{var}._vid = __rebound_{var}._vid` filter, so the bound column is
+        // under the *original* name and the two lookups above both miss it.
+        //
+        // Missing it is not merely a lost optimisation. Without the bound
+        // column the traversal has no endpoint to aim at, so every reachable
+        // vertex is an accepting endpoint and
+        // `MATCH (b {..}) WITH b MATCH p = (a)-[:R*]->(b)` enumerates paths to
+        // all of them -- measured at 23-46 s on a 30-vertex cyclic graph, while
+        // the same pattern with the predicate written inline answers in under a
+        // second.
+        if let Some(original) = target_variable.strip_prefix("__rebound_") {
+            let col = format!("{original}._vid");
+            if input_schema.column_with_name(&col).is_some() {
+                return Some(col);
+            }
+        }
         None
     }
 

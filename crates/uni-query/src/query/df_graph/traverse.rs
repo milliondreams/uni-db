@@ -5428,14 +5428,33 @@ impl GraphVariableLengthTraverseStream {
                     // it. `bound_target_column` is unset even for
                     // `MATCH (b {..}) WITH b MATCH p=(a)-[*]->(b)`, where the
                     // endpoint is enforced by a filter above this operator.
-                    _ if batch.num_rows() == 1 && expected_targets.is_none() => {
-                        let (dag, accepting) = self.exec.build_path_dag(
+                    _ if batch.num_rows() == 1 => {
+                        let (dag, mut accepting) = self.exec.build_path_dag(
                             vid,
                             eid_filters,
                             vertex_filters,
                             &used_eids,
                             vid_filter,
                         );
+                        // A bound endpoint is applied to the *accepting set*
+                        // rather than to the rows enumeration produces.
+                        //
+                        // Two things follow. The pause below becomes safe: the
+                        // loop further down filters enumerated paths against
+                        // the bound target, and pausing before that filter
+                        // could hand back fewer rows than the pass was asked
+                        // for -- narrowing first makes the filter a no-op, so
+                        // there is nothing left to drop. And it is strictly
+                        // less work, because paths to every other reachable
+                        // endpoint are never walked at all.
+                        if let Some(targets) = expected_targets {
+                            if targets.is_null(row_idx) {
+                                accepting.clear();
+                            } else {
+                                let wanted = targets.value(row_idx);
+                                accepting.retain(|(target, _, _)| target.as_u64() == wanted);
+                            }
+                        }
                         let mut state = Box::new(PausedRowEnumeration {
                             chunk: batch.clone(),
                             source: vid,

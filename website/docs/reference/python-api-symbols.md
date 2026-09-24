@@ -2489,7 +2489,7 @@ Locy program runtime error.
 
 ## `UniMemoryLimitExceededError` — extends `UniError`
 
-Query exceeded its memory limit.
+A query or Locy program was refused for exceeding a memory budget.
 
 ---
 
@@ -2561,7 +2561,7 @@ Storage layer error.
 
 ## `UniTimeoutError` — extends `UniError`
 
-Operation timed out.
+Operation timed out -- a Cypher query or Locy program included.
 
 ---
 

@@ -53,7 +53,7 @@ impl fmt::Display for LocyRuntimeError {
             Self::MemoryLimitExceeded { rule, bytes, limit } => {
                 write!(
                     f,
-                    "rule '{rule}' {DERIVED_BYTES_LIMIT_MARKER} ({bytes} bytes > {limit} byte limit)"
+                    "rule '{rule}' {DERIVED_BYTES_LIMIT_MARKER} memory limit ({bytes} bytes > {limit} byte limit)"
                 )
             }
         }

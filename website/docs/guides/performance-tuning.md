@@ -121,16 +121,24 @@ RETURN p1, p2
 
 This is the highest-leverage change available on a variable-length pattern.
 
-A `-[:R*1..n]->` pattern runs a graph search and, **only if the query binds a
-path**, expands that search into individual paths. The search cost tracks the
-edges explored. The expansion cost tracks the number of distinct paths, which on
-a graph with cycles grows combinatorially with the hop bound. Dropping the path
-variable removes the second cost entirely:
+A `-[:R*1..n]->` pattern runs a graph search and, **whenever the answer depends
+on how many paths match**, expands that search into individual paths. The search
+cost tracks the edges explored. The expansion cost tracks the number of distinct
+paths, which on a graph with cycles grows combinatorially with the hop bound.
+
+A `MATCH` produces one row per path even when the relationship is unnamed — so
+`count(*)`, `sum(...)` or a plain `RETURN b` all pay for expansion. Asking only
+*which* endpoints are reachable (`DISTINCT`, `count(DISTINCT ...)`, `min`/`max`,
+`EXISTS { ... }`, a pattern predicate in `WHERE`) lets the search stop there:
 
 ```cypher
 // Expensive: every distinct path is materialised
 MATCH p = (a:Company {id: 'X'})-[:OWNS*1..6]->(b:Company)
 RETURN p
+
+// Also expands: one row per path, even without a path variable
+MATCH (a:Company {id: 'X'})-[:OWNS*1..6]->(b:Company)
+RETURN b
 
 // Cheap: identical search, no expansion
 MATCH (a:Company {id: 'X'})-[:OWNS*1..6]->(b:Company)
@@ -734,7 +742,7 @@ Before deploying to production:
 - [ ] Cache sizes appropriate for working set
 - [ ] Queries use pushable predicates where possible
 - [ ] LIMIT applied early in query patterns
-- [ ] Variable-length patterns return endpoints unless a path is genuinely needed
+- [ ] Variable-length patterns return DISTINCT endpoints unless paths (or their count) are genuinely needed
 - [ ] Variable-length patterns carry an explicit upper hop bound
 - [ ] Only needed properties projected
 - [ ] Memory limits configured

@@ -4789,10 +4789,12 @@ impl GraphVariableLengthTraverseExecData {
         Ok(results)
     }
 
-    /// NFA-driven BFS returning only endpoints and depths (Mode A).
+    /// NFA-driven BFS returning each reachable endpoint once per depth.
     ///
-    /// More efficient when no path/step variable is bound — skips full path enumeration.
-    /// Uses lightweight trail verification via has_trail_valid_path().
+    /// Serves [`VlpOutputMode::Reachability`] only: it answers *whether* a
+    /// trail reaches an endpoint, not *how many* do, so it is correct only
+    /// where the consumer ignores multiplicity. Uses lightweight trail
+    /// verification via `has_trail_valid_path()`.
     fn bfs_endpoints_only(
         &self,
         source: Vid,
@@ -5389,7 +5391,7 @@ impl GraphVariableLengthTraverseStream {
 
                 // Dispatch to appropriate BFS mode based on output_mode
                 match &self.exec.output_mode {
-                    VlpOutputMode::EndpointsOnly => {
+                    VlpOutputMode::Reachability => {
                         let endpoints = self.exec.bfs_endpoints_only(
                             vid,
                             eid_filters,

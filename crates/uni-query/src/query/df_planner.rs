@@ -77,7 +77,7 @@ use datafusion::prelude::SessionContext;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use uni_algo::algo::AlgorithmRegistry;
 use uni_common::core::schema::{PropertyMeta, Schema as UniSchema};
 use uni_cypher::ast::{
@@ -152,6 +152,29 @@ pub struct HybridPhysicalPlanner {
     /// with the built-ins from `uni-plugin-builtin`; replace with
     /// [`Self::with_plugin_registry`] to use a host-supplied registry.
     plugin_registry: Arc<uni_plugin::PluginRegistry>,
+
+    /// Whether the node being planned may ignore row multiplicity.
+    ///
+    /// Set at the root by [`LogicalPlan::MultiplicityInsensitive`], and below
+    /// `Distinct` and multiplicity-insensitive aggregates; passed through only
+    /// by operators that preserve the set of distinct rows (see
+    /// [`Self::plan_internal`]). A variable-length traversal with no bound
+    /// variable reads it to choose reachability over per-path enumeration.
+    multiplicity_insensitive: AtomicBool,
+}
+
+/// Whether an aggregate's result is unchanged by duplicate input rows.
+///
+/// True for any `DISTINCT` aggregate and for `min` / `max`; an aggregate with
+/// no function (a bare grouping) is trivially insensitive. `count(*)`, `sum`,
+/// `avg` and a non-DISTINCT `collect` all see every duplicate.
+fn aggregate_ignores_multiplicity(expr: &Expr) -> bool {
+    match expr {
+        Expr::FunctionCall { name, distinct, .. } => {
+            *distinct || name.eq_ignore_ascii_case("min") || name.eq_ignore_ascii_case("max")
+        }
+        _ => false,
+    }
 }
 
 /// Whether a traversal must publish [`COL_FWD`] so the edge struct can carry
@@ -229,6 +252,7 @@ impl HybridPhysicalPlanner {
             mutation_ctx: None,
             outer_entity_vars: HashSet::new(),
             plugin_registry: super::df_graph::locy_fold::default_locy_plugin_registry(),
+            multiplicity_insensitive: AtomicBool::new(false),
         }
     }
 
@@ -386,6 +410,7 @@ impl HybridPhysicalPlanner {
             mutation_ctx: None,
             outer_entity_vars: HashSet::new(),
             plugin_registry: super::df_graph::locy_fold::default_locy_plugin_registry(),
+            multiplicity_insensitive: AtomicBool::new(false),
         }
     }
 
@@ -642,7 +667,8 @@ impl HybridPhysicalPlanner {
             // scans may bind labeled variables — recurse so those labels are
             // not lost (exhaustive; no `_ => {}` so a new variant must be
             // classified here — the #131 bug class).
-            LogicalPlan::FusedIndexScanWrapped { inner, .. } => {
+            LogicalPlan::FusedIndexScanWrapped { inner, .. }
+            | LogicalPlan::MultiplicityInsensitive { input: inner } => {
                 self.collect_variable_labels(inner, labels);
             }
             LogicalPlan::ShortestPath { input, .. }
@@ -727,6 +753,15 @@ impl HybridPhysicalPlanner {
     ///
     /// Returns an error if planning fails (unsupported operation, schema mismatch, etc.)
     pub fn plan(&self, logical: &LogicalPlan) -> Result<Arc<dyn ExecutionPlan>> {
+        // A root `MultiplicityInsensitive` marker becomes the planner flag and
+        // is stripped before the logical pre-passes below, which would
+        // otherwise stop at a node they do not recognise.
+        let (logical, insensitive) = match logical {
+            LogicalPlan::MultiplicityInsensitive { input } => (input.as_ref(), true),
+            other => (other, false),
+        };
+        self.multiplicity_insensitive
+            .store(insensitive, Ordering::Relaxed);
         // Pre-pass: lift UNWIND-correlated IN-list filters into the scan
         // subtrees of any Filter(CrossJoin(L, R)) shapes. Runs as a pure
         // logical-plan rewrite *before* any physical-plan optimization
@@ -821,12 +856,50 @@ impl HybridPhysicalPlanner {
         )?))
     }
 
+    /// Plan one node, first deciding whether its subtree may ignore row
+    /// multiplicity (see [`Self::multiplicity_insensitive`]).
+    ///
+    /// `Distinct`, and an aggregate whose every aggregate ignores duplicates,
+    /// make their input insensitive. `Project`, `Filter`, `Sort` and
+    /// traversals preserve the set of distinct rows, so they pass the inherited
+    /// value through. Every other operator — `Limit`, a counting aggregate, a
+    /// join, a mutation — may observe a duplicate, so its subtree is planned
+    /// as sensitive. Unknown operators default to sensitive, which is always
+    /// correct and at worst slower.
     fn plan_internal(
         &self,
         logical: &LogicalPlan,
         all_properties: &HashMap<String, HashSet<String>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let inherited = self.multiplicity_insensitive.load(Ordering::Relaxed);
+        let here = match logical {
+            LogicalPlan::MultiplicityInsensitive { .. } | LogicalPlan::Distinct { .. } => true,
+            LogicalPlan::Aggregate { aggregates, .. } => {
+                aggregates.iter().all(aggregate_ignores_multiplicity)
+            }
+            LogicalPlan::Project { .. }
+            | LogicalPlan::Filter { .. }
+            | LogicalPlan::Sort { .. }
+            | LogicalPlan::Traverse { .. }
+            | LogicalPlan::TraverseMainByType { .. } => inherited,
+            _ => false,
+        };
+        self.multiplicity_insensitive.store(here, Ordering::Relaxed);
+        let planned = self.plan_node(logical, all_properties);
+        self.multiplicity_insensitive
+            .store(inherited, Ordering::Relaxed);
+        planned
+    }
+
+    fn plan_node(
+        &self,
+        logical: &LogicalPlan,
+        all_properties: &HashMap<String, HashSet<String>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         match logical {
+            LogicalPlan::MultiplicityInsensitive { input } => {
+                self.plan_internal(input, all_properties)
+            }
             // === Graph Operations ===
             // Phase 5b followup: `FusedIndexScanWrapped` is a
             // planner-side observability wrapper around lossy
@@ -3744,8 +3817,10 @@ impl HybridPhysicalPlanner {
                     crate::query::df_graph::nfa::VlpOutputMode::StepVariable
                 } else if path_variable.is_some() {
                     crate::query::df_graph::nfa::VlpOutputMode::FullPath
+                } else if self.multiplicity_insensitive.load(Ordering::Relaxed) {
+                    crate::query::df_graph::nfa::VlpOutputMode::Reachability
                 } else {
-                    crate::query::df_graph::nfa::VlpOutputMode::EndpointsOnly
+                    crate::query::df_graph::nfa::VlpOutputMode::EndpointsPerPath
                 };
 
                 // Compile QPP NFA if multi-step pattern, otherwise let exec compile VLP NFA
@@ -4146,8 +4221,10 @@ impl HybridPhysicalPlanner {
             crate::query::df_graph::nfa::VlpOutputMode::StepVariable
         } else if path_variable.is_some() {
             crate::query::df_graph::nfa::VlpOutputMode::FullPath
+        } else if self.multiplicity_insensitive.load(Ordering::Relaxed) {
+            crate::query::df_graph::nfa::VlpOutputMode::Reachability
         } else {
-            crate::query::df_graph::nfa::VlpOutputMode::EndpointsOnly
+            crate::query::df_graph::nfa::VlpOutputMode::EndpointsPerPath
         };
 
         let traverse_plan = Arc::new(GraphVariableLengthTraverseMainExec::new(
@@ -7440,7 +7517,8 @@ pub(crate) fn collect_variable_kinds(
     match plan {
         // Phase 5b followup: recurse into the wrapped node so the
         // wrapped operator's variable still gets collected.
-        LogicalPlan::FusedIndexScanWrapped { inner, .. } => {
+        LogicalPlan::FusedIndexScanWrapped { inner, .. }
+        | LogicalPlan::MultiplicityInsensitive { input: inner } => {
             collect_variable_kinds(inner, kinds);
         }
         LogicalPlan::Scan { variable, .. }
@@ -7715,6 +7793,7 @@ fn collect_mutation_node_hints(plan: &LogicalPlan, hints: &mut Vec<String>) {
         // For all other nodes, recurse into inputs
         LogicalPlan::Traverse { input, .. }
         | LogicalPlan::TraverseMainByType { input, .. }
+        | LogicalPlan::MultiplicityInsensitive { input }
         | LogicalPlan::Filter { input, .. }
         | LogicalPlan::Project { input, .. }
         | LogicalPlan::Sort { input, .. }
@@ -7844,6 +7923,7 @@ fn collect_mutation_edge_hints(plan: &LogicalPlan, hints: &mut Vec<String>) {
         // For all other nodes, recurse into inputs
         LogicalPlan::Traverse { input, .. }
         | LogicalPlan::TraverseMainByType { input, .. }
+        | LogicalPlan::MultiplicityInsensitive { input }
         | LogicalPlan::Filter { input, .. }
         | LogicalPlan::Project { input, .. }
         | LogicalPlan::Sort { input, .. }
@@ -8058,7 +8138,8 @@ fn insert_node_var(variable: &str, out: &mut HashSet<String>) {
 fn collect_plan_variables_into(plan: &LogicalPlan, out: &mut HashSet<String>) {
     match plan {
         // Wrapped scan: recurse so the inner scan's variable is still collected.
-        LogicalPlan::FusedIndexScanWrapped { inner, .. } => {
+        LogicalPlan::FusedIndexScanWrapped { inner, .. }
+        | LogicalPlan::MultiplicityInsensitive { input: inner } => {
             collect_plan_variables_into(inner, out);
         }
         // Leaf node scans — each binds one node variable (+ `_vid`).

@@ -2629,10 +2629,11 @@ keeps merely naming a position free, and keeps `RETURN t.id` answering exactly
 as the anonymous form does. `EXPLAIN` shows the chosen mode and any live group
 bindings on the `GraphVariableLengthTraverseExec` line.
 
-Known gap, pre-existing and not introduced here: the endpoint-only plan
-collapses distinct paths that share endpoints, so a quantified pattern over a
-diamond reports one row where GQL specifies one row per binding. Projecting a
-group variable enumerates paths and gives the conformant count.
+A pruned quantified pattern, like an anonymous variable-length relationship,
+still yields **one row per path**: the endpoint-only mode is chosen only where
+the consumer ignores multiplicity (see Stage 2). This used to be a known gap —
+a quantified pattern over a diamond reported one row where GQL specifies one
+per binding.
 
 A quantified pattern is compiled to edge type **ids** and has no schemaless
 main-table operator, so a QPP over an undeclared relationship type is
@@ -2708,11 +2709,42 @@ complete.
 
 ### Stage 2 — enumerating paths out of the DAG
 
-Only run when the query actually needs paths — a path variable, a step variable,
-or a QPP group binding. `VlpOutputMode::EndpointsOnly` skips it entirely and
-verifies reachability with `has_trail_valid_path`, which stops at the first
-valid path. This is why `RETURN count(DISTINCT b)` is cheap on a graph where
-`RETURN p` is not.
+Run whenever the result depends on the paths. With no path, step or group
+variable bound there are two modes, and which one is correct depends on the
+consumer, not on the pattern:
+
+- **`EndpointsPerPath`** (the default) enumerates the paths and emits one row
+  per path carrying only the endpoint. openCypher binds a row per matched path
+  whether or not the relationship is named, so `MATCH (x)-[:R*2..2]->(e)
+  RETURN count(*)` over a diamond is 2 — the same as with `[r:R*2..2]`.
+- **`Reachability`** skips enumeration and verifies each `(endpoint, depth)`
+  with `has_trail_valid_path`, which stops at the first valid path. It is only
+  valid where multiplicity cannot be observed.
+
+The planner tracks that with a flag on `HybridPhysicalPlanner`
+(`multiplicity_insensitive`). `LogicalPlan::MultiplicityInsensitive` — a
+planning hint allowed only at a plan's root, stripped by `plan()` before the
+logical pre-passes — sets it for an `EXISTS` subquery or pattern predicate and
+for the body of a set-semantic Locy rule (no FOLD, ALONG or PROB). `Distinct`,
+and an `Aggregate` whose every aggregate is DISTINCT or min/max, set it for
+their input. `Project`, `Filter`, `Sort` and the traversals pass the inherited
+value through; every other operator — `Limit`, a counting aggregate, a join, a
+mutation — plans its subtree as sensitive, the always-correct default. This is
+why `RETURN count(DISTINCT b)` is cheap on a graph where `RETURN count(*)` and
+`RETURN p` are not.
+
+Until 2026-09 the endpoint-only BFS was the default for every anonymous
+relationship, so a plain `MATCH` silently reported one row per endpoint and
+depth — a count that changed when the relationship was given a name. The
+regression tests (`cypher_path::vlp_anonymous_path_multiplicity`) run each
+query shape with the relationship anonymous and named and require identical
+results.
+
+`Reachability` is cheap only where the frontier drains. On a dense cyclic graph
+under an unbounded `*` it runs to the hop ceiling, and the per-depth trail check
+is itself a search over the predecessor DAG: `EXISTS { (a)-[:R*]->(b) }` on a
+9-vertex complete digraph does not finish in minutes. That is a separate
+problem from the mode choice.
 
 Enumeration is a backward depth-first walk from each accepting endpoint. The
 count is **not** bounded by the DAG's size: a DAG with 15,000 accepting entries

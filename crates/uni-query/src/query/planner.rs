@@ -1773,6 +1773,21 @@ pub enum LogicalPlan {
         inner: Box<LogicalPlan>,
         kind: FusionKind,
     },
+    /// Marks a subplan whose consumer ignores row multiplicity.
+    ///
+    /// The consumer only asks *whether* rows exist or *which distinct* rows
+    /// exist: an `EXISTS` subquery or pattern predicate, or the body of a Locy
+    /// rule with set semantics. Inside it, a variable-length relationship with
+    /// no bound variable may be planned as a reachability search (one row per
+    /// endpoint and depth) instead of one row per path — linear rather than
+    /// exponential on a dense cyclic graph. Everywhere else openCypher requires
+    /// one row per path.
+    ///
+    /// Purely a planning hint: the physical planner plans `input` with the hint
+    /// set and adds no operator of its own.
+    MultiplicityInsensitive {
+        input: Box<LogicalPlan>,
+    },
     /// Lookup vertices by ext_id using the main vertices table.
     /// Used when a query references ext_id without specifying a label.
     ExtIdLookup {
@@ -2279,7 +2294,8 @@ impl LogicalPlan {
             | LogicalPlan::LocyBestBy { input, .. }
             | LogicalPlan::LocyPriority { input, .. }
             | LogicalPlan::LocyProject { input, .. }
-            | LogicalPlan::LocyModelInvoke { input, .. } => Some(input),
+            | LogicalPlan::LocyModelInvoke { input, .. }
+            | LogicalPlan::MultiplicityInsensitive { input } => Some(input),
             _ => None,
         }
     }
@@ -2334,6 +2350,7 @@ impl LogicalPlan {
             | LogicalPlan::BindZeroLengthPath { input, .. }
             | LogicalPlan::BindPath { input, .. }
             | LogicalPlan::FusedIndexScanWrapped { inner: input, .. }
+            | LogicalPlan::MultiplicityInsensitive { input }
             | LogicalPlan::LocyFold { input, .. }
             | LogicalPlan::LocyBestBy { input, .. }
             | LogicalPlan::LocyPriority { input, .. }
@@ -8594,6 +8611,7 @@ impl QueryPlanner {
             | LogicalPlan::Sort { input, .. }
             | LogicalPlan::Limit { input, .. }
             | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::MultiplicityInsensitive { input }
             | LogicalPlan::Apply { input, .. } => Self::find_scan_label_id(input, variable),
             LogicalPlan::CrossJoin { left, right } => Self::find_scan_label_id(left, variable)
                 .or_else(|| Self::find_scan_label_id(right, variable)),
@@ -9046,7 +9064,8 @@ impl QueryPlanner {
             | LogicalPlan::InvertedIndexLookup { variable, .. } => {
                 vars.insert(variable.clone());
             }
-            LogicalPlan::FusedIndexScanWrapped { inner, .. } => {
+            LogicalPlan::FusedIndexScanWrapped { inner, .. }
+            | LogicalPlan::MultiplicityInsensitive { input: inner } => {
                 Self::collect_plan_variables_impl(inner, vars);
             }
             LogicalPlan::TraverseMainByType {
@@ -9381,6 +9400,7 @@ pub fn projection_columns(plan: &LogicalPlan) -> Option<Vec<String>> {
         // Row-preserving wrappers: the columns are whatever the input projects.
         LogicalPlan::Limit { input, .. }
         | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::MultiplicityInsensitive { input }
         | LogicalPlan::Distinct { input, .. }
         | LogicalPlan::Filter { input, .. } => projection_columns(input),
         // Both branches are validated to carry the same column names when the
@@ -11146,7 +11166,8 @@ fn collect_properties_recursive(
             collect_properties_from_expr_into(expr, properties, kinds);
         }
         LogicalPlan::FusedIndexScan { filter: None, .. } => {}
-        LogicalPlan::FusedIndexScanWrapped { inner, .. } => {
+        LogicalPlan::FusedIndexScanWrapped { inner, .. }
+        | LogicalPlan::MultiplicityInsensitive { input: inner } => {
             collect_properties_recursive(inner, properties, kinds);
         }
         LogicalPlan::Explain { plan } => {

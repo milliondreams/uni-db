@@ -1457,6 +1457,7 @@ impl Executor {
             LogicalPlan::Scan { .. } => "read_scan",
             LogicalPlan::FusedIndexScan { .. } => "read_fused_index_scan",
             LogicalPlan::FusedIndexScanWrapped { .. } => "read_fused_index_scan_wrapped",
+            LogicalPlan::MultiplicityInsensitive { .. } => "read_multiplicity_insensitive",
             LogicalPlan::ExtIdLookup { .. } => "read_extid_lookup",
             LogicalPlan::Traverse { .. } => "read_traverse",
             LogicalPlan::TraverseMainByType { .. } => "read_traverse_main",
@@ -1504,6 +1505,7 @@ impl Executor {
             | LogicalPlan::Sort { input, .. }
             | LogicalPlan::Limit { input, .. }
             | LogicalPlan::Distinct { input }
+            | LogicalPlan::MultiplicityInsensitive { input }
             | LogicalPlan::Aggregate { input, .. }
             | LogicalPlan::Window { input, .. }
             | LogicalPlan::Unwind { input, .. }
@@ -3454,6 +3456,11 @@ impl Executor {
                         .execute_subplan(*input, prop_manager, params, ctx)
                         .await?;
                     self.execute_project(matches, &projections, prop_manager, params, ctx)
+                        .await
+                }
+                // A planning hint only; the rows are the input's.
+                LogicalPlan::MultiplicityInsensitive { input } => {
+                    self.execute_subplan(*input, prop_manager, params, ctx)
                         .await
                 }
                 LogicalPlan::Distinct { input } => {

@@ -3027,6 +3027,16 @@ impl PhysicalExpr for ExistsExecExpr {
                 )));
             }
         };
+        // `EXISTS` only asks whether a row exists, so a variable-length
+        // relationship inside it may be searched for reachability rather than
+        // enumerated path by path. `COUNT {}` and `COLLECT {}` see every row.
+        let logical_plan = if self.mode == SubqueryResult::Exists {
+            crate::query::planner::LogicalPlan::MultiplicityInsensitive {
+                input: Box::new(logical_plan),
+            }
+        } else {
+            logical_plan
+        };
 
         // Execute all rows on a dedicated thread with a single tokio runtime.
         // The runtime must be created and dropped on this thread (not in an async context).

@@ -1549,14 +1549,29 @@ fn convert_to_fixpoint_plans(
                 .map(|(i, _)| i)
                 .collect();
 
+            // A rule with no FOLD, ALONG or PROB column has set semantics: its
+            // facts are deduplicated, so how many ways a body row was derived
+            // cannot matter, and a variable-length relationship in the body may
+            // be searched for reachability rather than enumerated per path. A
+            // FOLD counts or sums derivations, and ALONG and PROB are per path
+            // or per proof, so those rules see every path.
+            let set_semantics =
+                rule.fold_bindings.is_empty() && !rule.yield_schema.iter().any(|yc| yc.is_prob);
             let clauses: Vec<FixpointClausePlan> = rule
                 .clauses
                 .iter()
                 .map(|clause| {
                     let is_ref_bindings =
                         convert_is_refs(&clause.is_refs, registry, &stratum_rule_names)?;
+                    let body_logical = if set_semantics && clause.along_bindings.is_empty() {
+                        crate::query::planner::LogicalPlan::MultiplicityInsensitive {
+                            input: Box::new(clause.body.clone()),
+                        }
+                    } else {
+                        clause.body.clone()
+                    };
                     Ok(FixpointClausePlan {
-                        body_logical: clause.body.clone(),
+                        body_logical,
                         is_ref_bindings,
                         priority: clause.priority,
                         along_bindings: clause.along_bindings.clone(),

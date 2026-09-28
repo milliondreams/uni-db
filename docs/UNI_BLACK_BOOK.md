@@ -4944,6 +4944,29 @@ graph TB
 - **Outside a transaction**: Sees Current Main L0 + Pending Flush L0s + L1 Storage
 - **Snapshot reads**: See only the data as of a specific snapshot version
 
+### Every decision a scan makes must see L0 too
+
+A label scan larger than one slice is walked in half-open `_vid` ranges
+(`GraphScanExec`, #214), and each range reads flushed rows and the visible L0
+rows in that range. The walk also makes three decisions *about* the label, and
+each has to count L0 or it goes wrong in a way no range read can repair:
+
+- **Sizing** — whether to walk at all. `vertex_row_count` asks flushed storage;
+  `L0Context::vertex_count` adds the unflushed rows. Without it an all-L0 label
+  sized as empty and was built as one batch, and whether a query chunked
+  depended on whether a background flush had landed.
+- **End of walk** and **seek** — after an empty range, whether and where the
+  label continues. Vids are allocated across labels, so a label's newer rows
+  can sit beyond a block of another label's vids that its flushed rows never
+  reach. Asking flushed storage alone ended the walk inside that gap and
+  silently dropped every unflushed row above it (`MATCH (p:P) RETURN count(p)`
+  returned 9000 for 9007 rows). `L0Context::min_vertex_vid_at_or_above`
+  supplies the unflushed answer, and the walk resumes at the smaller of the two.
+
+The L0 answers are upper bounds or early resume points, never exclusions: a
+tombstoned or double-counted vertex only makes the walk look one range further,
+and the range read drops it.
+
 ## Write Throttling
 
 When L1 runs accumulate (compaction falling behind), write throttling kicks in to prevent unbounded growth:

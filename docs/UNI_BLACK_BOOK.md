@@ -4010,6 +4010,25 @@ Two consequences inside `FixpointState`:
 - Contributions are **replaced** on re-derivation, keyed on every column except the fold inputs, rather than appended. Once a child's folded value can move between iterations, a parent that already emitted a row against the child's partial value would otherwise fold the stale row in alongside the fresh one.
 - Convergence is **value-based**: a clause reading a full snapshot re-derives every iteration, so delta-emptiness alone is not progress. `MonotonicAggState` cannot serve here — it is only ever fed the delta.
 
+#### Derivation identity: what tells two contributions apart
+
+The replace-on-re-derivation merge above is only correct if the derivation key really does identify one derivation. The key is every column except the fold inputs, and the columns that make it discriminating are the hidden `__deriv_*` ones, built by `derivation_discriminators` in `locy_planner.rs` for a recursive rule carrying FOLD or ALONG:
+
+| Column | Projected from | Separates |
+|---|---|---|
+| `__deriv_clause` | the clause index | rows of different clauses, whose other discriminators are NULL-padded |
+| `__deriv_vid_{v}` | `{v}._vid`, a MATCH-bound node not yielded bare | derivations through different nodes |
+| `__deriv_eid_{r}` | `{r}._eid`, a single-hop relationship | **parallel edges** between the same pair of nodes |
+| `__deriv_path_{r}` | `{r}`, the edge list of a variable-length relationship | **distinct paths** between the same endpoints |
+
+An **anonymous** relationship is bound to the positional name `__anon_edge_{clause}_{path}_{elem}` before the body is planned (`name_anonymous_edges`), so it gets a column too. The name is positional so that an IS-ref target's discriminator schema, computed from the compiled rule, matches the one its own clauses project. Binding a variable does not change which rows the MATCH produces.
+
+Until issue #294 only node vids were used. Two stakes `x -[30]-> a` and `x -[40]-> a` bind the same nodes, so they shared one derivation key and the merge kept whichever row came last — `a` came out as 60 or 50 depending on batch order, never 90. The non-recursive form of the same rule was always right, because it never builds a `FixpointState` and aggregates the plain bag of MATCH rows; that equivalence is what the #294 regression tests check.
+
+The discriminator columns are nullable by construction (a clause that does not bind a variable projects NULL), so `reconcile_schema` marks every `__deriv_*` field nullable before adopting a batch's schema. A relationship's `_eid` is declared non-nullable by the scan, and adopting it verbatim rejected a sibling clause's NULL-padded batch.
+
+In debug builds `merge_fold_contributions` also checks the invariant directly: two candidates of one merge that share a derivation key must agree on their fold input, since a derivation is evaluated once per iteration. If they differ, the key has failed to separate two derivations, and the merge returns an internal error instead of silently keeping one. The check is blind when the colliding rows carry equal fold inputs (e.g. `MSUM(1.0)` over two paths), which is why the discriminators themselves are the fix and the check is the tripwire.
+
 ### Post-FOLD WHERE (HAVING)
 
 A `WHERE` clause after `FOLD` filters aggregated groups — equivalent to SQL's `HAVING`:
@@ -4021,6 +4040,12 @@ CREATE RULE frequent_payer AS
     WHERE n >= 3 AND total >= 100
     YIELD KEY p, n, total
 ```
+
+#### What a FOLD clause may YIELD
+
+A FOLD emits one row per distinct KEY: the KEY columns plus one column per FOLD binding. `KEY` marks a **single** YIELD item, so a composite key is `YIELD KEY a, KEY b, total`; `YIELD KEY a, b, total` declares one KEY and a plain column `b`. A plain column has no single value per group, and `FoldExec` used to drop it without a diagnostic — a later `QUERY ... RETURN b` then read the absent column as NULL (issue #293). `check_fold_yield_is_grouped` now rejects, with `UngroupedFoldYield`, any YIELD item of a FOLD clause that is not a KEY, not a FOLD output, and does not mention one (`total * 2.0 AS score` is still allowed; the planner evaluates it after the fold). A clause *without* FOLD is unconstrained: a base clause `YIELD KEY e, 100.0 AS agg` seeds the column its sibling folds into.
+
+For the same reason a QUERY is checked against its rule's YIELD columns: `check_query_variables` rejects, with `UnknownQueryVariable`, a WHERE / RETURN / ORDER BY variable the rule does not yield (ORDER BY may also name a RETURN alias). The in-memory evaluator in `locy_query.rs` would otherwise return NULL for it on every row.
 
 The post-FOLD `WHERE` runs after all FOLD aggregates are computed and before BEST BY. It can reference FOLD output columns and KEY columns. Multiple conditions are combined with `AND`.
 

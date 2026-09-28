@@ -11,7 +11,9 @@ MATCH ...
 [REQUIRE agg_condition]             // definitional threshold (constrains recursion)
 [WHERE agg_condition]               // post-FOLD filter (HAVING)
 [BEST BY expr ASC|DESC]
-YIELD KEY a, value AS alias, prob_expr AS PROB
+YIELD KEY a, KEY b, value AS alias, prob_expr AS PROB
+// KEY marks ONE item: a composite key is `KEY a, KEY b`, not `KEY a, b`.
+// With FOLD, every non-KEY item must be a FOLD output (or an expression over one).
 // OR, for graph mutation rules (edge/node props are inline maps, no SET):
 DERIVE (src)-[:TYPE {prop: expr}]->(dst)
 ```

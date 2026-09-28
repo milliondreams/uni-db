@@ -714,10 +714,30 @@ impl FixpointState {
             .filter(|i| !fold_inputs.contains(i))
             .collect();
 
+        // Rows before this index are existing facts; the rest are candidates.
+        let facts_rows: usize = self.facts.iter().map(RecordBatch::num_rows).sum();
         let mut latest: HashMap<Vec<ScalarKey>, u32> = HashMap::new();
         for row in 0..combined.num_rows() {
             let key = extract_scalar_key(&combined, &deriv_key_indices, row);
-            latest.insert(key, row as u32);
+            let replaced = latest.insert(key, row as u32);
+            // A derivation is evaluated once per iteration, so two candidates
+            // sharing a derivation key must agree on their fold input. If they
+            // differ, the key failed to tell two derivations apart and the
+            // replace would silently drop one (issue #294). Checked in debug
+            // builds, where every test and fuzz run exercises it.
+            if cfg!(debug_assertions)
+                && let Some(prev) = replaced
+                && prev as usize >= facts_rows
+                && extract_scalar_key(&combined, &fold_inputs, prev as usize)
+                    != extract_scalar_key(&combined, &fold_inputs, row)
+            {
+                return Err(datafusion::error::DataFusionError::Internal(format!(
+                    "rule '{}': two derivations of one iteration share a derivation key \
+                     but differ in their fold input; the derivation discriminators do not \
+                     identify them, and one would be dropped",
+                    self.rule_name
+                )));
+            }
         }
         let mut keep: Vec<u32> = latest.into_values().collect();
         keep.sort_unstable();
@@ -1026,6 +1046,7 @@ impl FixpointState {
     /// schema, update ours so that `RowDedupState` / `RecordBatch::try_new`
     /// use the correct types.
     fn reconcile_schema(&mut self, actual_schema: &SchemaRef) {
+        let actual_schema = &nullable_discriminators(actual_schema);
         if self.schema.fields() != actual_schema.fields() {
             tracing::debug!(
                 rule = %self.rule_name,
@@ -6035,6 +6056,39 @@ impl RecordBatchStream for FixpointStream {
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
+
+/// `schema` with every derivation-discriminator column marked nullable.
+///
+/// A clause that does not bind a discriminating variable projects NULL for it
+/// (see `FOLD_DISCRIMINATOR_COL_PREFIX`), so these columns are nullable by
+/// construction. The scan's own field is not: a relationship's `_eid` is
+/// declared non-nullable, and adopting the first batch's schema verbatim would
+/// then reject a sibling clause's NULL-padded batch (issue #294).
+fn nullable_discriminators(schema: &SchemaRef) -> SchemaRef {
+    use crate::query::planner_locy_types::FOLD_DISCRIMINATOR_COL_PREFIX;
+    if !schema
+        .fields()
+        .iter()
+        .any(|f| f.name().starts_with(FOLD_DISCRIMINATOR_COL_PREFIX) && !f.is_nullable())
+    {
+        return Arc::clone(schema);
+    }
+    let fields: Vec<_> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            if f.name().starts_with(FOLD_DISCRIMINATOR_COL_PREFIX) {
+                Arc::new(f.as_ref().clone().with_nullable(true))
+            } else {
+                Arc::clone(f)
+            }
+        })
+        .collect();
+    Arc::new(arrow_schema::Schema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    ))
+}
 
 #[cfg(test)]
 mod tests {

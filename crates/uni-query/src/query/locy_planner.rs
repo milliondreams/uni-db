@@ -524,6 +524,7 @@ fn infer_expr_type(expr: &Expr, node_vars: &HashSet<String>) -> DataType {
     }
 }
 
+use super::df_graph::common::build_edge_list_field;
 use super::df_graph::locy_fixpoint::{DerivedScanEntry, DerivedScanRegistry, DerivedScanView};
 use super::planner::{
     LogicalPlan, QueryPlanner, VariableInfo, collect_expr_variables, is_var_in_scope,
@@ -590,12 +591,17 @@ struct ClassifierContext {
 /// variables. Bundled to keep `build_clause` under the
 /// too-many-arguments threshold.
 /// The derivation-discriminator columns for a rule (issue #159), in projection
-/// order: the clause index, then one `_vid` column per discriminating variable.
+/// order: the clause index, then one column per discriminating variable.
 ///
-/// A discriminating variable is a MATCH-bound **node** variable that no clause
-/// of the rule yields bare — precisely the binding that distinguishes one
-/// derivation of an output row from another, and which projection would
-/// otherwise erase.
+/// A discriminating variable is a MATCH-bound **node** or **relationship**
+/// variable that no clause of the rule yields bare — precisely the binding
+/// that distinguishes one derivation of an output row from another, and which
+/// projection would otherwise erase. See [`DerivKind`] for the column each
+/// kind contributes. Relationships matter because parallel edges and distinct
+/// paths bind the same nodes: with nodes alone, two stakes `x -[30]-> a` and
+/// `x -[40]-> a` shared one derivation key and the fixpoint kept only one
+/// (issue #294). Anonymous relationships are covered through
+/// [`name_anonymous_edges`].
 ///
 /// Returns empty unless the rule is recursive *and* carries `FOLD` or `ALONG`.
 /// The restriction is a correctness requirement, not an optimisation: a
@@ -611,12 +617,25 @@ fn derivation_discriminator_columns(
     rule: &CompiledRule,
     is_recursive: bool,
 ) -> Vec<(String, DataType)> {
+    derivation_discriminators(rule, is_recursive).map_or_else(Vec::new, |vars| {
+        std::iter::once((
+            format!("{FOLD_DISCRIMINATOR_COL_PREFIX}clause"),
+            DataType::Int64,
+        ))
+        .chain(vars.iter().map(|d| (d.column(), d.kind.data_type())))
+        .collect()
+    })
+}
+
+/// The discriminating variables behind [`derivation_discriminator_columns`],
+/// sorted by column name, or `None` when the rule needs no discriminators.
+fn derivation_discriminators(rule: &CompiledRule, is_recursive: bool) -> Option<Vec<DerivVar>> {
     let carries_fold_or_along = rule
         .clauses
         .iter()
         .any(|c| !c.fold.is_empty() || !c.along.is_empty());
     if !is_recursive || !carries_fold_or_along {
-        return Vec::new();
+        return None;
     }
 
     let yielded_bare: HashSet<&str> = rule
@@ -633,30 +652,131 @@ fn derivation_discriminator_columns(
         })
         .collect();
 
-    let mut vars: Vec<String> = rule
+    let mut vars: Vec<DerivVar> = rule
         .clauses
         .iter()
-        .flat_map(|c| {
-            let mut per_clause = HashSet::new();
-            collect_match_node_vars(c, &mut per_clause);
-            per_clause.into_iter()
+        .enumerate()
+        .flat_map(|(clause_index, c)| {
+            let mut nodes = HashSet::new();
+            collect_match_node_vars(c, &mut nodes);
+            nodes
+                .into_iter()
+                .map(|name| DerivVar {
+                    name,
+                    kind: DerivKind::Node,
+                })
+                .chain(match_edge_vars(c, clause_index))
         })
-        .filter(|v| !yielded_bare.contains(v.as_str()))
+        .filter(|d| !yielded_bare.contains(d.name.as_str()))
         .collect();
-    vars.sort();
+    vars.sort_by_key(DerivVar::column);
     vars.dedup();
+    Some(vars)
+}
 
-    std::iter::once((
-        format!("{FOLD_DISCRIMINATOR_COL_PREFIX}clause"),
-        DataType::Int64,
-    ))
-    .chain(vars.into_iter().map(|v| {
-        (
-            format!("{FOLD_DISCRIMINATOR_COL_PREFIX}vid_{v}"),
-            DataType::UInt64,
-        )
-    }))
-    .collect()
+/// A MATCH-bound variable whose identity discriminates derivations (#159).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DerivVar {
+    name: String,
+    kind: DerivKind,
+}
+
+/// What a discriminating variable binds, which decides the column it projects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DerivKind {
+    /// A node: its `_vid`, as `__deriv_vid_{var}`.
+    Node,
+    /// A single-hop relationship: its `_eid`, as `__deriv_eid_{var}`.
+    Edge,
+    /// A variable-length relationship: its whole edge list, as
+    /// `__deriv_path_{var}`. Two distinct paths between the same endpoints
+    /// differ only here.
+    EdgeList,
+}
+
+impl DerivKind {
+    /// The Arrow type of the projected discriminator column.
+    fn data_type(self) -> DataType {
+        match self {
+            Self::Node | Self::Edge => DataType::UInt64,
+            Self::EdgeList => build_edge_list_field("_").data_type().clone(),
+        }
+    }
+}
+
+impl DerivVar {
+    /// The hidden discriminator column this variable is projected as.
+    fn column(&self) -> String {
+        let kind = match self.kind {
+            DerivKind::Node => "vid",
+            DerivKind::Edge => "eid",
+            DerivKind::EdgeList => "path",
+        };
+        format!("{FOLD_DISCRIMINATOR_COL_PREFIX}{kind}_{}", self.name)
+    }
+
+    /// The scan column holding this variable's identity.
+    fn id_column(&self) -> String {
+        match self.kind {
+            DerivKind::Node => format!("{}._vid", self.name),
+            DerivKind::Edge => format!("{}._eid", self.name),
+            DerivKind::EdgeList => self.name.clone(),
+        }
+    }
+}
+
+/// The relationship variables of a clause's MATCH, in pattern order.
+///
+/// A single-hop relationship is identified by its `_eid`, a variable-length one
+/// by its edge list. An anonymous relationship is reported under the name
+/// [`name_anonymous_edges`] gives it, so anonymous parallel edges and paths are
+/// told apart too.
+fn match_edge_vars(clause: &CompiledClause, clause_index: usize) -> Vec<DerivVar> {
+    let mut vars = Vec::new();
+    for (path_index, path) in clause.match_pattern.paths.iter().enumerate() {
+        for (elem_index, elem) in path.elements.iter().enumerate() {
+            if let PatternElement::Relationship(rp) = elem {
+                vars.push(DerivVar {
+                    name: rp.variable.clone().unwrap_or_else(|| {
+                        anonymous_edge_name(clause_index, path_index, elem_index)
+                    }),
+                    kind: if rp.range.is_none() {
+                        DerivKind::Edge
+                    } else {
+                        DerivKind::EdgeList
+                    },
+                });
+            }
+        }
+    }
+    vars
+}
+
+/// The hidden variable an anonymous relationship is bound to.
+///
+/// Positional, so the name is the same whether it is computed from the
+/// compiled rule (as an IS-ref target's discriminator schema is) or from the
+/// renamed clause the body is planned from.
+fn anonymous_edge_name(clause_index: usize, path_index: usize, elem_index: usize) -> String {
+    format!("__anon_edge_{clause_index}_{path_index}_{elem_index}")
+}
+
+/// A copy of `clause` with every anonymous relationship bound to its
+/// [`anonymous_edge_name`], so the scan exposes the identity its derivation
+/// discriminator reads (issue #294). Binding a variable does not change which
+/// rows the MATCH produces.
+fn name_anonymous_edges(clause: &CompiledClause, clause_index: usize) -> CompiledClause {
+    let mut named = clause.clone();
+    for (path_index, path) in named.match_pattern.paths.iter_mut().enumerate() {
+        for (elem_index, elem) in path.elements.iter_mut().enumerate() {
+            if let PatternElement::Relationship(rp) = elem
+                && rp.variable.is_none()
+            {
+                rp.variable = Some(anonymous_edge_name(clause_index, path_index, elem_index));
+            }
+        }
+    }
+    named
 }
 
 struct ClauseCtx<'a> {
@@ -669,7 +789,7 @@ struct ClauseCtx<'a> {
     /// schema: a clause that binds the variable projects `{var}._vid`, one that
     /// does not projects a typed NULL. Empty unless the rule is recursive and
     /// carries FOLD or ALONG. See [`FOLD_DISCRIMINATOR_COL_PREFIX`].
-    deriv_vars: &'a [String],
+    deriv_vars: &'a [DerivVar],
     /// Whether this rule's stratum is recursive — needed to compute a
     /// same-stratum IS-ref target's own discriminator columns.
     is_recursive: bool,
@@ -963,17 +1083,17 @@ impl<'a> LocyPlanBuilder<'a> {
         // Derivation discriminators for a recursive FOLD / ALONG rule (#159).
         // See `derivation_discriminator_columns`.
         let deriv_columns = derivation_discriminator_columns(rule, is_recursive);
-        let deriv_vars: Vec<String> = deriv_columns
-            .iter()
-            .skip(1) // [0] is the clause index, not a variable
-            .map(|(name, _)| {
-                name.trim_start_matches(&format!("{FOLD_DISCRIMINATOR_COL_PREFIX}vid_"))
-                    .to_string()
-            })
-            .collect();
+        let deriv_vars = derivation_discriminators(rule, is_recursive).unwrap_or_default();
 
         let mut clauses = Vec::with_capacity(rule.clauses.len());
         for (clause_index, clause) in rule.clauses.iter().enumerate() {
+            let named;
+            let clause = if deriv_vars.is_empty() {
+                clause
+            } else {
+                named = name_anonymous_edges(clause, clause_index);
+                &named
+            };
             clauses.push(self.build_clause(
                 clause,
                 &rule.yield_schema,
@@ -1826,29 +1946,31 @@ impl<'a> LocyPlanBuilder<'a> {
 
             let mut bound_here = HashSet::new();
             collect_match_node_vars(clause, &mut bound_here);
+            bound_here.extend(
+                match_edge_vars(clause, ctx.clause_index)
+                    .into_iter()
+                    .map(|d| d.name),
+            );
             for var in ctx.deriv_vars {
                 // `Expr::Variable("a._vid")` is a raw dotted column reference,
                 // resolved against the input schema by full name — the same
                 // mechanism the issue #158 columns use.
                 //
-                // The explicit `UInt64` target type is load-bearing for the NULL
-                // arm: `CypherLiteral::Null` compiles to `DataType::Null`, which
-                // is neither string nor numeric, so it misses
-                // `plan_locy_project`'s cross-domain guard and reaches the
-                // catch-all cast. Inferring the type instead would make it
-                // `LargeUtf8`, which IS cross-domain against `UInt64` — the cast
-                // would be skipped and the clauses would silently diverge in
-                // schema. For the bound arm the cast is a no-op.
-                let expr = if bound_here.contains(var) {
-                    Expr::Variable(format!("{var}._vid"))
+                // The explicit target type is load-bearing for the NULL arm:
+                // `CypherLiteral::Null` compiles to `DataType::Null`, which is
+                // neither string nor numeric, so it misses `plan_locy_project`'s
+                // cross-domain guard and reaches the catch-all cast. Inferring
+                // the type instead would make it `LargeUtf8`, which IS
+                // cross-domain against `UInt64` — the cast would be skipped and
+                // the clauses would silently diverge in schema. For the bound
+                // arm the cast is a no-op.
+                let expr = if bound_here.contains(&var.name) {
+                    Expr::Variable(var.id_column())
                 } else {
                     Expr::Literal(CypherLiteral::Null)
                 };
-                projections.push((
-                    expr,
-                    Some(format!("{FOLD_DISCRIMINATOR_COL_PREFIX}vid_{var}")),
-                ));
-                target_types.push(DataType::UInt64);
+                projections.push((expr, Some(var.column())));
+                target_types.push(var.kind.data_type());
             }
         }
 

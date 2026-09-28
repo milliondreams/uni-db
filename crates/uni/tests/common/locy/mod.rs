@@ -38,6 +38,10 @@ pub mod value_assert;
 pub mod locy_issue_158_is_not_subject_scope;
 // Issue #159: aggregation inside a recursive rule dedups equal values.
 pub mod locy_issue_159_recursive_fold_dedup;
+// Issue #293: a FOLD silently dropped YIELD columns that were not KEY.
+pub mod locy_issue_293_fold_ungrouped_yield;
+// Issue #294: recursive FOLD collapsed parallel edges between one node pair.
+pub mod locy_issue_294_parallel_edge_fold;
 // Issue #160: QUERY (SLG) and derived (fixpoint) diverge when an IS-ref
 // introduces a variable binding the MATCH pattern does not provide.
 pub mod locy_issue_160_query_derived_parity;

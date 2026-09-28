@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use uni_cypher::ast::{BinaryOp, Expr};
+use uni_cypher::ast::{BinaryOp, CypherLiteral, Expr};
 use uni_cypher::locy_ast::{
     AlongBinding, FoldBinding, LocyExpr, LocyYieldItem, RuleCondition, RuleDefinition, RuleOutput,
     resolve_yield_column_names,
@@ -128,6 +128,7 @@ pub fn check(
         let is_recursive = strat.is_recursive[scc_idx];
 
         check_mixed_priority(rule_name, definitions)?;
+        check_count_fold_seed(rule_name, definitions, &mut warnings);
 
         let mut yield_schema = infer_yield_schema(rule_name, definitions)?;
 
@@ -380,6 +381,62 @@ fn check_mixed_priority(
         });
     }
     Ok(())
+}
+
+/// Warns when a clause without FOLD seeds a `COUNT` / `MCOUNT` column with a
+/// non-NULL literal. See [`WarningCode::CountFoldSeedCounted`].
+///
+/// Clauses line up by YIELD position (the rule's schema is positional), so the
+/// seed for a fold column is the item at the same index in a sibling clause.
+fn check_count_fold_seed(
+    rule_name: &str,
+    definitions: &[&RuleDefinition],
+    warnings: &mut Vec<CompilerWarning>,
+) {
+    for fold_def in definitions.iter().filter(|d| !d.fold.is_empty()) {
+        let RuleOutput::Yield(fold_yield) = &fold_def.output else {
+            continue;
+        };
+        for (idx, item) in fold_yield.items.iter().enumerate() {
+            let Expr::Variable(name) = &item.expr else {
+                continue;
+            };
+            let is_count = fold_def.fold.iter().any(|f| {
+                &f.name == name
+                    && matches!(
+                        &f.aggregate,
+                        Expr::FunctionCall { name: agg, distinct: false, .. }
+                            if agg.eq_ignore_ascii_case("COUNT")
+                                || agg.eq_ignore_ascii_case("MCOUNT")
+                    )
+            });
+            if !is_count {
+                continue;
+            }
+            let seeded = definitions.iter().filter(|d| d.fold.is_empty()).any(|d| {
+                matches!(
+                    &d.output,
+                    RuleOutput::Yield(y) if matches!(
+                        y.items.get(idx).map(|i| &i.expr),
+                        Some(Expr::Literal(lit)) if !matches!(lit, CypherLiteral::Null)
+                    )
+                )
+            });
+            if seeded {
+                warnings.push(CompilerWarning {
+                    code: WarningCode::CountFoldSeedCounted,
+                    message: format!(
+                        "a clause of rule '{rule_name}' seeds the count '{name}' with a literal. \
+                         A FOLD aggregates every row of its rule, so the seed is one counted \
+                         row, not a starting value: a key with no other rows counts 1. \
+                         Write `NULL AS {name}` to seed the key without counting it"
+                    ),
+                    rule_name: rule_name.to_string(),
+                });
+                return;
+            }
+        }
+    }
 }
 
 // ─── YIELD schema ────────────────────────────────────────────────────────────

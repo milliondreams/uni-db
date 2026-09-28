@@ -38,6 +38,8 @@ pub mod value_assert;
 pub mod locy_issue_158_is_not_subject_scope;
 // Issue #159: aggregation inside a recursive rule dedups equal values.
 pub mod locy_issue_159_recursive_fold_dedup;
+// A seed clause alongside a COUNT fold: the seed is one counted row.
+pub mod locy_count_fold_seed;
 // Issue #293: a FOLD silently dropped YIELD columns that were not KEY.
 pub mod locy_issue_293_fold_ungrouped_yield;
 // Issue #294: recursive FOLD collapsed parallel edges between one node pair.

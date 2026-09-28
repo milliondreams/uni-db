@@ -45,6 +45,23 @@ Likewise, a `QUERY` may only reference columns its rule yields; `QUERY stake
 RETURN e.uid` against a rule that does not yield `e` is a compile error, not a
 column of NULLs.
 
+### Seeding a fold
+
+A rule can give some keys a starting row in one clause and fold into the same
+column in another. The fold aggregates **all** of the rule's rows for a key, so
+the seed is one more input:
+
+```locy
+CREATE RULE f AS MATCH (e:E) WHERE e.uid IN ['x','y'] YIELD KEY e, 100.0 AS v
+CREATE RULE f AS MATCH (o:E)-[r:OWNS]->(e:E) WHERE o IS f
+FOLD v = MSUM(r.pct) YIELD KEY e, v
+```
+
+A key seeded with 100 that also receives a stake of 20 comes out as 120. For
+`COUNT` / `MCOUNT` a seed is one counted row — `0 AS n` makes a key with no
+other rows count **1**, and the compiler warns about it. Seed with `NULL AS n`
+to make a key present without counting it.
+
 ### FOLD in a recursive rule
 
 A recursive `FOLD` rolls up **per KEY, one level at a time**: a self-reference

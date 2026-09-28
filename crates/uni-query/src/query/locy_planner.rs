@@ -779,6 +779,98 @@ fn name_anonymous_edges(clause: &CompiledClause, clause_index: usize) -> Compile
     named
 }
 
+/// Whether `fb` is a non-DISTINCT `COUNT` / `MCOUNT`.
+///
+/// Such a fold only needs to know whether each input is NULL, which is what
+/// lets [`count_input_marker`] replace the input with an integer.
+fn is_count_fold(fb: &uni_cypher::locy_ast::FoldBinding) -> bool {
+    matches!(
+        &fb.aggregate,
+        Expr::FunctionCall { name, distinct: false, .. }
+            if name.eq_ignore_ascii_case("COUNT") || name.eq_ignore_ascii_case("MCOUNT")
+    )
+}
+
+/// `CASE WHEN <input> IS NULL THEN NULL ELSE 1 END`: a count's input reduced
+/// to what the count observes.
+///
+/// A count over a node or relationship used to carry the entity itself into
+/// the fold column, where a sibling clause's integer seed met it and the
+/// batches could not be concatenated. A MATCH-bound entity is tested through
+/// its identity column, which the scan always exposes.
+fn count_input_marker(input: Expr, clause: &CompiledClause, clause_index: usize) -> Expr {
+    let mut nodes = HashSet::new();
+    collect_match_node_vars(clause, &mut nodes);
+    let edges: HashSet<String> = match_edge_vars(clause, clause_index)
+        .into_iter()
+        .filter(|d| d.kind == DerivKind::Edge)
+        .map(|d| d.name)
+        .collect();
+    let probe = match &input {
+        Expr::Variable(v) if nodes.contains(v) => Expr::Variable(format!("{v}._vid")),
+        Expr::Variable(v) if edges.contains(v) => Expr::Variable(format!("{v}._eid")),
+        _ => input,
+    };
+    Expr::Case {
+        expr: None,
+        when_then: vec![(
+            Expr::IsNull(Box::new(probe)),
+            Expr::Literal(CypherLiteral::Null),
+        )],
+        else_expr: Some(Box::new(Expr::Literal(CypherLiteral::Integer(1)))),
+    }
+}
+
+/// The type each FOLD-output column carries *before* the fold, keyed by the
+/// rule's yield column name.
+///
+/// A FOLD aggregates every row of its rule per KEY, including the rows of a
+/// clause with no FOLD that yields the same column: such a clause seeds the
+/// column, and its value is one more input to the aggregate (SQL's
+/// `AGG(v) FROM (seeds UNION ALL inputs) GROUP BY key`). Both kinds of row
+/// share one column, so the seed must be projected with the fold input's type.
+/// Without this, `YIELD KEY e, 0 AS v` beside `FOLD v = MSUM(r.pct)` produced
+/// an Int64 batch next to a Float64 one and the merge failed.
+fn fold_input_column_types(
+    rule: &CompiledRule,
+    rule_catalog: &HashMap<String, CompiledRule>,
+    schema: &Schema,
+) -> HashMap<String, DataType> {
+    let Some(fold_clause) = rule.clauses.iter().find(|c| !c.fold.is_empty()) else {
+        return HashMap::new();
+    };
+    let RuleOutput::Yield(yc) = &fold_clause.output else {
+        return HashMap::new();
+    };
+    let fold_names: HashSet<&str> = fold_clause.fold.iter().map(|f| f.name.as_str()).collect();
+    let mut node_vars = HashSet::new();
+    collect_match_node_vars(fold_clause, &mut node_vars);
+    let var_labels = clause_var_labels(fold_clause);
+    rule.yield_schema
+        .iter()
+        .zip(yc.items.iter())
+        .filter_map(|(col, item)| {
+            let Expr::Variable(fold_name) = &item.expr else {
+                return None;
+            };
+            fold_names.contains(fold_name.as_str()).then(|| {
+                let ty = infer_yield_type(
+                    fold_name,
+                    fold_clause,
+                    &node_vars,
+                    &fold_names,
+                    &HashSet::new(),
+                    rule_catalog,
+                    false,
+                    schema,
+                    &var_labels,
+                );
+                (col.name.clone(), ty)
+            })
+        })
+        .collect()
+}
+
 struct ClauseCtx<'a> {
     stratum_rule_names: &'a HashSet<String>,
     rule_catalog: &'a HashMap<String, CompiledRule>,
@@ -790,6 +882,11 @@ struct ClauseCtx<'a> {
     /// does not projects a typed NULL. Empty unless the rule is recursive and
     /// carries FOLD or ALONG. See [`FOLD_DISCRIMINATOR_COL_PREFIX`].
     deriv_vars: &'a [DerivVar],
+    /// Target types for the columns a sibling clause folds into, keyed by
+    /// yield column name. A clause with no FOLD that yields such a column is
+    /// seeding it, and its value is aggregated alongside the fold's inputs, so
+    /// it must carry the fold input's type. See [`fold_input_column_types`].
+    seed_types: &'a HashMap<String, DataType>,
     /// Whether this rule's stratum is recursive — needed to compute a
     /// same-stratum IS-ref target's own discriminator columns.
     is_recursive: bool,
@@ -1084,6 +1181,7 @@ impl<'a> LocyPlanBuilder<'a> {
         // See `derivation_discriminator_columns`.
         let deriv_columns = derivation_discriminator_columns(rule, is_recursive);
         let deriv_vars = derivation_discriminators(rule, is_recursive).unwrap_or_default();
+        let seed_types = fold_input_column_types(rule, rule_catalog, self.planner.schema());
 
         let mut clauses = Vec::with_capacity(rule.clauses.len());
         for (clause_index, clause) in rule.clauses.iter().enumerate() {
@@ -1103,6 +1201,7 @@ impl<'a> LocyPlanBuilder<'a> {
                     rule_catalog,
                     node_vars: &node_vars,
                     deriv_vars: &deriv_vars,
+                    seed_types: &seed_types,
                     is_recursive,
                     clause_index,
                 },
@@ -1867,17 +1966,22 @@ impl<'a> LocyPlanBuilder<'a> {
             // columns (covers FOLD aggregate inputs and plain YIELD exprs).
             let expr = rewrite_is_ref_cols(expr, &is_ref_col_aliases);
             projections.push((expr, Some(yc.name.clone())));
-            target_types.push(infer_yield_type(
-                &yc.name,
-                clause,
-                node_vars,
-                &fold_output_names,
-                &along_names_set,
-                rule_catalog,
-                yc.is_key,
-                graph_schema,
-                &var_labels,
-            ));
+            let seeded = (clause.fold.is_empty() && !yc.is_key)
+                .then(|| ctx.seed_types.get(&yc.name).cloned())
+                .flatten();
+            target_types.push(seeded.unwrap_or_else(|| {
+                infer_yield_type(
+                    &yc.name,
+                    clause,
+                    node_vars,
+                    &fold_output_names,
+                    &along_names_set,
+                    rule_catalog,
+                    yc.is_key,
+                    graph_schema,
+                    &var_labels,
+                )
+            }));
         }
 
         // FOLD-input projection (issue #145 root fix).
@@ -1901,6 +2005,11 @@ impl<'a> LocyPlanBuilder<'a> {
             // bindings, then rewrite non-first IS-ref value columns.
             let expr = substitute_along_vars((*fold_input).clone(), &rewritten_along);
             let expr = rewrite_is_ref_cols(expr, &is_ref_col_aliases);
+            let expr = if is_count_fold(fb) {
+                count_input_marker(expr, clause, ctx.clause_index)
+            } else {
+                expr
+            };
             projections.push((expr, Some(fb.name.clone())));
             target_types.push(infer_yield_type(
                 &fb.name,
@@ -2592,11 +2701,17 @@ fn yield_schema_to_arrow_from_rule(
         .map(|c| c.along.iter().map(|a| a.name.as_str()).collect())
         .unwrap_or_default();
     let var_labels = first_clause.map(clause_var_labels).unwrap_or_default();
+    // A column some clause folds into is typed by that fold, even when the
+    // first clause only seeds it; see `fold_input_column_types`.
+    let fold_types = fold_input_column_types(target_rule, rule_catalog, schema);
 
     let fields: Vec<Field> = target_rule
         .yield_schema
         .iter()
         .map(|yc| {
+            if let Some(dt) = fold_types.get(&yc.name).filter(|_| !yc.is_key) {
+                return Field::new(&yc.name, dt.clone(), true);
+            }
             let dt = match first_clause {
                 Some(fc) => infer_yield_type(
                     &yc.name,
@@ -3274,6 +3389,7 @@ mod tests {
                     rule_catalog: &catalog,
                     node_vars: &HashSet::new(),
                     deriv_vars: &[],
+                    seed_types: &HashMap::new(),
                     is_recursive: false,
                     clause_index: 0,
                 },
@@ -3341,6 +3457,7 @@ mod tests {
                     rule_catalog: &catalog,
                     node_vars: &HashSet::new(),
                     deriv_vars: &[],
+                    seed_types: &HashMap::new(),
                     is_recursive: false,
                     clause_index: 0,
                 },
@@ -3405,6 +3522,7 @@ mod tests {
                     rule_catalog: &catalog,
                     node_vars: &HashSet::new(),
                     deriv_vars: &[],
+                    seed_types: &HashMap::new(),
                     is_recursive: false,
                     clause_index: 0,
                 },
@@ -3464,6 +3582,7 @@ mod tests {
                     rule_catalog: &catalog,
                     node_vars: &HashSet::new(),
                     deriv_vars: &[],
+                    seed_types: &HashMap::new(),
                     is_recursive: false,
                     clause_index: 0,
                 },
@@ -3533,6 +3652,7 @@ mod tests {
                     rule_catalog: &catalog,
                     node_vars: &HashSet::new(),
                     deriv_vars: &[],
+                    seed_types: &HashMap::new(),
                     is_recursive: false,
                     clause_index: 0,
                 },
@@ -3590,6 +3710,7 @@ mod tests {
                     rule_catalog: &catalog,
                     node_vars: &HashSet::new(),
                     deriv_vars: &[],
+                    seed_types: &HashMap::new(),
                     is_recursive: false,
                     clause_index: 0,
                 },
@@ -3669,6 +3790,7 @@ mod tests {
                     rule_catalog: &catalog,
                     node_vars: &HashSet::new(),
                     deriv_vars: &[],
+                    seed_types: &HashMap::new(),
                     is_recursive: false,
                     clause_index: 0,
                 },
@@ -3892,6 +4014,7 @@ mod tests {
                     rule_catalog: &catalog,
                     node_vars: &HashSet::new(),
                     deriv_vars: &[],
+                    seed_types: &HashMap::new(),
                     is_recursive: false,
                     clause_index: 0,
                 },
@@ -3951,6 +4074,7 @@ mod tests {
                     rule_catalog: &catalog,
                     node_vars: &HashSet::new(),
                     deriv_vars: &[],
+                    seed_types: &HashMap::new(),
                     is_recursive: false,
                     clause_index: 0,
                 },
@@ -4008,6 +4132,7 @@ mod tests {
                     rule_catalog: &catalog,
                     node_vars: &HashSet::new(),
                     deriv_vars: &[],
+                    seed_types: &HashMap::new(),
                     is_recursive: false,
                     clause_index: 0,
                 },
@@ -4057,6 +4182,7 @@ mod tests {
                     rule_catalog: &catalog,
                     node_vars: &HashSet::new(),
                     deriv_vars: &[],
+                    seed_types: &HashMap::new(),
                     is_recursive: false,
                     clause_index: 0,
                 },
@@ -4098,6 +4224,7 @@ mod tests {
                     rule_catalog: &catalog,
                     node_vars: &HashSet::new(),
                     deriv_vars: &[],
+                    seed_types: &HashMap::new(),
                     is_recursive: false,
                     clause_index: 0,
                 },
@@ -4180,6 +4307,7 @@ mod tests {
                     rule_catalog: &catalog,
                     node_vars: &HashSet::new(),
                     deriv_vars: &[],
+                    seed_types: &HashMap::new(),
                     is_recursive: false,
                     clause_index: 0,
                 },
@@ -4933,6 +5061,7 @@ mod tests {
                 rule_catalog: &catalog,
                 node_vars: &HashSet::new(),
                 deriv_vars: &[],
+                seed_types: &HashMap::new(),
                 is_recursive: false,
                 clause_index: 0,
             },
@@ -4985,6 +5114,7 @@ mod tests {
                 rule_catalog: &catalog,
                 node_vars: &HashSet::new(),
                 deriv_vars: &[],
+                seed_types: &HashMap::new(),
                 is_recursive: false,
                 clause_index: 0,
             },
@@ -5040,6 +5170,7 @@ mod tests {
                 rule_catalog: &catalog,
                 node_vars: &HashSet::new(),
                 deriv_vars: &[],
+                seed_types: &HashMap::new(),
                 is_recursive: false,
                 clause_index: 0,
             },
@@ -5089,6 +5220,7 @@ mod tests {
                 rule_catalog: &catalog,
                 node_vars: &HashSet::new(),
                 deriv_vars: &[],
+                seed_types: &HashMap::new(),
                 is_recursive: false,
                 clause_index: 0,
             },
@@ -5142,6 +5274,7 @@ mod tests {
                     rule_catalog: &catalog,
                     node_vars: &HashSet::new(),
                     deriv_vars: &[],
+                    seed_types: &HashMap::new(),
                     is_recursive: false,
                     clause_index: 0,
                 },
@@ -5196,6 +5329,7 @@ mod tests {
                 rule_catalog: &catalog,
                 node_vars: &HashSet::new(),
                 deriv_vars: &[],
+                seed_types: &HashMap::new(),
                 is_recursive: false,
                 clause_index: 0,
             },

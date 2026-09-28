@@ -4073,6 +4073,36 @@ CREATE RULE frequent_payer AS
     YIELD KEY p, n, total
 ```
 
+#### Seeding a fold
+
+A rule may seed a column in one clause and fold into it in another:
+
+```locy
+CREATE RULE f AS MATCH (e:E) WHERE e.uid IN ['x','y'] YIELD KEY e, 100.0 AS v
+CREATE RULE f AS MATCH (o:E)-[r:OWNS]->(e:E) WHERE o IS f FOLD v = MSUM(r.pct) YIELD KEY e, v
+```
+
+A FOLD aggregates, per KEY, **every** row of its rule: a folding clause
+contributes its aggregate's input and a seeding clause contributes the value it
+yields — SQL's `AGG(v) FROM (seeds UNION ALL inputs) GROUP BY key`. Measured:
+a seed of 100 plus an incoming stake of 20 is 120, recursive or not. For a
+count the same rule means a non-NULL seed is one counted row (its value is
+never read), and `NULL AS v` seeds a key without counting it. Because
+`YIELD KEY e, 0 AS n` beside `FOLD n = MCOUNT(r)` reads like a starting value,
+the compiler warns with `CountFoldSeedCounted`.
+
+Both kinds of row share the column, so both must carry one type:
+
+- a seeding clause projects the column with the fold's input type
+  (`fold_input_column_types`), so `0` feeds `MSUM(r.pct)` as `0.0`; the
+  self-reference's derived-scan schema uses the same types, rather than
+  inferring from whichever clause happens to be first;
+- a `COUNT` / `MCOUNT` input is projected as `CASE WHEN x IS NULL THEN NULL
+  ELSE 1 END` (`count_input_marker`), since a count only observes nullness.
+  Carrying the node or relationship itself put a `LargeBinary` or `UInt64`
+  column next to the seed's integer, and the merge failed with
+  `concatenate arrays of different data types`.
+
 #### What a FOLD clause may YIELD
 
 A FOLD emits one row per distinct KEY: the KEY columns plus one column per FOLD binding. `KEY` marks a **single** YIELD item, so a composite key is `YIELD KEY a, KEY b, total`; `YIELD KEY a, b, total` declares one KEY and a plain column `b`. A plain column has no single value per group, and `FoldExec` used to drop it without a diagnostic — a later `QUERY ... RETURN b` then read the absent column as NULL (issue #293). `check_fold_yield_is_grouped` now rejects, with `UngroupedFoldYield`, any YIELD item of a FOLD clause that is not a KEY, not a FOLD output, and does not mention one (`total * 2.0 AS score` is still allowed; the planner evaluates it after the fold). A clause *without* FOLD is unconstrained: a base clause `YIELD KEY e, 100.0 AS agg` seeds the column its sibling folds into.

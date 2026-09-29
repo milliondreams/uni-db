@@ -7073,17 +7073,16 @@ impl QueryPlanner {
         plan: LogicalPlan,
         optional: bool,
     ) -> Result<LogicalPlan> {
-        // Properties handling
-        let properties = match &node.properties {
-            Some(Expr::Map(entries)) => entries.as_slice(),
+        // A node's property map must be a literal map.
+        match &node.properties {
+            Some(Expr::Map(_)) | None => {}
             Some(Expr::Parameter(_)) => {
                 return Err(anyhow!(
                     "SyntaxError: InvalidParameterUse - Parameters cannot be used as node predicates"
                 ));
             }
             Some(_) => return Err(anyhow!("Node properties must be a Map")),
-            None => &[],
-        };
+        }
 
         let has_existing_scope = !matches!(plan, LogicalPlan::Empty);
 
@@ -7105,48 +7104,14 @@ impl QueryPlanner {
             (self.properties_to_expr(variable, &node.properties), None)
         };
 
-        // Check for ext_id in properties when no label is specified
+        // An unlabelled node — `(n {ext_id: 'x'})` included — scans the shared
+        // vertex table. An ext_id equality is pushed down to its index by the
+        // physical planner (`ext_id_equality`). A dedicated lookup operator
+        // used to handle ext_id here: it read flushed rows only, so a committed
+        // but unflushed vertex was not found, projected no properties
+        // (`RETURN n.name` failed to plan), and returned every property as a
+        // string.
         if node.labels.is_empty() {
-            // Try to find ext_id property for main table lookup
-            if let Some((_, ext_id_value)) = properties.iter().find(|(k, _)| k == "ext_id") {
-                // Extract the ext_id value as a string
-                let ext_id = match ext_id_value {
-                    Expr::Literal(CypherLiteral::String(s)) => s.clone(),
-                    _ => {
-                        return Err(anyhow!("ext_id must be a string literal for direct lookup"));
-                    }
-                };
-
-                // Build filter for remaining properties (excluding ext_id)
-                let remaining_props: Vec<_> = properties
-                    .iter()
-                    .filter(|(k, _)| k != "ext_id")
-                    .cloned()
-                    .collect();
-
-                let remaining_expr = if remaining_props.is_empty() {
-                    None
-                } else {
-                    Some(Expr::Map(remaining_props))
-                };
-
-                let (prop_filter, residual_filter) = if has_existing_scope {
-                    self.split_node_property_filters_for_scan(variable, &remaining_expr)
-                } else {
-                    (self.properties_to_expr(variable, &remaining_expr), None)
-                };
-
-                let ext_id_lookup = LogicalPlan::ExtIdLookup {
-                    variable: variable.to_string(),
-                    ext_id,
-                    filter: prop_filter,
-                    optional,
-                };
-
-                let joined = Self::join_with_plan(plan, ext_id_lookup);
-                return Ok(apply_residual_filter(joined, residual_filter));
-            }
-
             // No ext_id: create ScanAll for unlabeled node pattern
             let scan_all = LogicalPlan::ScanAll {
                 variable: variable.to_string(),

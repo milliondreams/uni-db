@@ -163,6 +163,46 @@ pub struct HybridPhysicalPlanner {
     multiplicity_insensitive: AtomicBool,
 }
 
+/// The string `variable.ext_id` is required to equal, if some conjunct of
+/// `filter` pins it to a literal or a string parameter.
+fn ext_id_equality(
+    filter: Option<&Expr>,
+    variable: &str,
+    params: &HashMap<String, uni_common::Value>,
+) -> Option<String> {
+    let filter = filter?;
+    if let Expr::BinaryOp { left, op, right } = filter {
+        match op {
+            uni_cypher::ast::BinaryOp::And => {
+                return ext_id_equality(Some(left), variable, params)
+                    .or_else(|| ext_id_equality(Some(right), variable, params));
+            }
+            uni_cypher::ast::BinaryOp::Eq => {
+                let is_ext_id = |e: &Expr| {
+                    matches!(e, Expr::Property(base, key)
+                        if key == "ext_id" && matches!(base.as_ref(), Expr::Variable(v) if v == variable))
+                };
+                let string_of = |e: &Expr| match e {
+                    Expr::Literal(CypherLiteral::String(s)) => Some(s.clone()),
+                    Expr::Parameter(name) => match params.get(name) {
+                        Some(uni_common::Value::String(s)) => Some(s.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if is_ext_id(left) {
+                    return string_of(right);
+                }
+                if is_ext_id(right) {
+                    return string_of(left);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Tags each row entering an `OPTIONAL MATCH` with a unique id, when this
 /// traversal is the clause's first hop.
 ///
@@ -3374,6 +3414,19 @@ impl HybridPhysicalPlanner {
             && vids.len() > 1
         {
             scan_exec = scan_exec.with_vid_list_filter(vids);
+        }
+        // `(n {ext_id: 'x'})`: push the equality down so the main table's
+        // `ext_id` index answers it. Flushed rows only — the Cypher filter the
+        // scan is finalized with still applies to every row, unflushed ones
+        // included, and remains the authoritative check.
+        if let Some(ext_id) = ext_id_equality(filter, variable, &self.params) {
+            let lance = uni_store::backend::types::FilterExpr::equals(
+                "ext_id",
+                uni_store::backend::types::Scalar::Str(ext_id),
+            )
+            .to_sql()
+            .map_err(|e| anyhow!("ext_id pushdown: {e}"))?;
+            scan_exec = scan_exec.with_extra_lance_filter(lance);
         }
         let scan_plan: Arc<dyn ExecutionPlan> = Arc::new(scan_exec);
         self.finalize_schemaless_scan(

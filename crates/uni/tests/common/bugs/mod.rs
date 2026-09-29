@@ -132,6 +132,7 @@ pub mod repro_issue_182_delete_before_first_flush;
 // the Lance dataset unchanged, so the next write to that label is rejected.
 pub mod bug_cypher_value_arg_decode;
 pub mod delete_sees_tx_local_edges;
+pub mod ext_id_lookup_sees_everything;
 pub mod fts_sees_current_text;
 pub mod inline_element_where;
 pub mod issue_225_merge_bound_anchor;

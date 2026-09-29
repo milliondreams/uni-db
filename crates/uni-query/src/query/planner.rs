@@ -4620,6 +4620,23 @@ impl QueryPlanner {
             return Err(anyhow!("Empty pattern"));
         }
 
+        // Relationship uniqueness spans the whole clause, so a relationship
+        // after a variable-length one must see the edges that one walked. It
+        // does through the step variable's edge list; an anonymous one has
+        // none, and without it the engine silently let a later hop reuse an
+        // edge the variable-length hop had already walked.
+        let named;
+        let match_clause = match self.name_anonymous_variable_length(&match_clause.pattern) {
+            Some(pattern) => {
+                named = MatchClause {
+                    pattern,
+                    ..match_clause.clone()
+                };
+                &named
+            }
+            None => match_clause,
+        };
+
         // Track variables introduced by this OPTIONAL MATCH
         let vars_before_pattern = vars_in_scope.len();
 
@@ -4705,6 +4722,59 @@ impl QueryPlanner {
         }
 
         Ok(plan)
+    }
+
+    /// `pattern` with a hidden step variable on every anonymous
+    /// variable-length relationship, when the clause has another relationship
+    /// that relationship uniqueness must keep off its edges; `None` when
+    /// nothing needs one.
+    ///
+    /// The name comes from [`Self::next_anon_var`], so it is as hidden as any
+    /// other generated variable. Shortest-path patterns enumerate no edge list
+    /// and are left alone.
+    fn name_anonymous_variable_length(&self, pattern: &Pattern) -> Option<Pattern> {
+        let relationships: usize = pattern
+            .paths
+            .iter()
+            .flat_map(|path| &path.elements)
+            .map(|element| match element {
+                PatternElement::Node(_) => 0,
+                PatternElement::Relationship(_) => 1,
+                PatternElement::Parenthesized { .. } => 2,
+            })
+            .sum();
+        let needs_name = |element: &PatternElement| {
+            matches!(
+                element,
+                PatternElement::Relationship(r)
+                    if r.range.is_some() && r.variable.as_deref().is_none_or(str::is_empty)
+            )
+        };
+        if relationships < 2
+            || !pattern
+                .paths
+                .iter()
+                .filter(|path| path.shortest_path_mode.is_none())
+                .flat_map(|path| &path.elements)
+                .any(needs_name)
+        {
+            return None;
+        }
+        let mut pattern = pattern.clone();
+        for path in pattern
+            .paths
+            .iter_mut()
+            .filter(|path| path.shortest_path_mode.is_none())
+        {
+            for element in &mut path.elements {
+                if needs_name(element)
+                    && let PatternElement::Relationship(r) = element
+                {
+                    r.variable = Some(self.next_anon_var());
+                }
+            }
+        }
+        Some(pattern)
     }
 
     /// Whether an OPTIONAL MATCH takes more than one step from the rows

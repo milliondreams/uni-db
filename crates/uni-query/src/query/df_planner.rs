@@ -2722,8 +2722,12 @@ impl HybridPhysicalPlanner {
         (properties, need_full)
     }
 
-    /// Collect edge columns (`._eid` and `__eid_to_*`) from a schema, filtered to the
-    /// current MATCH scope. Optionally excludes a specific column (for rebound edge patterns).
+    /// Collect edge columns (`._eid`, `__eid_to_*`, and a variable-length step
+    /// variable's `List<Edge>`) from a schema, filtered to the current MATCH
+    /// scope. Optionally excludes a specific column (for rebound edge patterns).
+    ///
+    /// The list column is how a relationship after a variable-length one learns
+    /// which edges that one walked; without it the later hop could reuse them.
     fn collect_used_edge_columns(
         schema: &SchemaRef,
         scope_match_variables: &HashSet<String>,
@@ -2746,11 +2750,27 @@ impl HybridPhysicalPlanner {
                     scope_match_variables
                         .contains(var_name)
                         .then(|| name.clone())
+                } else if scope_match_variables.contains(name.as_str())
+                    && Self::is_edge_list(f.data_type())
+                {
+                    Some(name.clone())
                 } else {
                     None
                 }
             })
             .collect()
+    }
+
+    /// Whether `data_type` is a list of edge structs, the shape of a
+    /// variable-length step variable.
+    fn is_edge_list(data_type: &DataType) -> bool {
+        match data_type {
+            DataType::List(item) => matches!(
+                item.data_type(),
+                DataType::Struct(fields) if fields.iter().any(|f| f.name() == "_eid")
+            ),
+            _ => false,
+        }
     }
 
     /// Conditionally add edge structural projection when the edge variable has wildcard access.

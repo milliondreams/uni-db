@@ -417,60 +417,94 @@ pub fn column_as_vid_array(
     )))
 }
 
-/// Resolve the named edge-ID columns used for Cypher relationship-uniqueness,
-/// failing closed on anything unexpected.
+/// The edge ids earlier elements of a MATCH pattern bound, per row.
 ///
-/// The traversal operators harvest these column names from their own input plan
-/// and use the resulting arrays to skip edges already bound by an earlier
-/// element of the same MATCH. The sites previously used
-/// `filter_map(|col| batch.column_by_name(col).and_then(downcast::<UInt64Array>))`,
-/// which drops a column that is absent or not `UInt64` — and a dropped column
-/// contributes no entries, so the `used_eids` check silently never fires for it
-/// and a path may reuse an edge. That is relationship-isomorphism quietly
-/// disabled, with no error and no residual re-check.
-///
-/// No current producer can trigger it: every `_eid`-shaped column is declared
-/// `UInt64`, the names come from the very plan that becomes the operator's
-/// child, and graph plans execute directly so no projection pushdown can prune
-/// one away. This exists so that a future change to the eid encoding fails
-/// loudly here instead of silently weakening path semantics — the same reason
-/// [`column_as_vid_array`] errors rather than skipping, in these same functions.
+/// A fixed hop publishes one id per row (`r._eid`, `__eid_to_<var>`); a
+/// variable-length hop publishes the list of edges it walked (its step
+/// variable, `List<Edge>`). Relationship uniqueness excludes both.
+pub struct UsedEdgeIds<'a> {
+    flat: Vec<&'a arrow_array::UInt64Array>,
+    lists: Vec<(&'a arrow_array::ListArray, &'a arrow_array::UInt64Array)>,
+}
+
+impl UsedEdgeIds<'_> {
+    /// The edge ids bound on `row`, in no particular order.
+    pub fn for_row(&self, row: usize) -> impl Iterator<Item = u64> + '_ {
+        let flat = self
+            .flat
+            .iter()
+            .filter(move |arr| !arr.is_null(row))
+            .map(move |arr| arr.value(row));
+        let listed = self
+            .lists
+            .iter()
+            .filter(move |(list, _)| !list.is_null(row))
+            .flat_map(move |(list, eids)| {
+                let offsets = list.value_offsets();
+                let (from, to) = (offsets[row] as usize, offsets[row + 1] as usize);
+                (from..to)
+                    .filter(|&i| !eids.is_null(i))
+                    .map(|i| eids.value(i))
+            });
+        flat.chain(listed)
+    }
+}
+
+/// Reads the relationship-uniqueness columns `used_edge_columns` of `batch`.
 ///
 /// # Errors
 ///
-/// Returns `DataFusionError::Execution` if a named column is missing from the
-/// batch or is not a `UInt64` array.
+/// Fails when a column is missing or is neither `UInt64` nor a list of edge
+/// structs: proceeding would silently allow an edge to be reused.
 pub fn used_edge_id_arrays<'a>(
     batch: &'a arrow_array::RecordBatch,
     used_edge_columns: &[String],
-) -> datafusion::error::Result<Vec<&'a arrow_array::UInt64Array>> {
-    used_edge_columns
-        .iter()
-        .map(|col| {
-            let column = batch.column_by_name(col).ok_or_else(|| {
+) -> datafusion::error::Result<UsedEdgeIds<'a>> {
+    let columns = batch.schema();
+    let mut used = UsedEdgeIds {
+        flat: Vec::new(),
+        lists: Vec::new(),
+    };
+    for col in used_edge_columns {
+        let column = batch.column_by_name(col).ok_or_else(|| {
+            datafusion::error::DataFusionError::Execution(format!(
+                "relationship-uniqueness column '{col}' is missing from the traversal input \
+                 (columns: {:?}); proceeding would silently allow an edge to be reused",
+                columns
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().as_str())
+                    .collect::<Vec<_>>()
+            ))
+        })?;
+        if let Some(flat) = column.as_any().downcast_ref::<arrow_array::UInt64Array>() {
+            used.flat.push(flat);
+            continue;
+        }
+        let eids = column
+            .as_any()
+            .downcast_ref::<arrow_array::ListArray>()
+            .and_then(|list| {
+                let edges = list
+                    .values()
+                    .as_any()
+                    .downcast_ref::<arrow_array::StructArray>()?;
+                let eids = edges
+                    .column_by_name("_eid")?
+                    .as_any()
+                    .downcast_ref::<arrow_array::UInt64Array>()?;
+                Some((list, eids))
+            })
+            .ok_or_else(|| {
                 datafusion::error::DataFusionError::Execution(format!(
-                    "relationship-uniqueness column '{col}' is missing from the traversal input \
-                     (columns: {:?}); proceeding would silently allow an edge to be reused",
-                    batch
-                        .schema()
-                        .fields()
-                        .iter()
-                        .map(|f| f.name().as_str())
-                        .collect::<Vec<_>>()
+                    "relationship-uniqueness column '{col}' has type {:?}, expected UInt64 \
+                     or a list of edges; proceeding would silently allow an edge to be reused",
+                    column.data_type()
                 ))
             })?;
-            column
-                .as_any()
-                .downcast_ref::<arrow_array::UInt64Array>()
-                .ok_or_else(|| {
-                    datafusion::error::DataFusionError::Execution(format!(
-                        "relationship-uniqueness column '{col}' has type {:?}, expected UInt64; \
-                         proceeding would silently allow an edge to be reused",
-                        column.data_type()
-                    ))
-                })
-        })
-        .collect()
+        used.lists.push(eids);
+    }
+    Ok(used)
 }
 
 /// Extract a VID from a CypherValue that is a vertex.

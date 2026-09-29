@@ -401,7 +401,7 @@ impl RowDedupState {
     /// computation in subsequent iterations correctly recognizes surviving facts.
     fn ingest_existing(&mut self, facts: &[RecordBatch], _schema: &SchemaRef) {
         self.seen.clear();
-        for batch in facts {
+        for batch in &float_key_view(facts) {
             if batch.num_rows() == 0 {
                 continue;
             }
@@ -426,13 +426,14 @@ impl RowDedupState {
         schema: &SchemaRef,
     ) -> DFResult<Vec<RecordBatch>> {
         let mut delta_batches = Vec::new();
-        for batch in candidates {
+        let keys = float_key_view(candidates);
+        for (batch, key_batch) in candidates.iter().zip(&keys) {
             if batch.num_rows() == 0 {
                 continue;
             }
 
-            // Vectorized encoding of all rows in this batch.
-            let arrays: Vec<_> = batch.columns().to_vec();
+            // Vectorized encoding of all rows in this batch, from the key view.
+            let arrays: Vec<_> = key_batch.columns().to_vec();
             let rows = self.converter.convert_columns(&arrays).map_err(arrow_err)?;
 
             // One pass: check+insert into persistent seen set.
@@ -685,8 +686,6 @@ impl FixpointState {
         if let Some(first) = candidates.iter().find(|b| b.num_rows() > 0) {
             self.reconcile_schema(&first.schema());
         }
-        let candidates = round_float_columns(&candidates);
-
         // Existing facts first, candidates after, so the newest row for a
         // derivation key is the one that survives.
         let mut all: Vec<RecordBatch> = self
@@ -716,9 +715,13 @@ impl FixpointState {
 
         // Rows before this index are existing facts; the rest are candidates.
         let facts_rows: usize = self.facts.iter().map(RecordBatch::num_rows).sum();
+        // Keys come from the rounded view; the rows kept are exact.
+        let combined_keys = float_key_view(std::slice::from_ref(&combined))
+            .pop()
+            .expect("one batch in, one out");
         let mut latest: HashMap<Vec<ScalarKey>, u32> = HashMap::new();
         for row in 0..combined.num_rows() {
-            let key = extract_scalar_key(&combined, &deriv_key_indices, row);
+            let key = extract_scalar_key(&combined_keys, &deriv_key_indices, row);
             let replaced = latest.insert(key, row as u32);
             // A derivation is evaluated once per iteration, so two candidates
             // sharing a derivation key must agree on their fold input. If they
@@ -728,8 +731,8 @@ impl FixpointState {
             if cfg!(debug_assertions)
                 && let Some(prev) = replaced
                 && prev as usize >= facts_rows
-                && extract_scalar_key(&combined, &fold_inputs, prev as usize)
-                    != extract_scalar_key(&combined, &fold_inputs, row)
+                && extract_scalar_key(&combined_keys, &fold_inputs, prev as usize)
+                    != extract_scalar_key(&combined_keys, &fold_inputs, row)
             {
                 return Err(datafusion::error::DataFusionError::Internal(format!(
                     "rule '{}': two derivations of one iteration share a derivation key \
@@ -757,8 +760,11 @@ impl FixpointState {
         let mut new_row_indices: Vec<u32> = Vec::new();
         {
             let prev = &self.fold_view.as_ref().expect("fold view").prev_rows;
+            let retained_keys = float_key_view(std::slice::from_ref(&retained))
+                .pop()
+                .expect("one batch in, one out");
             for row in 0..retained.num_rows() {
-                let full = extract_scalar_key(&retained, &self.all_column_indices, row);
+                let full = extract_scalar_key(&retained_keys, &self.all_column_indices, row);
                 if !prev.contains(&full) {
                     new_row_indices.push(row as u32);
                 }
@@ -1092,9 +1098,8 @@ impl FixpointState {
         }
 
         // Round floats for stable dedup
-        let candidates = round_float_columns(&candidates);
-
-        // Compute delta: rows in candidates not already in facts
+        // Compute delta: rows in candidates not already in facts. The dedup
+        // compares a rounded key view; the rows stored stay exact.
         let delta = self.compute_delta(&candidates, task_ctx.as_ref()).await?;
 
         if delta.is_empty() || delta.iter().all(|b| b.num_rows() == 0) {
@@ -1169,7 +1174,7 @@ impl FixpointState {
     fn compute_delta_legacy(&self, candidates: &[RecordBatch]) -> DFResult<Vec<RecordBatch>> {
         // Build set of existing fact row keys (ALL columns)
         let mut existing: HashSet<Vec<ScalarKey>> = HashSet::new();
-        for batch in &self.facts {
+        for batch in &float_key_view(&self.facts) {
             for row_idx in 0..batch.num_rows() {
                 let key = extract_scalar_key(batch, &self.all_column_indices, row_idx);
                 existing.insert(key);
@@ -1177,21 +1182,22 @@ impl FixpointState {
         }
 
         let mut delta_batches = Vec::new();
-        for batch in candidates {
+        let keys = float_key_view(candidates);
+        for (batch, key_batch) in candidates.iter().zip(&keys) {
             if batch.num_rows() == 0 {
                 continue;
             }
             // Filter to only new rows
             let mut keep = Vec::with_capacity(batch.num_rows());
             for row_idx in 0..batch.num_rows() {
-                let key = extract_scalar_key(batch, &self.all_column_indices, row_idx);
+                let key = extract_scalar_key(key_batch, &self.all_column_indices, row_idx);
                 keep.push(!existing.contains(&key));
             }
 
             // Also dedup within the candidate batch itself
             for (row_idx, kept) in keep.iter_mut().enumerate() {
                 if *kept {
-                    let key = extract_scalar_key(batch, &self.all_column_indices, row_idx);
+                    let key = extract_scalar_key(key_batch, &self.all_column_indices, row_idx);
                     if !existing.insert(key) {
                         *kept = false;
                     }
@@ -1269,8 +1275,6 @@ impl FixpointState {
         }
 
         // Round floats for stable dedup.
-        let candidates = round_float_columns(&candidates);
-
         // Snapshot existing best-per-KEY facts for change detection.
         let old_best: HashMap<Vec<ScalarKey>, Vec<ScalarKey>> =
             self.build_key_criteria_map(sort_criteria);
@@ -1360,13 +1364,18 @@ impl FixpointState {
             .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
 
         // Detect whether the best-per-KEY set actually changed.
+        // Compared through the rounded key view, like every other convergence
+        // test; the rows kept are exact.
         let new_best: HashMap<Vec<ScalarKey>, Vec<ScalarKey>> = {
             let mut map = HashMap::new();
+            let pruned_keys = float_key_view(std::slice::from_ref(&pruned))
+                .pop()
+                .expect("one batch in, one out");
             for row_idx in 0..pruned.num_rows() {
-                let key = extract_scalar_key(&pruned, &self.key_column_indices, row_idx);
+                let key = extract_scalar_key(&pruned_keys, &self.key_column_indices, row_idx);
                 let criteria: Vec<ScalarKey> = sort_criteria
                     .iter()
-                    .flat_map(|c| extract_scalar_key(&pruned, &[c.col_index], row_idx))
+                    .flat_map(|c| extract_scalar_key(&pruned_keys, &[c.col_index], row_idx))
                     .collect();
                 map.insert(key, criteria);
             }
@@ -1408,7 +1417,7 @@ impl FixpointState {
         sort_criteria: &[SortCriterion],
     ) -> HashMap<Vec<ScalarKey>, Vec<ScalarKey>> {
         let mut map = HashMap::new();
-        for batch in &self.facts {
+        for batch in &float_key_view(&self.facts) {
             for row_idx in 0..batch.num_rows() {
                 let key = extract_scalar_key(batch, &self.key_column_indices, row_idx);
                 let criteria: Vec<ScalarKey> = sort_criteria
@@ -1435,8 +1444,18 @@ fn batch_byte_size(batch: &RecordBatch) -> usize {
 // Float rounding for stable dedup
 // ---------------------------------------------------------------------------
 
-/// Round all Float64 columns to 12 decimal places for stable dedup.
-fn round_float_columns(batches: &[RecordBatch]) -> Vec<RecordBatch> {
+/// A copy of `batches` for building dedup and change-detection *keys*: every
+/// Float64 column rounded to an absolute 1e-12.
+///
+/// Values that differ only by floating-point noise from different evaluation
+/// orders must compare equal, or the fixpoint never sees an empty delta; and a
+/// value decaying toward 0 around a cycle (an `MPROD`, an `ALONG` product)
+/// only converges because it eventually rounds to 0. That is a property of the
+/// comparison, not of the data: the view is used for keys only, and the facts
+/// keep their exact values. Rounding the stored values themselves turned every
+/// magnitude below 1e-12 into 0 — an `ALONG` product of 1e-7 × 1e-7 was stored
+/// as 0.0.
+fn float_key_view(batches: &[RecordBatch]) -> Vec<RecordBatch> {
     batches
         .iter()
         .map(|batch| {
@@ -1486,78 +1505,89 @@ fn round_float_columns(batches: &[RecordBatch]) -> Vec<RecordBatch> {
 /// HashJoinExec is more cache-efficient.
 const DEDUP_ANTI_JOIN_THRESHOLD: usize = 300;
 
-/// Deduplicate `candidates` against `existing` using DataFusion's HashJoinExec.
+/// Rows of `candidates` not already in `existing`, and each only once, using
+/// DataFusion's `HashJoinExec` (LeftAnti) with NULLs comparing equal.
 ///
-/// Returns rows in `candidates` that do not appear in `existing` (LeftAnti semantics).
-/// `null_equals_null = true` so NULLs are treated as equal for dedup purposes.
-/// Dedup `batches` by all columns (set semantics), keeping the first occurrence.
-///
-/// `arrow_left_anti_dedup` removes candidate rows that match the existing fact
-/// set, but a single semi-naive iteration can emit the same row many times — e.g.
-/// a transitive-closure rule derives the same `(a, b)` pair via every intermediate
-/// `mid` on a path. A `LeftAnti` join does not remove these *within-candidate*
-/// duplicates, so they would leak into the fact set. The `RowDedupState` and legacy
-/// paths both dedup within the candidate batch ([`RowDedupState::compute_delta`],
-/// [`FixpointState::compute_delta_legacy`]); this keeps the `arrow_left_anti_dedup`
-/// path identical so dedup behavior does not change across `DEDUP_ANTI_JOIN_THRESHOLD`.
-fn dedup_batches_all_columns(
-    batches: Vec<RecordBatch>,
-    schema: &SchemaRef,
-) -> DFResult<Vec<RecordBatch>> {
-    let fields: Vec<SortField> = schema
-        .fields()
-        .iter()
-        .map(|f| SortField::new(f.data_type().clone()))
-        .collect();
-    // Unsupported column types: leave as-is. This path is only reached for facts
-    // sets >= DEDUP_ANTI_JOIN_THRESHOLD; for those types the <threshold path uses
-    // `compute_delta_legacy`, which dedups via `ScalarKey` instead.
-    let Ok(converter) = RowConverter::new(fields) else {
-        return Ok(batches);
-    };
-    let mut seen: HashSet<Box<[u8]>> = HashSet::new();
-    let mut out = Vec::with_capacity(batches.len());
-    for batch in batches {
-        if batch.num_rows() == 0 {
-            continue;
-        }
-        let rows = converter
-            .convert_columns(batch.columns())
-            .map_err(arrow_err)?;
-        let mut keep = Vec::with_capacity(batch.num_rows());
-        for row_idx in 0..batch.num_rows() {
-            let row_bytes: Box<[u8]> = rows.row(row_idx).data().into();
-            keep.push(seen.insert(row_bytes));
-        }
-        let keep_mask = arrow_array::BooleanArray::from(keep);
-        let cols = batch
-            .columns()
-            .iter()
-            .map(|c| arrow::compute::filter(c.as_ref(), &keep_mask).map_err(arrow_err))
-            .collect::<DFResult<Vec<_>>>()?;
-        if cols.first().is_some_and(|c| !c.is_empty()) {
-            out.push(RecordBatch::try_new(Arc::clone(schema), cols).map_err(arrow_err)?);
-        }
-    }
-    Ok(out)
-}
-
+/// Rows are compared through [`float_key_view`] and returned with their exact
+/// values.
 async fn arrow_left_anti_dedup(
     candidates: Vec<RecordBatch>,
     existing: &[RecordBatch],
     schema: &SchemaRef,
     task_ctx: &Arc<TaskContext>,
 ) -> DFResult<Vec<RecordBatch>> {
+    // Rows are compared through the rounded key view (`float_key_view`) and
+    // returned exact: keys pick the rows, the view is never stored.
+    let candidates: Vec<RecordBatch> = candidates
+        .into_iter()
+        .filter(|b| b.num_rows() > 0)
+        .collect();
+    if candidates.is_empty() {
+        return Ok(vec![]);
+    }
+    let exact = arrow::compute::concat_batches(schema, &candidates).map_err(arrow_err)?;
+    let keys = float_key_view(std::slice::from_ref(&exact))
+        .pop()
+        .expect("one batch in, one out");
+
+    // A single iteration may emit the same row twice: keep first occurrences.
+    let converter = RowConverter::new(
+        schema
+            .fields()
+            .iter()
+            .map(|f| SortField::new(f.data_type().clone()))
+            .collect(),
+    )
+    .map_err(arrow_err)?;
+    let rows = converter
+        .convert_columns(keys.columns())
+        .map_err(arrow_err)?;
+    let mut seen: HashSet<Box<[u8]>> = HashSet::new();
+    let first: Vec<u32> = (0..keys.num_rows())
+        .filter(|&i| seen.insert(rows.row(i).data().into()))
+        .map(|i| i as u32)
+        .collect();
+    let take_exact = |indices: Vec<u32>| -> DFResult<Vec<RecordBatch>> {
+        let idx = arrow_array::UInt32Array::from(indices);
+        let cols = exact
+            .columns()
+            .iter()
+            .map(|c| arrow::compute::take(c.as_ref(), &idx, None))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(arrow_err)?;
+        Ok(vec![
+            RecordBatch::try_new(Arc::clone(schema), cols).map_err(arrow_err)?,
+        ])
+    };
     if existing.is_empty() || existing.iter().all(|b| b.num_rows() == 0) {
-        // No existing facts to anti-join against, but still dedup the candidates
-        // among themselves (a single iteration may emit duplicate rows).
-        return dedup_batches_all_columns(candidates, schema);
+        return take_exact(first);
     }
 
+    // Anti-join the first occurrences' keys against the existing facts' keys,
+    // carrying each candidate's row index in a column the join does not use.
+    const ROW: &str = "__locy_candidate_row";
+    let first_idx = arrow_array::UInt32Array::from(first);
+    let mut left_cols = keys
+        .columns()
+        .iter()
+        .map(|c| arrow::compute::take(c.as_ref(), &first_idx, None))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(arrow_err)?;
+    left_cols.push(Arc::new(first_idx.clone()));
+    let mut left_fields: Vec<Arc<arrow_schema::Field>> = schema.fields().iter().cloned().collect();
+    left_fields.push(Arc::new(arrow_schema::Field::new(
+        ROW,
+        arrow_schema::DataType::UInt32,
+        false,
+    )));
+    let left_schema: SchemaRef = Arc::new(arrow_schema::Schema::new(left_fields));
+    let left_batch =
+        RecordBatch::try_new(Arc::clone(&left_schema), left_cols).map_err(arrow_err)?;
+
     let left: Arc<dyn ExecutionPlan> =
-        MemorySourceConfig::try_new_exec(&[candidates], Arc::clone(schema), None)?;
+        MemorySourceConfig::try_new_exec(&[vec![left_batch]], Arc::clone(&left_schema), None)?;
     let right: Arc<dyn ExecutionPlan> =
-        MemorySourceConfig::try_new_exec(&[existing.to_vec()], Arc::clone(schema), None)?;
+        MemorySourceConfig::try_new_exec(&[float_key_view(existing)], Arc::clone(schema), None)?;
 
     let on: Vec<(
         Arc<dyn datafusion::physical_plan::PhysicalExpr>,
@@ -1598,11 +1628,20 @@ async fn arrow_left_anti_dedup(
     )?;
 
     let join_arc: Arc<dyn ExecutionPlan> = Arc::new(join);
-    // LeftAnti removes candidates that match `existing`, but not duplicate rows
-    // within the candidate set — dedup those to match the other delta strategies.
     let mut reservation = operator_reservation("FixpointExec", 0, task_ctx);
     let anti = collect_all_partitions(&join_arc, task_ctx.clone(), &mut reservation).await?;
-    dedup_batches_all_columns(anti, schema)
+    let mut survivors: Vec<u32> = anti
+        .iter()
+        .filter_map(|b| {
+            b.column_by_name(ROW)?
+                .as_any()
+                .downcast_ref::<arrow_array::UInt32Array>()
+                .map(|a| a.values().to_vec())
+        })
+        .flatten()
+        .collect();
+    survivors.sort_unstable();
+    take_exact(survivors)
 }
 
 // ---------------------------------------------------------------------------
@@ -6294,7 +6333,7 @@ mod tests {
     // --- Float rounding tests ---
 
     #[test]
-    fn test_round_float_columns_near_duplicates() {
+    fn test_float_key_view_near_duplicates() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("name", DataType::Utf8, true),
             Field::new("dist", DataType::Float64, true),
@@ -6308,7 +6347,7 @@ mod tests {
         )
         .unwrap();
 
-        let rounded = round_float_columns(&[batch]);
+        let rounded = float_key_view(&[batch]);
         assert_eq!(rounded.len(), 1);
         let col = rounded[0]
             .column(1)

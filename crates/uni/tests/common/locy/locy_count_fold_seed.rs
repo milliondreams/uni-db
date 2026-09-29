@@ -165,3 +165,28 @@ async fn count_fold_seed_integer_seed_into_float_sum() -> Result<()> {
     }
     Ok(())
 }
+
+/// Fixpoint values below 1e-12 survive: an ALONG product of 1e-7 × 1e-7 is
+/// 1e-14, not 0. The fixpoint rounded every float to an absolute 1e-12 for
+/// stable dedup, which zeroed anything smaller.
+#[tokio::test]
+async fn count_fold_seed_small_fixpoint_floats_survive() -> Result<()> {
+    let db = build().await?;
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("MATCH ()-[r:OWNS]->() DELETE r").await?;
+    tx.execute("MATCH (x:E {uid: 'x'}), (y:E {uid: 'y'}) CREATE (x)-[:OWNS {pct: 1.0e-7}]->(y)")
+        .await?;
+    tx.execute("MATCH (y:E {uid: 'y'}), (a:E {uid: 'a'}) CREATE (y)-[:OWNS {pct: 1.0e-7}]->(a)")
+        .await?;
+    tx.commit().await?;
+    let program = "CREATE RULE reach AS MATCH (s:E {uid: 'x'})-[r:OWNS]->(e:E) YIELD KEY e, r.pct AS v \
+         CREATE RULE reach AS MATCH (m:E)-[r:OWNS]->(e:E) WHERE m IS reach \
+         ALONG v = prev.v * r.pct YIELD KEY e, v \
+         QUERY reach RETURN e.uid AS uid, v";
+    let got = values(&db, program).await?;
+    let a = got.iter().find(|(u, _)| u == "a").map(|(_, v)| *v);
+    let a = a.expect("a is reached through y");
+    assert!((a - 1e-14).abs() < 1e-26, "a = {a}, want 1e-14");
+    Ok(())
+}

@@ -962,7 +962,13 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
                 acc.extend(free_variables(e)?);
                 Some(acc)
             })
-            .is_some_and(|read| read.is_subset(&pattern_vars));
+            .is_some_and(|read| read.is_subset(&pattern_vars))
+            // A pattern variable bound in the outer row ties the answer to that
+            // row even when the body reads nothing else from outside.
+            && !pattern_vars.iter().any(|v| {
+                input_schema.column_with_name(&format!("{v}._vid")).is_some()
+                    || input_schema.column_with_name(v).is_some()
+            });
 
         Ok(Arc::new(PatternComprehensionSubqueryExpr {
             query,
@@ -1081,6 +1087,9 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
         input_schema: &Schema,
     ) -> Result<Arc<dyn PhysicalExpr>> {
         let pattern = extract_pattern_from_exists_query(query)?;
+        if let Some(reason) = fast_path_unsupported(&pattern, input_schema, FastPath::Exists) {
+            anyhow::bail!("pattern predicate not vectorizable: {reason}");
+        }
 
         let graph_ctx = self
             .graph_ctx
@@ -1879,7 +1888,44 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
         // evaluating the comprehension as a correlated subquery, mirroring what
         // the `Expr::Exists` arm above already does when `compile_pattern_exists`
         // cannot vectorize a pattern predicate.
+        // A node after the anchor that is already bound outside must be that
+        // very node. The vectorized operator would treat it as a fresh binding,
+        // so rename it and test identity instead: `(a)-->(b)` with `b` bound
+        // becomes `(a)-->(__pc_bound_0) WHERE id(__pc_bound_0) = id(b)`.
+        let (rebound, bound_preds) = rebind_bound_later_nodes(pattern, input_schema);
+        let pattern = &rebound;
+        let where_owned = bound_preds
+            .into_iter()
+            .chain(where_clause.cloned())
+            .reduce(|l, r| Expr::BinaryOp {
+                left: Box::new(l),
+                op: BinaryOp::And,
+                right: Box::new(r),
+            });
+        let where_clause = where_owned.as_ref();
+
         let (anchor_col, steps) = match analyze_pattern(pattern, input_schema, uni_schema) {
+            Ok(_)
+                if let Some(reason) =
+                    fast_path_unsupported(pattern, input_schema, FastPath::Comprehension) =>
+            {
+                // A bound node is in scope, but the pattern uses something the
+                // vectorized operator would ignore. The correlated subquery
+                // honours the whole pattern.
+                log::debug!("Pattern comprehension not vectorizable ({reason}); using a subquery");
+                let mut pattern = pattern.clone();
+                if let Some(first) = pattern.paths.first_mut()
+                    && path_variable.is_some()
+                {
+                    first.variable = path_variable.clone();
+                }
+                return self.compile_pattern_comprehension_as_subquery(
+                    &pattern,
+                    where_clause,
+                    map_expr,
+                    input_schema,
+                );
+            }
             Ok(analysis) => analysis,
             Err(e) => {
                 log::debug!(
@@ -3015,6 +3061,7 @@ impl PhysicalExpr for ExistsExecExpr {
         // 7.3: Rewrite correlated property accesses to parameter references.
         // e.g., `n.prop` where `n` is an outer entity → `$param("n.prop")`
         let rewritten_query = rewrite_query_correlated(&self.query, &entity_vars);
+        let labelled_outer = outer_nodes_with_labels(&self.query, &entity_vars);
 
         // 7.4: Plan ONCE — the rewritten query is parameterized, same for all rows.
         let planner = QueryPlanner::new(self.uni_schema.clone());
@@ -3084,6 +3131,7 @@ impl PhysicalExpr for ExistsExecExpr {
                             sub_params.insert(var.clone(), vid_val);
                         }
                     }
+                    supply_outer_labels(&mut sub_params, &labelled_outer, &graph_ctx);
 
                     let (batches, _plan) = rt.block_on(execute_subplan_with_outer_vars(
                         &logical_plan,
@@ -3514,19 +3562,22 @@ impl PhysicalExpr for PatternComprehensionSubqueryExpr {
                 vars_in_scope.insert(name.clone());
             }
         }
-        // A pattern variable shadows an outer column of the same name.
+        // A pattern variable shadows an outer *value* of the same name. An
+        // outer node or relationship of that name is not shadowed: in openCypher
+        // a variable already bound in scope refers to the same entity inside the
+        // pattern, so it stays correlated.
         for v in &self.pattern_vars {
-            vars_in_scope.remove(v);
+            if !entity_vars.contains(v) {
+                vars_in_scope.remove(v);
+            }
         }
         let vars_in_scope: Vec<String> = vars_in_scope.into_iter().collect();
 
         // Only genuine entity variables drive the property-access rewrite; a
         // shadowed name must not be rewritten to an outer parameter either.
-        let correlated_vars: HashSet<String> = entity_vars
-            .difference(&self.pattern_vars)
-            .cloned()
-            .collect();
+        let correlated_vars: HashSet<String> = entity_vars.clone();
         let rewritten_query = rewrite_query_correlated(&self.query, &correlated_vars);
+        let labelled_outer = outer_nodes_with_labels(&self.query, &correlated_vars);
 
         // Planned once; the rewrite turned correlated references into parameters,
         // so the plan is the same for every row.
@@ -3598,6 +3649,7 @@ impl PhysicalExpr for PatternComprehensionSubqueryExpr {
                             sub_params.insert(var.clone(), vid_val);
                         }
                     }
+                    supply_outer_labels(&mut sub_params, &labelled_outer, &graph_ctx);
 
                     // Counted here rather than once per `evaluate`: the cost
                     // this path carries is one sub-plan execution per outer
@@ -3817,18 +3869,285 @@ fn rewrite_query_correlated(query: &Query, outer_vars: &HashSet<String>) -> Quer
     }
 }
 
+/// Which vectorized operator a pattern is being considered for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FastPath {
+    /// `PatternExistsExecExpr`, for a pattern predicate.
+    Exists,
+    /// The vectorized pattern comprehension.
+    Comprehension,
+}
+
+/// Renames every node after a pattern's first element whose variable is bound
+/// in `input_schema`, returning the rewritten pattern and one
+/// `id(<new>) = id(<bound>)` predicate per rename.
+fn rebind_bound_later_nodes(
+    pattern: &uni_cypher::ast::Pattern,
+    input_schema: &Schema,
+) -> (uni_cypher::ast::Pattern, Vec<Expr>) {
+    use uni_cypher::ast::PatternElement;
+    let bound = |v: &str| {
+        input_schema
+            .column_with_name(&format!("{v}._vid"))
+            .is_some()
+            || input_schema.column_with_name(v).is_some()
+    };
+    let id_of = |v: &str| Expr::FunctionCall {
+        name: "id".to_string(),
+        args: vec![Expr::Variable(v.to_string())],
+        distinct: false,
+        window_spec: None,
+    };
+    let mut pattern = pattern.clone();
+    let mut preds = Vec::new();
+    for path in &mut pattern.paths {
+        for elem in path.elements.iter_mut().skip(1) {
+            if let PatternElement::Node(node) = elem
+                && let Some(var) = node.variable.clone().filter(|v| bound(v))
+            {
+                let fresh = format!("__pc_bound_{}", preds.len());
+                preds.push(Expr::BinaryOp {
+                    left: Box::new(id_of(&fresh)),
+                    op: BinaryOp::Eq,
+                    right: Box::new(id_of(&var)),
+                });
+                node.variable = Some(fresh);
+            }
+        }
+    }
+    (pattern, preds)
+}
+
+/// Why `pattern` cannot use the vectorized operator, or `None` if it can.
+///
+/// Both operators walk adjacency from a bound anchor and honour only part of
+/// a pattern; anything else they used to drop silently — the anchor's labels,
+/// relationship property maps, relationship uniqueness across hops, and for a
+/// comprehension also target property maps and variable-length ranges. This
+/// admits a pattern only when every feature it uses is one the operator
+/// implements, so everything else takes the general subquery path.
+fn fast_path_unsupported(
+    pattern: &uni_cypher::ast::Pattern,
+    input_schema: &Schema,
+    path: FastPath,
+) -> Option<&'static str> {
+    use uni_cypher::ast::{LabelExpr, PatternElement};
+    let bound = |v: &str| {
+        input_schema
+            .column_with_name(&format!("{v}._vid"))
+            .is_some()
+            || input_schema.column_with_name(v).is_some()
+    };
+    let [only] = pattern.paths.as_slice() else {
+        return Some("more than one path");
+    };
+    if only.shortest_path_mode.is_some() {
+        return Some("shortest path");
+    }
+    let mut elements = only.elements.iter();
+    match elements.next() {
+        Some(PatternElement::Node(anchor)) if anchor.variable.as_deref().is_some_and(bound) => {
+            if !matches!(anchor.labels, LabelExpr::Empty)
+                || anchor.properties.is_some()
+                || anchor.where_clause.is_some()
+            {
+                return Some("constraint on the anchor node");
+            }
+        }
+        _ => return Some("the first element is not a bound node"),
+    }
+    let mut rel_types: Vec<&[String]> = Vec::new();
+    for elem in elements {
+        match elem {
+            PatternElement::Relationship(r) => {
+                if r.range.is_some() {
+                    return Some("variable-length relationship");
+                }
+                if r.properties.is_some() || r.where_clause.is_some() {
+                    return Some("relationship property constraint");
+                }
+                if r.variable.as_deref().is_some_and(bound) {
+                    return Some("bound relationship variable");
+                }
+                rel_types.push(r.types.names());
+            }
+            PatternElement::Node(n) => {
+                if n.where_clause.is_some() {
+                    return Some("node inline WHERE");
+                }
+                match &n.labels {
+                    LabelExpr::Empty => {}
+                    LabelExpr::Conjunction(names) if names.len() == 1 => {}
+                    _ => return Some("more than one label on a node"),
+                }
+                if path == FastPath::Comprehension {
+                    if n.properties.is_some() {
+                        return Some("node property map in a comprehension");
+                    }
+                    if n.variable.as_deref().is_some_and(bound) {
+                        return Some("bound node after the anchor");
+                    }
+                }
+            }
+            PatternElement::Parenthesized { .. } => return Some("quantified sub-pattern"),
+        }
+    }
+    // Relationship uniqueness: the operators keep no per-path edge set, so two
+    // hops that could match the same relationship must not share a type.
+    for (i, a) in rel_types.iter().enumerate() {
+        for b in &rel_types[i + 1..] {
+            if a.is_empty() || b.is_empty() || a.iter().any(|t| b.contains(t)) {
+                return Some("two hops could match the same relationship");
+            }
+        }
+    }
+    None
+}
+
+/// Parameter holding an outer node's labels inside a correlated subquery.
+fn outer_labels_param(var: &str) -> String {
+    format!("{var}._labels")
+}
+
+/// Moves the labels of outer-bound nodes out of a subquery pattern and into
+/// predicates over `$<var>._labels`.
+///
+/// Inside the subquery an outer node exists only as parameters, not as scan
+/// columns, so the label filter the planner emits for `(n:Person)` —
+/// `array_has(n._labels, ...)` — referred to a column that is never there and
+/// failed with `No field named "n._labels"`. The predicate reads the same
+/// labels from a parameter [`ExistsExecExpr`] supplies instead.
+fn lift_outer_node_labels(
+    pattern: &uni_cypher::ast::Pattern,
+    outer_vars: &HashSet<String>,
+) -> (uni_cypher::ast::Pattern, Vec<Expr>) {
+    use uni_cypher::ast::{LabelExpr, PatternElement};
+    let mut pattern = pattern.clone();
+    let mut preds = Vec::new();
+    for path in &mut pattern.paths {
+        for elem in &mut path.elements {
+            let PatternElement::Node(node) = elem else {
+                continue;
+            };
+            let Some(var) = node.variable.as_ref().filter(|v| outer_vars.contains(*v)) else {
+                continue;
+            };
+            let has = |label: &String| Expr::In {
+                expr: Box::new(Expr::Literal(CypherLiteral::String(label.clone()))),
+                list: Box::new(Expr::Parameter(outer_labels_param(var))),
+            };
+            let combine = |op: BinaryOp, names: &[String]| {
+                names.iter().map(has).reduce(|l, r| Expr::BinaryOp {
+                    left: Box::new(l),
+                    op,
+                    right: Box::new(r),
+                })
+            };
+            let pred = match &node.labels {
+                LabelExpr::Empty => None,
+                LabelExpr::Conjunction(names) => combine(BinaryOp::And, names),
+                LabelExpr::Disjunction(names) => combine(BinaryOp::Or, names),
+            };
+            if let Some(pred) = pred {
+                preds.push(pred);
+                node.labels = LabelExpr::Empty;
+            }
+        }
+    }
+    (pattern, preds)
+}
+
+/// Adds `$<var>._labels` for each of `vars` the outer row does not already
+/// carry, resolved from the node's id. See [`lift_outer_node_labels`].
+fn supply_outer_labels(
+    sub_params: &mut HashMap<String, Value>,
+    vars: &HashSet<String>,
+    graph_ctx: &Arc<GraphExecutionContext>,
+) {
+    for var in vars {
+        let key = outer_labels_param(var);
+        if sub_params.contains_key(&key) {
+            continue;
+        }
+        let labels = match sub_params.get(&format!("{var}._vid")) {
+            Some(Value::Int(raw)) => graph_ctx
+                .resolve_vertex_labels(
+                    uni_common::core::id::Vid::from(*raw as u64),
+                    &graph_ctx.query_context(),
+                )
+                .unwrap_or_default()
+                .into_iter()
+                .map(Value::String)
+                .collect(),
+            // A NULL outer node has no labels, so a label test on it is false,
+            // as `(n:Label)` over NULL matches nothing.
+            _ => Vec::new(),
+        };
+        sub_params.insert(key, Value::List(labels));
+    }
+}
+
+/// Outer variables whose labels a correlated subquery tests (see
+/// [`lift_outer_node_labels`]), so their labels must be supplied per row.
+fn outer_nodes_with_labels(query: &Query, outer_vars: &HashSet<String>) -> HashSet<String> {
+    use uni_cypher::ast::{LabelExpr, PatternElement};
+    let mut out = HashSet::new();
+    let mut visit = |stmt: &Statement| {
+        for clause in &stmt.clauses {
+            if let Clause::Match(m) = clause {
+                for path in &m.pattern.paths {
+                    for elem in &path.elements {
+                        if let PatternElement::Node(node) = elem
+                            && let Some(var) = &node.variable
+                            && outer_vars.contains(var)
+                            && !matches!(node.labels, LabelExpr::Empty)
+                        {
+                            out.insert(var.clone());
+                        }
+                    }
+                }
+            }
+        }
+    };
+    fn walk(q: &Query, visit: &mut dyn FnMut(&Statement)) {
+        match q {
+            Query::Single(stmt) => visit(stmt),
+            Query::Union { left, right, .. } => {
+                walk(left, visit);
+                walk(right, visit);
+            }
+            _ => {}
+        }
+    }
+    walk(query, &mut visit);
+    out
+}
+
 /// Rewrite expressions within a clause for correlated property access.
 fn rewrite_clause_correlated(clause: &Clause, outer_vars: &HashSet<String>) -> Clause {
     match clause {
-        Clause::Match(m) => Clause::Match(MatchClause {
-            optional: m.optional,
-            pattern: m.pattern.clone(),
-            where_clause: m
+        Clause::Match(m) => {
+            let (pattern, label_preds) = lift_outer_node_labels(&m.pattern, outer_vars);
+            let where_clause = m
                 .where_clause
                 .as_ref()
-                .map(|e| rewrite_expr_correlated(e, outer_vars)),
-            for_update: m.for_update,
-        }),
+                .map(|e| rewrite_expr_correlated(e, outer_vars));
+            let where_clause =
+                label_preds
+                    .into_iter()
+                    .chain(where_clause)
+                    .reduce(|l, r| Expr::BinaryOp {
+                        left: Box::new(l),
+                        op: BinaryOp::And,
+                        right: Box::new(r),
+                    });
+            Clause::Match(MatchClause {
+                optional: m.optional,
+                pattern,
+                where_clause,
+                for_update: m.for_update,
+            })
+        }
         Clause::With(w) => Clause::With(WithClause {
             distinct: w.distinct,
             items: w

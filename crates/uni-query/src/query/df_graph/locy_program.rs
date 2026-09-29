@@ -962,13 +962,15 @@ async fn run_program(
                 exec.set_profile_collector(Arc::clone(c));
             }
             let task_ctx = session_ctx.read().task_ctx();
+            let per_rule_output = exec.per_rule_output();
             let exec_arc: Arc<dyn ExecutionPlan> = Arc::new(exec);
             // #261. The derived store keeps every relation of every stratum to
             // completion; `max_derived_bytes` bounds the fixpoint's own facts
             // but this accumulation sits outside it, and `peak_memory_slot` only
             // reports the total afterwards.
             let mut reservation = operator_reservation("LocyProgramExec", 0, &task_ctx);
-            let batches = collect_all_partitions(&exec_arc, task_ctx, &mut reservation).await?;
+            let _concatenated =
+                collect_all_partitions(&exec_arc, task_ctx, &mut reservation).await?;
             // The fixpoint driver spans the whole stratum and is a child of
             // nothing, so this is the only place it can be observed (#177).
             // Recorded only while profiling, so the walk is not paid otherwise.
@@ -976,46 +978,32 @@ async fn run_program(
                 stratum_operators = crate::query::executor::core::collect_plan_metrics(&exec_arc);
             }
 
-            // FixpointExec concatenates all rules' output; store per-rule.
-            // For now, store all output under each rule name (since FixpointExec
-            // handles per-rule state internally, the output is already correct).
-            // NOTE(deferred): Per-rule fact demultiplexing is not yet implemented.
-            // FixpointExec concatenates all rules' output into a single batch stream.
-            // Proper demux requires FixpointExec to tag output batches with rule identity
-            // (e.g. an extra column or side-channel), which is a non-trivial change to
-            // run_fixpoint_loop. The current schema-field-count heuristic (filter below)
-            // works because recursive stratum rules share compatible schemas.
-            // Revisit when cross-stratum consumption of individual recursive rules is needed.
+            // `batches` concatenates every rule of the stratum; each rule's own
+            // facts come from the per-rule slot. Storing the concatenation under
+            // every name gave mutually recursive rules each other's rows.
+            let per_rule = per_rule_output
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
             for rule in &stratum.rules {
                 // Skip DERIVE-only rules (empty yield_schema).
                 if rule.yield_schema.is_empty() {
                     continue;
                 }
-                // Write converged facts into registry handles for cross-stratum consumers
-                let rule_entries = registry.entries_for_rule(&rule.name);
-                for entry in rule_entries {
+                let facts: Vec<RecordBatch> = per_rule.get(&rule.name).cloned().unwrap_or_default();
+                // Write converged facts into registry handles for cross-stratum
+                // consumers; FixpointExec already wrote the self-ref handles.
+                for entry in registry.entries_for_rule(&rule.name) {
                     if !entry.is_self_ref {
-                        // Cross-stratum handles get the full fixpoint output
-                        // In practice, FixpointExec already wrote self-ref handles;
-                        // we need to write non-self-ref handles for later strata.
-                        let all_facts: Vec<RecordBatch> = batches
-                            .iter()
-                            .filter(|b| {
-                                // If schemas match, this batch belongs to this rule
-                                let rule_schema = yield_columns_to_arrow_schema(&rule.yield_schema);
-                                b.schema().fields().len() == rule_schema.fields().len()
-                            })
-                            .cloned()
-                            .collect();
                         let mut guard = entry.data.write();
-                        *guard = if all_facts.is_empty() {
+                        *guard = if facts.is_empty() {
                             vec![RecordBatch::new_empty(Arc::clone(&entry.schema))]
                         } else {
-                            all_facts
+                            facts.clone()
                         };
                     }
                 }
-                derived_store.insert(rule.name.clone(), batches.clone());
+                derived_store.insert(rule.name.clone(), facts);
             }
         } else {
             // Non-recursive: single-pass evaluation

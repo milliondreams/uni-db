@@ -1734,6 +1734,7 @@ async fn run_fixpoint_loop(
     max_bdd_variables: usize,
     warnings_slot: Arc<StdRwLock<Vec<RuntimeWarning>>>,
     approximate_slot: Arc<StdRwLock<HashMap<String, Vec<String>>>>,
+    per_rule_output: PerRuleOutput,
     top_k_proofs: usize,
     timeout_flag: Arc<std::sync::atomic::AtomicU8>,
     semiring_kind: SemiringKind,
@@ -2100,6 +2101,10 @@ async fn run_fixpoint_loop(
             &params,
         )
         .await?;
+        per_rule_output
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(rule.name.clone(), processed.clone());
         all_output.extend(processed);
     }
 
@@ -5495,6 +5500,15 @@ fn record_post_ops(plan: &Arc<dyn ExecutionPlan>, sink: Option<&mut Vec<Operator
 ///
 /// Has no physical children: clause bodies are re-planned from logical plans
 /// on each iteration (same pattern as `RecursiveCTEExec` and `GraphApplyExec`).
+/// Each rule's converged output, keyed by rule name, filled when the fixpoint
+/// finishes.
+///
+/// The operator's own stream concatenates every rule of the stratum, which is
+/// what the `ExecutionPlan` contract can carry. Mutually recursive rules have
+/// different facts, and a consumer that stored the concatenation under each
+/// rule's name gave every rule the others' rows too.
+pub type PerRuleOutput = Arc<StdRwLock<HashMap<String, Vec<RecordBatch>>>>;
+
 pub struct FixpointExec {
     rules: Vec<FixpointRulePlan>,
     max_iterations: usize,
@@ -5521,6 +5535,9 @@ pub struct FixpointExec {
     warnings_slot: Arc<StdRwLock<Vec<RuntimeWarning>>>,
     /// Shared slot for groups where BDD fell back to independence mode.
     approximate_slot: Arc<StdRwLock<HashMap<String, Vec<String>>>>,
+    /// Each rule's converged output, keyed by rule name. See
+    /// [`Self::per_rule_output`].
+    per_rule_output: PerRuleOutput,
     /// When > 0, retain at most this many proofs per fact (top-k provenance).
     top_k_proofs: usize,
     /// Shared flag: set to true on timeout to signal partial results.
@@ -5801,6 +5818,7 @@ impl FixpointExec {
             max_bdd_variables,
             warnings_slot,
             approximate_slot,
+            per_rule_output: PerRuleOutput::default(),
             top_k_proofs,
             timeout_flag,
             semiring_kind,
@@ -5821,6 +5839,12 @@ impl FixpointExec {
     ///
     /// Mirrors `set_derivation_tracker`: call before wrapping the exec in an
     /// `Arc` and executing. Only the Locy `profile()` path sets this.
+    /// The slot this operator fills with each rule's own output once the
+    /// fixpoint converges. Take it before executing; see [`PerRuleOutput`].
+    pub fn per_rule_output(&self) -> PerRuleOutput {
+        Arc::clone(&self.per_rule_output)
+    }
+
     pub fn set_profile_collector(&mut self, collector: Arc<LocyProfileCollector>) {
         self.profile_collector = Some(collector);
     }
@@ -5936,6 +5960,7 @@ impl ExecutionPlan for FixpointExec {
         let max_bdd_variables = self.max_bdd_variables;
         let warnings_slot = Arc::clone(&self.warnings_slot);
         let approximate_slot = Arc::clone(&self.approximate_slot);
+        let per_rule_output = Arc::clone(&self.per_rule_output);
         let top_k_proofs = self.top_k_proofs;
         let timeout_flag = Arc::clone(&self.timeout_flag);
         let semiring_kind = self.semiring_kind;
@@ -5965,6 +5990,7 @@ impl ExecutionPlan for FixpointExec {
                 max_bdd_variables,
                 warnings_slot,
                 approximate_slot,
+                per_rule_output,
                 top_k_proofs,
                 timeout_flag,
                 semiring_kind,

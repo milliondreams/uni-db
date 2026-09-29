@@ -208,8 +208,14 @@ fn compile_with_context(
     // Assemble strata in topological order
     let mut strata = Vec::new();
     for &scc_idx in &strat.scc_order {
-        let scc_rules: Vec<_> = strat.sccs[scc_idx]
-            .iter()
+        // A strongly connected component is a set; sort it so a stratum's
+        // rules — and so everything that depends on their order, from the
+        // fixpoint's per-rule states to the output schema — are the same on
+        // every run.
+        let mut scc_names: Vec<&String> = strat.sccs[scc_idx].iter().collect();
+        scc_names.sort();
+        let scc_rules: Vec<_> = scc_names
+            .into_iter()
             .filter_map(|name| compiled_rules.get(name).cloned())
             .collect();
 

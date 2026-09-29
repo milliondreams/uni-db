@@ -146,6 +146,7 @@ pub mod merge_per_row_counters;
 pub mod not_null_on_unflushed_rows;
 pub mod optional_match_clause_close;
 pub mod optional_match_row_identity;
+pub mod optional_traverse_chunked;
 pub mod pattern_fast_path_constraints;
 pub mod repro_distinct_entity_over_counts;
 pub mod repro_issue_249_add_property_to_existing_label;

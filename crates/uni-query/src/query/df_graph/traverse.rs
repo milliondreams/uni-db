@@ -2043,11 +2043,50 @@ impl Stream for GraphTraverseStream {
                     offset,
                 } => {
                     if offset >= expansions.len() {
+                        // The chunks carry matches only. Which input rows
+                        // matched nothing is a property of the whole expansion
+                        // set, so their NULL rows are decided here, once:
+                        // decided per chunk, every row whose matches fell in
+                        // another chunk got a NULL row too, once per chunk.
+                        let unmatched = if self.optional {
+                            let matched: HashSet<usize> =
+                                expansions.iter().map(|(idx, _, _, _, _)| *idx).collect();
+                            collect_unmatched_optional_group_rows(
+                                &input,
+                                &matched,
+                                &self.schema,
+                                &self.optional_pattern_vars,
+                            )
+                            .and_then(|rows| {
+                                (!rows.is_empty())
+                                    .then(|| {
+                                        build_optional_null_batch_for_rows_with_optional_vars(
+                                            &input,
+                                            &rows,
+                                            &self.schema,
+                                            &self.optional_pattern_vars,
+                                        )
+                                    })
+                                    .transpose()
+                            })
+                        } else {
+                            Ok(None)
+                        };
                         // The expansion set and its input die here, so what they
                         // backed is released here.
                         self.reservation.free();
                         self.state = TraverseStreamState::Reading;
-                        continue;
+                        match unmatched {
+                            Ok(Some(nulls)) => {
+                                self.metrics.record_output(nulls.num_rows());
+                                return Poll::Ready(Some(Ok(nulls)));
+                            }
+                            Ok(None) => continue,
+                            Err(e) => {
+                                self.state = TraverseStreamState::Done;
+                                return Poll::Ready(Some(Err(e)));
+                            }
+                        }
                     }
                     let end = (offset + self.slice_size).min(expansions.len());
                     let chunk: Vec<Expansion> = expansions[offset..end].to_vec();
@@ -2061,7 +2100,9 @@ impl Stream for GraphTraverseStream {
                         self.target_properties.clone(),
                         self.target_label_name.clone(),
                         self.graph_ctx.clone(),
-                        self.optional,
+                        // NULL rows for unmatched input rows are added once the
+                        // last chunk is out, above.
+                        false,
                         self.optional_pattern_vars.clone(),
                         self.target_props.clone(),
                         self.target_props_map.clone(),

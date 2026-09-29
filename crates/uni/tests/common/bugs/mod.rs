@@ -148,6 +148,7 @@ pub mod repro_registry_monotonicity_oracle;
 pub mod repro_schemaless_pattern_comprehension_empty;
 pub mod repro_stream_error_loses_abort_type;
 pub mod scan_range_walk_l0_rows;
+pub mod unique_key_reuse;
 pub mod vid_lookup_join_payoff;
 pub mod vid_lookup_join_reachability;
 pub mod vlp_default_hop_bound_warns;

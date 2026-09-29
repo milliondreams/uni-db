@@ -4589,43 +4589,10 @@ impl Executor {
         writer: &Writer,
         tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
     ) -> Result<()> {
-        let schema = self.storage.schema_manager().schema();
-        let edge_type_ids: Vec<u32> = schema.all_edge_type_ids();
-
-        // Collect tombstoned edge IDs from both the writer L0 and tx L0.
-        let tombstoned_eids = collect_tombstoned_eids(writer, tx_l0);
-
-        let out_graph = self
-            .storage
-            .load_subgraph_cached(
-                &[vid],
-                &edge_type_ids,
-                1,
-                uni_store::runtime::Direction::Outgoing,
-                Some(writer.l0_manager.get_current()),
-            )
-            .await?;
-        let has_out = out_graph.edges().any(|e| !tombstoned_eids.contains(&e.eid));
-
-        let in_graph = self
-            .storage
-            .load_subgraph_cached(
-                &[vid],
-                &edge_type_ids,
-                1,
-                uni_store::runtime::Direction::Incoming,
-                Some(writer.l0_manager.get_current()),
-            )
-            .await?;
-        let has_in = in_graph.edges().any(|e| !tombstoned_eids.contains(&e.eid));
-
-        if has_out || has_in {
-            return Err(anyhow!(
-                "ConstraintVerificationFailed: DeleteConnectedNode - Cannot delete node {}, because it still has relationships. To delete the node and its relationships, use DETACH DELETE.",
-                vid
-            ));
-        }
-        Ok(())
+        // One implementation for the single and the batched path, so a fix to
+        // what counts as "still has relationships" cannot reach only one.
+        self.batch_check_vertices_have_no_edges(&[vid], writer, tx_l0)
+            .await
     }
 
     /// Execute edge deletion from a map representation.

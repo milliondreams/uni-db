@@ -1,6 +1,6 @@
 # Finding silent wrong answers by class, not by customer report
 
-**Date:** 2026-09-28 · **Status:** W1 done (all confirmed defects fixed, plus four found on the way); W2–W6 open · **Trigger:** issues #293, #294
+**Date:** 2026-09-28 · **Status:** W1 done (all confirmed defects fixed, plus four found on the way); W2 done (found the OPTIONAL MATCH clause-close class); W3–W6 open · **Trigger:** issues #293, #294
 
 ## Why
 
@@ -84,7 +84,8 @@ is justified by a bug it would have caught.
 | Locy non-recursive rule ≡ equivalent Cypher `MATCH … RETURN key, agg(...)` | FOLD grouping, #293 | new |
 | before flush ≡ after flush, **on fixtures with vid gaps and > 1 slice per label** | scan L0 gap, FTS stale, UNIQUE | lever exists; fixture does not |
 | inside transaction ≡ after commit | non-DETACH delete | new |
-| `target_partitions` ∈ {1, 2, 8}, batch size ∈ {1, 8192}, fresh session × N | #294's nondeterminism, keep-last merges | **blocked**: config not wired (§4) |
+| `target_partitions` ∈ {1, 2, 8}, batch size ∈ {1, 8192}, fresh session × N | #294's nondeterminism, keep-last merges; OPTIONAL null-fill per batch | done for the TCKs (W2) |
+| `MATCH (a) OPTIONAL MATCH p` ≡ `MATCH (a) MATCH p` ⊎ `MATCH (a) WHERE NOT EXISTS { MATCH p }` padded with NULL | OPTIONAL clause close (W2) | hand test (`bugs::optional_match_clause_close`); a lever for W3 |
 | adding a parallel edge with value v changes MSUM by exactly v; splitting a node does not change totals | identity keys | new |
 
 ## 4. Work items, in order
@@ -100,6 +101,24 @@ reader. Sessions build `SessionConfig::new()` at `api/mod.rs:2161` and
 a determinism check that runs the Locy TCK and the Cypher TCK under
 `target_partitions ∈ {1, 8}` and `batch_size ∈ {1, 8192}`. This reuses ~4450
 existing hand-written expectations.
+
+*W2 result.* `UniConfig.parallelism` now sets DataFusion `target_partitions`,
+and a new `UniConfig.execution_batch_size` (default `None` = DataFusion's 8192)
+sets the engine batch size; `batch_size` is documented as what it is, the
+cursor page size. Both TCK harnesses read `UNI_TCK_PARALLELISM` /
+`UNI_TCK_EXECUTION_BATCH_SIZE` (a malformed value fails every scenario, so a
+run cannot silently fall back to the defaults). Swept at (1, 1), (8, 7) and
+(2, 8192) against the default: Locy 528/528 everywhere; Cypher 3925/3925
+except `Graph6[6]` at batch size 1 — a leading `OPTIONAL MATCH` emitted one
+NULL row per batch. Mapping it with the OPTIONAL oracle above found the class,
+most of it wrong **at default settings**: every dead end of a multi-step
+OPTIONAL pattern emitted its own NULL row, a comma-separated second path
+extended rows the first had failed (`[6, 7]` where `[6, NULL]` was due), and a
+leading clause with a labelled start emitted a NULL row per start vertex. Fixed
+by closing every multi-step OPTIONAL clause with one evidence-aware
+`OptionalFilterExec` (Black Book B2). `parallelism` moved no counter the DQP
+Tier-3 probe observes; `execution_batch_size` does, and is now its observable
+knob.
 
 **W3 — widen the DQP fixture and generator.**
 - Fixture: add a second relationship type over one label with parallel edges,

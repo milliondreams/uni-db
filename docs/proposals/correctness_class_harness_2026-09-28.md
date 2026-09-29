@@ -1,6 +1,6 @@
 # Finding silent wrong answers by class, not by customer report
 
-**Date:** 2026-09-28 · **Status:** W1 done (all confirmed defects fixed, plus four found on the way); W2 done (found the OPTIONAL MATCH clause-close class); W3–W6 open · **Trigger:** issues #293, #294
+**Date:** 2026-09-28 · **Status:** W1 done (all confirmed defects fixed, plus four found on the way); W2 done (found the OPTIONAL MATCH clause-close class); W3 in part (query-rewrite relations + topology fixture; four engine defects found); W4–W6 open · **Trigger:** issues #293, #294
 
 ## Why
 
@@ -130,6 +130,26 @@ knob.
 - New Tier-2 levers that rewrite the *query* (the driver currently passes the
   same query to both sides, `driver.rs:390`): named↔anonymous,
   predicate↔`EXISTS`, comprehension↔`COUNT`.
+
+*W3 result (in part).* `metamorphic::dqp::topo` holds data and engine fixed
+and compares each generated query with equivalent formulations — six relations
+(named ↔ anonymous relationship; `OPTIONAL MATCH` ↔ `MATCH` ⊎ `NOT EXISTS`;
+`EXISTS` ↔ `COUNT > 0` ↔ pattern predicate; comprehension ↔ `COUNT {}`;
+`*i..j` ↔ ⊎ₖ `*k..k` ↔ ⊎ₖ k fixed hops; `DISTINCT` ↔ grouping) — over a
+fixture with chains, a diamond, parallel and identical-parallel edges,
+self-loops, 2- and 3-cycles, fan-in/out, a second label and a dense cluster,
+flushed and half in L0 at a two-row execution batch. Every reference query
+also runs twice. Activation = the relation applies *and* the reference returns
+rows (floor 30%; measured 47–85% per relation). The first runs found four
+silent wrong answers, all at default settings, each with a regression test in
+`bugs/`: a hop after a variable-length relationship reused its edges (221 rows
+for 104); the reachability BFS dropped endpoints in an order-dependent way
+(95–103 of 103 rows, run to run); a chunked OPTIONAL traversal emitted a NULL
+row per chunk; and an unbound OPTIONAL entity was a non-null struct of NULLs
+(`labels()` failed, `keys()` gave `[]` or the declared property names, a list
+or map holding it became NULL). Not done from the W3 list: the > 8192-row,
+vid-gap tier for the existing state levers, and querygen `UNWIND` /
+min/max/collect. Known open: `elementId(b)` fails with "No field named b".
 
 **W4 — Locy through the levers.** A program-text case type and generator
 (FOLD with composite keys, seeds, recursion, ALONG, parallel edges), an

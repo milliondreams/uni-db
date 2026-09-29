@@ -7227,6 +7227,44 @@ under `crates/uni/tests/common/` that fails with the fix reverted.
   each rule's output (`per_rule_output`), and a stratum's rules are sorted so
   their order is the same on every run (`locy::locy_mutual_recursion_per_rule_facts`).
 
+**Relationship uniqueness spans the whole pattern, in every direction.**
+- A relationship *after* a variable-length one excludes that one's edges. The
+  traversal operators exclude used edges from `._eid` / `__eid_to_*` columns
+  and, now, from a variable-length step variable's `List<Edge>` column
+  (`UsedEdgeIds`, `collect_used_edge_columns`); an anonymous variable-length
+  relationship in a clause with another relationship is given a hidden
+  `_anon_N` step variable so it has one (`name_anonymous_variable_length`),
+  which also keeps it off the reachability path. Before, a fixed hop after
+  `-[*1..2]-` could walk back along an edge the variable-length hop had
+  used: 221 rows where brute force gives 104 (`bugs::vlp_relationship_uniqueness`).
+- The reachability BFS (`bfs_endpoints_only`, used under `DISTINCT`/`EXISTS`)
+  checks trail validity only after every predecessor at a depth is recorded.
+  Checking at first discovery dropped an endpoint whose first-found
+  predecessor reused an edge, in an order that varied run to run
+  (`bugs::reachability_trail_any_predecessor`).
+
+**A chunked operator decides per-input-row facts over the whole input
+batch.** `GraphTraverseExec` emits a large expansion set in
+`batch_size` chunks; its OPTIONAL NULL rows are now built once, after the last
+chunk, from the full set of matched rows. Built per chunk, every row whose
+matches fell in another chunk got a NULL row per chunk — at the default batch
+size, once one input batch expands past 8192 rows (`bugs::optional_traverse_chunked`).
+
+**An entity that is absent is NULL, not a struct of NULLs.** A node or
+relationship variable is materialized as a `named_struct` of its flattened
+columns (`add_structural_projection`, `add_edge_structural_projection`), and
+`named_struct` is never NULL. Each is now guarded by
+`absent_entity_is_null` (`CASE WHEN <var>._vid|_eid IS NOT NULL THEN … END`).
+Unguarded, an OPTIONAL MATCH miss made `labels(b)` fail, `keys(b)` return
+`[]`, `keys(r)` return the declared property names, and `[b, 1]` / `{k: b}`
+collapse to NULL; a labelled target hid it because its filter re-nulled the
+column (`bugs::optional_entity_is_null`).
+
+All four were found by the query-rewrite relations of
+`metamorphic::dqp::topo` (W3), which hold data and engine fixed and compare a
+query with equivalent formulations over a fixture with parallel edges,
+self-loops, cycles and a diamond; every reference query also runs twice.
+
 **A fast path takes only inputs whose every feature it implements.**
 - The vectorized pattern predicate and pattern comprehension pass
   `fast_path_unsupported` first: anchor constraints, relationship property maps

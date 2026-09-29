@@ -118,5 +118,6 @@ pub mod plan_cache_lever;
 pub mod seed;
 pub mod stateful;
 pub mod tier3_probe;
+pub mod topo;
 pub mod transition_probe;
 pub mod vid_determinism;

@@ -2970,9 +2970,8 @@ impl StorageManager {
 
             // Build combined filter: _deleted = false + optional user filter + HWM
             let mut filter_parts = vec![Self::build_active_filter(filter)];
-            if ctx.is_some()
-                && let Some(hwm) = self.version_high_water_mark()
-            {
+            let hwm = ctx.and(self.version_high_water_mark());
+            if let Some(hwm) = hwm {
                 filter_parts.push(FilterExpr::version_at_most(hwm));
             }
             let combined_filter = FilterExpr::all(filter_parts);
@@ -2994,18 +2993,29 @@ impl StorageManager {
                 opts.refine_factor = Some(clamp_defaulted_refine(r, fetch_k));
             }
 
-            let batches = backend
-                .vector_search(
-                    &name,
-                    property,
-                    query,
-                    fetch_k,
-                    backend_metric,
-                    combined_filter,
-                    opts,
-                    ctx.and_then(|c| c.counters.clone()),
-                )
-                .await?;
+            // Hits on superseded row versions are dropped; only when that
+            // happened and left the answer short is the search widened.
+            let mut fetch = fetch_k;
+            let batches = loop {
+                let raw = backend
+                    .vector_search(
+                        &name,
+                        property,
+                        query,
+                        fetch,
+                        backend_metric,
+                        combined_filter.clone(),
+                        opts,
+                        ctx.and_then(|c| c.counters.clone()),
+                    )
+                    .await?;
+                let returned: usize = raw.iter().map(|b| b.num_rows()).sum();
+                let (kept, dropped) = self.keep_latest_row_versions(&name, raw, hwm).await?;
+                if dropped == 0 || returned < fetch || fetch >= fetch_k.saturating_mul(8) {
+                    break kept;
+                }
+                fetch = fetch.saturating_mul(2);
+            };
 
             // Re-score ANN candidates with an EXACT distance rather than trusting
             // Lance's `_distance`. Lance's cosine ANN distance is on a different
@@ -3410,23 +3420,33 @@ impl StorageManager {
         let mut results = if backend.table_exists(&name).await? {
             // Build combined filter: _deleted = false + optional user filter + HWM
             let mut filter_parts = vec![Self::build_active_filter(filter)];
-            if ctx.is_some()
-                && let Some(hwm) = self.version_high_water_mark()
-            {
+            let hwm = ctx.and(self.version_high_water_mark());
+            if let Some(hwm) = hwm {
                 filter_parts.push(FilterExpr::version_at_most(hwm));
             }
             let combined_filter = FilterExpr::all(filter_parts);
 
-            let batches = backend
-                .full_text_search(
-                    &name,
-                    property,
-                    query,
-                    k,
-                    combined_filter,
-                    ctx.and_then(|c| c.counters.clone()),
-                )
-                .await?;
+            // Hits on superseded row versions are dropped; only when that
+            // happened and left the answer short is the search widened.
+            let mut fetch = k;
+            let batches = loop {
+                let raw = backend
+                    .full_text_search(
+                        &name,
+                        property,
+                        query,
+                        fetch,
+                        combined_filter.clone(),
+                        ctx.and_then(|c| c.counters.clone()),
+                    )
+                    .await?;
+                let returned: usize = raw.iter().map(|b| b.num_rows()).sum();
+                let (kept, dropped) = self.keep_latest_row_versions(&name, raw, hwm).await?;
+                if dropped == 0 || returned < fetch || fetch >= k.saturating_mul(8) {
+                    break kept;
+                }
+                fetch = fetch.saturating_mul(2);
+            };
 
             let mut fts_results = extract_vid_score_pairs(&batches, "_vid", "_score")?;
             // Results should already be sorted by score from backend, but ensure descending order
@@ -3440,8 +3460,97 @@ impl StorageManager {
         if let Some(qctx) = ctx {
             merge_l0_into_fts_results(&mut results, qctx, label, property, query, k);
         }
+        results.truncate(k);
 
         Ok(results)
+    }
+
+    /// `batches` narrowed to rows that are their vertex's latest version.
+    ///
+    /// Vertex tables are append-only: an update writes a new row and leaves
+    /// the old one, which a search index still matches. A search over them
+    /// returned a node through text or a vector it no longer has. Each hit is
+    /// kept only if its `_version` is the highest the vertex has, within the
+    /// pinned snapshot's ceiling when `hwm` is set. Batches without `_version`
+    /// are returned unchanged. Also returns how many hits were dropped.
+    ///
+    /// # Errors
+    /// Propagates backend failures from the version lookup.
+    async fn keep_latest_row_versions(
+        &self,
+        table: &str,
+        batches: Vec<arrow_array::RecordBatch>,
+        hwm: Option<u64>,
+    ) -> Result<(Vec<arrow_array::RecordBatch>, usize)> {
+        let before: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let columns = |b: &arrow_array::RecordBatch| {
+            let vid = b
+                .column_by_name("_vid")?
+                .as_any()
+                .downcast_ref::<UInt64Array>()?
+                .clone();
+            let version = b
+                .column_by_name("_version")?
+                .as_any()
+                .downcast_ref::<UInt64Array>()?
+                .clone();
+            Some((vid, version))
+        };
+        let hit_vids: HashSet<u64> = batches
+            .iter()
+            .filter_map(columns)
+            .flat_map(|(vid, _)| vid.iter().flatten().collect::<Vec<_>>())
+            .collect();
+        if hit_vids.is_empty() {
+            return Ok((batches, 0));
+        }
+        let mut parts = vec![FilterExpr::one_of(
+            "_vid",
+            hit_vids.iter().map(|v| Scalar::UInt(*v)),
+        )];
+        if let Some(hwm) = hwm {
+            parts.push(FilterExpr::version_at_most(hwm));
+        }
+        let rows = self
+            .backend
+            .scan(
+                crate::backend::types::ScanRequest::all(table)
+                    .with_columns(vec!["_vid".to_string(), "_version".to_string()])
+                    .with_filter(FilterExpr::all(parts)),
+            )
+            .await?;
+        let mut latest: HashMap<u64, u64> = HashMap::new();
+        for (vid, version) in rows.iter().filter_map(columns) {
+            for (vid, version) in vid.iter().zip(version.iter()) {
+                if let (Some(vid), Some(version)) = (vid, version) {
+                    let slot = latest.entry(vid).or_insert(version);
+                    *slot = (*slot).max(version);
+                }
+            }
+        }
+        batches
+            .into_iter()
+            .map(|batch| {
+                let Some((vid, version)) = columns(&batch) else {
+                    return Ok(batch);
+                };
+                let keep: arrow_array::BooleanArray = vid
+                    .iter()
+                    .zip(version.iter())
+                    .map(|(vid, version)| {
+                        Some(match (vid, version) {
+                            (Some(vid), Some(version)) => latest.get(&vid) == Some(&version),
+                            _ => true,
+                        })
+                    })
+                    .collect();
+                Ok(arrow::compute::filter_record_batch(&batch, &keep)?)
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(|kept| {
+                let after: usize = kept.iter().map(|b| b.num_rows()).sum();
+                (kept, before - after)
+            })
     }
 
     #[cfg(feature = "lance-backend")]
@@ -3987,14 +4096,6 @@ fn compute_text_relevance(query: &str, text: &str) -> f32 {
     hits as f32 / query_tokens.len() as f32
 }
 
-/// Extracts a string slice from a property value.
-fn extract_text_from_props<'a>(
-    props: &'a uni_common::Properties,
-    property: &str,
-) -> Option<&'a str> {
-    props.get(property)?.as_str()
-}
-
 /// Merges L0 buffer vertices into LanceDB full-text search results.
 ///
 /// Follows the same pattern as [`merge_l0_into_vector_results`]: visits L0
@@ -4032,17 +4133,25 @@ fn merge_l0_into_fts_results(
             if !labels.iter().any(|l| l == label) {
                 continue;
             }
-            if let Some(props) = buf.vertex_properties.get(&vid)
-                && let Some(text) = extract_text_from_props(props, property)
-            {
-                let score = compute_text_relevance(query, text);
-                if score > 0.0 {
-                    // Last writer wins: later buffer overwrites earlier.
-                    l0_candidates.insert(vid, score);
-                }
-                // If re-created in a later L0, remove from tombstones.
-                tombstoned.remove(&vid);
-            }
+            let Some(props) = buf.vertex_properties.get(&vid) else {
+                continue;
+            };
+            // Record every vertex whose indexed text L0 now determines — with
+            // a score of 0 when it no longer matches. Recording only positive
+            // scores left the flushed hit standing after an update removed the
+            // match, so the old text kept being found. A partial update that
+            // does not touch the property says nothing about it and is skipped.
+            let score = match props.get(property) {
+                Some(value) if !value.is_null() => value
+                    .as_str()
+                    .map_or(0.0, |text| compute_text_relevance(query, text)),
+                Some(_) => 0.0,
+                None => continue,
+            };
+            // Last writer wins: later buffer overwrites earlier.
+            l0_candidates.insert(vid, score);
+            // If re-created in a later L0, remove from tombstones.
+            tombstoned.remove(&vid);
         }
     }
 
@@ -4068,6 +4177,8 @@ fn merge_l0_into_fts_results(
             results.push((*vid, *score));
         }
     }
+    // A vertex whose current text does not match is not a hit.
+    results.retain(|(_, score)| *score > 0.0);
 
     // Re-sort by score descending (higher relevance first).
     results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));

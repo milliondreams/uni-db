@@ -172,6 +172,15 @@ impl OptionalFilterExec {
     /// into struct columns. The blob case handles MERGE output where variables
     /// are serialized as CypherValue blobs without separate `._vid` columns.
     fn compute_source_key_columns(&self) -> Vec<SourceKeyColumn> {
+        // The row's identity as it entered the OPTIONAL MATCH, when the planner
+        // tagged it (see `optional_source`). Grouping by node ids instead
+        // merged entering rows that differ only in a scalar or that repeat, so
+        // one passing row suppressed another row's NULL.
+        if let Some(idx) = super::optional_source::newest_source_row_column(&self.schema, |name| {
+            self.is_optional_column(name)
+        }) {
+            return vec![SourceKeyColumn::FlatVid(idx)];
+        }
         let mut result = Vec::new();
         let mut covered_vars: HashSet<String> = HashSet::new();
 

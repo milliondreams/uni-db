@@ -76,6 +76,7 @@ pub mod mutation_remove;
 pub mod mutation_set;
 pub mod nfa;
 pub mod optional_filter;
+pub(crate) mod optional_source;
 pub mod pattern_comprehension;
 pub mod pattern_exists;
 pub mod pred_dag;

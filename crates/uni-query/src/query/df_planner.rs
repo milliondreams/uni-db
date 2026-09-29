@@ -163,6 +163,31 @@ pub struct HybridPhysicalPlanner {
     multiplicity_insensitive: AtomicBool,
 }
 
+/// Tags each row entering an `OPTIONAL MATCH` with a unique id, when this
+/// traversal is the clause's first hop.
+///
+/// The first hop is the one whose input binds none of the clause's own
+/// variables; later hops see rows the clause has already fanned out, which must
+/// keep the id assigned at entry. See `df_graph::optional_source`.
+fn tag_optional_source(
+    input: Arc<dyn ExecutionPlan>,
+    optional: bool,
+    optional_pattern_vars: &HashSet<String>,
+) -> Arc<dyn ExecutionPlan> {
+    let enters_clause = optional
+        && !input.schema().fields().iter().any(|f| {
+            crate::query::df_graph::traverse::is_optional_column_for_vars(
+                f.name(),
+                optional_pattern_vars,
+            )
+        });
+    if enters_clause {
+        Arc::new(crate::query::df_graph::optional_source::OptionalSourceRowIdExec::new(input))
+    } else {
+        input
+    }
+}
+
 /// Whether an aggregate's result is unchanged by duplicate input rows.
 ///
 /// True for any `DISTINCT` aggregate and for `min` / `max`; an aggregate with
@@ -3390,6 +3415,7 @@ impl HybridPhysicalPlanner {
         qpp_inner_source: Option<&str>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let input_plan = self.plan_internal(input, all_properties)?;
+        let input_plan = tag_optional_source(input_plan, optional, optional_pattern_vars);
 
         let adj_direction = convert_direction(direction.clone());
         let (input_plan, source_col) = Self::resolve_source_vid_col(input_plan, source_variable)?;
@@ -4013,6 +4039,7 @@ impl HybridPhysicalPlanner {
         scope_match_variables: &HashSet<String>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let input_plan = self.plan_internal(input, all_properties)?;
+        let input_plan = tag_optional_source(input_plan, optional, optional_pattern_vars);
 
         let adj_direction = convert_direction(direction.clone());
         let (input_plan, source_col) = Self::resolve_source_vid_col(input_plan, source_variable)?;

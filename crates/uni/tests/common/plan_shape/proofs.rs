@@ -229,6 +229,22 @@ async fn an_optional_match_predicate_runs_the_optional_filter() -> Result<()> {
     Ok(())
 }
 
+/// Rows entering an OPTIONAL MATCH are tagged with an id, so the operators
+/// that null-fill unmatched or filtered-out rows group by entering row rather
+/// than by bound node id (see `df_graph::optional_source`). Without the tag a
+/// second entering row binding the same node lost its NULL row.
+#[tokio::test]
+async fn an_optional_match_tags_its_entering_rows() -> Result<()> {
+    let db = fixture().await?;
+    assert_plan_uses(
+        &db.session(),
+        "MATCH (a:Src) OPTIONAL MATCH (a)-[:R]->(b:Dst) RETURN a.k, b.k",
+        "OptionalSourceRowIdExec",
+    )
+    .await;
+    Ok(())
+}
+
 // ── Mutations ──────────────────────────────────────────────────────────────
 //
 // `MutationExec` reports one of five `display_name`s, and the registry gives

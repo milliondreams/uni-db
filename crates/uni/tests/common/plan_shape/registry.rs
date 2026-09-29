@@ -223,6 +223,14 @@ pub const OPERATORS: &[Operator] = &[
         },
     },
     Operator {
+        ty: "OptionalSourceRowIdExec",
+        runtime_name: "OptionalSourceRowIdExec",
+        status: Status::Proven {
+            by: "an_optional_match_tags_its_entering_rows",
+            in_file: "crates/uni/tests/common/plan_shape/proofs.rs",
+        },
+    },
+    Operator {
         ty: "OptionalFilterExec",
         runtime_name: "OptionalFilterExec",
         status: Status::Proven {

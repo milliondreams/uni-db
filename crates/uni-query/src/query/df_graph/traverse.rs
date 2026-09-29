@@ -1652,7 +1652,7 @@ fn build_optional_null_batch_for_rows(
     RecordBatch::try_new(schema.clone(), columns).map_err(arrow_err)
 }
 
-fn is_optional_column_for_vars(col_name: &str, optional_vars: &HashSet<String>) -> bool {
+pub(crate) fn is_optional_column_for_vars(col_name: &str, optional_vars: &HashSet<String>) -> bool {
     optional_vars.contains(col_name)
         || optional_vars.iter().any(|var| {
             // `var.` property columns (e.g. `x.name`), and the exact internal
@@ -1732,6 +1732,16 @@ fn source_group_key_columns(
     schema: &SchemaRef,
     optional_vars: &HashSet<String>,
 ) -> Vec<OptionalGroupKeyColumn> {
+    // The row's identity as it entered the OPTIONAL MATCH, when the planner
+    // tagged it (see `optional_source`). Node ids alone merge entering rows
+    // that bind the same node but differ elsewhere, or repeat.
+    if let Some(idx) = super::optional_source::newest_source_row_column(schema, |name| {
+        is_optional_column_for_vars(name, optional_vars)
+    }) && idx < input.num_columns()
+    {
+        return vec![OptionalGroupKeyColumn::FlatVid(idx)];
+    }
+
     let mut cols = Vec::new();
     let mut covered: HashSet<String> = HashSet::new();
 

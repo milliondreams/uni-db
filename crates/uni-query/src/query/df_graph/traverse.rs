@@ -4859,6 +4859,7 @@ impl GraphVariableLengthTraverseExecData {
             depth += 1;
             let mut next_frontier: Vec<(Vid, NfaStateId)> = Vec::new();
             let mut seen_at_depth: FxHashSet<(Vid, NfaStateId)> = FxHashSet::default();
+            let mut accepting: Vec<(Vid, NfaStateId)> = Vec::new();
 
             for &(vid, state) in &frontier {
                 for (neighbor, eid, dst_state) in
@@ -4868,16 +4869,25 @@ impl GraphVariableLengthTraverseExecData {
 
                     if seen_at_depth.insert((neighbor, dst_state)) {
                         next_frontier.push((neighbor, dst_state));
-
-                        // Check if accepting with trail verification
                         if nfa.is_accepting(dst_state)
                             && self.check_target_label(neighbor)
                             && vid_filter.contains(neighbor)
-                            && dag.has_trail_valid_path(source, neighbor, dst_state, depth, depth)
                         {
-                            results.push((neighbor, depth));
+                            accepting.push((neighbor, dst_state));
                         }
                     }
+                }
+            }
+
+            // Trail validity is decided only once every predecessor at this
+            // depth is recorded. Checking at first discovery saw whichever
+            // predecessor the frontier happened to reach first; if that one's
+            // path reused an edge the endpoint was dropped for good, although a
+            // predecessor added later in the same depth had a valid trail — a
+            // silent, order-dependent miss (undirected hops made it common).
+            for (neighbor, state) in accepting {
+                if dag.has_trail_valid_path(source, neighbor, state, depth, depth) {
+                    results.push((neighbor, depth));
                 }
             }
 

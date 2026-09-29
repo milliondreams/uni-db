@@ -801,6 +801,17 @@ impl L0Context {
             .min()
     }
 
+    /// How many rows of `entity` — vertices of that label, or edges of that
+    /// type — the visible buffers hold. An upper bound, like
+    /// [`Self::vertex_count`].
+    pub fn entity_count(&self, entity: &str) -> usize {
+        let edges: usize = self
+            .iter_l0_buffers()
+            .map(|l0| l0.read().eids_for_type(entity).len())
+            .sum();
+        self.vertex_count(Some(entity)) + edges
+    }
+
     /// How many vertices carrying `label` (any vertex when `None`) the
     /// visible buffers hold. An upper bound: a vertex written in more than one
     /// buffer, or also flushed, is counted each time.

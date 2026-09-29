@@ -1018,13 +1018,22 @@ impl StorageManager {
         }
     }
 
-    /// Rows already materialized for `entity`, or 0 when nothing is on disk.
+    /// Rows that already exist for `entity`, flushed or not.
     ///
-    /// Tables are created lazily, so "no table" and "no rows" are the same
-    /// answer: neither can violate a `NOT NULL` a caller is about to declare.
-    pub async fn materialized_row_count(&self, entity: &str) -> anyhow::Result<usize> {
+    /// Answers whether a `NOT NULL` a caller is about to declare could be
+    /// violated by rows that have no value for it. Tables are created lazily,
+    /// so "no table" counts as no flushed rows — but committed rows still in
+    /// L0 exist just as much. Counting only flushed tables recorded a NOT NULL
+    /// over an all-L0 label, and every flush after it then failed on the NULLs
+    /// those rows carried. `l0` supplies the unflushed side; an upper bound is
+    /// fine, since only zero versus non-zero matters.
+    pub async fn existing_row_count(
+        &self,
+        entity: &str,
+        l0: &crate::runtime::l0_visibility::L0Context,
+    ) -> anyhow::Result<usize> {
         let backend = self.backend();
-        let mut total = 0usize;
+        let mut total = l0.entity_count(entity);
         for table in self.property_tables_for(entity) {
             if backend.table_exists(&table).await? {
                 total += backend.count_rows(&table, None).await?;

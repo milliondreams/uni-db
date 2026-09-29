@@ -138,6 +138,7 @@ pub mod issue_269_bulk_rows_absent_from_vid_labels_index;
 pub mod issue_290_runtime_bound_state;
 pub mod merge_path_binding;
 pub mod merge_per_row_counters;
+pub mod not_null_on_unflushed_rows;
 pub mod repro_distinct_entity_over_counts;
 pub mod repro_issue_249_add_property_to_existing_label;
 pub mod repro_optional_match_over_unwound_entity;

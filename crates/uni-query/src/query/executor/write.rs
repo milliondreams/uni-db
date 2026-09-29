@@ -1447,6 +1447,7 @@ impl Executor {
     /// `execute_alter_edge_type` since they have identical logic.
     pub(crate) async fn execute_alter_entity(
         storage: &uni_store::storage::manager::StorageManager,
+        l0: &uni_store::runtime::l0_visibility::L0Context,
         entity_name: &str,
         action: AlterAction,
     ) -> Result<()> {
@@ -1460,7 +1461,7 @@ impl Executor {
                 // say so, rather than asserting a constraint the stored data
                 // violates. NOT NULL is enforced forward, at write time, either
                 // way. Mirrors `SchemaBuilder::apply`.
-                let rows = storage.materialized_row_count(entity_name).await?;
+                let rows = storage.existing_row_count(entity_name, l0).await?;
                 let effective_nullable = if prop.nullable || rows == 0 {
                     prop.nullable
                 } else {
@@ -1517,11 +1518,13 @@ impl Executor {
     }
 
     pub(crate) async fn execute_alter_label(&self, clause: AlterLabel) -> Result<()> {
-        Self::execute_alter_entity(&self.storage, &clause.name, clause.action).await
+        let l0 = self.visible_l0().await;
+        Self::execute_alter_entity(&self.storage, &l0, &clause.name, clause.action).await
     }
 
     pub(crate) async fn execute_alter_edge_type(&self, clause: AlterEdgeType) -> Result<()> {
-        Self::execute_alter_entity(&self.storage, &clause.name, clause.action).await
+        let l0 = self.visible_l0().await;
+        Self::execute_alter_entity(&self.storage, &l0, &clause.name, clause.action).await
     }
 
     pub(crate) async fn execute_drop_label(&self, clause: DropLabel) -> Result<()> {

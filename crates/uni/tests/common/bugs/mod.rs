@@ -144,6 +144,7 @@ pub mod label_disjunction_on_traversal_target;
 pub mod merge_path_binding;
 pub mod merge_per_row_counters;
 pub mod not_null_on_unflushed_rows;
+pub mod optional_entity_is_null;
 pub mod optional_match_clause_close;
 pub mod optional_match_row_identity;
 pub mod optional_traverse_chunked;

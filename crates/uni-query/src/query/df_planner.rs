@@ -5065,7 +5065,17 @@ impl HybridPhysicalPlanner {
                         )));
                     }
 
-                    let struct_expr = named_struct(struct_args);
+                    let struct_expr = match ["_vid", "_eid"].iter().find(|id| {
+                        expanded_fields
+                            .iter()
+                            .any(|(_, f)| f.strip_prefix(prefix.as_str()) == Some(**id))
+                    }) {
+                        Some(id) => Self::absent_entity_is_null(
+                            named_struct(struct_args),
+                            &format!("{prefix}{id}"),
+                        ),
+                        None => named_struct(struct_args),
+                    };
                     let df_schema =
                         datafusion::common::DFSchema::try_from(schema.as_ref().clone())?;
                     let session = self.session_ctx.read();
@@ -6795,6 +6805,20 @@ impl HybridPhysicalPlanner {
 
     /// Add a structural projection on top of an execution plan to create a Struct column
     /// for a Node or Edge variable.
+    /// `entity` when `id_column` is non-null, and NULL otherwise.
+    ///
+    /// `named_struct` is never NULL, even when every field is: an entity an
+    /// OPTIONAL MATCH did not bind became a struct of NULLs, which `labels()`
+    /// rejected, `keys()` read as `[]` (or, for a relationship, as its
+    /// declared property names), and a list or map holding it collapsed to
+    /// NULL as a whole.
+    fn absent_entity_is_null(entity: DfExpr, id_column: &str) -> DfExpr {
+        let id = DfExpr::Column(datafusion::common::Column::from_name(id_column));
+        datafusion::logical_expr::when(id.is_not_null(), entity.clone())
+            .end()
+            .unwrap_or(entity)
+    }
+
     fn add_structural_projection(
         &self,
         input: Arc<dyn ExecutionPlan>,
@@ -6841,7 +6865,8 @@ impl HybridPhysicalPlanner {
         }
 
         // If no properties, still create an empty struct to represent the entity
-        let struct_expr = named_struct(struct_args);
+        let struct_expr =
+            Self::absent_entity_is_null(named_struct(struct_args), &format!("{}._vid", variable));
 
         let df_schema = datafusion::common::DFSchema::try_from(input_schema.as_ref().clone())?;
         let session = self.session_ctx.read();
@@ -6990,7 +7015,8 @@ impl HybridPhysicalPlanner {
             )));
         }
 
-        let struct_expr = named_struct(struct_args);
+        let struct_expr =
+            Self::absent_entity_is_null(named_struct(struct_args), &format!("{}._eid", variable));
 
         let df_schema = datafusion::common::DFSchema::try_from(input_schema.as_ref().clone())?;
         let session = self.session_ctx.read();

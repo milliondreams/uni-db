@@ -2380,6 +2380,67 @@ impl LogicalPlan {
     }
 }
 
+/// The inline `WHERE` predicates of a pattern's nodes and relationships.
+///
+/// Each is a filter over the whole match, so it can be ANDed into the clause's
+/// WHERE. The two places where that is not equivalent are refused: a
+/// variable-length relationship's predicate applies to every edge, not to the
+/// list the variable binds, and an element inside a quantified sub-pattern
+/// applies per iteration.
+///
+/// # Errors
+/// Returns an error for an inline `WHERE` in either of those positions.
+fn inline_element_predicates(pattern: &Pattern) -> Result<Vec<Expr>> {
+    fn walk(elements: &[PatternElement], quantified: bool, out: &mut Vec<Expr>) -> Result<()> {
+        for elem in elements {
+            match elem {
+                PatternElement::Node(n) => {
+                    if let Some(w) = &n.where_clause {
+                        if quantified {
+                            return Err(anyhow!(
+                                "An inline WHERE on a node inside a quantified path pattern \
+                                 is not supported; filter the matched path instead"
+                            ));
+                        }
+                        out.push(w.clone());
+                    }
+                }
+                PatternElement::Relationship(r) => {
+                    if let Some(w) = &r.where_clause {
+                        if quantified || r.range.is_some() {
+                            return Err(anyhow!(
+                                "An inline WHERE on a variable-length or quantified \
+                                 relationship is not supported: it would apply to each edge, \
+                                 not to the list the variable binds. Use \
+                                 `all(e IN r WHERE ...)` in the MATCH's WHERE instead"
+                            ));
+                        }
+                        out.push(w.clone());
+                    }
+                }
+                PatternElement::Parenthesized { pattern, .. } => {
+                    walk(&pattern.elements, true, out)?;
+                }
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    for path in &pattern.paths {
+        walk(&path.elements, false, &mut out)?;
+    }
+    Ok(out)
+}
+
+/// `preds` joined with AND, or `None` when there are none.
+fn and_predicates(preds: impl IntoIterator<Item = Expr>) -> Option<Expr> {
+    preds.into_iter().reduce(|l, r| Expr::BinaryOp {
+        left: Box::new(l),
+        op: BinaryOp::And,
+        right: Box::new(r),
+    })
+}
+
 /// Extracted vector similarity predicate info for optimization
 struct VectorSimilarityPredicate {
     variable: String,
@@ -4536,6 +4597,25 @@ impl QueryPlanner {
     ) -> Result<LogicalPlan> {
         let mut plan = plan;
 
+        // Inline element predicates — `(m WHERE m.id = 3)`, `[r WHERE r.w = 1]`
+        // — belong to the clause's WHERE. Nothing downstream applied them, so
+        // they were silently ignored.
+        let folded;
+        let match_clause = match and_predicates(
+            inline_element_predicates(&match_clause.pattern)?
+                .into_iter()
+                .chain(match_clause.where_clause.clone()),
+        ) {
+            Some(where_clause) if Some(&where_clause) != match_clause.where_clause.as_ref() => {
+                folded = MatchClause {
+                    where_clause: Some(where_clause),
+                    ..match_clause.clone()
+                };
+                &folded
+            }
+            _ => match_clause,
+        };
+
         if match_clause.pattern.paths.is_empty() {
             return Err(anyhow!("Empty pattern"));
         }
@@ -4862,6 +4942,14 @@ impl QueryPlanner {
                 vars_before_pattern,
                 where_anchored,
             )?;
+        }
+        // Inline element predicates, as in `plan_match_clause`.
+        if let Some(predicate) = and_predicates(inline_element_predicates(pattern)?) {
+            plan = LogicalPlan::Filter {
+                input: Box::new(plan),
+                predicate,
+                optional_variables: HashSet::new(),
+            };
         }
         Ok(plan)
     }

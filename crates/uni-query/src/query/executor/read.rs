@@ -273,6 +273,24 @@ static DUMP_PHYSICAL_PLAN: std::sync::LazyLock<bool> =
 /// the vertex and edge read paths.
 const EXPORT_BATCH: usize = 10_000;
 
+/// The DataFusion session configuration a query runs under.
+///
+/// `UniConfig::parallelism` becomes `target_partitions` and
+/// `UniConfig::execution_batch_size`, when set, becomes `batch_size`; both
+/// were previously ignored, so every query ran with DataFusion's defaults
+/// whatever the config said. Every place that builds a session must use this,
+/// or a knob silently applies to some queries and not others.
+pub fn datafusion_session_config(
+    config: &uni_common::UniConfig,
+) -> datafusion::prelude::SessionConfig {
+    let session =
+        datafusion::prelude::SessionConfig::new().with_target_partitions(config.parallelism.max(1));
+    match config.execution_batch_size {
+        Some(rows) => session.with_batch_size(rows.max(1)),
+        None => session,
+    }
+}
+
 impl Executor {
     /// Helper to verify and filter candidates against an optional predicate.
     ///
@@ -546,15 +564,19 @@ impl Executor {
             let session = if optimizer_providers.is_empty() {
                 match df_runtime.clone() {
                     Some(rt) => SessionContext::new_with_config_rt(
-                        datafusion::prelude::SessionConfig::new(),
+                        datafusion_session_config(&self.config),
                         rt,
                     ),
-                    None => SessionContext::new(),
+                    None => {
+                        SessionContext::new_with_config(datafusion_session_config(&self.config))
+                    }
                 }
             } else {
                 use datafusion::execution::session_state::SessionStateBuilder;
                 use uni_plugin::traits::operator::OptimizerPhase;
-                let mut builder = SessionStateBuilder::new().with_default_features();
+                let mut builder = SessionStateBuilder::new()
+                    .with_config(datafusion_session_config(&self.config))
+                    .with_default_features();
                 if let Some(rt) = df_runtime.clone() {
                     builder = builder.with_runtime_env(rt);
                 }

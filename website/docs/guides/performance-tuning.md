@@ -493,8 +493,8 @@ Uni uses morsel-driven parallelism for large queries:
 use uni_db::{Uni, UniConfig};
 
 let mut config = UniConfig::default();
-config.parallelism = 8;   // Parallel workers
-config.batch_size = 4096; // Rows per morsel
+config.parallelism = 8;                   // Partitions per query plan
+config.execution_batch_size = Some(4096); // Rows per batch inside the engine (default 8192)
 
 let db = Uni::open("./graph")
     .config(config)
@@ -568,7 +568,7 @@ config.max_query_memory = 4 * 1024 * 1024 * 1024; // 4 GB
 
 ### Reducing Memory Usage
 
-1. **Smaller batch sizes**: use `UniConfig.batch_size` or `BulkWriter.batch_size()`
+1. **Smaller batch sizes**: use `UniConfig.execution_batch_size` (query execution) or `BulkWriter.batch_size()` (bulk ingest)
 2. **Smaller caches**: Reduce `UniConfig.cache_size`
 3. **Stream large results**: Use SKIP/LIMIT pagination
 4. **Avoid large intermediates**: Filter early

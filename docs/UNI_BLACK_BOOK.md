@@ -2805,8 +2805,9 @@ regression (#141).
 The limit binds as ordinary **back-pressure** instead: the operator drains at
 most `slice_size` paths per batch, hands the batch downstream, and if nothing
 pulls again the remaining paths are never walked. `slice_size` is DataFusion's
-`SessionConfig::batch_size` — **8192**, not `UniConfig::batch_size` (1024), which
-sizes storage morsels and is a different knob.
+`SessionConfig::batch_size` — **8192** unless `UniConfig::execution_batch_size`
+overrides it. It is not `UniConfig::batch_size` (1024), which is only the page
+size a query cursor hands back.
 
 So the granularity of a limit is one batch, which is directly measurable. On an
 852-vertex / 1013-edge cyclic graph:
@@ -5979,8 +5980,9 @@ graph TB
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `cache_size` | `usize` | 1 GB | Adjacency cache size in bytes |
-| `parallelism` | `usize` | CPU count | Worker threads for query execution |
-| `batch_size` | `usize` | 1,024 | Morsel size for DataFusion streaming |
+| `parallelism` | `usize` | CPU count | DataFusion `target_partitions` (partitions per plan) |
+| `batch_size` | `usize` | 1,024 | Rows per page a query cursor hands back; does not affect execution |
+| `execution_batch_size` | `Option<usize>` | `None` (8,192) | DataFusion `batch_size`: rows per batch inside the engine. Result-neutral; smaller values bound per-batch memory and LIMIT granularity at some throughput cost |
 | `max_frontier_size` | `usize` | 1,000,000 | Max vertices in traversal frontier |
 | `query_timeout` | `Duration` | 30s | Per-query timeout |
 | `max_query_memory` | `usize` | 1 GB | Per-query memory limit |

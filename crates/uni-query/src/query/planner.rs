@@ -4649,7 +4649,7 @@ impl QueryPlanner {
             .map(Self::equality_anchored_properties)
             .unwrap_or_default();
 
-        for path in paths {
+        for &path in &paths {
             if let Some(mode) = &path.shortest_path_mode {
                 plan =
                     self.plan_shortest_path(path, plan, vars_in_scope, mode, vars_before_pattern)?;
@@ -4677,10 +4677,67 @@ impl QueryPlanner {
 
         // Handle WHERE clause with vector_similarity and predicate pushdown
         if let Some(predicate) = &match_clause.where_clause {
-            plan = self.plan_where_clause(predicate, plan, vars_in_scope, optional_vars)?;
+            plan = self.plan_where_clause(predicate, plan, vars_in_scope, optional_vars.clone())?;
+        }
+
+        // Close the clause. Each traversal inside it decides "this row found no
+        // match" for the rows it sees, which is exact only for the step the
+        // rows enter by: past it, one entering row is spread over several rows
+        // and batches, so each dead end emitted its own NULL row, and a later
+        // path extended rows an earlier one had already failed. One operator
+        // over the whole clause's output makes the decision per entering row.
+        if match_clause.optional
+            && !optional_vars.is_empty()
+            && Self::optional_clause_has_several_steps(
+                &paths,
+                &vars_in_scope[..vars_before_pattern],
+            )
+            && !matches!(
+                &plan,
+                LogicalPlan::Filter { optional_variables, .. } if *optional_variables == optional_vars
+            )
+        {
+            plan = LogicalPlan::Filter {
+                input: Box::new(plan),
+                predicate: Expr::Literal(CypherLiteral::Bool(true)),
+                optional_variables: optional_vars,
+            };
         }
 
         Ok(plan)
+    }
+
+    /// Whether an OPTIONAL MATCH takes more than one step from the rows
+    /// entering it: more than one path, more than one relationship, or a
+    /// relationship out of a node the clause itself scans for.
+    ///
+    /// A single relationship out of an already-bound node decides "no match"
+    /// per entering row by construction and needs no closing operator.
+    fn optional_clause_has_several_steps(
+        paths: &[&PathPattern],
+        bound_before_clause: &[VariableInfo],
+    ) -> bool {
+        if paths.len() != 1 {
+            return true;
+        }
+        let elements = &paths[0].elements;
+        let steps: usize = elements
+            .iter()
+            .map(|element| match element {
+                PatternElement::Node(_) => 0,
+                PatternElement::Relationship(_) => 1,
+                // A quantified group is at least one step and usually more.
+                PatternElement::Parenthesized { .. } => 2,
+            })
+            .sum();
+        let starts_unbound = match elements.first() {
+            Some(PatternElement::Node(n)) => n
+                .variable
+                .as_deref()
+                .is_none_or(|v| v.is_empty() || !is_var_in_scope(bound_before_clause, v)),
+            _ => true,
+        };
+        steps + usize::from(starts_unbound && steps > 0) > 1
     }
 
     /// Plan a shortestPath pattern.
@@ -5443,14 +5500,25 @@ impl QueryPlanner {
 
         // For OPTIONAL MATCH, extract all variables from this pattern upfront.
         // When any hop fails in a multi-hop pattern, ALL these variables should be NULL.
+        //
+        // "This pattern" is the whole clause: a variable an earlier
+        // comma-separated path of the same clause bound is in scope here, but
+        // it is still the clause's own. Excluding it made this path's first
+        // hop treat every row as newly entering the clause — re-tagging it and
+        // null-filling per earlier match — and left that path's variables
+        // standing on rows where this path failed.
+        let bound_before_clause = &vars_in_scope[..vars_before_pattern];
         let mut optional_pattern_vars: HashSet<String> = if optional {
-            let mut vars = HashSet::new();
+            let mut vars: HashSet<String> = vars_in_scope[vars_before_pattern..]
+                .iter()
+                .map(|v| v.name.clone())
+                .collect();
             for element in elements {
                 match element {
                     PatternElement::Node(n) => {
                         if let Some(v) = &n.variable
                             && !v.is_empty()
-                            && !is_var_in_scope(vars_in_scope, v)
+                            && !is_var_in_scope(bound_before_clause, v)
                         {
                             vars.insert(v.clone());
                         }
@@ -5458,7 +5526,7 @@ impl QueryPlanner {
                     PatternElement::Relationship(r) => {
                         if let Some(v) = &r.variable
                             && !v.is_empty()
-                            && !is_var_in_scope(vars_in_scope, v)
+                            && !is_var_in_scope(bound_before_clause, v)
                         {
                             vars.insert(v.clone());
                         }
@@ -5470,7 +5538,7 @@ impl QueryPlanner {
                                 PatternElement::Node(n) => {
                                     if let Some(v) = &n.variable
                                         && !v.is_empty()
-                                        && !is_var_in_scope(vars_in_scope, v)
+                                        && !is_var_in_scope(bound_before_clause, v)
                                     {
                                         vars.insert(v.clone());
                                     }
@@ -5478,7 +5546,7 @@ impl QueryPlanner {
                                 PatternElement::Relationship(r) => {
                                     if let Some(v) = &r.variable
                                         && !v.is_empty()
-                                        && !is_var_in_scope(vars_in_scope, v)
+                                        && !is_var_in_scope(bound_before_clause, v)
                                     {
                                         vars.insert(v.clone());
                                     }

@@ -4094,7 +4094,12 @@ impl GraphVariableLengthTraverseExec {
         }
 
         // Add hop count
-        fields.push(Field::new("_hop_count", DataType::UInt64, false));
+        // Nullable: an OPTIONAL carrier row (no path matched) has no hop
+        // count, and a NULL here is what lets the clause's closing
+        // `OptionalFilterExec` tell it from a zero-hop match when the
+        // traversal introduces no other identity column (an anonymous
+        // relationship into an already-bound node).
+        fields.push(Field::new("_hop_count", DataType::UInt64, true));
 
         // Add step variable (edge list) if bound
         if let Some(step_var) = step_variable {
@@ -5654,9 +5659,9 @@ impl GraphVariableLengthTraverseStream {
         }
 
         // Add hop count column
-        let hop_counts: Vec<u64> = expansions
+        let hop_counts: Vec<Option<u64>> = expansions
             .iter()
-            .map(|(_, _, hops, _, _)| *hops as u64)
+            .map(|(_, vid, hops, _, _)| (vid.as_u64() != u64::MAX).then_some(*hops as u64))
             .collect();
         columns.push(Arc::new(UInt64Array::from(hop_counts)));
 
@@ -6174,7 +6179,12 @@ impl GraphVariableLengthTraverseMainExec {
         }
 
         // Add hop count
-        fields.push(Field::new("_hop_count", DataType::UInt64, false));
+        // Nullable: an OPTIONAL carrier row (no path matched) has no hop
+        // count, and a NULL here is what lets the clause's closing
+        // `OptionalFilterExec` tell it from a zero-hop match when the
+        // traversal introduces no other identity column (an anonymous
+        // relationship into an already-bound node).
+        fields.push(Field::new("_hop_count", DataType::UInt64, true));
 
         // Add step variable column (list of edge structs) if bound
         // This is the relationship variable like `r` in `[r*1..3]`
@@ -6692,9 +6702,9 @@ impl GraphVariableLengthTraverseMainStream {
         }
 
         // Add hop count column
-        let hop_counts: Vec<u64> = expansions
+        let hop_counts: Vec<Option<u64>> = expansions
             .iter()
-            .map(|(_, _, hops, _, _)| *hops as u64)
+            .map(|(_, vid, hops, _, _)| (vid.as_u64() != u64::MAX).then_some(*hops as u64))
             .collect();
         columns.push(Arc::new(UInt64Array::from(hop_counts)));
 

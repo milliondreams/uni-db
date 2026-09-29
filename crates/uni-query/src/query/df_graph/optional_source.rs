@@ -113,6 +113,28 @@ pub(crate) fn newest_source_row_column(
         .map(|(_, idx)| idx)
 }
 
+/// The schema of the rows that entered the clause whose row-id column is
+/// `column`, row-id column included, found by locating the operator that
+/// appended it in `plan`.
+///
+/// Everything else in a later schema was created inside the clause. The
+/// row-id column counts as entering: it is the entering row's identity, and a
+/// NULL row built for that entering row must keep it.
+pub(crate) fn entering_schema(plan: &Arc<dyn ExecutionPlan>, column: &str) -> Option<SchemaRef> {
+    if let Some(tagger) = plan.downcast_ref::<OptionalSourceRowIdExec>()
+        && tagger
+            .schema
+            .fields()
+            .last()
+            .is_some_and(|f| f.name() == column)
+    {
+        return Some(Arc::clone(&tagger.schema));
+    }
+    plan.children()
+        .into_iter()
+        .find_map(|child| entering_schema(child, column))
+}
+
 impl DisplayAs for OptionalSourceRowIdExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "OptionalSourceRowIdExec")

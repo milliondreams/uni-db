@@ -7202,10 +7202,27 @@ under `crates/uni/tests/common/` that fails with the fix reverted.
 - Rows entering an `OPTIONAL MATCH` carry an id (`OptionalSourceRowIdExec`,
   `__optional_source_row_<k>`); the null-fill in the traversal and in
   `OptionalFilterExec` groups by it. Grouping by bound node ids merged entering
-  rows that differed only in a scalar or repeated exactly, dropping NULL rows.
-  Known gap: a clause whose first element is an unbound node keeps the legacy
-  grouping, which TCK `Graph6[6]` requires to be one group
-  (`bugs::optional_match_row_identity`).
+  rows that differed only in a scalar or repeated exactly, dropping NULL rows
+  (`bugs::optional_match_row_identity`). A clause with no rows entering it (a
+  leading `OPTIONAL MATCH`) is untagged and forms one group.
+- "No match → one NULL row" is decided once per entering row, over the whole
+  clause. A traversal's own null-fill is exact only for the step rows enter
+  by; past it one entering row is spread over several rows and batches, so each
+  dead end of `(a)-->(b)-->(c)` or `(a)-->(b), (b)-->(c)` emitted a NULL row, a
+  second comma-separated path extended rows the first had failed (returning a
+  value where NULL was due), and a leading clause emitted one NULL row per
+  batch. An OPTIONAL clause of more than one step now ends in an
+  `OptionalFilterExec` (predicate `true` when it has no WHERE). A row passes it
+  only if every identity column the clause created (`._vid`, `._eid`,
+  `__eid_to_*`, `_hop_count`; "created" = not in the tagging operator's output)
+  is non-null, and the NULL row it emits nulls every created column. The
+  optional variable set of a clause's later paths includes its earlier paths'
+  variables, so a second path does not re-tag rows. VLP `_hop_count` is NULL
+  on carrier rows: an anonymous relationship into a bound node creates no other
+  identity column. Found by running the Cypher TCK at an execution batch size
+  of 1 (`Graph6[6]`), then mapped with an oracle — `MATCH (a) OPTIONAL MATCH p`
+  ≡ `MATCH (a) MATCH p` ⊎ `MATCH (a) WHERE NOT EXISTS { MATCH p }` padded with
+  NULL (`bugs::optional_match_clause_close`).
 - Mutually recursive Locy rules keep their own facts: `FixpointExec` exposes
   each rule's output (`per_rule_output`), and a stratum's rules are sorted so
   their order is the same on every run (`locy::locy_mutual_recursion_per_rule_facts`).

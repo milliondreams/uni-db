@@ -7166,6 +7166,77 @@ uv run ruff format .
 - **Only re-run after code changes** that affect the tests
 - **Save baselines separately**: `/tmp/test_baseline.txt` and `/tmp/test_after_fix.txt` for comparison
 
+## Appendix B2: Correctness Invariants from the 2026-09 Class Audit
+
+A class audit (identity keys, partial views, unchecked shortcut preconditions;
+see `docs/proposals/correctness_class_harness_2026-09-28.md`) confirmed a set of
+silent wrong answers by comparing each suspect query with a differently
+formulated equivalent. Each fix states an invariant; each has a regression test
+under `crates/uni/tests/common/` that fails with the fix reverted.
+
+**Every decision about "which rows exist" consults L0 as well as storage.**
+- `StorageManager::existing_row_count(entity, &L0Context)` decides whether a
+  `NOT NULL` property can be declared strictly. Counting flushed tables alone
+  recorded `NOT NULL` over an all-L0 label, and every later flush failed on the
+  NULLs those rows carried (`bugs::not_null_on_unflushed_rows`).
+- The non-DETACH `DELETE` check adds the transaction's own edges
+  (`tx_incident_edges`); the adjacency overlay only receives them at commit
+  (`bugs::delete_sees_tx_local_edges`).
+- A vertex `UNIQUE` probe treats every layer's hit as a *candidate* and resolves
+  it to current values (`Writer::vertex_key_held`); vertex tables are
+  append-only and a deleted or moved key's row outlives its value. The L0
+  constraint index keeps a reverse map (`constraint_keys_by_vid`) so a `SET`
+  retires the vertex's previous key — the stale entry also tripped the
+  commit-time SSI guard (`bugs::unique_key_reuse`).
+- Full-text and vector search drop hits on superseded row versions
+  (`keep_latest_row_versions`), widening the search only when that left the
+  answer short, and an L0 update that removes a match overrides the flushed hit
+  (`bugs::fts_sees_current_text`).
+- An unlabelled `(n {ext_id: ...})` plans as the ordinary schemaless scan with
+  the equality pushed to the `ext_id` index; the retired dedicated lookup read
+  flushed rows only (`bugs::ext_id_lookup_sees_everything`).
+
+**A row's identity is the row, not the values it happens to bind.**
+- Rows entering an `OPTIONAL MATCH` carry an id (`OptionalSourceRowIdExec`,
+  `__optional_source_row_<k>`); the null-fill in the traversal and in
+  `OptionalFilterExec` groups by it. Grouping by bound node ids merged entering
+  rows that differed only in a scalar or repeated exactly, dropping NULL rows.
+  Known gap: a clause whose first element is an unbound node keeps the legacy
+  grouping, which TCK `Graph6[6]` requires to be one group
+  (`bugs::optional_match_row_identity`).
+- Mutually recursive Locy rules keep their own facts: `FixpointExec` exposes
+  each rule's output (`per_rule_output`), and a stratum's rules are sorted so
+  their order is the same on every run (`locy::locy_mutual_recursion_per_rule_facts`).
+
+**A fast path takes only inputs whose every feature it implements.**
+- The vectorized pattern predicate and pattern comprehension pass
+  `fast_path_unsupported` first: anchor constraints, relationship property maps
+  or inline WHERE, overlapping relationship types across hops (uniqueness),
+  variable-length ranges and multi-label nodes go to the correlated subquery
+  instead. A bound node after the anchor is renamed and tested by id
+  (`rebind_bound_later_nodes`). Labels on an outer-bound node in a correlated
+  subquery are tested against `$<var>._labels`, supplied from the node's id
+  (`bugs::pattern_fast_path_constraints`).
+- `LabelExpr` derefs to its bare names, so anything taking `&[String]` loses
+  AND/OR. `node_filter_expr` takes `&LabelExpr`; a disjunctive traversal target
+  carries no single label id; a quantified pattern's inner node with more than
+  one label is refused (`bugs::label_disjunction_on_traversal_target`).
+- Inline element predicates `(m WHERE ...)` / `[r WHERE ...]` are ANDed into the
+  clause's WHERE (and into Locy rule bodies); nothing applied them before. On a
+  variable-length or quantified element they are refused, since they would
+  apply per edge (`bugs::inline_element_where`).
+
+**Locy fixpoint rounding applies to keys, not values.** Dedup and
+change detection compare `float_key_view` — every Float64 rounded to an
+absolute 1e-12 — so noise from evaluation order compares equal and a value
+decaying around a cycle converges to 0; the facts keep their exact values. The
+rounding used to be applied to the stored rows, which turned every magnitude
+below 1e-12 into 0 (an ALONG product of 1e-7 × 1e-7 was stored as 0.0). A
+purely relative rounding was tried first and broke convergence on cyclic
+`MPROD` folds (`issue_162_cyclic_recursive_fold_terminates`). The hash anti-join
+path compares the key view with a candidate row index carried outside the join
+keys, and maps the survivors back to exact rows.
+
 ## Appendix C: Anti-Pattern Summary
 
 Quick reference of all anti-patterns from every chapter:

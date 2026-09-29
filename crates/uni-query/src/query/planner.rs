@@ -5804,6 +5804,23 @@ impl QueryPlanner {
                             }
                             all_edge_type_ids.extend_from_slice(&step_edge_type_ids);
 
+                            // A step node carries a single-label constraint.
+                            // `(:A:B)` or `(:A|B)` would be checked against `A`
+                            // alone, matching nodes the pattern excludes or
+                            // missing ones it admits, so refuse rather than
+                            // answer a different question.
+                            if node.labels.len() > 1 {
+                                return Err(anyhow!(
+                                    "Quantified path patterns support at most one label on an \
+                                     inner node, but a node is labelled `{}`. Filter the extra \
+                                     labels with a WHERE clause instead.",
+                                    node.labels.names().join(if node.labels.is_disjunction() {
+                                        "|"
+                                    } else {
+                                        ":"
+                                    })
+                                ));
+                            }
                             let target_label = node.labels.first().and_then(|l| {
                                 self.schema.get_label_case_insensitive(l).map(|_| l.clone())
                             });
@@ -6490,7 +6507,12 @@ impl QueryPlanner {
         // traverse output. Mirrors the schema-then-virtual fallthrough used
         // by single-vertex `Scan` planning (~`plan_node_pattern` below).
         let mut virtual_target_label_id: Option<u16> = None;
-        let target_label_meta = if let Some(label_name) = params.target_node.labels.first() {
+        let target_label_meta = if params.target_node.labels.is_proper_disjunction() {
+            // `(m:A|B)`: no single label id describes the target. Leave it
+            // unconstrained and let the target filter apply the disjunction;
+            // pinning the first label dropped every `B` endpoint.
+            None
+        } else if let Some(label_name) = params.target_node.labels.first() {
             // Use first label for target_label_id
             // For schemaless support, allow unknown target labels
             match self.schema.get_label_case_insensitive(label_name) {
@@ -8432,14 +8454,22 @@ impl QueryPlanner {
     pub fn node_filter_expr(
         &self,
         variable: &str,
-        labels: &[String],
+        labels: &uni_cypher::ast::LabelExpr,
         properties: &Option<Expr>,
     ) -> Option<Expr> {
-        let mut final_expr = None;
-
-        // Add label checks using hasLabel(variable, 'label')
-        for label in labels {
-            let label_check = Expr::FunctionCall {
+        // Label checks via `hasLabel(variable, 'label')`, combined by the label
+        // expression's own operator. `LabelExpr` derefs to its bare names, and
+        // taking those as `&[String]` ANDed every label: `(m:Robot|C)` on a
+        // traversal target required both and matched nothing.
+        let op = if labels.is_disjunction() {
+            BinaryOp::Or
+        } else {
+            BinaryOp::And
+        };
+        let mut final_expr = labels
+            .names()
+            .iter()
+            .map(|label| Expr::FunctionCall {
                 name: "hasLabel".to_string(),
                 args: vec![
                     Expr::Variable(variable.to_string()),
@@ -8447,17 +8477,12 @@ impl QueryPlanner {
                 ],
                 distinct: false,
                 window_spec: None,
-            };
-
-            final_expr = match final_expr {
-                Some(e) => Some(Expr::BinaryOp {
-                    left: Box::new(e),
-                    op: BinaryOp::And,
-                    right: Box::new(label_check),
-                }),
-                None => Some(label_check),
-            };
-        }
+            })
+            .reduce(|l, r| Expr::BinaryOp {
+                left: Box::new(l),
+                op,
+                right: Box::new(r),
+            });
 
         // Add property checks
         if let Some(prop_expr) = self.properties_to_expr(variable, properties) {

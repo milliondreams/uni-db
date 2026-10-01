@@ -454,7 +454,7 @@ Uni supports standard aggregation functions.
 | `COUNT(*)` | Count all rows | `RETURN COUNT(*)` |
 | `COUNT(x)` | Count non-null values | `RETURN COUNT(p.doi)` |
 | `COUNT(DISTINCT x)` | Count distinct values | `RETURN COUNT(DISTINCT p.venue)` |
-| `SUM(x)` | Sum numeric values | `RETURN SUM(p.citations)` |
+| `SUM(x)` | Sum numeric values; `0` when there are none (no rows, or all NULL) | `RETURN SUM(p.citations)` |
 | `AVG(x)` | Average | `RETURN AVG(p.citations)` |
 | `MIN(x)` | Minimum | `RETURN MIN(p.year)` |
 | `MAX(x)` | Maximum | `RETURN MAX(p.year)` |

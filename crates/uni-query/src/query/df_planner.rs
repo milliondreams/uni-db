@@ -203,6 +203,43 @@ fn ext_id_equality(
     None
 }
 
+/// Whether `expr` is a `sum(...)` aggregate.
+fn is_sum_aggregate(expr: &Expr) -> bool {
+    matches!(expr, Expr::FunctionCall { name, window_spec: None, .. } if name.eq_ignore_ascii_case("sum"))
+}
+
+/// `sum_column`, with NULL replaced by a zero of its type.
+///
+/// Cypher's `sum` over no non-null value is 0 (Neo4j), like `count`;
+/// DataFusion's, following SQL, is NULL. A NULL there also spread: `sum(x) +
+/// 1` was NULL and `WHERE sum(x) < 10` dropped the group. The Cypher-value sum
+/// (`CypherSumUdaf`) and the row executor's accumulator already return 0.
+fn sum_of_nothing_is_zero(
+    sum_column: Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+    data_type: &DataType,
+) -> Result<Arc<dyn datafusion::physical_expr::PhysicalExpr>> {
+    use datafusion::common::ScalarValue;
+    let zero = match data_type {
+        DataType::Int64 => ScalarValue::Int64(Some(0)),
+        DataType::Float64 => ScalarValue::Float64(Some(0.0)),
+        DataType::LargeBinary => ScalarValue::LargeBinary(Some(
+            uni_common::cypher_value_codec::encode(&uni_common::Value::Int(0)),
+        )),
+        // Decimal or another type `sum` was not expected to produce: left as is.
+        _ => return Ok(sum_column),
+    };
+    Ok(Arc::new(
+        datafusion::physical_expr::expressions::CaseExpr::try_new(
+            None,
+            vec![(
+                datafusion::physical_expr::expressions::is_null(Arc::clone(&sum_column))?,
+                datafusion::physical_expr::expressions::lit(zero),
+            )],
+            Some(sum_column),
+        )?,
+    ))
+}
+
 /// Tags each row entering an `OPTIONAL MATCH` with a unique id, when this
 /// traversal is the clause's first hop.
 ///
@@ -5387,9 +5424,12 @@ impl HybridPhysicalPlanner {
             Vec::new();
 
         for (i, field) in agg_schema.fields().iter().enumerate() {
-            let col_expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> = Arc::new(
+            let mut col_expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> = Arc::new(
                 datafusion::physical_expr::expressions::Column::new(field.name(), i),
             );
+            if i >= num_group_by && is_sum_aggregate(&aggregates[i - num_group_by]) {
+                col_expr = sum_of_nothing_is_zero(col_expr, field.data_type())?;
+            }
             let name = if i >= num_group_by {
                 // Rename aggregate column to expected Cypher name
                 aggregate_column_name(&aggregates[i - num_group_by])

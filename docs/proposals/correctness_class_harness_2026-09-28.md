@@ -163,9 +163,10 @@ equality on a variable-length target making Lance reject a duplicate column;
 and `elementId` failing to plan on every MATCH-bound variable. Each has a
 regression test that fails with its fix reversed.
 
-Decision left open: `sum` over no non-null values returns NULL (SQL's
-convention; Neo4j returns 0). The engine is consistent about it, the TCK does
-not test it, and the `aggregate` relation encodes the current behaviour.
+Decided 2026-10-01: `sum` over no non-null value is 0, as in Neo4j, not
+NULL as in SQL. It had been NULL from DataFusion's `sum` and the Cypher-value
+`sum`, but 0 from the row executor's accumulator; all three now agree on 0
+(`bugs::sum_of_nothing_is_zero`), and the `aggregate` relation folds from 0.
 
 **W4 — Locy through the levers.** A program-text case type and generator
 (FOLD with composite keys, seeds, recursion, ALONG, parallel edges), an

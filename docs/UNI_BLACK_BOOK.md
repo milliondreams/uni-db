@@ -7288,6 +7288,13 @@ its compiled layout by name before building the inner batch
 - `elementId(n)` reads the identity column as `id(n)` does; it had failed to
   plan on every MATCH-bound variable (`bugs::element_id_of_bound_variables`).
 
+**`sum` over no non-null value is 0**, as in Cypher (Neo4j), not NULL as in
+SQL. DataFusion's `sum` result is wrapped in `CASE WHEN … IS NULL THEN 0`
+(a zero of its type) in `plan_aggregate`'s renaming projection
+(`sum_of_nothing_is_zero`); `CypherSumAccumulator` returns `Int(0)`; the row
+executor's `Accumulator::Sum` already did. Windowed `sum(...) OVER` keeps SQL
+semantics. `min`/`max`/`avg` of nothing stay NULL (`bugs::sum_of_nothing_is_zero`).
+
 **A storage projection names each column once.** The property fetch drops
 repeated names (`retain_first_occurrences`); a repeated equality on a
 variable-length target listed `id` twice and Lance rejected the scan

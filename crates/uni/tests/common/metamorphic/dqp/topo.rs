@@ -779,9 +779,8 @@ impl Relation {
                          ELSE toFloat({}) / size(xs) END AS m",
                         fold("null", "CASE WHEN m IS NULL OR v < m THEN v ELSE m END"),
                         fold("null", "CASE WHEN m IS NULL OR v > m THEN v ELSE m END"),
-                        // `sum` over no non-null values is NULL here (SQL's
-                        // convention; Neo4j returns 0), so the fold starts at NULL.
-                        fold("null", "coalesce(m, 0) + v"),
+                        // `sum` over no non-null value is 0, as the fold's start.
+                        fold("0", "m + v"),
                         fold("0", "m + v"),
                     )]],
                 })

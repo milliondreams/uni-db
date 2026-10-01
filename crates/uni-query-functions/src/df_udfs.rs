@@ -6097,9 +6097,8 @@ impl DfAccumulator for CypherSumAccumulator {
         Ok(())
     }
     fn evaluate(&mut self) -> DFResult<ScalarValue> {
-        if !self.has_value {
-            return Ok(ScalarValue::LargeBinary(None));
-        }
+        // `sum` over no numeric value is 0, as in Cypher (Neo4j), not NULL:
+        // `int_sum` is 0 and `all_ints` still true, so this encodes `Int(0)`.
         let val = if self.all_ints {
             Value::Int(self.int_sum)
         } else {

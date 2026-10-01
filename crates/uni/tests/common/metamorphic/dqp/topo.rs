@@ -24,6 +24,9 @@
 //! | `comprehension` | `size([p \| 1])` = `COUNT { MATCH p }` |
 //! | `unroll` | `-[*i..j]-` = ⊎ₖ `-[*k..k]-` = ⊎ₖ k fixed hops |
 //! | `distinct` | `RETURN DISTINCT x` = `WITH x, count(*) AS n RETURN x` |
+//! | `aggregate` | `count`/`min`/`max`/`sum`/`avg` = `reduce` over `collect` |
+//! | `unwind` | `UNWIND [v…] AS u … WHERE a.id = u` = ⊎ᵥ the query with `u := v` |
+//! | `collect_unwind` | `UNWIND collect(x)` = the rows where `x` is not NULL |
 //!
 //! The fixture ([`build_topo`]) has chains, a diamond, parallel edges (two with
 //! identical properties), self-loops, a 2-cycle and a 3-cycle, fan-in, fan-out,
@@ -76,6 +79,10 @@ const ROBOTS: std::ops::Range<i64> = 100..104;
 
 /// Nodes created only after the flush in [`Layout::HalfUnflushed`].
 const LATE_PERSONS: std::ops::Range<i64> = 48..52;
+
+/// Anchor ids an `UNWIND` draws from: mostly nodes with edges, plus an
+/// isolated one, a robot (not a `Person`), and an id no node has.
+const UNWIND_IDS: [i64; 12] = [0, 1, 5, 9, 12, 13, 16, 18, 31, 36, 40, 100];
 
 /// `age` values cycle through this domain; `None` is a missing property.
 const AGE_DOMAIN: [Option<i64>; 4] = [Some(10), Some(20), Some(30), None];
@@ -350,6 +357,8 @@ pub struct TopoCase {
     end: EndLabel,
     inner: Option<Pred>,
     items: Vec<Item>,
+    /// Anchor ids an `UNWIND` feeds in, duplicates allowed.
+    unwind: Vec<i64>,
 }
 
 /// How relationships are written when a pattern is rendered.
@@ -573,13 +582,15 @@ pub fn arb_topo_case() -> impl Strategy<Value = TopoCase> {
         arb_end(),
         proptest::option::weighted(0.4, arb_pred(Just(Var::B).boxed())),
         proptest::collection::vec(arb_item(), 1..=3),
+        proptest::collection::vec(proptest::sample::select(&UNWIND_IDS[..]), 1..=4),
     )
-        .prop_map(|(anchor, hops, end, inner, items)| TopoCase {
+        .prop_map(|(anchor, hops, end, inner, items, unwind)| TopoCase {
             anchor,
             hops,
             end,
             inner,
             items,
+            unwind,
         })
 }
 
@@ -613,17 +624,26 @@ pub enum Relation {
     Unroll,
     /// `DISTINCT` is grouping.
     Distinct,
+    /// An aggregate is a `reduce` over the `collect` of the same values.
+    Aggregate,
+    /// `UNWIND` of a list is the sum over its elements, duplicates included.
+    Unwind,
+    /// `UNWIND collect(x)` returns the non-null `x` rows.
+    CollectUnwind,
 }
 
 impl Relation {
     /// Every relation, in report order.
-    pub const ALL: [Relation; 6] = [
+    pub const ALL: [Relation; 9] = [
         Relation::NamedRel,
         Relation::Optional,
         Relation::Exists,
         Relation::Comprehension,
         Relation::Unroll,
         Relation::Distinct,
+        Relation::Aggregate,
+        Relation::Unwind,
+        Relation::CollectUnwind,
     ];
 
     /// Short name for reports and failures.
@@ -635,6 +655,9 @@ impl Relation {
             Relation::Comprehension => "comprehension",
             Relation::Unroll => "unroll",
             Relation::Distinct => "distinct",
+            Relation::Aggregate => "aggregate",
+            Relation::Unwind => "unwind",
+            Relation::CollectUnwind => "collect_unwind",
         }
     }
 
@@ -741,6 +764,72 @@ impl Relation {
                     )]],
                 })
             }
+            Relation::Aggregate => {
+                let joined = case.joined(Naming::Anonymous);
+                let fold = |init: &str, step: &str| format!("reduce(m = {init}, v IN xs | {step})");
+                Some(Rewrite {
+                    reference: format!(
+                        "{joined} RETURN a.id AS c0, count(*) AS n, count(b.age) AS k, \
+                         min(b.age) AS lo, max(b.age) AS hi, sum(b.age) AS s, avg(b.age) AS m"
+                    ),
+                    equivalents: vec![vec![format!(
+                        "{joined} WITH a, collect(b.age) AS xs, collect(1) AS all \
+                         RETURN a.id AS c0, size(all) AS n, size(xs) AS k, {} AS lo, {} AS hi, \
+                         {} AS s, CASE size(xs) WHEN 0 THEN null \
+                         ELSE toFloat({}) / size(xs) END AS m",
+                        fold("null", "CASE WHEN m IS NULL OR v < m THEN v ELSE m END"),
+                        fold("null", "CASE WHEN m IS NULL OR v > m THEN v ELSE m END"),
+                        // `sum` over no non-null values is NULL here (SQL's
+                        // convention; Neo4j returns 0), so the fold starts at NULL.
+                        fold("null", "coalesce(m, 0) + v"),
+                        fold("0", "m + v"),
+                    )]],
+                })
+            }
+            Relation::Unwind => {
+                // The list is the anchor, so the case's anchor predicate is left
+                // out: with it, too few draws matched any row to compare.
+                let tail = |anchor: &str| {
+                    let conds: Vec<String> = std::iter::once(anchor.to_string())
+                        .chain(case.inner.iter().map(Pred::render))
+                        .collect();
+                    format!(
+                        "MATCH {} WHERE {}",
+                        case.pattern(Naming::Anonymous),
+                        conds.join(" AND ")
+                    )
+                };
+                let list: Vec<String> = case.unwind.iter().map(i64::to_string).collect();
+                Some(Rewrite {
+                    reference: format!(
+                        "UNWIND [{}] AS u MATCH (a:Person) {} RETURN u AS u, {ret}",
+                        list.join(", "),
+                        tail("a.id = u")
+                    ),
+                    equivalents: vec![
+                        case.unwind
+                            .iter()
+                            .map(|v| {
+                                format!(
+                                    "MATCH (a:Person) {} RETURN {v} AS u, {ret}",
+                                    tail(&format!("a.id = {v}"))
+                                )
+                            })
+                            .collect(),
+                    ],
+                })
+            }
+            Relation::CollectUnwind => {
+                let joined = case.joined(Naming::Anonymous);
+                Some(Rewrite {
+                    reference: format!(
+                        "{joined} WITH collect(b.age) AS xs UNWIND xs AS x RETURN x AS c0"
+                    ),
+                    equivalents: vec![vec![format!(
+                        "{joined} WITH b.age AS x WHERE x IS NOT NULL RETURN x AS c0"
+                    )]],
+                })
+            }
         }
     }
 }
@@ -755,6 +844,12 @@ impl Relation {
 /// sits well below the lowest of them, so a generator or fixture drift that
 /// empties the results fails loudly instead of passing on empty bags.
 pub const MIN_NON_EMPTY_RATE: f64 = 0.30;
+
+/// Applicable cases below which the rate is too noisy to hold to
+/// [`MIN_NON_EMPTY_RATE`]; such a run only has to produce one non-empty case.
+/// Measured: the 25-case small-batch run drew `unwind` non-empty in 5 and in 13
+/// of 25 on two runs of the same code.
+const MIN_CASES_FOR_RATE: u64 = 40;
 
 /// Rows one case may return across every query of every relation.
 const PER_CASE_ROW_CEILING: usize = 20_000;
@@ -883,6 +978,15 @@ pub fn drive_topo(label: &str, layout: Layout, execution_batch_size: Option<usiz
             "[{label}] relation {} never applied",
             relation.name()
         );
+        assert!(
+            t.non_empty > 0,
+            "[{label}] relation {}: none of {} applicable cases returned rows",
+            relation.name(),
+            t.applied
+        );
+        if t.applied < MIN_CASES_FOR_RATE {
+            continue;
+        }
         let rate = t.non_empty as f64 / t.applied as f64;
         assert!(
             rate >= MIN_NON_EMPTY_RATE,
@@ -897,30 +1001,35 @@ pub fn drive_topo(label: &str, layout: Layout, execution_batch_size: Option<usiz
 }
 
 /// All rows flushed, default execution batch size.
+///
+/// 60 cases: about 55 s alone. The full suite runs it beside everything else
+/// under the default profile's 180 s limit, and at 100 cases (about 90 s alone)
+/// a full-suite run timed out.
 #[test]
 fn topo_rewrites_flushed() {
-    drive_topo("flushed", Layout::Flushed, None, cases_from_env(100));
+    drive_topo("flushed", Layout::Flushed, None, cases_from_env(60));
 }
 
 /// Half the graph in L0 and a two-row execution batch, so every multi-row
 /// intermediate spans batches.
 ///
 /// Fewer cases than the flushed run: a two-row batch makes every operator pay
-/// its per-batch cost per pair of rows, measured at about 2 s per case.
+/// its per-batch cost per pair of rows, measured at about 2 s per case, so 15
+/// cases take about 30 s.
 #[test]
 fn topo_rewrites_unflushed_small_batches() {
     drive_topo(
         "unflushed-b2",
         Layout::HalfUnflushed,
         Some(2),
-        cases_from_env(25),
+        cases_from_env(15),
     );
 }
 
-/// Nightly volume over the flushed fixture: a quarter of `DQP_CASES`. Each case
-/// runs about 25 queries, measured at 0.59 s a case over 1 500 cases, so the
-/// nightly 10 000 becomes 2 500 cases, about 25 minutes — inside the soak
-/// profile's 54-minute cap with room to spare.
+/// Nightly volume over the flushed fixture: a fifth of `DQP_CASES`. Each case
+/// runs about 35 queries, measured at 0.95 s a case over 100 cases, so the
+/// nightly 10 000 becomes 2 000 cases, about 32 minutes — inside the soak
+/// profile's 54-minute cap.
 #[test]
 #[ignore = "soak: run nightly under the soak profile"]
 fn topo_soak() {
@@ -928,12 +1037,12 @@ fn topo_soak() {
         "flushed-soak",
         Layout::Flushed,
         None,
-        (cases_from_env(20_000) / 4).max(1),
+        (cases_from_env(20_000) / 5).max(1),
     );
 }
 
 /// Nightly volume over L0 and two-row batches: a twentieth of `DQP_CASES`,
-/// since each case costs about 2 s here (measured over 150 cases).
+/// since each case costs about 2.4 s here (measured over 25 cases).
 #[test]
 #[ignore = "soak: run nightly under the soak profile"]
 fn topo_small_batches_soak() {

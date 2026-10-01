@@ -1,6 +1,6 @@
 # Finding silent wrong answers by class, not by customer report
 
-**Date:** 2026-09-28 · **Status:** W1 done (all confirmed defects fixed, plus four found on the way); W2 done (found the OPTIONAL MATCH clause-close class); W3 in part (query-rewrite relations + topology fixture; four engine defects found); W4–W6 open · **Trigger:** issues #293, #294
+**Date:** 2026-09-28 · **Status:** W1 done (all confirmed defects fixed, plus four found on the way); W2 done (found the OPTIONAL MATCH clause-close class); W3 done (query-rewrite relations, topology fixture, wide tier; eleven engine defects found); W4–W6 open · **Trigger:** issues #293, #294
 
 ## Why
 
@@ -147,9 +147,25 @@ for 104); the reachability BFS dropped endpoints in an order-dependent way
 (95–103 of 103 rows, run to run); a chunked OPTIONAL traversal emitted a NULL
 row per chunk; and an unbound OPTIONAL entity was a non-null struct of NULLs
 (`labels()` failed, `keys()` gave `[]` or the declared property names, a list
-or map holding it became NULL). Not done from the W3 list: the > 8192-row,
-vid-gap tier for the existing state levers, and querygen `UNWIND` /
-min/max/collect. Known open: `elementId(b)` fails with "No field named b".
+or map holding it became NULL).
+
+*W3 second round.* Three more relations — aggregates against `reduce` over
+`collect`, `UNWIND` of a list against the sum over its elements, `UNWIND
+collect(x)` against the non-null rows — and a wide DQP tier (`Tier::Wide`:
+> 8192 `Person` rows with vid gaps and a 65 536-row filler block) under the
+flush lever, which fails on its first case with the scan-range fix reversed.
+They found: `reduce` truncating float elements to the accumulator's integer
+type, and panicking in Arrow with a `null` start; comprehensions, quantifiers,
+`reduce` and pattern comprehensions failing — or, for a pattern comprehension,
+returning empty — inside a `CASE` branch; mixed Int/Float arithmetic and
+comparison failing when an operand holds a custom expression; a repeated
+equality on a variable-length target making Lance reject a duplicate column;
+and `elementId` failing to plan on every MATCH-bound variable. Each has a
+regression test that fails with its fix reversed.
+
+Decision left open: `sum` over no non-null values returns NULL (SQL's
+convention; Neo4j returns 0). The engine is consistent about it, the TCK does
+not test it, and the `aggregate` relation encodes the current behaviour.
 
 **W4 — Locy through the levers.** A program-text case type and generator
 (FOLD with composite keys, seeds, recursion, ALONG, parallel edges), an

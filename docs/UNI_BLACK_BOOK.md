@@ -7260,7 +7260,46 @@ Unguarded, an OPTIONAL MATCH miss made `labels(b)` fail, `keys(b)` return
 collapse to NULL; a labelled target hid it because its filter re-nulled the
 column (`bugs::optional_entity_is_null`).
 
-All four were found by the query-rewrite relations of
+**An expression with its own scope carries its outer columns with it.** A
+list comprehension, quantifier, `reduce` or pattern comprehension compiles its
+body against the input schema plus its own variables and keeps the body out of
+`children()`. DataFusion's `CASE` evaluates each branch on a batch projected
+down to the columns its children reference, renumbered — so a hidden body read
+columns that were gone or had moved: an error, or (a pattern comprehension
+whose anchor was dropped) an empty result per row. Each now exposes the outer
+columns its body reads (`common::outer_column_refs`) and realigns the batch to
+its compiled layout by name before building the inner batch
+(`common::realign_by_name`) (`bugs::nested_scope_in_case_branch`).
+
+**Types are decided where the values are.**
+- `reduce` stays typed only when the list's element type is known and the
+  body returns the accumulator's type; otherwise accumulator, elements and body
+  are Cypher values (`ToCypherValueExpr`). Decoding an untyped list *as the
+  accumulator's type* truncated floats (`reduce(s = 0, v IN [1.5, 2.5] | s +
+  v)` returned 3), and a `null` start panicked in Arrow
+  (`bugs::reduce_accumulator_types`).
+- `cv_array_to_large_list` declares the list's item type from the values it
+  built, not from the type asked for.
+- A binary operator compiled outside the logical path (an operand holding a
+  custom expression) casts its operands to the types DataFusion's own
+  `BinaryTypeCoercer` picks; `size([x IN xs | x]) * 1.5` failed.
+- `CASE` casts a `Null`-typed branch to the other branches' type, and converts
+  every branch to a Cypher value when any branch is one.
+- `elementId(n)` reads the identity column as `id(n)` does; it had failed to
+  plan on every MATCH-bound variable (`bugs::element_id_of_bound_variables`).
+
+**A storage projection names each column once.** The property fetch drops
+repeated names (`retain_first_occurrences`); a repeated equality on a
+variable-length target listed `id` twice and Lance rejected the scan
+(`bugs::duplicate_property_projection`).
+
+**A scan walks every slice, whatever its gaps.** DQP `Tier::Wide` puts
+`Person` in three chunks with `Company` chunks between them, over more than one
+8192-row scan slice, then a 65 536-row `Filler` block, so the flush lever's L0
+delta sits past a gap wider than the range walk grows to; `flush_wide_smoke`
+fails on its first case with the scan-range fix (`0993d4f68`) reversed.
+
+All of these were found by the query-rewrite relations of
 `metamorphic::dqp::topo` (W3), which hold data and engine fixed and compare a
 query with equivalent formulations over a fixture with parallel edges,
 self-loops, cycles and a diamond; every reference query also runs twice.

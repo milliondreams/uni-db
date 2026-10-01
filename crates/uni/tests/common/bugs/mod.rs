@@ -133,6 +133,7 @@ pub mod repro_issue_182_delete_before_first_flush;
 pub mod bug_cypher_value_arg_decode;
 pub mod delete_sees_tx_local_edges;
 pub mod duplicate_property_projection;
+pub mod element_id_of_bound_variables;
 pub mod ext_id_lookup_sees_everything;
 pub mod fts_sees_current_text;
 pub mod inline_element_where;

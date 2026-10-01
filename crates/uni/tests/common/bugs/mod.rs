@@ -150,6 +150,7 @@ pub mod optional_match_row_identity;
 pub mod optional_traverse_chunked;
 pub mod pattern_fast_path_constraints;
 pub mod reachability_trail_any_predecessor;
+pub mod reduce_accumulator_types;
 pub mod repro_distinct_entity_over_counts;
 pub mod repro_issue_249_add_property_to_existing_label;
 pub mod repro_optional_match_over_unwound_entity;

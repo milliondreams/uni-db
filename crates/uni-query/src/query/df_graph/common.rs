@@ -1564,7 +1564,11 @@ pub fn cv_array_to_large_list(
         }
     };
 
-    let field = Arc::new(Field::new("item", element_type.clone(), true));
+    // The item type is the one the values were built as, not the one asked
+    // for: an element type with no arm here (`Null`, say, for a `reduce` whose
+    // accumulator starts as `null`) is built as encoded blobs by the fallback,
+    // and declaring it as asked made `LargeListArray::new` panic.
+    let field = Arc::new(Field::new("item", values_array.data_type().clone(), true));
     let offset_buffer = OffsetBuffer::new(ScalarBuffer::from(offsets));
     let null_buffer = datafusion::arrow::buffer::NullBuffer::from(nulls);
 

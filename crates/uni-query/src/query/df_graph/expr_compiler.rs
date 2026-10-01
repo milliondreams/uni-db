@@ -55,6 +55,26 @@ fn is_cypher_value_type(dt: Option<&DataType>) -> bool {
 /// # Errors
 ///
 /// Returns an error if the data type is not a recognized list type.
+/// The schema a `reduce` body sees: the input, with the accumulator and loop
+/// variable added (shadowing outer columns of the same names).
+fn reduce_inner_schema(
+    input_schema: &Schema,
+    accumulator: &str,
+    acc_type: DataType,
+    variable: &str,
+    element_type: DataType,
+) -> Schema {
+    let mut fields = input_schema.fields().to_vec();
+    for (name, data_type) in [(accumulator, acc_type), (variable, element_type)] {
+        let field = Arc::new(Field::new(name, data_type, true));
+        match fields.iter().position(|f| f.name() == name) {
+            Some(pos) => fields[pos] = field,
+            None => fields.push(field),
+        }
+    }
+    Schema::new(fields)
+}
+
 fn resolve_list_element_type(
     list_data_type: &DataType,
     large_binary_fallback: DataType,
@@ -190,6 +210,121 @@ impl PhysicalExpr for LargeListToCypherValueExpr {
     fn fmt_sql(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "LargeListToCypherValue({})", self.child)
     }
+}
+
+/// Physical expression wrapper that encodes any value as a Cypher value
+/// (`LargeBinary`), row by row.
+///
+/// A Cypher value carries its own type per row, which a typed Arrow column
+/// cannot. `reduce` needs that when its accumulator's type is not fixed — an
+/// untyped `null` start, or a body that turns an integer into a float.
+#[derive(Debug)]
+struct ToCypherValueExpr {
+    child: Arc<dyn PhysicalExpr>,
+}
+
+impl std::fmt::Display for ToCypherValueExpr {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "ToCypherValue({})", self.child)
+    }
+}
+
+impl PartialEq for ToCypherValueExpr {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.child, &other.child)
+    }
+}
+
+impl Eq for ToCypherValueExpr {}
+
+impl std::hash::Hash for ToCypherValueExpr {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::any::type_name::<Self>().hash(state);
+    }
+}
+
+impl PartialEq<dyn std::any::Any> for ToCypherValueExpr {
+    fn eq(&self, other: &dyn std::any::Any) -> bool {
+        other
+            .downcast_ref::<Self>()
+            .map(|x| self == x)
+            .unwrap_or(false)
+    }
+}
+
+impl PhysicalExpr for ToCypherValueExpr {
+    fn data_type(&self, _input_schema: &Schema) -> datafusion::error::Result<DataType> {
+        Ok(DataType::LargeBinary)
+    }
+
+    fn nullable(&self, input_schema: &Schema) -> datafusion::error::Result<bool> {
+        self.child.nullable(input_schema)
+    }
+
+    fn evaluate(
+        &self,
+        batch: &arrow_array::RecordBatch,
+    ) -> datafusion::error::Result<datafusion::logical_expr::ColumnarValue> {
+        use datafusion::logical_expr::ColumnarValue;
+
+        let array = self.child.evaluate(batch)?.into_array(batch.num_rows())?;
+        match array.data_type() {
+            DataType::LargeBinary => Ok(ColumnarValue::Array(array)),
+            _ => {
+                // `logical_nulls`, not `is_null`: a `NullArray` has no null
+                // buffer, so `is_null` calls every row valid, and encoding that
+                // row gives a non-null blob holding NULL, which `IS NULL` misses.
+                let nulls = array.logical_nulls();
+                let mut builder = arrow_array::builder::LargeBinaryBuilder::new();
+                for row in 0..array.len() {
+                    if nulls.as_ref().is_some_and(|n| n.is_null(row)) {
+                        builder.append_null();
+                        continue;
+                    }
+                    let value = uni_store::storage::arrow_convert::arrow_to_value(
+                        array.as_ref(),
+                        row,
+                        None,
+                    )
+                    .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+                    builder.append_value(uni_common::cypher_value_codec::encode(&value));
+                }
+                Ok(ColumnarValue::Array(Arc::new(builder.finish())))
+            }
+        }
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+        vec![&self.child]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn PhysicalExpr>>,
+    ) -> datafusion::error::Result<Arc<dyn PhysicalExpr>> {
+        match <[_; 1]>::try_from(children) {
+            Ok([child]) => Ok(Arc::new(ToCypherValueExpr { child })),
+            Err(_) => Err(datafusion::error::DataFusionError::Execution(
+                "ToCypherValueExpr expects exactly 1 child".to_string(),
+            )),
+        }
+    }
+
+    fn fmt_sql(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "ToCypherValue({})", self.child)
+    }
+}
+
+/// `expr` as a Cypher value, unless it already is one.
+fn as_cypher_value(
+    expr: Arc<dyn PhysicalExpr>,
+    schema: &Schema,
+) -> datafusion::error::Result<Arc<dyn PhysicalExpr>> {
+    Ok(if expr.data_type(schema)? == DataType::LargeBinary {
+        expr
+    } else {
+        Arc::new(ToCypherValueExpr { child: expr })
+    })
 }
 
 /// Compiler for converting Cypher expressions directly to DataFusion Physical Expressions.
@@ -1757,51 +1892,91 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
         input_schema: &Schema,
     ) -> Result<Arc<dyn PhysicalExpr>> {
         let list_phy = self.compile(list, input_schema)?;
-
         let initial_phy = self.compile(initial, input_schema)?;
-        let acc_type = initial_phy.data_type(input_schema)?;
-
+        let init_type = initial_phy.data_type(input_schema)?;
         let list_data_type = list_phy.data_type(input_schema)?;
-        // For LargeBinary (CypherValue arrays), use the accumulator type as element type so the
-        // reduce body expression compiles correctly (e.g. acc + x where both are Int64).
-        let inner_data_type =
-            resolve_list_element_type(&list_data_type, acc_type.clone(), "Reduce")?;
 
-        // Create inner schema with accumulator and loop variable (shadow outer variables if same names)
-        let mut fields = input_schema.fields().to_vec();
-
-        let acc_field = Arc::new(Field::new(accumulator, acc_type, true));
-        if let Some(pos) = fields.iter().position(|f| f.name() == accumulator) {
-            fields[pos] = acc_field;
-        } else {
-            fields.push(acc_field);
+        // Typed only when both the elements' type is known and the body keeps
+        // the accumulator's type. Otherwise the accumulator, the elements of an
+        // untyped list, and the body's result are all Cypher values, which carry
+        // a type per row. Decoding an untyped list *as the accumulator's type*
+        // truncated floats to integers — `reduce(s = 0, v IN [1.5, 2.5] | s + v)`
+        // returned 3 — and an untyped `null` start could not hold anything.
+        let element_type =
+            resolve_list_element_type(&list_data_type, DataType::LargeBinary, "Reduce")?;
+        let typed = element_type != DataType::LargeBinary && init_type != DataType::Null;
+        if typed
+            && let Ok(reduce) = self.compile_reduce_body(
+                accumulator,
+                init_type.clone(),
+                variable,
+                element_type.clone(),
+                reduce_expr,
+                input_schema,
+            )
+            && reduce.data_type(&reduce_inner_schema(
+                input_schema,
+                accumulator,
+                init_type.clone(),
+                variable,
+                element_type.clone(),
+            ))? == init_type
+        {
+            return Ok(Arc::new(ReduceExecExpr::new(
+                accumulator.to_string(),
+                initial_phy,
+                variable.to_string(),
+                list_phy,
+                reduce,
+                Arc::new(input_schema.clone()),
+                init_type,
+            )));
         }
 
-        let var_field = Arc::new(Field::new(variable, inner_data_type, true));
-        if let Some(pos) = fields.iter().position(|f| f.name() == variable) {
-            fields[pos] = var_field;
-        } else {
-            fields.push(var_field);
-        }
-
-        let inner_schema = Arc::new(Schema::new(fields));
-
-        // Compile reduce expression with scoped translation context
-        let mut scoped_ctx = None;
-        let reduce_compiler = self.scoped_compiler(&[accumulator, variable], &mut scoped_ctx);
-
-        let reduce_phy = reduce_compiler.compile(reduce_expr, &inner_schema)?;
-        let output_type = reduce_phy.data_type(&inner_schema)?;
-
+        let initial_phy = as_cypher_value(initial_phy, input_schema)?;
+        let inner_schema = reduce_inner_schema(
+            input_schema,
+            accumulator,
+            DataType::LargeBinary,
+            variable,
+            element_type.clone(),
+        );
+        let reduce = self.compile_reduce_body(
+            accumulator,
+            DataType::LargeBinary,
+            variable,
+            element_type,
+            reduce_expr,
+            input_schema,
+        )?;
+        let reduce = as_cypher_value(reduce, &inner_schema)?;
         Ok(Arc::new(ReduceExecExpr::new(
             accumulator.to_string(),
             initial_phy,
             variable.to_string(),
             list_phy,
-            reduce_phy,
+            reduce,
             Arc::new(input_schema.clone()),
-            output_type,
+            DataType::LargeBinary,
         )))
+    }
+
+    /// Compiles a `reduce` body with the accumulator and loop variable typed
+    /// as given.
+    fn compile_reduce_body(
+        &self,
+        accumulator: &str,
+        acc_type: DataType,
+        variable: &str,
+        element_type: DataType,
+        reduce_expr: &Expr,
+        input_schema: &Schema,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        let inner_schema =
+            reduce_inner_schema(input_schema, accumulator, acc_type, variable, element_type);
+        let mut scoped_ctx = None;
+        let reduce_compiler = self.scoped_compiler(&[accumulator, variable], &mut scoped_ctx);
+        reduce_compiler.compile(reduce_expr, &inner_schema)
     }
 
     fn compile_quantifier(

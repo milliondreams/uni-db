@@ -507,6 +507,92 @@ pub fn used_edge_id_arrays<'a>(
     Ok(used)
 }
 
+/// The outer columns that expressions hidden from `children()` read, as
+/// `Column`s against `outer`.
+///
+/// A comprehension, quantifier or `reduce` compiles its body against the outer
+/// schema plus its own variables, and keeps the body out of `children()`
+/// because DataFusion would misread the inner columns. But DataFusion also
+/// uses `children()` to decide which columns an expression needs: `CASE`
+/// projects each batch down to the columns its branches reference (and
+/// renumbers them) before evaluating a branch. A body it cannot see then read
+/// a batch without its columns, or with them at other positions — an error, or
+/// the wrong column read silently. Exposing these references as extra children
+/// makes DataFusion keep them; [`realign_by_name`] puts them back where the
+/// body expects them.
+pub fn outer_column_refs(
+    hidden: &[&Arc<dyn datafusion::physical_plan::PhysicalExpr>],
+    outer: &arrow_schema::Schema,
+    inner_names: &[&str],
+) -> Vec<Arc<dyn datafusion::physical_plan::PhysicalExpr>> {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::physical_expr::expressions::Column;
+
+    let mut indices = std::collections::BTreeSet::new();
+    for expr in hidden {
+        let _ = expr.apply(|e| {
+            if let Some(col) = e.downcast_ref::<Column>()
+                && col.index() < outer.fields().len()
+                && outer.field(col.index()).name() == col.name()
+                && !inner_names.contains(&col.name())
+            {
+                indices.insert(col.index());
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+    }
+    indices
+        .into_iter()
+        .map(|idx| {
+            Arc::new(Column::new(outer.field(idx).name(), idx))
+                as Arc<dyn datafusion::physical_plan::PhysicalExpr>
+        })
+        .collect()
+}
+
+/// `batch` laid out as `schema`, matching columns by name.
+///
+/// The inverse of a projection such as `CASE`'s (see [`outer_column_refs`]):
+/// a column the batch lacks is not read by anything evaluated against the
+/// result, and is filled with NULLs. Returns the batch unchanged when it is
+/// already laid out as `schema`.
+pub fn realign_by_name(
+    batch: &arrow_array::RecordBatch,
+    schema: &arrow_schema::Schema,
+) -> datafusion::error::Result<arrow_array::RecordBatch> {
+    let same = batch.num_columns() == schema.fields().len()
+        && batch
+            .schema()
+            .fields()
+            .iter()
+            .zip(schema.fields())
+            .all(|(a, b)| a.name() == b.name());
+    if same {
+        return Ok(batch.clone());
+    }
+    let rows = batch.num_rows();
+    let (fields, columns): (Vec<Field>, Vec<arrow_array::ArrayRef>) = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let column = batch
+                .column_by_name(field.name())
+                .cloned()
+                .unwrap_or_else(|| arrow_array::new_null_array(field.data_type(), rows));
+            (
+                Field::new(field.name(), column.data_type().clone(), true),
+                column,
+            )
+        })
+        .unzip();
+    arrow_array::RecordBatch::try_new_with_options(
+        Arc::new(arrow_schema::Schema::new(fields)),
+        columns,
+        &arrow_array::RecordBatchOptions::new().with_row_count(Some(rows)),
+    )
+    .map_err(arrow_err)
+}
+
 /// Extract a VID from a CypherValue that is a vertex.
 ///
 /// Delegates to [`uni_common::Value::entity_vid`], the one definition of vertex

@@ -143,6 +143,7 @@ pub mod issue_290_runtime_bound_state;
 pub mod label_disjunction_on_traversal_target;
 pub mod merge_path_binding;
 pub mod merge_per_row_counters;
+pub mod nested_scope_in_case_branch;
 pub mod not_null_on_unflushed_rows;
 pub mod optional_entity_is_null;
 pub mod optional_match_clause_close;

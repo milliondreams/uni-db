@@ -2345,6 +2345,49 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
             }
         }
 
+        // A branch that is a Cypher value makes the result one: every other
+        // non-null branch is converted to match (lists were, above). And a
+        // branch typed `Null` — a literal `null` — takes the other branches'
+        // type. Otherwise `CASE WHEN … THEN null ELSE reduce(…) END` failed
+        // at run time ("arguments need to have the same data type").
+        let branch_type = |e: &Arc<dyn PhysicalExpr>| e.data_type(input_schema).ok();
+        let branches: Vec<Option<DataType>> = when_then_phy
+            .iter()
+            .map(|(_, t)| branch_type(t))
+            .chain(else_phy.iter().map(branch_type))
+            .collect();
+        let target = if branches.contains(&Some(DataType::LargeBinary)) {
+            Some(DataType::LargeBinary)
+        } else {
+            // One type among the non-null branches: cast the `Null` ones to it.
+            // Several: leave them (numeric mixes are not unified here).
+            let mut typed = branches.iter().flatten().filter(|t| **t != DataType::Null);
+            match typed.next() {
+                Some(first) if typed.all(|t| t == first) => Some(first.clone()),
+                _ => None,
+            }
+        };
+        if let Some(target) = target {
+            let unify = |e: Arc<dyn PhysicalExpr>| -> Result<Arc<dyn PhysicalExpr>> {
+                Ok(match e.data_type(input_schema)? {
+                    t if t == target => e,
+                    DataType::Null => datafusion::physical_expr::expressions::cast(
+                        e,
+                        input_schema,
+                        target.clone(),
+                    )?,
+                    _ if target == DataType::LargeBinary => as_cypher_value(e, input_schema)?,
+                    _ => e,
+                })
+            };
+            for (_, t_phy) in &mut when_then_phy {
+                *t_phy = unify(t_phy.clone())?;
+            }
+            if let Some(e_phy) = else_phy.take() {
+                else_phy = Some(unify(e_phy)?);
+            }
+        }
+
         let case_expr = datafusion::physical_expr::expressions::CaseExpr::try_new(
             operand_phy,
             when_then_phy,
@@ -2464,7 +2507,30 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
             }
         }
 
-        // Use DataFusion's binary physical expression creator which handles coercion
+        // The physical `binary` does not coerce its operands; the logical path
+        // does, but an operand holding a comprehension, `reduce` or other custom
+        // expression is compiled here instead, so `size([x IN xs | x]) * 1.5`
+        // failed at run time ("Invalid arithmetic operation: Int64 * Float64"),
+        // as did the comparison `> 1.5`. Cast to the types DataFusion's own
+        // coercion picks.
+        let (left, right) = match (&left_type, &right_type) {
+            (Some(l), Some(r)) if l != r => {
+                match datafusion::logical_expr::type_coercion::binary::BinaryTypeCoercer::new(
+                    l, &df_op, r,
+                )
+                .get_input_types()
+                {
+                    Ok((lt, rt)) => (
+                        datafusion::physical_expr::expressions::cast(left, input_schema, lt)?,
+                        datafusion::physical_expr::expressions::cast(right, input_schema, rt)?,
+                    ),
+                    Err(_) => (left, right),
+                }
+            }
+            _ => (left, right),
+        };
+
+        // Use DataFusion's binary physical expression creator
         binary(left, df_op, right, input_schema)
             .map_err(|e| anyhow!("Failed to create binary expression: {}", e))
     }

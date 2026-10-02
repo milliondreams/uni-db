@@ -10,6 +10,10 @@
 //! path. The NULL spread: `sum(x) + 1` was NULL and `WHERE total < 10` dropped
 //! the group. `min`, `max` and `avg` of nothing stay NULL.
 //!
+//! A `sum(...) OVER (...)` window is held to the same rule, and also cast
+//! every argument to an integer before adding it, so a float window sum was
+//! truncated: `0.5` and `1.25` summed to `1`.
+//!
 //! Found by the `aggregate` relation of `metamorphic::dqp::topo`.
 //!
 //! Run with:
@@ -83,5 +87,39 @@ async fn sum_of_nothing_is_zero_on_every_path() -> Result<()> {
     for (query, want) in cases {
         assert_eq!(&rows(&db, query).await?, want, "{query}");
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn sum_of_nothing_is_zero_in_a_window() -> Result<()> {
+    let db = open().await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:N {g: 1, i: 3, f: 1.25})").await?;
+    tx.commit().await?;
+    assert_eq!(
+        rows(
+            &db,
+            "MATCH (n:N) RETURN n.g AS g, sum(n.i) OVER (PARTITION BY n.g) AS si, \
+             sum(n.f) OVER (PARTITION BY n.g) AS sf, avg(n.f) OVER (PARTITION BY n.g) AS af \
+             ORDER BY g"
+        )
+        .await?,
+        vec![
+            vec![
+                Value::Int(1),
+                Value::Int(5),
+                Value::Float(1.75),
+                Value::Float(0.875)
+            ],
+            vec![
+                Value::Int(1),
+                Value::Int(5),
+                Value::Float(1.75),
+                Value::Float(0.875)
+            ],
+            vec![Value::Int(2), Value::Int(0), Value::Float(0.0), Value::Null],
+            vec![Value::Int(2), Value::Int(0), Value::Float(0.0), Value::Null],
+        ]
+    );
     Ok(())
 }

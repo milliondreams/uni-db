@@ -507,7 +507,7 @@ function_name(args) OVER (
 | `row_number()` | Sequential row number | `row_number() OVER (ORDER BY p.year)` |
 | `rank()` | Rank with gaps for ties | `rank() OVER (ORDER BY p.citations DESC)` |
 | `dense_rank()` | Rank without gaps | `dense_rank() OVER (ORDER BY p.citations DESC)` |
-| `sum()` | Running sum | `sum(p.citations) OVER (ORDER BY p.year)` |
+| `sum()` | Running sum; `0` over a frame with no non-null value | `sum(p.citations) OVER (ORDER BY p.year)` |
 | `avg()` | Running average | `avg(p.citations) OVER (PARTITION BY p.venue)` |
 | `count()` | Running count | `count(*) OVER (PARTITION BY p.venue)` |
 | `min()` / `max()` | Running min/max | `max(p.citations) OVER (PARTITION BY p.author)` |

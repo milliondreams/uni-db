@@ -6422,6 +6422,8 @@ impl HybridPhysicalPlanner {
             std::sync::Arc<dyn datafusion::physical_expr::window::WindowExpr>,
             Vec<datafusion::physical_expr::PhysicalSortExpr>,
         )> = Vec::new();
+        // Output names of the `sum` windows, whose NULL becomes 0 below.
+        let mut sum_columns: HashSet<String> = HashSet::new();
 
         for expr in window_exprs {
             let Expr::FunctionCall {
@@ -6526,9 +6528,20 @@ impl HybridPhysicalPlanner {
                             let mut df_expr = cypher_expr_to_df(arg, tx_ctx.as_ref())?;
 
                             // Cast numeric types only for SUM/AVG aggregate functions:
-                            // SUM needs Int64 to avoid overflow, AVG needs Float64
+                            // SUM widens integers to Int64 and floats to Float64, as
+                            // the grouped `sum` does — casting every argument to
+                            // Int64 truncated each float before it was added
+                            // (`sum(0.5, 1.25) OVER ()` returned 1). AVG needs Float64.
                             if is_aggregate {
+                                let is_float = matches!(
+                                    df_expr.get_type(&df_schema),
+                                    Ok(datafusion::arrow::datatypes::DataType::Float32
+                                        | datafusion::arrow::datatypes::DataType::Float64)
+                                );
                                 let cast_type = match name_lower.as_str() {
+                                    "sum" if is_float => {
+                                        Some(datafusion::arrow::datatypes::DataType::Float64)
+                                    }
                                     "sum" => Some(datafusion::arrow::datatypes::DataType::Int64),
                                     "avg" => Some(datafusion::arrow::datatypes::DataType::Float64),
                                     _ => None,
@@ -6660,6 +6673,9 @@ impl HybridPhysicalPlanner {
                 }
             }
 
+            if name_lower == "sum" {
+                sum_columns.insert(window_expr.name().to_string());
+            }
             window_specs.push((window_expr, required_ordering));
         }
 
@@ -6686,7 +6702,24 @@ impl HybridPhysicalPlanner {
             )?);
         }
 
-        Ok(plan)
+        // A `sum` window over a frame with no non-null value is 0, as the grouped
+        // `sum` is (see `sum_of_nothing_is_zero`), not SQL's NULL.
+        if sum_columns.is_empty() {
+            return Ok(plan);
+        }
+        let schema = plan.schema();
+        let mut proj_exprs: Vec<(Arc<dyn datafusion::physical_expr::PhysicalExpr>, String)> =
+            Vec::with_capacity(schema.fields().len());
+        for (i, field) in schema.fields().iter().enumerate() {
+            let mut column: Arc<dyn datafusion::physical_expr::PhysicalExpr> = Arc::new(
+                datafusion::physical_expr::expressions::Column::new(field.name(), i),
+            );
+            if sum_columns.contains(field.name()) {
+                column = sum_of_nothing_is_zero(column, field.data_type())?;
+            }
+            proj_exprs.push((column, field.name().clone()));
+        }
+        Ok(Arc::new(ProjectionExec::try_new(proj_exprs, plan)?))
     }
 
     /// Plan an empty input that produces exactly one row.

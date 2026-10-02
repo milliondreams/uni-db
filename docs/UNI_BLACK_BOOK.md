@@ -7292,8 +7292,10 @@ its compiled layout by name before building the inner batch
 SQL. DataFusion's `sum` result is wrapped in `CASE WHEN … IS NULL THEN 0`
 (a zero of its type) in `plan_aggregate`'s renaming projection
 (`sum_of_nothing_is_zero`); `CypherSumAccumulator` returns `Int(0)`; the row
-executor's `Accumulator::Sum` already did. Windowed `sum(...) OVER` keeps SQL
-semantics. `min`/`max`/`avg` of nothing stay NULL (`bugs::sum_of_nothing_is_zero`).
+executor's `Accumulator::Sum` already did. A `sum(...) OVER` window gets the
+same wrap in `plan_window_functions`, and sums a float argument as Float64
+(it had cast every argument to Int64, truncating each float before adding).
+`min`/`max`/`avg` of nothing stay NULL (`bugs::sum_of_nothing_is_zero`).
 
 **A storage projection names each column once.** The property fetch drops
 repeated names (`retain_first_occurrences`); a repeated equality on a

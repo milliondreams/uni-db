@@ -167,6 +167,9 @@ Decided 2026-10-01: `sum` over no non-null value is 0, as in Neo4j, not
 NULL as in SQL. It had been NULL from DataFusion's `sum` and the Cypher-value
 `sum`, but 0 from the row executor's accumulator; all three now agree on 0
 (`bugs::sum_of_nothing_is_zero`), and the `aggregate` relation folds from 0.
+`sum(...) OVER` windows follow the same rule; making them do so exposed that
+a window `sum` cast every argument to an integer, so float window sums were
+truncated (fixed in the same change).
 
 **W4 — Locy through the levers.** A program-text case type and generator
 (FOLD with composite keys, seeds, recursion, ALONG, parallel edges), an

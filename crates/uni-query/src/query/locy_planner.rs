@@ -236,6 +236,16 @@ fn fold_argument_type(
                         .then(|| undeclared_property_arrow_type(schema, prop))
                 })
                 .or_else(|| uniform_declared_type(schema, prop))
+                // Declared nowhere (a schemaless graph): the value arrives as
+                // the stored Cypher value, which the aggregate reads as is.
+                // Casting it to Float64 turned an integer MAX into `0.0`.
+                .or_else(|| {
+                    (!schema
+                        .properties
+                        .values()
+                        .any(|p| p.contains_key(prop.as_str())))
+                    .then_some(DataType::LargeBinary)
+                })
         }
         arg @ Expr::Literal(_) => Some(infer_expr_type(arg, node_vars)),
         _ => None,

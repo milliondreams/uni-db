@@ -10,8 +10,10 @@
 //! `COLLECT(b.id)` a list of floats, `b.id AS bid` on an unlabelled `b` and
 //! `r.w AS w` returned floats — and above 2^53 the value itself was wrong.
 //! `MIN`/`MAX` (and `MMIN`/`MMAX`) now take their argument's type, `COLLECT`'s
-//! input is not cast, and a property whose every schema declaration agrees
-//! takes that type.
+//! input is not cast, a property whose every schema declaration agrees takes
+//! that type, and a property declared nowhere (a schemaless graph) is left as
+//! the stored value — found by the W5 random-program oracle, where `b` bound
+//! by `a IS reach TO b` still came back as a float.
 //!
 //! Found by the `locy_fold` relation of `metamorphic::dqp::topo` (W4).
 //!
@@ -116,5 +118,38 @@ async fn locy_value_types_recursive_max() -> Result<()> {
     )
     .await?;
     assert_eq!(row, vec![Value::Int(BIG)]);
+    Ok(())
+}
+
+/// A schemaless graph, with the target bound by an `IS ... TO` reference rather
+/// than by `MATCH`.
+#[tokio::test]
+async fn locy_value_types_schemaless() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    let tx = db.session().tx().await?;
+    tx.execute(
+        "CREATE (n0:Node {id: 0}), (n1:Node {id: 1}), \
+         (n0)-[:EDGE {w: 1}]->(n1), (n0)-[:EDGE {w: 4}]->(n0)",
+    )
+    .await?;
+    tx.commit().await?;
+    let row = query_row(
+        &db,
+        "CREATE RULE reach AS MATCH (a:Node)-[:EDGE]->(b:Node) YIELD KEY a, KEY b \
+         CREATE RULE reach AS MATCH (a:Node)-[:EDGE]->(m:Node) WHERE m IS reach TO b \
+         YIELD KEY a, KEY b \
+         CREATE RULE span AS MATCH (a:Node) WHERE a IS reach TO b \
+         FOLD hi = MAX(b.id), lo = MMIN(b.id) YIELD KEY a, hi, lo \
+         QUERY span RETURN hi AS c0, lo AS c1",
+    )
+    .await?;
+    assert_eq!(row, vec![Value::Int(1), Value::Int(0)]);
+    let row = query_row(
+        &db,
+        "CREATE RULE d AS MATCH (a:Node)-[e:EDGE]->(b:Node) FOLD lo = MIN(e.w), hi = MAX(e.w) \
+         YIELD KEY a, lo, hi QUERY d RETURN lo AS c0, hi AS c1",
+    )
+    .await?;
+    assert_eq!(row, vec![Value::Int(1), Value::Int(4)]);
     Ok(())
 }

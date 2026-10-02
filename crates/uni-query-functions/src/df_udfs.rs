@@ -6218,6 +6218,7 @@ impl AggregateUDFImpl for CypherCollectUdaf {
             .and_then(|field| field.metadata().get("uni_raw_bytes"))
             .is_some_and(|v| v == "true");
         Ok(Box::new(CypherCollectAccumulator {
+            seen: std::collections::HashSet::new(),
             values: Vec::new(),
             distinct: acc_args.is_distinct,
             raw_bytes,
@@ -6240,6 +6241,8 @@ impl AggregateUDFImpl for CypherCollectUdaf {
 struct CypherCollectAccumulator {
     values: Vec<Value>,
     distinct: bool,
+    /// [`Self::distinct_key`] of every value kept, when `distinct`.
+    seen: std::collections::HashSet<Vec<u8>>,
     /// Input column is a raw `DataType::Bytes` column (`uni_raw_bytes=true`); its
     /// `LargeBinary` elements are verbatim bytes, not tagged CypherValue payloads.
     raw_bytes: bool,
@@ -6250,39 +6253,66 @@ struct CypherCollectAccumulator {
 impl CypherCollectAccumulator {
     /// Pushes `val` into the accumulator, skipping duplicates when `distinct`.
     fn push_value(&mut self, val: Value) {
-        if self.distinct {
-            let key = Self::distinct_key(&val);
-            if self.values.iter().any(|v| Self::distinct_key(v) == key) {
-                return;
-            }
+        if self.distinct && !self.seen.insert(Self::distinct_key(&val)) {
+            return;
         }
         self.values.push(val);
     }
 
     /// Deduplication key for `collect(DISTINCT ...)`.
     ///
-    /// Entities dedup by identity (`_vid` / `_eid`) so two references to the
-    /// same node/edge collapse to one regardless of property values — matching
-    /// openCypher's identity-based DISTINCT (issue #134 family). Graph entities
-    /// surface here as `Value::Map` (a node/edge struct carrying `_vid`/`_eid`),
-    /// whose `to_string()` is order-nondeterministic (backed by a `HashMap`) and
-    /// so cannot be used as a key. Non-entity values dedup by their string
-    /// representation, as before. The `\0` prefixes keep entity keys from
-    /// colliding with any scalar's string form.
-    fn distinct_key(val: &Value) -> String {
-        // The `\0n` / `\0e` prefixes carry the vertex/edge distinction, so a
-        // vertex and an edge of the same number stay apart. What the map arm
-        // this replaces did *not* handle: an `_id`-spelled entity fell through
-        // to `val.to_string()` over a `HashMap`, whose rendering is
-        // order-nondeterministic, and a `_vid` carrying the serde string
-        // `"Vid(7)"` keyed as `"\0nVid(7)"` — neither matching the native
-        // form's `"\0n7"`, so `collect(DISTINCT n)` emitted the same node
-        // twice (#234).
-        match val.entity_ref() {
-            Some(EntityRef::Vertex(vid)) => format!("\0n{vid}"),
-            Some(EntityRef::Edge(eid)) => format!("\0e{eid}"),
-            None => val.to_string(),
+    /// Entities dedup by identity (`_vid` / `_eid`), so the two encodings of
+    /// one node or edge — a `Value::Node` and an entity map — collapse to one
+    /// regardless of property values (issue #134 family, #234). Every other
+    /// value keys by its structure, with each scalar type-tagged by the codec,
+    /// recursing into lists and maps (keys sorted) so an entity inside one is
+    /// still keyed by identity.
+    ///
+    /// The key used to be the value's display string, which merged values
+    /// that print alike — `1` and `'1'`, `[1]` and `['1']` — and split equal
+    /// maps, whose display follows `HashMap` order.
+    fn distinct_key(val: &Value) -> Vec<u8> {
+        fn write(val: &Value, out: &mut Vec<u8>) {
+            match val.entity_ref() {
+                Some(EntityRef::Vertex(vid)) => {
+                    out.push(b'n');
+                    out.extend_from_slice(&vid.as_u64().to_le_bytes());
+                }
+                Some(EntityRef::Edge(eid)) => {
+                    out.push(b'e');
+                    out.extend_from_slice(&eid.as_u64().to_le_bytes());
+                }
+                None => match val {
+                    Value::List(items) => {
+                        out.push(b'l');
+                        out.extend_from_slice(&(items.len() as u64).to_le_bytes());
+                        for item in items {
+                            write(item, out);
+                        }
+                    }
+                    Value::Map(map) => {
+                        let mut keys: Vec<&String> = map.keys().collect();
+                        keys.sort();
+                        out.push(b'm');
+                        out.extend_from_slice(&(keys.len() as u64).to_le_bytes());
+                        for key in keys {
+                            out.extend_from_slice(&(key.len() as u64).to_le_bytes());
+                            out.extend_from_slice(key.as_bytes());
+                            write(&map[key], out);
+                        }
+                    }
+                    other => {
+                        let bytes = uni_common::cypher_value_codec::encode(other);
+                        out.push(b's');
+                        out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+                        out.extend_from_slice(&bytes);
+                    }
+                },
+            }
         }
+        let mut out = Vec::new();
+        write(val, &mut out);
+        out
     }
 }
 

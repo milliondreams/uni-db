@@ -4582,20 +4582,8 @@ impl ScalarUDFImpl for CvToBoolUdf {
 
         match &args.args[0] {
             ColumnarValue::Scalar(ScalarValue::LargeBinary(Some(bytes))) => {
-                // Fast path: tag-only decode for boolean
-                use uni_common::cypher_value_codec::{TAG_BOOL, TAG_NULL, decode_bool, peek_tag};
-                // `unwrap_or(false)` here turned a truncated boolean payload
-                // into `false`, which silently failed the enclosing WHERE and
-                // made the row vanish. A matched TAG_BOOL that does not decode
-                // is corruption and must be reported.
-                let b = match peek_tag(bytes) {
-                    Some(TAG_BOOL) => decode_bool(bytes)
-                        .map_err(|e| cv_decode_error(&e))?
-                        .unwrap_or(false),
-                    Some(TAG_NULL) => false,
-                    _ => false, // Non-boolean in boolean context
-                };
-                Ok(ColumnarValue::Scalar(ScalarValue::Boolean(Some(b))))
+                let b = cv_bool(bytes)?;
+                Ok(ColumnarValue::Scalar(ScalarValue::Boolean(b)))
             }
             ColumnarValue::Scalar(_) => Ok(ColumnarValue::Scalar(ScalarValue::Boolean(None))),
             ColumnarValue::Array(arr) => {
@@ -4611,24 +4599,12 @@ impl ScalarUDFImpl for CvToBoolUdf {
 
                 let mut builder = arrow_array::builder::BooleanBuilder::with_capacity(lb_arr.len());
 
-                // Fast path: tag-only decode for boolean
-                use uni_common::cypher_value_codec::{TAG_BOOL, TAG_NULL, decode_bool, peek_tag};
-
                 for i in 0..lb_arr.len() {
                     if lb_arr.is_null(i) {
                         builder.append_null();
                     } else {
                         let bytes = lb_arr.value(i);
-                        // See the scalar arm: corruption must not read as
-                        // `false` and drop the row.
-                        let b = match peek_tag(bytes) {
-                            Some(TAG_BOOL) => decode_bool(bytes)
-                                .map_err(|e| cv_decode_error(&e))?
-                                .unwrap_or(false),
-                            Some(TAG_NULL) => false,
-                            _ => false, // Non-boolean in boolean context
-                        };
-                        builder.append_value(b);
+                        builder.append_option(cv_bool(bytes)?);
                     }
                 }
                 Ok(ColumnarValue::Array(Arc::new(builder.finish())))
@@ -5182,6 +5158,27 @@ cypher_scalar_udf! {
     }
 }
 
+/// Reads an encoded value in a boolean context (`WHERE`, `CASE WHEN`).
+///
+/// An encoded NULL is NULL, so `NOT` over it stays NULL. Anything that is not a
+/// boolean is a type error, as in Cypher. Both used to read as `false`: the row
+/// silently failed a `WHERE`, and under `NOT` silently passed it. A boolean tag
+/// whose payload does not decode is corruption and is reported too.
+fn cv_bool(bytes: &[u8]) -> DFResult<Option<bool>> {
+    use uni_common::cypher_value_codec::{TAG_BOOL, TAG_NULL, decode_bool, peek_tag};
+    match peek_tag(bytes) {
+        Some(TAG_BOOL) => decode_bool(bytes).map_err(|e| cv_decode_error(&e)),
+        Some(TAG_NULL) => Ok(None),
+        _ => {
+            let value =
+                uni_common::cypher_value_codec::decode(bytes).map_err(|e| cv_decode_error(&e))?;
+            Err(datafusion::error::DataFusionError::Execution(format!(
+                "TypeError: expected a boolean, got {value:?}"
+            )))
+        }
+    }
+}
+
 // ============================================================================
 // _cypher_list_slice(list, start, end) -> LargeBinary (CypherValue)
 // ============================================================================
@@ -5218,14 +5215,17 @@ cypher_scalar_udf! {
         }
 
         let len = list.len() as i64;
-        let raw_start = match &vals[1] {
-            Value::Int(i) => *i,
-            _ => 0,
+        // A bound that is not an integer is a type error, as in Cypher. It
+        // used to read as 0 (start) or the length (end), returning a slice the
+        // query never asked for.
+        let bound = |v: &Value| match v {
+            Value::Int(i) => Ok(*i),
+            other => Err(datafusion::error::DataFusionError::Execution(format!(
+                "TypeError: a list slice bound must be an integer, got {other:?}"
+            ))),
         };
-        let raw_end = match &vals[2] {
-            Value::Int(i) => *i,
-            _ => len,
-        };
+        let raw_start = bound(&vals[1])?;
+        let raw_end = bound(&vals[2])?;
 
         // Resolve negative indices: if idx < 0 → len + idx (clamp to 0)
         let start = if raw_start < 0 {
@@ -7038,6 +7038,59 @@ mod tests {
             ColumnarValue::Scalar(ScalarValue::Boolean(Some(b))) => assert!(b),
             other => panic!("expected Boolean(Some(true)), got {other:?}"),
         }
+    }
+
+    /// An encoded NULL in a boolean context is NULL, and a non-boolean is a
+    /// type error. Both read as `false`: under `NOT` a NULL row was kept, and a
+    /// non-boolean silently failed its `WHERE`. Scalar and array inputs alike.
+    #[test]
+    fn cv_to_bool_is_three_valued_and_strict() {
+        use uni_common::cypher_value_codec::encode;
+        let udf = CvToBoolUdf::new();
+        let field = |name: &str, t: DataType| Arc::new(arrow::datatypes::Field::new(name, t, true));
+        let call = |arg: ColumnarValue, rows: usize| {
+            udf.invoke_with_args(ScalarFunctionArgs {
+                args: vec![arg],
+                arg_fields: vec![field("v", DataType::LargeBinary)],
+                number_rows: rows,
+                return_field: field("out", DataType::Boolean),
+                config_options: Arc::new(datafusion::config::ConfigOptions::default()),
+            })
+        };
+        let scalar = |v: &Value| {
+            call(
+                ColumnarValue::Scalar(ScalarValue::LargeBinary(Some(encode(v)))),
+                1,
+            )
+        };
+
+        match scalar(&Value::Null).expect("an encoded NULL decodes") {
+            ColumnarValue::Scalar(ScalarValue::Boolean(None)) => {}
+            other => panic!("expected Boolean(None), got {other:?}"),
+        }
+        for v in [Value::Int(1), Value::String("true".into())] {
+            assert!(scalar(&v).is_err(), "{v:?} is not a boolean");
+        }
+
+        let array = |vs: &[Value]| {
+            let bytes: Vec<Vec<u8>> = vs.iter().map(encode).collect();
+            let arr = arrow_array::LargeBinaryArray::from_iter_values(bytes.iter());
+            call(ColumnarValue::Array(Arc::new(arr)), vs.len())
+        };
+        let ColumnarValue::Array(out) =
+            array(&[Value::Bool(true), Value::Null, Value::Bool(false)]).expect("booleans")
+        else {
+            panic!("expected an array");
+        };
+        let out = out
+            .as_any()
+            .downcast_ref::<arrow_array::BooleanArray>()
+            .expect("Boolean array");
+        assert_eq!(
+            out.iter().collect::<Vec<_>>(),
+            vec![Some(true), None, Some(false)]
+        );
+        assert!(array(&[Value::Bool(true), Value::Int(0)]).is_err());
     }
 
     /// `get_value_from_array`'s third decode fallback ended in

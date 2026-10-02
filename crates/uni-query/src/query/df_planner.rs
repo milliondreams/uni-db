@@ -4504,7 +4504,7 @@ impl HybridPhysicalPlanner {
         let session = self.session_ctx.read();
         let state = session.state();
         let compiler = self.expr_compiler(&state, Some(&ctx));
-        let physical_predicate = compiler.compile(predicate, &schema)?;
+        let physical_predicate = compiler.compile_predicate(predicate, &schema)?;
 
         // For OPTIONAL MATCH: use OptionalFilterExec for proper NULL row preservation.
         if !optional_variables.is_empty() {
@@ -4731,7 +4731,7 @@ impl HybridPhysicalPlanner {
             let session = self.session_ctx.read();
             let state = session.state();
             let compiler = self.expr_compiler(&state, Some(&merged_ctx));
-            let physical_residual = compiler.compile(&residual, &join_schema)?;
+            let physical_residual = compiler.compile_predicate(&residual, &join_schema)?;
             return Ok(Some(Arc::new(FilterExec::try_new(
                 physical_residual,
                 join,

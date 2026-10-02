@@ -546,6 +546,25 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
         self
     }
 
+    /// Compiles a Cypher expression used as a predicate (`WHERE`).
+    ///
+    /// A dynamically typed (CypherValue) result is read as a boolean through
+    /// `_cv_to_bool`, as `NOT` and `CASE WHEN` already read one: true keeps the
+    /// row, false and NULL drop it, and anything else is a type error. Without
+    /// it, `WHERE n.b` over a schemaless property failed to plan even when
+    /// every `b` was a boolean.
+    pub fn compile_predicate(
+        &self,
+        expr: &Expr,
+        input_schema: &Schema,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        let compiled = self.compile(expr, input_schema)?;
+        if matches!(compiled.data_type(input_schema), Ok(DataType::LargeBinary)) {
+            return self.wrap_with_cv_to_bool(compiled);
+        }
+        Ok(compiled)
+    }
+
     /// Compile a Cypher expression into a DataFusion PhysicalExpr.
     pub fn compile(&self, expr: &Expr, input_schema: &Schema) -> Result<Arc<dyn PhysicalExpr>> {
         match expr {
@@ -915,10 +934,12 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
         var_name: &str,
         field_name: &str,
         input_schema: &Schema,
-    ) -> Option<Arc<dyn PhysicalExpr>> {
-        let col_idx = input_schema.index_of(var_name).ok()?;
+    ) -> Result<Option<Arc<dyn PhysicalExpr>>> {
+        let Ok(col_idx) = input_schema.index_of(var_name) else {
+            return Ok(None);
+        };
         let DataType::Struct(struct_fields) = input_schema.field(col_idx).data_type() else {
-            return None;
+            return Ok(None);
         };
         let col_expr: Arc<dyn PhysicalExpr> = Arc::new(
             datafusion::physical_expr::expressions::Column::new(var_name, col_idx),
@@ -926,41 +947,48 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
 
         if let Some(field_idx) = struct_fields.iter().position(|f| f.name() == field_name) {
             let output_type = struct_fields[field_idx].data_type().clone();
-            return Some(Arc::new(StructFieldAccessExpr::new(
+            return Ok(Some(Arc::new(StructFieldAccessExpr::new(
                 col_expr,
                 field_idx,
                 output_type,
-            )));
+            ))));
         }
 
-        if let Some(expr) = self.try_compile_struct_property(&col_expr, struct_fields, field_name) {
-            return Some(expr);
+        if let Some(expr) =
+            self.try_compile_struct_property(&col_expr, struct_fields, field_name)?
+        {
+            return Ok(Some(expr));
         }
 
         // Cypher semantics: accessing a missing key returns null. Type it as
         // LargeBinary (an encoded CypherValue null) rather than `ScalarValue::Null`
         // so the value composes with the CypherValue list/comparison machinery —
         // an untyped null cannot be encoded into a result list.
-        Some(Arc::new(
+        Ok(Some(Arc::new(
             datafusion::physical_expr::expressions::Literal::new(
                 datafusion::common::ScalarValue::LargeBinary(None),
             ),
-        ))
+        )))
     }
 
     /// Look a name up inside an entity struct's `properties` CypherValue blob.
     ///
     /// Returns `None` when the struct has no such blob (an ordinary struct, where
-    /// a missing field really is a missing key).
+    /// a missing field really is a missing key). Failing to plan the lookup is
+    /// an error: it used to read as "no blob", so the property compiled to a
+    /// NULL literal.
     fn try_compile_struct_property(
         &self,
         col_expr: &Arc<dyn PhysicalExpr>,
         struct_fields: &arrow_schema::Fields,
         field_name: &str,
-    ) -> Option<Arc<dyn PhysicalExpr>> {
-        let props_idx = struct_fields
+    ) -> Result<Option<Arc<dyn PhysicalExpr>>> {
+        let Some(props_idx) = struct_fields
             .iter()
-            .position(|f| f.name() == "properties" && *f.data_type() == DataType::LargeBinary)?;
+            .position(|f| f.name() == "properties" && *f.data_type() == DataType::LargeBinary)
+        else {
+            return Ok(None);
+        };
 
         let props_expr: Arc<dyn PhysicalExpr> = Arc::new(StructFieldAccessExpr::new(
             col_expr.clone(),
@@ -978,9 +1006,9 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
             key_expr,
             DataType::LargeBinary,
             DataType::Utf8,
-        )
-        .ok()
-        .flatten()
+        )?
+        .map(Some)
+        .ok_or_else(|| anyhow!("UDF `index` is not registered"))
     }
 
     /// Compile property access on a struct column (e.g. `x.a` where `x` is Struct).
@@ -992,7 +1020,7 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
     ) -> Result<Arc<dyn PhysicalExpr>> {
         if let Expr::Variable(var_name) = base {
             // 1. Try struct field access (e.g. `x.a` where `x` is a Struct column)
-            if let Some(expr) = self.try_compile_struct_field(var_name, prop, input_schema) {
+            if let Some(expr) = self.try_compile_struct_field(var_name, prop, input_schema)? {
                 return Ok(expr);
             }
             // 2. Try flat column "{var}.{prop}" (for pattern comprehension inner schemas)
@@ -1133,7 +1161,7 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
     ) -> Result<Arc<dyn PhysicalExpr>> {
         if let Expr::Variable(var_name) = array
             && let Expr::Literal(CypherLiteral::String(prop)) = index
-            && let Some(expr) = self.try_compile_struct_field(var_name, prop, input_schema)
+            && let Some(expr) = self.try_compile_struct_field(var_name, prop, input_schema)?
         {
             return Ok(expr);
         }
@@ -2476,6 +2504,24 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
 
         let has_cv =
             is_cypher_value_type(left_type.as_ref()) || is_cypher_value_type(right_type.as_ref());
+
+        // A dynamically typed operand of AND/OR is read as a boolean, as under
+        // NOT; DataFusion's logical operators take only booleans, so
+        // `n.b AND true` over a schemaless property failed to plan.
+        if matches!(df_op, Operator::And | Operator::Or) && has_cv {
+            let left = if is_cypher_value_type(left_type.as_ref()) {
+                self.wrap_with_cv_to_bool(left)?
+            } else {
+                left
+            };
+            let right = if is_cypher_value_type(right_type.as_ref()) {
+                self.wrap_with_cv_to_bool(right)?
+            } else {
+                right
+            };
+            return binary(left, df_op, right, input_schema)
+                .map_err(|e| anyhow!("Failed to create binary expression: {}", e));
+        }
 
         if has_cv {
             if let Some(result) = self.compile_cv_comparison(

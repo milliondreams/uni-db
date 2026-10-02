@@ -130,6 +130,7 @@ pub mod repro_issue_181_flush_resurrects_detached_edge;
 pub mod repro_issue_182_delete_before_first_flush;
 // #249: declaring a property on a label that already has flushed data leaves
 // the Lance dataset unchanged, so the next write to that label is rejected.
+pub mod boolean_context_is_strict;
 pub mod bug_cypher_value_arg_decode;
 pub mod delete_sees_tx_local_edges;
 pub mod duplicate_property_projection;

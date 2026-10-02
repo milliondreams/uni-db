@@ -330,7 +330,42 @@ fn eval_unary_op(op: &UnaryOp, v: &Value) -> Result<Value, LocyError> {
     }
 }
 
+/// Cypher's three-valued `AND` / `OR` / `XOR`: NULL is "unknown", so
+/// `false AND NULL` is false and `true OR NULL` is true — not NULL.
+fn kleene(left: &Value, right: &Value, op: KleeneOp) -> Value {
+    let (l, r) = (left.as_bool(), right.as_bool());
+    match op {
+        KleeneOp::And => match (l, r) {
+            (Some(false), _) | (_, Some(false)) => Value::Bool(false),
+            (Some(true), Some(true)) => Value::Bool(true),
+            _ => Value::Null,
+        },
+        KleeneOp::Or => match (l, r) {
+            (Some(true), _) | (_, Some(true)) => Value::Bool(true),
+            (Some(false), Some(false)) => Value::Bool(false),
+            _ => Value::Null,
+        },
+        KleeneOp::Xor => match (l, r) {
+            (Some(a), Some(b)) => Value::Bool(a ^ b),
+            _ => Value::Null,
+        },
+    }
+}
+
+#[derive(Clone, Copy)]
+enum KleeneOp {
+    And,
+    Or,
+    Xor,
+}
+
 fn eval_locy_binary_op(left: &Value, op: &LocyBinaryOp, right: &Value) -> Result<Value, LocyError> {
+    match op {
+        LocyBinaryOp::And => return Ok(kleene(left, right, KleeneOp::And)),
+        LocyBinaryOp::Or => return Ok(kleene(left, right, KleeneOp::Or)),
+        LocyBinaryOp::Xor => return Ok(kleene(left, right, KleeneOp::Xor)),
+        _ => {}
+    }
     if left.is_null() || right.is_null() {
         return Ok(Value::Null);
     }
@@ -366,28 +401,25 @@ fn eval_locy_binary_op(left: &Value, op: &LocyBinaryOp, right: &Value) -> Result
             })?;
             Ok(Value::Float(l.powf(r)))
         }
-        LocyBinaryOp::And => match (left.as_bool(), right.as_bool()) {
-            (Some(a), Some(b)) => Ok(Value::Bool(a && b)),
-            _ => Ok(Value::Null),
-        },
-        LocyBinaryOp::Or => match (left.as_bool(), right.as_bool()) {
-            (Some(a), Some(b)) => Ok(Value::Bool(a || b)),
-            _ => Ok(Value::Null),
-        },
-        LocyBinaryOp::Xor => match (left.as_bool(), right.as_bool()) {
-            (Some(a), Some(b)) => Ok(Value::Bool(a ^ b)),
-            _ => Ok(Value::Null),
-        },
+        LocyBinaryOp::And | LocyBinaryOp::Or | LocyBinaryOp::Xor => {
+            unreachable!("handled above")
+        }
     }
 }
 
 fn eval_binary_op(left: &Value, op: &BinaryOp, right: &Value) -> Result<Value, LocyError> {
+    match op {
+        BinaryOp::And => return Ok(kleene(left, right, KleeneOp::And)),
+        BinaryOp::Or => return Ok(kleene(left, right, KleeneOp::Or)),
+        BinaryOp::Xor => return Ok(kleene(left, right, KleeneOp::Xor)),
+        _ => {}
+    }
+    // Any comparison with NULL is NULL ("unknown"), as in Cypher and in a
+    // rule body's WHERE. `NULL = x` used to be false and `NULL <> x` true, so a
+    // `QUERY ... WHERE a.age <> 0` or `NOT (a.age = 30)` kept every row whose
+    // `age` is NULL.
     if left.is_null() || right.is_null() {
-        return match op {
-            BinaryOp::Eq => Ok(Value::Bool(left.is_null() && right.is_null())),
-            BinaryOp::NotEq => Ok(Value::Bool(!(left.is_null() && right.is_null()))),
-            _ => Ok(Value::Null),
-        };
+        return Ok(Value::Null);
     }
     match op {
         BinaryOp::Add => numeric_op(left, right, |a, b| a + b, |a, b| a + b),
@@ -426,18 +458,6 @@ fn eval_binary_op(left: &Value, op: &BinaryOp, right: &Value) -> Result<Value, L
         BinaryOp::GtEq => Ok(Value::Bool(
             value_less_than(right, left) || values_equal(left, right),
         )),
-        BinaryOp::And => match (left.as_bool(), right.as_bool()) {
-            (Some(a), Some(b)) => Ok(Value::Bool(a && b)),
-            _ => Ok(Value::Null),
-        },
-        BinaryOp::Or => match (left.as_bool(), right.as_bool()) {
-            (Some(a), Some(b)) => Ok(Value::Bool(a || b)),
-            _ => Ok(Value::Null),
-        },
-        BinaryOp::Xor => match (left.as_bool(), right.as_bool()) {
-            (Some(a), Some(b)) => Ok(Value::Bool(a ^ b)),
-            _ => Ok(Value::Null),
-        },
         BinaryOp::Contains => match (left.as_str(), right.as_str()) {
             (Some(l), Some(r)) => Ok(Value::Bool(l.contains(r))),
             _ => Ok(Value::Null),

@@ -494,6 +494,32 @@ pub(crate) fn dedup_fact_rows(facts: Vec<RecordBatch>) -> DFResult<Vec<RecordBat
     Ok(out)
 }
 
+/// Debug-build invariant: a rule's stored facts hold no row twice. Not checked
+/// for an ALONG rule, whose facts are per path.
+///
+/// Both evaluation paths are meant to guarantee it — the fixpoint through its
+/// delta computation, a non-recursive rule through [`dedup_fact_rows`] — and the
+/// non-recursive path once silently did not. A regression of either now fails
+/// every test that derives a duplicate, naming the rule, instead of returning
+/// an extra row. Release builds skip the check.
+pub(crate) fn debug_assert_facts_are_rows(rule: &str, facts: &[RecordBatch]) {
+    if cfg!(debug_assertions) {
+        let total: usize = facts.iter().map(RecordBatch::num_rows).sum();
+        let distinct: usize = dedup_fact_rows(facts.to_vec())
+            .unwrap_or_else(|e| panic!("Locy rule `{rule}`: cannot check its facts: {e}"))
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(
+            total,
+            distinct,
+            "Locy rule `{rule}`: {} of its {total} facts are duplicate rows; \
+             a derived fact is a row (whole-row deduplication)",
+            total - distinct
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // FixpointState — per-rule delta tracking during fixpoint iteration
 // ---------------------------------------------------------------------------

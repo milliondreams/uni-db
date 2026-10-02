@@ -38,6 +38,28 @@ pub fn eval_locy_expr(
     }
 }
 
+/// Evaluates a Locy filter condition (`WHERE` of `QUERY`, `DERIVE`, `ABDUCE`,
+/// `EXPLAIN RULE`, or a rule body's target-dependent condition).
+///
+/// True keeps the row; false and NULL ("unknown") drop it, as in Cypher. An
+/// evaluation error, or a value that is not a boolean, is an error. Every
+/// caller used to map both to "drop the row", so a malformed or unsupported
+/// condition silently returned fewer rows — for `DERIVE`, wrote fewer facts,
+/// and for `ABDUCE`, reported a conclusion as no longer holding.
+///
+/// # Errors
+///
+/// [`LocyError`] when the condition fails to evaluate or is not boolean.
+pub fn eval_condition(expr: &Expr, bindings: &FactRow, context: &str) -> Result<bool, LocyError> {
+    match eval_expr(expr, bindings)? {
+        Value::Bool(b) => Ok(b),
+        Value::Null => Ok(false),
+        other => Err(LocyError::TypeError {
+            message: format!("{context} must be a boolean, got {other:?}"),
+        }),
+    }
+}
+
 /// Evaluate a Cypher expression given variable bindings.
 pub fn eval_expr(expr: &Expr, bindings: &FactRow) -> Result<Value, LocyError> {
     match expr {
@@ -444,20 +466,20 @@ fn eval_binary_op(left: &Value, op: &BinaryOp, right: &Value) -> Result<Value, L
             numeric_op(left, right, |a, b| a % b, |a, b| a % b)
         }
         BinaryOp::Pow => {
-            let l = left.as_f64().unwrap_or(0.0);
-            let r = right.as_f64().unwrap_or(0.0);
+            let l = left.as_f64().ok_or_else(|| LocyError::TypeError {
+                message: format!("pow requires numeric, got {left:?}"),
+            })?;
+            let r = right.as_f64().ok_or_else(|| LocyError::TypeError {
+                message: format!("pow requires numeric, got {right:?}"),
+            })?;
             Ok(Value::Float(l.powf(r)))
         }
         BinaryOp::Eq => Ok(Value::Bool(values_equal(left, right))),
         BinaryOp::NotEq => Ok(Value::Bool(!values_equal(left, right))),
-        BinaryOp::Lt => Ok(Value::Bool(value_less_than(left, right))),
-        BinaryOp::LtEq => Ok(Value::Bool(
-            value_less_than(left, right) || values_equal(left, right),
-        )),
-        BinaryOp::Gt => Ok(Value::Bool(value_less_than(right, left))),
-        BinaryOp::GtEq => Ok(Value::Bool(
-            value_less_than(right, left) || values_equal(left, right),
-        )),
+        BinaryOp::Lt => Ok(compare(left, right, std::cmp::Ordering::is_lt)),
+        BinaryOp::LtEq => Ok(compare(left, right, std::cmp::Ordering::is_le)),
+        BinaryOp::Gt => Ok(compare(left, right, std::cmp::Ordering::is_gt)),
+        BinaryOp::GtEq => Ok(compare(left, right, std::cmp::Ordering::is_ge)),
         BinaryOp::Contains => match (left.as_str(), right.as_str()) {
             (Some(l), Some(r)) => Ok(Value::Bool(l.contains(r))),
             _ => Ok(Value::Null),
@@ -765,6 +787,58 @@ pub fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
         std::cmp::Ordering::Greater
     } else {
         std::cmp::Ordering::Equal
+    }
+}
+
+/// A three-valued ordering comparison (`<`, `<=`, `>`, `>=`), as in Cypher.
+///
+/// Values of types that have no order between them (`1 < 'a'`, a date and a
+/// datetime, two maps) compare as NULL. They used to compare as false, so
+/// `NOT (x < y)` kept every incomparable row. NaN is ordered against nothing
+/// and compares as false, as in Cypher.
+fn compare(left: &Value, right: &Value, holds: fn(std::cmp::Ordering) -> bool) -> Value {
+    match ordering(left, right) {
+        Comparable::Ordered(o) => Value::Bool(holds(o)),
+        Comparable::Unordered => Value::Bool(false),
+        Comparable::Incomparable => Value::Null,
+    }
+}
+
+enum Comparable {
+    Ordered(std::cmp::Ordering),
+    /// Same type, but no order (NaN).
+    Unordered,
+    /// No order between the types, or a NULL inside a list.
+    Incomparable,
+}
+
+fn ordering(a: &Value, b: &Value) -> Comparable {
+    use Comparable::*;
+    let float = |o: Option<std::cmp::Ordering>| o.map_or(Unordered, Ordered);
+    match (a, b) {
+        (Value::Null, _) | (_, Value::Null) => Incomparable,
+        (Value::Int(x), Value::Int(y)) => Ordered(x.cmp(y)),
+        (Value::Float(x), Value::Float(y)) => float(x.partial_cmp(y)),
+        (Value::Int(x), Value::Float(y)) => float((*x as f64).partial_cmp(y)),
+        (Value::Float(x), Value::Int(y)) => float(x.partial_cmp(&(*y as f64))),
+        (Value::String(x), Value::String(y)) => Ordered(x.cmp(y)),
+        (Value::Bool(x), Value::Bool(y)) => Ordered(x.cmp(y)),
+        (Value::Temporal(x), Value::Temporal(y))
+            if std::mem::discriminant(x) == std::mem::discriminant(y) =>
+        {
+            Ordered(temporal_less_than(x, y))
+        }
+        // Lexicographic; a shorter prefix sorts first.
+        (Value::List(x), Value::List(y)) => {
+            for (l, r) in x.iter().zip(y) {
+                match ordering(l, r) {
+                    Ordered(std::cmp::Ordering::Equal) => {}
+                    other => return other,
+                }
+            }
+            Ordered(x.len().cmp(&y.len()))
+        }
+        _ => Incomparable,
     }
 }
 

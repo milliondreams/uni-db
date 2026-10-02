@@ -1003,6 +1003,9 @@ async fn run_program(
                         };
                     }
                 }
+                if !facts_are_per_path(rule) {
+                    super::locy_fixpoint::debug_assert_facts_are_rows(&rule.name, &facts);
+                }
                 derived_store.insert(rule.name.clone(), facts);
             }
         } else {
@@ -1201,8 +1204,17 @@ async fn run_program(
 
                 // A fact is a row: two derivations of the same row are one fact,
                 // as the fixpoint's delta computation makes them in a recursive
-                // stratum.
-                let facts = super::locy_fixpoint::dedup_fact_rows(facts)?;
+                // stratum. Except under ALONG, whose facts are per path (#159):
+                // the recursive path keeps one row per path through its hidden
+                // derivation columns, so deduplicating here collapsed two
+                // parallel edges carrying the same value into one row, and a
+                // downstream SUM under-counted — the same rule gave a different
+                // answer once a recursive clause was added.
+                let facts = if facts_are_per_path(rule) {
+                    facts
+                } else {
+                    super::locy_fixpoint::dedup_fact_rows(facts)?
+                };
 
                 // Profiling: record this rule's single non-recursive pass.
                 if let Some(ref c) = collector {
@@ -1219,6 +1231,9 @@ async fn run_program(
 
                 // Write facts into registry handles for later strata
                 write_facts_to_registry(&registry, &rule.name, &facts);
+                if !facts_are_per_path(rule) {
+                    super::locy_fixpoint::debug_assert_facts_are_rows(&rule.name, &facts);
+                }
                 derived_store.insert(rule.name.clone(), facts);
             }
         }
@@ -2007,6 +2022,13 @@ pub fn stats_schema() -> SchemaRef {
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
+
+/// Whether a rule's facts are one row per derivation path rather than a set:
+/// a rule with ALONG (#159). Equal-valued rows from distinct paths are distinct
+/// facts there, so neither deduplication nor the row invariant applies.
+fn facts_are_per_path(rule: &crate::query::planner_locy_types::LocyRulePlan) -> bool {
+    rule.clauses.iter().any(|c| !c.along_bindings.is_empty())
+}
 
 #[cfg(test)]
 mod tests {

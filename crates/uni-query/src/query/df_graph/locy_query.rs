@@ -21,7 +21,7 @@ use uni_locy::{CompiledProgram, FactRow, LocyConfig, LocyError, LocyStats};
 
 use super::locy_delta::RowStore;
 
-use super::locy_eval::{eval_expr, value_cmp};
+use super::locy_eval::{eval_condition, eval_expr, value_cmp};
 use super::locy_slg::{SLGResolver, extract_goal_bindings};
 use super::locy_traits::DerivedFactSource;
 
@@ -103,7 +103,7 @@ pub async fn evaluate_query(
             .map(str::to_string);
     if let Some(relation) = store_key.and_then(|k| derived_store.get(&k)) {
         let rows = relation.rows.clone();
-        let filtered = filter_where(rows, query.where_expr.as_ref(), &config.params);
+        let filtered = filter_where(rows, query.where_expr.as_ref(), &config.params)?;
         return apply_return_clause(filtered, &query.return_clause, &config.params);
     }
 
@@ -131,7 +131,7 @@ pub async fn evaluate_query(
     stats.mutations_executed += resolver.stats.mutations_executed;
 
     // Apply WHERE filter (SLG may return superset if goal bindings are partial).
-    let filtered = filter_where(results, query.where_expr.as_ref(), &config.params);
+    let filtered = filter_where(results, query.where_expr.as_ref(), &config.params)?;
 
     // Apply RETURN clause if present
     apply_return_clause(filtered, &query.return_clause, &config.params)
@@ -150,14 +150,24 @@ pub(super) fn apply_return_clause(
 
     // Project columns. Params are merged into each row so $name references
     // in RETURN expressions (e.g. RETURN $agent_id AS id) resolve correctly.
-    let mut projected: Vec<FactRow> = rows
+    //
+    // Sort keys are computed here too, from the row *before* projection with
+    // the returned aliases laid over it, so `ORDER BY` can name a returned alias
+    // or any expression over the rule's columns. Evaluated after projection, a
+    // key that was not a returned column (`RETURN a.name AS n ORDER BY a.age`)
+    // read a column that was gone; the error became NULL and every key tied, so
+    // the clause silently did nothing.
+    let mut entries: Vec<(FactRow, Vec<Value>)> = rows
         .into_iter()
         .map(|row| {
             let merged = merge_params(&row, params);
             let mut new_row = FactRow::new();
             for item in &rc.items {
                 match item {
-                    ReturnItem::All => return Ok(row.clone()),
+                    ReturnItem::All => {
+                        new_row = row.clone();
+                        break;
+                    }
                     ReturnItem::Expr { expr, alias, .. } => {
                         let value = eval_expr(expr, &merged)?;
                         let name = alias.clone().unwrap_or_else(|| return_item_name(expr));
@@ -165,7 +175,18 @@ pub(super) fn apply_return_clause(
                     }
                 }
             }
-            Ok(new_row)
+            let keys = match &rc.order_by {
+                Some(sort_items) => {
+                    let mut scope = merged;
+                    scope.extend(new_row.iter().map(|(k, v)| (k.clone(), v.clone())));
+                    sort_items
+                        .iter()
+                        .map(|item| eval_expr(&item.expr, &scope))
+                        .collect::<Result<Vec<_>, LocyError>>()?
+                }
+                None => Vec::new(),
+            };
+            Ok((new_row, keys))
         })
         .collect::<Result<Vec<_>, LocyError>>()?;
 
@@ -177,7 +198,7 @@ pub(super) fn apply_return_clause(
         // DISTINCT. `Value` has a canonical `Hash`/`Eq`, so this dedups by
         // content deterministically.
         let mut seen = std::collections::HashSet::new();
-        projected.retain(|row| {
+        entries.retain(|(row, _)| {
             let key: std::collections::BTreeMap<String, uni_common::Value> =
                 row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             seen.insert(key)
@@ -186,14 +207,12 @@ pub(super) fn apply_return_clause(
 
     // Order by
     if let Some(sort_items) = &rc.order_by {
-        projected.sort_by(|a, b| {
-            for item in sort_items {
-                let va = eval_expr(&item.expr, a).unwrap_or(uni_common::Value::Null);
-                let vb = eval_expr(&item.expr, b).unwrap_or(uni_common::Value::Null);
+        entries.sort_by(|(_, ka), (_, kb)| {
+            for (item, (va, vb)) in sort_items.iter().zip(ka.iter().zip(kb)) {
                 let cmp = if item.ascending {
-                    value_cmp(&va, &vb)
+                    value_cmp(va, vb)
                 } else {
-                    value_cmp(&vb, &va)
+                    value_cmp(vb, va)
                 };
                 if cmp != std::cmp::Ordering::Equal {
                     return cmp;
@@ -202,6 +221,7 @@ pub(super) fn apply_return_clause(
             std::cmp::Ordering::Equal
         });
     }
+    let mut projected: Vec<FactRow> = entries.into_iter().map(|(row, _)| row).collect();
 
     // Skip
     if let Some(Expr::Literal(CypherLiteral::Integer(n))) = &rc.skip {
@@ -237,22 +257,31 @@ pub(super) fn merge_params(row: &FactRow, params: &HashMap<String, Value>) -> Fa
 /// when the predicate evaluates to a truthy value; an evaluation error or a
 /// non-boolean result drops the row. Used uniformly by both the FOLD-rule and
 /// non-FOLD result paths so the filter is never bypassed.
+/// Keeps the rows `where_expr` is true for.
+///
+/// False and NULL ("unknown") drop a row, as in Cypher. An evaluation error, or
+/// a condition that is not a boolean, is an error: it used to drop the row
+/// too, so a malformed or unsupported filter silently returned fewer rows.
+///
+/// # Errors
+///
+/// [`LocyError`] when the condition fails to evaluate or is not boolean.
 pub(super) fn filter_where(
     rows: Vec<FactRow>,
     where_expr: Option<&Expr>,
     params: &HashMap<String, Value>,
-) -> Vec<FactRow> {
+) -> Result<Vec<FactRow>, LocyError> {
     let Some(expr) = where_expr else {
-        return rows;
+        return Ok(rows);
     };
-    rows.into_iter()
-        .filter(|row| {
-            let merged = merge_params(row, params);
-            eval_expr(expr, &merged)
-                .map(|v| v.as_bool().unwrap_or(false))
-                .unwrap_or(false)
-        })
-        .collect()
+    let mut kept = Vec::with_capacity(rows.len());
+    for row in rows {
+        let merged = merge_params(&row, params);
+        if eval_condition(expr, &merged, "QUERY WHERE")? {
+            kept.push(row);
+        }
+    }
+    Ok(kept)
 }
 
 /// Derive a column name from a RETURN expression when no alias is given.

@@ -192,6 +192,64 @@ fn property_arrow_type(
     Some(meta.r#type.to_arrow())
 }
 
+/// The type the schema declares for `prop`, when every label and edge type
+/// that declares it agrees.
+///
+/// For a property of a variable whose label or edge type the clause does not
+/// know (an unlabelled node, any relationship), this is the type its column
+/// carries. A disagreement, or no declaration, gives `None` and the caller's
+/// historical guess.
+fn uniform_declared_type(schema: &Schema, prop: &str) -> Option<DataType> {
+    let mut types = schema
+        .properties
+        .values()
+        .filter_map(|props| props.get(prop))
+        .map(|meta| meta.r#type.to_arrow());
+    let first = types.next()?;
+    types.all(|t| t == first).then_some(first)
+}
+
+/// The type of a FOLD aggregate's argument, when it can be told.
+///
+/// `MIN`/`MAX` (and their monotone forms) return their input's type, and
+/// `COLLECT` keeps its elements', so the planner must not cast their input to
+/// the Float64 every other numeric fold uses: an integer property came back as
+/// a float, losing precision above 2^53.
+fn fold_argument_type(
+    aggregate: &Expr,
+    schema: &Schema,
+    var_labels: &HashMap<String, String>,
+    node_vars: &HashSet<String>,
+) -> Option<DataType> {
+    let Expr::FunctionCall { args, .. } = aggregate else {
+        return None;
+    };
+    match args.first()? {
+        Expr::Property(object, prop) => {
+            let Expr::Variable(var) = object.as_ref() else {
+                return None;
+            };
+            property_arrow_type(schema, var_labels, var, prop)
+                .or_else(|| {
+                    var_labels
+                        .contains_key(var)
+                        .then(|| undeclared_property_arrow_type(schema, prop))
+                })
+                .or_else(|| uniform_declared_type(schema, prop))
+        }
+        arg @ Expr::Literal(_) => Some(infer_expr_type(arg, node_vars)),
+        _ => None,
+    }
+}
+
+/// The aggregate name of a FOLD binding's expression, upper-cased.
+fn fold_function_name(aggregate: &Expr) -> Option<String> {
+    match aggregate {
+        Expr::FunctionCall { name, .. } => Some(name.to_uppercase()),
+        _ => None,
+    }
+}
+
 /// The Arrow type the *scan* will emit for a property of a label that is not
 /// declared in the schema.
 ///
@@ -280,6 +338,13 @@ fn infer_yield_type_rec(
         {
             match fn_name.to_uppercase().as_str() {
                 "COUNT" | "MCOUNT" => return DataType::Int64,
+                "MIN" | "MAX" | "MMIN" | "MMAX" => {
+                    if let Some(dt) =
+                        fold_argument_type(&fold.aggregate, schema, var_labels, node_vars)
+                    {
+                        return dt;
+                    }
+                }
                 _ => {}
             }
         }
@@ -362,6 +427,15 @@ fn infer_yield_type_rec(
                     // as a real Float64, so there the coercion is exactly right.
                     if var_labels.contains_key(var) && !item.is_prob {
                         return undeclared_property_arrow_type(schema, prop);
+                    }
+                    // An unlabelled node or a relationship: the schema's type,
+                    // when every declaration of the property agrees. The
+                    // `Property → Float64` guess below turned `b.id AS bid` into
+                    // `1.0`.
+                    if !item.is_prob
+                        && let Some(dt) = uniform_declared_type(schema, prop)
+                    {
+                        return dt;
                     }
                 }
                 let _ = is_key;
@@ -2011,17 +2085,24 @@ impl<'a> LocyPlanBuilder<'a> {
                 expr
             };
             projections.push((expr, Some(fb.name.clone())));
-            target_types.push(infer_yield_type(
-                &fb.name,
-                clause,
-                node_vars,
-                &fold_output_names,
-                &along_names_set,
-                rule_catalog,
-                false, // a FOLD input is never a KEY column
-                graph_schema,
-                &var_labels,
-            ));
+            // `COLLECT` keeps its elements' type: its input is not cast (its
+            // output is a list, typed separately).
+            let collect_input = (fold_function_name(&fb.aggregate).as_deref() == Some("COLLECT"))
+                .then(|| fold_argument_type(&fb.aggregate, graph_schema, &var_labels, node_vars))
+                .flatten();
+            target_types.push(collect_input.unwrap_or_else(|| {
+                infer_yield_type(
+                    &fb.name,
+                    clause,
+                    node_vars,
+                    &fold_output_names,
+                    &along_names_set,
+                    rule_catalog,
+                    false, // a FOLD input is never a KEY column
+                    graph_schema,
+                    &var_labels,
+                )
+            }));
         }
 
         // Add __priority literal column if present

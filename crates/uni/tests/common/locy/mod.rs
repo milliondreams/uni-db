@@ -77,3 +77,4 @@ pub mod locy_is_not_scalar_to_target;
 // W4: a fact is a row; QUERY WHERE is three-valued; a sum of nothing is 0.
 pub mod locy_facts_and_filters;
 // W4: MIN/MAX/COLLECT and yielded properties keep their value types.
+pub mod locy_value_types;

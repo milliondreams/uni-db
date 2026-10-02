@@ -1199,6 +1199,11 @@ async fn run_program(
                 )
                 .await?;
 
+                // A fact is a row: two derivations of the same row are one fact,
+                // as the fixpoint's delta computation makes them in a recursive
+                // stratum.
+                let facts = super::locy_fixpoint::dedup_fact_rows(facts)?;
+
                 // Profiling: record this rule's single non-recursive pass.
                 if let Some(ref c) = collector {
                     let fact_count: usize = facts.iter().map(|b| b.num_rows()).sum();

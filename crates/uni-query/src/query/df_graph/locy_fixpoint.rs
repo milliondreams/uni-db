@@ -465,6 +465,35 @@ impl RowDedupState {
     }
 }
 
+/// `facts` with each row kept once, by the same rule the fixpoint uses to
+/// suppress re-derivations: every column, compared through
+/// [`float_key_view`].
+///
+/// A derived fact is a row, not a derivation (whole-row deduplication, Locy
+/// reference §6.2). The fixpoint gets this from its delta computation; a
+/// non-recursive rule, evaluated in one pass, has none, so three parallel edges
+/// derived `(a, b)` three times.
+pub(crate) fn dedup_fact_rows(facts: Vec<RecordBatch>) -> DFResult<Vec<RecordBatch>> {
+    let Some(schema) = facts.first().map(RecordBatch::schema) else {
+        return Ok(facts);
+    };
+    if let Some(mut seen) = RowDedupState::try_new(&schema) {
+        return seen.compute_delta(&facts, &schema);
+    }
+    let all_columns: Vec<usize> = (0..schema.fields().len()).collect();
+    let mut seen: HashSet<Vec<ScalarKey>> = HashSet::new();
+    let keys = float_key_view(&facts);
+    let mut out = Vec::with_capacity(facts.len());
+    for (batch, key_batch) in facts.iter().zip(&keys) {
+        let keep: Vec<bool> = (0..batch.num_rows())
+            .map(|row| seen.insert(extract_scalar_key(key_batch, &all_columns, row)))
+            .collect();
+        let mask = arrow_array::BooleanArray::from(keep);
+        out.push(arrow::compute::filter_record_batch(batch, &mask).map_err(arrow_err)?);
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // FixpointState — per-rule delta tracking during fixpoint iteration
 // ---------------------------------------------------------------------------

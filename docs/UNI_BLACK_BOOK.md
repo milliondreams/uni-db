@@ -7325,6 +7325,10 @@ Locy↔Cypher relations of `metamorphic::dqp::topo`):
   `dedup_fact_rows` (the fixpoint's own `RowDedupState` / scalar-key dedup)
   after its post-fixpoint chain. Only the recursive path deduplicated, so
   parallel edges derived one fact per edge (`locy::locy_facts_and_filters`).
+  A rule with ALONG is the exception (`facts_are_per_path`): its facts are
+  one row per path (#159), as the recursive path keeps them through its
+  hidden derivation columns, so equal-valued paths stay distinct. Deduplicating
+  it collapsed two parallel equal-valued edges and halved a downstream SUM.
 - `QUERY ... WHERE` (the in-memory `locy_eval`) uses three-valued logic: a
   comparison with NULL is NULL and `AND`/`OR` are Kleene. `NULL <> x` was
   true, so a filter kept rows a rule-body WHERE rejects.
@@ -7339,6 +7343,31 @@ Locy↔Cypher relations of `metamorphic::dqp::topo`):
 - A Locy rule body is planned by `plan_pattern_scoped`, which now names
   anonymous variable-length relationships as `plan_match_clause` does, so
   relationship uniqueness holds there too.
+
+**A condition that cannot be evaluated is an error, not a dropped row** (W6).
+Every Locy filter goes through `locy_eval::eval_condition`: true keeps the
+row, false and NULL drop it, and an evaluation error or a non-boolean is a
+`LocyError`. That covers `QUERY`, `DERIVE`, `ABDUCE` and `EXPLAIN RULE`
+`WHERE`, and a rule body's target-dependent conditions on the SLG path; each
+had mapped both to "drop the row", so `DERIVE` wrote fewer facts and `ABDUCE`
+reported a conclusion that no longer held. In the same evaluator, `<`, `<=`,
+`>`, `>=` between types with no order (`1 < 'x'`) are NULL, not false
+(`compare`/`ordering`); `^` of a non-number is a type error, not `0.0`;
+`QUERY ... ORDER BY` evaluates its keys on the row before projection, with
+the returned aliases over it, and propagates errors. It evaluated them on the
+projected row, so `ORDER BY a.age` read a missing column, every key became
+NULL, and the clause did nothing. The SLG goal binding compares by
+`values_equal`, and is injected into the body only for a key yielded as a bare
+variable; an aliased key (`YIELD KEY n.k AS k`) is checked after projection.
+On the Cypher side `_cv_to_bool` reads an encoded NULL as NULL and a
+non-boolean as a type error; both read as `false`, so `NOT n.b` kept a row
+whose `b` is `1`. `CypherPhysicalExprCompiler::compile_predicate` wraps a
+CypherValue `WHERE`, and `compile_binary_op` wraps CypherValue AND/OR
+operands, in `_cv_to_bool`. Before, `WHERE n.b` on a schemaless property failed
+to plan. A list slice bound that is not an integer is a type error. In debug
+builds `debug_assert_facts_are_rows` checks that every non-ALONG rule's facts
+entering the derived store are distinct rows (`locy::locy_facts_and_filters`,
+`bugs::boolean_context_is_strict`, `locy::locy_generator_plugin`).
 
 **A storage projection names each column once.** The property fetch drops
 repeated names (`retain_first_occurrences`); a repeated equality on a

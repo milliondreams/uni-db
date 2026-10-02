@@ -1,6 +1,6 @@
 # Finding silent wrong answers by class, not by customer report
 
-**Date:** 2026-09-28 · **Status:** W1 done (all confirmed defects fixed, plus four found on the way); W2 done (found the OPTIONAL MATCH clause-close class); W3 done (query-rewrite relations, topology fixture, wide tier; eleven engine defects found); W4 in part (Locy↔Cypher relations; five Locy defects found); W5 in part (random programs vs the naive oracle, FOLD over bags); W6 open · **Trigger:** issues #293, #294
+**Date:** 2026-09-28 · **Status:** W1 done (all confirmed defects fixed, plus four found on the way); W2 done (found the OPTIONAL MATCH clause-close class); W3 done (query-rewrite relations, topology fixture, wide tier; eleven engine defects found); W4 in part (Locy↔Cypher relations; five Locy defects found); W5 in part (random programs vs the naive oracle, FOLD over bags); W6 done (fail-open evaluation sites made loud, plus a debug invariant) · **Trigger:** issues #293, #294
 
 ## Why
 
@@ -229,6 +229,47 @@ Debug-build invariant checks at merge/dedup sites (as `merge_fold_contributions`
 now has), and compile-time rejection of programs that would otherwise be
 silently degraded (as #293 now does), turn the next member into a failing test
 instead of a wrong answer.
+
+*W6 result.* An audit of `unwrap_or(false)` / `unwrap_or(Null)` /
+`.ok()` sites on the evaluation path found eight confirmed fail-open sites and
+four suspects. All but one are fixed, each with a test that fails with only
+its fix reverted, except where noted:
+- Locy `QUERY`, `DERIVE`, `EXPLAIN RULE` and `ABDUCE` `WHERE`, and the SLG
+  path's target-dependent rule conditions, now share `eval_condition`. An
+  evaluation error or a non-boolean was "drop the row". `ABDUCE`'s own two
+  sites are reached in tests only through the `EXPLAIN` it runs first, which
+  raises the same error.
+- `QUERY ... ORDER BY` a non-returned expression sorted on NULL keys: a no-op.
+- Locy `<`/`>` between incomparable types was false, not NULL, so under `NOT`
+  every such row was kept. `^` of a non-number was `0.0`.
+- `DERIVE`'s reported edge properties: an unevaluable map became no
+  properties.
+- Cypher `_cv_to_bool`: a non-boolean was `false`, so `NOT n.b` kept a row
+  with `b = 1`. An encoded NULL was `false` too; no query found reaches that
+  arm with an encoded NULL (they arrive as Arrow nulls), so it is unit-tested.
+  Fixing it exposed that a bare `WHERE n.b`, and `n.b AND ...`, on a
+  CypherValue failed to plan. Both are now read through `_cv_to_bool`.
+- A list slice bound that is not an integer was 0 or the length.
+- The SLG goal binding compared by `==`, so `QUERY idx WHERE k = 3.0`
+  returned nothing. It also injected `k = 3` into a body where `k` is a YIELD
+  alias, failing with "Variable 'k' not defined".
+- A struct property's blob lookup that failed to plan compiled to a NULL
+  literal. This is hardening without a repro.
+
+Debug builds now assert that every rule's facts entering the derived store are
+distinct rows (`debug_assert_facts_are_rows`). Its first run fired on an ALONG
+rule, and that exposed a W4 regression: an ALONG rule's facts are per path
+(#159), but the W4 dedup collapsed a non-recursive ALONG rule's equal-valued
+paths, so the same rule's downstream SUM changed when a recursive clause was
+added. ALONG rules are now exempt from both. The `locy_query_where` topology
+relation applied to about one case in eight, so its activation check
+failed at random in the small lane. It now also moves the anchor predicate. Open, and loud rather than
+silent: Cypher `1 <= {k: 1}` raises an Arrow "Nested comparison" error where
+openCypher gives NULL; Locy raises on `x / 0.0` and `toInteger('abc')` where
+Cypher does not; `count(*)` in a `QUERY RETURN`, `x AND NOT a IS r TO b`,
+`WHERE m:A|B` and an inline WHERE on a variable-length relationship are
+refused. Not done: the fixpoint classifier's provenance fallback, which only
+affects provenance.
 
 ## 5. What would have caught today's bugs earliest
 

@@ -27,6 +27,11 @@
 //! | `aggregate` | `count`/`min`/`max`/`sum`/`avg` = `reduce` over `collect` |
 //! | `unwind` | `UNWIND [v…] AS u … WHERE a.id = u` = ⊎ᵥ the query with `u := v` |
 //! | `collect_unwind` | `UNWIND collect(x)` = the rows where `x` is not NULL |
+//! | `locy_rule` | a Locy rule's facts = the `DISTINCT` rows of its body |
+//! | `locy_fold` | `FOLD COUNT/SUM/MIN/MAX` = the Cypher aggregate grouped by the `KEY` |
+//! | `locy_reach` | a recursive reachability rule = `-[*1..]->` with `DISTINCT` |
+//! | `locy_negation` | `a IS NOT reach TO b` = `NOT EXISTS { (a)-[*1..]->(b) }` |
+//! | `locy_query_where` | a `QUERY ... WHERE` filter = the same filter in the rule body |
 //!
 //! The fixture ([`build_topo`]) has chains, a diamond, parallel edges (two with
 //! identical properties), self-loops, a 2-cycle and a 3-cycle, fan-in, fan-out,
@@ -361,6 +366,26 @@ pub struct TopoCase {
     unwind: Vec<i64>,
 }
 
+/// ` WHERE c1 AND c2 ...`, or nothing when there are no conditions.
+fn where_all(conds: impl Iterator<Item = String>) -> String {
+    let conds: Vec<String> = conds.collect();
+    if conds.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conds.join(" AND "))
+    }
+}
+
+/// A recursive Locy reachability rule over every node, along `hop`'s
+/// direction.
+fn reach_rules(hop: Hop) -> String {
+    let rel = render_rel(hop, None, None);
+    format!(
+        "CREATE RULE reach AS MATCH (a){rel}(b) YIELD KEY a, KEY b \
+         CREATE RULE reach AS MATCH (a){rel}(m) WHERE m IS reach TO b YIELD KEY a, KEY b"
+    )
+}
+
 /// How relationships are written when a pattern is rendered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Naming {
@@ -493,6 +518,22 @@ impl TopoCase {
             Some(p) => format!(" WHERE {} AND {extra}", p.render()),
             None => format!(" WHERE {extra}"),
         }
+    }
+
+    /// The pattern as a Locy rule body: the anchor is labelled in place.
+    fn locy_pattern(&self) -> String {
+        let pattern = self.pattern(Naming::Anonymous);
+        format!("(a:Person){}", &pattern["(a)".len()..])
+    }
+
+    /// The anchor and inner predicates as one `WHERE`, or nothing.
+    fn body_where(&self) -> String {
+        where_all(
+            self.anchor
+                .iter()
+                .chain(self.inner.iter())
+                .map(Pred::render),
+        )
     }
 
     /// The single ranged hop, if exactly one hop is ranged.
@@ -630,11 +671,21 @@ pub enum Relation {
     Unwind,
     /// `UNWIND collect(x)` returns the non-null `x` rows.
     CollectUnwind,
+    /// A Locy rule's facts are the `DISTINCT` rows of its body as a query.
+    LocyRule,
+    /// A Locy `FOLD` is the Cypher aggregate grouped by its `KEY`.
+    LocyFold,
+    /// A recursive Locy reachability rule is a variable-length `DISTINCT` match.
+    LocyReach,
+    /// `a IS NOT reach TO b` is `NOT EXISTS` of the variable-length match.
+    LocyNegation,
+    /// A filter in `QUERY ... WHERE` is the same filter in the rule body.
+    LocyQueryWhere,
 }
 
 impl Relation {
     /// Every relation, in report order.
-    pub const ALL: [Relation; 9] = [
+    pub const ALL: [Relation; 14] = [
         Relation::NamedRel,
         Relation::Optional,
         Relation::Exists,
@@ -644,6 +695,11 @@ impl Relation {
         Relation::Aggregate,
         Relation::Unwind,
         Relation::CollectUnwind,
+        Relation::LocyRule,
+        Relation::LocyFold,
+        Relation::LocyReach,
+        Relation::LocyNegation,
+        Relation::LocyQueryWhere,
     ];
 
     /// Short name for reports and failures.
@@ -658,6 +714,11 @@ impl Relation {
             Relation::Aggregate => "aggregate",
             Relation::Unwind => "unwind",
             Relation::CollectUnwind => "collect_unwind",
+            Relation::LocyRule => "locy_rule",
+            Relation::LocyFold => "locy_fold",
+            Relation::LocyReach => "locy_reach",
+            Relation::LocyNegation => "locy_negation",
+            Relation::LocyQueryWhere => "locy_query_where",
         }
     }
 
@@ -829,6 +890,102 @@ impl Relation {
                     )]],
                 })
             }
+            Relation::LocyRule => Some(Rewrite {
+                reference: format!(
+                    "CREATE RULE r AS MATCH {}{} YIELD KEY a, KEY b \
+                     QUERY r RETURN a.id AS c0, b.id AS c1",
+                    case.locy_pattern(),
+                    case.body_where()
+                ),
+                equivalents: vec![vec![format!(
+                    "{} RETURN DISTINCT a.id AS c0, b.id AS c1",
+                    case.joined(Naming::Anonymous)
+                )]],
+            }),
+            Relation::LocyFold => Some(Rewrite {
+                // `SUM` folds to a Float (documented); `MIN` / `MAX` keep the
+                // input's type, so the Cypher side converts only the sum.
+                reference: format!(
+                    "CREATE RULE f AS MATCH {}{} \
+                     FOLD n = COUNT(*), s = SUM(b.age), lo = MIN(b.id), hi = MAX(b.id) \
+                     YIELD KEY a, n, s, lo, hi \
+                     QUERY f RETURN a.id AS c0, n AS c1, s AS c2, lo AS c3, hi AS c4",
+                    case.locy_pattern(),
+                    case.body_where()
+                ),
+                equivalents: vec![vec![format!(
+                    "{} RETURN a.id AS c0, count(*) AS c1, toFloat(sum(b.age)) AS c2, \
+                     min(b.id) AS c3, max(b.id) AS c4",
+                    case.joined(Naming::Anonymous)
+                )]],
+            }),
+            Relation::LocyReach => {
+                let hop = case.hops[0];
+                // A walk may revisit an edge and a trail may not, so an
+                // undirected walk returns to its start where no trail does;
+                // directed, a closed walk contains a cycle, which is a trail.
+                let distinct = matches!(hop.dir, Dir::Both).then_some("a.id <> b.id");
+                let filter = where_all(
+                    case.anchor
+                        .iter()
+                        .map(Pred::render)
+                        .chain(distinct.map(String::from)),
+                );
+                Some(Rewrite {
+                    reference: format!(
+                        "{} QUERY reach{filter} RETURN a.id AS c0, b.id AS c1",
+                        reach_rules(hop)
+                    ),
+                    equivalents: vec![vec![format!(
+                        "MATCH (a){}(b){filter} RETURN DISTINCT a.id AS c0, b.id AS c1",
+                        render_rel(hop, Some((1, u32::MAX)), None)
+                            .replace(&format!("..{}", u32::MAX), "..")
+                    )]],
+                })
+            }
+            Relation::LocyNegation => {
+                let hop = case.hops[0];
+                // Undirected walks and trails disagree at a = b (above), and
+                // without an anchor every pair is checked, which is slow.
+                let anchor = case
+                    .anchor
+                    .as_ref()
+                    .filter(|_| !matches!(hop.dir, Dir::Both))?;
+                let vlp = render_rel(hop, Some((1, u32::MAX)), None)
+                    .replace(&format!("..{}", u32::MAX), "..");
+                Some(Rewrite {
+                    reference: format!(
+                        "{} CREATE RULE un AS MATCH (a:Person), (b:Person) \
+                         WHERE a IS NOT reach TO b YIELD KEY a, KEY b \
+                         QUERY un WHERE {} RETURN a.id AS c0, b.id AS c1",
+                        reach_rules(hop),
+                        anchor.render()
+                    ),
+                    equivalents: vec![vec![format!(
+                        "MATCH (a:Person), (b:Person) WHERE {} \
+                         AND NOT EXISTS {{ MATCH (a){vlp}(b) }} RETURN a.id AS c0, b.id AS c1",
+                        anchor.render()
+                    )]],
+                })
+            }
+            Relation::LocyQueryWhere => {
+                let inner = case.inner.as_ref()?;
+                let anchor = where_all(case.anchor.iter().map(Pred::render));
+                Some(Rewrite {
+                    reference: format!(
+                        "CREATE RULE r AS MATCH {}{} YIELD KEY a, KEY b \
+                         QUERY r RETURN a.id AS c0, b.id AS c1",
+                        case.locy_pattern(),
+                        case.body_where()
+                    ),
+                    equivalents: vec![vec![format!(
+                        "CREATE RULE r AS MATCH {}{anchor} YIELD KEY a, KEY b \
+                         QUERY r WHERE {} RETURN a.id AS c0, b.id AS c1",
+                        case.locy_pattern(),
+                        inner.render()
+                    )]],
+                })
+            }
         }
     }
 }
@@ -867,12 +1024,42 @@ struct Tally {
 }
 
 async fn run_bag(db: &Uni, query: &str) -> anyhow::Result<RowBag> {
+    if query.starts_with("CREATE RULE") {
+        return run_locy_bag(db, query).await;
+    }
     let result = db
         .session()
         .query(query)
         .await
         .map_err(|e| anyhow::anyhow!("{e}\n  query: {query}"))?;
     Ok(bag(&result))
+}
+
+/// The rows of a Locy program's first `QUERY`, as a [`RowBag`] keyed by the
+/// returned column names (the Cypher side's bag sorts columns by name too).
+async fn run_locy_bag(db: &Uni, program: &str) -> anyhow::Result<RowBag> {
+    let result = db
+        .session()
+        .locy(program)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}\n  program: {program}"))?;
+    let rows = result
+        .command_results()
+        .iter()
+        .find_map(|c| c.as_query())
+        .ok_or_else(|| anyhow::anyhow!("program has no QUERY: {program}"))?;
+    let mut out = RowBag::default();
+    for row in rows {
+        let mut columns: Vec<&String> = row.keys().collect();
+        columns.sort();
+        if out.columns.is_empty() {
+            out.columns = columns.iter().map(|c| (*c).clone()).collect();
+        }
+        let canon = crate::diff::CanonRow(columns.iter().map(|c| row[*c].clone()).collect());
+        *out.counts.entry(canon).or_insert(0) += 1;
+        out.total += 1;
+    }
+    Ok(out)
 }
 
 async fn check_case(
@@ -1001,34 +1188,33 @@ pub fn drive_topo(label: &str, layout: Layout, execution_batch_size: Option<usiz
 
 /// All rows flushed, default execution batch size.
 ///
-/// 60 cases: about 55 s alone. The full suite runs it beside everything else
-/// under the default profile's 180 s limit, and at 100 cases (about 90 s alone)
-/// a full-suite run timed out.
+/// 40 cases: with the Locy relations a case costs about 1.8 s (107 s for 60
+/// alone), and the full suite runs it beside everything else under this
+/// test's six-minute nextest limit (`.config/nextest.toml`).
 #[test]
 fn topo_rewrites_flushed() {
-    drive_topo("flushed", Layout::Flushed, None, cases_from_env(60));
+    drive_topo("flushed", Layout::Flushed, None, cases_from_env(40));
 }
 
 /// Half the graph in L0 and a two-row execution batch, so every multi-row
 /// intermediate spans batches.
 ///
 /// Fewer cases than the flushed run: a two-row batch makes every operator pay
-/// its per-batch cost per pair of rows, measured at about 2 s per case, so 15
-/// cases take about 30 s.
+/// its per-batch cost per pair of rows, measured at about 6 s per case with
+/// the Locy relations (93 s for 15), so 8 cases take about 50 s.
 #[test]
 fn topo_rewrites_unflushed_small_batches() {
     drive_topo(
         "unflushed-b2",
         Layout::HalfUnflushed,
         Some(2),
-        cases_from_env(15),
+        cases_from_env(8),
     );
 }
 
-/// Nightly volume over the flushed fixture: a fifth of `DQP_CASES`. Each case
-/// runs about 35 queries, measured at 0.95 s a case over 100 cases, so the
-/// nightly 10 000 becomes 2 000 cases, about 32 minutes — inside the soak
-/// profile's 54-minute cap.
+/// Nightly volume over the flushed fixture: a tenth of `DQP_CASES`. At about
+/// 1.8 s a case the nightly 10 000 becomes 1 000 cases, about 30 minutes —
+/// inside the soak profile's 54-minute cap.
 #[test]
 #[ignore = "soak: run nightly under the soak profile"]
 fn topo_soak() {
@@ -1036,12 +1222,13 @@ fn topo_soak() {
         "flushed-soak",
         Layout::Flushed,
         None,
-        (cases_from_env(20_000) / 5).max(1),
+        (cases_from_env(20_000) / 10).max(1),
     );
 }
 
-/// Nightly volume over L0 and two-row batches: a twentieth of `DQP_CASES`,
-/// since each case costs about 2.4 s here (measured over 25 cases).
+/// Nightly volume over L0 and two-row batches: a fortieth of `DQP_CASES`,
+/// since each case costs about 6 s here; the nightly 10 000 becomes 250 cases,
+/// about 25 minutes.
 #[test]
 #[ignore = "soak: run nightly under the soak profile"]
 fn topo_small_batches_soak() {
@@ -1049,7 +1236,7 @@ fn topo_small_batches_soak() {
         "unflushed-b2-soak",
         Layout::HalfUnflushed,
         Some(2),
-        (cases_from_env(20_000) / 20).max(1),
+        (cases_from_env(20_000) / 40).max(1),
     );
 }
 

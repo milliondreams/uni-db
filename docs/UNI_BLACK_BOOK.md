@@ -7319,6 +7319,26 @@ just the first: `WITH n AS a WITH a AS x RETURN x.id` on an unlabelled node
 loaded only the `_all_props` blob and compiled `x.id` to NULL
 (`bugs::with_rebinds_entity_names`).
 
+**Locy keeps Cypher's semantics where the two overlap** (W4, found by the
+Locy↔Cypher relations of `metamorphic::dqp::topo`):
+- A derived fact is a row: a non-recursive rule's facts pass through
+  `dedup_fact_rows` (the fixpoint's own `RowDedupState` / scalar-key dedup)
+  after its post-fixpoint chain. Only the recursive path deduplicated, so
+  parallel edges derived one fact per edge (`locy::locy_facts_and_filters`).
+- `QUERY ... WHERE` (the in-memory `locy_eval`) uses three-valued logic: a
+  comparison with NULL is NULL and `AND`/`OR` are Kleene. `NULL <> x` was
+  true, so a filter kept rows a rule-body WHERE rejects.
+- `SUM` / `MSUM` of nothing is 0.0, matching Cypher's `sum`.
+- `infer_yield_type_rec` types `MIN`/`MAX`/`MMIN`/`MMAX` by their argument
+  (`fold_argument_type`), does not cast `COLLECT`'s input, and types a
+  property of an unlabelled node or a relationship from the schema when every
+  declaration agrees (`uniform_declared_type`); everything was Float64, so
+  integers came back as floats and lost precision above 2^53
+  (`locy::locy_value_types`).
+- A Locy rule body is planned by `plan_pattern_scoped`, which now names
+  anonymous variable-length relationships as `plan_match_clause` does, so
+  relationship uniqueness holds there too.
+
 **A storage projection names each column once.** The property fetch drops
 repeated names (`retain_first_occurrences`); a repeated equality on a
 variable-length target listed `id` twice and Lance rejected the scan

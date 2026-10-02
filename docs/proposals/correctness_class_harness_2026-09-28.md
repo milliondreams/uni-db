@@ -1,6 +1,6 @@
 # Finding silent wrong answers by class, not by customer report
 
-**Date:** 2026-09-28 · **Status:** W1 done (all confirmed defects fixed, plus four found on the way); W2 done (found the OPTIONAL MATCH clause-close class); W3 done (query-rewrite relations, topology fixture, wide tier; eleven engine defects found); W4–W6 open · **Trigger:** issues #293, #294
+**Date:** 2026-09-28 · **Status:** W1 done (all confirmed defects fixed, plus four found on the way); W2 done (found the OPTIONAL MATCH clause-close class); W3 done (query-rewrite relations, topology fixture, wide tier; eleven engine defects found); W4 in part (Locy↔Cypher relations; five Locy defects found); W5–W6 open · **Trigger:** issues #293, #294
 
 ## Why
 
@@ -185,6 +185,23 @@ truncated (fixed in the same change).
 recursion-unrolling and Locy↔Cypher relations. Verify first that
 `LocyResult::metrics()` counters actually move, or the activation floor is
 vacuous.
+
+*W4 result (in part).* Five Locy relations in `metamorphic::dqp::topo`, each
+against an independent Cypher formulation over the topology fixture (flushed,
+and half in L0 at a two-row batch): a rule's facts ≡ `DISTINCT` of its body;
+`FOLD COUNT/SUM/MIN/MAX` ≡ the grouped Cypher aggregate; recursive
+reachability ≡ `-[*1..]->` with `DISTINCT`; `IS NOT` ≡ `NOT EXISTS`; a
+`QUERY ... WHERE` filter ≡ the same filter in the body. Every Locy reference
+also runs twice. They found: non-recursive rules did not deduplicate facts
+(one per parallel edge); `QUERY ... WHERE` used two-valued logic with NULL;
+`MIN`/`MAX`/`COLLECT` and properties of unlabelled nodes or relationships
+came back as Float64; the W3 variable-length uniqueness fix had not reached
+Locy rule bodies (a second planning entry point); and, decided 2026-10-01,
+Locy `SUM`/`MSUM` of nothing now matches Cypher's 0. Loud, not fixed:
+`count(*)` in a `QUERY ... RETURN` ("unsupported expression: Wildcard"), and
+`x AND NOT a IS r TO b` is a parse error (`IS NOT` alone works). Not done
+from W4: a program generator with composite keys, seeds, ALONG and recursive
+FOLD (W5's multiset oracle is the reference those need).
 
 **W5 — extend the naive Locy oracle** to FOLD and monotonic aggregates over
 **multisets** (so duplicate contributions are not collapsed), with a random

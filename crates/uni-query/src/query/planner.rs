@@ -5059,6 +5059,18 @@ impl QueryPlanner {
         vars_in_scope.clear();
         vars_in_scope.extend_from_slice(initial_vars);
         let vars_before_pattern = vars_in_scope.len();
+        // As in `plan_match_clause`: without a step variable, an anonymous
+        // variable-length relationship publishes no edges, and a later hop
+        // reused them — a Locy rule body `(a)-[*1..2]->()-[]->(b)` derived
+        // pairs only an edge-reusing walk reaches.
+        let named;
+        let pattern = match self.name_anonymous_variable_length(pattern) {
+            Some(p) => {
+                named = p;
+                &named
+            }
+            None => pattern,
+        };
         let mut plan = LogicalPlan::Empty;
         for path in &pattern.paths {
             plan = self.plan_path(

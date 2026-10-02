@@ -99,3 +99,24 @@ async fn vlp_relationship_uniqueness_controls() -> Result<()> {
     );
     Ok(())
 }
+
+/// The same rule for a Locy rule body, which is planned by another entry
+/// point and missed the fix at first.
+#[tokio::test]
+async fn vlp_relationship_uniqueness_in_a_locy_rule_body() -> Result<()> {
+    let db = open().await?;
+    let result = db
+        .session()
+        .locy(
+            "CREATE RULE r AS MATCH (a:N {id: 2})<-[:K*1..1]-(x)-[:K]->(b) YIELD KEY a, KEY b \
+             QUERY r RETURN b.id AS id",
+        )
+        .await?;
+    let rows = result
+        .command_results()
+        .iter()
+        .find_map(|c| c.as_query())
+        .expect("program has a QUERY");
+    assert!(rows.is_empty(), "{rows:?}");
+    Ok(())
+}

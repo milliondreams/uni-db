@@ -65,6 +65,48 @@ pub struct OracleRule {
     pub name: String,
     /// Clauses whose results are unioned into this relation.
     pub clauses: Vec<OracleClause>,
+    /// A `FOLD` over the rule's rows, when the rule aggregates.
+    pub fold: Option<OracleFold>,
+}
+
+/// A FOLD aggregate the oracle evaluates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Agg {
+    /// `COUNT(*)`: rows in the group.
+    CountStar,
+    /// `COUNT(x)`: non-null inputs in the group (inputs are never null here).
+    Count,
+    /// `SUM(x)` / `MSUM(x)`.
+    Sum,
+    /// `MIN(x)` / `MMIN(x)`.
+    Min,
+    /// `MAX(x)` / `MMAX(x)`.
+    Max,
+}
+
+/// One aggregate of a [`OracleFold`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoldAgg {
+    /// The aggregate.
+    pub agg: Agg,
+    /// Column of the clause's projected row holding the input; `None` for
+    /// [`Agg::CountStar`].
+    pub input: Option<usize>,
+}
+
+/// A `FOLD` over a rule's rows: `YIELD KEY k1..kn, agg1, agg2, ...`.
+///
+/// Each clause projects its `yield_vars` as the `key_count` key columns
+/// followed by the aggregates' input columns. Unlike a plain rule, which is a
+/// **set**, the fold reads the **bag** of those rows — every binding counts,
+/// so parallel edges contribute once each — grouped by the key columns. The
+/// fact for a group is its key followed by each aggregate's value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OracleFold {
+    /// Leading key columns of each projected row.
+    pub key_count: usize,
+    /// The aggregates, in output order.
+    pub aggs: Vec<FoldAgg>,
 }
 
 /// A stratified program: rules grouped into dependency-ordered strata.

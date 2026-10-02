@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ir::{OracleClause, OracleProgram, Tuple};
+use crate::ir::{Agg, OracleClause, OracleFold, OracleProgram, OracleRule, Tuple};
 
 /// A relation: the set of derived (or base) fact tuples for one rule.
 pub type Relation = HashSet<Tuple>;
@@ -37,9 +37,15 @@ fn matches_subject(fact: &[i64], subj: &[i64]) -> bool {
 pub fn evaluate(program: &OracleProgram) -> HashMap<String, Relation> {
     let mut rels: HashMap<String, Relation> = HashMap::new();
     for stratum in &program.strata {
+        // A FOLD rule reads only earlier strata, so it is evaluated once.
+        for rule in stratum.iter().filter(|r| r.fold.is_some()) {
+            let facts = eval_fold_rule(rule, &rels);
+            rels.insert(rule.name.clone(), facts);
+        }
+        let stratum: Vec<&OracleRule> = stratum.iter().filter(|r| r.fold.is_none()).collect();
         loop {
             let mut changed = false;
-            for rule in stratum {
+            for rule in &stratum {
                 for clause in &rule.clauses {
                     // Compute before mutably borrowing `rels` for the insert.
                     let derived = eval_clause(clause, &rels);
@@ -57,6 +63,51 @@ pub fn evaluate(program: &OracleProgram) -> HashMap<String, Relation> {
         }
     }
     rels
+}
+
+/// Evaluates a FOLD rule: the bag of its clauses' rows, grouped by key.
+///
+/// # Panics
+/// Panics if the rule refers to itself (a recursive FOLD is out of scope) or a
+/// row is shorter than the fold's columns (a generator bug).
+fn eval_fold_rule(rule: &OracleRule, rels: &HashMap<String, Relation>) -> Relation {
+    let fold: &OracleFold = rule.fold.as_ref().expect("a FOLD rule");
+    assert!(
+        rule.clauses.iter().all(|c| c
+            .pos_refs
+            .iter()
+            .chain(&c.neg_refs)
+            .all(|r| r.rule != rule.name)),
+        "recursive FOLD is outside the oracle's scope: {}",
+        rule.name
+    );
+    // The bag: `eval_clause` returns every binding's row, duplicates kept.
+    let mut groups: HashMap<Tuple, Vec<Tuple>> = HashMap::new();
+    for clause in &rule.clauses {
+        for row in eval_clause(clause, rels) {
+            groups
+                .entry(row[..fold.key_count].to_vec())
+                .or_default()
+                .push(row);
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(key, rows)| {
+            let mut fact = key;
+            for a in &fold.aggs {
+                let inputs = || rows.iter().map(|r| r[a.input.expect("an input column")]);
+                fact.push(match a.agg {
+                    Agg::CountStar => rows.len() as i64,
+                    Agg::Count => inputs().count() as i64,
+                    Agg::Sum => inputs().sum(),
+                    Agg::Min => inputs().min().expect("a group has a row"),
+                    Agg::Max => inputs().max().expect("a group has a row"),
+                });
+            }
+            fact
+        })
+        .collect()
 }
 
 /// Evaluates one clause against the current relations: join, anti-join, project.
@@ -192,6 +243,42 @@ mod tests {
         }
     }
 
+    /// A FOLD reads the bag: two identical parallel edges count twice.
+    #[test]
+    fn fold_counts_every_row() {
+        use crate::ir::{Agg, FoldAgg, OracleFold};
+        // Edges [src, dst, index, weight]: two identical 0->1 edges and 0->2.
+        let edges: Vec<Tuple> = vec![vec![0, 1, 0, 2], vec![0, 1, 1, 2], vec![0, 2, 2, 5]];
+        let deg = OracleRule {
+            name: "deg".to_string(),
+            clauses: vec![OracleClause {
+                base: edges,
+                var_cols: HashMap::from([("a".to_string(), 0), ("w".to_string(), 3)]),
+                pos_refs: Vec::new(),
+                neg_refs: Vec::new(),
+                yield_vars: vec!["a".to_string(), "w".to_string()],
+            }],
+            fold: Some(OracleFold {
+                key_count: 1,
+                aggs: [
+                    (Agg::CountStar, None),
+                    (Agg::Sum, Some(1)),
+                    (Agg::Min, Some(1)),
+                    (Agg::Max, Some(1)),
+                    (Agg::Count, Some(1)),
+                ]
+                .into_iter()
+                .map(|(agg, input)| FoldAgg { agg, input })
+                .collect(),
+            }),
+        };
+        let rels = evaluate(&OracleProgram {
+            strata: vec![vec![deg]],
+        });
+        let expected: Relation = [vec![0, 3, 9, 2, 5, 3]].into_iter().collect();
+        assert_eq!(rels["deg"], expected);
+    }
+
     /// Stratified `IS NOT`: `unreached` is the exact complement of `reaches`.
     ///
     /// Graph 0->1->2. reaches = {(0,1),(1,2),(0,2)}; all 9 ordered pairs minus
@@ -204,6 +291,7 @@ mod tests {
             .collect();
 
         let reaches = OracleRule {
+            fold: None,
             name: "reaches".to_string(),
             clauses: vec![
                 OracleClause {
@@ -227,6 +315,7 @@ mod tests {
             ],
         };
         let unreached = OracleRule {
+            fold: None,
             name: "unreached".to_string(),
             clauses: vec![OracleClause {
                 base: all_pairs,

@@ -1,6 +1,6 @@
 # Finding silent wrong answers by class, not by customer report
 
-**Date:** 2026-09-28 · **Status:** W1 done (all confirmed defects fixed, plus four found on the way); W2 done (found the OPTIONAL MATCH clause-close class); W3 done (query-rewrite relations, topology fixture, wide tier; eleven engine defects found); W4 in part (Locy↔Cypher relations; five Locy defects found); W5–W6 open · **Trigger:** issues #293, #294
+**Date:** 2026-09-28 · **Status:** W1 done (all confirmed defects fixed, plus four found on the way); W2 done (found the OPTIONAL MATCH clause-close class); W3 done (query-rewrite relations, topology fixture, wide tier; eleven engine defects found); W4 in part (Locy↔Cypher relations; five Locy defects found); W5 in part (random programs vs the naive oracle, FOLD over bags); W6 open · **Trigger:** issues #293, #294
 
 ## Why
 
@@ -206,6 +206,23 @@ FOLD (W5's multiset oracle is the reference those need).
 **W5 — extend the naive Locy oracle** to FOLD and monotonic aggregates over
 **multisets** (so duplicate contributions are not collapsed), with a random
 program generator in place of the three templates.
+
+*W5 result (in part).* The naive oracle (`uni-locy-oracle`) evaluates
+non-recursive FOLD over the **bag** of a rule's rows (`COUNT(*)`, `COUNT`,
+`SUM`/`MSUM`, `MIN`/`MMIN`, `MAX`/`MMAX`, `MCOUNT`), and
+`random_program_strategy` replaces the three templates as the main source of
+cases: a random multigraph (self-loops, parallel and identical edges, two
+relationship types, integer weights) under random strata of base relations,
+recursive reachability, stratified negation and three FOLD rules (over edges,
+over the closure, over an edge joined with the closure). Every relation is
+compared, values included, with types checked strictly (only sums may be
+floats). Each relation must derive facts in at least a fifth of the cases.
+It catches the oracle made to use set semantics, and the W4 dedup fix
+reverted, each at its minimal shape. Soaked at 2 000 programs; PR lane 96;
+nightly 5 000 via the existing oracle soak filter. It found one more defect:
+in a schemaless graph a FOLD over a target bound by `IS ... TO` was still cast
+to Float64 (fixed with the W4 type fix). Out of scope still: recursive FOLD,
+whose self-reference contributes the target's folded value, ALONG and BEST BY.
 
 **W6 — fail loud by default.** Each class member found so far was silent.
 Debug-build invariant checks at merge/dedup sites (as `merge_fold_contributions`

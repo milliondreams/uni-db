@@ -19,9 +19,16 @@
 //! # Scope
 //!
 //! The oracle covers Locy's **monotone core** — plain rules, `IS` references,
-//! stratified `IS NOT`, and `YIELD`. Non-core constructs (`FOLD` non-`M`
-//! aggregates, `ALONG`, `BEST BY`, `DERIVE`, `ASSUME`, `PROB`, `HAVING`) are out
-//! of scope and the oracle panics rather than silently mis-handling them.
+//! stratified `IS NOT`, and `YIELD` — plus **non-recursive `FOLD`** over the
+//! bag of a rule's rows (`COUNT(*)`, `COUNT`, `SUM`/`MSUM`, `MIN`/`MMIN`,
+//! `MAX`/`MMAX`, `MCOUNT`): every binding counts, so parallel edges contribute
+//! once each. A recursive `FOLD` (whose self-reference contributes the target's
+//! folded value), `ALONG`, `BEST BY`, `DERIVE`, `ASSUME`, `PROB` and `HAVING`
+//! are out of scope; a recursive `FOLD` panics rather than being mis-handled.
+//!
+//! [`generator::random_program_strategy`] draws random programs over a random
+//! multigraph (self-loops, parallel and identical edges, two relationship
+//! types, integer weights) that exercise all of the above.
 
 // Rust guideline compliant
 pub mod eval;

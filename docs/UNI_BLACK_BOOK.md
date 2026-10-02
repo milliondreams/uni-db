@@ -7332,7 +7332,8 @@ Locy↔Cypher relations of `metamorphic::dqp::topo`):
 - `infer_yield_type_rec` types `MIN`/`MAX`/`MMIN`/`MMAX` by their argument
   (`fold_argument_type`), does not cast `COLLECT`'s input, and types a
   property of an unlabelled node or a relationship from the schema when every
-  declaration agrees (`uniform_declared_type`); everything was Float64, so
+  declaration agrees (`uniform_declared_type`), and leaves a property declared
+  nowhere (schemaless) as the stored Cypher value; everything was Float64, so
   integers came back as floats and lost precision above 2^53
   (`locy::locy_value_types`).
 - A Locy rule body is planned by `plan_pattern_scoped`, which now names

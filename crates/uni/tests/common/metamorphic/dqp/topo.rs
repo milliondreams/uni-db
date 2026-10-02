@@ -969,21 +969,48 @@ impl Relation {
                 })
             }
             Relation::LocyQueryWhere => {
-                let inner = case.inner.as_ref()?;
-                let anchor = where_all(case.anchor.iter().map(Pred::render));
+                // Move the anchor predicate, the inner one, or both, from the
+                // rule body to the QUERY. Moving only the inner one applied to
+                // about one case in eight, too few for a small lane's
+                // activation check to mean anything.
+                let anchor = case.anchor.as_ref();
+                let inner = case.inner.as_ref();
+                if anchor.is_none() && inner.is_none() {
+                    return None;
+                }
+                let mut splits: Vec<(Option<&Pred>, Option<&Pred>)> = Vec::new();
+                if let Some(i) = inner {
+                    splits.push((anchor, Some(i)));
+                }
+                if let Some(a) = anchor {
+                    splits.push((inner, Some(a)));
+                    if inner.is_some() {
+                        splits.push((None, None));
+                    }
+                }
+                let program = |body: String, query: String| {
+                    format!(
+                        "CREATE RULE r AS MATCH {}{body} YIELD KEY a, KEY b \
+                         QUERY r{query} RETURN a.id AS c0, b.id AS c1",
+                        case.locy_pattern()
+                    )
+                };
+                let both = where_all(anchor.into_iter().chain(inner).map(Pred::render));
+                let equivalents = splits
+                    .into_iter()
+                    .map(|(kept, moved)| {
+                        let body = where_all(kept.into_iter().map(Pred::render));
+                        let query = match moved {
+                            Some(p) => format!(" WHERE {}", p.render()),
+                            None => both.clone(),
+                        };
+                        let body = if moved.is_none() { String::new() } else { body };
+                        vec![program(body, query)]
+                    })
+                    .collect();
                 Some(Rewrite {
-                    reference: format!(
-                        "CREATE RULE r AS MATCH {}{} YIELD KEY a, KEY b \
-                         QUERY r RETURN a.id AS c0, b.id AS c1",
-                        case.locy_pattern(),
-                        case.body_where()
-                    ),
-                    equivalents: vec![vec![format!(
-                        "CREATE RULE r AS MATCH {}{anchor} YIELD KEY a, KEY b \
-                         QUERY r WHERE {} RETURN a.id AS c0, b.id AS c1",
-                        case.locy_pattern(),
-                        inner.render()
-                    )]],
+                    reference: program(case.body_where(), String::new()),
+                    equivalents,
                 })
             }
         }

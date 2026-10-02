@@ -10591,12 +10591,17 @@ pub(crate) fn reconcile_passthrough_properties(
         }
     }
 
-    // Fold each alias's accessed properties onto its source. This is
-    // unconditional and safe: if the source is later kept wide the extra
-    // properties are subsumed by "*", and if it is narrowed it needs exactly
-    // these. A single non-cascading pass (props are read from a pre-fold
-    // snapshot) suffices because rename *chains* keep their endpoints wide (see
-    // `keep_wide` below), so cascading folds are never required for correctness.
+    // Fold each alias's accessed properties onto every variable it renames,
+    // following the whole chain (`WITH n AS a WITH a AS x`: `x`'s properties
+    // reach `n`). This is unconditional and safe: if a source is kept wide the
+    // extra properties are subsumed by "*", and if it is narrowed it needs
+    // exactly these.
+    //
+    // The fold used to stop after one link, on the grounds that rename chains
+    // keep their endpoints wide. Wide is not enough for an unlabelled or
+    // schemaless scan: "*" there loads only the `_all_props` blob, so `x.id`
+    // two renames up found no `id` and compiled to NULL — or, after a MERGE
+    // re-encoded the entity, failed to plan.
     let real_props: HashMap<String, Vec<String>> = properties
         .iter()
         .map(|(v, set)| {
@@ -10612,14 +10617,21 @@ pub(crate) fn reconcile_passthrough_properties(
             (v.clone(), props)
         })
         .collect();
-    for (alias, src) in &alias_source {
-        if let Some(props) = real_props.get(alias)
-            && !props.is_empty()
-        {
+    for (alias, first) in &alias_source {
+        let Some(props) = real_props.get(alias).filter(|p| !p.is_empty()) else {
+            continue;
+        };
+        let mut seen: HashSet<&String> = HashSet::from([alias]);
+        let mut src = first;
+        while seen.insert(src) {
             properties
                 .entry(src.clone())
                 .or_default()
                 .extend(props.iter().cloned());
+            match alias_source.get(src) {
+                Some(next) => src = next,
+                None => break,
+            }
         }
     }
 

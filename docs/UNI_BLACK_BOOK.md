@@ -7297,6 +7297,28 @@ same wrap in `plan_window_functions`, and sums a float argument as Float64
 (it had cast every argument to Int64, truncating each float before adding).
 `min`/`max`/`avg` of nothing stay NULL (`bugs::sum_of_nothing_is_zero`).
 
+**An entity map is recognised by structure, never by an id key alone.**
+`entity_ref_from_map` is the one definition: a vertex needs `_labels` (every
+vertex encoding carries it), an edge a type (`_type`, `_type_name`,
+`edge_type`), both endpoints, or an edge id with an endpoint. Recognising any
+map with `_id`/`_vid`/`vid`/`_eid` made `{_id: 0, x: 1} = {_id: 0, x: 2}`
+true, collapsed such maps in `collect(DISTINCT)`, and turned them into nodes
+under `UNWIND`/`RETURN`. `ResultNormalizer::is_node_map`/`is_edge_map` defer
+to it. `collect(DISTINCT)` keys values structurally (entities by identity,
+scalars by their codec bytes), not by display string
+(`bugs::user_maps_are_not_entities`).
+
+**A projection rebinds its aliases.** `WITH b AS a` carries `b`'s flattened
+columns as `a.*` (`carry_entity_columns`), and `collect_variable_kinds` /
+`collect_variable_labels` rebind `a` to `b`'s kind and label (a computed alias
+becomes opaque), as `UNWIND` already did. Carried under the source name, a
+swap `WITH b AS a, a AS b` filtered on the old `a` — silently wrong — and a
+rename onto a used name failed to plan. `reconcile_passthrough_properties`
+folds an alias's property reads onto every variable up its rename chain, not
+just the first: `WITH n AS a WITH a AS x RETURN x.id` on an unlabelled node
+loaded only the `_all_props` blob and compiled `x.id` to NULL
+(`bugs::with_rebinds_entity_names`).
+
 **A storage projection names each column once.** The property fetch drops
 repeated names (`retain_first_occurrences`); a repeated equality on a
 variable-length target listed `id` twice and Lance rejected the scan

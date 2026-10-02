@@ -171,3 +171,4 @@ pub mod vlp_default_hop_bound_warns;
 pub mod vlp_limit_stops_enumeration;
 pub mod vlp_pinned_endpoint_prunes;
 pub mod vlp_relationship_uniqueness;
+pub mod with_rebinds_entity_names;

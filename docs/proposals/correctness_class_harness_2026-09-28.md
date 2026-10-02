@@ -65,6 +65,14 @@ search had the FTS stale-version defect; a vertex `UNIQUE` key moved by an
 unflushed `SET` stayed taken. The invariants are recorded in the Black Book,
 Appendix B2.
 
+Re-probed on the W3 topology fixture (2026-10-01): of the "not reproduced"
+suspects below, the reachability trail check was real (fixed in W3);
+"WHERE pushdown through a shadowing WITH" was real — a rename onto a used
+name failed to plan, and a swap read the old binding's columns, silently;
+`count(DISTINCT m)` over `_id` maps was right, but `collect(DISTINCT m)`,
+`=` and `IN` merged any map with an `_id`/`_vid`/`vid`/`_eid` key; the
+left-of-anchor hop was ruled out (8 shapes, both layouts). All fixed.
+
 Not reproduced on the probe graphs (weak evidence only): the reachability
 BFS first-predecessor trail check, `WHERE` pushdown through a shadowing
 `WITH`, `count(DISTINCT m)` over maps carrying `_id`. Remaining unprobed

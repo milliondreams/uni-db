@@ -733,15 +733,45 @@ impl HybridPhysicalPlanner {
                     labels.insert(sv.clone(), type_names[0].clone());
                 }
             }
+            // A projection or UNWIND rebinds names, exactly as in
+            // `collect_variable_kinds`: after `WITH r AS a`, `a`'s label is
+            // `r`'s, not that of the node a scan bound to `a` below. Left in
+            // place, `type(a)` resolved to the old node's label and compared
+            // false for every row.
+            LogicalPlan::Project { input, projections } => {
+                self.collect_variable_labels(input, labels);
+                let below = labels.clone();
+                for (expr, alias) in projections {
+                    let Some(alias) = alias else { continue };
+                    match expr {
+                        Expr::Variable(src) if src == alias => {}
+                        Expr::Variable(src) => match below.get(src) {
+                            Some(label) => {
+                                labels.insert(alias.clone(), label.clone());
+                            }
+                            None => {
+                                labels.remove(alias);
+                            }
+                        },
+                        _ => {
+                            labels.remove(alias);
+                        }
+                    }
+                }
+            }
+            LogicalPlan::Unwind {
+                input, variable, ..
+            } => {
+                self.collect_variable_labels(input, labels);
+                labels.remove(variable);
+            }
             // Wrapper nodes: recurse into input(s)
             LogicalPlan::Filter { input, .. }
-            | LogicalPlan::Project { input, .. }
             | LogicalPlan::Sort { input, .. }
             | LogicalPlan::Limit { input, .. }
             | LogicalPlan::Aggregate { input, .. }
             | LogicalPlan::Distinct { input, .. }
             | LogicalPlan::Window { input, .. }
-            | LogicalPlan::Unwind { input, .. }
             | LogicalPlan::Create { input, .. }
             | LogicalPlan::CreateBatch { input, .. }
             | LogicalPlan::Merge { input, .. }
@@ -4993,6 +5023,39 @@ impl HybridPhysicalPlanner {
     }
 
     /// Build projection expressions from an already-planned input.
+    /// Carries `var`'s flattened columns (`{var}._vid`, `{var}._labels`,
+    /// `{var}.{prop}`) through a projection, named for the binding they now
+    /// belong to: `{name}.*`.
+    ///
+    /// They used to keep the source's name, so after `WITH b AS a` there was no
+    /// `a.id` (a filter on it failed to plan) and, in a swap `WITH b AS a, a AS
+    /// b`, the `a.*` columns still held the old `a`'s values — a filter on
+    /// `a.id` read the wrong node and returned wrong rows.
+    fn carry_entity_columns(
+        schema: &SchemaRef,
+        var: &str,
+        name: &str,
+        exprs: &mut Vec<(Arc<dyn datafusion::physical_expr::PhysicalExpr>, String)>,
+    ) {
+        let prefix = format!("{var}.");
+        for (idx, field) in schema.fields().iter().enumerate() {
+            let Some(suffix) = field.name().strip_prefix(&prefix) else {
+                continue;
+            };
+            let out = format!("{name}.{suffix}");
+            if exprs.iter().any(|(_, n)| *n == out) {
+                continue;
+            }
+            exprs.push((
+                Arc::new(datafusion::physical_expr::expressions::Column::new(
+                    field.name(),
+                    idx,
+                )),
+                out,
+            ));
+        }
+    }
+
     fn plan_project_from_input(
         &self,
         input_plan: Arc<dyn ExecutionPlan>,
@@ -5038,41 +5101,8 @@ impl HybridPhysicalPlanner {
                         datafusion::physical_expr::expressions::Column::new(var_name, col_idx),
                     );
                     let name = alias.clone().unwrap_or_else(|| var_name.clone());
-                    exprs.push((col_expr, name));
-
-                    // Include _vid and _labels as helper columns for post-processing
-                    let vid_col = format!("{}._vid", var_name);
-                    let labels_col = format!("{}._labels", var_name);
-                    if let Some((vi, _)) = schema.column_with_name(&vid_col) {
-                        let ve: Arc<dyn datafusion::physical_expr::PhysicalExpr> = Arc::new(
-                            datafusion::physical_expr::expressions::Column::new(&vid_col, vi),
-                        );
-                        exprs.push((ve, vid_col.clone()));
-                    }
-                    if let Some((li, _)) = schema.column_with_name(&labels_col) {
-                        let le: Arc<dyn datafusion::physical_expr::PhysicalExpr> = Arc::new(
-                            datafusion::physical_expr::expressions::Column::new(&labels_col, li),
-                        );
-                        exprs.push((le, labels_col.clone()));
-                    }
-
-                    // Carry through all {var}.{prop} columns so downstream
-                    // operators (e.g. RETURN n.name after WITH n) can find them.
-                    let prefix = format!("{}.", var_name);
-                    for (idx, field) in schema.fields().iter().enumerate() {
-                        let fname = field.name();
-                        if fname.starts_with(&prefix)
-                            && fname != &vid_col
-                            && fname != &labels_col
-                            && !exprs.iter().any(|(_, n)| n == fname)
-                        {
-                            let prop_expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
-                                Arc::new(datafusion::physical_expr::expressions::Column::new(
-                                    fname, idx,
-                                ));
-                            exprs.push((prop_expr, fname.clone()));
-                        }
-                    }
+                    exprs.push((col_expr, name.clone()));
+                    Self::carry_entity_columns(&schema, var_name, &name, &mut exprs);
                     continue;
                 }
 
@@ -5129,40 +5159,8 @@ impl HybridPhysicalPlanner {
                     )?;
 
                     let name = alias.clone().unwrap_or_else(|| var_name.clone());
-                    exprs.push((physical_struct_expr, name));
-
-                    // Also include _vid and _labels helpers
-                    let vid_col = format!("{}._vid", var_name);
-                    let labels_col = format!("{}._labels", var_name);
-                    if let Some((vi, _)) = schema.column_with_name(&vid_col) {
-                        let ve: Arc<dyn datafusion::physical_expr::PhysicalExpr> = Arc::new(
-                            datafusion::physical_expr::expressions::Column::new(&vid_col, vi),
-                        );
-                        exprs.push((ve, vid_col.clone()));
-                    }
-                    if let Some((li, _)) = schema.column_with_name(&labels_col) {
-                        let le: Arc<dyn datafusion::physical_expr::PhysicalExpr> = Arc::new(
-                            datafusion::physical_expr::expressions::Column::new(&labels_col, li),
-                        );
-                        exprs.push((le, labels_col.clone()));
-                    }
-
-                    // Carry through remaining {var}.{prop} columns not already
-                    // included by the struct projection above.
-                    for (idx, field) in schema.fields().iter().enumerate() {
-                        let fname = field.name();
-                        if fname.starts_with(&prefix)
-                            && fname != &vid_col
-                            && fname != &labels_col
-                            && !exprs.iter().any(|(_, n)| n == fname)
-                        {
-                            let prop_expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
-                                Arc::new(datafusion::physical_expr::expressions::Column::new(
-                                    fname, idx,
-                                ));
-                            exprs.push((prop_expr, fname.clone()));
-                        }
-                    }
+                    exprs.push((physical_struct_expr, name.clone()));
+                    Self::carry_entity_columns(&schema, var_name, &name, &mut exprs);
                     continue;
                 }
                 // Fall through to normal expression compilation if no matching columns at all
@@ -7859,8 +7857,33 @@ pub(crate) fn collect_variable_kinds(
             kinds.insert(path_variable.clone(), VariableKind::Path);
         }
         // Wrapper nodes: recurse into input(s)
+        // A projection rebinds its aliases, as UNWIND does (below): after
+        // `WITH b AS a`, `a` is whatever `b` was, and after `WITH r.w AS a` it is
+        // a plain value — not the node a scan bound to `a` further down. Read
+        // from a snapshot, so a swap (`WITH b AS a, a AS b`) reads each source
+        // before either is overwritten.
+        LogicalPlan::Project { input, projections } => {
+            collect_variable_kinds(input, kinds);
+            let below = kinds.clone();
+            for (expr, alias) in projections {
+                let Some(alias) = alias else { continue };
+                match expr {
+                    Expr::Variable(src) if src == alias => {}
+                    Expr::Variable(src) => match below.get(src) {
+                        Some(kind) => {
+                            kinds.insert(alias.clone(), *kind);
+                        }
+                        None => {
+                            kinds.remove(alias);
+                        }
+                    },
+                    _ => {
+                        kinds.insert(alias.clone(), VariableKind::Opaque);
+                    }
+                }
+            }
+        }
         LogicalPlan::Filter { input, .. }
-        | LogicalPlan::Project { input, .. }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Aggregate { input, .. }

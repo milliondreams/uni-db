@@ -2559,6 +2559,14 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
         // failed at run time ("Invalid arithmetic operation: Int64 * Float64"),
         // as did the comparison `> 1.5`. Cast to the types DataFusion's own
         // coercion picks.
+        if let (Some(l), Some(r)) = (&left_type, &right_type)
+            && crate::query::df_expr::is_map_vs_other(l, r)
+            && let Some(answer) =
+                incomparable_map_comparison(df_op, left.clone(), right.clone(), input_schema)?
+        {
+            return Ok(answer);
+        }
+
         let (left, right) = match (&left_type, &right_type) {
             (Some(l), Some(r)) if l != r => {
                 match datafusion::logical_expr::type_coercion::binary::BinaryTypeCoercer::new(
@@ -4582,6 +4590,42 @@ fn resolve_metric_for_property(
         }
     }
     None
+}
+
+/// A comparison of a map against another concrete type, answered without
+/// comparing (see `df_expr::is_map_vs_other`): NULL for an ordering operator,
+/// and for `=` / `<>` false / true unless a side is NULL. `None` for any other
+/// operator.
+fn incomparable_map_comparison(
+    op: datafusion::logical_expr::Operator,
+    left: Arc<dyn PhysicalExpr>,
+    right: Arc<dyn PhysicalExpr>,
+    schema: &Schema,
+) -> Result<Option<Arc<dyn PhysicalExpr>>> {
+    use datafusion::common::ScalarValue;
+    use datafusion::logical_expr::Operator;
+    use datafusion::physical_expr::expressions::{CaseExpr, IsNullExpr, Literal};
+    let null: Arc<dyn PhysicalExpr> = Arc::new(Literal::new(ScalarValue::Boolean(None)));
+    match op {
+        Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq => Ok(Some(null)),
+        Operator::Eq | Operator::NotEq => {
+            let either_null = binary(
+                Arc::new(IsNullExpr::new(left)),
+                Operator::Or,
+                Arc::new(IsNullExpr::new(right)),
+                schema,
+            )?;
+            let answer: Arc<dyn PhysicalExpr> = Arc::new(Literal::new(ScalarValue::Boolean(Some(
+                op == Operator::NotEq,
+            ))));
+            Ok(Some(Arc::new(CaseExpr::try_new(
+                None,
+                vec![(either_null, null)],
+                Some(answer),
+            )?)))
+        }
+        _ => Ok(None),
+    }
 }
 
 #[cfg(test)]

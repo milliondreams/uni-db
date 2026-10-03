@@ -141,3 +141,51 @@ async fn boolean_context_is_strict_on_list_slice_bounds() -> Result<()> {
     assert_eq!(single(&db, "RETURN [1, 2, 3][null..]").await?, Value::Null);
     Ok(())
 }
+
+/// A map compared with a value of another type is answered as openCypher
+/// specifies: an ordering is NULL, `=` false and `<>` true (NULL when a side is
+/// NULL). DataFusion has no common type for the pair, so `1 < {k: 1}` failed to
+/// plan and `a.id <= {k: 1}` in a WHERE failed at run time ("Nested comparison").
+#[tokio::test]
+async fn boolean_context_is_strict_map_against_a_scalar() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    db.schema()
+        .label("P")
+        .property("id", uni_db::DataType::Int)
+        .property_nullable("age", uni_db::DataType::Int)
+        .apply()
+        .await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:P {id: 1})").await?;
+    tx.commit().await?;
+    for (expr, want) in [
+        ("1 < {k: 1}", Value::Null),
+        ("{k: 1} >= 1", Value::Null),
+        ("1 = {k: 1}", Value::Bool(false)),
+        ("1 <> {k: 1}", Value::Bool(true)),
+        ("a.id <= {k: 1}", Value::Null),
+        ("a.id = {k: 1}", Value::Bool(false)),
+        ("a.id <> {k: 1}", Value::Bool(true)),
+        ("a.age = {k: 1}", Value::Null),
+        ("a.age <> {k: 1}", Value::Null),
+    ] {
+        assert_eq!(
+            single(&db, &format!("MATCH (a:P) RETURN {expr}")).await?,
+            want,
+            "{expr}"
+        );
+    }
+    for (filter, want) in [
+        ("NOT (a.id <= {k: 1})", 0),
+        ("a.id <> {k: 1}", 1),
+        ("NOT (a.id = {k: 1})", 1),
+        ("a.age <> {k: 1}", 0),
+    ] {
+        assert_eq!(
+            single(&db, &format!("MATCH (a:P) WHERE {filter} RETURN count(*)")).await?,
+            Value::Int(want),
+            "{filter}"
+        );
+    }
+    Ok(())
+}

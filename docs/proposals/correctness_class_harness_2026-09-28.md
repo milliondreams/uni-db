@@ -1,6 +1,6 @@
 # Finding silent wrong answers by class, not by customer report
 
-**Date:** 2026-09-28 · **Status:** W1 done (all confirmed defects fixed, plus four found on the way); W2 done (found the OPTIONAL MATCH clause-close class); W3 done (query-rewrite relations, topology fixture, wide tier; eleven engine defects found); W4 in part (Locy↔Cypher relations; five Locy defects found); W5 in part (random programs vs the naive oracle, FOLD over bags); W6 done (fail-open evaluation sites made loud, plus a debug invariant) · **Trigger:** issues #293, #294
+**Date:** 2026-09-28 · **Status:** W1 done (all confirmed defects fixed, plus four found on the way); W2 done (found the OPTIONAL MATCH clause-close class); W3 done (query-rewrite relations, topology fixture, wide tier; eleven engine defects found); W4 done (Locy↔Cypher relations and Locy through the fork, pinned and flush levers); W5 done (oracle covers ALONG, recursive FOLD, BEST BY and PROB); W6 done (fail-open evaluation sites made loud, plus a debug invariant) · **Trigger:** issues #293, #294
 
 ## Why
 
@@ -223,6 +223,41 @@ nightly 5 000 via the existing oracle soak filter. It found one more defect:
 in a schemaless graph a FOLD over a target bound by `IS ... TO` was still cast
 to Float64 (fixed with the W4 type fix). Out of scope still: recursive FOLD,
 whose self-reference contributes the target's folded value, ALONG and BEST BY.
+
+*W4/W5 completion (2026-10-02).* `metamorphic::dqp::locy_levers` runs seven
+Locy programs (plain, FOLD, recursion with negation, a variable-length body,
+ALONG under a FOLD, ALONG with BEST BY over cycles, a recursive FOLD) through
+the fork, pinned and flush levers, every program held to the lever's counter
+witness; the pinned lever also writes after its snapshot and checks the pinned
+side still gives the pre-write answer while the live side moves. Plan cache
+does not apply (Locy has no plan cache) and delete's subset law fails under
+`IS NOT`. Locy's counters were already harvested (the "always 0" note was
+stale); the pinned witness exposed that `snapshot_reads` was never counted for
+an edge or unlabelled-vertex scan, now counted. The oracle evaluates every
+rule as a bag and gained per-path ALONG, recursive FOLD over folded values,
+BEST BY (ASC over cycles, DESC over the acyclic part) and PROB (MNOR, MPROD,
+and the probabilistic `IS NOT` complement), each with hand-computed unit
+tests; all fourteen relations derive facts in a large share of cases. It found
+three defects:
+- an integer ALONG accumulation came back as Float64 (every ALONG column was
+  typed Float64); now unified over the rule's clauses, and a dynamic value
+  for a schemaless property, which a downstream SUM now reads;
+- **silent wrong answer**: a derivation was identified by its clause and its
+  own nodes and edges but not by the fact it extended, so two paths sharing
+  the first hop and diverging below it with equal values were one fact (a
+  downstream SUM read 4 for 7) — #159's class one level down. A hidden
+  `__deriv_ref_*` column now hashes the referenced row. Consequence: an ALONG
+  rule over a zero-weight cycle reports the iteration limit;
+- the pinned-snapshot counter gap above.
+
+The loud defects listed under W6 are closed except one: `count(*)` and every
+other aggregate in a `QUERY ... RETURN` (grouped as Cypher's RETURN, checked
+against Cypher), `LIMIT $n` there (was silently ignored), `x AND NOT a IS r TO
+b` (the condition is the `AND` chain up to the reference; an `OR` before it is
+still refused rather than regrouped), `WHERE n:A|B`, Cypher `1 <= {k: 1}`
+(NULL, `=` false, `<>` true), and Locy `x / 0.0` / `toInteger('abc')` (checked
+expression by expression against Cypher). An inline `WHERE` on a
+variable-length relationship stays refused, as Neo4j refuses it.
 
 **W6 — fail loud by default.** Each class member found so far was silent.
 Debug-build invariant checks at merge/dedup sites (as `merge_fold_contributions`

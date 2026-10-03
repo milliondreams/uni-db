@@ -46,8 +46,11 @@ The aggregates marked *unbounded* are monotone but have no top element, so a rec
 ## Goal Query
 
 ```cypher
-QUERY name [WHERE ...] [RETURN ...]
+QUERY name [WHERE ...] [RETURN [DISTINCT] items [ORDER BY ...] [SKIP n] [LIMIT n]]
 ```
+
+`RETURN` items may aggregate (`count(*)`, `count`, `sum`, `avg`, `min`,
+`max`, `collect`, with `DISTINCT`); the other items are the grouping key.
 
 ## Derive Command
 

@@ -4053,6 +4053,9 @@ The replace-on-re-derivation merge above is only correct if the derivation key r
 | `__deriv_vid_{v}` | `{v}._vid`, a MATCH-bound node not yielded bare | derivations through different nodes |
 | `__deriv_eid_{r}` | `{r}._eid`, a single-hop relationship | **parallel edges** between the same pair of nodes |
 | `__deriv_path_{r}` | `{r}`, the edge list of a variable-length relationship | **distinct paths** between the same endpoints |
+| `__deriv_ref_{c}_{o}` | `__locy_row_hash` of every column of the fact the clause's `o`-th positive same-stratum IS-ref read (contributions view only) | extensions of **different referenced facts** — two sub-paths that share the first hop and diverge below it |
+
+The referenced-fact column hashes the whole referenced row, its own hidden columns included, so the identity chains through the derivation at a fixed 16 bytes (`df_graph/locy_row_hash.rs`). Without it, `0 -> 1` followed by two parallel `1 -> 2` edges of equal weight was one `(0, 2, 3)` fact, not two, and a downstream SUM read 4 instead of 7 — found by the random-program oracle. A reference reading the **folded** view gets no such column: that row is the child's KEY with its current folded value, so hashing it would give a re-derived contribution a new key each iteration, and it would be appended instead of replacing the old one. One consequence: an ALONG rule over a cycle whose values do not grow (a zero-weight cycle) now has a new derivation every lap — infinitely many paths — and reaches the iteration limit, reported as such, where it used to converge on a collapsed answer.
 
 An **anonymous** relationship is bound to the positional name `__anon_edge_{clause}_{path}_{elem}` before the body is planned (`name_anonymous_edges`), so it gets a column too. The name is positional so that an IS-ref target's discriminator schema, computed from the compiled rule, matches the one its own clauses project. Binding a variable does not change which rows the MATCH produces.
 
@@ -7368,6 +7371,21 @@ to plan. A list slice bound that is not an integer is a type error. In debug
 builds `debug_assert_facts_are_rows` checks that every non-ALONG rule's facts
 entering the derived store are distinct rows (`locy::locy_facts_and_filters`,
 `bugs::boolean_context_is_strict`, `locy::locy_generator_plugin`).
+
+**Locy and Cypher answer alike where they overlap (W4/W5 completion).**
+A `QUERY ... RETURN` that aggregates groups by its non-aggregate items, as
+Cypher's RETURN does (`aggregate_return` in `locy_query.rs`; an aggregate in
+ORDER BY needs one in the RETURN), and `SKIP`/`LIMIT` take any expression
+over the parameters. Locy `/` and `%` error only for integer zero (a float
+zero gives IEEE Infinity/NaN), and `toInteger`/`toFloat` of an unparsable
+string is NULL. A rule-body condition list may join an expression to an
+IS-reference with `AND` (`rule_and_condition` in `locy.pest`). A label
+disjunction `n:A|B` is an expression (`label_predicate` in the walker, lowered
+to `n:A OR n:B`). A map compared with another concrete type is answered
+without comparing (`is_map_vs_other`). ALONG columns take the type unified
+over the rule's clauses (`along_column_types`), and a Locy aggregate reads a
+numeric CypherValue cell (`numeric_at`). `snapshot_reads` counts edge and
+main-vertex scans of a pinned session too.
 
 **A storage projection names each column once.** The property fetch drops
 repeated names (`retain_first_occurrences`); a repeated equality on a

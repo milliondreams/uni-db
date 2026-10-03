@@ -2429,6 +2429,15 @@ impl StorageManager {
             return Ok(None);
         };
 
+        // Counted where the ceiling is applied, as for vertex tables. Edge and
+        // unlabelled scans of a pinned session read the snapshot but were never
+        // counted, so a pinned query that touched no labelled vertex reported
+        // `snapshot_reads: 0`.
+        if edge_hwm.is_some()
+            && let Some(c) = counters
+        {
+            c.add_snapshot_read();
+        }
         let filter = combine_hwm_filter(edge_hwm, additional_filter);
 
         let mut request = ScanRequest::all(&table_name)
@@ -2473,6 +2482,11 @@ impl StorageManager {
         }
 
         // Combine caller filter with version HWM for snapshot isolation
+        if self.snapshot_version_hwm().is_some()
+            && let Some(c) = counters
+        {
+            c.add_snapshot_read();
+        }
         let full_filter = combine_hwm_filter(self.version_high_water_mark(), filter);
 
         let request = ScanRequest::all(table_name)

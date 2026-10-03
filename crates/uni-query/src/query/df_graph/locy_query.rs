@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use uni_common::Value;
-use uni_cypher::ast::{CypherLiteral, Expr, ReturnItem};
+use uni_cypher::ast::{Expr, ReturnItem};
 use uni_cypher::locy_ast::GoalQuery;
 use uni_locy::{CompiledProgram, FactRow, LocyConfig, LocyError, LocyStats};
 
@@ -147,6 +147,15 @@ pub(super) fn apply_return_clause(
         Some(rc) => rc,
         None => return Ok(rows),
     };
+    // Aggregating RETURN: fold each group to one row, then project as usual.
+    let aggregated;
+    let (rows, rc) = match aggregate_return(rows, rc, params)? {
+        Aggregation::None(rows) => (rows, rc),
+        Aggregation::Grouped(rows, rewritten) => {
+            aggregated = *rewritten;
+            (rows, &aggregated)
+        }
+    };
 
     // Project columns. Params are merged into each row so $name references
     // in RETURN expressions (e.g. RETURN $agent_id AS id) resolve correctly.
@@ -223,22 +232,250 @@ pub(super) fn apply_return_clause(
     }
     let mut projected: Vec<FactRow> = entries.into_iter().map(|(row, _)| row).collect();
 
-    // Skip
-    if let Some(Expr::Literal(CypherLiteral::Integer(n))) = &rc.skip {
-        let n = *n as usize;
-        if n < projected.len() {
-            projected = projected[n..].to_vec();
-        } else {
-            projected.clear();
-        }
+    // SKIP / LIMIT take any expression over the parameters. Only an integer
+    // literal used to be honoured: `LIMIT $n` was silently ignored.
+    if let Some(n) = row_count_bound(rc.skip.as_ref(), "SKIP", params)? {
+        projected.drain(..n.min(projected.len()));
     }
-
-    // Limit
-    if let Some(Expr::Literal(CypherLiteral::Integer(n))) = &rc.limit {
-        projected.truncate(*n as usize);
+    if let Some(n) = row_count_bound(rc.limit.as_ref(), "LIMIT", params)? {
+        projected.truncate(n);
     }
 
     Ok(projected)
+}
+
+/// Evaluates a `SKIP` / `LIMIT` bound, which must be a non-negative integer.
+fn row_count_bound(
+    expr: Option<&Expr>,
+    clause: &str,
+    params: &HashMap<String, Value>,
+) -> Result<Option<usize>, LocyError> {
+    let Some(expr) = expr else {
+        return Ok(None);
+    };
+    match eval_expr(expr, &merge_params(&FactRow::new(), params))? {
+        Value::Int(n) if n >= 0 => Ok(Some(n as usize)),
+        other => Err(LocyError::TypeError {
+            message: format!("{clause} must be a non-negative integer, got {other:?}"),
+        }),
+    }
+}
+
+/// The rows a `RETURN` projects: the input, or one row per group.
+enum Aggregation {
+    None(Vec<FactRow>),
+    /// One row per group, carrying each aggregate under a placeholder column,
+    /// and the clause rewritten to read the placeholders.
+    Grouped(Vec<FactRow>, Box<uni_cypher::ast::ReturnClause>),
+}
+
+const AGG_PLACEHOLDER: &str = "__locy_agg_";
+
+/// Groups a `QUERY ... RETURN` that aggregates, as Cypher's `RETURN` does: the
+/// items without an aggregate are the grouping key, every aggregate (anywhere
+/// in an item or an `ORDER BY` key) is evaluated over its group, and with no
+/// grouping key an empty input is still one row (`count(*)` is 0). Aggregates
+/// were evaluated row by row, so `count(*)` failed ("unsupported expression:
+/// Wildcard") and `sum(x)` was not a sum.
+fn aggregate_return(
+    rows: Vec<FactRow>,
+    rc: &uni_cypher::ast::ReturnClause,
+    params: &HashMap<String, Value>,
+) -> Result<Aggregation, LocyError> {
+    let item_exprs = rc.items.iter().filter_map(|item| match item {
+        ReturnItem::Expr { expr, .. } => Some(expr),
+        ReturnItem::All => None,
+    });
+    if !item_exprs.clone().any(contains_aggregate) {
+        if rc
+            .order_by
+            .iter()
+            .flatten()
+            .any(|sort| contains_aggregate(&sort.expr))
+        {
+            return Err(LocyError::TypeError {
+                message: "an aggregate in ORDER BY needs an aggregate in the RETURN".to_string(),
+            });
+        }
+        return Ok(Aggregation::None(rows));
+    }
+    if rc.items.iter().any(|i| matches!(i, ReturnItem::All)) {
+        return Err(LocyError::TypeError {
+            message: "RETURN * cannot be combined with an aggregate".to_string(),
+        });
+    }
+
+    let mut aggregates: Vec<Expr> = Vec::new();
+    let mut rewritten = rc.clone();
+    for item in &mut rewritten.items {
+        if let ReturnItem::Expr { expr, alias, .. } = item
+            && contains_aggregate(expr)
+        {
+            alias.get_or_insert_with(|| return_item_name(expr));
+            *expr = lift_aggregates(expr.clone(), &mut aggregates);
+        }
+    }
+    if let Some(order_by) = &mut rewritten.order_by {
+        for sort in order_by {
+            sort.expr = lift_aggregates(sort.expr.clone(), &mut aggregates);
+        }
+    }
+    let keys: Vec<&Expr> = rc
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ReturnItem::Expr { expr, .. } if !contains_aggregate(expr) => Some(expr),
+            _ => None,
+        })
+        .collect();
+
+    // Groups in first-seen order.
+    let mut index: HashMap<Vec<Value>, usize> = HashMap::new();
+    let mut groups: Vec<Vec<FactRow>> = Vec::new();
+    for row in rows {
+        let merged = merge_params(&row, params);
+        let key = keys
+            .iter()
+            .map(|k| eval_expr(k, &merged))
+            .collect::<Result<Vec<_>, _>>()?;
+        let slot = *index.entry(key).or_insert_with(|| {
+            groups.push(Vec::new());
+            groups.len() - 1
+        });
+        groups[slot].push(merged);
+    }
+    if groups.is_empty() && keys.is_empty() {
+        groups.push(Vec::new());
+    }
+
+    let mut out = Vec::with_capacity(groups.len());
+    for group in groups {
+        let mut row = group.first().cloned().unwrap_or_default();
+        for (i, agg) in aggregates.iter().enumerate() {
+            row.insert(format!("{AGG_PLACEHOLDER}{i}"), aggregate(agg, &group)?);
+        }
+        out.push(row);
+    }
+    Ok(Aggregation::Grouped(out, Box::new(rewritten)))
+}
+
+/// An aggregate function call itself. (`Expr::is_aggregate` answers "contains
+/// an aggregate" for most nodes, but only the call's own name for a function.)
+fn is_aggregate_call(expr: &Expr) -> bool {
+    matches!(expr, Expr::FunctionCall { .. }) && expr.is_aggregate()
+}
+
+fn contains_aggregate(expr: &Expr) -> bool {
+    if is_aggregate_call(expr) {
+        return true;
+    }
+    let mut found = false;
+    expr.for_each_child(&mut |child| found |= contains_aggregate(child));
+    found
+}
+
+/// Replaces each aggregate in `expr` with a placeholder variable, recording it.
+fn lift_aggregates(expr: Expr, aggregates: &mut Vec<Expr>) -> Expr {
+    if is_aggregate_call(&expr) {
+        let i = aggregates
+            .iter()
+            .position(|a| *a == expr)
+            .unwrap_or_else(|| {
+                aggregates.push(expr);
+                aggregates.len() - 1
+            });
+        return Expr::Variable(format!("{AGG_PLACEHOLDER}{i}"));
+    }
+    expr.map_children(&mut |child| lift_aggregates(child, aggregates))
+}
+
+/// One aggregate over a group, with Cypher's semantics: NULLs are skipped,
+/// `sum` of nothing is 0 (an integer sum stays an integer), `avg`, `min` and
+/// `max` of nothing are NULL, and `collect` of nothing is `[]`.
+fn aggregate(expr: &Expr, group: &[FactRow]) -> Result<Value, LocyError> {
+    let Expr::FunctionCall {
+        name,
+        args,
+        distinct,
+        ..
+    } = expr
+    else {
+        unreachable!("lifted only aggregates");
+    };
+    let name = name.to_lowercase();
+    if name == "count" && matches!(args.as_slice(), [Expr::Wildcard]) {
+        return Ok(Value::Int(group.len() as i64));
+    }
+    let [arg] = args.as_slice() else {
+        return Err(LocyError::TypeError {
+            message: format!("{name}() in a QUERY RETURN takes one argument"),
+        });
+    };
+    let mut values = Vec::with_capacity(group.len());
+    for row in group {
+        let v = eval_expr(arg, row)?;
+        if !v.is_null() && !(*distinct && values.contains(&v)) {
+            values.push(v);
+        }
+    }
+    let numbers = |values: &[Value]| -> Result<Vec<f64>, LocyError> {
+        values
+            .iter()
+            .map(|v| {
+                v.as_f64().ok_or_else(|| LocyError::TypeError {
+                    message: format!("{name}() requires numbers, got {v:?}"),
+                })
+            })
+            .collect()
+    };
+    match name.as_str() {
+        "count" => Ok(Value::Int(values.len() as i64)),
+        "collect" => Ok(Value::List(values)),
+        "sum" => {
+            if values.iter().all(|v| matches!(v, Value::Int(_))) {
+                let mut total = 0i64;
+                for v in &values {
+                    let Value::Int(i) = v else { unreachable!() };
+                    total = total
+                        .checked_add(*i)
+                        .ok_or_else(|| LocyError::EvaluationError {
+                            message: "integer overflow in sum()".to_string(),
+                        })?;
+                }
+                Ok(Value::Int(total))
+            } else {
+                Ok(Value::Float(numbers(&values)?.iter().sum()))
+            }
+        }
+        "avg" => {
+            let ns = numbers(&values)?;
+            Ok(if ns.is_empty() {
+                Value::Null
+            } else {
+                Value::Float(ns.iter().sum::<f64>() / ns.len() as f64)
+            })
+        }
+        "min" | "max" => {
+            let want = if name == "min" {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            };
+            Ok(values
+                .into_iter()
+                .reduce(|best, v| {
+                    if value_cmp(&v, &best) == want {
+                        v
+                    } else {
+                        best
+                    }
+                })
+                .unwrap_or(Value::Null))
+        }
+        other => Err(LocyError::TypeError {
+            message: format!("aggregate {other}() is not supported in a QUERY RETURN"),
+        }),
+    }
 }
 
 /// Merge query parameters into a row so that `Expr::Parameter(name)` can

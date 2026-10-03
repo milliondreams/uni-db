@@ -1020,6 +1020,15 @@ fn numeric_at(col: &dyn Array, i: usize) -> Option<f64> {
         DataType::UInt32 => Some(f64::from(col.as_primitive::<UInt32Type>().value(i))),
         DataType::UInt16 => Some(f64::from(col.as_primitive::<UInt16Type>().value(i))),
         DataType::UInt8 => Some(f64::from(col.as_primitive::<UInt8Type>().value(i))),
+        // A dynamically typed (CypherValue) cell holding a number: a schemaless
+        // property, or an ALONG column over one. Anything else stays unreadable.
+        DataType::LargeBinary => {
+            match uni_common::cypher_value_codec::decode(col.as_binary::<i64>().value(i)) {
+                Ok(uni_common::Value::Int(n)) => Some(n as f64),
+                Ok(uni_common::Value::Float(f)) => Some(f),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }

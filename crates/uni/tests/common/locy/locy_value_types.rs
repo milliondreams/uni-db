@@ -153,3 +153,77 @@ async fn locy_value_types_schemaless() -> Result<()> {
     assert_eq!(row, vec![Value::Int(1), Value::Int(4)]);
     Ok(())
 }
+
+/// An ALONG accumulation keeps its type, unified over the rule's clauses: an
+/// integer path cost is an integer (every ALONG column was Float64), one float
+/// step makes it a float, and over a schemaless graph it is the stored value,
+/// which a downstream SUM can still read. Found by the W5 random-program oracle.
+#[tokio::test]
+async fn locy_value_types_along() -> Result<()> {
+    let db = open().await?;
+    let base = "CREATE RULE c AS MATCH (a:P)-[e:K]->(b:P) ALONG q = e.w YIELD KEY a, KEY b, q ";
+    let row = query_row(
+        &db,
+        &format!(
+            "{base}CREATE RULE c AS MATCH (a:P)-[e:K]->(m:P) WHERE m IS c TO b \
+             ALONG q = prev.q + e.w YIELD KEY a, KEY b, q \
+             QUERY c WHERE a.id = 1 AND b.id = 3 AND q > 7 RETURN q AS c0"
+        ),
+    )
+    .await?;
+    assert_eq!(row, vec![Value::Int(8)]);
+    let row = query_row(
+        &db,
+        &format!(
+            "{base}CREATE RULE c AS MATCH (a:P)-[e:K]->(m:P) WHERE m IS c TO b \
+             ALONG q = prev.q * 0.5 + e.w YIELD KEY a, KEY b, q \
+             QUERY c WHERE a.id = 1 AND b.id = 3 AND q > 4 RETURN q AS c0"
+        ),
+    )
+    .await?;
+    assert_eq!(row, vec![Value::Float(7.5)]);
+    // Above 2^53.
+    let row = query_row(
+        &db,
+        &format!(
+            "CREATE RULE c AS MATCH (a:P)-[e:K]->(b:P) ALONG q = b.big + 0 YIELD KEY a, KEY b, q \
+             QUERY c WHERE b.id = 2 RETURN q AS c0"
+        ),
+    )
+    .await?;
+    assert_eq!(row, vec![Value::Int(BIG)]);
+
+    // Schemaless.
+    let db = Uni::in_memory().build().await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (a:N {id: 0})-[:E {w: 2}]->(b:N {id: 1})-[:E {w: 3}]->(c:N {id: 2})")
+        .await?;
+    tx.commit().await?;
+    let row = query_row(
+        &db,
+        "CREATE RULE c AS MATCH (a:N)-[e:E]->(b:N) ALONG q = e.w YIELD KEY a, KEY b, q \
+         CREATE RULE c AS MATCH (a:N)-[e:E]->(m:N) WHERE m IS c TO b ALONG q = prev.q + e.w \
+         YIELD KEY a, KEY b, q \
+         CREATE RULE t AS MATCH (a:N) WHERE a IS c TO b FOLD s = SUM(q) YIELD KEY a, s \
+         QUERY c WHERE a.id = 0 AND b.id = 2 RETURN q AS c0",
+    )
+    .await?;
+    assert_eq!(row, vec![Value::Int(5)]);
+    let result = db
+        .session()
+        .locy(
+            "CREATE RULE c AS MATCH (a:N)-[e:E]->(b:N) ALONG q = e.w YIELD KEY a, KEY b, q \
+             CREATE RULE c AS MATCH (a:N)-[e:E]->(m:N) WHERE m IS c TO b ALONG q = prev.q + e.w \
+             YIELD KEY a, KEY b, q \
+             CREATE RULE t AS MATCH (a:N) WHERE a IS c TO b FOLD s = SUM(q) YIELD KEY a, s \
+             QUERY t WHERE a.id = 0 RETURN s AS c0",
+        )
+        .await?;
+    let rows = result
+        .command_results()
+        .iter()
+        .find_map(|c| c.as_query())
+        .expect("a QUERY");
+    assert_eq!(rows[0].get("c0"), Some(&Value::Float(7.0)));
+    Ok(())
+}

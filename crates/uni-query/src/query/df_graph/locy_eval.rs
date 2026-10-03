@@ -395,25 +395,8 @@ fn eval_locy_binary_op(left: &Value, op: &LocyBinaryOp, right: &Value) -> Result
         LocyBinaryOp::Add => numeric_op(left, right, |a, b| a + b, |a, b| a + b),
         LocyBinaryOp::Sub => numeric_op(left, right, |a, b| a - b, |a, b| a - b),
         LocyBinaryOp::Mul => numeric_op(left, right, |a, b| a * b, |a, b| a * b),
-        LocyBinaryOp::Div => {
-            let r = right.as_f64().unwrap_or(0.0);
-            if r == 0.0 {
-                return Err(LocyError::EvaluationError {
-                    message: "division by zero".to_string(),
-                });
-            }
-            numeric_op(left, right, |a, b| a / b, |a, b| a / b)
-        }
-        LocyBinaryOp::Mod => {
-            // Guard against modulo by zero: an integer `a % 0` panics in Rust,
-            // so return a clean evaluation error instead of aborting the query.
-            if right.as_f64().unwrap_or(0.0) == 0.0 {
-                return Err(LocyError::EvaluationError {
-                    message: "modulo by zero".to_string(),
-                });
-            }
-            numeric_op(left, right, |a, b| a % b, |a, b| a % b)
-        }
+        LocyBinaryOp::Div => divide(left, right),
+        LocyBinaryOp::Mod => modulo(left, right),
         LocyBinaryOp::Pow => {
             let l = left.as_f64().ok_or_else(|| LocyError::TypeError {
                 message: format!("pow requires numeric, got {left:?}"),
@@ -447,24 +430,8 @@ fn eval_binary_op(left: &Value, op: &BinaryOp, right: &Value) -> Result<Value, L
         BinaryOp::Add => numeric_op(left, right, |a, b| a + b, |a, b| a + b),
         BinaryOp::Sub => numeric_op(left, right, |a, b| a - b, |a, b| a - b),
         BinaryOp::Mul => numeric_op(left, right, |a, b| a * b, |a, b| a * b),
-        BinaryOp::Div => {
-            // Guard against integer division by zero, which panics in Rust.
-            if right.as_f64().unwrap_or(0.0) == 0.0 {
-                return Err(LocyError::EvaluationError {
-                    message: "division by zero".to_string(),
-                });
-            }
-            numeric_op(left, right, |a, b| a / b, |a, b| a / b)
-        }
-        BinaryOp::Mod => {
-            // Guard against integer modulo by zero, which panics in Rust.
-            if right.as_f64().unwrap_or(0.0) == 0.0 {
-                return Err(LocyError::EvaluationError {
-                    message: "modulo by zero".to_string(),
-                });
-            }
-            numeric_op(left, right, |a, b| a % b, |a, b| a % b)
-        }
+        BinaryOp::Div => divide(left, right),
+        BinaryOp::Mod => modulo(left, right),
         BinaryOp::Pow => {
             let l = left.as_f64().ok_or_else(|| LocyError::TypeError {
                 message: format!("pow requires numeric, got {left:?}"),
@@ -498,6 +465,28 @@ fn eval_binary_op(left: &Value, op: &BinaryOp, right: &Value) -> Result<Value, L
     }
 }
 
+/// `/`, as in Cypher: an integer divided by integer zero is an error (it
+/// panics in Rust); a float division follows IEEE 754, so `1 / 0.0` is
+/// Infinity and `0 / 0.0` NaN. Every zero divisor used to be an error.
+fn divide(left: &Value, right: &Value) -> Result<Value, LocyError> {
+    if let (Value::Int(_), Value::Int(0)) = (left, right) {
+        return Err(LocyError::EvaluationError {
+            message: "division by zero".to_string(),
+        });
+    }
+    numeric_op(left, right, i64::wrapping_div, |a, b| a / b)
+}
+
+/// `%`, as in Cypher: integer modulo zero is an error; a float one is NaN.
+fn modulo(left: &Value, right: &Value) -> Result<Value, LocyError> {
+    if let (Value::Int(_), Value::Int(0)) = (left, right) {
+        return Err(LocyError::EvaluationError {
+            message: "modulo by zero".to_string(),
+        });
+    }
+    numeric_op(left, right, i64::wrapping_rem, |a, b| a % b)
+}
+
 fn numeric_op(
     left: &Value,
     right: &Value,
@@ -526,13 +515,14 @@ fn eval_function(name: &str, args: &[Value]) -> Result<Value, LocyError> {
             match v {
                 Value::Int(i) => Ok(Value::Int(*i)),
                 Value::Float(f) => Ok(Value::Int(*f as i64)),
-                Value::String(s) => {
-                    s.parse::<i64>()
-                        .map(Value::Int)
-                        .map_err(|_| LocyError::TypeError {
-                            message: format!("cannot convert '{s}' to integer"),
-                        })
-                }
+                // A string that is not a number converts to NULL, as in
+                // Cypher; it used to be an error.
+                Value::String(s) => Ok(s
+                    .trim()
+                    .parse::<i64>()
+                    .map(Value::Int)
+                    .or_else(|_| s.trim().parse::<f64>().map(|f| Value::Int(f as i64)))
+                    .unwrap_or(Value::Null)),
                 _ => Ok(Value::Null),
             }
         }
@@ -541,13 +531,11 @@ fn eval_function(name: &str, args: &[Value]) -> Result<Value, LocyError> {
             match v {
                 Value::Float(f) => Ok(Value::Float(*f)),
                 Value::Int(i) => Ok(Value::Float(*i as f64)),
-                Value::String(s) => {
-                    s.parse::<f64>()
-                        .map(Value::Float)
-                        .map_err(|_| LocyError::TypeError {
-                            message: format!("cannot convert '{s}' to float"),
-                        })
-                }
+                Value::String(s) => Ok(s
+                    .trim()
+                    .parse::<f64>()
+                    .map(Value::Float)
+                    .unwrap_or(Value::Null)),
                 _ => Ok(Value::Null),
             }
         }

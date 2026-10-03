@@ -209,6 +209,102 @@ fn uniform_declared_type(schema: &Schema, prop: &str) -> Option<DataType> {
     types.all(|t| t == first).then_some(first)
 }
 
+/// The Arrow type of each ALONG column, unified over every clause binding it.
+///
+/// An accumulation that stays integral (`e.w`, `prev.q + e.w`, `prev.n * 2`
+/// over integer properties and literals) is Int64; any float part makes it
+/// Float64; a property declared nowhere (a schemaless graph) leaves it the
+/// dynamic CypherValue the arithmetic produces. Every ALONG column was Float64,
+/// so an integer path cost came back as `3.0` — and above 2^53, wrong.
+fn along_column_types(clauses: &[CompiledClause], schema: &Schema) -> HashMap<String, DataType> {
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum Kind {
+        /// `prev.x`: whatever the column is.
+        Neutral,
+        Int,
+        Float,
+        Dynamic,
+    }
+    fn kind(expr: &LocyExpr, schema: &Schema, labels: &HashMap<String, String>) -> Kind {
+        match expr {
+            LocyExpr::PrevRef(_) => Kind::Neutral,
+            LocyExpr::Cypher(Expr::Literal(CypherLiteral::Integer(_))) => Kind::Int,
+            LocyExpr::Cypher(Expr::Literal(CypherLiteral::Float(_))) => Kind::Float,
+            LocyExpr::Cypher(Expr::Property(object, prop)) => {
+                let Expr::Variable(var) = object.as_ref() else {
+                    return Kind::Float;
+                };
+                let declared = property_arrow_type(schema, labels, var, prop)
+                    .or_else(|| uniform_declared_type(schema, prop));
+                match declared {
+                    Some(DataType::Int64 | DataType::Int32 | DataType::UInt64) => Kind::Int,
+                    Some(DataType::LargeBinary) => Kind::Dynamic,
+                    Some(_) => Kind::Float,
+                    None if !schema
+                        .properties
+                        .values()
+                        .any(|p| p.contains_key(prop.as_str())) =>
+                    {
+                        Kind::Dynamic
+                    }
+                    None => Kind::Float,
+                }
+            }
+            LocyExpr::Cypher(_) => Kind::Float,
+            LocyExpr::BinaryOp { left, op, right } => {
+                let k = kind(left, schema, labels).max(kind(right, schema, labels));
+                match op {
+                    LocyBinaryOp::Pow if k != Kind::Dynamic => Kind::Float,
+                    _ => k,
+                }
+            }
+            LocyExpr::UnaryOp(_, inner) => kind(inner, schema, labels),
+        }
+    }
+    // A probability is numeric by definition, and the complement / noisy-OR
+    // arithmetic reads it as Float64 (see `infer_yield_type_rec`).
+    let prob_names: HashSet<String> = clauses
+        .iter()
+        .filter_map(|c| match &c.output {
+            RuleOutput::Yield(y) => Some(y.items.iter()),
+            _ => None,
+        })
+        .flatten()
+        .filter(|item| item.is_prob)
+        .filter_map(|item| match &item.expr {
+            Expr::Variable(v) => Some(v.clone()),
+            _ => None,
+        })
+        .collect();
+    let mut kinds: HashMap<String, Kind> = HashMap::new();
+    for clause in clauses {
+        let labels = clause_var_labels(clause);
+        for binding in &clause.along {
+            let k = kind(&binding.expr, schema, &labels);
+            let slot = kinds.entry(binding.name.clone()).or_insert(Kind::Neutral);
+            if k > *slot {
+                *slot = k;
+            }
+        }
+    }
+    kinds
+        .into_iter()
+        .map(|(name, k)| {
+            let k = if prob_names.contains(&name) {
+                Kind::Float
+            } else {
+                k
+            };
+            let dt = match k {
+                Kind::Int => DataType::Int64,
+                Kind::Dynamic => DataType::LargeBinary,
+                Kind::Neutral | Kind::Float => DataType::Float64,
+            };
+            (name, dt)
+        })
+        .collect()
+}
+
 /// The type of a FOLD aggregate's argument, when it can be told.
 ///
 /// `MIN`/`MAX` (and their monotone forms) return their input's type, and
@@ -303,7 +399,7 @@ fn infer_yield_type(
     first_clause: &CompiledClause,
     node_vars: &HashSet<String>,
     fold_output_names: &HashSet<&str>,
-    along_names: &HashSet<&str>,
+    along_types: &HashMap<String, DataType>,
     rule_catalog: &HashMap<String, CompiledRule>,
     is_key: bool,
     schema: &Schema,
@@ -315,7 +411,7 @@ fn infer_yield_type(
         first_clause,
         node_vars,
         fold_output_names,
-        along_names,
+        along_types,
         rule_catalog,
         is_key,
         schema,
@@ -333,7 +429,7 @@ fn infer_yield_type_rec(
     first_clause: &CompiledClause,
     node_vars: &HashSet<String>,
     fold_output_names: &HashSet<&str>,
-    along_names: &HashSet<&str>,
+    along_types: &HashMap<String, DataType>,
     rule_catalog: &HashMap<String, CompiledRule>,
     is_key: bool,
     schema: &Schema,
@@ -360,9 +456,9 @@ fn infer_yield_type_rec(
         }
         return DataType::Float64;
     }
-    // ALONG bindings → Float64 (typically numeric accumulations)
-    if along_names.contains(name) {
-        return DataType::Float64;
+    // ALONG bindings: the type unified over every clause (`along_column_types`).
+    if let Some(dt) = along_types.get(name) {
+        return dt.clone();
     }
     // Look at the yield expression from the first clause. The UInt64 (node-VID)
     // shortcut is gated on the expression being a bare node Variable — NOT on the
@@ -378,11 +474,11 @@ fn infer_yield_type_rec(
                     if node_vars.contains(v) {
                         return DataType::UInt64;
                     }
-                    // A bare Variable referencing an ALONG name → Float64
-                    // (ALONG bindings are numeric). Without this,
-                    // `ew AS link_weight` would infer Variable("ew") as LargeUtf8.
-                    if along_names.contains(v.as_str()) {
-                        return DataType::Float64;
+                    // A bare Variable referencing an ALONG name takes its type.
+                    // Without this, `ew AS link_weight` would infer
+                    // Variable("ew") as LargeUtf8.
+                    if let Some(dt) = along_types.get(v.as_str()) {
+                        return dt.clone();
                     }
                     // A bare Variable naming a NON-KEY value column carried in by a
                     // positive IS-reference: resolve its type from the source rule
@@ -502,7 +598,7 @@ fn infer_is_ref_value_col_type(
         };
         let src_node_vars = collect_node_vars(&rule.clauses, rule_catalog);
         let src_fold: HashSet<&str> = src_clause.fold.iter().map(|fb| fb.name.as_str()).collect();
-        let src_along: HashSet<&str> = src_clause.along.iter().map(|a| a.name.as_str()).collect();
+        let src_along = along_column_types(&rule.clauses, schema);
         let src_var_labels = clause_var_labels(src_clause);
         // Forwarded columns are NON-KEY (filtered above), so `is_key = false`.
         return Some(infer_yield_type_rec(
@@ -700,20 +796,30 @@ struct ClassifierContext {
 fn derivation_discriminator_columns(
     rule: &CompiledRule,
     is_recursive: bool,
+    stratum_rule_names: &HashSet<String>,
+    rule_catalog: &HashMap<String, CompiledRule>,
 ) -> Vec<(String, DataType)> {
-    derivation_discriminators(rule, is_recursive).map_or_else(Vec::new, |vars| {
-        std::iter::once((
-            format!("{FOLD_DISCRIMINATOR_COL_PREFIX}clause"),
-            DataType::Int64,
-        ))
-        .chain(vars.iter().map(|d| (d.column(), d.kind.data_type())))
-        .collect()
-    })
+    derivation_discriminators(rule, is_recursive, stratum_rule_names, rule_catalog).map_or_else(
+        Vec::new,
+        |vars| {
+            std::iter::once((
+                format!("{FOLD_DISCRIMINATOR_COL_PREFIX}clause"),
+                DataType::Int64,
+            ))
+            .chain(vars.iter().map(|d| (d.column(), d.kind.data_type())))
+            .collect()
+        },
+    )
 }
 
 /// The discriminating variables behind [`derivation_discriminator_columns`],
 /// sorted by column name, or `None` when the rule needs no discriminators.
-fn derivation_discriminators(rule: &CompiledRule, is_recursive: bool) -> Option<Vec<DerivVar>> {
+fn derivation_discriminators(
+    rule: &CompiledRule,
+    is_recursive: bool,
+    stratum_rule_names: &HashSet<String>,
+    rule_catalog: &HashMap<String, CompiledRule>,
+) -> Option<Vec<DerivVar>> {
     let carries_fold_or_along = rule
         .clauses
         .iter()
@@ -752,6 +858,14 @@ fn derivation_discriminators(rule: &CompiledRule, is_recursive: bool) -> Option<
                 .chain(match_edge_vars(c, clause_index))
         })
         .filter(|d| !yielded_bare.contains(d.name.as_str()))
+        .chain(
+            rule.clauses
+                .iter()
+                .enumerate()
+                .flat_map(|(clause_index, c)| {
+                    referenced_fact_vars(c, clause_index, stratum_rule_names, rule_catalog)
+                }),
+        )
         .collect();
     vars.sort_by_key(DerivVar::column);
     vars.dedup();
@@ -776,6 +890,16 @@ enum DerivKind {
     /// `__deriv_path_{var}`. Two distinct paths between the same endpoints
     /// differ only here.
     EdgeList,
+    /// The fact a positive same-stratum IS-reference read, as
+    /// `__deriv_ref_{name}`: a hash of the referenced row (`locy_row_hash`).
+    /// Two derivations through the same nodes and edges that extended
+    /// different facts — two sub-paths with equal values — differ only here.
+    Ref {
+        /// The clause holding the reference.
+        clause_index: usize,
+        /// Its position among the clause's positive references.
+        occurrence: usize,
+    },
 }
 
 impl DerivKind {
@@ -784,6 +908,7 @@ impl DerivKind {
         match self {
             Self::Node | Self::Edge => DataType::UInt64,
             Self::EdgeList => build_edge_list_field("_").data_type().clone(),
+            Self::Ref { .. } => crate::query::df_graph::locy_row_hash::row_hash_type(),
         }
     }
 }
@@ -795,6 +920,7 @@ impl DerivVar {
             DerivKind::Node => "vid",
             DerivKind::Edge => "eid",
             DerivKind::EdgeList => "path",
+            DerivKind::Ref { .. } => "ref",
         };
         format!("{FOLD_DISCRIMINATOR_COL_PREFIX}{kind}_{}", self.name)
     }
@@ -804,9 +930,50 @@ impl DerivVar {
         match self.kind {
             DerivKind::Node => format!("{}._vid", self.name),
             DerivKind::Edge => format!("{}._eid", self.name),
-            DerivKind::EdgeList => self.name.clone(),
+            DerivKind::EdgeList | DerivKind::Ref { .. } => self.name.clone(),
         }
     }
+}
+
+/// The referenced-fact discriminators of one clause: one per positive
+/// IS-reference to a rule of the same stratum that the clause reads per
+/// derivation (the Contributions view). A reference reading the Folded view
+/// gets none — that row is its KEY with the child's *current* folded value, so
+/// hashing it would give a re-derived contribution a new identity each
+/// iteration, and it would be added rather than replace the old one.
+///
+/// The view rule here must match the one `build_clause` applies.
+fn referenced_fact_vars(
+    clause: &CompiledClause,
+    clause_index: usize,
+    stratum_rule_names: &HashSet<String>,
+    rule_catalog: &HashMap<String, CompiledRule>,
+) -> Vec<DerivVar> {
+    clause
+        .where_conditions
+        .iter()
+        .filter_map(|c| match c {
+            RuleCondition::IsReference(r) if !r.negated => Some(r),
+            _ => None,
+        })
+        .enumerate()
+        .filter(|(_, r)| {
+            let target = r.rule_name.to_string();
+            let same_stratum = stratum_rule_names.contains(&target);
+            let target_has_fold = rule_catalog
+                .get(&target)
+                .is_some_and(|t| t.clauses.iter().any(|c| !c.fold.is_empty()));
+            let folded_view = same_stratum && target_has_fold && clause.along.is_empty();
+            same_stratum && !folded_view
+        })
+        .map(|(occurrence, _)| DerivVar {
+            name: format!("{clause_index}_{occurrence}"),
+            kind: DerivKind::Ref {
+                clause_index,
+                occurrence,
+            },
+        })
+        .collect()
 }
 
 /// The relationship variables of a clause's MATCH, in pattern order.
@@ -943,7 +1110,7 @@ fn fold_input_column_types(
                     fold_clause,
                     &node_vars,
                     &fold_names,
-                    &HashSet::new(),
+                    &HashMap::new(),
                     rule_catalog,
                     false,
                     schema,
@@ -1263,9 +1430,18 @@ impl<'a> LocyPlanBuilder<'a> {
 
         // Derivation discriminators for a recursive FOLD / ALONG rule (#159).
         // See `derivation_discriminator_columns`.
-        let deriv_columns = derivation_discriminator_columns(rule, is_recursive);
-        let deriv_vars = derivation_discriminators(rule, is_recursive).unwrap_or_default();
-        let seed_types = fold_input_column_types(rule, rule_catalog, self.planner.schema());
+        let deriv_columns =
+            derivation_discriminator_columns(rule, is_recursive, stratum_rule_names, rule_catalog);
+        let deriv_vars =
+            derivation_discriminators(rule, is_recursive, stratum_rule_names, rule_catalog)
+                .unwrap_or_default();
+        // Columns a sibling clause folds into, and ALONG columns: every clause
+        // must emit them with one type, unified over the rule.
+        let mut seed_types = fold_input_column_types(rule, rule_catalog, self.planner.schema());
+        // A FOLD's type wins over an ALONG binding of the same name.
+        for (name, dt) in along_column_types(&rule.clauses, self.planner.schema()) {
+            seed_types.entry(name).or_insert(dt);
+        }
 
         let mut clauses = Vec::with_capacity(rule.clauses.len());
         for (clause_index, clause) in rule.clauses.iter().enumerate() {
@@ -1390,11 +1566,9 @@ impl<'a> LocyPlanBuilder<'a> {
         let fold_output_names: HashSet<&str> = fold_clause
             .map(|c| c.fold.iter().map(|fb| fb.name.as_str()).collect())
             .unwrap_or_default();
-        let along_names: HashSet<&str> = first_clause
-            .map(|c| c.along.iter().map(|a| a.name.as_str()).collect())
-            .unwrap_or_default();
-        let var_labels = first_clause.map(clause_var_labels).unwrap_or_default();
         let graph_schema = self.planner.schema();
+        let along_types = along_column_types(&rule.clauses, graph_schema);
+        let var_labels = first_clause.map(clause_var_labels).unwrap_or_default();
 
         let yield_schema: Vec<LocyYieldColumn> = rule
             .yield_schema
@@ -1406,7 +1580,7 @@ impl<'a> LocyPlanBuilder<'a> {
                         fc,
                         &node_vars,
                         &fold_output_names,
-                        &along_names,
+                        &along_types,
                         rule_catalog,
                         yc.is_key,
                         graph_schema,
@@ -1648,6 +1822,9 @@ impl<'a> LocyPlanBuilder<'a> {
         let mut is_refs = Vec::new();
         let mut along_bindings = Vec::new();
         let mut positive_is_ref_occurrence: usize = 0;
+        // Each positive reference's scan columns, by occurrence, for its
+        // referenced-fact discriminator (`DerivKind::Ref`).
+        let mut ref_scan_columns: HashMap<usize, Vec<String>> = HashMap::new();
 
         // Bare→aliased name map for non-KEY value columns of non-first positive
         // IS-refs (whose scan columns get an `__isref{n}_` prefix). Used to
@@ -1696,7 +1873,12 @@ impl<'a> LocyPlanBuilder<'a> {
                 // A same-stratum handle is fed live pre-fold facts, so it must
                 // declare the TARGET rule's discriminators — which in a
                 // mutually-recursive stratum need not match this rule's.
-                let target_deriv = derivation_discriminator_columns(target_rule, ctx.is_recursive);
+                let target_deriv = derivation_discriminator_columns(
+                    target_rule,
+                    ctx.is_recursive,
+                    stratum_rule_names,
+                    rule_catalog,
+                );
                 // Issue #162: a positive same-stratum reference to a rule that
                 // carries FOLD reads the folded view, so this clause folds one
                 // value per child rather than one per child *derivation*.
@@ -1821,6 +2003,14 @@ impl<'a> LocyPlanBuilder<'a> {
                     } else {
                         alias_derived_schema(&handle.schema, &col_prefix)
                     };
+                    ref_scan_columns.insert(
+                        positive_is_ref_occurrence - 1,
+                        scan_schema
+                            .fields()
+                            .iter()
+                            .map(|f| f.name().clone())
+                            .collect(),
+                    );
                     let derived_scan = LogicalPlan::LocyDerivedScan {
                         scan_index: handle.scan_index,
                         data: handle.data.clone(),
@@ -2004,7 +2194,7 @@ impl<'a> LocyPlanBuilder<'a> {
             _ => HashMap::new(),
         };
 
-        let along_names_set: HashSet<&str> = clause.along.iter().map(|a| a.name.as_str()).collect();
+        let along_types = along_column_types(std::slice::from_ref(clause), self.planner.schema());
 
         // Pre-compute rewritten ALONG expressions for variable substitution.
         // When a YIELD expression references an ALONG name (e.g., `ew * 2.0 AS score`
@@ -2059,7 +2249,7 @@ impl<'a> LocyPlanBuilder<'a> {
                     clause,
                     node_vars,
                     &fold_output_names,
-                    &along_names_set,
+                    &along_types,
                     rule_catalog,
                     yc.is_key,
                     graph_schema,
@@ -2106,7 +2296,7 @@ impl<'a> LocyPlanBuilder<'a> {
                     clause,
                     node_vars,
                     &fold_output_names,
-                    &along_names_set,
+                    &along_types,
                     rule_catalog,
                     false, // a FOLD input is never a KEY column
                     graph_schema,
@@ -2164,10 +2354,21 @@ impl<'a> LocyPlanBuilder<'a> {
                 // cross-domain against `UInt64` — the cast would be skipped and
                 // the clauses would silently diverge in schema. For the bound
                 // arm the cast is a no-op.
-                let expr = if bound_here.contains(&var.name) {
-                    Expr::Variable(var.id_column())
-                } else {
-                    Expr::Literal(CypherLiteral::Null)
+                let expr = match var.kind {
+                    DerivKind::Ref {
+                        clause_index,
+                        occurrence,
+                    } => match ref_scan_columns.get(&occurrence) {
+                        Some(columns) if clause_index == ctx.clause_index => Expr::FunctionCall {
+                            name: crate::query::df_graph::locy_row_hash::ROW_HASH_FN.to_string(),
+                            args: columns.iter().cloned().map(Expr::Variable).collect(),
+                            distinct: false,
+                            window_spec: None,
+                        },
+                        _ => Expr::Literal(CypherLiteral::Null),
+                    },
+                    _ if bound_here.contains(&var.name) => Expr::Variable(var.id_column()),
+                    _ => Expr::Literal(CypherLiteral::Null),
                 };
                 projections.push((expr, Some(var.column())));
                 target_types.push(var.kind.data_type());
@@ -2788,9 +2989,7 @@ fn yield_schema_to_arrow_from_rule(
     let fold_names: HashSet<&str> = first_clause
         .map(|c| c.fold.iter().map(|fb| fb.name.as_str()).collect())
         .unwrap_or_default();
-    let along_names: HashSet<&str> = first_clause
-        .map(|c| c.along.iter().map(|a| a.name.as_str()).collect())
-        .unwrap_or_default();
+    let along_types = along_column_types(&target_rule.clauses, schema);
     let var_labels = first_clause.map(clause_var_labels).unwrap_or_default();
     // A column some clause folds into is typed by that fold, even when the
     // first clause only seeds it; see `fold_input_column_types`.
@@ -2809,7 +3008,7 @@ fn yield_schema_to_arrow_from_rule(
                     fc,
                     &target_node_vars,
                     &fold_names,
-                    &along_names,
+                    &along_types,
                     rule_catalog,
                     yc.is_key,
                     schema,

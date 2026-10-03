@@ -66,6 +66,7 @@ pub mod locy_priority;
 pub mod locy_profile;
 pub mod locy_program;
 pub mod locy_query;
+pub mod locy_row_hash;
 pub mod locy_slg;
 pub mod locy_traits;
 pub mod locy_validate;

@@ -5258,6 +5258,32 @@ impl HybridPhysicalPlanner {
                 // Fall through to generic expression compilation
             }
 
+            // A recursive rule's referenced-fact discriminator (#159): a hash of
+            // the referenced row's columns, read by name from the derived scan.
+            if let Expr::FunctionCall { name, args, .. } = expr
+                && name == crate::query::df_graph::locy_row_hash::ROW_HASH_FN
+            {
+                let children = args
+                    .iter()
+                    .map(|arg| {
+                        let Expr::Variable(col) = arg else {
+                            return Err(anyhow!("{name} takes column names"));
+                        };
+                        let (idx, _) = schema
+                            .column_with_name(col)
+                            .ok_or_else(|| anyhow!("{name}: no column {col}"))?;
+                        Ok(Arc::new(Column::new(col, idx))
+                            as Arc<dyn datafusion::physical_expr::PhysicalExpr>)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let hash = crate::query::df_graph::locy_row_hash::RowHashExpr::new(children);
+                exprs.push((
+                    Arc::new(hash),
+                    alias.clone().unwrap_or_else(|| name.clone()),
+                ));
+                continue;
+            }
+
             // Generic expression compilation (property access, literals, etc.)
             let compiler = self.expr_compiler(&state, Some(&ctx));
             let physical_expr = compiler.compile(expr, &schema)?;

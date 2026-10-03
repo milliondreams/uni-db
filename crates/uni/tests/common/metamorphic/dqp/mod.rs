@@ -113,6 +113,7 @@ pub mod fork_lever;
 pub mod identity;
 pub mod index_lever;
 pub mod lever;
+pub mod locy_levers;
 pub mod pinned_lever;
 pub mod plan_cache_lever;
 pub mod seed;

@@ -57,7 +57,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use proptest::prelude::*;
-use proptest::test_runner::{Config, TestCaseError, TestRunner};
+use proptest::test_runner::{Config, RngAlgorithm, TestCaseError, TestRng, TestRunner};
 use uni_db::{DataType, Uni, UniConfig};
 
 use crate::diff::{RowBag, bag, bag_eq, bag_union};
@@ -945,12 +945,18 @@ impl Relation {
             }
             Relation::LocyNegation => {
                 let hop = case.hops[0];
-                // Undirected walks and trails disagree at a = b (above), and
-                // without an anchor every pair is checked, which is slow.
+                // Undirected walks and trails disagree at a = b (above).
+                if matches!(hop.dir, Dir::Both) {
+                    return None;
+                }
+                // Without an anchor every pair would be checked, which is slow;
+                // a case without one gets a few fixed ids. Requiring the case's
+                // own anchor applied this relation to about one case in eight,
+                // too few for a small lane's activation check.
                 let anchor = case
                     .anchor
                     .as_ref()
-                    .filter(|_| !matches!(hop.dir, Dir::Both))?;
+                    .map_or_else(|| "a.id IN [0, 1, 5, 9]".to_string(), Pred::render);
                 let vlp = render_rel(hop, Some((1, u32::MAX)), None)
                     .replace(&format!("..{}", u32::MAX), "..");
                 Some(Rewrite {
@@ -959,57 +965,51 @@ impl Relation {
                          WHERE a IS NOT reach TO b YIELD KEY a, KEY b \
                          QUERY un WHERE {} RETURN a.id AS c0, b.id AS c1",
                         reach_rules(hop),
-                        anchor.render()
+                        anchor
                     ),
                     equivalents: vec![vec![format!(
                         "MATCH (a:Person), (b:Person) WHERE {} \
                          AND NOT EXISTS {{ MATCH (a){vlp}(b) }} RETURN a.id AS c0, b.id AS c1",
-                        anchor.render()
+                        anchor
                     )]],
                 })
             }
             Relation::LocyQueryWhere => {
                 // Move the anchor predicate, the inner one, or both, from the
-                // rule body to the QUERY. Moving only the inner one applied to
-                // about one case in eight, too few for a small lane's
-                // activation check to mean anything.
-                let anchor = case.anchor.as_ref();
-                let inner = case.inner.as_ref();
-                if anchor.is_none() && inner.is_none() {
-                    return None;
-                }
-                let mut splits: Vec<(Option<&Pred>, Option<&Pred>)> = Vec::new();
-                if let Some(i) = inner {
-                    splits.push((anchor, Some(i)));
-                }
-                if let Some(a) = anchor {
-                    splits.push((inner, Some(a)));
-                    if inner.is_some() {
-                        splits.push((None, None));
-                    }
-                }
-                let program = |body: String, query: String| {
+                // rule body to the QUERY. A case with neither gets a few fixed
+                // anchor ids, so the relation applies to every case: moving only
+                // the inner one applied to about one case in eight, too few for
+                // a small lane's activation check to mean anything.
+                let inner = case.inner.as_ref().map(Pred::render);
+                let anchor = case
+                    .anchor
+                    .as_ref()
+                    .map(Pred::render)
+                    .or_else(|| inner.is_none().then(|| "a.id IN [0, 1, 5, 9]".to_string()));
+                let program = |body: &[&String], query: &[&String]| {
                     format!(
-                        "CREATE RULE r AS MATCH {}{body} YIELD KEY a, KEY b \
-                         QUERY r{query} RETURN a.id AS c0, b.id AS c1",
-                        case.locy_pattern()
+                        "CREATE RULE r AS MATCH {}{} YIELD KEY a, KEY b \
+                         QUERY r{} RETURN a.id AS c0, b.id AS c1",
+                        case.locy_pattern(),
+                        where_all(body.iter().map(|p| (*p).clone())),
+                        where_all(query.iter().map(|p| (*p).clone())),
                     )
                 };
-                let both = where_all(anchor.into_iter().chain(inner).map(Pred::render));
-                let equivalents = splits
-                    .into_iter()
-                    .map(|(kept, moved)| {
-                        let body = where_all(kept.into_iter().map(Pred::render));
-                        let query = match moved {
-                            Some(p) => format!(" WHERE {}", p.render()),
-                            None => both.clone(),
-                        };
-                        let body = if moved.is_none() { String::new() } else { body };
-                        vec![program(body, query)]
-                    })
-                    .collect();
+                let both: Vec<&String> = anchor.iter().chain(inner.iter()).collect();
+                let mut equivalents = Vec::new();
+                if let Some(i) = &inner {
+                    let kept: Vec<&String> = anchor.iter().collect();
+                    equivalents.push(vec![program(&kept, &[i])]);
+                }
+                if let Some(a) = &anchor {
+                    let kept: Vec<&String> = inner.iter().collect();
+                    equivalents.push(vec![program(&kept, &[a])]);
+                }
+                if both.len() == 2 {
+                    equivalents.push(vec![program(&[], &both)]);
+                }
                 Some(Rewrite {
-                    reference: program(case.body_where(), String::new()),
+                    reference: program(&both, &[]),
                     equivalents,
                 })
             }
@@ -1152,13 +1152,31 @@ async fn check_case(
     Ok(())
 }
 
+/// How a topology run draws its cases.
+#[derive(Clone, Copy, Debug)]
+pub enum Seeding {
+    /// The same cases every run. A PR lane's activation checks ("each relation
+    /// returned rows in at least one case") then pass or fail on the code, not
+    /// on the draw: at eight random cases and fourteen relations a few percent
+    /// of runs failed by chance.
+    Fixed,
+    /// Fresh cases every run, for breadth: the nightly soaks.
+    Random,
+}
+
 /// Runs every relation over `cases` generated cases against one fixture.
 ///
 /// # Panics
 ///
 /// Panics on a disagreement (after shrinking), on a query error, or when a
 /// relation's non-empty rate falls below [`MIN_NON_EMPTY_RATE`].
-pub fn drive_topo(label: &str, layout: Layout, execution_batch_size: Option<usize>, cases: u32) {
+pub fn drive_topo(
+    label: &str,
+    layout: Layout,
+    execution_batch_size: Option<usize>,
+    cases: u32,
+    seeding: Seeding,
+) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -1167,11 +1185,17 @@ pub fn drive_topo(label: &str, layout: Layout, execution_batch_size: Option<usiz
         .block_on(build_topo(layout, execution_batch_size))
         .expect("build topology fixture");
     let tallies = RefCell::new(vec![Tally::default(); Relation::ALL.len()]);
-    let mut runner = TestRunner::new(Config {
+    let config = Config {
         cases,
         failure_persistence: None,
         ..Config::default()
-    });
+    };
+    let mut runner = match seeding {
+        Seeding::Fixed => {
+            TestRunner::new_with_rng(config, TestRng::deterministic_rng(RngAlgorithm::ChaCha))
+        }
+        Seeding::Random => TestRunner::new(config),
+    };
     let outcome = runner.run(&arb_topo_case(), |case| {
         rt.block_on(check_case(&db, &case, &tallies))
             .map_err(TestCaseError::fail)
@@ -1220,7 +1244,13 @@ pub fn drive_topo(label: &str, layout: Layout, execution_batch_size: Option<usiz
 /// test's six-minute nextest limit (`.config/nextest.toml`).
 #[test]
 fn topo_rewrites_flushed() {
-    drive_topo("flushed", Layout::Flushed, None, cases_from_env(40));
+    drive_topo(
+        "flushed",
+        Layout::Flushed,
+        None,
+        cases_from_env(40),
+        Seeding::Fixed,
+    );
 }
 
 /// Half the graph in L0 and a two-row execution batch, so every multi-row
@@ -1236,6 +1266,7 @@ fn topo_rewrites_unflushed_small_batches() {
         Layout::HalfUnflushed,
         Some(2),
         cases_from_env(8),
+        Seeding::Fixed,
     );
 }
 
@@ -1250,6 +1281,7 @@ fn topo_soak() {
         Layout::Flushed,
         None,
         (cases_from_env(20_000) / 10).max(1),
+        Seeding::Random,
     );
 }
 
@@ -1264,6 +1296,7 @@ fn topo_small_batches_soak() {
         Layout::HalfUnflushed,
         Some(2),
         (cases_from_env(20_000) / 40).max(1),
+        Seeding::Random,
     );
 }
 

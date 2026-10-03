@@ -23,11 +23,12 @@ use proptest::prelude::*;
 use uni_common::{LocyIncompleteReason, Value};
 use uni_db::{Uni, UniError};
 
-use uni_locy_oracle::eval::{Relation, evaluate};
+use uni_locy_oracle::eval::{Relation, evaluate, evaluate_bags};
 use uni_locy_oracle::generator::{
     build_complement, build_layered_dag, build_union, expected_closure_size,
     random_program_strategy,
 };
+use uni_locy_oracle::ir::PROB_SCALE;
 use uni_locy_oracle::ir::{Generated, Tuple};
 
 /// Recovers the seeded integer id from a `YIELD KEY` column value.
@@ -420,10 +421,30 @@ fn closure_is_set_soak() {
 /// coerced: an integer `MIN` that came back as `2.0` is the defect W4 found.
 fn column_to_i64(column: &str, value: &Value) -> Option<i64> {
     match value {
-        Value::Node(_) | Value::Int(_) => Some(key_to_id(value)),
+        Value::Node(_) | Value::Int(_) if column != PROB_COLUMN => Some(key_to_id(value)),
         Value::Float(f) if column == "s" && f.fract() == 0.0 => Some(*f as i64),
+        // A probability, in the oracle's fixed-point units.
+        Value::Float(f) if column == PROB_COLUMN => Some((f * PROB_SCALE as f64).round() as i64),
         _ => None,
     }
+}
+
+/// The PROB column of every probabilistic relation the generator emits.
+const PROB_COLUMN: &str = "pb";
+
+/// Whether two sorted bags agree, a probability within two fixed-point units
+/// (floating-point evaluation order differs between the two sides).
+fn bags_agree(got: &[Tuple], want: &[Tuple], cols: &[String]) -> bool {
+    got.len() == want.len()
+        && got.iter().zip(want).all(|(g, w)| {
+            g.iter().zip(w).zip(cols).all(|((a, b), c)| {
+                if c == PROB_COLUMN {
+                    (a - b).abs() <= 2
+                } else {
+                    a == b
+                }
+            })
+        })
 }
 
 /// Runs a generated program once and returns every relation that differs from
@@ -435,7 +456,7 @@ async fn all_divergences(
 ) -> Result<Vec<String>> {
     let db = seeded_db(generated).await?;
     let result = db.session().locy(&generated.program_text).await?;
-    let oracle = evaluate(&generated.oracle_rules);
+    let oracle = evaluate_bags(&generated.oracle_rules);
     let mut out = Vec::new();
     let mut rels: Vec<&String> = generated.key_schema.keys().collect();
     rels.sort();
@@ -455,17 +476,15 @@ async fn all_divergences(
             }
             raw.push(tuple);
         }
-        let set = as_set(&raw);
+        // Bags: a plain rule's oracle relation is a set, so an engine
+        // duplicate is a divergence; an ALONG rule's has one row per path.
+        raw.sort();
         let want = oracle.get(rel.as_str()).cloned().unwrap_or_default();
         if !want.is_empty() {
             non_empty.insert(rel.clone());
         }
-        if raw.len() != set.len() || set != want {
-            let mut got: Vec<&Tuple> = raw.iter().collect();
-            got.sort();
-            let mut exp: Vec<&Tuple> = want.iter().collect();
-            exp.sort();
-            out.push(format!("{rel}: engine {got:?}\n    oracle {exp:?}"));
+        if !bags_agree(&raw, &want, cols) {
+            out.push(format!("{rel}: engine {raw:?}\n    oracle {want:?}"));
         }
     }
     Ok(out)
@@ -518,7 +537,10 @@ fn drive_random_programs(cases: u32) {
     let tally = tally.into_inner();
     eprintln!("[oracle:random] cases={cases} non-empty per relation: {tally:?}");
     outcome.expect("a random program's derived facts diverged from the oracle");
-    for rel in ["link", "reach", "un", "deg", "span", "flow"] {
+    for rel in [
+        "link", "reach", "un", "deg", "span", "flow", "cost", "tot", "roll", "opt", "pr", "nor",
+        "prd", "safe",
+    ] {
         let n = tally.get(rel).copied().unwrap_or(0);
         assert!(
             n * 5 >= cases,

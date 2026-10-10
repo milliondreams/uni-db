@@ -138,6 +138,10 @@ pub async fn evaluate_assume(
         ..parent_program.clone()
     };
 
+    // The body's facts are fixed from here on: body commands read them by
+    // shared reference, as top-level commands do.
+    let assume_derived_store = assume_derived_store;
+
     // 5. Execute body commands and collect results
     let mut result_rows = Vec::new();
     let assume_start = Instant::now();
@@ -147,7 +151,7 @@ pub async fn evaluate_assume(
             &command_program,
             ctx,
             config,
-            &mut assume_derived_store,
+            &assume_derived_store,
             stats,
             assume_start,
         )
@@ -184,7 +188,7 @@ fn dispatch_body_command<'a>(
     program: &'a CompiledProgram,
     ctx: &'a dyn LocyExecutionContext,
     config: &'a LocyConfig,
-    derived_store: &'a mut RowStore,
+    derived_store: &'a RowStore,
     stats: &'a mut LocyStats,
     start: Instant,
 ) -> std::pin::Pin<

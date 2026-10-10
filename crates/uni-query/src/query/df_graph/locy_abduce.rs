@@ -35,7 +35,7 @@ pub async fn evaluate_abduce(
     program: &CompiledProgram,
     ctx: &dyn LocyExecutionContext,
     config: &LocyConfig,
-    derived_store: &mut RowStore,
+    derived_store: &RowStore,
     stats: &mut LocyStats,
     tracker: Option<&ProvenanceStore>,
 ) -> Result<AbductionResult, LocyError> {

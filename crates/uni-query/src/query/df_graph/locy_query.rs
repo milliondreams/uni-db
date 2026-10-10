@@ -35,7 +35,7 @@ pub async fn evaluate_query(
     program: &CompiledProgram,
     fact_source: &dyn DerivedFactSource,
     config: &LocyConfig,
-    derived_store: &mut RowStore,
+    derived_store: &RowStore,
     stats: &mut LocyStats,
     start: Instant,
 ) -> Result<Vec<FactRow>, LocyError> {

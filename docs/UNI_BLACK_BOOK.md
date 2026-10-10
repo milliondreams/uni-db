@@ -7432,6 +7432,22 @@ purely relative rounding was tried first and broke convergence on cyclic
 path compares the key view with a candidate row index carried outside the join
 keys, and maps the survivors back to exact rows.
 
+**A Locy command never changes what a later command reads.** Once the fixpoint
+publishes a program's facts, `QUERY`, `EXPLAIN RULE`, `ABDUCE` and `ASSUME`
+body commands receive that store by shared reference (`&RowStore`), at the top
+level (`impl_locy.rs`, `dispatch_native_command`) and inside an `ASSUME` body,
+so a command that writes it does not compile. `EXPLAIN RULE` without provenance
+to read (its WHERE matches no fact, or the rule has none) re-derives the rule
+through the in-memory SLG evaluator, which implements neither FOLD, BEST BY,
+post-FOLD WHERE nor set semantics; it used to merge those rows into the shared
+store, so one non-matching `EXPLAIN` changed every later answer: a FOLD came
+back as NULL rows, a BEST BY loser reappeared, an `IS NOT` against a filtered
+FOLD dropped a node, mutual recursion returned nothing. The re-derivation now
+lives in a store local to the `EXPLAIN` (`locy_command_noninterference`; the
+`locy_commands` relation of `metamorphic::dqp::topo`; the oracle differential's
+`QUERY`-after-`EXPLAIN` check). Found while triaging #298; see
+`docs/proposals/locy_contract_drift_class_2026-10-09.md`.
+
 ## Appendix C: Anti-Pattern Summary
 
 Quick reference of all anti-patterns from every chapter:

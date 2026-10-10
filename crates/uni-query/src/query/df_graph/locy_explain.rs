@@ -203,7 +203,7 @@ pub async fn explain_rule(
     program: &CompiledProgram,
     fact_source: &dyn DerivedFactSource,
     config: &LocyConfig,
-    derived_store: &mut RowStore,
+    derived_store: &RowStore,
     stats: &mut LocyStats,
     tracker: Option<&ProvenanceStore>,
     approximate_groups: Option<&HashMap<String, Vec<String>>>,
@@ -409,7 +409,7 @@ async fn explain_rule_mode_b(
     program: &CompiledProgram,
     fact_source: &dyn DerivedFactSource,
     config: &LocyConfig,
-    derived_store: &mut RowStore,
+    derived_store: &RowStore,
     stats: &mut LocyStats,
     approximate_groups: Option<&HashMap<String, Vec<String>>>,
 ) -> Result<DerivationNode, LocyError> {
@@ -443,19 +443,31 @@ async fn explain_rule_mode_b(
     // are; until then EXPLAIN keeps its own re-derivation. Mode A
     // (`explain_rule_mode_a`) reads the fixpoint's ProvenanceStore and is
     // unaffected either way.
+    //
+    // The re-derivation lives in a store local to this EXPLAIN and is never
+    // written back. The caller's store holds the facts the fixpoint
+    // published, which every later command reads, and the in-memory
+    // evaluator does not implement FOLD, BEST BY, post-FOLD WHERE or set
+    // semantics: merging its rows there changed the answer of every later
+    // QUERY in the program (see `locy_command_noninterference`).
+    let mut explain_store = RowStore::new();
     {
-        let mut fresh_store = RowStore::new();
         let slg_start = std::time::Instant::now();
         let mut resolver =
-            SLGResolver::new(program, fact_source, config, &mut fresh_store, slg_start);
+            SLGResolver::new(program, fact_source, config, &mut explain_store, slg_start);
         resolver.resolve_goal(&rule_name, &HashMap::new()).await?;
         stats.queries_executed += resolver.stats.queries_executed;
-        // Merge full-node facts into derived_store so IS-ref lookups in
-        // build_derivation_node also get proper node objects (not VIDs).
-        for (name, relation) in fresh_store {
-            derived_store.insert(name, relation);
+    }
+    // A rule the re-derivation did not produce is read from the published
+    // facts, as it was when the two stores were merged.
+    for name in rules_reachable_from(&rule_name, program) {
+        if !explain_store.contains_key(&name)
+            && let Some(relation) = derived_store.get(&name)
+        {
+            explain_store.insert(name, relation.clone());
         }
     }
+    let derived_store = &explain_store;
 
     // Get all derived facts for this rule (now populated with full node objects)
     let facts = derived_store
@@ -519,6 +531,31 @@ async fn explain_rule_mode_b(
     Ok(root)
 }
 
+/// Names of `rule_name` and every rule it reaches through an IS reference.
+///
+/// Negated references are included: a clause with `IS NOT r` reads `r`.
+fn rules_reachable_from(rule_name: &str, program: &CompiledProgram) -> Vec<String> {
+    let mut seen: Vec<String> = vec![rule_name.to_string()];
+    let mut next = 0;
+    while let Some(name) = seen.get(next).cloned() {
+        next += 1;
+        let Some(rule) = program.rule_catalog.get(&name) else {
+            continue;
+        };
+        for clause in &rule.clauses {
+            for cond in &clause.where_conditions {
+                if let RuleCondition::IsReference(is_ref) = cond {
+                    let target = is_ref.rule_name.to_string();
+                    if !seen.contains(&target) {
+                        seen.push(target);
+                    }
+                }
+            }
+        }
+    }
+    seen
+}
+
 /// Recursively build a derivation node for a single fact of a rule.
 ///
 /// Finds which clause produced this fact, extracts ALONG values,
@@ -533,7 +570,7 @@ fn build_derivation_node<'a>(
     key_columns: &'a [String],
     program: &'a CompiledProgram,
     fact_source: &'a dyn DerivedFactSource,
-    derived_store: &'a mut RowStore,
+    derived_store: &'a RowStore,
     stats: &'a mut LocyStats,
     visited: &'a mut VisitedSet,
     max_depth: usize,

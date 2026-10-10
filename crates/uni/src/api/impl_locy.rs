@@ -950,6 +950,12 @@ impl<'a> LocyEngine<'a> {
             }
         }
 
+        // The published facts are fixed from here on. Commands receive the
+        // store by shared reference, so no command can change what a later
+        // one reads; one that needs to re-derive does so in a store of its
+        // own (see `locy_command_noninterference`).
+        let orch_store = orch_store;
+
         // 8. Dispatch commands via native trait interfaces
         let native_ctx = NativeExecutionAdapter::new(
             self.db,
@@ -998,7 +1004,7 @@ impl<'a> LocyEngine<'a> {
                     &compiled,
                     &native_ctx,
                     config,
-                    &mut orch_store,
+                    &orch_store,
                     &mut locy_stats,
                     tracker.clone(),
                     start,
@@ -1773,7 +1779,7 @@ fn dispatch_native_command<'a>(
     program: &'a CompiledProgram,
     ctx: &'a NativeExecutionAdapter<'a>,
     config: &'a LocyConfig,
-    orch_store: &'a mut RowStore,
+    orch_store: &'a RowStore,
     stats: &'a mut LocyStats,
     tracker: Option<Arc<ProvenanceStore>>,
     start: Instant,

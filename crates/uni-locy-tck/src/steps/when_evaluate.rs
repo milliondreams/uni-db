@@ -208,16 +208,16 @@ fn expr_contains_aggregate(expr: &uni_cypher::ast::Expr) -> bool {
     }
 }
 
-/// Asserts that `QUERY <rule>` does not go vacuous while `derived[<rule>]` holds
-/// facts — checked on **every** scenario that evaluates a program.
+/// Asserts that `QUERY <rule>` answers with the facts in `derived[<rule>]` —
+/// checked on **every** scenario that evaluates a program.
 ///
-/// `derived` is served by the DataFusion semi-naive fixpoint; `QUERY` is served
-/// by a separate top-down SLG resolver that re-derives from scratch. The two
-/// engines do not have equal expressive power, so a rule can derive facts on one
-/// surface and return nothing on the other
-/// (<https://github.com/rustic-ai/uni-db/issues/160>). That is a silent
-/// wrong-answer bug: an ad-hoc `QUERY` reports "nothing found" about data that
-/// does contain matches.
+/// `QUERY` was once served by a separate top-down SLG resolver that re-derived
+/// from scratch, and the two engines do not have equal expressive power, so a
+/// rule could derive facts on one surface and return nothing on the other
+/// (<https://github.com/rustic-ai/uni-db/issues/160>). Both now read the facts
+/// the fixpoint published, but they are still two reads of two stores (the
+/// fixpoint's and the hydrated row store commands read), so this asserts they
+/// agree rather than assuming it.
 ///
 /// `SemanticParity.feature` already tried to catch this class with seven
 /// hand-written scenarios, and #160 slipped through the gap between them. This
@@ -293,10 +293,11 @@ fn assert_query_derived_parity(program: &str, result: &uni_locy::LocyResult) {
             continue;
         }
 
-        // Strong check: every key tuple the fixpoint derived must appear in the
-        // QUERY result. Subset rather than equality — the SLG path may carry
-        // extra columns, and a superset is not a divergence in the direction
-        // that hurts (silently missing answers is).
+        // Strong check: the QUERY's key tuples are exactly the ones the
+        // fixpoint derived. Both read the published facts, so a missing tuple
+        // is a lost answer and an extra one is a fact the fixpoint never
+        // derived (a command once wrote re-derived rows into the store QUERY
+        // reads; see `locy_command_noninterference`).
         let projection = key_columns
             .get(&rule)
             .and_then(|keys| comparable_key_projection(keys, gq.return_clause.as_ref()))
@@ -322,14 +323,23 @@ fn assert_query_derived_parity(program: &str, result: &uni_locy::LocyResult) {
                 .collect();
 
             let missing: Vec<_> = derived_keys.difference(&query_keys).collect();
+            let extra: Vec<_> = query_keys.difference(&derived_keys).collect();
+            assert!(
+                extra.is_empty(),
+                "QUERY/derived parity violated for rule `{rule}`: the QUERY result \
+                 has {} key tuple(s) the fixpoint did not derive, and the query has \
+                 no WHERE / LIMIT / SKIP that could explain it.\n\
+                 Extra: {extra:?}\n\
+                 Program:\n{program}",
+                extra.len()
+            );
             assert!(
                 missing.is_empty(),
                 "QUERY/derived parity violated for rule `{rule}`: {} of {} derived \
                  key tuple(s) are absent from the QUERY result ({} rows), and the \
                  query has no WHERE / LIMIT / SKIP that could explain it.\n\
                  Missing: {missing:?}\n\
-                 This is the issue #160 class: `derived` (fixpoint) and `QUERY` \
-                 (SLG) disagree.\n\
+                 This is the issue #160 class: `derived` and `QUERY` disagree.\n\
                  Program:\n{program}",
                 missing.len(),
                 derived_keys.len(),
@@ -345,8 +355,7 @@ fn assert_query_derived_parity(program: &str, result: &uni_locy::LocyResult) {
                 "QUERY/derived parity violated for rule `{rule}`: the fixpoint \
                  derived {} fact(s) but QUERY returned 0 rows, and the query has \
                  no WHERE / LIMIT / SKIP that could explain it.\n\
-                 This is the issue #160 class: `derived` (fixpoint) and `QUERY` \
-                 (SLG) disagree.\n\
+                 This is the issue #160 class: `derived` and `QUERY` disagree.\n\
                  Program:\n{program}",
                 derived.len()
             );

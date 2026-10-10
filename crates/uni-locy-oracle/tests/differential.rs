@@ -15,12 +15,13 @@
 
 // Rust guideline compliant
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use anyhow::Result;
 use proptest::prelude::*;
 use uni_common::{LocyIncompleteReason, Value};
+use uni_db::locy::CommandResult;
 use uni_db::{Uni, UniError};
 
 use uni_locy_oracle::eval::{Relation, evaluate, evaluate_bags};
@@ -487,6 +488,67 @@ async fn all_divergences(
             out.push(format!("{rel}: engine {raw:?}\n    oracle {want:?}"));
         }
     }
+    out.extend(query_divergences(&db, generated, &oracle).await?);
+    Ok(out)
+}
+
+/// Runs the program again with an `EXPLAIN RULE` on every relation before any
+/// `QUERY`, then a `QUERY` per relation, and returns every `QUERY` whose rows
+/// differ from the oracle.
+///
+/// Each `EXPLAIN` matches no fact, so it re-derives its rule through the
+/// in-memory evaluator; that evaluator's rows once landed in the store every
+/// later `QUERY` reads. Holding the `QUERY`s to the oracle, rather than
+/// `result.derived`, also checks that a `QUERY` answers what the fixpoint
+/// derived.
+async fn query_divergences(
+    db: &Uni,
+    generated: &Generated,
+    oracle: &HashMap<String, Vec<Tuple>>,
+) -> Result<Vec<String>> {
+    let mut rels: Vec<&String> = generated.key_schema.keys().collect();
+    rels.sort();
+    let mut program = generated.program_text.clone();
+    for rel in &rels {
+        let first = &generated.key_schema[*rel][0];
+        program.push_str(&format!("\nEXPLAIN RULE {rel} WHERE {first} IS NULL"));
+    }
+    for rel in &rels {
+        program.push_str(&format!("\nQUERY {rel}"));
+    }
+    let result = db.session().locy(&program).await?;
+    let queries: Vec<&Vec<HashMap<String, Value>>> = result
+        .command_results
+        .iter()
+        .filter_map(|c| match c {
+            CommandResult::Query(rows) => Some(rows),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(queries.len(), rels.len(), "one QUERY result per relation");
+    let mut out = Vec::new();
+    for (rel, rows) in rels.iter().zip(queries) {
+        let cols = &generated.key_schema[*rel];
+        let mut got: Vec<Tuple> = rows
+            .iter()
+            .map(|row| {
+                cols.iter()
+                    .map(|c| {
+                        row.get(c)
+                            .and_then(|v| column_to_i64(c, v))
+                            .unwrap_or(i64::MIN)
+                    })
+                    .collect()
+            })
+            .collect();
+        got.sort();
+        let want = oracle.get(rel.as_str()).cloned().unwrap_or_default();
+        if !bags_agree(&got, &want, cols) {
+            out.push(format!(
+                "QUERY {rel} after EXPLAIN: engine {got:?}\n    oracle {want:?}"
+            ));
+        }
+    }
     Ok(out)
 }
 
@@ -536,7 +598,9 @@ fn drive_random_programs(cases: u32) {
     });
     let tally = tally.into_inner();
     eprintln!("[oracle:random] cases={cases} non-empty per relation: {tally:?}");
-    outcome.expect("a random program's derived facts diverged from the oracle");
+    outcome.expect(
+        "a random program diverged from the oracle (derived facts, or a QUERY after EXPLAIN)",
+    );
     for rel in [
         "link", "reach", "un", "deg", "span", "flow", "cost", "tot", "roll", "opt", "pr", "nor",
         "prd", "safe",

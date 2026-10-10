@@ -129,7 +129,7 @@ async fn command_noninterference_best_by() -> Result<()> {
         "CREATE RULE cheap AS MATCH (x:N)-[e:E]->(y:N) BEST BY e.w ASC YIELD KEY x, e.w AS w\n",
         "cheap",
         "QUERY cheap RETURN x.name AS x, w",
-        &["w=5.0 x=a"],
+        &["w=5 x=a"],
     )
     .await
 }

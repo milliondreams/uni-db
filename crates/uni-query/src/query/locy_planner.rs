@@ -376,6 +376,14 @@ fn fold_function_name(aggregate: &Expr) -> Option<String> {
 /// The merge matters in the realistic partial-schema case: with `Sensor.name`
 /// declared and label `Tag` undeclared, `t.name` still arrives as `Utf8`, not
 /// as cv-encoded bytes.
+/// Whether any label or edge type in `schema` declares `prop`.
+fn property_declared_anywhere(schema: &Schema, prop: &str) -> bool {
+    schema
+        .properties
+        .values()
+        .any(|label_props| label_props.contains_key(prop))
+}
+
 fn undeclared_property_arrow_type(schema: &Schema, prop: &str) -> DataType {
     schema
         .properties
@@ -550,6 +558,12 @@ fn infer_yield_type_rec(
                     {
                         return dt;
                     }
+                    // Declared nowhere: stored as an encoded value, so keep it
+                    // one. The `Property → Float64` guess turned a stored `5`
+                    // into `5.0`.
+                    if !item.is_prob && !property_declared_anywhere(schema, prop) {
+                        return DataType::LargeBinary;
+                    }
                 }
                 let _ = is_key;
                 return infer_expr_type(&item.expr, node_vars);
@@ -679,6 +693,17 @@ fn infer_expr_type(expr: &Expr, node_vars: &HashSet<String>) -> DataType {
             }
         }
         Expr::IsNull(_) | Expr::IsNotNull(_) => DataType::Boolean,
+        // Lists and maps, and the expressions that build them: no single Arrow
+        // type holds every such value (a list of encoded values, a nested
+        // list, a map), so the column is a Cypher value. The catch-all below
+        // typed them as strings, and the projection cast a list to its text.
+        Expr::List(_)
+        | Expr::Map(_)
+        | Expr::ListComprehension { .. }
+        | Expr::PatternComprehension { .. }
+        | Expr::MapProjection { .. }
+        | Expr::CollectSubquery(_)
+        | Expr::Reduce { .. } => DataType::LargeBinary,
         // Function calls: infer return type from function name.
         Expr::FunctionCall { name, args, .. } => {
             match name.to_uppercase().as_str() {

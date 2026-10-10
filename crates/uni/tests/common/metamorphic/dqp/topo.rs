@@ -1046,15 +1046,13 @@ impl Relation {
                         case.body_where()
                     )
                 };
-                let equivalents = [
-                    "EXPLAIN RULE f WHERE a.id = -1",
-                    "EXPLAIN RULE reach WHERE a.id = -1",
-                    "EXPLAIN RULE out WHERE a.id = -1",
-                    "ABDUCE NOT out WHERE a.id = -1",
-                ]
-                .iter()
-                .map(|command| vec![program(command)])
-                .collect();
+                // One command: an EXPLAIN of `out` that matches nothing
+                // re-derives `out`, and through it `f` and `reach`, so it
+                // reaches every rule. Each further command cost about 35 s a
+                // run of this lane (measured: 82 s without the relation, 224 s
+                // with four commands); ABDUCE and per-rule EXPLAIN are covered
+                // by `locy_command_noninterference`.
+                let equivalents = vec![vec![program("EXPLAIN RULE out WHERE a.id = -1")]];
                 Some(Rewrite {
                     reference: program(""),
                     equivalents,

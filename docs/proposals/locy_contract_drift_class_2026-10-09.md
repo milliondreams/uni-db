@@ -61,7 +61,7 @@ that matches leaves later results unchanged. That was checked.
 | L7 | `IS NOT link TO t` with interleaved KEYs | plan error, while the positive `IS` works | R2 |
 | L8 | two FOLD clauses, `SUM` and `MAX` into one column | Arrow concatenate error | R4 |
 
-### Found while building L3 (confirmed, not yet fixed)
+### Found while building L3 (confirmed; fixed, see below)
 
 A list built from values in a Locy YIELD comes back wrong, outside any scope question:
 
@@ -72,9 +72,18 @@ A list built from values in a Locy YIELD comes back wrong, outside any scope que
 | `[e.w, e.w] AS ws` | `[0205, 0205]` — **silent wrong answer**: the values' codec bytes |
 | `[v IN [1, 2] \| v * 2] AS ws` | run-time `Encountered non UTF-8 data` |
 
-Probable mechanism, unverified: the YIELD column's type inference does not cover a list of
-dynamically typed values, so the encoded elements are declared as a string or binary list. To be
-probed and fixed as its own item.
+*Mechanism (confirmed in the code, and broader than first probed):* the YIELD projection casts each
+column to a type inferred from its expression, and the inference's catch-all for an expression it
+did not know (a list, a comprehension, a map, `reduce`) was `LargeUtf8`. **Every** list a rule
+yielded came back as its text, schema or not (`[5, 5]` → `"[5, 5]"`); with no schema the elements
+were encoded values and the text was their bytes, a nested list or comprehension failed UTF-8
+validation, and a map failed the cast. A relationship property declared nowhere was guessed
+`Float64`, so a stored `5` came back `5.0`. Plain Cypher was right throughout.
+*Fix:* those expressions, and a property declared nowhere, are typed as Cypher values
+(`LargeBinary`), and the Locy projection encodes a column into that type value by value
+(`to_cypher_value_expr`) instead of an Arrow cast. `locy_yield_list_values` holds ten expressions
+to plain Cypher's answer with and without a schema (15 of 20 differed before). Two of this
+track's own tests had recorded the float guess (`w=5.0` for a stored `5`) and were corrected.
 
 ### Predicted, not yet run
 
@@ -195,6 +204,10 @@ what they exist to show.)
   existed. A command that writes it no longer compiles, which replaces the planned debug-build
   fingerprint check.
 - Coverage, in three places:
+  - *Cost note (measured during the YIELD-typing fix):* the topo `locy_commands` relation with four
+    commands took the flushed lane from 82 s to 224 s alone, near the 6-minute slow-timeout under
+    full-suite load (one run timed out). It now interposes one command, a non-matching EXPLAIN of
+    the rule that reads every other (145 s alone); it still fails with the L1 fix reverted.
   - **Non-interference relation:** for a program P, `P; <cmd>; QUERY r` must equal `P; QUERY r`, for
     every rule `r` and for `<cmd>` drawn from EXPLAIN and ABDUCE with matching, non-matching and
     unbound-key WHERE. Added to the oracle differential (the oracle generator starts emitting

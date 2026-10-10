@@ -330,7 +330,7 @@ async fn scope_check_accepts_what_is_visible() -> Result<()> {
             "CREATE RULE p AS MATCH (x:N)-[e:E]->(y:N) BEST BY e.w DESC YIELD KEY x, e.w AS w\n\
              QUERY p RETURN w"
                 .into(),
-            Rows(&["w=7.0"]),
+            Rows(&["w=7"]),
         ),
         (
             "a KEY alias and a renamed FOLD output after the FOLD",

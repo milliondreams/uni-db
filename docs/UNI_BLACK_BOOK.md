@@ -7487,6 +7487,16 @@ call is refused. Guards: `locy_scope_check` (a hand matrix, and a generated
 slot × candidate sweep asserting no scope error reaches the planner) and the
 TCK compile step, which now also plans every program it compiles.
 
+**A Locy YIELD returns the value its expression has in Cypher.** The YIELD
+projection casts each column to a type `infer_expr_type` derives from the
+expression. A list, comprehension, map, `reduce` or pattern comprehension is
+typed as a Cypher value (`LargeBinary`), as is a property no label or edge type
+declares, and `plan_locy_project` encodes into that type value by value
+(`to_cypher_value_expr`) rather than Arrow-casting. The old catch-all typed
+those expressions as strings, so every yielded list came back as its text (or
+its encoded bytes, schemaless), and an undeclared relationship property was
+guessed `Float64` (`locy_yield_list_values`, with plain Cypher as the oracle).
+
 ## Appendix C: Anti-Pattern Summary
 
 Quick reference of all anti-patterns from every chapter:

@@ -5302,7 +5302,12 @@ impl HybridPhysicalPlanner {
                 };
                 let cross_domain = (is_string(&actual_dt) && is_numeric(target_dt))
                     || (is_numeric(&actual_dt) && is_string(target_dt));
-                if actual_dt != *target_dt && !cross_domain {
+                if actual_dt != *target_dt && *target_dt == DataType::LargeBinary {
+                    // A dynamically typed column: encode the value, whatever
+                    // its type, instead of an Arrow cast that cannot carry a
+                    // list or a map.
+                    crate::query::df_graph::expr_compiler::to_cypher_value_expr(physical_expr)
+                } else if actual_dt != *target_dt && !cross_domain {
                     coerce_physical_expr(physical_expr, &actual_dt, target_dt, schema.as_ref())
                 } else {
                     physical_expr

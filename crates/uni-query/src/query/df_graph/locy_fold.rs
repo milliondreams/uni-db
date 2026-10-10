@@ -182,6 +182,11 @@ pub struct FoldBinding {
     /// Column name for name-based resolution (more robust than positional index).
     /// `None` for `COUNTALL` which has no input column.
     pub input_col_name: Option<String>,
+    /// `AGG(DISTINCT x)`: each group folds one row per distinct input value.
+    ///
+    /// The compiler admits it only in non-recursive rules, where the operator
+    /// sees a group's whole bag at once.
+    pub distinct: bool,
 }
 
 /// DataFusion `ExecutionPlan` that applies FOLD semantics.
@@ -543,12 +548,16 @@ impl ExecutionPlan for FoldExec {
                 } else {
                     None
                 };
+                let distinct_groups = binding
+                    .distinct
+                    .then(|| distinct_value_groups(col.as_ref(), &groups))
+                    .transpose()?;
                 let agg_col = compute_fold_aggregate(
                     col.as_ref(),
                     &binding.aggregate,
                     FoldGroups {
                         ordered_keys: &ordered_keys,
-                        groups: &groups,
+                        groups: distinct_groups.as_ref().unwrap_or(&groups),
                         num_groups,
                     },
                     &cx,
@@ -653,6 +662,34 @@ fn compute_fold_aggregate(
         scalars.push(state.finalize().map_err(fn_error_to_df)?);
     }
     ScalarValue::iter_to_array(scalars)
+}
+
+/// Keeps, per key group, the first row of each distinct input value.
+///
+/// This is `DISTINCT` in a FOLD aggregate: the aggregate then sees each value
+/// once, as Cypher's `count(DISTINCT x)` does. NULL rows are kept, since every
+/// aggregate skips them anyway.
+///
+/// # Errors
+///
+/// Returns an error if a value cannot be read from `col`.
+fn distinct_value_groups(
+    col: &dyn Array,
+    groups: &HashMap<Vec<ScalarKey>, Vec<usize>>,
+) -> DFResult<HashMap<Vec<ScalarKey>, Vec<usize>>> {
+    groups
+        .iter()
+        .map(|(key, rows)| {
+            let mut seen = std::collections::HashSet::new();
+            let mut kept = Vec::with_capacity(rows.len());
+            for &row in rows {
+                if col.is_null(row) || seen.insert(ScalarValue::try_from_array(col, row)?) {
+                    kept.push(row);
+                }
+            }
+            Ok((key.clone(), kept))
+        })
+        .collect()
 }
 
 /// Map a plugin [`FnError`](uni_plugin::FnError) to a DataFusion error,
@@ -925,6 +962,7 @@ mod tests {
                 aggregate: builtin_agg("SUM"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
         )
         .await;
@@ -962,6 +1000,7 @@ mod tests {
                 aggregate: builtin_agg("COUNT"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
         )
         .await;
@@ -990,6 +1029,7 @@ mod tests {
                 aggregate: builtin_agg("MAX"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
         )
         .await;
@@ -1002,6 +1042,7 @@ mod tests {
                 aggregate: builtin_agg("MIN"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
         )
         .await;
@@ -1034,6 +1075,7 @@ mod tests {
                 aggregate: builtin_agg("AVG"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
         )
         .await;
@@ -1063,6 +1105,7 @@ mod tests {
                 aggregate: builtin_agg("SUM"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
         )
         .await;
@@ -1105,6 +1148,7 @@ mod tests {
                 aggregate: builtin_agg("SUM"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
         )
         .await;
@@ -1126,6 +1170,7 @@ mod tests {
                     aggregate: builtin_agg("SUM"),
                     input_col_index: 1,
                     input_col_name: None,
+                    distinct: false,
                 },
                 FoldBinding {
                     output_name: "cnt".to_string(),
@@ -1133,6 +1178,7 @@ mod tests {
                     aggregate: builtin_agg("COUNT"),
                     input_col_index: 1,
                     input_col_name: None,
+                    distinct: false,
                 },
                 FoldBinding {
                     output_name: "mx".to_string(),
@@ -1140,6 +1186,7 @@ mod tests {
                     aggregate: builtin_agg("MAX"),
                     input_col_index: 1,
                     input_col_name: None,
+                    distinct: false,
                 },
             ],
         )
@@ -1186,6 +1233,7 @@ mod tests {
                 aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
         )
         .await;
@@ -1213,6 +1261,7 @@ mod tests {
                 aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
         )
         .await;
@@ -1239,6 +1288,7 @@ mod tests {
                 aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
         )
         .await;
@@ -1265,6 +1315,7 @@ mod tests {
                 aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
         )
         .await;
@@ -1308,6 +1359,7 @@ mod tests {
                 aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
         )
         .await;
@@ -1335,6 +1387,7 @@ mod tests {
                 aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
         )
         .await;
@@ -1361,6 +1414,7 @@ mod tests {
                 aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
         )
         .await;
@@ -1389,6 +1443,7 @@ mod tests {
                 aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
         )
         .await;
@@ -1441,6 +1496,7 @@ mod tests {
                 aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
         )
         .await;
@@ -1466,6 +1522,7 @@ mod tests {
                 aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
         )
         .await;
@@ -1491,6 +1548,7 @@ mod tests {
                 aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
         )
         .await;
@@ -1516,6 +1574,7 @@ mod tests {
                 aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
         )
         .await;
@@ -1545,6 +1604,7 @@ mod tests {
                 aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
         )
         .await;
@@ -1570,6 +1630,7 @@ mod tests {
                 aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
         )
         .await;
@@ -1595,6 +1656,7 @@ mod tests {
                 aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
         )
         .await;
@@ -1620,6 +1682,7 @@ mod tests {
                 aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
         )
         .await;
@@ -1655,6 +1718,7 @@ mod tests {
             aggregate: builtin_agg("MNOR"),
             input_col_index: 1,
             input_col_name: None,
+            distinct: false,
         }];
         let r1 = execute_fold(make_memory_exec(fwd), vec![0], binding.clone()).await;
         let r2 = execute_fold(make_memory_exec(rev), vec![0], binding).await;
@@ -1686,6 +1750,7 @@ mod tests {
             aggregate: builtin_agg("MPROD"),
             input_col_index: 1,
             input_col_name: None,
+            distinct: false,
         }];
         let r1 = execute_fold(make_memory_exec(fwd), vec![0], binding.clone()).await;
         let r2 = execute_fold(make_memory_exec(rev), vec![0], binding).await;
@@ -1720,6 +1785,7 @@ mod tests {
                 aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
         )
         .await;
@@ -1751,6 +1817,7 @@ mod tests {
                 aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
         )
         .await;
@@ -1782,6 +1849,7 @@ mod tests {
                 aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
         )
         .await;
@@ -1815,6 +1883,7 @@ mod tests {
                 aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
         )
         .await;
@@ -1835,6 +1904,7 @@ mod tests {
                 aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
         )
         .await;
@@ -1860,6 +1930,7 @@ mod tests {
                 aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
         )
         .await;
@@ -1885,6 +1956,7 @@ mod tests {
                 aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
         )
         .await;
@@ -1910,6 +1982,7 @@ mod tests {
                 aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
         )
         .await;
@@ -1935,6 +2008,7 @@ mod tests {
                 aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
         )
         .await;
@@ -1961,6 +2035,7 @@ mod tests {
                 aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
         )
         .await;
@@ -1987,6 +2062,7 @@ mod tests {
                 aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
         )
         .await;
@@ -2012,6 +2088,7 @@ mod tests {
                 aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
         )
         .await;
@@ -2039,6 +2116,7 @@ mod tests {
                 aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
         )
         .await;
@@ -2149,6 +2227,7 @@ mod tests {
                 aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
             true,
         )
@@ -2175,6 +2254,7 @@ mod tests {
                 aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
             true,
         )
@@ -2201,6 +2281,7 @@ mod tests {
                 aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
             true,
         )
@@ -2227,6 +2308,7 @@ mod tests {
                 aggregate: builtin_agg("MPROD"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
             true,
         )
@@ -2253,6 +2335,7 @@ mod tests {
                 aggregate: builtin_agg("MNOR"),
                 input_col_index: 1,
                 input_col_name: None,
+                distinct: false,
             }],
             true,
         )
@@ -2287,6 +2370,7 @@ mod tests {
                 aggregate: builtin_agg("COUNTALL"),
                 input_col_index: 0, // unused for CountAll
                 input_col_name: None,
+                distinct: false,
             }],
         )
         .await;
@@ -2470,6 +2554,7 @@ mod tests {
             aggregate: Arc::new(RangeAgg),
             input_col_index: 1,
             input_col_name: Some("value".to_string()),
+            distinct: false,
         };
         let out = execute_fold(input, vec![0], vec![binding]).await;
         assert_eq!(out.num_rows(), 2);

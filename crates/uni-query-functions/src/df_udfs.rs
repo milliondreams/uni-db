@@ -6145,6 +6145,194 @@ pub fn create_cypher_sum_udaf() -> AggregateUDF {
 }
 
 // ============================================================================
+// DISTINCT over any aggregate
+// ============================================================================
+
+/// `AGG(DISTINCT ...)` for an aggregate that does not implement DISTINCT.
+///
+/// DataFusion passes DISTINCT to an aggregate as `AccumulatorArgs::is_distinct`
+/// and leaves it to the accumulator: its own `sum`, `count`, `avg`, `min` and
+/// `max` honour it, but an aggregate that ignores the flag silently folds every
+/// row. Cypher's `sum` over a dynamically typed column did, so
+/// `sum(DISTINCT e.w)` summed duplicates. This wrapper keeps the set of
+/// distinct argument tuples and folds them through the wrapped aggregate when
+/// it evaluates, so DISTINCT holds for any aggregate, including a plugin's.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct DistinctUdaf {
+    inner: AggregateUDF,
+    name: String,
+}
+
+impl AggregateUDFImpl for DistinctUdaf {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn signature(&self) -> &Signature {
+        self.inner.signature()
+    }
+    fn return_type(&self, args: &[DataType]) -> DFResult<DataType> {
+        self.inner.return_type(args)
+    }
+    fn return_field(
+        &self,
+        args: &[arrow::datatypes::FieldRef],
+    ) -> DFResult<arrow::datatypes::FieldRef> {
+        self.inner.return_field(args)
+    }
+    fn accumulator(
+        &self,
+        acc_args: datafusion::logical_expr::function::AccumulatorArgs,
+    ) -> DFResult<Box<dyn DfAccumulator>> {
+        let arg_types = acc_args
+            .expr_fields
+            .iter()
+            .map(|f| f.data_type().clone())
+            .collect();
+        Ok(Box::new(DistinctAccumulator {
+            inner: self.inner.accumulator(acc_args)?,
+            arg_types,
+            order: Vec::new(),
+            seen: std::collections::HashSet::new(),
+            fed: false,
+        }))
+    }
+    fn state_fields(
+        &self,
+        args: datafusion::logical_expr::function::StateFieldsArgs,
+    ) -> DFResult<Vec<Arc<arrow::datatypes::Field>>> {
+        Ok(args
+            .input_fields
+            .iter()
+            .enumerate()
+            .map(|(i, field)| {
+                Arc::new(arrow::datatypes::Field::new(
+                    format!("{}_distinct_{i}", args.name),
+                    DataType::List(Arc::new(arrow::datatypes::Field::new(
+                        "item",
+                        field.data_type().clone(),
+                        true,
+                    ))),
+                    true,
+                ))
+            })
+            .collect())
+    }
+}
+
+/// The distinct argument tuples of one group, folded by `inner` on evaluate.
+#[derive(Debug)]
+struct DistinctAccumulator {
+    inner: Box<dyn DfAccumulator>,
+    arg_types: Vec<DataType>,
+    /// Distinct tuples in first-seen order, so a float sum is deterministic.
+    order: Vec<Vec<ScalarValue>>,
+    seen: std::collections::HashSet<Vec<ScalarValue>>,
+    /// Whether `inner` has been fed the set; it is fed once, on evaluate.
+    fed: bool,
+}
+
+impl DistinctAccumulator {
+    fn insert(&mut self, tuple: Vec<ScalarValue>) -> DFResult<()> {
+        if self.fed {
+            return Err(datafusion::error::DataFusionError::Internal(
+                "DISTINCT aggregate updated after it was evaluated".to_string(),
+            ));
+        }
+        if self.seen.insert(tuple.clone()) {
+            self.order.push(tuple);
+        }
+        Ok(())
+    }
+
+    /// Column `i` of the distinct tuples.
+    fn column(&self, i: usize) -> DFResult<ArrayRef> {
+        if self.order.is_empty() {
+            return Ok(arrow_array::new_empty_array(&self.arg_types[i]));
+        }
+        ScalarValue::iter_to_array(self.order.iter().map(|t| t[i].clone()))
+    }
+}
+
+impl DfAccumulator for DistinctAccumulator {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> DFResult<()> {
+        let rows = values.first().map_or(0, |a| a.len());
+        for row in 0..rows {
+            let tuple = values
+                .iter()
+                .map(|a| ScalarValue::try_from_array(a, row))
+                .collect::<DFResult<Vec<_>>>()?;
+            self.insert(tuple)?;
+        }
+        Ok(())
+    }
+
+    fn evaluate(&mut self) -> DFResult<ScalarValue> {
+        if !self.fed {
+            let columns = (0..self.arg_types.len())
+                .map(|i| self.column(i))
+                .collect::<DFResult<Vec<_>>>()?;
+            self.inner.update_batch(&columns)?;
+            self.fed = true;
+        }
+        self.inner.evaluate()
+    }
+
+    fn size(&self) -> usize {
+        std::mem::size_of_val(self)
+            + self.inner.size()
+            + self
+                .order
+                .iter()
+                .flatten()
+                .map(ScalarValue::size)
+                .sum::<usize>()
+                * 2
+    }
+
+    fn state(&mut self) -> DFResult<Vec<ScalarValue>> {
+        (0..self.arg_types.len())
+            .map(|i| {
+                let values: Vec<ScalarValue> = self.order.iter().map(|t| t[i].clone()).collect();
+                Ok(ScalarValue::List(ScalarValue::new_list_nullable(
+                    &values,
+                    &self.arg_types[i],
+                )))
+            })
+            .collect()
+    }
+
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> DFResult<()> {
+        use arrow::array::AsArray;
+        let Some(first) = states.first() else {
+            return Ok(());
+        };
+        for row in 0..first.len() {
+            if first.is_null(row) {
+                continue;
+            }
+            let lists: Vec<ArrayRef> = states
+                .iter()
+                .map(|s| s.as_list::<i32>().value(row))
+                .collect();
+            for j in 0..lists[0].len() {
+                let tuple = lists
+                    .iter()
+                    .map(|l| ScalarValue::try_from_array(l, j))
+                    .collect::<DFResult<Vec<_>>>()?;
+                self.insert(tuple)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `inner` with DISTINCT applied to its arguments; see [`DistinctUdaf`].
+pub fn distinct_udaf(inner: AggregateUDF) -> AggregateUDF {
+    let name = format!("{}_distinct", inner.name());
+    AggregateUDF::from(DistinctUdaf { inner, name })
+}
+
+// ============================================================================
 // Cypher-aware COLLECT UDAF
 // ============================================================================
 

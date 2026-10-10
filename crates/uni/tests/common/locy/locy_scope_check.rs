@@ -48,9 +48,10 @@ const CHAIN: &str = "CREATE (a:N {name: 'a'}), (b:N {name: 'b'}), (c:N {name: 'c
 const TOT: &str = "CREATE RULE tot AS MATCH (x:N)-[e:E]->(y:N) FOLD s = SUM(e.w) YIELD KEY x, s\n";
 
 /// Recursive path rule over CHAIN, with an MSUM per (x, y); `{body}` replaces
-/// the recursive clause's FOLD/REQUIRE tail.
-const RECURSIVE: &str = "CREATE RULE r AS MATCH (x:N)-[e:E]->(y:N) FOLD t = MSUM(e.w) \
-     YIELD KEY x, KEY y, t\n\
+/// the recursive clause's FOLD/REQUIRE tail. The base clause seeds the fold
+/// rather than stating a FOLD of its own, so the recursive clause's tail is the
+/// rule's: clauses that fold must state the same tail.
+const RECURSIVE: &str = "CREATE RULE r AS MATCH (x:N)-[e:E]->(y:N) YIELD KEY x, KEY y, e.w AS t\n\
      CREATE RULE r AS MATCH (x:N)-[e:E]->(m:N) WHERE m IS r TO y {body} YIELD KEY x, KEY y, t\n";
 
 fn config() -> LocyConfig {

@@ -5776,16 +5776,27 @@ impl HybridPhysicalPlanner {
                 }
             };
 
-            // Apply DISTINCT if needed (collect/percentile handle their own distinct)
-            let df_agg = if *distinct
-                && !matches!(
-                    name_lower.as_str(),
-                    "collect" | "percentiledisc" | "percentilecont"
-                ) {
-                use datafusion::prelude::ExprFunctionExt;
-                df_agg.distinct().build().map_err(|e| anyhow!("{}", e))?
-            } else {
-                df_agg
+            // Apply DISTINCT (collect handles its own). DataFusion leaves
+            // DISTINCT to the aggregate's accumulator: its own count / sum /
+            // avg / min / max honour the flag, any other aggregate (Cypher's
+            // `sum` over a dynamically typed column, percentiles, plugin
+            // aggregates) would silently fold every row, so it is wrapped to
+            // fold the distinct argument tuples instead.
+            let df_agg = match df_agg {
+                _ if !*distinct || name_lower == "collect" => df_agg,
+                DfExpr::AggregateFunction(agg)
+                    if !matches!(agg.func.name(), "count" | "sum" | "avg" | "min" | "max") =>
+                {
+                    let wrapped = crate::query::df_udfs::distinct_udaf(agg.func.as_ref().clone());
+                    DfExpr::AggregateFunction(datafusion::logical_expr::expr::AggregateFunction {
+                        func: Arc::new(wrapped),
+                        params: agg.params,
+                    })
+                }
+                df_agg => {
+                    use datafusion::prelude::ExprFunctionExt;
+                    df_agg.distinct().build().map_err(|e| anyhow!("{}", e))?
+                }
             };
 
             // Resolve UDFs and apply type coercion inside aggregate arguments
@@ -7548,7 +7559,12 @@ fn resolve_fold_bindings(
         .map(|(output_name, expr)| {
             // Parse aggregate expression: FunctionCall { name, args }
             match expr {
-                Expr::FunctionCall { name, args, .. } => {
+                Expr::FunctionCall {
+                    name,
+                    args,
+                    distinct,
+                    ..
+                } => {
                     let upper = name.to_uppercase();
                     let is_count = matches!(upper.as_str(), "COUNT" | "MCOUNT");
 
@@ -7594,6 +7610,7 @@ fn resolve_fold_bindings(
                             aggregate,
                             input_col_index: 0,
                             input_col_name: None,
+                            distinct: false,
                         });
                     }
 
@@ -7630,6 +7647,7 @@ fn resolve_fold_bindings(
                         aggregate,
                         input_col_index,
                         input_col_name: Some(output_name.clone()),
+                        distinct: *distinct,
                     })
                 }
                 _ => Err(anyhow::anyhow!(

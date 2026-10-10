@@ -75,6 +75,36 @@ pub enum LocyCompileError {
     #[error("mixed priority in rule '{rule}': some clauses have PRIORITY, others don't")]
     MixedPriority { rule: String },
 
+    /// Clauses of one rule state different FOLD, post-FOLD WHERE, REQUIRE or
+    /// BEST BY.
+    ///
+    /// These apply to the whole rule, after its clauses are unioned, so a rule
+    /// has one of each. The planner used to take them from the first clause
+    /// that folds and silently ignore what any other clause stated.
+    #[error(
+        "clauses of rule '{rule}' disagree on {part}: {detail}. A rule's FOLD, \
+         post-FOLD WHERE, REQUIRE and BEST BY apply to all of its clauses at \
+         once, so every clause that folds must state the same ones; a clause \
+         without FOLD seeds the fold and states none of them"
+    )]
+    ClauseMismatch {
+        rule: String,
+        part: String,
+        detail: String,
+    },
+
+    /// A FOLD aggregate in a recursive rule uses `DISTINCT`.
+    ///
+    /// A recursive FOLD is computed incrementally, one iteration's new rows at
+    /// a time, so it never sees the whole bag a distinct count would need.
+    #[error(
+        "FOLD '{fold}' in recursive rule '{rule}' uses DISTINCT, which only a \
+         non-recursive rule supports: a recursive FOLD folds each iteration's \
+         new rows and never sees the whole set of values. Fold the distinct \
+         values in a non-recursive rule that reads this one"
+    )]
+    DistinctFoldInRecursion { rule: String, fold: String },
+
     #[error("module not found: {name}")]
     ModuleNotFound { name: String },
 

@@ -80,5 +80,6 @@ pub mod locy_is_ref_binding;
 // W4: a fact is a row; QUERY WHERE is three-valued; a sum of nothing is 0.
 pub mod locy_facts_and_filters;
 // W4: MIN/MAX/COLLECT and yielded properties keep their value types.
+pub mod locy_clause_contract;
 pub mod locy_value_types;
 pub mod locy_yield_list_values;

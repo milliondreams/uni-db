@@ -1,6 +1,6 @@
 # Locy contract drift: one rule, several meanings
 
-**Date:** 2026-10-09 · **Status:** L1 done (`9e24aa3d6`); L2 done (`374be77f2`, closes #298); L3 implemented (uncommitted); L4–L6 proposed · **Trigger:** issue #298
+**Date:** 2026-10-09 · **Status:** L1 done (`9e24aa3d6`); L2 done (`374be77f2`, closes #298); L3 done (`5d9224467`); YIELD value typing fixed (`821fcca98`); L4 implemented (uncommitted); L5–L6 proposed · **Trigger:** issue #298
 
 ## Why
 
@@ -301,6 +301,48 @@ what they exist to show.)
     `DISTINCT`;
   - the oracle's `Agg` gains a `distinct` flag;
   - a topo relation checks `FOLD COUNT(DISTINCT y)` against Cypher `count(DISTINCT y)`.
+
+- *Done:* `check_yield_agreement` (names, KEY and PROB by name, order free; a positional PROB
+  check and `check_count_fold_seed`'s positional seed lookup became by-name) and
+  `check_fold_tail_agreement` (`ClauseMismatch`). Decision 3 as recommended, refined by
+  measurement: the contract is **by name, not by position**. A clause yielding `KEY b, KEY a`
+  beside `KEY a, KEY b` was already answered correctly, and rejecting it would break a correct
+  program; FOLD *arguments* legitimately differ per clause (`ProbabilisticStress.feature:221`
+  folds `MNOR(e.prob)` in the base clause and `MNOR(p)` in the recursive one), so the FOLD check
+  compares names, aggregates and DISTINCT only. DISTINCT per decision 2(a): `FoldBinding::distinct`,
+  set by both FOLD resolvers (two copies of the same parser, another instance of R2's drift),
+  deduplicated per group in `FoldExec`; `DistinctFoldInRecursion` in recursive rules.
+  Tests: `locy_clause_contract` (5 tests; the DISTINCT test holds 8 aggregate forms, with and
+  without DISTINCT, to plain Cypher; with the dedup disabled 6 of 16 differ). A survey of 248
+  multi-clause rules in the corpus found 3 that disagree: 2 negative tests already expecting the
+  error, and `test_similar_to_in_locy_along`, whose `BEST BY` on the recursive clause only was
+  the defect below (fixed by stating it on both clauses). `locy_scope_check`'s recursive template
+  stated its REQUIRE on one clause only; its base clause now seeds instead of folding.
+  The oracle generator and a topo `count(DISTINCT)` relation were not added: the oracle's
+  generated rules never differ across clauses, and the Cypher-oracle test covers DISTINCT on
+  both engines directly.
+- *Found on the way, silent:*
+  - **S11.** A REQUIRE on any clause but the first that folds was ignored: on CHAIN,
+    `REQUIRE t >= 2` on the recursive clause only returned all six `t = 1` facts (both
+    clauses: none).
+  - **S12.** The same for a post-FOLD WHERE.
+  - **S13.** A BEST BY in a rule without FOLD ranked the whole rule when clause 1 stated it and
+    only its own clause otherwise (`w=5` versus `w=5, w=7` for the same two clauses).
+  - **S14 (Cypher).** `sum(DISTINCT e.w)` over a schemaless property summed every row (17 for
+    distinct values {1, 2, 3, 4}), and so would `percentileDisc` / `percentileCont`, `stdev` and
+    any plugin aggregate under DISTINCT: DataFusion passes DISTINCT to the accumulator as a flag
+    that only its own count / sum / avg / min / max read. The planner's comment said percentiles
+    "handle their own distinct"; they did not. Fixed with one wrapper (`distinct_udaf`) for every
+    aggregate outside that set.
+  - **A regression from the YIELD-typing fix (`821fcca98`):** clauses type their columns
+    independently, and with an undeclared property now a Cypher value, `r.w` in one clause and
+    `e.w + 1` in another failed ("concatenate arrays of different data types"). Both were guessed
+    `Float64` before. Fixed in the planner by unifying a column the clauses type differently
+    (`clause_column_types`).
+- *Found, not fixed:* Cypher's `sum` over a dynamically typed column skips a value it cannot add
+  (`// skip non-numeric` in `CypherSumAccumulator`), so `sum(x.name)` is 0 and a sum of durations
+  is 0. A literal `sum('a')` fails loudly; Neo4j raises a type error for strings and sums
+  durations. The fix is to implement duration sums and error on other types.
 
 **L5 — The in-memory evaluator as a second engine (R1, remaining).**
 - Fix:

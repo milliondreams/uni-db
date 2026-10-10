@@ -367,7 +367,22 @@ CREATE RULE reachable AS
     YIELD KEY a, KEY b
 ```
 
-Results are the **union** of all clause evaluations. All clauses must have the **same YIELD schema** — same number of columns, same KEY positions, same PROB annotations. Violations produce `YieldSchemaMismatch`.
+Results are the **union** of all clause evaluations, so the clauses must agree on what the rule is:
+
+- **The same YIELD columns.** Clauses are matched by column **name**, so every clause yields the
+  same names, each with the same KEY flag and PROB annotation; the order may differ. A clause
+  that names a column differently is `YieldSchemaMismatch`: alias it with `AS`
+  (`YIELD KEY a, KEY c AS b`).
+- **One FOLD tail.** FOLD, the post-FOLD WHERE, REQUIRE and BEST BY apply to the union of the
+  clauses, so every clause that folds states the same ones: the same FOLD names and aggregates
+  (each clause folds its own argument expression), the same post-FOLD WHERE, REQUIRE and BEST BY.
+  A clause without FOLD seeds the fold and states none of them. In a rule without FOLD, BEST BY
+  ranks the union, so every clause states the same BEST BY or none does. Violations are
+  `ClauseMismatch`.
+
+Before this check, a clause yielding `KEY a, KEY c` beside one yielding `KEY a, KEY b` filled
+`b` from its own body variable `b`, and a REQUIRE or post-FOLD WHERE on any clause but the first
+that folds was ignored.
 
 ## 4.4 MATCH Clause
 
@@ -585,12 +600,14 @@ PROB marks a column as carrying a **probability value** in [0, 1]:
 
 ## 6.4 Schema Consistency
 
-All clauses of a multi-clause rule must produce the same YIELD schema:
-- Same number of columns
-- Same KEY positions
-- Same PROB annotations
+All clauses of a multi-clause rule must produce the same YIELD schema, matched by column name:
+- Same number of columns, with the same names (alias with `AS` where a clause's expression
+  would name a column differently)
+- The same KEY flag for each name
+- The same PROB annotation for each name
 
-Violations produce `YieldSchemaMismatch`.
+The order of the columns may differ between clauses. Violations produce `YieldSchemaMismatch`.
+See [Section 4.3](#43-multi-clause-rules-union-semantics) for the FOLD tail the clauses share.
 
 ---
 
@@ -675,6 +692,12 @@ CREATE RULE spending AS
     FOLD total = SUM(r.amount), count = COUNT(*)
     YIELD KEY p, total, count
 ```
+
+`AGG(DISTINCT expr)` folds each distinct value of `expr` once per KEY group, as Cypher's
+`count(DISTINCT x)` does: `FOLD k = COUNT(DISTINCT y)` counts a group's distinct `y`, however
+many rows reach each one. A recursive rule cannot use it (`DistinctFoldInRecursion`): its FOLD
+folds each iteration's new rows and never sees a group's whole set of values. Fold the distinct
+values in a non-recursive rule that reads the recursive one.
 
 ## 8.2 Monotonic Aggregates (Safe in Recursion)
 
@@ -1245,7 +1268,8 @@ A two-pass algorithm:
 
 **Pass 1 (per-rule):**
 - Mixed priority check → `MixedPriority`
-- YIELD schema inference — collect items from all clauses, verify consistency → `YieldSchemaMismatch`
+- YIELD schema inference — collect items from all clauses, verify the names, KEY and PROB flags agree by name → `YieldSchemaMismatch`
+- FOLD tail agreement across clauses → `ClauseMismatch`; DISTINCT in a recursive FOLD → `DistinctFoldInRecursion`
 - Implicit PROB annotation from MNOR/MPROD folds
 - Multiple PROB validation → `MultipleProbColumns`
 - `prev` in base case check → `PrevInBaseCase`
@@ -1717,7 +1741,9 @@ session.locy_with(program) \
 | `NonMonotonicInRecursion` | `rule: String, aggregate: String` | SUM/COUNT/AVG/etc. used in a recursive stratum | Use monotonic variant (MSUM/MCOUNT/etc.) or restructure |
 | `BestByWithMonotonicFold` | `rule: String, fold: String` | BEST BY combined with MSUM/MNOR/etc. | Remove BEST BY or use non-monotonic fold |
 | `WardednessViolation` | `rule: String, variable: String` | NEW node's companion not bound by MATCH | Bind companion variable in the MATCH pattern |
-| `YieldSchemaMismatch` | `rule: String, detail: String` | Clauses of same rule differ in column count or PROB | Align all clauses' YIELD schemas |
+| `YieldSchemaMismatch` | `rule: String, detail: String` | Clauses of same rule differ in column count, column names, or a column's KEY or PROB flag | Name every clause's columns alike, with `AS` |
+| `ClauseMismatch` | `rule, part, detail` | Clauses that fold state different FOLD aggregates, post-FOLD WHERE, REQUIRE or BEST BY; a seeding clause states BEST BY; or, without FOLD, clauses state different BEST BY | State the tail identically on every folding clause |
+| `DistinctFoldInRecursion` | `rule, fold` | `AGG(DISTINCT ...)` in a recursive rule | Fold the distinct values in a non-recursive rule reading this one |
 | `MixedPriority` | `rule: String` | Some clauses have PRIORITY, others don't | Add PRIORITY to all or remove from all |
 | `MultipleProbColumns` | `rule: String, count: usize` | More than one PROB annotation per rule | Use at most one PROB column |
 | `IsArityMismatch` | `rule, target, expected, actual` | IS reference provides wrong number of bindings | Match binding count to target rule's yield width |

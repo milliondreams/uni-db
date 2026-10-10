@@ -1845,6 +1845,7 @@ fn convert_fold_bindings(
                     aggregate,
                     input_col_index: 0, // unused for CountAll
                     input_col_name: None,
+                    distinct: false,
                 });
             }
 
@@ -1862,6 +1863,7 @@ fn convert_fold_bindings(
                 aggregate,
                 input_col_index,
                 input_col_name: Some(name.clone()),
+                distinct: matches!(expr, Expr::FunctionCall { distinct: true, .. }),
             })
         })
         .collect()

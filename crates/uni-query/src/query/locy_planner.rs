@@ -1144,6 +1144,94 @@ fn rule_fold_layout(rule: &CompiledRule) -> Vec<(String, String)> {
         .collect()
 }
 
+/// One type for each column the rule's clauses would project with different
+/// types, keyed by YIELD column name, and FOLD inputs by FOLD variable.
+///
+/// Each clause infers its column types from its own expressions, and the
+/// clauses' batches are then unioned, so two clauses typing one column
+/// differently fail ("concatenate arrays of different data types"): `r.w` of
+/// a property no schema declares is a Cypher value, `e.w + 1` a float. Mixed
+/// integers and floats unify to a float, anything else to a Cypher value,
+/// which carries any value. A column every clause types the same is absent,
+/// so a rule whose clauses agree plans as before. Seeded FOLD columns and
+/// ALONG columns are unified separately (`fold_input_column_types`,
+/// `along_column_types`); `COLLECT` keeps its elements' type.
+fn clause_column_types(
+    rule: &CompiledRule,
+    rule_catalog: &HashMap<String, CompiledRule>,
+    schema: &Schema,
+) -> HashMap<String, DataType> {
+    if rule.clauses.len() < 2 {
+        return HashMap::new();
+    }
+    let along_types = along_column_types(&rule.clauses, schema);
+    let seeded: HashSet<String> = rule_fold_layout(rule)
+        .into_iter()
+        .map(|(_, yield_name)| yield_name)
+        .collect();
+    let mut types: HashMap<String, Vec<DataType>> = HashMap::new();
+    for clause in &rule.clauses {
+        let RuleOutput::Yield(yc) = &clause.output else {
+            continue;
+        };
+        let fold_names: HashSet<&str> = clause.fold.iter().map(|f| f.name.as_str()).collect();
+        let mut node_vars = HashSet::new();
+        collect_match_node_vars(clause, &mut node_vars);
+        let var_labels = clause_var_labels(clause);
+        let infer = |name: &str, is_key: bool| {
+            infer_yield_type(
+                name,
+                clause,
+                &node_vars,
+                &fold_names,
+                &along_types,
+                rule_catalog,
+                is_key,
+                schema,
+                &var_labels,
+            )
+        };
+        for (name, item) in resolve_yield_column_names(&yc.items)
+            .into_iter()
+            .zip(&yc.items)
+        {
+            let fold_output = expr_references_fold_output(&item.expr, &fold_names);
+            let seed = clause.fold.is_empty() && seeded.contains(&name);
+            if fold_output || seed || along_types.contains_key(&name) {
+                continue;
+            }
+            let ty = infer(&name, item.is_key);
+            types.entry(name).or_default().push(ty);
+        }
+        for fb in &clause.fold {
+            let has_argument =
+                matches!(&fb.aggregate, Expr::FunctionCall { args, .. } if !args.is_empty());
+            if !has_argument || fold_function_name(&fb.aggregate).as_deref() == Some("COLLECT") {
+                continue;
+            }
+            types
+                .entry(fb.name.clone())
+                .or_default()
+                .push(infer(&fb.name, false));
+        }
+    }
+    types
+        .into_iter()
+        .filter(|(_, tys)| tys.iter().any(|t| *t != tys[0]))
+        .map(|(name, tys)| {
+            let numeric = tys
+                .iter()
+                .all(|t| matches!(t, DataType::Int64 | DataType::Float64));
+            let ty = if numeric {
+                DataType::Float64
+            } else {
+                DataType::LargeBinary
+            };
+            (name, ty)
+        })
+        .collect()
+}
+
 /// The type each FOLD-output column carries *before* the fold, keyed by the
 /// rule's yield column name.
 ///
@@ -1526,6 +1614,15 @@ impl<'a> LocyPlanBuilder<'a> {
         }
 
         let fold_layout = rule_fold_layout(rule);
+        // Columns the clauses type differently, unified; a FOLD input's type
+        // also decides the type of the column seeding it.
+        let unified = clause_column_types(rule, rule_catalog, self.planner.schema());
+        for (fold_var, yield_name) in &fold_layout {
+            if let Some(dt) = unified.get(fold_var) {
+                seed_types.insert(yield_name.clone(), dt.clone());
+            }
+        }
+        seed_types.extend(unified.iter().map(|(k, v)| (k.clone(), v.clone())));
 
         let mut clauses = Vec::with_capacity(rule.clauses.len());
         for (clause_index, clause) in rule.clauses.iter().enumerate() {
@@ -1660,6 +1757,11 @@ impl<'a> LocyPlanBuilder<'a> {
             .iter()
             .map(|yc| {
                 let data_type = match first_clause {
+                    _ if unified.contains_key(&yc.name)
+                        && !fold_output_names.contains(yc.name.as_str()) =>
+                    {
+                        unified[&yc.name].clone()
+                    }
                     Some(fc) => infer_yield_type(
                         &yc.name,
                         fc,
@@ -2427,10 +2529,11 @@ impl<'a> LocyPlanBuilder<'a> {
             // columns (covers FOLD aggregate inputs and plain YIELD exprs).
             let expr = rewrite_is_ref_cols(expr, &is_ref_col_aliases);
             projections.push((expr, Some(column_name.clone())));
-            let seeded = (clause.fold.is_empty() && !yc.is_key)
-                .then(|| ctx.seed_types.get(&yc.name).cloned())
-                .flatten();
-            target_types.push(seeded.unwrap_or_else(|| {
+            // A FOLD clause never reaches here with a FOLD output, and
+            // `seed_types` holds a KEY column only when the clauses type it
+            // differently, so the rule-wide type applies to every clause.
+            let unified = ctx.seed_types.get(&yc.name).cloned();
+            target_types.push(unified.unwrap_or_else(|| {
                 infer_yield_type(
                     &yc.name,
                     clause,
@@ -2477,7 +2580,8 @@ impl<'a> LocyPlanBuilder<'a> {
             let collect_input = (fold_function_name(&fb.aggregate).as_deref() == Some("COLLECT"))
                 .then(|| fold_argument_type(&fb.aggregate, graph_schema, &var_labels, node_vars))
                 .flatten();
-            target_types.push(collect_input.unwrap_or_else(|| {
+            let unified = || ctx.seed_types.get(&fb.name).cloned();
+            target_types.push(collect_input.or_else(unified).unwrap_or_else(|| {
                 infer_yield_type(
                     &fb.name,
                     clause,

@@ -7496,6 +7496,34 @@ declares, and `plan_locy_project` encodes into that type value by value
 those expressions as strings, so every yielded list came back as its text (or
 its encoded bytes, schemaless), and an undeclared relationship property was
 guessed `Float64` (`locy_yield_list_values`, with plain Cypher as the oracle).
+Clauses of one rule infer their column types independently and are unioned, so
+`clause_column_types` unifies a column the clauses type differently (mixed
+integer and float to `Float64`, anything else to a Cypher value) and every
+clause projects that type; a column the clauses agree on keeps its own type.
+
+**The clauses of one Locy rule agree on what the rule is (C-CLAUSE).** The
+planner maps each clause's YIELD onto the rule's columns by name, falling back
+to a body variable of the same name, and reads FOLD, post-FOLD WHERE, REQUIRE
+and BEST BY from the first clause that folds. The compiler therefore requires
+(`typecheck.rs`): the same column names with the same KEY and PROB flags, order
+free (`check_yield_agreement`, `YieldSchemaMismatch`); and one FOLD tail
+(`check_fold_tail_agreement`, `ClauseMismatch`): every folding clause states the
+same FOLD names, aggregates and DISTINCT flags (arguments are per clause), the
+same post-FOLD WHERE, REQUIRE and BEST BY; a seeding clause states none; without
+FOLD, every clause states the same BEST BY. Before, `KEY a, KEY c` beside
+`KEY a, KEY b` filled `b` from the clause's own `b`, and a REQUIRE on a later
+clause was dropped (`locy_clause_contract`).
+
+**A FOLD aggregate honours DISTINCT.** `parse_fold_aggregate` and
+`resolve_fold_bindings` set `FoldBinding::distinct`, and `FoldExec` keeps one
+row per distinct input value in each key group (`distinct_value_groups`) before
+the aggregate sees it. A recursive rule rejects it (`DistinctFoldInRecursion`):
+`MonotonicAggState` folds deltas and never sees the whole bag. In Cypher,
+DataFusion leaves DISTINCT to the accumulator (`AccumulatorArgs::is_distinct`);
+only its own count / sum / avg / min / max honour it, so every other aggregate
+(`_cypher_sum` over a dynamically typed column, percentiles, `stdev`, plugin
+aggregates) is wrapped in `distinct_udaf`, which folds the distinct argument
+tuples. `sum(DISTINCT e.w)` over a schemaless property used to sum every row.
 
 ## Appendix C: Anti-Pattern Summary
 

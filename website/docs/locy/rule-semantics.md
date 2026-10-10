@@ -48,7 +48,20 @@ aggregate is a whole-relation quantity — see *What a self-reference reads* bel
 
 ## Overloaded Rules
 
-Multiple `CREATE RULE` clauses sharing one name define one logical relation. Clauses can be prioritized where supported.
+Multiple `CREATE RULE` clauses sharing one name define one logical relation: its facts are the
+union of what the clauses derive. Clauses can be prioritized where supported.
+
+The clauses must agree on what the relation is:
+
+- They yield the same column **names**, each with the same `KEY` and `PROB` marking; the order
+  may differ. Name a column with `AS` where a clause's expression would name it differently
+  (`YIELD KEY a, KEY c AS b`).
+- Every clause that folds states the same `FOLD` names and aggregates (each over its own
+  argument), post-FOLD `WHERE`, `REQUIRE` and `BEST BY`, because these apply to the union. A
+  clause without `FOLD` seeds the fold and states none of them. In a rule without `FOLD`, every
+  clause states the same `BEST BY` or none does.
+
+A disagreement is a compile error (`YieldSchemaMismatch` or `ClauseMismatch`).
 
 ## Negation Rules
 

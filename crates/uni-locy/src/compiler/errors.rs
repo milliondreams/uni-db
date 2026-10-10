@@ -91,6 +91,42 @@ pub enum LocyCompileError {
         actual: usize,
     },
 
+    /// `prev` written anywhere but as a direct operand of an ALONG expression.
+    ///
+    /// `prev.<column>` reads the referenced fact in a recursive clause, and
+    /// only ALONG gives it that meaning. Every other slot (and an ALONG under
+    /// a function call or parentheses) is plain Cypher, where `prev` is just an
+    /// unbound variable that failed at run time with "No field named prev".
+    #[error(
+        "`prev` in the {slot} of rule '{rule}': `prev.<column>` reads the referenced fact only \
+         as a direct operand of an ALONG expression in a recursive clause (for example \
+         `ALONG c = prev.c + e.w`). To read a referenced rule's value elsewhere, use its \
+         column name."
+    )]
+    PrevOutsideAlong { rule: String, slot: String },
+
+    /// An expression names a variable that is not bound where it is written.
+    #[error(
+        "variable `{variable}` in the {slot} of rule '{rule}' is not bound there. Visible: \
+         {available:?}"
+    )]
+    UnboundVariable {
+        rule: String,
+        slot: String,
+        variable: String,
+        available: Vec<String>,
+    },
+
+    /// A FOLD binding whose value is not a single aggregate call.
+    ///
+    /// The runtime folds the call's argument, so `FOLD t = SUM(e.w) * 1.0`
+    /// has nothing to fold, and the recursion checks only see top-level calls.
+    #[error(
+        "FOLD `{name}` in rule '{rule}' must be a single aggregate call such as \
+         `SUM(e.w)`; compute with its result in YIELD instead (`... YIELD {name} * 1.0 AS x`)"
+    )]
+    FoldNotAnAggregateCall { rule: String, name: String },
+
     /// An `IS NOT` reference compares an already-bound variable with one of
     /// the referenced rule's value columns.
     ///

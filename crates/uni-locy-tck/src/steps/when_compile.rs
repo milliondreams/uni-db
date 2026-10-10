@@ -39,6 +39,20 @@ async fn when_compiling_locy_program(world: &mut LocyWorld, step: &cucumber::ghe
                 message: format!("LocyCompileError: {e}"),
                 query: None,
             });
+            // A program the compiler accepts must plan: a planner "No field
+            // named" is a scope error the compiler should have reported. Most
+            // compile-only scenarios set up no data, so any other evaluation
+            // outcome is allowed.
+            if compile_result.is_ok() {
+                if let Err(e) = world.db().session().locy(program).await {
+                    let message = e.to_string();
+                    assert!(
+                        !message.contains("No field named"),
+                        "the program compiled but failed scope in the planner: {message}\n\
+                         Program:\n{program}"
+                    );
+                }
+            }
             world.set_compile_result(compile_result);
         }
     }

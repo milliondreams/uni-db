@@ -27,7 +27,7 @@ fn extract_match_variables(def: &RuleDefinition) -> HashSet<String> {
 }
 
 /// Every variable a pattern binds, of any kind.
-fn extract_pattern_variables(pattern: &Pattern) -> HashSet<String> {
+pub(super) fn extract_pattern_variables(pattern: &Pattern) -> HashSet<String> {
     let mut vars = HashSet::new();
     for path in &pattern.paths {
         collect_path_vars(path, &mut vars);

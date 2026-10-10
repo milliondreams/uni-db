@@ -1,6 +1,6 @@
 # Locy contract drift: one rule, several meanings
 
-**Date:** 2026-10-09 · **Status:** L1 done (`9e24aa3d6`); L2 implemented (uncommitted); L3–L6 proposed · **Trigger:** issue #298
+**Date:** 2026-10-09 · **Status:** L1 done (`9e24aa3d6`); L2 done (`374be77f2`, closes #298); L3 implemented (uncommitted); L4–L6 proposed · **Trigger:** issue #298
 
 ## Why
 
@@ -60,6 +60,21 @@ that matches leaves later results unchanged. That was checked.
 | L6 | `BEST BY zz.w` (typo variable) | accepted; ranks on column `w` | R3 |
 | L7 | `IS NOT link TO t` with interleaved KEYs | plan error, while the positive `IS` works | R2 |
 | L8 | two FOLD clauses, `SUM` and `MAX` into one column | Arrow concatenate error | R4 |
+
+### Found while building L3 (confirmed, not yet fixed)
+
+A list built from values in a Locy YIELD comes back wrong, outside any scope question:
+
+| YIELD item | Result |
+|---|---|
+| `[1, 2] AS ws` | `[1, 2]` (correct) |
+| `e.w * 2 AS ws` | `10.0`, `14.0` (correct) |
+| `[e.w, e.w] AS ws` | `[0205, 0205]` — **silent wrong answer**: the values' codec bytes |
+| `[v IN [1, 2] \| v * 2] AS ws` | run-time `Encountered non UTF-8 data` |
+
+Probable mechanism, unverified: the YIELD column's type inference does not cover a list of
+dynamically typed values, so the encoded elements are declared as a string or binary list. To be
+probed and fixed as its own item.
 
 ### Predicted, not yet run
 
@@ -253,6 +268,18 @@ what they exist to show.)
     from valid programs into other slots.
   - Extend the `locy_parse` fuzz target to compile. A planning stage can follow if the fuzz
     harness can host a database.
+- *Done:* `compiler/scope.rs` (`PrevOutsideAlong`, `UnboundVariable`, `FoldNotAnAggregateCall`),
+  EXPLAIN / ABDUCE / DERIVE WHERE checks, and REQUIRE splitting `AND` and refusing a fold output
+  inside an expression. The pass runs after every existing check, so their errors keep
+  precedence. Coverage: `locy_scope_check` — 18 rejections and 10 acceptances by hand, plus a
+  generated sweep of 9 slots × 8 candidates asserting no "No field named" reaches the planner.
+  The sweep caught the first version's post-FOLD YIELD scope being too wide (it admitted body
+  variables the folded batch does not hold). The TCK compile step now evaluates every program it
+  compiles. The construct × position table was replaced by the generated sweep, which classifies
+  every cell without listing them. The fuzz target is unchanged (it is parse-only and has no
+  database to plan against).
+- *Before the fix, silently:* `REQUIRE prev.t >= 1` returned rows; `BEST BY zz.w` ranked by `w`;
+  an unbound variable in an ABDUCE, EXPLAIN or DERIVE WHERE matched nothing without an error.
 
 **L4 — Cross-clause contract and aggregate modifiers (R4, R5).**
 - Fix: C-CLAUSE as a compile check. For `DISTINCT` in FOLD, see decision 2 in §6.

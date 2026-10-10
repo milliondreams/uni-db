@@ -391,6 +391,9 @@ pub fn check(
         }
     }
 
+    // Last, so a program the checks above reject keeps their error.
+    super::scope::check_rule_scopes(rule_groups, &compiled_rules, module_ctx)?;
+
     Ok((compiled_rules, warnings))
 }
 
@@ -987,7 +990,28 @@ fn check_require_direction(
         })
     };
 
+    // `REQUIRE a AND b` parses as one conjunction; each conjunct is a bound
+    // of its own and must be one-way on its own.
+    fn conjuncts<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
+        match expr {
+            Expr::BinaryOp {
+                left,
+                op: BinaryOp::And,
+                right,
+            } => {
+                conjuncts(left, out);
+                conjuncts(right, out);
+            }
+            other => out.push(other),
+        }
+    }
+    let mut predicates = Vec::new();
     for predicate in &def.require {
+        conjuncts(predicate, &mut predicates);
+    }
+    let fold_names: HashSet<&str> = def.fold.iter().map(|f| f.name.as_str()).collect();
+
+    for predicate in predicates {
         let Expr::BinaryOp { left, op, right } = predicate else {
             return reject(format!(
                 "`{predicate:?}` is not a comparison against a fold output"
@@ -1003,6 +1027,15 @@ fn check_require_direction(
                 return reject(
                     "both sides name a fold output, so neither bound is fixed".to_string(),
                 );
+            }
+            // A fold output inside an expression (`t * 1.0 <= 50`): which way
+            // the expression moves with the output is not known, so neither
+            // is which way the bound points. Refused rather than guessed.
+            (None, None) if expr_mentions_any(predicate, &fold_names) => {
+                return reject(format!(
+                    "`{predicate:?}` uses a fold output inside an expression; compare the \
+                     output itself with a value (`t <= 50`), so the bound's direction is known"
+                ));
             }
             // No fold output mentioned: constant across iterations, so it can
             // never flip. Admitted.

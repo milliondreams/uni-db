@@ -7469,6 +7469,24 @@ FOLD outputs yielded in a different order from their FOLD bindings
 (`locy_is_ref_binding`; the `locy_binding` topo relation; the oracle
 differential reorders every generated rule's YIELD in its second run).
 
+**Every Locy expression is scope-checked at compile time.** Locy reparses every
+slot but the inside of ALONG as plain Cypher, so a misspelt variable or a
+`prev.x` outside ALONG failed late ("No field named …" from DataFusion) or, in a
+command WHERE the in-memory evaluator runs, evaluated to NULL and silently
+matched nothing. `compiler/scope.rs` checks each slot against what it sees at
+run time: the rule body (MATCH variables, positive IS subjects and targets,
+generator outputs, referenced rules' value columns by name), plus ALONG names
+for ALONG, FOLD arguments and YIELD; and, for a YIELD item over a FOLD output,
+the post-FOLD WHERE and REQUIRE, only the folded batch (KEY columns by YIELD
+name, FOLD outputs by name and alias). EXPLAIN, ABDUCE and DERIVE WHERE are
+checked against the rule's facts. A clause referencing a rule the compiler has
+no schema for is checked only for `prev`. The pass runs last, so existing
+errors keep precedence. REQUIRE in recursion splits `AND` and refuses a fold
+output inside an expression (fail closed); a FOLD that is not one aggregate
+call is refused. Guards: `locy_scope_check` (a hand matrix, and a generated
+slot × candidate sweep asserting no scope error reaches the planner) and the
+TCK compile step, which now also plans every program it compiles.
+
 ## Appendix C: Anti-Pattern Summary
 
 Quick reference of all anti-patterns from every chapter:

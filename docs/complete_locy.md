@@ -1722,6 +1722,9 @@ session.locy_with(program) \
 | `MultipleProbColumns` | `rule: String, count: usize` | More than one PROB annotation per rule | Use at most one PROB column |
 | `IsArityMismatch` | `rule, target, expected, actual` | IS reference provides wrong number of bindings | Match binding count to target rule's yield width |
 | `IsNotBindsValueColumn` | `rule, target, variable, column` | `IS NOT` compares an already-bound variable with a value column | Test the value in WHERE after a positive reference |
+| `PrevOutsideAlong` | `rule, slot` | `prev.<column>` anywhere but as a direct operand of ALONG (including under a function call or parentheses inside ALONG) | Read a referenced rule's value by its column name |
+| `UnboundVariable` | `rule, slot, variable, available` | An expression names a variable not visible in its slot (rule body, ALONG, FOLD, YIELD, BEST BY, post-FOLD WHERE, REQUIRE, or an EXPLAIN / ABDUCE / DERIVE WHERE) | Use a name from `available` |
+| `FoldNotAnAggregateCall` | `rule, name` | A FOLD binding is not a single aggregate call (`SUM(e.w) * 1.0`) | Fold the call, compute with its result in YIELD |
 | `PrevFieldNotInSchema` | `rule, field, available` | `prev.field` references a nonexistent column | Check field name against target rule's yield schema |
 | `ModuleNotFound` | `name: String` | USE references unknown module | Ensure module is available |
 | `ImportNotFound` | `module, rule: String` | Selective import for nonexistent rule | Check rule name in import list |

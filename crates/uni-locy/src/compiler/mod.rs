@@ -1,6 +1,7 @@
 pub mod dependency;
 pub mod errors;
 pub mod models;
+mod scope;
 pub mod stratify;
 pub mod typecheck;
 pub mod warded;
@@ -277,10 +278,7 @@ fn check_query_variables(
     let columns: Vec<String> = rule.yield_schema.iter().map(|c| c.name.clone()).collect();
 
     fn free_vars(expr: &Expr, out: &mut Vec<String>) {
-        if let Expr::Variable(v) = expr {
-            out.push(v.clone());
-        }
-        expr.for_each_child_in_scope(&mut |child| free_vars(child, out));
+        out.extend(scope::free_variables(expr));
     }
 
     let mut referenced = Vec::new();
@@ -314,6 +312,46 @@ fn check_query_variables(
             rule: rule_name.to_string(),
             variable: variable.clone(),
             available: columns,
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Rejects an EXPLAIN, ABDUCE or DERIVE `WHERE` that names a variable its rule's
+/// facts do not carry.
+///
+/// These commands evaluate the WHERE per fact in the in-memory evaluator, where
+/// an unbound variable is NULL: the command silently matched nothing. A fact
+/// carries the rule's YIELD columns; a DERIVE rule's carries its MATCH
+/// variables.
+fn check_command_where(
+    rule_name: &str,
+    rule: &crate::types::CompiledRule,
+    where_expr: Option<&uni_cypher::ast::Expr>,
+    slot: &str,
+) -> Result<(), LocyCompileError> {
+    let Some(where_expr) = where_expr else {
+        return Ok(());
+    };
+    let mut available: Vec<String> = if rule.yield_schema.is_empty() {
+        rule.clauses
+            .iter()
+            .flat_map(|c| warded::extract_pattern_variables(&c.match_pattern))
+            .collect()
+    } else {
+        rule.yield_schema.iter().map(|c| c.name.clone()).collect()
+    };
+    available.sort();
+    available.dedup();
+    match scope::free_variables(where_expr)
+        .into_iter()
+        .find(|v| !available.contains(v))
+    {
+        Some(variable) => Err(LocyCompileError::UnboundVariable {
+            rule: rule_name.to_string(),
+            slot: slot.to_string(),
+            variable,
+            available,
         }),
         None => Ok(()),
     }
@@ -357,14 +395,31 @@ fn extract_commands(
             }
             LocyStatement::ExplainRule(eq) => {
                 validate_rule(&eq.rule_name.to_string())?;
+                let resolved = modules::resolve_rule_name(module_ctx, &eq.rule_name.to_string());
+                if let Some(rule) = rule_catalog.get(&resolved) {
+                    check_command_where(
+                        &resolved,
+                        rule,
+                        eq.where_expr.as_ref(),
+                        "EXPLAIN RULE WHERE",
+                    )?;
+                }
                 commands.push(CompiledCommand::ExplainRule(eq.clone()));
             }
             LocyStatement::AbduceQuery(aq) => {
                 validate_rule(&aq.rule_name.to_string())?;
+                let resolved = modules::resolve_rule_name(module_ctx, &aq.rule_name.to_string());
+                if let Some(rule) = rule_catalog.get(&resolved) {
+                    check_command_where(&resolved, rule, aq.where_expr.as_ref(), "ABDUCE WHERE")?;
+                }
                 commands.push(CompiledCommand::Abduce(aq.clone()));
             }
             LocyStatement::DeriveCommand(dc) => {
                 validate_rule(&dc.rule_name.to_string())?;
+                let resolved = modules::resolve_rule_name(module_ctx, &dc.rule_name.to_string());
+                if let Some(rule) = rule_catalog.get(&resolved) {
+                    check_command_where(&resolved, rule, dc.where_expr.as_ref(), "DERIVE WHERE")?;
+                }
                 commands.push(CompiledCommand::DeriveCommand(dc.clone()));
             }
             LocyStatement::AssumeBlock(ab) => {

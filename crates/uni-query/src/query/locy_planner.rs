@@ -45,7 +45,7 @@ fn collect_node_vars(
 }
 
 /// Body of [`collect_node_vars`], carrying the cycle guard that
-/// [`is_ref_target_binds_node`] needs to walk into the referenced rule.
+/// [`is_ref_binds_node`] needs to walk into the referenced rule.
 fn collect_node_vars_guarded(
     clauses: &[CompiledClause],
     rule_catalog: &HashMap<String, CompiledRule>,
@@ -54,23 +54,27 @@ fn collect_node_vars_guarded(
     let mut node_vars = HashSet::new();
     for clause in clauses {
         collect_match_node_vars(clause, &mut node_vars);
-        // IS-ref subjects are always node VIDs (UInt64) — a subject binds a KEY
-        // column by construction. A TO target only sometimes is; ask the
-        // referenced rule (issue #272).
+        // A subject that binds a KEY column is a node VID (UInt64). A variable
+        // bound past the KEY columns (a later subject, or the TO target) only
+        // sometimes is; ask the referenced rule (issues #272, #298).
         for condition in &clause.where_conditions {
             if let RuleCondition::IsReference(is_ref) = condition {
-                for subject in &is_ref.subjects {
-                    node_vars.insert(subject.clone());
-                }
-                if let Some(target_var) = &is_ref.target
-                    && is_ref_target_binds_node(
-                        &is_ref.rule_name.to_string(),
-                        is_ref.subjects.len(),
-                        rule_catalog,
-                        visiting,
-                    )
-                {
-                    node_vars.insert(target_var.clone());
+                let rule_name = is_ref.rule_name.to_string();
+                let key_count = rule_catalog.get(&rule_name).map_or(usize::MAX, |r| {
+                    r.yield_schema.iter().filter(|c| c.is_key).count()
+                });
+                let bound = is_ref
+                    .subjects
+                    .iter()
+                    .chain(is_ref.target.as_ref())
+                    .enumerate();
+                for (position, var) in bound {
+                    let is_target = position == is_ref.subjects.len();
+                    if (!is_target && position < key_count)
+                        || is_ref_binds_node(&rule_name, position, rule_catalog, visiting)
+                    {
+                        node_vars.insert(var.clone());
+                    }
                 }
             }
         }
@@ -78,8 +82,11 @@ fn collect_node_vars_guarded(
     node_vars
 }
 
-/// Whether `IS <rule_name> TO <target>`, with `subject_count` subjects, binds
-/// its target to a **node VID** rather than to an ordinary scalar.
+/// Whether the IS-reference variable at `position` binds a **node VID** rather
+/// than an ordinary scalar.
+///
+/// Positions follow [`uni_locy::is_binding::binding_sequence`]: subject `i` is
+/// at `i`, a `TO` target at the subject count.
 ///
 /// A KEY column always holds a VID. A value column usually does not — a FOLD
 /// result, an ALONG accumulation, a projected property — but it can: `YIELD KEY
@@ -97,9 +104,9 @@ fn collect_node_vars_guarded(
 /// yield columns; a target reached only through a cycle keeps the pre-#272
 /// node assumption, which is what `reachable(a,b) :- reachable(a,mid),
 /// reachable(mid,b)` needs.
-fn is_ref_target_binds_node(
+fn is_ref_binds_node(
     rule_name: &str,
-    subject_count: usize,
+    position: usize,
     rule_catalog: &HashMap<String, CompiledRule>,
     visiting: &mut HashSet<String>,
 ) -> bool {
@@ -108,7 +115,7 @@ fn is_ref_target_binds_node(
     let Some(target_rule) = rule_catalog.get(rule_name) else {
         return true;
     };
-    let Some((col_name, is_key)) = is_ref_target_column(subject_count, &target_rule.yield_schema)
+    let Some((col_name, is_key)) = is_ref_binding_column(position, &target_rule.yield_schema)
     else {
         return true;
     };
@@ -1072,6 +1079,46 @@ fn count_input_marker(input: Expr, clause: &CompiledClause, clause_index: usize)
     }
 }
 
+/// A FOLD rule's FOLD-input columns in the order its FOLD clause projects
+/// them, as `(FOLD variable, YIELD column)`.
+///
+/// The FOLD clause projects its YIELD columns other than FOLD outputs in YIELD
+/// order, then one input column per aggregate that has an argument, named by
+/// the FOLD variable. A sibling clause that seeds those columns is unioned
+/// with it by position, so it must lay its columns out the same way, which
+/// YIELD order gives only when every KEY is yielded before every FOLD output:
+/// `YIELD 1 AS s, KEY a` beside `FOLD s = ... YIELD s, KEY a` unioned the seed
+/// value with the KEY and failed with "concatenate arrays of different data
+/// types". Empty for a rule without FOLD.
+fn rule_fold_layout(rule: &CompiledRule) -> Vec<(String, String)> {
+    let Some(fold_clause) = rule.clauses.iter().find(|c| !c.fold.is_empty()) else {
+        return Vec::new();
+    };
+    let yield_name_of: HashMap<&str, String> = match &fold_clause.output {
+        RuleOutput::Yield(yc) => resolve_yield_column_names(&yc.items)
+            .into_iter()
+            .zip(yc.items.iter())
+            .filter_map(|(name, item)| match &item.expr {
+                Expr::Variable(var) => Some((var.as_str(), name)),
+                _ => None,
+            })
+            .collect(),
+        _ => HashMap::new(),
+    };
+    fold_clause
+        .fold
+        .iter()
+        .filter(|fb| matches!(&fb.aggregate, Expr::FunctionCall { args, .. } if !args.is_empty()))
+        .map(|fb| {
+            let yield_name = yield_name_of
+                .get(fb.name.as_str())
+                .cloned()
+                .unwrap_or_else(|| fb.name.clone());
+            (fb.name.clone(), yield_name)
+        })
+        .collect()
+}
+
 /// The type each FOLD-output column carries *before* the fold, keyed by the
 /// rule's yield column name.
 ///
@@ -1097,9 +1144,16 @@ fn fold_input_column_types(
     let mut node_vars = HashSet::new();
     collect_match_node_vars(fold_clause, &mut node_vars);
     let var_labels = clause_var_labels(fold_clause);
+    // By name: the rule's schema is in binding order, the clause's items in
+    // YIELD order.
+    let item_by_name: HashMap<String, &uni_cypher::locy_ast::LocyYieldItem> =
+        resolve_yield_column_names(&yc.items)
+            .into_iter()
+            .zip(yc.items.iter())
+            .collect();
     rule.yield_schema
         .iter()
-        .zip(yc.items.iter())
+        .filter_map(|col| item_by_name.get(&col.name).map(|item| (col, *item)))
         .filter_map(|(col, item)| {
             let Expr::Variable(fold_name) = &item.expr else {
                 return None;
@@ -1138,6 +1192,9 @@ struct ClauseCtx<'a> {
     /// seeding it, and its value is aggregated alongside the fold's inputs, so
     /// it must carry the fold input's type. See [`fold_input_column_types`].
     seed_types: &'a HashMap<String, DataType>,
+    /// The rule's FOLD-input columns in the order its FOLD clause projects
+    /// them, as `(FOLD variable, YIELD column)`. See [`rule_fold_layout`].
+    fold_layout: &'a [(String, String)],
     /// Whether this rule's stratum is recursive — needed to compute a
     /// same-stratum IS-ref target's own discriminator columns.
     is_recursive: bool,
@@ -1443,6 +1500,8 @@ impl<'a> LocyPlanBuilder<'a> {
             seed_types.entry(name).or_insert(dt);
         }
 
+        let fold_layout = rule_fold_layout(rule);
+
         let mut clauses = Vec::with_capacity(rule.clauses.len());
         for (clause_index, clause) in rule.clauses.iter().enumerate() {
             let named;
@@ -1462,6 +1521,7 @@ impl<'a> LocyPlanBuilder<'a> {
                     node_vars: &node_vars,
                     deriv_vars: &deriv_vars,
                     seed_types: &seed_types,
+                    fold_layout: &fold_layout,
                     is_recursive,
                     clause_index,
                 },
@@ -1833,6 +1893,10 @@ impl<'a> LocyPlanBuilder<'a> {
         // already exposed unprefixed (by an occurrence-0 ref) so they keep
         // shadowing later identically named columns.
         let mut is_ref_col_aliases: HashMap<String, String> = HashMap::new();
+        // Scalar variables an IS reference bound (a value-column subject or a
+        // scalar `TO` target) → the scan column holding them. A later binding
+        // of the same variable is a test against that column, not a rebinding.
+        let mut scalar_bindings: HashMap<String, String> = HashMap::new();
         let mut bare_is_ref_cols: HashSet<String> = HashSet::new();
 
         // Hidden `{var}._vid` projections for negated IS-ref subjects, so the
@@ -1851,23 +1915,53 @@ impl<'a> LocyPlanBuilder<'a> {
                     format!("IS-reference to unknown rule '{}'", target_rule_name)
                 })?;
 
-                // Validate: arity — subjects bind to KEY columns positionally.
-                // The optional target binds to the next KEY column (if any remain)
-                // or the first non-KEY column. So subjects must not exceed KEY count.
+                // Validate: arity. Subjects, then the optional target, bind the
+                // referenced rule's binding sequence: its KEY columns, then its
+                // value columns (`uni_locy::is_binding`). The compiler checks
+                // the same rule; this guards programs built without it.
                 let key_count = target_rule
                     .yield_schema
                     .iter()
                     .filter(|yc| yc.is_key)
                     .count();
-                if is_ref.subjects.len() > key_count {
+                let Some(bound_columns) = uni_locy::is_binding::bound_columns(
+                    &target_rule.yield_schema,
+                    is_ref.subjects.len(),
+                    is_ref.target.is_some(),
+                ) else {
                     bail!(
-                        "IS-reference to '{}': arity mismatch — {} subjects \
-                         provided but rule has only {} KEY columns",
+                        "IS-reference to '{}': arity mismatch — {} bindings \
+                         provided but rule yields only {} columns",
                         target_rule_name,
-                        is_ref.subjects.len(),
-                        key_count,
+                        is_ref.subjects.len() + usize::from(is_ref.target.is_some()),
+                        target_rule.yield_schema.len(),
+                    );
+                };
+                // As the compiler: an unbound variable on a value column is
+                // existentially quantified and dropped from the anti-join; a
+                // bound one would need a value comparison negation cannot make.
+                if is_ref.negated
+                    && let Some((var, col)) = is_ref
+                        .subjects
+                        .iter()
+                        .chain(is_ref.target.iter())
+                        .zip(bound_columns.iter())
+                        .find(|(var, col)| {
+                            !col.is_key
+                                && (clause_node_vars.contains(*var)
+                                    || scalar_bindings.contains_key(*var))
+                        })
+                {
+                    bail!(
+                        "IS NOT reference to '{}' compares the bound variable `{}` with `{}`, \
+                         which is not a KEY column",
+                        target_rule_name,
+                        var,
+                        col.name,
                     );
                 }
+                let binding_columns: Vec<String> =
+                    bound_columns.iter().map(|c| c.name.clone()).collect();
 
                 let is_self_ref = stratum_rule_names.contains(&target_rule_name);
                 // A same-stratum handle is fed live pre-fold facts, so it must
@@ -1958,6 +2052,7 @@ impl<'a> LocyPlanBuilder<'a> {
                     target_has_prob,
                     target_prob_col,
                     subject_vid_cols,
+                    binding_columns,
                 };
                 is_refs.push(locy_is_ref);
 
@@ -1981,6 +2076,19 @@ impl<'a> LocyPlanBuilder<'a> {
                         format!("__isref{}_", positive_is_ref_occurrence)
                     };
                     positive_is_ref_occurrence += 1;
+
+                    // What each bare name resolved to before this reference, so
+                    // binding a name an earlier reference exposed is a test
+                    // rather than a silent rebinding.
+                    let exposed_before: HashMap<String, String> = bare_is_ref_cols
+                        .iter()
+                        .map(|name| (name.clone(), name.clone()))
+                        .chain(
+                            is_ref_col_aliases
+                                .iter()
+                                .map(|(k, v)| (k.clone(), v.clone())),
+                        )
+                        .collect();
 
                     // Record bare→aliased names for this ref's non-KEY value
                     // columns so later FOLD/YIELD/WHERE references resolve to
@@ -2021,94 +2129,124 @@ impl<'a> LocyPlanBuilder<'a> {
                         right: Box::new(derived_scan),
                     };
 
-                    // Subject-only predicate: n._vid = a (target handled separately).
-                    let predicate = build_is_ref_predicate(
-                        &is_ref.subjects,
-                        &None,
-                        &target_rule.yield_schema,
-                        &clause_node_vars,
-                        &col_prefix,
-                    )?;
-                    plan = LogicalPlan::Filter {
-                        input: Box::new(plan),
-                        predicate,
-                        optional_variables: HashSet::new(),
-                    };
+                    // Subjects that bind KEY columns test the derived scan:
+                    // `n._vid = a`.
+                    let key_subjects = &is_ref.subjects[..is_ref.subjects.len().min(key_count)];
+                    if !key_subjects.is_empty() {
+                        let predicate = build_is_ref_predicate(
+                            key_subjects,
+                            &target_rule.yield_schema,
+                            &clause_node_vars,
+                            &col_prefix,
+                        )?;
+                        plan = LogicalPlan::Filter {
+                            input: Box::new(plan),
+                            predicate,
+                            optional_variables: HashSet::new(),
+                        };
+                    }
 
-                    // If the IS-ref has a target variable, bind it to the derived
-                    // scan's target column. When the target var name differs from
-                    // the derived column name (e.g., `m` vs `b`), add an implicit
-                    // ScanAll for the target so it becomes a proper node column.
-                    if let Some(target_var) = &is_ref.target {
-                        let target_col =
-                            is_ref_target_column(is_ref.subjects.len(), &target_rule.yield_schema);
-                        let target_is_node = is_ref_target_binds_node(
+                    // Subjects past the KEY columns, then the `TO` target, bind
+                    // the rest of the binding sequence (`uni_locy::is_binding`):
+                    // `(o, e, pct) IS stake` binds `pct` exactly as
+                    // `(o, e) IS stake TO pct` does (issues #272, #298).
+                    let later_bindings = is_ref
+                        .subjects
+                        .iter()
+                        .enumerate()
+                        .skip(key_count)
+                        .chain(is_ref.target.iter().map(|t| (is_ref.subjects.len(), t)));
+                    for (position, bound_var) in later_bindings {
+                        let binding_col =
+                            is_ref_binding_column(position, &target_rule.yield_schema);
+                        let binds_node = is_ref_binds_node(
                             &target_rule_name,
-                            is_ref.subjects.len(),
+                            position,
                             rule_catalog,
                             &mut HashSet::new(),
                         );
 
-                        if let Some((col_name, _)) = &target_col
-                            && !target_is_node
+                        if let Some((col_name, _)) = &binding_col
+                            && !binds_node
                         {
-                            // The target binds a scalar column — a FOLD
-                            // result, an ALONG accumulation, a projected
-                            // property. Bind it by name: record `target_var` →
-                            // this scan's column so FOLD, YIELD and the
-                            // deferred WHERE resolve it, and do not scan,
-                            // VID-join, or register it as a node. Treating it
-                            // as a node is issue #272 — the emitted
-                            // `target._vid = <scalar col>` matched nothing and
-                            // the rule silently returned no rows.
+                            // A scalar column — a FOLD result, an ALONG
+                            // accumulation, a projected property. Bind it by
+                            // name: record `bound_var` → this scan's column so
+                            // FOLD, YIELD and the deferred WHERE resolve it,
+                            // and do not scan, VID-join, or register it as a
+                            // node. Treating it as a node is issue #272 — the
+                            // emitted `var._vid = <scalar col>` matched nothing
+                            // and the rule silently returned no rows. A
+                            // variable bound already is tested instead.
                             let scan_col = format!("{col_prefix}{col_name}");
-                            if *target_var != scan_col {
-                                is_ref_col_aliases.insert(target_var.clone(), scan_col);
+                            let earlier = scalar_bindings
+                                .get(bound_var)
+                                .or_else(|| exposed_before.get(bound_var))
+                                .cloned();
+                            match earlier {
+                                Some(earlier_col) => {
+                                    plan = LogicalPlan::Filter {
+                                        input: Box::new(plan),
+                                        predicate: Expr::BinaryOp {
+                                            left: Box::new(Expr::Variable(earlier_col)),
+                                            op: BinaryOp::Eq,
+                                            right: Box::new(Expr::Variable(scan_col)),
+                                        },
+                                        optional_variables: HashSet::new(),
+                                    };
+                                }
+                                None => {
+                                    if *bound_var != scan_col {
+                                        is_ref_col_aliases
+                                            .insert(bound_var.clone(), scan_col.clone());
+                                    }
+                                    scalar_bindings.insert(bound_var.clone(), scan_col);
+                                }
                             }
                         }
 
-                        if let Some((col_name, _)) = target_col.filter(|_| target_is_node) {
-                            // Materialize `target_var` as a proper node (with
+                        if let Some((col_name, _)) = binding_col.filter(|_| binds_node) {
+                            // Materialize `bound_var` as a proper node (with
                             // `._vid`, `._labels`, and property columns) the
                             // FIRST time it appears, so property access (e.g.
                             // `b.embedding`) works and later subjects can use it.
-                            // If the target is already a node variable — a
-                            // MATCH-bound var, or the shared target of an earlier
-                            // IS-ref (`... TO ce, ... TO ce`) — do NOT re-scan it:
-                            // a second `ScanAll` cross-joins the node with itself,
-                            // inflating any aggregate over the joined value columns
-                            // (e.g. `MPROD(mapping_conf)` over the cartesian square
-                            // of the shared element set).
-                            if !clause_node_vars.contains(target_var) {
-                                let target_node_scan = LogicalPlan::ScanAll {
-                                    variable: target_var.clone(),
+                            // If it is already a node variable — a MATCH-bound
+                            // var, or the shared target of an earlier IS-ref
+                            // (`... TO ce, ... TO ce`) — do NOT re-scan it: a
+                            // second `ScanAll` cross-joins the node with itself,
+                            // inflating any aggregate over the joined value
+                            // columns (e.g. `MPROD(mapping_conf)` over the
+                            // cartesian square of the shared element set).
+                            if !clause_node_vars.contains(bound_var) {
+                                let node_scan = LogicalPlan::ScanAll {
+                                    variable: bound_var.clone(),
                                     filter: None,
                                     optional: false,
                                 };
                                 plan = LogicalPlan::CrossJoin {
                                     left: Box::new(plan),
-                                    right: Box::new(target_node_scan),
+                                    right: Box::new(node_scan),
                                 };
                             }
-                            // Bind: target_var._vid = derived_col (UInt64
-                            // equality). For an already-bound target this ties
+                            // Bind: bound_var._vid = derived_col (UInt64
+                            // equality). For an already-bound variable this ties
                             // this ref's derived scan to the same node the earlier
-                            // ref bound, turning a shared `TO ce` into a join
+                            // binding chose, turning a shared `TO ce` into a join
                             // constraint rather than a fresh cross product.
-                            let target_binding = Expr::BinaryOp {
-                                left: Box::new(Expr::Variable(format!("{}._vid", target_var))),
+                            let node_binding = Expr::BinaryOp {
+                                left: Box::new(Expr::Variable(format!("{}._vid", bound_var))),
                                 op: BinaryOp::Eq,
                                 right: Box::new(Expr::Variable(format!("{col_prefix}{col_name}"))),
                             };
                             plan = LogicalPlan::Filter {
                                 input: Box::new(plan),
-                                predicate: target_binding,
+                                predicate: node_binding,
                                 optional_variables: HashSet::new(),
                             };
-                            // Record the target as a node variable so chained
-                            // IS-refs later in this clause can use it as a subject
+                            // Record it as a node variable so chained IS-refs
+                            // later in this clause can use it as a subject
                             // (`x IS r TO mid, mid IS r TO z`).
-                            clause_node_vars.insert(target_var.clone());
+                            clause_node_vars.insert(bound_var.clone());
                         }
                     }
                 }
@@ -2210,7 +2348,31 @@ impl<'a> LocyPlanBuilder<'a> {
         let mut target_types = Vec::new();
         let var_labels = clause_var_labels(clause);
         let graph_schema = self.planner.schema();
-        for yc in yield_cols {
+        // A clause that seeds a sibling FOLD lays its columns out as the FOLD
+        // clause does: the other YIELD columns in order, then each seeded
+        // column under its FOLD variable, in FOLD order (`rule_fold_layout`).
+        let seeded_name = |yc: &YieldColumn| -> Option<&String> {
+            clause
+                .fold
+                .is_empty()
+                .then(|| {
+                    ctx.fold_layout
+                        .iter()
+                        .find(|(_, y)| *y == yc.name)
+                        .map(|(f, _)| f)
+                })
+                .flatten()
+        };
+        let ordered_cols: Vec<(&YieldColumn, &String)> = yield_cols
+            .iter()
+            .filter(|yc| seeded_name(yc).is_none())
+            .map(|yc| (yc, &yc.name))
+            .chain(ctx.fold_layout.iter().filter_map(|(fold_var, yield_name)| {
+                let yc = yield_cols.iter().find(|yc| &yc.name == yield_name)?;
+                seeded_name(yc).map(|_| (yc, fold_var))
+            }))
+            .collect();
+        for (yc, column_name) in ordered_cols {
             let expr = if let Some(locy_expr) = along_map.get(yc.name.as_str()) {
                 rewrite_locy_expr(locy_expr)?
             } else if fold_output_names.contains(yc.name.as_str()) {
@@ -2239,7 +2401,7 @@ impl<'a> LocyPlanBuilder<'a> {
             // Resolve bare references to non-first IS-refs' aliased value
             // columns (covers FOLD aggregate inputs and plain YIELD exprs).
             let expr = rewrite_is_ref_cols(expr, &is_ref_col_aliases);
-            projections.push((expr, Some(yc.name.clone())));
+            projections.push((expr, Some(column_name.clone())));
             let seeded = (clause.fold.is_empty() && !yc.is_key)
                 .then(|| ctx.seed_types.get(&yc.name).cloned())
                 .flatten();
@@ -2721,51 +2883,32 @@ fn alias_derived_schema(schema: &SchemaRef, prefix: &str) -> SchemaRef {
     Arc::new(ArrowSchema::new(fields))
 }
 
-/// Which yield column an `IS <rule> TO <target>` binds, and whether that column
-/// is a KEY.
+/// The column of the referenced rule bound by the IS-reference variable at
+/// `position`, with whether it is a KEY column.
 ///
-/// Subjects consume the referenced rule's KEY columns positionally; the
-/// optional target binds the next remaining KEY column, or — once the subjects
-/// have consumed every KEY — the rule's first value (non-KEY) column.
-///
-/// The `is_key` half of the answer is load-bearing: a KEY column holds a node
-/// VID and is bound by node identity (`target._vid = <col>`), while a value
-/// column holds an ordinary scalar (a FOLD result, a projected property) and
-/// must be bound by name. Binding a value column as a node compares a UInt64
-/// VID against, say, an `MSUM` float — a filter nothing satisfies, so the rule
-/// yields zero rows and reports nothing (issue #272).
-fn is_ref_target_column(
-    subject_count: usize,
-    yield_schema: &[YieldColumn],
-) -> Option<(String, bool)> {
-    let mut keys = yield_schema.iter().filter(|yc| yc.is_key);
-    match keys.nth(subject_count) {
-        Some(key) => Some((key.name.clone(), true)),
-        None => yield_schema
-            .iter()
-            .find(|yc| !yc.is_key)
-            .map(|c| (c.name.clone(), false)),
-    }
+/// One rule for every binding: [`uni_locy::is_binding::binding_sequence`].
+fn is_ref_binding_column(position: usize, yield_schema: &[YieldColumn]) -> Option<(String, bool)> {
+    uni_locy::is_binding::binding_column(yield_schema, position).map(|c| (c.name.clone(), c.is_key))
 }
 
-/// Maps subjects → KEY yield columns by position, and target → remaining KEY
-/// or first non-KEY yield column. For node variables, compares `._vid` property
-/// (UInt64) instead of bare variable (which doesn't exist as a column).
+/// Equality predicates tying IS-reference subjects to the KEY columns they bind.
+///
+/// `subjects` are the reference's subjects that bind KEY columns: the first
+/// `min(subjects, KEY count)` of them, whose columns are the referenced rule's
+/// KEY columns in YIELD order. Subjects past the KEY columns, and a `TO`
+/// target, are bound by the caller (they may introduce a variable rather than
+/// test one). For node variables the predicate compares `._vid` (UInt64)
+/// instead of the bare variable, which is not a column.
 ///
 /// `col_prefix` is the derived scan's column alias prefix (empty for the
 /// clause's first positive IS-ref); the yield-column side of every predicate
 /// is prefixed so it resolves against the right scan.
 fn build_is_ref_predicate(
     subjects: &[String],
-    target: &Option<String>,
     yield_schema: &[YieldColumn],
     node_vars: &HashSet<String>,
     col_prefix: &str,
 ) -> Result<Expr> {
-    let key_cols: Vec<&YieldColumn> = yield_schema.iter().filter(|yc| yc.is_key).collect();
-
-    let mut predicates = Vec::new();
-
     /// Build the expression for a variable in an IS-ref predicate.
     /// Node variables use `var._vid` as a raw column reference (UInt64);
     /// scalars use bare `var`.
@@ -2785,28 +2928,17 @@ fn build_is_ref_predicate(
         }
     }
 
-    // subjects[i] = key_cols[i]
-    for (i, subject) in subjects.iter().enumerate() {
-        let key_col = key_cols.get(i).with_context(|| {
-            format!(
-                "IS-ref subject index {} exceeds KEY column count {}",
-                i,
-                key_cols.len()
-            )
-        })?;
+    let mut predicates = Vec::new();
+    for (position, subject) in subjects.iter().enumerate() {
+        let (col_name, is_key) =
+            is_ref_binding_column(position, yield_schema).with_context(|| {
+                format!("IS-ref subject {position} has no column to bind in the referenced rule")
+            })?;
+        if !is_key {
+            bail!("IS-ref subject {position} binds value column `{col_name}`, not a KEY column");
+        }
         predicates.push(Expr::BinaryOp {
             left: Box::new(make_var_expr(subject, node_vars)),
-            op: BinaryOp::Eq,
-            right: Box::new(Expr::Variable(format!("{col_prefix}{}", key_col.name))),
-        });
-    }
-
-    // target: bind to remaining KEY column (after subjects) or first non-KEY
-    if let Some(target_var) = target
-        && let Some((col_name, _is_key)) = is_ref_target_column(subjects.len(), yield_schema)
-    {
-        predicates.push(Expr::BinaryOp {
-            left: Box::new(make_var_expr(target_var, node_vars)),
             op: BinaryOp::Eq,
             right: Box::new(Expr::Variable(format!("{col_prefix}{col_name}"))),
         });
@@ -3680,6 +3812,7 @@ mod tests {
                     node_vars: &HashSet::new(),
                     deriv_vars: &[],
                     seed_types: &HashMap::new(),
+                    fold_layout: &[],
                     is_recursive: false,
                     clause_index: 0,
                 },
@@ -3748,6 +3881,7 @@ mod tests {
                     node_vars: &HashSet::new(),
                     deriv_vars: &[],
                     seed_types: &HashMap::new(),
+                    fold_layout: &[],
                     is_recursive: false,
                     clause_index: 0,
                 },
@@ -3813,6 +3947,7 @@ mod tests {
                     node_vars: &HashSet::new(),
                     deriv_vars: &[],
                     seed_types: &HashMap::new(),
+                    fold_layout: &[],
                     is_recursive: false,
                     clause_index: 0,
                 },
@@ -3873,6 +4008,7 @@ mod tests {
                     node_vars: &HashSet::new(),
                     deriv_vars: &[],
                     seed_types: &HashMap::new(),
+                    fold_layout: &[],
                     is_recursive: false,
                     clause_index: 0,
                 },
@@ -3943,6 +4079,7 @@ mod tests {
                     node_vars: &HashSet::new(),
                     deriv_vars: &[],
                     seed_types: &HashMap::new(),
+                    fold_layout: &[],
                     is_recursive: false,
                     clause_index: 0,
                 },
@@ -4001,6 +4138,7 @@ mod tests {
                     node_vars: &HashSet::new(),
                     deriv_vars: &[],
                     seed_types: &HashMap::new(),
+                    fold_layout: &[],
                     is_recursive: false,
                     clause_index: 0,
                 },
@@ -4081,6 +4219,7 @@ mod tests {
                     node_vars: &HashSet::new(),
                     deriv_vars: &[],
                     seed_types: &HashMap::new(),
+                    fold_layout: &[],
                     is_recursive: false,
                     clause_index: 0,
                 },
@@ -4305,6 +4444,7 @@ mod tests {
                     node_vars: &HashSet::new(),
                     deriv_vars: &[],
                     seed_types: &HashMap::new(),
+                    fold_layout: &[],
                     is_recursive: false,
                     clause_index: 0,
                 },
@@ -4365,6 +4505,7 @@ mod tests {
                     node_vars: &HashSet::new(),
                     deriv_vars: &[],
                     seed_types: &HashMap::new(),
+                    fold_layout: &[],
                     is_recursive: false,
                     clause_index: 0,
                 },
@@ -4423,6 +4564,7 @@ mod tests {
                     node_vars: &HashSet::new(),
                     deriv_vars: &[],
                     seed_types: &HashMap::new(),
+                    fold_layout: &[],
                     is_recursive: false,
                     clause_index: 0,
                 },
@@ -4473,6 +4615,7 @@ mod tests {
                     node_vars: &HashSet::new(),
                     deriv_vars: &[],
                     seed_types: &HashMap::new(),
+                    fold_layout: &[],
                     is_recursive: false,
                     clause_index: 0,
                 },
@@ -4515,6 +4658,7 @@ mod tests {
                     node_vars: &HashSet::new(),
                     deriv_vars: &[],
                     seed_types: &HashMap::new(),
+                    fold_layout: &[],
                     is_recursive: false,
                     clause_index: 0,
                 },
@@ -4598,6 +4742,7 @@ mod tests {
                     node_vars: &HashSet::new(),
                     deriv_vars: &[],
                     seed_types: &HashMap::new(),
+                    fold_layout: &[],
                     is_recursive: false,
                     clause_index: 0,
                 },
@@ -5352,6 +5497,7 @@ mod tests {
                 node_vars: &HashSet::new(),
                 deriv_vars: &[],
                 seed_types: &HashMap::new(),
+                fold_layout: &[],
                 is_recursive: false,
                 clause_index: 0,
             },
@@ -5405,6 +5551,7 @@ mod tests {
                 node_vars: &HashSet::new(),
                 deriv_vars: &[],
                 seed_types: &HashMap::new(),
+                fold_layout: &[],
                 is_recursive: false,
                 clause_index: 0,
             },
@@ -5461,6 +5608,7 @@ mod tests {
                 node_vars: &HashSet::new(),
                 deriv_vars: &[],
                 seed_types: &HashMap::new(),
+                fold_layout: &[],
                 is_recursive: false,
                 clause_index: 0,
             },
@@ -5511,6 +5659,7 @@ mod tests {
                 node_vars: &HashSet::new(),
                 deriv_vars: &[],
                 seed_types: &HashMap::new(),
+                fold_layout: &[],
                 is_recursive: false,
                 clause_index: 0,
             },
@@ -5565,6 +5714,7 @@ mod tests {
                     node_vars: &HashSet::new(),
                     deriv_vars: &[],
                     seed_types: &HashMap::new(),
+                    fold_layout: &[],
                     is_recursive: false,
                     clause_index: 0,
                 },
@@ -5620,6 +5770,7 @@ mod tests {
                 node_vars: &HashSet::new(),
                 deriv_vars: &[],
                 seed_types: &HashMap::new(),
+                fold_layout: &[],
                 is_recursive: false,
                 clause_index: 0,
             },

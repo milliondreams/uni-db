@@ -403,6 +403,18 @@ IS references are how rules compose — one rule references another rule's deriv
 
 ## 5.1 Positive IS References
 
+### Binding Order
+
+Every form below binds variables to the referenced rule's columns in one order, its **binding
+sequence**: the rule's KEY columns in YIELD order, then its other columns in YIELD order. Subjects
+take columns from the front of the sequence, and a `TO` target takes the next one. For a rule whose
+KEY columns are yielded first, the binding sequence is simply YIELD order. The same order is used
+by `IS`, `IS NOT`, EXPLAIN and every evaluation path (`uni_locy::is_binding`).
+
+A variable that is not yet bound is bound to the column; one that is already bound is tested
+against it. A KEY column of a node binds a node; a value column (a FOLD result, an ALONG
+accumulation, a projected property) binds a value.
+
 ### Unary Form
 
 ```
@@ -417,7 +429,9 @@ WHERE x IS flagged
 WHERE x IS reachable TO y
 ```
 
-`x` and `y` are bound to the first two columns of the `reachable` rule. Succeeds if the pair `(x, y)` exists in the derived relation.
+`x` binds the first column of `reachable`'s binding sequence and `y` the second: the second KEY
+column, or the first value column when `reachable` has one KEY. Succeeds if the pair `(x, y)`
+exists in the derived relation.
 
 ### Tuple Form
 
@@ -425,11 +439,38 @@ WHERE x IS reachable TO y
 WHERE (x, y, cost) IS weighted_path
 ```
 
-All variables are bound positionally to the `weighted_path` rule's yield columns. The number of bindings must not exceed the target rule's yield schema width (compiler error: `IsArityMismatch`).
+All variables bind `weighted_path`'s binding sequence positionally, so with `YIELD KEY x, KEY y,
+cost` the third variable reads the `cost` value of each matching fact. The number of bindings must
+not exceed the rule's column count (compiler error: `IsArityMismatch`). `(x, y) IS weighted_path TO
+cost` binds the same columns.
+
+### Reading a Value Column by Name
+
+A positive IS reference also makes each of the referenced rule's value columns available under its
+own name, without binding it:
+
+```
+CREATE RULE stake AS
+    MATCH (o:E)-[r:OWNS]->(e:E)
+    FOLD pct = MAX(r.pct)
+    YIELD KEY o, KEY e, pct
+
+CREATE RULE exposure AS
+    MATCH (o:E), (e:E)
+    WHERE o IS stake TO e
+    FOLD total = MSUM(pct)
+    YIELD KEY e, total
+```
+
+When two references in one clause expose the same name, the first one wins; bind the value
+explicitly (tuple form or `TO`) to choose.
 
 ### Semantics
 
-A positive IS reference is a **semi-join**: for each row from the MATCH clause, check if the subject(s) exist in the target rule's derived relation. If found, the row passes through; if not, it's filtered out. When the target rule has additional yield columns beyond the bound subjects, those columns become available as `__prev_*` variables for ALONG expressions.
+A positive IS reference is a **semi-join**: for each row from the MATCH clause, check if the
+subject(s) exist in the target rule's derived relation. If found, the row passes through, once per
+matching fact; if not, it's filtered out. `prev.<column>` inside ALONG reads a column of the
+referenced fact in a recursive clause (§6).
 
 ## 5.2 IS NOT References (Negation)
 
@@ -441,6 +482,12 @@ WHERE NOT x IS blocked            -- Prefix form
 WHERE x IS NOT rule TO y          -- Binary with negation
 WHERE (x, y) IS NOT rule          -- Tuple with negation
 ```
+
+Variables bind the same binding sequence as a positive reference (§5.1). A fact is identified by its
+KEY, and negation asks whether a fact exists, so `IS NOT` cannot compare a value: a variable that is
+already bound and lands on a value column is a compile error (`IsNotBindsValueColumn`); test the
+value in WHERE after a positive reference instead. An unbound variable on a value column is
+existentially quantified and ignored, so `b IS NOT stake TO agg` means `b IS NOT stake`.
 
 ### Boolean Semantics (Default)
 
@@ -1208,7 +1255,7 @@ A two-pass algorithm:
 - MNOR/MPROD domain warning → `ProbabilityDomainViolation`
 
 **Pass 2 (IS-ref validation):**
-- IS-ref arity check → `IsArityMismatch`
+- IS-ref arity check → `IsArityMismatch`; `IS NOT` comparing a bound variable with a value column → `IsNotBindsValueColumn`
 - `prev.field` validation → `PrevFieldNotInSchema`
 
 ## 14.7 Program Assembly
@@ -1674,6 +1721,7 @@ session.locy_with(program) \
 | `MixedPriority` | `rule: String` | Some clauses have PRIORITY, others don't | Add PRIORITY to all or remove from all |
 | `MultipleProbColumns` | `rule: String, count: usize` | More than one PROB annotation per rule | Use at most one PROB column |
 | `IsArityMismatch` | `rule, target, expected, actual` | IS reference provides wrong number of bindings | Match binding count to target rule's yield width |
+| `IsNotBindsValueColumn` | `rule, target, variable, column` | `IS NOT` compares an already-bound variable with a value column | Test the value in WHERE after a positive reference |
 | `PrevFieldNotInSchema` | `rule, field, available` | `prev.field` references a nonexistent column | Check field name against target rule's yield schema |
 | `ModuleNotFound` | `name: String` | USE references unknown module | Ensure module is available |
 | `ImportNotFound` | `module, rule: String` | Selective import for nonexistent rule | Check rule name in import list |

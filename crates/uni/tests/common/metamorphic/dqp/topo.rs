@@ -33,6 +33,7 @@
 //! | `locy_negation` | `a IS NOT reach TO b` = `NOT EXISTS { (a)-[*1..]->(b) }` |
 //! | `locy_query_where` | a `QUERY ... WHERE` filter = the same filter in the rule body |
 //! | `locy_commands` | an `EXPLAIN RULE` or `ABDUCE` before a `QUERY` leaves its answer unchanged |
+//! | `locy_binding` | a rule's value read by tuple, by `TO`, by name, and through a permuted `YIELD` |
 //!
 //! The fixture ([`build_topo`]) has chains, a diamond, parallel edges (two with
 //! identical properties), self-loops, a 2-cycle and a 3-cycle, fan-in, fan-out,
@@ -685,11 +686,16 @@ pub enum Relation {
     /// A command never changes what a later command reads: `EXPLAIN RULE` or
     /// `ABDUCE` placed before a `QUERY` leaves the `QUERY`'s answer unchanged.
     LocyCommands,
+    /// One binding rule for IS references: reading a rule's value column as a
+    /// third subject, as a `TO` target, by its name, or from a copy of the rule
+    /// whose `YIELD` lists the value first and the KEYs swapped, derives the
+    /// same facts.
+    LocyBinding,
 }
 
 impl Relation {
     /// Every relation, in report order.
-    pub const ALL: [Relation; 15] = [
+    pub const ALL: [Relation; 16] = [
         Relation::NamedRel,
         Relation::Optional,
         Relation::Exists,
@@ -705,6 +711,7 @@ impl Relation {
         Relation::LocyNegation,
         Relation::LocyQueryWhere,
         Relation::LocyCommands,
+        Relation::LocyBinding,
     ];
 
     /// Short name for reports and failures.
@@ -725,6 +732,7 @@ impl Relation {
             Relation::LocyNegation => "locy_negation",
             Relation::LocyQueryWhere => "locy_query_where",
             Relation::LocyCommands => "locy_commands",
+            Relation::LocyBinding => "locy_binding",
         }
     }
 
@@ -1050,6 +1058,38 @@ impl Relation {
                 Some(Rewrite {
                     reference: program(""),
                     equivalents,
+                })
+            }
+            Relation::LocyBinding => {
+                // `p` counts each (a, b) pair's matches. Its value column `n`
+                // is read four ways; the last reads a copy of `p` that yields
+                // `n` first and its KEYs in the other order, which binds
+                // `(b, a, v)` to the same columns: KEY columns bind first, in
+                // YIELD order, then the value.
+                let rule = |name: &str, yield_items: &str| {
+                    format!(
+                        "CREATE RULE {name} AS MATCH {}{} FOLD n = COUNT(*) YIELD {yield_items} ",
+                        case.locy_pattern(),
+                        case.body_where()
+                    )
+                };
+                let p = rule("p", "KEY a, KEY b, n");
+                let reader = |rules: &str, body: &str| {
+                    format!(
+                        "{rules}CREATE RULE q AS MATCH (a), (b) WHERE {body} \
+                         QUERY q RETURN a.id AS c0, b.id AS c1, v AS c2"
+                    )
+                };
+                Some(Rewrite {
+                    reference: reader(&p, "(a, b, v) IS p YIELD KEY a, KEY b, v"),
+                    equivalents: vec![
+                        vec![reader(&p, "(a, b) IS p TO v YIELD KEY a, KEY b, v")],
+                        vec![reader(&p, "(a, b) IS p YIELD KEY a, KEY b, n AS v")],
+                        vec![reader(
+                            &rule("p", "n, KEY b, KEY a"),
+                            "(b, a, v) IS p YIELD KEY a, KEY b, v",
+                        )],
+                    ],
                 })
             }
         }

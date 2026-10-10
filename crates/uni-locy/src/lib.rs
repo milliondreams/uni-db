@@ -3,6 +3,7 @@ pub mod compiler;
 pub mod config;
 pub mod dependency_dnf;
 pub mod errors;
+pub mod is_binding;
 pub mod names;
 pub mod neural;
 pub mod prune;

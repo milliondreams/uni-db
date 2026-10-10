@@ -96,7 +96,9 @@ enum SubjectMode {
 
 /// Check whether a derived fact matches the subject bindings from a base row.
 ///
-/// Positional: `subjects[i]` maps to `schema[i]` in the derived relation.
+/// Positional: `subjects[i]` maps to `schema[i]` and the target to the column
+/// after the subjects, where `schema` is the referenced rule's binding sequence
+/// (`uni_locy::is_binding::binding_column_names`): KEY columns first.
 fn is_ref_matches(
     base_row: &FactRow,
     derived_fact: &FactRow,
@@ -360,8 +362,16 @@ pub async fn resolve_clause_with_is_refs(
     for cond in &clause.where_conditions {
         if let RuleCondition::IsReference(is_ref) = cond {
             let rule_name = is_ref.rule_name.to_string();
+            // Bind in the referenced rule's binding sequence, as the planner
+            // does: KEY columns, then value columns. The relation's own column
+            // order is YIELD order, which bound a `TO` target to a value
+            // column whenever one was yielded between two KEYs.
             let (schema, derived_facts) = if let Some(relation) = derived_store.get(&rule_name) {
-                (relation.columns.clone(), relation.rows.clone())
+                let schema = rule_catalog.get(&rule_name).map_or_else(
+                    || relation.columns.clone(),
+                    |r| uni_locy::is_binding::binding_column_names(&r.yield_schema),
+                );
+                (schema, relation.rows.clone())
             } else {
                 (Vec::new(), Vec::new())
             };

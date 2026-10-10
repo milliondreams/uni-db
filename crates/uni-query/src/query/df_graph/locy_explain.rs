@@ -667,6 +667,10 @@ fn build_derivation_node<'a>(
                                 .filter(|c| c.is_key)
                                 .map(|c| c.name.clone())
                                 .collect();
+                            // The column each subject, then the target, binds
+                            // (`uni_locy::is_binding`), as in evaluation.
+                            let ref_binding_columns =
+                                uni_locy::is_binding::binding_column_names(&ref_rule.yield_schema);
 
                             let ref_facts: Vec<FactRow> = derived_store
                                 .get(&ref_rule_name)
@@ -683,7 +687,7 @@ fn build_derivation_node<'a>(
                                                 fact,
                                                 subject,
                                                 ref_fact,
-                                                ref_key_columns.get(i),
+                                                ref_binding_columns.get(i),
                                             )
                                         });
                                     let target_matches =
@@ -693,7 +697,7 @@ fn build_derivation_node<'a>(
                                                 fact,
                                                 target,
                                                 ref_fact,
-                                                ref_key_columns.get(is_ref.subjects.len()),
+                                                ref_binding_columns.get(is_ref.subjects.len()),
                                             )
                                         });
                                     subjects_match && target_matches

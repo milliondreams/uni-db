@@ -91,6 +91,27 @@ pub enum LocyCompileError {
         actual: usize,
     },
 
+    /// An `IS NOT` reference compares an already-bound variable with one of
+    /// the referenced rule's value columns.
+    ///
+    /// A fact is identified by its KEY columns, and negation asks whether a
+    /// fact exists, so it cannot compare a value. An *unbound* variable on a
+    /// value column is legal: it is existentially quantified and ignored, so
+    /// `b IS NOT stake TO agg` means `b IS NOT stake`. Bindings follow
+    /// [`crate::is_binding::binding_sequence`].
+    #[error(
+        "IS NOT reference to '{target}' in rule '{rule}' compares the bound variable \
+         `{variable}` with `{column}`, which is not a KEY column of '{target}'. Negation asks \
+         whether a fact exists, and a fact is identified by its KEY, so IS NOT cannot compare a \
+         value; test it in WHERE after a positive IS reference instead."
+    )]
+    IsNotBindsValueColumn {
+        rule: String,
+        target: String,
+        variable: String,
+        column: String,
+    },
+
     /// The subject of an `IS NOT` reference is not a node.
     ///
     /// Negation joins on node identity, so the subject has to be something that

@@ -1,6 +1,6 @@
 # Locy contract drift: one rule, several meanings
 
-**Date:** 2026-10-09 · **Status:** L1 implemented (uncommitted); L2–L6 proposed · **Trigger:** issue #298
+**Date:** 2026-10-09 · **Status:** L1 done (`9e24aa3d6`); L2 implemented (uncommitted); L3–L6 proposed · **Trigger:** issue #298
 
 ## Why
 
@@ -205,6 +205,32 @@ what they exist to show.)
 
   The oracle switches from prefix matching to C-IS, so that it stops sharing the engine's
   assumption.
+- *Done:* `uni_locy::is_binding` is the one definition. The compiler's arity check, the planner's
+  positive references (subjects past the KEY columns now bind like a `TO` target: a node is
+  scanned and joined, a scalar is aliased, an already-bound variable is tested), IS NOT and
+  provenance (via `LocyIsRef::binding_columns`, resolved at planning time), the in-memory
+  evaluator and EXPLAIN children all bind through it. `IS NOT` comparing a bound variable with a
+  value column is `IsNotBindsValueColumn` (decision 1, as refined). Tests: `locy_is_ref_binding` (8). The topo harness has a
+  `locy_binding` relation (tuple / `TO` / bare name / permuted YIELD). Rather than teach the oracle
+  C-IS, its second run of every generated program interleaves each rule's value columns among its
+  KEYs: under C-IS that changes no answer, so the KEY-first oracle still applies.
+- *Found on the way:* ABDUCE builds its tree with the in-memory evaluator, which bound `TO t` by
+  the stored relation's column order. With a value column between two KEYs, no clause reproduced
+  the fact, the tree ended there, and ABDUCE reported **no valid edit** (silently) where removing
+  either edge would do. Fixed by the same change (`is_ref_binding_abduce_follows_the_binding`).
+  A matching EXPLAIN cannot show this: with EXPLAIN in a program the provenance tracker always
+  exists, and Mode A records no children.
+- *Found on the way, by the oracle's interleaved-YIELD run on its first random program:* the whole
+  FOLD pipeline assumed KEY-first. The FOLD operator emits KEYs before aggregates, a seeding clause
+  emitted YIELD order, derived scans were declared in YIELD order, and `fold_input_column_types`
+  paired schema and items by position. `YIELD 1 AS s, KEY a` beside `FOLD s = ... YIELD s, KEY a`
+  failed ("concatenate arrays of different data types"), and the recursive form failed ("column
+  types must match schema types"). Rather than patch each consumer, the compiler now stores every
+  rule's schema in binding order (`into_binding_order`); column order is not observable, since
+  facts are read by name. A seeding clause also lays its columns out like the FOLD clause
+  (`rule_fold_layout`), which fixed a separate loud failure even with KEYs first: two FOLD outputs
+  yielded in an order other than their FOLD bindings (`YIELD KEY a, t, n` with `FOLD n = ..., t =
+  ...`). Each fix is needed: disabling either one fails `is_ref_binding_yield_order_changes_no_answer`.
 
 **L3 — Scope checking (R3).**
 - Fix: a compile pass implementing C-SCOPE over every Cypher `Expr` slot, including inside ASSUME
@@ -263,6 +289,10 @@ L1's tests.
    the planner refuses a scalar `TO` target under IS NOT (L7). *Recommendation:* allow IS NOT to bind
    KEY columns only, as a compile error naming the column. Negation's stratification argument is
    about facts, and a fact is identified by its KEY.
+   *Refined during L2 (decided 2026-10-09):* an existing test (`locy_is_not_scalar_to_target`) pins
+   an **unbound** variable on a value column as existentially quantified (`b IS NOT stake TO agg`
+   means `b IS NOT stake`). That stays legal; only a variable already bound there is a compile
+   error, since it would need a value comparison.
 2. **`DISTINCT` inside FOLD.**
    - (a) Implement it for non-recursive rules and reject it in recursive ones, where a distinct
      contribution has no clear monotone meaning.

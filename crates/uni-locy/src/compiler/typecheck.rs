@@ -302,21 +302,51 @@ pub fn check(
 
             let mut has_self_is = false;
             let mut is_ref_targets = Vec::new();
+            // Variables bound before each condition: MATCH variables, then
+            // whatever earlier positive IS references bind.
+            let mut bound_vars =
+                super::warded::extract_pattern_node_variables(&clause.match_pattern);
 
             for cond in &clause.where_conditions {
                 if let RuleCondition::IsReference(is_ref) = cond {
                     let target_name = is_ref.rule_name.to_string();
                     if let Some(target_rule) = compiled_rules.get(&target_name) {
-                        let binding_count =
-                            is_ref.subjects.len() + is_ref.target.is_some() as usize;
-                        if binding_count > target_rule.yield_schema.len() {
+                        let Some(bound) = crate::is_binding::bound_columns(
+                            &target_rule.yield_schema,
+                            is_ref.subjects.len(),
+                            is_ref.target.is_some(),
+                        ) else {
                             return Err(LocyCompileError::IsArityMismatch {
                                 rule: rule_name.clone(),
                                 target: target_name,
                                 expected: target_rule.yield_schema.len(),
-                                actual: binding_count,
+                                actual: is_ref.subjects.len()
+                                    + usize::from(is_ref.target.is_some()),
                             });
+                        };
+                        // An unbound variable on a value column is existentially
+                        // quantified and ignored (`b IS NOT stake TO agg` reads "no
+                        // `stake` fact for `b`, whatever `agg` is"). A bound one
+                        // would need a value comparison, which negation over facts
+                        // identified by their KEY cannot make.
+                        if is_ref.negated {
+                            let vars = is_ref.subjects.iter().chain(is_ref.target.iter());
+                            if let Some((var, col)) = vars
+                                .zip(bound.iter())
+                                .find(|(var, col)| !col.is_key && bound_vars.contains(*var))
+                            {
+                                return Err(LocyCompileError::IsNotBindsValueColumn {
+                                    rule: rule_name.clone(),
+                                    target: target_name.clone(),
+                                    variable: var.clone(),
+                                    column: col.name.clone(),
+                                });
+                            }
                         }
+                    }
+                    if !is_ref.negated {
+                        bound_vars.extend(is_ref.subjects.iter().cloned());
+                        bound_vars.extend(is_ref.target.iter().cloned());
                     }
 
                     if scc_rules.contains(&target_name) {
@@ -479,7 +509,11 @@ fn infer_yield_schema(
         }
     }
 
-    Ok(schema.unwrap_or_default())
+    // Stored in binding order (KEY columns first, each group in YIELD order):
+    // see `crate::is_binding::into_binding_order`.
+    Ok(schema
+        .map(crate::is_binding::into_binding_order)
+        .unwrap_or_default())
 }
 
 fn yield_columns_from_items(items: &[LocyYieldItem]) -> Vec<YieldColumn> {

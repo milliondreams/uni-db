@@ -1717,8 +1717,12 @@ fn convert_is_refs(
                 })?;
 
             // For negated IS-refs, compute (left_body_col, right_derived_col) pairs for
-            // anti-join filtering. The derived column name is taken positionally from
-            // the registry entry's schema (KEY columns come first).
+            // anti-join filtering. The derived column is the one the planner
+            // resolved for that subject (`LocyIsRef::binding_columns`, from
+            // `uni_locy::is_binding`), so IS NOT binds what the positive join
+            // binds. Taking the registry schema's fields by position assumed
+            // KEY columns come first; for a rule yielding `b, KEY a` it tested
+            // `b` and returned exactly the wrong nodes.
             //
             // The left name prefers the hidden `{var}._vid` column the planner
             // projected (`LocyIsRef::subject_vid_cols`). The anti-join runs after
@@ -1743,11 +1747,10 @@ fn convert_is_refs(
                     .enumerate()
                     .filter_map(|(i, s)| {
                         if let uni_cypher::ast::Expr::Variable(var) = s {
-                            let right_col = entry
-                                .schema
-                                .fields()
+                            let right_col = is_ref
+                                .binding_columns
                                 .get(i)
-                                .map(|f| f.name().clone())
+                                .cloned()
                                 .unwrap_or_else(|| var.clone());
                             Some((left_col(var), right_col))
                         } else {
@@ -1759,11 +1762,10 @@ fn convert_is_refs(
                 // Without this, `d IS NOT known TO dis` only checks d, not (d, dis),
                 // filtering ALL pairs where the drug has ANY indication regardless
                 // of disease.
-                if let Some(uni_cypher::ast::Expr::Variable(target_var)) = &is_ref.target {
-                    let target_idx = is_ref.subjects.len();
-                    if let Some(field) = entry.schema.fields().get(target_idx) {
-                        cols.push((left_col(target_var), field.name().clone()));
-                    }
+                if let Some(uni_cypher::ast::Expr::Variable(target_var)) = &is_ref.target
+                    && let Some(column) = is_ref.binding_columns.get(is_ref.subjects.len())
+                {
+                    cols.push((left_col(target_var), column.clone()));
                 }
                 cols
             } else {
@@ -1784,11 +1786,10 @@ fn convert_is_refs(
                 .enumerate()
                 .filter_map(|(i, s)| {
                     if let uni_cypher::ast::Expr::Variable(var) = s {
-                        let right_col = entry
-                            .schema
-                            .fields()
+                        let right_col = is_ref
+                            .binding_columns
                             .get(i)
-                            .map(|f| f.name().clone())
+                            .cloned()
                             .unwrap_or_else(|| var.clone());
                         Some((left_col(var), right_col))
                     } else {

@@ -122,6 +122,14 @@ pub struct LocyIsRef {
     /// `_vid`; scalar and ALONG-bound subjects have neither) — those keep the
     /// by-name path and its error.
     pub subject_vid_cols: std::collections::HashMap<String, String>,
+    /// The referenced rule's column bound by each subject, in order, then by
+    /// the target if there is one (`uni_locy::is_binding::bound_columns`).
+    ///
+    /// Resolved once at planning time, where the rule catalog is at hand, so
+    /// the executor's anti-join and provenance join bind the same columns as
+    /// the planner's positive join instead of taking the derived scan's fields
+    /// by position.
+    pub binding_columns: Vec<String>,
 }
 
 /// Prefix for the hidden `_vid` columns described on

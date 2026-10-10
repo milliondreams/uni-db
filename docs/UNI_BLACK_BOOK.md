@@ -7448,6 +7448,27 @@ lives in a store local to the `EXPLAIN` (`locy_command_noninterference`; the
 `QUERY`-after-`EXPLAIN` check). Found while triaging #298; see
 `docs/proposals/locy_contract_drift_class_2026-10-09.md`.
 
+**One rule decides which column an IS reference binds.** A referenced rule's
+columns form a binding sequence — its KEY columns in YIELD order, then its
+value columns in YIELD order — and an IS reference's subjects take columns from
+the front, a `TO` target the next one (`uni_locy::is_binding`). The compiler's
+arity check, the planner's positive join, IS NOT and provenance
+(`LocyIsRef::binding_columns`, resolved at planning time), the in-memory
+evaluator and EXPLAIN children all bind through it; before, they used four
+rules, so `(o, e, pct) IS stake` failed to plan (#298), `IS NOT` against a rule
+yielding `b, KEY a` tested `b` and returned exactly the wrong nodes, and ABDUCE
+over a `TO` with interleaved KEYs found no valid edit. `IS NOT` cannot compare
+a bound variable with a value column (`IsNotBindsValueColumn`); an unbound one
+there is existentially quantified and dropped from the anti-join. The compiler stores every rule's
+schema in binding order (`into_binding_order`), so KEY columns are a prefix for
+every consumer: the FOLD operator emits KEYs before aggregates and derived
+scans were declared in YIELD order, so a value yielded before a KEY failed a
+seeded or recursive FOLD. A clause that seeds a sibling FOLD lays out its
+columns as the FOLD clause does (`rule_fold_layout`), which also fixed two
+FOLD outputs yielded in a different order from their FOLD bindings
+(`locy_is_ref_binding`; the `locy_binding` topo relation; the oracle
+differential reorders every generated rule's YIELD in its second run).
+
 ## Appendix C: Anti-Pattern Summary
 
 Quick reference of all anti-patterns from every chapter:

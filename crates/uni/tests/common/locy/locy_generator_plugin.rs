@@ -150,10 +150,10 @@ async fn locy_generator_binds_and_explodes_in_rule_body() -> anyhow::Result<()> 
     Ok(())
 }
 
-/// A `QUERY ... WHERE key = literal` over a generator rule (resolved by the SLG
-/// path) keeps the rows Locy's `=` keeps. The goal binding compared the key by
-/// structural `==`, so `k = 3.0` against an integer `k` matched nothing and the
-/// query silently returned no rows (W6).
+/// A `QUERY ... WHERE key = literal` over a generator rule keeps the rows
+/// Locy's `=` keeps. The goal binding compared the key by structural `==`, so
+/// `k = 3.0` against an integer `k` matched nothing and the query silently
+/// returned no rows (W6).
 #[tokio::test]
 async fn locy_generator_goal_binding_uses_value_equality() -> anyhow::Result<()> {
     let db = Uni::in_memory().build().await?;

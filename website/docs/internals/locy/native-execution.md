@@ -24,7 +24,7 @@ After strata converge, `dispatch_native_command()` processes each command:
 
 | Command | Operation | Uses DataFusion? |
 |---------|-----------|-----------------|
-| `QUERY` | SLG goal resolution | Indirectly (via strata) |
+| `QUERY` | Read the rule's derived facts → filter → project | No (reads what the strata published) |
 | `DERIVE` | Iterate facts → generate mutations | No (row-level) |
 | `ABDUCE` | Savepoint → mutate → re-evaluate → check → rollback | Yes (re-evaluates strata) |
 | `ASSUME` | Savepoint → mutate → re-evaluate → dispatch body | Yes (re-evaluates strata) |

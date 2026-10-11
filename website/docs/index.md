@@ -94,7 +94,7 @@ The five pillars run on a unified substrate — one process, one data model, one
 
 - Full OpenCypher with recursive CTEs, window functions, and time travel (`VERSION AS OF`)
 - 36 built-in graph algorithms — PageRank, Louvain, Dijkstra, betweenness centrality, k-shortest paths, and more
-- Locy logic layer — recursive rules, stratified negation, goal-directed evaluation (SLG resolution)
+- Locy logic layer — recursive rules, stratified negation, semi-naive fixpoint evaluation
 
 **Associative Recall:**
 

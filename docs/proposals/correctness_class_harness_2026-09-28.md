@@ -312,3 +312,33 @@ W2's determinism check (for #294) and W3's fixture with parallel edges and vid
 gaps (for #294, the VLP bug and the scan gap) are the highest-yield items: both
 reuse existing expectations or existing levers, and neither needs a reference
 implementation.
+
+## 6. Standing checklist for a new generator
+
+Issue #298 and the work it started (`docs/proposals/locy_contract_drift_class_2026-10-09.md`)
+found defects no harness could reach, because every generator emitted only the engine's
+canonical program shape. Before a generator, relation or fixture lands, check that it varies each
+dimension below. A dimension it cannot vary is stated in its doc comment, so the gap is visible.
+
+| Shape dimension | The canonical shape that hid defects | Vary it by |
+|---|---|---|
+| Commands after the rules | rules only, or one trailing QUERY; EXPLAIN and ABDUCE always last | interposing EXPLAIN / ABDUCE (matching, non-matching, unbound WHERE) before a QUERY |
+| Column order | KEY columns first | permuting YIELD, a value column first, KEYs interleaved |
+| Names across clauses | identical in every clause | renaming variables per clause, aliasing with `AS` |
+| Aggregate modifiers | no `DISTINCT` | `DISTINCT` in FOLD and in Cypher aggregates, over values that repeat |
+| Command WHERE scope | always bound, always matching | unbound, misspelt and non-matching variables |
+| Compile vs plan | compiling taken as success | running every program that compiles, on an empty graph at least |
+| Entity kinds in facts | nodes only | rules yielding relationships, scalars as KEYs |
+| ID spaces | fixtures where a VID and an EID never share a number | creating unrelated nodes first, so EIDs and VIDs collide |
+| Program structure | top-level rules, no generators | `MODULE`s, generator rules, rules referencing both |
+
+Three checks apply to the assertion, not the program:
+
+- **Read the store the user reads.** An assertion on an intermediate store (Locy's
+  `result.derived`) cannot see a defect in what commands return.
+- **Don't share the engine's conventions.** An oracle that binds by position or groups by a KEY
+  prefix agrees with an engine that does the same, wrongly. Where the oracle needs a convention,
+  run the program a second time in a form the convention cannot change (for example, with the
+  YIELD reordered).
+- **Show that the test discriminates.** Revert the fix and watch the test fail. A revert that
+  restores only half of the old behaviour can pass for free; L5 had two such reverts.

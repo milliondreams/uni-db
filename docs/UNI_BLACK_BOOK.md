@@ -4402,7 +4402,8 @@ Commands execute in **Phase 2** (row-level dispatch) after strata have converged
 QUERY reachable WHERE start.name = 'Alice' RETURN node, distance
 ```
 
-Evaluates rules using SLG (Selective Linear Definite clause) resolution.
+Reads the rule's facts as the fixpoint derived them, keeps the rows the WHERE
+holds for, and projects RETURN. It never derives a rule itself.
 
 ### DERIVE (Fact Derivation)
 
@@ -4476,7 +4477,7 @@ LocyConfig {
     max_iterations: usize,          // Max fixpoint iterations per recursive stratum
     timeout: Duration,              // Overall evaluation timeout
     max_explain_depth: usize,       // Max derivation tree depth
-    max_slg_depth: usize,           // Max SLG resolution depth
+    max_slg_depth: usize,           // No effect; kept for compatibility
     max_abduce_candidates: usize,   // Candidate modifications to explore
     max_abduce_results: usize,      // Validated ABDUCE results to return
     max_derived_bytes: usize,       // Memory bound per derived relation
@@ -7351,7 +7352,7 @@ Locy↔Cypher relations of `metamorphic::dqp::topo`):
 Every Locy filter goes through `locy_eval::eval_condition`: true keeps the
 row, false and NULL drop it, and an evaluation error or a non-boolean is a
 `LocyError`. That covers `QUERY`, `DERIVE`, `ABDUCE` and `EXPLAIN RULE`
-`WHERE`, and a rule body's target-dependent conditions on the SLG path; each
+`WHERE`; each
 had mapped both to "drop the row", so `DERIVE` wrote fewer facts and `ABDUCE`
 reported a conclusion that no longer held. In the same evaluator, `<`, `<=`,
 `>`, `>=` between types with no order (`1 < 'x'`) are NULL, not false
@@ -7359,9 +7360,9 @@ reported a conclusion that no longer held. In the same evaluator, `<`, `<=`,
 `QUERY ... ORDER BY` evaluates its keys on the row before projection, with
 the returned aliases over it, and propagates errors. It evaluated them on the
 projected row, so `ORDER BY a.age` read a missing column, every key became
-NULL, and the clause did nothing. The SLG goal binding compares by
-`values_equal`, and is injected into the body only for a key yielded as a bare
-variable; an aliased key (`YIELD KEY n.k AS k`) is checked after projection.
+NULL, and the clause did nothing. A `QUERY` WHERE over a key compares
+by `values_equal`, so `k = 3.0` matches an integer `k`
+(`locy_generator_goal_binding_uses_value_equality`).
 On the Cypher side `_cv_to_bool` reads an encoded NULL as NULL and a
 non-boolean as a type error; both read as `false`, so `NOT n.b` kept a row
 whose `b` is `1`. `CypherPhysicalExprCompiler::compile_predicate` wraps a
@@ -7432,7 +7433,7 @@ purely relative rounding was tried first and broke convergence on cyclic
 path compares the key view with a candidate row index carried outside the join
 keys, and maps the survivors back to exact rows.
 
-**A Locy command never changes what a later command reads.** Once the fixpoint
+**A Locy command never changes what a later command reads (C-NONINTERFERENCE).** Once the fixpoint
 publishes a program's facts, `QUERY`, `EXPLAIN RULE`, `ABDUCE` and `ASSUME`
 body commands receive that store by shared reference (`&RowStore`), at the top
 level (`impl_locy.rs`, `dispatch_native_command`) and inside an `ASSUME` body,
@@ -7477,13 +7478,13 @@ references and the rule a command names are rewritten to the catalog key
 own checks only, so every IS reference, EXPLAIN, ABDUCE and DERIVE in a module
 failed with "unknown rule".
 
-**One rule decides which column an IS reference binds.** A referenced rule's
+**One rule decides which column an IS reference binds (C-IS).** A referenced rule's
 columns form a binding sequence — its KEY columns in YIELD order, then its
 value columns in YIELD order — and an IS reference's subjects take columns from
 the front, a `TO` target the next one (`uni_locy::is_binding`). The compiler's
 arity check, the planner's positive join, IS NOT and provenance
-(`LocyIsRef::binding_columns`, resolved at planning time), the in-memory
-evaluator and EXPLAIN children all bind through it; before, they used four
+(`LocyIsRef::binding_columns`, resolved at planning time) and EXPLAIN
+children all bind through it; before, they used four
 rules, so `(o, e, pct) IS stake` failed to plan (#298), `IS NOT` against a rule
 yielding `b, KEY a` tested `b` and returned exactly the wrong nodes, and ABDUCE
 over a `TO` with interleaved KEYs found no valid edit. `IS NOT` cannot compare
@@ -7498,11 +7499,11 @@ FOLD outputs yielded in a different order from their FOLD bindings
 (`locy_is_ref_binding`; the `locy_binding` topo relation; the oracle
 differential reorders every generated rule's YIELD in its second run).
 
-**Every Locy expression is scope-checked at compile time.** Locy reparses every
+**Every Locy expression is scope-checked at compile time (C-SCOPE).** Locy reparses every
 slot but the inside of ALONG as plain Cypher, so a misspelt variable or a
 `prev.x` outside ALONG failed late ("No field named …" from DataFusion) or, in a
-command WHERE the in-memory evaluator runs, evaluated to NULL and silently
-matched nothing. `compiler/scope.rs` checks each slot against what it sees at
+command WHERE (evaluated row by row by `locy_eval`), evaluated to NULL and
+silently matched nothing. `compiler/scope.rs` checks each slot against what it sees at
 run time: the rule body (MATCH variables, positive IS subjects and targets,
 generator outputs, referenced rules' value columns by name), plus ALONG names
 for ALONG, FOLD arguments and YIELD; and, for a YIELD item over a FOLD output,

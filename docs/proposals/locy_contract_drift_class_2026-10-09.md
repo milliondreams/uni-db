@@ -1,6 +1,6 @@
 # Locy contract drift: one rule, several meanings
 
-**Date:** 2026-10-09 · **Status:** L1 done (`9e24aa3d6`); L2 done (`374be77f2`, closes #298); L3 done (`5d9224467`); YIELD value typing fixed (`821fcca98`); L4 done (`8e081a882`); L5 done; L6 proposed · **Trigger:** issue #298
+**Date:** 2026-10-09 · **Status:** L1 done (`9e24aa3d6`); L2 done (`374be77f2`, closes #298); L3 done (`5d9224467`); YIELD value typing fixed (`821fcca98`); L4 done (`8e081a882`); L5 and L6 implemented (uncommitted) · **Trigger:** issue #298
 
 ## Why
 
@@ -176,9 +176,13 @@ clauses (EXPLAIN, ABDUCE, DERIVE) are checked against the rule's yield schema, a
 is. Violations are compile errors that name the rule, clause, slot and variable.
 
 **C-CLAUSE.**
-- All clauses of a rule agree, position by position, on YIELD names and KEY flags.
-- Every clause that states FOLD, HAVING, REQUIRE or BEST BY states the same one.
-- A seeding clause without FOLD stays legal.
+- All clauses of a rule agree on YIELD names and KEY and PROB flags, by name; column order is
+  free. (Proposed as position by position; L4 measured that a positional check would reject
+  programs answered correctly.)
+- Every folding clause states the same FOLD names, aggregates and DISTINCT flags (arguments may
+  differ), and the same post-FOLD WHERE, REQUIRE and BEST BY. In a rule without FOLD, every clause
+  states the same BEST BY or none does.
+- A seeding clause without FOLD stays legal, and states none of them.
 - Disagreement is a compile error, with a hint to alias with `AS`.
 
 **C-NONINTERFERENCE.** A command never changes what a later command reads. The facts a stratum
@@ -411,6 +415,15 @@ what they exist to show.)
 **L6 — Record the invariants.** Black Book Appendix B2 gets C-IS, C-SCOPE, C-CLAUSE and
 C-NONINTERFERENCE, each with the test that pins it. The correctness-class harness proposal gains
 the "shape dimensions" table of §3 as a standing checklist for new generators.
+- *Done:* all four entries were already in B2, each added with its item and naming its
+  tests. L6 tags three of them with their contract names (C-CLAUSE had its tag). It also corrects
+  descriptions L5 left stale: C-IS listed the deleted evaluator as a caller; QUERY was described
+  as SLG resolution (Black Book, website internals, the landing page, `why-uni.md`); and the
+  compliance-remediation example said `queries_executed` counts SLG clause evaluations (it counts
+  Cypher statements and EXPLAIN's pattern queries; measured 0 for that program). The harness
+  proposal gains §6, the checklist, with three dimensions L5 added: relationships in facts,
+  colliding ID spaces, and modules and generators.
+
 **Order.** L1 comes first because it is the smallest change with the most silent wrong answers
 (six), and its relation catches any future command that writes shared state. L2 closes the issue.
 L3 and L4 are compile-time tightening and can run in parallel. L5 is the largest and depends on

@@ -7315,8 +7315,19 @@ string column was cast to an integer (`sum` over `'12'` and `'3'` was 15); a
 window failed with "Unsupported CAST from LargeBinary" on durations and on
 every schemaless property; Locy's `QUERY` rejected durations and errored on
 an integer overflow Cypher continues past
-(`bugs::sum_avg_take_numbers_or_durations`). Locy FOLD `SUM` still takes
-numbers only, and says so.
+(`bugs::sum_avg_take_numbers_or_durations`). Locy FOLD `SUM` / `AVG` take
+numbers only.
+
+**A numeric FOLD refuses a non-number.** A Locy projection brings a column
+to the type the planner inferred for it, and a FOLD input to `SUM`, `AVG`,
+`MSUM`, `MNOR` or `MPROD` is Float64. A Cypher value (a schemaless property)
+or a non-numeric column is read there through `_cypher_number`
+(`coerce_physical_expr`), which keeps NULL, reads every number and fails on
+anything else. It went through `_cypher_to_float64`, which turns a
+non-number into NULL, so a FOLD over strings or durations summed to 0.0 and
+`AVG` / `MNOR` answered NULL, recursive or not
+(`locy::locy_fold_reads_numbers`). `_cypher_to_float64` is still the
+argument conversion of Cypher's math functions.
 
 **An entity map is recognised by structure, never by an id key alone.**
 `entity_ref_from_map` is the one definition: a vertex needs `_labels` (every

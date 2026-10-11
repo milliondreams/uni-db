@@ -231,9 +231,11 @@ fn mixed() -> anyhow::Error {
     anyhow!("sum() and avg() cannot mix numbers and durations")
 }
 
-fn describe(value: &Value) -> String {
+/// The value as an error message names it: `the string "x"`, `a Boolean`.
+pub(crate) fn describe(value: &Value) -> String {
     match value {
         Value::String(s) => format!("the string {s:?}"),
+        Value::Temporal(TemporalValue::Duration { .. }) => "a duration".to_string(),
         Value::Temporal(_) => "a temporal value that is not a duration".to_string(),
         other => format!("a {}", other.type_name()),
     }

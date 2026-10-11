@@ -7573,29 +7573,35 @@ fn coerce_physical_expr(
 ) -> Arc<dyn datafusion::physical_expr::PhysicalExpr> {
     use datafusion::physical_expr::expressions::CastExpr;
 
+    // A value that is not a number is an error, not NULL: a Cypher value or a
+    // non-numeric column brought to a number reads through `_cypher_number`.
+    // `_cypher_to_float64` turned a string or a duration into NULL here, so a
+    // FOLD `SUM` over them summed to 0.
     match (actual_dt, target_dt) {
-        // LargeBinary → Float64: use Cypher value deserializer UDF
-        (DataType::LargeBinary, DataType::Float64) => wrap_cypher_to_float64(expr, schema),
-        // LargeBinary → Int64: cast through Float64 first (extract number, then truncate)
+        (DataType::LargeBinary, DataType::Float64) => wrap_cypher_number(expr, schema),
+        // Read the number, then truncate.
         (DataType::LargeBinary, DataType::Int64) => {
-            let float_expr = wrap_cypher_to_float64(expr, schema);
+            let float_expr = wrap_cypher_number(expr, schema);
             Arc::new(CastExpr::new(float_expr, DataType::Int64, None))
+        }
+        (actual, DataType::Float64) if !actual.is_numeric() && actual != &DataType::Null => {
+            wrap_cypher_number(expr, schema)
         }
         // Standard Arrow casts (Int64→Float64, Float64→Int64, etc.)
         _ => Arc::new(CastExpr::new(expr, target_dt.clone(), None)),
     }
 }
 
-/// Wrap a physical expression with `_cypher_to_float64` UDF.
-fn wrap_cypher_to_float64(
+/// Wrap a physical expression with the `_cypher_number` UDF.
+fn wrap_cypher_number(
     expr: Arc<dyn datafusion::physical_expr::PhysicalExpr>,
     schema: &arrow_schema::Schema,
 ) -> Arc<dyn datafusion::physical_expr::PhysicalExpr> {
-    let udf = Arc::new(super::df_udfs::cypher_to_float64_udf());
+    let udf = Arc::new(super::df_udfs::cypher_number_udf());
     let config = Arc::new(datafusion::common::config::ConfigOptions::default());
     Arc::new(
         datafusion::physical_expr::ScalarFunctionExpr::try_new(udf, vec![expr], schema, config)
-            .expect("CypherToFloat64Udf accepts Any(1) signature"),
+            .expect("CypherNumberUdf accepts Any(1) signature"),
     )
 }
 

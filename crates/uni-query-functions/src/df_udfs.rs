@@ -5656,6 +5656,106 @@ pub fn cypher_to_float64_udf() -> datafusion::logical_expr::ScalarUDF {
 }
 
 // ============================================================================
+// CypherNumber Scalar UDF
+// ============================================================================
+
+/// Scalar UDF that reads a value as a Float64 number and refuses anything else.
+///
+/// `_cypher_to_float64` turns a value that is not a number into NULL. Where a
+/// column is brought to a numeric type, that drops data without a word: a
+/// Locy FOLD `SUM` over strings or durations summed to 0 and `AVG` was NULL.
+/// This one keeps NULL as NULL, reads every number, and fails on the rest.
+struct CypherNumberUdf {
+    signature: Signature,
+}
+
+impl_udf_eq_hash!(CypherNumberUdf);
+
+impl std::fmt::Debug for CypherNumberUdf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CypherNumberUdf").finish()
+    }
+}
+
+impl ScalarUDFImpl for CypherNumberUdf {
+    fn name(&self) -> &str {
+        "_cypher_number"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _args: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Float64)
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let [arg] = args.args.as_slice() else {
+            return Err(datafusion::error::DataFusionError::Execution(
+                "_cypher_number requires exactly 1 argument".into(),
+            ));
+        };
+        match arg {
+            ColumnarValue::Scalar(scalar) => {
+                let numbers = numbers_of(&scalar.to_array_of_size(1)?)?;
+                Ok(ColumnarValue::Scalar(ScalarValue::try_from_array(
+                    &numbers, 0,
+                )?))
+            }
+            ColumnarValue::Array(arr) => Ok(ColumnarValue::Array(numbers_of(arr)?)),
+        }
+    }
+}
+
+/// Reads every cell of `arr` as a Float64 number: NULL stays NULL, and a
+/// non-null cell that is not a number is an error.
+fn numbers_of(arr: &ArrayRef) -> DFResult<ArrayRef> {
+    let not_a_number = |what: String| {
+        datafusion::error::DataFusionError::Execution(format!("cannot read {what} as a number"))
+    };
+    match arr.data_type() {
+        DataType::LargeBinary => {
+            let lb = arr
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .ok_or_else(|| not_a_number("a malformed Cypher value".into()))?;
+            let mut builder = arrow::array::Float64Builder::with_capacity(lb.len());
+            for i in 0..lb.len() {
+                if lb.is_null(i) {
+                    builder.append_null();
+                    continue;
+                }
+                if let Some(f) = cv_bytes_as_f64(lb.value(i)) {
+                    builder.append_value(f);
+                    continue;
+                }
+                match uni_common::cypher_value_codec::decode(lb.value(i))
+                    .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?
+                {
+                    Value::Null => builder.append_null(),
+                    Value::Int(n) => builder.append_value(n as f64),
+                    Value::Float(f) => builder.append_value(f),
+                    other => return Err(not_a_number(crate::cypher_sum::describe(&other))),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Float64 => Ok(Arc::clone(arr)),
+        dt if dt.is_numeric() => Ok(arrow::compute::cast(arr, &DataType::Float64)?),
+        _ if arr.null_count() == arr.len() => {
+            Ok(arrow::array::new_null_array(&DataType::Float64, arr.len()))
+        }
+        dt => Err(not_a_number(format!("a value of type {dt}"))),
+    }
+}
+
+/// Create the `_cypher_number` ScalarUDF: a value read as a Float64 number,
+/// NULL kept, anything else an error.
+pub fn cypher_number_udf() -> datafusion::logical_expr::ScalarUDF {
+    ScalarUDF::from(CypherNumberUdf {
+        signature: Signature::new(TypeSignature::Any(1), Volatility::Immutable),
+    })
+}
+
+// ============================================================================
 // Cypher-aware Min/Max UDAFs
 // ============================================================================
 

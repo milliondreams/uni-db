@@ -84,5 +84,7 @@ pub mod locy_clause_contract;
 pub mod locy_single_engine;
 // Entity functions (type, labels, id, keys, startNode, ...) in a Locy QUERY RETURN.
 pub mod locy_entity_functions;
+// A numeric FOLD refuses a string or a duration instead of summing it to 0.
+pub mod locy_fold_reads_numbers;
 pub mod locy_value_types;
 pub mod locy_yield_list_values;

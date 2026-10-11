@@ -167,6 +167,8 @@ pub mod scan_range_walk_l0_rows;
 pub mod sum_of_nothing_is_zero;
 // sum/avg take numbers or durations; a string is a type error.
 pub mod sum_avg_take_numbers_or_durations;
+// Numeric functions and statistics reject a non-number instead of answering NULL.
+pub mod numeric_functions_take_numbers;
 pub mod unique_key_reuse;
 pub mod user_maps_are_not_entities;
 pub mod vid_lookup_join_payoff;

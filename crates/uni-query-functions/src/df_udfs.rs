@@ -281,7 +281,7 @@ pub fn register_cypher_udfs(ctx: &SessionContext) -> DFResult<()> {
     }
 
     // CypherValue-to-Float64 conversion UDF (for SUM/AVG on LargeBinary columns)
-    ctx.register_udf(create_cypher_to_float64_udf());
+    ctx.register_udf(cypher_number_udf());
 
     // Similarity scoring UDF
     ctx.register_udf(create_similar_to_udf());
@@ -5531,140 +5531,16 @@ fn cypher_value_cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
 }
 
 // ============================================================================
-// CypherToFloat64 Scalar UDF
-// ============================================================================
-
-/// Scalar UDF that decodes LargeBinary CypherValue bytes to Float64.
-/// Non-numeric or null inputs produce Arrow null.
-/// Non-LargeBinary inputs (e.g., Int64, Float64) are passed through with a cast.
-struct CypherToFloat64Udf {
-    signature: Signature,
-}
-
-impl CypherToFloat64Udf {
-    fn new() -> Self {
-        Self {
-            signature: Signature::new(TypeSignature::Any(1), Volatility::Immutable),
-        }
-    }
-}
-
-impl_udf_eq_hash!(CypherToFloat64Udf);
-
-impl std::fmt::Debug for CypherToFloat64Udf {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CypherToFloat64Udf").finish()
-    }
-}
-
-impl ScalarUDFImpl for CypherToFloat64Udf {
-    fn name(&self) -> &str {
-        "_cypher_to_float64"
-    }
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-    fn return_type(&self, _args: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Float64)
-    }
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        if args.args.len() != 1 {
-            return Err(datafusion::error::DataFusionError::Execution(
-                "_cypher_to_float64 requires exactly 1 argument".into(),
-            ));
-        }
-        match &args.args[0] {
-            ColumnarValue::Scalar(scalar) => {
-                let f = match scalar {
-                    ScalarValue::LargeBinary(Some(bytes)) => cv_bytes_as_f64(bytes),
-                    ScalarValue::Int64(Some(i)) => Some(*i as f64),
-                    ScalarValue::Int32(Some(i)) => Some(*i as f64),
-                    ScalarValue::Float64(Some(f)) => Some(*f),
-                    ScalarValue::Float32(Some(f)) => Some(*f as f64),
-                    _ => None,
-                };
-                Ok(ColumnarValue::Scalar(ScalarValue::Float64(f)))
-            }
-            ColumnarValue::Array(arr) => {
-                let len = arr.len();
-                let mut builder = arrow::array::Float64Builder::with_capacity(len);
-                match arr.data_type() {
-                    DataType::LargeBinary => {
-                        let lb = arr.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
-                        for i in 0..len {
-                            if lb.is_null(i) {
-                                builder.append_null();
-                            } else {
-                                match cv_bytes_as_f64(lb.value(i)) {
-                                    Some(f) => builder.append_value(f),
-                                    None => builder.append_null(),
-                                }
-                            }
-                        }
-                    }
-                    DataType::Int64 => {
-                        let int_arr = arr.as_any().downcast_ref::<Int64Array>().unwrap();
-                        for i in 0..len {
-                            if int_arr.is_null(i) {
-                                builder.append_null();
-                            } else {
-                                builder.append_value(int_arr.value(i) as f64);
-                            }
-                        }
-                    }
-                    DataType::Float64 => {
-                        let f_arr = arr.as_any().downcast_ref::<Float64Array>().unwrap();
-                        for i in 0..len {
-                            if f_arr.is_null(i) {
-                                builder.append_null();
-                            } else {
-                                builder.append_value(f_arr.value(i));
-                            }
-                        }
-                    }
-                    _ => {
-                        for _ in 0..len {
-                            builder.append_null();
-                        }
-                    }
-                }
-                Ok(ColumnarValue::Array(Arc::new(builder.finish())))
-            }
-        }
-    }
-}
-
-fn create_cypher_to_float64_udf() -> ScalarUDF {
-    ScalarUDF::from(CypherToFloat64Udf::new())
-}
-
-/// Helper: wrap a DataFusion expression with `_cypher_to_float64()` UDF.
-pub fn cypher_to_float64_expr(
-    arg: datafusion::logical_expr::Expr,
-) -> datafusion::logical_expr::Expr {
-    datafusion::logical_expr::Expr::ScalarFunction(
-        datafusion::logical_expr::expr::ScalarFunction::new_udf(
-            Arc::new(create_cypher_to_float64_udf()),
-            vec![arg],
-        ),
-    )
-}
-
-/// Create the `_cypher_to_float64` ScalarUDF for use in physical planning.
-pub fn cypher_to_float64_udf() -> datafusion::logical_expr::ScalarUDF {
-    create_cypher_to_float64_udf()
-}
-
-// ============================================================================
 // CypherNumber Scalar UDF
 // ============================================================================
 
 /// Scalar UDF that reads a value as a Float64 number and refuses anything else.
 ///
-/// `_cypher_to_float64` turns a value that is not a number into NULL. Where a
-/// column is brought to a numeric type, that drops data without a word: a
-/// Locy FOLD `SUM` over strings or durations summed to 0 and `AVG` was NULL.
-/// This one keeps NULL as NULL, reads every number, and fails on the rest.
+/// It replaced `_cypher_to_float64`, which turned a value that is not a
+/// number into NULL: a Locy FOLD `SUM` over strings or durations summed to 0,
+/// and `ceil('x')` or `sqrt(duration)` answered NULL. This one keeps NULL as
+/// NULL, reads every number, and fails on the rest, as the row evaluator's
+/// math functions do.
 struct CypherNumberUdf {
     signature: Signature,
 }
@@ -5740,7 +5616,8 @@ fn numbers_of(arr: &ArrayRef) -> DFResult<ArrayRef> {
         }
         DataType::Float64 => Ok(Arc::clone(arr)),
         dt if dt.is_numeric() => Ok(arrow::compute::cast(arr, &DataType::Float64)?),
-        _ if arr.null_count() == arr.len() => {
+        // A `Null` array's cells are all NULL, though its null count is 0.
+        _ if arr.logical_null_count() == arr.len() => {
             Ok(arrow::array::new_null_array(&DataType::Float64, arr.len()))
         }
         dt => Err(not_a_number(format!("a value of type {dt}"))),
@@ -5753,6 +5630,17 @@ pub fn cypher_number_udf() -> datafusion::logical_expr::ScalarUDF {
     ScalarUDF::from(CypherNumberUdf {
         signature: Signature::new(TypeSignature::Any(1), Volatility::Immutable),
     })
+}
+
+/// Wrap a DataFusion expression with the `_cypher_number` UDF: the argument
+/// of a numeric function or aggregate, read as a Float64 number.
+pub fn cypher_number_expr(arg: datafusion::logical_expr::Expr) -> datafusion::logical_expr::Expr {
+    datafusion::logical_expr::Expr::ScalarFunction(
+        datafusion::logical_expr::expr::ScalarFunction::new_udf(
+            Arc::new(cypher_number_udf()),
+            vec![arg],
+        ),
+    )
 }
 
 // ============================================================================

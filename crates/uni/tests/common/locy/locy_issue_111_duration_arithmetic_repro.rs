@@ -16,7 +16,10 @@
 //!
 //! Two guarantees are asserted:
 //! 1. the previously-crashing direct form (`... * exp(... duration.inDays ...)`)
-//!    plans and evaluates WITHOUT error and does NOT poison a co-registered rule;
+//!    plans, and fails at evaluation with a type error naming the duration,
+//!    as Neo4j and `abs()` answer; the co-registered rule alone still runs.
+//!    (Decision C first made `exp` of a duration NULL, so `decay` silently
+//!    matched nothing; math functions now refuse a non-number everywhere.)
 //! 2. the `.days` accessor form yields the correct numeric and filters rows.
 
 // Rust guideline compliant
@@ -55,31 +58,33 @@ async fn setup() -> Result<Uni> {
 async fn duration_arithmetic_does_not_crash_or_poison() -> Result<()> {
     // The exact failure mode from the issue: arithmetic over a duration inside a
     // WHERE, registered alongside an unrelated rule. Before the fix the whole
-    // QUERY failed to PLAN ("Unsupported CAST from LargeBinary to Float64"),
-    // poisoning the unrelated `healthy` rule too.
+    // QUERY failed to PLAN ("Unsupported CAST from LargeBinary to Float64").
     let db = setup().await?;
-    // Direct arithmetic over the duration (no `.days`) is the exact issue repro:
-    // it previously failed to PLAN with "Unsupported CAST from LargeBinary to
-    // Float64". Under decision C this no longer crashes — `exp` of a non-numeric
-    // duration cleanly yields NULL — so `decay` simply matches nothing while the
-    // co-registered `healthy` rule is unaffected.
-    let program = r#"
+    let decay = r#"
         CREATE RULE decay AS
             MATCH (s:Span)
             WHERE s.imp * exp(-0.1 * duration.inDays(s.t0, s.t1)) <= 1.0
             YIELD KEY s.name AS name
+    "#;
+    let healthy = r#"
         CREATE RULE healthy AS
             MATCH (s:Span) YIELD KEY s.name AS name
         QUERY healthy RETURN name
     "#;
-    let result = db.session().locy(program).await;
+    // `exp` of a duration is a type error, raised while evaluating, not a
+    // planning failure.
+    let err = db
+        .session()
+        .locy(&format!("{decay}{healthy}"))
+        .await
+        .expect_err("exp() of a duration is a type error");
+    let message = err.to_string();
     assert!(
-        result.is_ok(),
-        "issue #111: duration arithmetic must not crash the planner; got {:?}",
-        result.err()
+        message.contains("cannot read a duration as a number") && !message.contains("CAST"),
+        "issue #111: expected the type error, not a planning failure; got {message}"
     );
-    let result = result?;
-    // The unrelated rule must still return its row (no cross-rule poisoning).
+    // The unrelated rule, on its own, returns its row.
+    let result = db.session().locy(healthy).await?;
     let empty = vec![];
     let rows = result.rows().unwrap_or(&empty);
     let names: HashSet<String> = rows
@@ -89,11 +94,7 @@ async fn duration_arithmetic_does_not_crash_or_poison() -> Result<()> {
             _ => None,
         })
         .collect();
-    assert_eq!(
-        names,
-        HashSet::from(["a".to_string()]),
-        "co-registered rule was poisoned by the duration rule; got {names:?}"
-    );
+    assert_eq!(names, HashSet::from(["a".to_string()]), "got {names:?}");
     Ok(())
 }
 

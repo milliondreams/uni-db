@@ -1451,8 +1451,8 @@ fn translate_binary_op(left: DfExpr, op: &BinaryOp, right: DfExpr) -> Result<DfE
             // LargeBinary (schemaless property arithmetic) decodes instead of
             // hitting the unsupported `LargeBinary -> Float64` cast (issue #111
             // family).
-            let left_f = crate::df_udfs::cypher_to_float64_expr(left);
-            let right_f = crate::df_udfs::cypher_to_float64_expr(right);
+            let left_f = crate::df_udfs::cypher_number_expr(left);
+            let right_f = crate::df_udfs::cypher_number_expr(right);
             Ok(datafusion::functions::math::expr_fn::power(left_f, right_f))
         }
 
@@ -1661,10 +1661,11 @@ where
     // A typed value carried as `LargeBinary` (cv_encoded Duration/Btic/etc.) has
     // no DataFusion `LargeBinary -> Float64` kernel, so a blind cast fails at
     // PLAN time and — because Locy plans all rules together — poisons every
-    // co-registered rule (issue #111). `cypher_to_float64_expr` decodes a
-    // numeric CypherValue and yields a clean per-row NULL for non-numeric values
-    // (e.g. `exp(duration)`), matching SIGN/ABS/AVG which already use it.
-    Ok(math_fn(crate::df_udfs::cypher_to_float64_expr(first_arg(
+    // co-registered rule (issue #111). `cypher_number_expr` decodes a numeric
+    // CypherValue and fails on a value that is not a number (`exp(duration)`),
+    // as Neo4j and the row evaluator do: it answered NULL for one, so
+    // `ceil('x')` was NULL while `abs('x')` was an error.
+    Ok(math_fn(crate::df_udfs::cypher_number_expr(first_arg(
         df_args,
     ))))
 }
@@ -1729,7 +1730,7 @@ fn translate_aggregate_function(
                     "percentileDisc() requires exactly 2 arguments"
                 )));
             }
-            let coerced = crate::df_udfs::cypher_to_float64_expr(df_args[0].clone());
+            let coerced = crate::df_udfs::cypher_number_expr(df_args[0].clone());
             let udaf = Arc::new(crate::df_udfs::create_cypher_percentile_disc_udaf());
             Some(Ok(udaf.call(vec![coerced, df_args[1].clone()])))
         }
@@ -1739,7 +1740,7 @@ fn translate_aggregate_function(
                     "percentileCont() requires exactly 2 arguments"
                 )));
             }
-            let coerced = crate::df_udfs::cypher_to_float64_expr(df_args[0].clone());
+            let coerced = crate::df_udfs::cypher_number_expr(df_args[0].clone());
             let udaf = Arc::new(crate::df_udfs::create_cypher_percentile_cont_udaf());
             Some(Ok(udaf.call(vec![coerced, df_args[1].clone()])))
         }
@@ -1894,23 +1895,23 @@ fn translate_math_function(name_upper: &str, df_args: &[DfExpr]) -> Option<Resul
             // Cypher-aware Float64 coercion: a cv-encoded numeric carried as
             // LargeBinary would otherwise fail `ceil`'s signature coercion
             // (issue #111 family). Same for FLOOR/ROUND below.
-            Some(Ok(expr_fn::ceil(crate::df_udfs::cypher_to_float64_expr(
+            Some(Ok(expr_fn::ceil(crate::df_udfs::cypher_number_expr(
                 first_arg(df_args),
             ))))
         }
         "FLOOR" => {
             check_args!(1, df_args, "floor");
-            Some(Ok(expr_fn::floor(crate::df_udfs::cypher_to_float64_expr(
+            Some(Ok(expr_fn::floor(crate::df_udfs::cypher_number_expr(
                 first_arg(df_args),
             ))))
         }
         "ROUND" => {
             check_args!(1, df_args, "round");
             let args = if df_args.len() == 1 {
-                vec![crate::df_udfs::cypher_to_float64_expr(first_arg(df_args))]
+                vec![crate::df_udfs::cypher_number_expr(first_arg(df_args))]
             } else {
                 vec![
-                    crate::df_udfs::cypher_to_float64_expr(df_args[0].clone()),
+                    crate::df_udfs::cypher_number_expr(df_args[0].clone()),
                     df_args[1].clone(),
                 ]
             };
@@ -1918,8 +1919,12 @@ fn translate_math_function(name_upper: &str, df_args: &[DfExpr]) -> Option<Resul
         }
         "SIGN" => {
             check_args!(1, df_args, "sign");
-            let coerced = crate::df_udfs::cypher_to_float64_expr(first_arg(df_args));
-            Some(Ok(expr_fn::signum(coerced)))
+            let coerced = crate::df_udfs::cypher_number_expr(first_arg(df_args));
+            // An integer, as in Neo4j and the row evaluator; `signum` is a float.
+            Some(Ok(datafusion::logical_expr::cast(
+                expr_fn::signum(coerced),
+                datafusion::arrow::datatypes::DataType::Int64,
+            )))
         }
         "SQRT" => unary_f64("sqrt", expr_fn::sqrt),
         "LOG" | "LN" => unary_f64("log", expr_fn::ln),
@@ -1936,8 +1941,8 @@ fn translate_math_function(name_upper: &str, df_args: &[DfExpr]) -> Option<Resul
             // Cypher-aware Float64 coercion (see `apply_unary_math_f64`): avoids
             // the unsupported `LargeBinary -> Float64` cast on cv_encoded args.
             Some(Ok(expr_fn::atan2(
-                crate::df_udfs::cypher_to_float64_expr(df_args[0].clone()),
-                crate::df_udfs::cypher_to_float64_expr(df_args[1].clone()),
+                crate::df_udfs::cypher_number_expr(df_args[0].clone()),
+                crate::df_udfs::cypher_number_expr(df_args[1].clone()),
             )))
         }
         "RAND" | "RANDOM" => Some(Ok(expr_fn::random())),

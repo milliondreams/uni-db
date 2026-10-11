@@ -189,7 +189,7 @@ impl Accumulator {
     /// # Errors
     ///
     /// When `sum` or `avg` receives a value that is neither a number nor a
-    /// duration, or mixes the two.
+    /// duration, or mixes the two, or a percentile receives a non-number.
     pub(crate) fn update(&mut self, val: &Value, is_wildcard: bool) -> anyhow::Result<()> {
         match self {
             Accumulator::Count(c) => {
@@ -233,11 +233,18 @@ impl Accumulator {
                 }
             }
             Accumulator::PercentileDisc { values, .. }
-            | Accumulator::PercentileCont { values, .. } => {
-                if let Some(n) = val.as_f64() {
-                    values.push(n);
+            | Accumulator::PercentileCont { values, .. } => match val {
+                Value::Null => {}
+                Value::Int(i) => values.push(*i as f64),
+                Value::Float(f) => values.push(*f),
+                // It skipped a value that is not a number, as `sum` did.
+                other => {
+                    return Err(anyhow::anyhow!(
+                        "percentileDisc() and percentileCont() take numbers, got a {}",
+                        other.type_name()
+                    ));
                 }
-            }
+            },
         }
         Ok(())
     }
@@ -1139,6 +1146,16 @@ mod tests {
     use super::*;
 
     // ── Accumulator tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_accumulator_percentile_rejects_a_non_number() {
+        for op in ["PERCENTILECONT", "PERCENTILEDISC"] {
+            let mut acc = Accumulator::new_with_percentile(op, false, 0.5);
+            acc.update(&Value::Int(1), false).unwrap();
+            acc.update(&Value::Null, false).unwrap();
+            assert!(acc.update(&Value::String("x".into()), false).is_err());
+        }
+    }
 
     #[test]
     fn test_accumulator_count_basic() {

@@ -5733,19 +5733,19 @@ impl HybridPhysicalPlanner {
                 // schemaless (LargeBinary) numeric property works directly.
                 "stdev" | "stddev" => {
                     let arg = get_arg()?;
-                    stddev(Self::coerce_numeric_for_stat(arg, schema, self))
+                    stddev(Self::coerce_numeric_for_stat(arg, schema))
                 }
                 "stdevp" | "stddevp" => {
                     let arg = get_arg()?;
-                    stddev_pop(Self::coerce_numeric_for_stat(arg, schema, self))
+                    stddev_pop(Self::coerce_numeric_for_stat(arg, schema))
                 }
                 "variance" => {
                     let arg = get_arg()?;
-                    var_sample(Self::coerce_numeric_for_stat(arg, schema, self))
+                    var_sample(Self::coerce_numeric_for_stat(arg, schema))
                 }
                 "variancep" => {
                     let arg = get_arg()?;
-                    var_pop(Self::coerce_numeric_for_stat(arg, schema, self))
+                    var_pop(Self::coerce_numeric_for_stat(arg, schema))
                 }
                 "min" => {
                     // Use Cypher-aware min for LargeBinary columns (mixed types)
@@ -5775,7 +5775,7 @@ impl HybridPhysicalPlanner {
                     }
                     let expr_arg = cypher_expr_to_df(&args[0], Some(ctx))?;
                     let pct_arg = cypher_expr_to_df(&args[1], Some(ctx))?;
-                    let coerced = crate::query::df_udfs::cypher_to_float64_expr(expr_arg);
+                    let coerced = Self::coerce_numeric_for_stat(expr_arg, schema);
                     let udaf =
                         Arc::new(crate::query::df_udfs::create_cypher_percentile_disc_udaf());
                     udaf.call(vec![coerced, pct_arg])
@@ -5786,7 +5786,7 @@ impl HybridPhysicalPlanner {
                     }
                     let expr_arg = cypher_expr_to_df(&args[0], Some(ctx))?;
                     let pct_arg = cypher_expr_to_df(&args[1], Some(ctx))?;
-                    let coerced = crate::query::df_udfs::cypher_to_float64_expr(expr_arg);
+                    let coerced = Self::coerce_numeric_for_stat(expr_arg, schema);
                     let udaf =
                         Arc::new(crate::query::df_udfs::create_cypher_percentile_cont_udaf());
                     udaf.call(vec![coerced, pct_arg])
@@ -7533,13 +7533,17 @@ impl HybridPhysicalPlanner {
     }
 
     /// Coerce an aggregate argument to `Float64` for numeric statistical
-    /// aggregates (stDev/variance). A schemaless property arrives as a
-    /// `LargeBinary` CypherValue column and is decoded via the Cypher→Float64
-    /// UDF; a schema-typed numeric column is cast directly. Mirrors the
-    /// coercion `avg` applies so the two agree on which rows are numeric.
-    fn coerce_numeric_for_stat(arg: DfExpr, schema: &SchemaRef, this: &Self) -> DfExpr {
-        if this.is_large_binary_col(&arg, schema) {
-            crate::query::df_udfs::cypher_to_float64_expr(arg)
+    /// aggregates (stDev, variance, percentiles). A numeric column is cast
+    /// directly; anything else (a schemaless property's `LargeBinary`
+    /// CypherValue, a string or duration column) reads through
+    /// `_cypher_number`, so a value that is not a number is an error, as in
+    /// `sum` and `avg`.
+    fn coerce_numeric_for_stat(arg: DfExpr, schema: &SchemaRef) -> DfExpr {
+        if Self::numeric_column_type(&arg, schema).is_none() {
+            // A Cypher value, or a column that is not numeric (a string, a
+            // duration): read as a number, an error if it is not one. A raw
+            // cast summarised a string column `'12'` as 12.
+            crate::query::df_udfs::cypher_number_expr(arg)
         } else {
             use datafusion::logical_expr::Cast;
             DfExpr::Cast(Cast::new(
@@ -7562,8 +7566,8 @@ impl HybridPhysicalPlanner {
 /// Coerce a physical expression from `actual_dt` to `target_dt`.
 ///
 /// Arrow's CastExpr cannot handle LargeBinary→Float64 because LargeBinary holds
-/// serialized CypherValue bytes. For these cases, use the `_cypher_to_float64` UDF
-/// which deserializes properly. For standard numeric coercions (Int64→Float64 etc.)
+/// serialized CypherValue bytes. For these cases, use the `_cypher_number` UDF,
+/// which decodes the number or fails. For standard numeric coercions (Int64→Float64 etc.)
 /// we use Arrow's built-in CastExpr.
 fn coerce_physical_expr(
     expr: Arc<dyn datafusion::physical_expr::PhysicalExpr>,

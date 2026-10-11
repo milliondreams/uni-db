@@ -120,25 +120,28 @@ async fn population_stdev_of_single_value_is_zero() -> Result<()> {
     Ok(())
 }
 
-/// REQ-3 robustness: non-numeric values in the column are coerced to NULL and
-/// skipped (matching `avg`), rather than crashing the query. Mixed [2,4,'x',6]
-/// ⇒ sample stddev over {2,4,6} = 2.0.
+/// REQ-3 robustness: a non-numeric value in the column is a type error, as in
+/// Neo4j and as `sum` / `avg` answer, not a crash. Mixed [2,4,'x',6] used to
+/// skip `'x'` (coerced to NULL) and answer the stddev of {2,4,6}, 2.0, matching
+/// the `avg` of the day, which skipped it too.
 #[tokio::test]
-async fn stdev_skips_non_numeric_values() -> Result<()> {
+async fn stdev_rejects_non_numeric_values() -> Result<()> {
     let db = Uni::in_memory().build().await?;
     let tx = db.session().tx().await?;
     tx.execute("CREATE (:Z {v: 2}), (:Z {v: 4}), (:Z {v: 'x'}), (:Z {v: 6})")
         .await?;
     tx.commit().await?;
 
-    let r = db
-        .session()
-        .query("MATCH (n:Z) RETURN stDev(n.v) AS x")
-        .await?;
-    assert!(
-        (r.rows()[0].get::<f64>("x")? - 2.0).abs() < 1e-9,
-        "stDev should skip the non-numeric value and compute over {{2,4,6}}; got {}",
-        r.rows()[0].get::<f64>("x")?
-    );
+    for aggregate in ["stDev", "avg"] {
+        let err = db
+            .session()
+            .query(&format!("MATCH (n:Z) RETURN {aggregate}(n.v) AS x"))
+            .await
+            .expect_err("a string in the column is a type error");
+        assert!(
+            err.to_string().contains("\"x\""),
+            "{aggregate}: the error should name the string; got {err}"
+        );
+    }
     Ok(())
 }

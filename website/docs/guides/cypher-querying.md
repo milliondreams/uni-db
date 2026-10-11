@@ -566,6 +566,8 @@ Uni provides a comprehensive set of scalar functions for data transformation.
 
 ### Math Functions
 
+Math functions take numbers: `NULL` gives `NULL`, and any other value (a string, a duration) is a type error. So are `stDev`, `variance` and the percentiles over a value that is not a number.
+
 | Function | Description | Example |
 |----------|-------------|---------|
 | `abs(n)` | Absolute value | `RETURN abs(-5)` → `5` |

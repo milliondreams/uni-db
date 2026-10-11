@@ -7318,16 +7318,18 @@ an integer overflow Cypher continues past
 (`bugs::sum_avg_take_numbers_or_durations`). Locy FOLD `SUM` / `AVG` take
 numbers only.
 
-**A numeric FOLD refuses a non-number.** A Locy projection brings a column
-to the type the planner inferred for it, and a FOLD input to `SUM`, `AVG`,
-`MSUM`, `MNOR` or `MPROD` is Float64. A Cypher value (a schemaless property)
-or a non-numeric column is read there through `_cypher_number`
-(`coerce_physical_expr`), which keeps NULL, reads every number and fails on
-anything else. It went through `_cypher_to_float64`, which turns a
-non-number into NULL, so a FOLD over strings or durations summed to 0.0 and
-`AVG` / `MNOR` answered NULL, recursive or not
-(`locy::locy_fold_reads_numbers`). `_cypher_to_float64` is still the
-argument conversion of Cypher's math functions.
+**A number is read strictly, or not at all.** `_cypher_number` reads a
+value as Float64: NULL stays NULL, every number is read, and anything else is
+an error. It is the argument conversion of Cypher's math functions (`ceil`,
+`sqrt`, `^`, `atan2`, ...), of `stDev` / `variance` / percentiles over a
+non-numeric column, and of a Locy projection bringing a column to Float64
+(`coerce_physical_expr`), which is where a FOLD `SUM`, `AVG`, `MSUM`, `MNOR`
+or `MPROD` reads its input. It replaced `_cypher_to_float64`, which turned a non-number
+into NULL: `ceil('x')` and `sqrt(duration)` answered NULL while `abs('x')` and
+the row evaluator failed, `stDev` over a string column `'12'` read 12, and a
+FOLD over strings or durations summed to 0.0 with `AVG` / `MNOR` NULL,
+recursive or not (`bugs::numeric_functions_take_numbers`,
+`locy::locy_fold_reads_numbers`). `sign()` returns an integer on every path.
 
 **An entity map is recognised by structure, never by an id key alone.**
 `entity_ref_from_map` is the one definition: a vertex needs `_labels` (every

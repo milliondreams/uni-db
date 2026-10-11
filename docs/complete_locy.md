@@ -1421,7 +1421,7 @@ Every command reads the facts the fixpoint published (Appendix B2 of the Black B
 
 A rule's facts carry a node as its VID and a single-hop relationship as its EID; both are hydrated into `Node` / `Edge` values before commands run. The ID spaces overlap, so the columns holding relationships are known from the rules (`uni_locy::entity_columns`), not guessed.
 
-Locy used to keep an in-memory top-down resolver (SLG) for generator rules and EXPLAIN. It implemented no FOLD, BEST BY or post-FOLD WHERE, so its answers could differ from the fixpoint's; it was removed once generators ran in the fixpoint and edges were hydrated. `max_slg_depth` is still accepted and has no effect.
+Locy used to keep an in-memory top-down resolver (SLG) for generator rules and EXPLAIN. It implemented no FOLD, BEST BY or post-FOLD WHERE, so its answers could differ from the fixpoint's; it was removed once generators ran in the fixpoint and edges were hydrated. `max_slg_depth` is still accepted, has no effect, and is deprecated: setting it warns.
 
 ## 15.8 Expression Evaluation Paths
 
@@ -1670,7 +1670,7 @@ LocyExplainOutput {
 | `max_iterations` | `usize` | `1000` | Maximum fixpoint iterations per recursive stratum |
 | `timeout` | `Duration` | `300s` | Overall evaluation timeout |
 | `max_explain_depth` | `usize` | `100` | Maximum recursion depth for EXPLAIN derivation trees |
-| `max_slg_depth` | `usize` | `1000` | No effect; kept so existing configurations still build |
+| `max_slg_depth` | `usize` | `1000` | Deprecated, no effect; will be removed. Setting or reading it warns (a Rust deprecation warning, a Python `DeprecationWarning`) |
 | `max_abduce_candidates` | `usize` | `20` | Maximum candidate modifications generated during ABDUCE |
 | `max_abduce_results` | `usize` | `10` | Maximum validated results returned from ABDUCE |
 | `max_derived_bytes` | `usize` | `256 MiB` | Maximum bytes of derived facts per relation |

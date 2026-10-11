@@ -142,7 +142,7 @@ Key guardrails come from `LocyConfig`:
 - `timeout`
 - `max_derived_bytes`
 - `max_explain_depth`
-- `max_slg_depth` (no effect; kept for compatibility)
+- `max_slg_depth` (deprecated, no effect; setting it warns)
 - `strict_probability_domain`
 - `probability_epsilon`
 - `exact_probability`

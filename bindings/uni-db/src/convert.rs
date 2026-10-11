@@ -874,7 +874,11 @@ pub fn extract_locy_config(
         locy_config.max_explain_depth = v.extract::<usize>(py)?;
     }
     if let Some(v) = config.get("max_slg_depth") {
-        locy_config.max_slg_depth = v.extract::<usize>(py)?;
+        crate::types::deprecation_warning(py, crate::types::MAX_SLG_DEPTH_DEPRECATED)?;
+        #[expect(deprecated, reason = "accepted so existing configurations still run")]
+        {
+            locy_config.max_slg_depth = v.extract::<usize>(py)?;
+        }
     }
     if let Some(v) = config.get("max_abduce_candidates") {
         locy_config.max_abduce_candidates = v.extract::<usize>(py)?;

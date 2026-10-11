@@ -4477,7 +4477,7 @@ LocyConfig {
     max_iterations: usize,          // Max fixpoint iterations per recursive stratum
     timeout: Duration,              // Overall evaluation timeout
     max_explain_depth: usize,       // Max derivation tree depth
-    max_slg_depth: usize,           // No effect; kept for compatibility
+    max_slg_depth: usize,           // Deprecated: no effect
     max_abduce_candidates: usize,   // Candidate modifications to explore
     max_abduce_results: usize,      // Validated ABDUCE results to return
     max_derived_bytes: usize,       // Memory bound per derived relation

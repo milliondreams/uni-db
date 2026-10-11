@@ -29,8 +29,8 @@ The second `WHERE` (after `FOLD`) filters on aggregated values — equivalent to
 | `COUNT(*)` / `COUNT(expr)` | Row count | Safe (unbounded) |
 | `SUM(expr)` | Arithmetic sum | Non-recursive only |
 | `AVG(expr)` | Arithmetic mean | Non-recursive only |
-| `MIN(expr)` | Minimum value | Safe in recursion |
-| `MAX(expr)` | Maximum value | Safe in recursion |
+| `MIN(expr)` | Minimum value, in Cypher's `ORDER BY` order | Safe in recursion |
+| `MAX(expr)` | Maximum value, in Cypher's `ORDER BY` order | Safe in recursion |
 | `COLLECT(expr)` | Collect into list | Safe (unbounded) |
 | `MSUM(expr)` | Monotonic sum (non-decreasing) | Safe (unbounded) |
 | `MMAX(expr)` | Monotonic maximum | Safe in recursion |

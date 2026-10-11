@@ -5588,39 +5588,21 @@ impl HybridPhysicalPlanner {
         Ok(Arc::new(ProjectionExec::try_new(proj_exprs, agg_exec)?))
     }
 
-    /// Wrap a temporal aggregate argument with `get_field(arg, "nanos_since_epoch")` or
-    /// `get_field(arg, "nanos_since_midnight")` when the argument is a DateTime/Time struct.
-    ///
-    /// Returns the argument unchanged for non-temporal types.
-    fn wrap_temporal_sort_key(
-        arg: datafusion::logical_expr::Expr,
+    /// Whether `arg` is a DateTime or Time struct, which `min` / `max` must
+    /// read as a whole: reduced to its nanoseconds, the aggregate lost the
+    /// offset and zone, and failed outright ("expected Timestamp(ns) but found
+    /// LargeBinary").
+    fn is_temporal_struct(
+        arg: &datafusion::logical_expr::Expr,
         schema: &SchemaRef,
-    ) -> Result<datafusion::logical_expr::Expr> {
-        use datafusion::logical_expr::ScalarUDF;
-        if let Ok(arg_type) = arg.get_type(&datafusion::common::DFSchema::try_from(
+    ) -> Result<bool> {
+        let arg_type = arg.get_type(&datafusion::common::DFSchema::try_from(
             schema.as_ref().clone(),
-        )?) {
-            if uni_common::core::schema::is_datetime_struct(&arg_type) {
-                return Ok(datafusion::logical_expr::Expr::ScalarFunction(
-                    datafusion::logical_expr::expr::ScalarFunction::new_udf(
-                        Arc::new(ScalarUDF::from(
-                            datafusion::functions::core::getfield::GetFieldFunc::new(),
-                        )),
-                        vec![arg, datafusion::logical_expr::lit("nanos_since_epoch")],
-                    ),
-                ));
-            } else if uni_common::core::schema::is_time_struct(&arg_type) {
-                return Ok(datafusion::logical_expr::Expr::ScalarFunction(
-                    datafusion::logical_expr::expr::ScalarFunction::new_udf(
-                        Arc::new(ScalarUDF::from(
-                            datafusion::functions::core::getfield::GetFieldFunc::new(),
-                        )),
-                        vec![arg, datafusion::logical_expr::lit("nanos_since_midnight")],
-                    ),
-                ));
-            }
-        }
-        Ok(arg)
+        )?);
+        Ok(arg_type.is_ok_and(|t| {
+            uni_common::core::schema::is_datetime_struct(&t)
+                || uni_common::core::schema::is_time_struct(&t)
+        }))
     }
 
     /// Translate Cypher aggregate expressions to DataFusion.
@@ -5748,10 +5730,14 @@ impl HybridPhysicalPlanner {
                     var_pop(Self::coerce_numeric_for_stat(arg, schema))
                 }
                 "min" => {
-                    // Use Cypher-aware min for LargeBinary columns (mixed types)
-                    let arg = Self::wrap_temporal_sort_key(get_arg()?, schema)?;
+                    // Cypher-aware min for LargeBinary columns (mixed types) and
+                    // for a DateTime / Time struct, which it orders by instant
+                    // and returns whole, offset and zone included.
+                    let arg = get_arg()?;
 
-                    if self.is_large_binary_col(&arg, schema) {
+                    if self.is_large_binary_col(&arg, schema)
+                        || Self::is_temporal_struct(&arg, schema)?
+                    {
                         let udaf = Arc::new(crate::query::df_udfs::create_cypher_min_udaf());
                         udaf.call(vec![arg])
                     } else {
@@ -5759,10 +5745,14 @@ impl HybridPhysicalPlanner {
                     }
                 }
                 "max" => {
-                    // Use Cypher-aware max for LargeBinary columns (mixed types)
-                    let arg = Self::wrap_temporal_sort_key(get_arg()?, schema)?;
+                    // Cypher-aware max for LargeBinary columns (mixed types) and
+                    // for a DateTime / Time struct, which it orders by instant
+                    // and returns whole, offset and zone included.
+                    let arg = get_arg()?;
 
-                    if self.is_large_binary_col(&arg, schema) {
+                    if self.is_large_binary_col(&arg, schema)
+                        || Self::is_temporal_struct(&arg, schema)?
+                    {
                         let udaf = Arc::new(crate::query::df_udfs::create_cypher_max_udaf());
                         udaf.call(vec![arg])
                     } else {

@@ -34,6 +34,7 @@ fn logspace_state() -> Box<dyn uni_plugin::traits::locy::LocyAggState> {
         strict: false,
         epsilon: 0.1,
         semiring: FoldSemiring::AddMult,
+        ..FoldContext::default()
     };
     let mut s = MprodAgg.create();
     let col = Float64Array::from(vec![Some(0.5); 8]);

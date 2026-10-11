@@ -169,6 +169,10 @@ pub mod sum_of_nothing_is_zero;
 pub mod sum_avg_take_numbers_or_durations;
 // Numeric functions and statistics reject a non-number instead of answering NULL.
 pub mod numeric_functions_take_numbers;
+// Durations sort by length; min/max follow ORDER BY; `<` between durations is null.
+pub mod duration_order;
+// min/max over a declared DateTime / Time: the earliest or latest instant, offset kept.
+pub mod min_max_keep_temporal_values;
 pub mod unique_key_reuse;
 pub mod user_maps_are_not_entities;
 pub mod vid_lookup_join_payoff;

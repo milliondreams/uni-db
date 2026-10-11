@@ -495,6 +495,10 @@ impl ExecutionPlan for FoldExec {
                     SemiringKind::MaxMinProb => FoldSemiring::MaxMin,
                     _ => FoldSemiring::AddMult,
                 },
+                // MIN / MAX over a Cypher value order it as `ORDER BY` does.
+                order: Some(uni_plugin::traits::locy::ValueOrder(
+                    crate::query::df_udfs::cypher_value_order,
+                )),
             };
 
             // Fold binding columns: compute aggregates per group via the

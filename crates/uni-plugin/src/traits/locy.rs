@@ -47,6 +47,11 @@ pub struct FoldContext {
     pub epsilon: f64,
     /// Active probability semiring for this fold.
     pub semiring: FoldSemiring,
+    /// The host's order of Cypher values (its `ORDER BY` order), for an
+    /// aggregate that orders a Cypher-value (`LargeBinary`) column, as `MIN`
+    /// and `MAX` do. `None` where no host supplies one: such an aggregate then
+    /// refuses the column rather than ordering its encoded bytes.
+    pub order: Option<ValueOrder>,
 }
 
 impl Default for FoldContext {
@@ -55,7 +60,42 @@ impl Default for FoldContext {
             strict: false,
             epsilon: 0.0,
             semiring: FoldSemiring::AddMult,
+            order: None,
         }
+    }
+}
+
+/// An order of Cypher values, supplied by the host through [`FoldContext`].
+///
+/// The order is the host's `ORDER BY` order. A Cypher value arrives encoded,
+/// and its bytes do not sort as the value does (`-1` after `1`, `'b'` after
+/// `'aa'`), so an aggregate that orders values decodes them and asks this.
+///
+/// # Examples
+///
+/// ```
+/// use std::cmp::Ordering;
+/// use uni_common::Value;
+/// use uni_plugin::traits::locy::ValueOrder;
+///
+/// fn by_debug(a: &Value, b: &Value) -> Ordering {
+///     format!("{a:?}").cmp(&format!("{b:?}"))
+/// }
+/// let order = ValueOrder(by_debug);
+/// assert_eq!((order.0)(&Value::Int(1), &Value::Int(2)), Ordering::Less);
+/// ```
+#[derive(Clone, Copy)]
+pub struct ValueOrder(pub fn(&uni_common::Value, &uni_common::Value) -> std::cmp::Ordering);
+
+impl std::fmt::Debug for ValueOrder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ValueOrder")
+    }
+}
+
+impl PartialEq for ValueOrder {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::fn_addr_eq(self.0, other.0)
     }
 }
 

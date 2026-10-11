@@ -3060,6 +3060,20 @@ fn coerce_temporal_comparisons(
         return None;
     }
 
+    // Durations have no order (a month has no fixed length): `<` between two
+    // is null, as in Neo4j and the row evaluator. Two duration literals were
+    // compared natively, field by field (`duration('P1D') < duration('P2D')`
+    // was true while the same comparison over properties was null).
+    if matches!(left_type, DataType::Interval(_))
+        && matches!(right_type, DataType::Interval(_))
+        && matches!(
+            op,
+            Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq
+        )
+    {
+        return Some(lit(ScalarValue::Boolean(None)));
+    }
+
     // DateTime struct comparisons
     if uni_common::core::schema::is_datetime_struct(left_type)
         && uni_common::core::schema::is_datetime_struct(right_type)

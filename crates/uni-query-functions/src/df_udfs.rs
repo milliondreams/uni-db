@@ -5647,46 +5647,30 @@ pub fn cypher_number_expr(arg: datafusion::logical_expr::Expr) -> datafusion::lo
 // Cypher-aware Min/Max UDAFs
 // ============================================================================
 
-/// Cross-type ordering rank for Cypher min/max (lower rank = smaller).
-/// In OpenCypher: MAP < NODE < REL < PATH < LIST < STRING < BOOLEAN < NUMBER
-/// For min/max, we use: LIST(1) < STRING(2) < BOOLEAN(3) < NUMBER(4)
-fn cypher_type_rank(val: &Value) -> u8 {
-    match val {
-        Value::Null => 0,
-        Value::List(_) => 1,
-        Value::String(_) => 2,
-        Value::Bool(_) => 3,
-        Value::Int(_) | Value::Float(_) => 4,
-        _ => 5, // Map, Node, Edge, Path, etc.
-    }
-}
-
-/// Compare two Cypher values for min/max with cross-type ordering.
-/// Uses type rank for different types, within-type comparison for same type.
-fn cypher_cross_type_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    let ra = cypher_type_rank(a);
-    let rb = cypher_type_rank(b);
-    if ra != rb {
-        return ra.cmp(&rb);
-    }
-    // Same type rank: compare within type.
-    //
-    // `total_cmp`, not `partial_cmp(..).unwrap_or(Equal)`: the latter made NaN
-    // compare Equal to every number, so `accumulate` kept whichever value it
-    // happened to see first and min/max became input-order dependent. IEEE-754
-    // total ordering is deterministic (NaN sorts above +inf), which is what
-    // min/max needs — an unordered element must not silently tie.
-    match (a, b) {
-        (Value::Int(l), Value::Int(r)) => l.cmp(r),
-        (Value::Float(l), Value::Float(r)) => l.total_cmp(r),
-        (Value::Int(l), Value::Float(r)) => (*l as f64).total_cmp(r),
-        (Value::Float(l), Value::Int(r)) => l.total_cmp(&(*r as f64)),
-        (Value::String(l), Value::String(r)) => l.cmp(r),
-        (Value::Bool(l), Value::Bool(r)) => l.cmp(r),
-        (Value::List(l), Value::List(r)) => cypher_list_cmp(l, r).unwrap_or(Ordering::Equal),
-        _ => Ordering::Equal,
-    }
+/// Orders two Cypher values as `ORDER BY` does.
+///
+/// `min` and `max`, in Cypher and in a Locy FOLD, follow Cypher's
+/// orderability, the order `ORDER BY` sorts by, so they compare the values'
+/// sort keys ([`encode_cypher_sort_key`]): one definition for all three. A
+/// hand-written comparison here ranked temporal values all equal, so `min` /
+/// `max` over dates or durations kept whichever value came first.
+///
+/// # Examples
+///
+/// ```
+/// use std::cmp::Ordering;
+/// use uni_common::Value;
+/// use uni_query_functions::df_udfs::cypher_value_order;
+///
+/// assert_eq!(cypher_value_order(&Value::Int(-1), &Value::Int(1)), Ordering::Less);
+/// assert_eq!(
+///     cypher_value_order(&Value::String("aa".into()), &Value::String("b".into())),
+///     Ordering::Less
+/// );
+/// ```
+#[must_use]
+pub fn cypher_value_order(a: &Value, b: &Value) -> std::cmp::Ordering {
+    encode_cypher_sort_key(a).cmp(&encode_cypher_sort_key(b))
 }
 
 /// Decode a LargeBinary scalar into a Value.
@@ -5748,8 +5732,21 @@ impl AggregateUDFImpl for CypherMinMaxUdaf {
         &self.signature
     }
     fn return_type(&self, args: &[DataType]) -> DFResult<DataType> {
-        // Return same type as input
-        Ok(args.first().cloned().unwrap_or(DataType::LargeBinary))
+        // The input's type where `evaluate` produces it, a Cypher value
+        // otherwise. It promised the input type for every input, so over a
+        // `Timestamp` or `Int32` argument `evaluate`'s `LargeBinary` met a
+        // schema that said otherwise and the query failed.
+        Ok(match args.first() {
+            Some(
+                t @ (DataType::Int64
+                | DataType::UInt64
+                | DataType::Float64
+                | DataType::Utf8
+                | DataType::LargeUtf8
+                | DataType::Boolean),
+            ) => t.clone(),
+            _ => DataType::LargeBinary,
+        })
     }
     fn accumulator(
         &self,
@@ -5802,7 +5799,7 @@ impl CypherMinMaxAccumulator {
         self.current = Some(match self.current.take() {
             None => val,
             Some(cur) => {
-                let ord = cypher_cross_type_cmp(&val, &cur);
+                let ord = cypher_value_order(&val, &cur);
                 if (self.is_max && ord == std::cmp::Ordering::Greater)
                     || (!self.is_max && ord == std::cmp::Ordering::Less)
                 {
@@ -7164,7 +7161,7 @@ mod tests {
         assert_eq!(large_binary_row(&ints, 0), None);
     }
 
-    /// `cypher_cross_type_cmp` used `partial_cmp(..).unwrap_or(Ordering::Equal)`,
+    /// `cypher_value_order` used `partial_cmp(..).unwrap_or(Ordering::Equal)`,
     /// which made NaN compare Equal to every number. `accumulate` then kept
     /// whichever value it happened to see first, so `min`/`max` over a column
     /// containing NaN returned an INPUT-ORDER-DEPENDENT element. `total_cmp`
@@ -7179,8 +7176,8 @@ mod tests {
         // NaN must not tie with an ordinary number in either direction, and the
         // two directions must disagree — that is what "ordered" means.
         for other in [&one, &ten] {
-            let fwd = cypher_cross_type_cmp(&nan, other);
-            let rev = cypher_cross_type_cmp(other, &nan);
+            let fwd = cypher_value_order(&nan, other);
+            let rev = cypher_value_order(other, &nan);
             assert_ne!(
                 fwd,
                 Ordering::Equal,
@@ -7190,10 +7187,10 @@ mod tests {
         }
 
         // Control: ordinary values still order correctly, across Int/Float too.
-        assert_eq!(cypher_cross_type_cmp(&one, &ten), Ordering::Less);
-        assert_eq!(cypher_cross_type_cmp(&ten, &one), Ordering::Greater);
+        assert_eq!(cypher_value_order(&one, &ten), Ordering::Less);
+        assert_eq!(cypher_value_order(&ten, &one), Ordering::Greater);
         assert_eq!(
-            cypher_cross_type_cmp(&Value::Int(3), &Value::Float(3.0)),
+            cypher_value_order(&Value::Int(3), &Value::Float(3.0)),
             Ordering::Equal
         );
     }

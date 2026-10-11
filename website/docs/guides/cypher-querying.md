@@ -456,8 +456,8 @@ Uni supports standard aggregation functions.
 | `COUNT(DISTINCT x)` | Count distinct values | `RETURN COUNT(DISTINCT p.venue)` |
 | `SUM(x)` | Sum of numbers or of durations; `0` when there are none (no rows, or all NULL). Any other value, or numbers mixed with durations, is a type error | `RETURN SUM(p.citations)` |
 | `AVG(x)` | Average of numbers (a float) or of durations (a duration); NULL when there are none. Other values are a type error | `RETURN AVG(p.citations)` |
-| `MIN(x)` | Minimum | `RETURN MIN(p.year)` |
-| `MAX(x)` | Maximum | `RETURN MAX(p.year)` |
+| `MIN(x)` | Minimum, in `ORDER BY` order (durations by length, date-times by instant, offset kept) | `RETURN MIN(p.year)` |
+| `MAX(x)` | Maximum, in `ORDER BY` order | `RETURN MAX(p.year)` |
 | `COLLECT(x)` | Collect into list | `RETURN COLLECT(p.title)` |
 
 ### Implicit Grouping

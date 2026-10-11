@@ -7331,6 +7331,26 @@ FOLD over strings or durations summed to 0.0 with `AVG` / `MNOR` NULL,
 recursive or not (`bugs::numeric_functions_take_numbers`,
 `locy::locy_fold_reads_numbers`). `sign()` returns an integer on every path.
 
+**One order of values: `ORDER BY`'s.** `encode_cypher_sort_key` defines it,
+and `cypher_value_order` compares two values by it. Cypher `min` / `max`
+use it, and so do Locy `MIN` / `MAX` / `MMIN` / `MMAX` over a Cypher-value
+column, through `FoldContext::order` (`uni-plugin`), which the host fills:
+the aggregate cannot depend on the query crate. Before, Cypher `min` / `max`
+ranked every pair of temporal values equal, answering whichever came first,
+and Locy compared encoded bytes (`MIN(-1, 1)` was 1, `MIN('b', 'aa')` was
+`'b'`). Durations sort by length, as Neo4j orders them: a month is
+30.436875 days, a day 24 hours; components break a tie. `<` between two
+durations is null, as in Neo4j (`bugs::duration_order`,
+`locy_aggregates::tests::min_max_order_cypher_values_by_the_host_order`).
+
+**`min` / `max` over a DateTime or Time column return the value whole.**
+`_cypher_min` / `_cypher_max` take the struct and return it with its offset;
+the planner reduced it to nanoseconds, and the aggregate promised its input's
+type while producing a Cypher value, so every such query failed
+("expected Timestamp(ns) but found LargeBinary"). The aggregate's return type
+is now the input's only where `evaluate` produces that type
+(`bugs::min_max_keep_temporal_values`).
+
 **An entity map is recognised by structure, never by an id key alone.**
 `entity_ref_from_map` is the one definition: a vertex needs `_labels` (every
 vertex encoding carries it), an edge a type (`_type`, `_type_name`,

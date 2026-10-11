@@ -7555,6 +7555,18 @@ only its own count / sum / avg / min / max honour it, so every other aggregate
 aggregates) is wrapped in `distinct_udaf`, which folds the distinct argument
 tuples. `sum(DISTINCT e.w)` over a schemaless property used to sum every row.
 
+**Entity functions have one definition.** `id`, `elementId`, `type`, `labels`
+and `properties` live in `eval_scalar_function` (`eval_entity_function`),
+over a `Value::Node` / `Value::Edge` or an entity map, and `keys` accepts a
+native node or edge. The row executor kept private copies and Locy's
+evaluator, which falls back to `eval_scalar_function`, had none, though
+`is_scalar_function` listed them all: `type(e)` in a Locy `QUERY ... RETURN`
+failed with "not implemented", and `keys(n)` rejected a hydrated node. The row
+executor keeps only `type()`, which names an edge carried by its type id
+through the schema (the shared function refuses one); `startNode` / `endNode`
+read the row's bindings, so Locy's `eval_expr` has its own
+(`locy::locy_entity_functions`, with plain Cypher as the oracle).
+
 ## Appendix C: Anti-Pattern Summary
 
 Quick reference of all anti-patterns from every chapter:

@@ -82,5 +82,7 @@ pub mod locy_facts_and_filters;
 // W4: MIN/MAX/COLLECT and yielded properties keep their value types.
 pub mod locy_clause_contract;
 pub mod locy_single_engine;
+// Entity functions (type, labels, id, keys, startNode, ...) in a Locy QUERY RETURN.
+pub mod locy_entity_functions;
 pub mod locy_value_types;
 pub mod locy_yield_list_values;

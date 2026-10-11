@@ -1183,8 +1183,69 @@ fn eval_size(arg: &Value) -> Result<Value> {
     }
 }
 
+/// `id`, `elementId`, `type`, `labels` and `properties` over a node or edge in
+/// either encoding (`Value::Node` / `Value::Edge`, or an entity map).
+///
+/// A value that is not the right kind of entity is NULL. `type()` of an edge
+/// carried by its numeric type id is an error: naming it needs the schema,
+/// which only the executor's own `type()` has.
+fn eval_entity_function(name: &str, args: &[Value]) -> Result<Value> {
+    let [arg] = args else {
+        return Err(anyhow!(
+            "{}() requires exactly 1 argument",
+            name.to_lowercase()
+        ));
+    };
+    Ok(match name {
+        "ID" => match (arg.entity_vid(), arg.entity_eid()) {
+            (Some(vid), _) => Value::Int(vid.as_u64() as i64),
+            (None, Some(eid)) => Value::Int(eid.as_u64() as i64),
+            (None, None) => Value::Null,
+        },
+        "ELEMENTID" => match (arg.entity_vid(), arg.entity_eid()) {
+            (Some(vid), _) => Value::String(vid.as_u64().to_string()),
+            (None, Some(eid)) => Value::String(eid.as_u64().to_string()),
+            (None, None) => Value::Null,
+        },
+        "TYPE" => match arg.edge_type_ref() {
+            Some(uni_common::value::EdgeTypeRef::Name(type_name)) => Value::String(type_name),
+            Some(uni_common::value::EdgeTypeRef::Id(type_id)) => {
+                return Err(anyhow!(
+                    "type() cannot name edge type id {type_id} without the schema"
+                ));
+            }
+            None => Value::Null,
+        },
+        "LABELS" => arg.entity_labels().map_or(Value::Null, |labels| {
+            Value::List(labels.into_iter().map(Value::String).collect())
+        }),
+        "PROPERTIES" => match (arg.entity_properties(), arg) {
+            (Some(props), _) => Value::Map(props),
+            // A plain map is its own properties.
+            (None, Value::Map(map)) => Value::Map(
+                map.iter()
+                    .filter(|(k, _)| !k.starts_with('_'))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            ),
+            (None, _) => Value::Null,
+        },
+        _ => unreachable!("eval_entity_function is called only for entity functions"),
+    })
+}
+
 fn eval_keys(arg: &Value) -> Result<Value> {
     match arg {
+        // A native node or edge: its property names, null-valued ones excluded
+        // as for an entity map.
+        Value::Node(_) | Value::Edge(_) => {
+            let mut keys: Vec<String> = arg
+                .entity_properties()
+                .map(|props| props.into_keys().collect())
+                .unwrap_or_default();
+            keys.sort();
+            Ok(Value::List(keys.into_iter().map(Value::String).collect()))
+        }
         Value::Map(map) => {
             // Entities (nodes/edges) are detected by internal fields (_vid, _eid).
             // For entities, null-valued properties don't exist (REMOVE sets them to Null).
@@ -1202,7 +1263,7 @@ fn eval_keys(arg: &Value) -> Result<Value> {
             ))
         }
         Value::Null => Ok(Value::Null),
-        _ => Err(anyhow!("keys() expects a Map")),
+        _ => Err(anyhow!("keys() expects a Map, a node or a relationship")),
     }
 }
 
@@ -1946,6 +2007,13 @@ pub fn eval_scalar_function(
             } else {
                 Ok(args[0].clone())
             }
+        }
+
+        // Entity functions. Each caller with entities in its rows used to keep
+        // its own copy, and Locy's row evaluator had none: `type(e)` in a
+        // `QUERY ... RETURN` failed with "not implemented".
+        "ID" | "ELEMENTID" | "TYPE" | "LABELS" | "PROPERTIES" => {
+            eval_entity_function(&name_upper, args)
         }
 
         // List/Collection functions

@@ -406,6 +406,11 @@ what they exist to show.)
 - *Found, not fixed:* `type(e)` in a QUERY RETURN fails ("Function type not implemented"): the
   row-level RETURN evaluator lacks it (loud). `max_slg_depth` is kept as a no-op field (Rust and
   Python), since removing it breaks existing configurations.
+  *Fixed after L6:* `id`, `elementId`, `type`, `labels` and `properties` were missing from the
+  shared `eval_scalar_function` that Locy falls back to (each Cypher executor kept its own), and
+  `keys` rejected a hydrated node; they are shared now, with `startNode` / `endNode` in Locy's
+  evaluator (`locy_entity_functions`). `max_slg_depth` is deprecated: using it warns in Rust and
+  Python.
 - Tests: `locy_single_engine` (7), `locy_generator_plugin` (+3, one the plan-shape proof for
   `LocyGenerateExec`). `repro_issue_157`'s test pinning the module "known limitation" (an
   ambiguous bare name refused) now asserts the answer comes from the enclosing module. Toggled off one at a time,

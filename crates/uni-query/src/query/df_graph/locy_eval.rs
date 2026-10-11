@@ -81,7 +81,12 @@ pub fn eval_expr(expr: &Expr, bindings: &FactRow) -> Result<Value, LocyError> {
         Expr::FunctionCall { name, args, .. } => {
             let evaluated_args: Result<Vec<Value>, _> =
                 args.iter().map(|a| eval_expr(a, bindings)).collect();
-            eval_function(name, &evaluated_args?)
+            let evaluated_args = evaluated_args?;
+            let upper = name.to_uppercase();
+            if upper == "STARTNODE" || upper == "ENDNODE" {
+                return endpoint_node(&upper, &evaluated_args, bindings);
+            }
+            eval_function(name, &evaluated_args)
         }
         Expr::Parameter(name) => Ok(bindings.get(name).cloned().unwrap_or(Value::Null)),
         Expr::IsNull(inner) => {
@@ -505,6 +510,34 @@ fn numeric_op(
             Ok(Value::Float(float_op(a, b)))
         }
     }
+}
+
+/// `startNode(e)` / `endNode(e)`: the endpoint as the row binds it, or a node
+/// carrying only its identity when the row binds no such node, as the Cypher
+/// executor answers.
+fn endpoint_node(name: &str, args: &[Value], bindings: &FactRow) -> Result<Value, LocyError> {
+    let [edge] = args else {
+        return Err(LocyError::EvaluationError {
+            message: format!("{}() requires exactly 1 argument", name.to_lowercase()),
+        });
+    };
+    let Some((src, dst)) = edge.edge_endpoints() else {
+        return Ok(Value::Null);
+    };
+    let Some(vid) = (if name == "STARTNODE" { src } else { dst }) else {
+        return Ok(Value::Null);
+    };
+    Ok(bindings
+        .values()
+        .find(|v| v.entity_vid() == Some(vid) && v.entity_labels().is_some())
+        .cloned()
+        .unwrap_or_else(|| {
+            Value::Node(uni_common::Node {
+                vid,
+                labels: Vec::new(),
+                properties: std::collections::HashMap::new(),
+            })
+        }))
 }
 
 fn eval_function(name: &str, args: &[Value]) -> Result<Value, LocyError> {

@@ -3865,7 +3865,7 @@ impl Executor {
         if rows.is_empty() {
             if group_by.is_empty() {
                 let accs = Self::create_accumulators(aggregates);
-                let row = Self::build_aggregate_result(group_by, aggregates, &[], &accs);
+                let row = Self::build_aggregate_result(group_by, aggregates, &[], &accs)?;
                 return Ok(vec![row]);
             }
             return Ok(vec![]);
@@ -3904,7 +3904,7 @@ impl Executor {
         let results = groups
             .values()
             .map(|(k_vals, accs)| Self::build_aggregate_result(group_by, aggregates, k_vals, accs))
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(results)
     }
@@ -4317,7 +4317,7 @@ impl Executor {
                     self.evaluate_expr(&args[0], row, prop_manager, params, ctx)
                         .await?
                 };
-                accs[i].update(&val, is_wildcard);
+                accs[i].update(&val, is_wildcard)?;
             }
         }
         Ok(())
@@ -4512,7 +4512,7 @@ impl Executor {
         aggregates: &[Expr],
         key_vals: &[Value],
         accs: &[Accumulator],
-    ) -> HashMap<String, Value> {
+    ) -> Result<HashMap<String, Value>> {
         let mut res_row = HashMap::new();
         for (i, expr) in group_by.iter().enumerate() {
             res_row.insert(expr.to_string_repr(), key_vals[i].clone());
@@ -4520,9 +4520,9 @@ impl Executor {
         for (i, expr) in aggregates.iter().enumerate() {
             // Use aggregate_column_name to ensure consistency with planner
             let col_name = crate::query::planner::aggregate_column_name(expr);
-            res_row.insert(col_name, accs[i].finish());
+            res_row.insert(col_name, accs[i].finish()?);
         }
-        res_row
+        Ok(res_row)
     }
 
     /// Compare and return ordering for sort operation.

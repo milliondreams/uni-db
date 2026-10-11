@@ -374,42 +374,25 @@ fn aggregate(expr: &Expr, group: &[FactRow]) -> Result<Value, LocyError> {
             values.push(v);
         }
     }
-    let numbers = |values: &[Value]| -> Result<Vec<f64>, LocyError> {
-        values
-            .iter()
-            .map(|v| {
-                v.as_f64().ok_or_else(|| LocyError::TypeError {
-                    message: format!("{name}() requires numbers, got {v:?}"),
-                })
-            })
-            .collect()
-    };
     match name.as_str() {
         "count" => Ok(Value::Int(values.len() as i64)),
         "collect" => Ok(Value::List(values)),
-        "sum" => {
-            if values.iter().all(|v| matches!(v, Value::Int(_))) {
-                let mut total = 0i64;
-                for v in &values {
-                    let Value::Int(i) = v else { unreachable!() };
-                    total = total
-                        .checked_add(*i)
-                        .ok_or_else(|| LocyError::EvaluationError {
-                            message: "integer overflow in sum()".to_string(),
-                        })?;
-                }
-                Ok(Value::Int(total))
-            } else {
-                Ok(Value::Float(numbers(&values)?.iter().sum()))
+        // Cypher's `sum` / `avg`, shared with the Cypher aggregates: numbers
+        // or durations. A duration used to be a type error here, and an
+        // integer overflow an error where Cypher continues in floats.
+        "sum" | "avg" => {
+            let type_error = |e: anyhow::Error| LocyError::TypeError {
+                message: e.to_string(),
+            };
+            let mut total = uni_query_functions::cypher_sum::CypherSum::default();
+            for v in &values {
+                total.add(v).map_err(type_error)?;
             }
-        }
-        "avg" => {
-            let ns = numbers(&values)?;
-            Ok(if ns.is_empty() {
-                Value::Null
+            if name == "sum" {
+                Ok(total.sum())
             } else {
-                Value::Float(ns.iter().sum::<f64>() / ns.len() as f64)
-            })
+                total.avg(values.len() as u64).map_err(type_error)
+            }
         }
         "min" | "max" => {
             let want = if name == "min" {

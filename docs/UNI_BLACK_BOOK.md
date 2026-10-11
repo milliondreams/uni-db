@@ -7301,6 +7301,23 @@ same wrap in `plan_window_functions`, and sums a float argument as Float64
 (it had cast every argument to Int64, truncating each float before adding).
 `min`/`max`/`avg` of nothing stay NULL (`bugs::sum_of_nothing_is_zero`).
 
+**`sum` and `avg` take numbers or durations, and nothing else** (Neo4j). One
+running total, `uni_query_functions::cypher_sum::CypherSum`, serves every
+evaluator: the `_cypher_sum` / `_cypher_avg` aggregates, the row executor's
+`Accumulator` and Locy's `QUERY` aggregates. Integers stay exact until one
+overflows, then continue as a float; durations add component by component and
+average with the same division as `duration / n`; a string, a boolean, or
+numbers mixed with durations are a type error. Only a numeric *column* goes to
+DataFusion's own `sum` / `avg`, grouped or in a window
+(`numeric_column_type`). Before, the Cypher-value sum skipped every
+non-number, so `sum` over durations or strings was 0 and `avg` NULL; a typed
+string column was cast to an integer (`sum` over `'12'` and `'3'` was 15); a
+window failed with "Unsupported CAST from LargeBinary" on durations and on
+every schemaless property; Locy's `QUERY` rejected durations and errored on
+an integer overflow Cypher continues past
+(`bugs::sum_avg_take_numbers_or_durations`). Locy FOLD `SUM` still takes
+numbers only, and says so.
+
 **An entity map is recognised by structure, never by an id key alone.**
 `entity_ref_from_map` is the one definition: a vertex needs `_labels` (every
 vertex encoding carries it), an edge a type (`_type`, `_type_name`,

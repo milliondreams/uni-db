@@ -1706,9 +1706,12 @@ fn translate_aggregate_function(
         }
         "AVG" => {
             check_args!(1, df_args, "AVG");
-            let coerced = crate::df_udfs::cypher_to_float64_expr(first_arg(df_args));
-            let expr = datafusion::functions_aggregate::average::avg(coerced);
-            Some(maybe_distinct(expr, distinct, "AVG"))
+            let udaf = Arc::new(crate::df_udfs::create_cypher_avg_udaf());
+            Some(maybe_distinct(
+                udaf.call(vec![first_arg(df_args)]),
+                distinct,
+                "AVG",
+            ))
         }
         "MIN" => {
             check_args!(1, df_args, "MIN");

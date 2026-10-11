@@ -347,6 +347,11 @@ what they exist to show.)
   (`// skip non-numeric` in `CypherSumAccumulator`), so `sum(x.name)` is 0 and a sum of durations
   is 0. A literal `sum('a')` fails loudly; Neo4j raises a type error for strings and sums
   durations. The fix is to implement duration sums and error on other types.
+  *Fixed after L6:* wider than stated. `avg` dropped the same values (NULL); a typed string column
+  was cast to an integer (`sum` of `'12'` and `'3'` was 15, grouped and in a window); a window
+  `sum` / `avg` failed on durations and on every schemaless property; Locy's QUERY rejected
+  durations. One accumulator (`cypher_sum::CypherSum`) now serves all of them, and only a
+  numeric column goes to DataFusion's own aggregates (`sum_avg_take_numbers_or_durations`).
 
 **L5 — The in-memory evaluator as a second engine (R1, remaining).**
 - Fix:

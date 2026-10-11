@@ -292,6 +292,7 @@ pub fn register_cypher_udfs(ctx: &SessionContext) -> DFResult<()> {
     ctx.register_udaf(create_cypher_min_udaf());
     ctx.register_udaf(create_cypher_max_udaf());
     ctx.register_udaf(create_cypher_sum_udaf());
+    ctx.register_udaf(create_cypher_avg_udaf());
     ctx.register_udaf(create_cypher_collect_udaf());
 
     // Cypher percentileDisc/percentileCont UDAFs
@@ -5950,23 +5951,30 @@ pub fn create_cypher_max_udaf() -> AggregateUDF {
 // Cypher-aware SUM UDAF
 // ============================================================================
 
-/// Custom UDAF for Cypher sum that preserves integer type when all inputs are integers.
+/// Cypher `sum` (`_cypher_sum`) or `avg` (`_cypher_avg`) over any input type.
+///
+/// Both fold into a [`crate::cypher_sum::CypherSum`], so they take numbers or
+/// durations and reject anything else, and an integer `sum` stays an integer.
+/// The result is CypherValue-encoded `LargeBinary`. The planner sends a
+/// numeric column to DataFusion's own `sum` / `avg` and everything else here.
 #[derive(Debug, Clone)]
 struct CypherSumUdaf {
     signature: Signature,
+    avg: bool,
 }
 
 impl CypherSumUdaf {
-    fn new() -> Self {
+    fn new(avg: bool) -> Self {
         Self {
             signature: Signature::new(TypeSignature::Any(1), Volatility::Immutable),
+            avg,
         }
     }
 }
 
 impl PartialEq for CypherSumUdaf {
     fn eq(&self, other: &Self) -> bool {
-        self.signature == other.signature
+        self.signature == other.signature && self.avg == other.avg
     }
 }
 
@@ -5980,14 +5988,17 @@ impl Hash for CypherSumUdaf {
 
 impl AggregateUDFImpl for CypherSumUdaf {
     fn name(&self) -> &str {
-        "_cypher_sum"
+        if self.avg {
+            "_cypher_avg"
+        } else {
+            "_cypher_sum"
+        }
     }
     fn signature(&self) -> &Signature {
         &self.signature
     }
     fn return_type(&self, _args: &[DataType]) -> DFResult<DataType> {
-        // We'll return LargeBinary to encode the result as a CypherValue,
-        // which preserves Int vs Float distinction.
+        // CypherValue-encoded: an Int, a Float or a Duration.
         Ok(DataType::LargeBinary)
     }
     fn accumulator(
@@ -5995,10 +6006,9 @@ impl AggregateUDFImpl for CypherSumUdaf {
         _acc_args: datafusion::logical_expr::function::AccumulatorArgs,
     ) -> DFResult<Box<dyn DfAccumulator>> {
         Ok(Box::new(CypherSumAccumulator {
-            sum: 0.0,
-            all_ints: true,
-            int_sum: 0i64,
-            has_value: false,
+            total: crate::cypher_sum::CypherSum::Empty,
+            count: 0,
+            avg: self.avg,
         }))
     }
     fn state_fields(
@@ -6007,23 +6017,13 @@ impl AggregateUDFImpl for CypherSumUdaf {
     ) -> DFResult<Vec<Arc<arrow::datatypes::Field>>> {
         Ok(vec![
             Arc::new(arrow::datatypes::Field::new(
-                format!("{}_sum", args.name),
-                DataType::Float64,
+                format!("{}_total", args.name),
+                DataType::LargeBinary,
                 true,
             )),
             Arc::new(arrow::datatypes::Field::new(
-                format!("{}_int_sum", args.name),
-                DataType::Int64,
-                true,
-            )),
-            Arc::new(arrow::datatypes::Field::new(
-                format!("{}_all_ints", args.name),
-                DataType::Boolean,
-                true,
-            )),
-            Arc::new(arrow::datatypes::Field::new(
-                format!("{}_has_value", args.name),
-                DataType::Boolean,
+                format!("{}_count", args.name),
+                DataType::UInt64,
                 true,
             )),
         ])
@@ -6032,116 +6032,143 @@ impl AggregateUDFImpl for CypherSumUdaf {
 
 #[derive(Debug)]
 struct CypherSumAccumulator {
-    sum: f64,
-    all_ints: bool,
-    int_sum: i64,
-    has_value: bool,
+    total: crate::cypher_sum::CypherSum,
+    /// Non-null values added, the divisor of `avg`.
+    count: u64,
+    avg: bool,
+}
+
+fn sum_error(e: anyhow::Error) -> datafusion::error::DataFusionError {
+    datafusion::error::DataFusionError::Execution(e.to_string())
+}
+
+impl CypherSumAccumulator {
+    /// Adds one non-null cell of `arr`.
+    fn add_cell(&mut self, arr: &ArrayRef, i: usize) -> DFResult<()> {
+        use uni_common::cypher_value_codec::{
+            TAG_FLOAT, TAG_INT, decode_float, decode_int, peek_tag,
+        };
+        let added = match arr.data_type() {
+            DataType::LargeBinary => {
+                let bytes = arr
+                    .as_any()
+                    .downcast_ref::<LargeBinaryArray>()
+                    .unwrap()
+                    .value(i);
+                match peek_tag(bytes) {
+                    Some(TAG_INT) => match decode_int(bytes).map_err(|e| cv_decode_error(&e))? {
+                        Some(v) => self.total.add_int(v).map(|()| true),
+                        None => Ok(false),
+                    },
+                    Some(TAG_FLOAT) => {
+                        match decode_float(bytes).map_err(|e| cv_decode_error(&e))? {
+                            Some(v) => self.total.add_float(v).map(|()| true),
+                            None => Ok(false),
+                        }
+                    }
+                    _ => {
+                        let value = uni_common::cypher_value_codec::decode(bytes)
+                            .map_err(|e| cv_decode_error(&e))?;
+                        let present = !value.is_null();
+                        self.total.add(&value).map(|()| present)
+                    }
+                }
+            }
+            DataType::Int64 => {
+                let v = arr.as_any().downcast_ref::<Int64Array>().unwrap().value(i);
+                self.total.add_int(v).map(|()| true)
+            }
+            DataType::Float64 => {
+                let v = arr
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap()
+                    .value(i);
+                self.total.add_float(v).map(|()| true)
+            }
+            // Any other type through its Cypher value: a narrower number or
+            // an interval is added, a string or a boolean is an error.
+            _ => {
+                let value = scalar_to_value(&ScalarValue::try_from_array(arr, i)?)?;
+                let present = !value.is_null();
+                self.total.add(&value).map(|()| present)
+            }
+        };
+        if added.map_err(sum_error)? {
+            self.count += 1;
+        }
+        Ok(())
+    }
 }
 
 impl DfAccumulator for CypherSumAccumulator {
     fn update_batch(&mut self, values: &[ArrayRef]) -> DFResult<()> {
         let arr = &values[0];
         for i in 0..arr.len() {
-            if arr.is_null(i) {
-                continue;
-            }
-            match arr.data_type() {
-                DataType::LargeBinary => {
-                    let lb = arr.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
-                    let bytes = lb.value(i);
-                    use uni_common::cypher_value_codec::{
-                        TAG_FLOAT, TAG_INT, decode_float, decode_int, peek_tag,
-                    };
-                    match peek_tag(bytes) {
-                        Some(TAG_INT) => {
-                            if let Some(v) = decode_int(bytes).map_err(|e| cv_decode_error(&e))? {
-                                self.sum += v as f64;
-                                // On i64 overflow, drop the exact-int path so the
-                                // result is the f64 sum, not a silent wraparound.
-                                match self.int_sum.checked_add(v) {
-                                    Some(s) => self.int_sum = s,
-                                    None => self.all_ints = false,
-                                }
-                                self.has_value = true;
-                            }
-                        }
-                        Some(TAG_FLOAT) => {
-                            if let Some(v) = decode_float(bytes).map_err(|e| cv_decode_error(&e))? {
-                                self.sum += v;
-                                self.all_ints = false;
-                                self.has_value = true;
-                            }
-                        }
-                        _ => {} // skip non-numeric
-                    }
-                }
-                DataType::Int64 => {
-                    let a = arr.as_any().downcast_ref::<Int64Array>().unwrap();
-                    let v = a.value(i);
-                    self.sum += v as f64;
-                    match self.int_sum.checked_add(v) {
-                        Some(s) => self.int_sum = s,
-                        None => self.all_ints = false,
-                    }
-                    self.has_value = true;
-                }
-                DataType::Float64 => {
-                    let a = arr.as_any().downcast_ref::<Float64Array>().unwrap();
-                    self.sum += a.value(i);
-                    self.all_ints = false;
-                    self.has_value = true;
-                }
-                _ => {}
+            if !arr.is_null(i) {
+                self.add_cell(arr, i)?;
             }
         }
         Ok(())
     }
     fn evaluate(&mut self) -> DFResult<ScalarValue> {
-        // `sum` over no numeric value is 0, as in Cypher (Neo4j), not NULL:
-        // `int_sum` is 0 and `all_ints` still true, so this encodes `Int(0)`.
-        let val = if self.all_ints {
-            Value::Int(self.int_sum)
+        // `sum` over nothing is 0, as in Cypher (Neo4j), not NULL; `avg` over
+        // nothing is NULL.
+        let val = if self.avg {
+            self.total.avg(self.count).map_err(sum_error)?
         } else {
-            Value::Float(self.sum)
+            self.total.sum()
         };
-        let bytes = uni_common::cypher_value_codec::encode(&val);
-        Ok(ScalarValue::LargeBinary(Some(bytes)))
+        Ok(ScalarValue::LargeBinary(if val.is_null() {
+            None
+        } else {
+            Some(uni_common::cypher_value_codec::encode(&val))
+        }))
     }
     fn size(&self) -> usize {
         std::mem::size_of_val(self)
     }
     fn state(&mut self) -> DFResult<Vec<ScalarValue>> {
+        let total = self.total.to_state();
         Ok(vec![
-            ScalarValue::Float64(Some(self.sum)),
-            ScalarValue::Int64(Some(self.int_sum)),
-            ScalarValue::Boolean(Some(self.all_ints)),
-            ScalarValue::Boolean(Some(self.has_value)),
+            ScalarValue::LargeBinary(if total.is_null() {
+                None
+            } else {
+                Some(uni_common::cypher_value_codec::encode(&total))
+            }),
+            ScalarValue::UInt64(Some(self.count)),
         ])
     }
     fn merge_batch(&mut self, states: &[ArrayRef]) -> DFResult<()> {
-        let sum_arr = states[0].as_any().downcast_ref::<Float64Array>().unwrap();
-        let int_sum_arr = states[1].as_any().downcast_ref::<Int64Array>().unwrap();
-        let all_ints_arr = states[2].as_any().downcast_ref::<BooleanArray>().unwrap();
-        let has_value_arr = states[3].as_any().downcast_ref::<BooleanArray>().unwrap();
-        for i in 0..sum_arr.len() {
-            if !has_value_arr.is_null(i) && has_value_arr.value(i) {
-                self.sum += sum_arr.value(i);
-                match self.int_sum.checked_add(int_sum_arr.value(i)) {
-                    Some(s) => self.int_sum = s,
-                    None => self.all_ints = false,
-                }
-                if !all_ints_arr.value(i) {
-                    self.all_ints = false;
-                }
-                self.has_value = true;
+        let totals = states[0]
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap();
+        let counts = states[1].as_any().downcast_ref::<UInt64Array>().unwrap();
+        for i in 0..totals.len() {
+            if !counts.is_null(i) {
+                self.count += counts.value(i);
             }
+            if totals.is_null(i) {
+                continue;
+            }
+            let value = uni_common::cypher_value_codec::decode(totals.value(i))
+                .map_err(|e| cv_decode_error(&e))?;
+            let partial = crate::cypher_sum::CypherSum::from_state(&value).map_err(sum_error)?;
+            self.total.merge(&partial).map_err(sum_error)?;
         }
         Ok(())
     }
 }
 
+/// Cypher `sum`: see [`CypherSumUdaf`].
 pub fn create_cypher_sum_udaf() -> AggregateUDF {
-    AggregateUDF::from(CypherSumUdaf::new())
+    AggregateUDF::from(CypherSumUdaf::new(false))
+}
+
+/// Cypher `avg`: see [`CypherSumUdaf`].
+pub fn create_cypher_avg_udaf() -> AggregateUDF {
+    AggregateUDF::from(CypherSumUdaf::new(true))
 }
 
 // ============================================================================

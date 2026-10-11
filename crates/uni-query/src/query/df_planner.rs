@@ -5692,50 +5692,36 @@ impl HybridPhysicalPlanner {
                         count(get_arg()?)
                     }
                 }
+                // DataFusion's own `sum` / `avg` only for a numeric column;
+                // anything else (an encoded value, a string, a duration, any
+                // expression) folds by Cypher's rules, which take numbers or
+                // durations and reject the rest. A string column used to be
+                // cast to Int64, so `sum` over '12' answered 12.
                 "sum" => {
                     let arg = get_arg()?;
-                    if self.is_large_binary_col(&arg, schema) {
-                        let udaf = Arc::new(crate::query::df_udfs::create_cypher_sum_udaf());
-                        udaf.call(vec![arg])
-                    } else {
-                        // Widen small integers to Int64 (DataFusion doesn't support Int32 sum).
-                        // Float columns pass through unchanged so SUM preserves float type.
-                        use datafusion::logical_expr::Cast;
-                        let is_float = if let DfExpr::Column(col) = &arg
-                            && let Ok(field) = schema.field_with_name(&col.name)
-                        {
-                            matches!(
-                                field.data_type(),
-                                datafusion::arrow::datatypes::DataType::Float32
-                                    | datafusion::arrow::datatypes::DataType::Float64
-                            )
-                        } else {
-                            false
-                        };
-                        if is_float {
-                            sum(DfExpr::Cast(Cast::new(
-                                Box::new(arg),
-                                datafusion::arrow::datatypes::DataType::Float64,
-                            )))
-                        } else {
-                            sum(DfExpr::Cast(Cast::new(
-                                Box::new(arg),
-                                datafusion::arrow::datatypes::DataType::Int64,
-                            )))
-                        }
+                    match Self::numeric_column_type(&arg, schema) {
+                        Some(true) => sum(DfExpr::Cast(datafusion::logical_expr::Cast::new(
+                            Box::new(arg),
+                            datafusion::arrow::datatypes::DataType::Float64,
+                        ))),
+                        // Widen small integers to Int64 (DataFusion has no Int32 sum).
+                        Some(false) => sum(DfExpr::Cast(datafusion::logical_expr::Cast::new(
+                            Box::new(arg),
+                            datafusion::arrow::datatypes::DataType::Int64,
+                        ))),
+                        None => Arc::new(crate::query::df_udfs::create_cypher_sum_udaf())
+                            .call(vec![arg]),
                     }
                 }
                 "avg" => {
                     let arg = get_arg()?;
-                    if self.is_large_binary_col(&arg, schema) {
-                        let coerced = crate::query::df_udfs::cypher_to_float64_expr(arg);
-                        avg(coerced)
-                    } else {
-                        use datafusion::logical_expr::Cast;
-                        avg(DfExpr::Cast(Cast::new(
+                    match Self::numeric_column_type(&arg, schema) {
+                        Some(_) => avg(DfExpr::Cast(datafusion::logical_expr::Cast::new(
                             Box::new(arg),
                             datafusion::arrow::datatypes::DataType::Float64,
-                        )))
+                        ))),
+                        None => Arc::new(crate::query::df_udfs::create_cypher_avg_udaf())
+                            .call(vec![arg]),
                     }
                 }
                 // Numerically-stable standard-deviation / variance aggregates
@@ -6596,7 +6582,7 @@ impl HybridPhysicalPlanner {
             let name_lower = name.to_lowercase();
 
             // Resolve the window function definition: either AggregateUDF or WindowUDF
-            let (window_fn_def, is_aggregate) = match name_lower.as_str() {
+            let (mut window_fn_def, is_aggregate) = match name_lower.as_str() {
                 // Aggregate window functions → AggregateUDF
                 "count" => (WindowFunctionDefinition::AggregateUDF(count_udaf()), true),
                 "sum" => (WindowFunctionDefinition::AggregateUDF(sum_udaf()), true),
@@ -6665,6 +6651,43 @@ impl HybridPhysicalPlanner {
                 }
             };
 
+            // `sum` / `avg` over anything but a numeric column fold by Cypher's
+            // rules, as the grouped aggregates do: DataFusion's cast below
+            // summed the strings '12' and '3' to 15, and failed on durations
+            // and on every schemaless (encoded) property.
+            let cypher_sum = matches!(name_lower.as_str(), "sum" | "avg")
+                && matches!(args.as_slice(), [arg] if !matches!(arg, Expr::Wildcard))
+                && !matches!(
+                    cypher_expr_to_df(&args[0], tx_ctx.as_ref())?.get_type(&df_schema),
+                    Ok(datafusion::arrow::datatypes::DataType::Float16
+                        | datafusion::arrow::datatypes::DataType::Float32
+                        | datafusion::arrow::datatypes::DataType::Float64
+                        | datafusion::arrow::datatypes::DataType::Int8
+                        | datafusion::arrow::datatypes::DataType::Int16
+                        | datafusion::arrow::datatypes::DataType::Int32
+                        | datafusion::arrow::datatypes::DataType::Int64
+                        | datafusion::arrow::datatypes::DataType::UInt8
+                        | datafusion::arrow::datatypes::DataType::UInt16
+                        | datafusion::arrow::datatypes::DataType::UInt32
+                        | datafusion::arrow::datatypes::DataType::UInt64)
+                );
+            // A non-built-in aggregate ignores DataFusion's DISTINCT flag.
+            let mut window_distinct = *distinct;
+            if cypher_sum {
+                let udaf = if name_lower == "sum" {
+                    crate::query::df_udfs::create_cypher_sum_udaf()
+                } else {
+                    crate::query::df_udfs::create_cypher_avg_udaf()
+                };
+                let udaf = if window_distinct {
+                    window_distinct = false;
+                    crate::query::df_udfs::distinct_udaf(udaf)
+                } else {
+                    udaf
+                };
+                window_fn_def = WindowFunctionDefinition::AggregateUDF(Arc::new(udaf));
+            }
+
             // Translate argument expressions to physical expressions
             let physical_args: Vec<Arc<dyn datafusion::physical_expr::PhysicalExpr>> =
                 if args.is_empty() || matches!(args.as_slice(), [Expr::Wildcard]) {
@@ -6689,7 +6712,7 @@ impl HybridPhysicalPlanner {
                             // the grouped `sum` does — casting every argument to
                             // Int64 truncated each float before it was added
                             // (`sum(0.5, 1.25) OVER ()` returned 1). AVG needs Float64.
-                            if is_aggregate {
+                            if is_aggregate && !cypher_sum {
                                 let is_float = matches!(
                                     df_expr.get_type(&df_schema),
                                     Ok(datafusion::arrow::datatypes::DataType::Float32
@@ -6803,7 +6826,7 @@ impl HybridPhysicalPlanner {
                 window_frame,
                 input_schema.clone(),
                 false, // ignore_nulls
-                *distinct,
+                window_distinct,
                 None, // filter
             )?;
 
@@ -7474,6 +7497,27 @@ impl HybridPhysicalPlanner {
     }
 
     /// Check if a DataFusion expression refers to a LargeBinary column in the schema.
+    /// For a column of a numeric Arrow type, whether it is a float; `None`
+    /// for any other column or expression.
+    fn numeric_column_type(expr: &DfExpr, schema: &SchemaRef) -> Option<bool> {
+        use datafusion::arrow::datatypes::DataType as D;
+        let DfExpr::Column(col) = expr else {
+            return None;
+        };
+        match schema.field_with_name(&col.name).ok()?.data_type() {
+            D::Float16 | D::Float32 | D::Float64 => Some(true),
+            D::Int8
+            | D::Int16
+            | D::Int32
+            | D::Int64
+            | D::UInt8
+            | D::UInt16
+            | D::UInt32
+            | D::UInt64 => Some(false),
+            _ => None,
+        }
+    }
+
     fn is_large_binary_col(&self, expr: &DfExpr, schema: &SchemaRef) -> bool {
         if let DfExpr::Column(col) = expr
             && let Ok(field) = schema.field_with_name(&col.name)

@@ -250,22 +250,18 @@ impl Accumulator {
     }
 
     /// The aggregate's value.
-    ///
-    /// # Errors
-    ///
-    /// When averaging durations fails.
-    pub(crate) fn finish(&self) -> anyhow::Result<Value> {
-        Ok(match self {
+    pub(crate) fn finish(&self) -> Value {
+        match self {
             Accumulator::Count(c) => Value::Int(*c),
             Accumulator::Sum(total) => total.sum(),
             Accumulator::Min(opt) => opt.as_ref().cloned().unwrap_or(Value::Null),
             Accumulator::Max(opt) => opt.as_ref().cloned().unwrap_or(Value::Null),
-            Accumulator::Avg { sum, count } => sum.avg(*count)?,
+            Accumulator::Avg { sum, count } => sum.avg(*count),
             Accumulator::Collect(v) => Value::List(v.clone()),
             Accumulator::CountDistinct(s) => Value::Int(s.len() as i64),
             Accumulator::PercentileDisc { values, percentile } => {
                 if values.is_empty() {
-                    return Ok(Value::Null);
+                    return Value::Null;
                 }
                 let mut sorted = values.clone();
                 sorted.sort_by(|a, b| a.total_cmp(b));
@@ -275,13 +271,13 @@ impl Accumulator {
             }
             Accumulator::PercentileCont { values, percentile } => {
                 if values.is_empty() {
-                    return Ok(Value::Null);
+                    return Value::Null;
                 }
                 let mut sorted = values.clone();
                 sorted.sort_by(|a, b| a.total_cmp(b));
                 let n = sorted.len();
                 if n == 1 {
-                    return Ok(Value::Float(sorted[0]));
+                    return Value::Float(sorted[0]);
                 }
                 let pos = percentile * (n as f64 - 1.0);
                 let lower = (pos.floor() as usize).min(n - 1);
@@ -293,7 +289,7 @@ impl Accumulator {
                     Value::Float(sorted[lower] + frac * (sorted[upper] - sorted[lower]))
                 }
             }
-        })
+        }
     }
 }
 
@@ -1163,7 +1159,7 @@ mod tests {
         acc.update(&Value::Int(1), false).unwrap();
         acc.update(&Value::Null, false).unwrap(); // null skipped
         acc.update(&Value::Int(2), false).unwrap();
-        assert_eq!(acc.finish().unwrap(), Value::Int(2));
+        assert_eq!(acc.finish(), Value::Int(2));
     }
 
     #[test]
@@ -1172,7 +1168,7 @@ mod tests {
         acc.update(&Value::Int(1), true).unwrap();
         acc.update(&Value::Null, true).unwrap(); // wildcard counts nulls
         acc.update(&Value::Int(2), true).unwrap();
-        assert_eq!(acc.finish().unwrap(), Value::Int(3));
+        assert_eq!(acc.finish(), Value::Int(3));
     }
 
     #[test]
@@ -1181,7 +1177,7 @@ mod tests {
         acc.update(&Value::Int(10), false).unwrap();
         acc.update(&Value::Float(2.5), false).unwrap();
         acc.update(&Value::Null, false).unwrap(); // null skipped
-        assert_eq!(acc.finish().unwrap(), Value::Float(12.5));
+        assert_eq!(acc.finish(), Value::Float(12.5));
     }
 
     #[test]
@@ -1208,12 +1204,12 @@ mod tests {
             max_acc.update(v, false).unwrap();
         }
         assert_eq!(
-            min_acc.finish().unwrap(),
+            min_acc.finish(),
             y2010,
             "MIN over dates must return the earliest"
         );
         assert_eq!(
-            max_acc.finish().unwrap(),
+            max_acc.finish(),
             y2030,
             "MAX over dates must return the latest"
         );
@@ -1225,13 +1221,13 @@ mod tests {
         acc.update(&Value::Int(10), false).unwrap();
         acc.update(&Value::Int(20), false).unwrap();
         acc.update(&Value::Int(30), false).unwrap();
-        assert_eq!(acc.finish().unwrap(), Value::Float(20.0));
+        assert_eq!(acc.finish(), Value::Float(20.0));
     }
 
     #[test]
     fn test_accumulator_avg_empty() {
         let acc = Accumulator::new("AVG", false);
-        assert_eq!(acc.finish().unwrap(), Value::Null);
+        assert_eq!(acc.finish(), Value::Null);
     }
 
     #[test]
@@ -1242,8 +1238,8 @@ mod tests {
             min_acc.update(v, false).unwrap();
             max_acc.update(v, false).unwrap();
         }
-        assert_eq!(min_acc.finish().unwrap(), Value::Int(1));
-        assert_eq!(max_acc.finish().unwrap(), Value::Int(3));
+        assert_eq!(min_acc.finish(), Value::Int(1));
+        assert_eq!(max_acc.finish(), Value::Int(3));
     }
 
     #[test]
@@ -1253,7 +1249,7 @@ mod tests {
         acc.update(&Value::Null, false).unwrap(); // null skipped
         acc.update(&Value::String("b".into()), false).unwrap();
         assert_eq!(
-            acc.finish().unwrap(),
+            acc.finish(),
             Value::List(vec![Value::String("a".into()), Value::String("b".into()),])
         );
     }
@@ -1265,13 +1261,13 @@ mod tests {
         acc.update(&Value::String("b".into()), false).unwrap();
         acc.update(&Value::String("a".into()), false).unwrap(); // duplicate
         acc.update(&Value::Null, false).unwrap(); // null skipped
-        assert_eq!(acc.finish().unwrap(), Value::Int(2));
+        assert_eq!(acc.finish(), Value::Int(2));
     }
 
     #[test]
     fn test_accumulator_percentile_empty() {
         let acc = Accumulator::new_with_percentile("PERCENTILEDISC", false, 0.5);
-        assert_eq!(acc.finish().unwrap(), Value::Null);
+        assert_eq!(acc.finish(), Value::Null);
     }
 
     // ── compare_values tests ─────────────────────────────────────────
@@ -1326,25 +1322,17 @@ mod tests {
         let mut acc = Accumulator::new("COUNT", true);
         acc.update(&Value::Int(1), false).unwrap();
         acc.update(&Value::Float(1.0), false).unwrap();
-        assert_eq!(acc.finish().unwrap(), Value::Int(1), "1 and 1.0 count once");
+        assert_eq!(acc.finish(), Value::Int(1), "1 and 1.0 count once");
 
         let mut acc = Accumulator::new("COUNT", true);
         acc.update(&Value::Int(1), false).unwrap();
         acc.update(&Value::String("1".to_string()), false).unwrap();
-        assert_eq!(
-            acc.finish().unwrap(),
-            Value::Int(2),
-            "1 and '1' are distinct"
-        );
+        assert_eq!(acc.finish(), Value::Int(2), "1 and '1' are distinct");
 
         let mut acc = Accumulator::new("COUNT", true);
         acc.update(&Value::Int(1), false).unwrap();
         acc.update(&Value::Bool(true), false).unwrap();
-        assert_eq!(
-            acc.finish().unwrap(),
-            Value::Int(2),
-            "1 and true are distinct"
-        );
+        assert_eq!(acc.finish(), Value::Int(2), "1 and true are distinct");
 
         // Non-integral and non-finite floats keep float identity; NaN and
         // signed zero follow Value's normalized Hash/Eq (one bucket each).
@@ -1355,10 +1343,6 @@ mod tests {
         acc.update(&Value::Float(f64::NAN), false).unwrap();
         acc.update(&Value::Float(0.0), false).unwrap();
         acc.update(&Value::Float(-0.0), false).unwrap();
-        assert_eq!(
-            acc.finish().unwrap(),
-            Value::Int(3),
-            "1.5, NaN, 0 -> 3 buckets"
-        );
+        assert_eq!(acc.finish(), Value::Int(3), "1.5, NaN, 0 -> 3 buckets");
     }
 }

@@ -7315,16 +7315,18 @@ string column was cast to an integer (`sum` over `'12'` and `'3'` was 15); a
 window failed with "Unsupported CAST from LargeBinary" on durations and on
 every schemaless property; Locy's `QUERY` rejected durations and errored on
 an integer overflow Cypher continues past
-(`bugs::sum_avg_take_numbers_or_durations`). Locy FOLD `SUM` / `AVG` take
-numbers only.
+(`bugs::sum_avg_take_numbers_or_durations`). `CypherSum` lives in
+`uni-common` so Locy's FOLD `SUM` / `AVG` (in `uni-plugin-builtin`) share it:
+over a Cypher-value column they add durations and refuse strings, and the
+planner types their result as a Cypher value (`infer_yield_type_rec`).
 
 **A number is read strictly, or not at all.** `_cypher_number` reads a
 value as Float64: NULL stays NULL, every number is read, and anything else is
 an error. It is the argument conversion of Cypher's math functions (`ceil`,
 `sqrt`, `^`, `atan2`, ...), of `stDev` / `variance` / percentiles over a
 non-numeric column, and of a Locy projection bringing a column to Float64
-(`coerce_physical_expr`), which is where a FOLD `SUM`, `AVG`, `MSUM`, `MNOR`
-or `MPROD` reads its input. It replaced `_cypher_to_float64`, which turned a non-number
+(`coerce_physical_expr`), which is where a FOLD `MSUM`, `MNOR` or `MPROD`
+reads its input. It replaced `_cypher_to_float64`, which turned a non-number
 into NULL: `ceil('x')` and `sqrt(duration)` answered NULL while `abs('x')` and
 the row evaluator failed, `stDev` over a string column `'12'` read 12, and a
 FOLD over strings or durations summed to 0.0 with `AVG` / `MNOR` NULL,
@@ -7341,7 +7343,7 @@ and Locy compared encoded bytes (`MIN(-1, 1)` was 1, `MIN('b', 'aa')` was
 `'b'`). Durations sort by length, as Neo4j orders them: a month is
 30.436875 days, a day 24 hours; components break a tie. `<` between two
 durations is null, as in Neo4j (`bugs::duration_order`,
-`locy_aggregates::tests::min_max_order_cypher_values_by_the_host_order`).
+`locy::locy_fold_any_column_type`).
 
 **`min` / `max` over a DateTime or Time column return the value whole.**
 `_cypher_min` / `_cypher_max` take the struct and return it with its offset;
@@ -7349,7 +7351,9 @@ the planner reduced it to nanoseconds, and the aggregate promised its input's
 type while producing a Cypher value, so every such query failed
 ("expected Timestamp(ns) but found LargeBinary"). The aggregate's return type
 is now the input's only where `evaluate` produces that type
-(`bugs::min_max_keep_temporal_values`).
+(`bugs::min_max_keep_temporal_values`). A FOLD `COLLECT` receives its input
+as a Cypher value, so it reads every column type (`Int32`, `Date`,
+`DateTime`).
 
 **An entity map is recognised by structure, never by an id key alone.**
 `entity_ref_from_map` is the one definition: a vertex needs `_labels` (every

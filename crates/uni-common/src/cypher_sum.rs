@@ -7,15 +7,15 @@
 //! nothing is 0, and an average over nothing is NULL. Integers stay integers
 //! until one overflows, when the total continues as a float. Mixing numbers
 //! and durations, or anything else (a string, a list, a node), is an error:
-//! the DataFusion aggregate, the row executor and Locy's `QUERY` aggregates
-//! each used to skip such a value, so `sum` over strings or durations
-//! answered 0 and `avg` answered NULL.
+//! the DataFusion aggregate, the row executor, Locy's `QUERY` aggregates and
+//! Locy's FOLD `SUM` / `AVG` each used to skip such a value, so `sum` over
+//! strings or durations answered 0 and `avg` answered NULL.
 
 // Rust guideline compliant
 
+use crate::Value;
+use crate::value::TemporalValue;
 use anyhow::{Result, anyhow};
-use uni_common::Value;
-use uni_common::value::TemporalValue;
 
 /// A running Cypher `sum`, also the numerator of `avg`.
 ///
@@ -23,7 +23,7 @@ use uni_common::value::TemporalValue;
 ///
 /// ```
 /// use uni_common::Value;
-/// use uni_query_functions::cypher_sum::CypherSum;
+/// use uni_common::cypher_sum::CypherSum;
 ///
 /// let mut total = CypherSum::default();
 /// total.add(&Value::Int(2)).unwrap();
@@ -171,30 +171,26 @@ impl CypherSum {
     }
 
     /// The average over `count` values: NULL over nothing, a float for
-    /// numbers, a duration for durations.
-    ///
-    /// # Errors
-    ///
-    /// When dividing the duration fails.
-    pub fn avg(&self, count: u64) -> Result<Value> {
+    /// numbers, a duration for durations (divided as `duration / n` is).
+    #[must_use]
+    pub fn avg(&self, count: u64) -> Value {
         if count == 0 {
-            return Ok(Value::Null);
+            return Value::Null;
         }
-        Ok(match *self {
+        match *self {
             Self::Empty => Value::Null,
             Self::Int(i) => Value::Float(i as f64 / count as f64),
             Self::Float(f) => Value::Float(f / count as f64),
-            // The same division as `duration / n` in an expression.
             Self::Duration {
                 months,
                 days,
                 nanos,
-            } => crate::expr_eval::eval_binary_op(
-                &duration(months, days, nanos),
-                &uni_cypher::ast::BinaryOp::Div,
-                &Value::Int(count as i64),
-            )?,
-        })
+            } => {
+                let (months, days, nanos) =
+                    crate::datetime::scale_duration(months, days, nanos, 1.0 / count as f64);
+                duration(months, days, nanos)
+            }
+        }
     }
 
     /// The running total as a value, for a partial aggregate's state: NULL
@@ -231,8 +227,9 @@ fn mixed() -> anyhow::Error {
     anyhow!("sum() and avg() cannot mix numbers and durations")
 }
 
-/// The value as an error message names it: `the string "x"`, `a Boolean`.
-pub(crate) fn describe(value: &Value) -> String {
+/// The value as an error message names it: `the string "x"`, `a duration`.
+#[must_use]
+pub fn describe(value: &Value) -> String {
     match value {
         Value::String(s) => format!("the string {s:?}"),
         Value::Temporal(TemporalValue::Duration { .. }) => "a duration".to_string(),
@@ -275,7 +272,7 @@ mod tests {
     fn durations_sum_and_average() {
         let t = total(&[duration(1, 2, 3), Value::Null, duration(1, 0, 5)]).unwrap();
         assert_eq!(t.sum(), duration(2, 2, 8));
-        assert_eq!(t.avg(2).unwrap(), duration(1, 1, 4));
+        assert_eq!(t.avg(2), duration(1, 1, 4));
     }
 
     #[test]
@@ -288,11 +285,8 @@ mod tests {
 
     #[test]
     fn average_over_nothing_is_null() {
-        assert_eq!(CypherSum::default().avg(0).unwrap(), Value::Null);
-        assert_eq!(
-            total(&[Value::Int(3)]).unwrap().avg(2).unwrap(),
-            Value::Float(1.5)
-        );
+        assert_eq!(CypherSum::default().avg(0), Value::Null);
+        assert_eq!(total(&[Value::Int(3)]).unwrap().avg(2), Value::Float(1.5));
     }
 
     #[test]

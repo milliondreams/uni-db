@@ -465,7 +465,8 @@ fn infer_yield_type_rec(
     visited: &mut HashSet<String>,
 ) -> DataType {
     // FOLD outputs — type depends on the aggregate function.
-    // COUNT/MCOUNT produce Int64; SUM/MSUM/AVG produce Float64.
+    // COUNT/MCOUNT produce Int64; SUM/MSUM/AVG produce Float64, but SUM/AVG
+    // over a Cypher value produce a Cypher value.
     if fold_output_names.contains(name) {
         if let Some(fold) = first_clause.fold.iter().find(|fb| fb.name == name)
             && let Expr::FunctionCall { name: fn_name, .. } = &fold.aggregate
@@ -480,6 +481,16 @@ fn infer_yield_type_rec(
                     {
                         return dt;
                     }
+                }
+                // Over a Cypher value (a schemaless or duration property), a
+                // Cypher value: a float, or a duration. The input stays the
+                // Cypher value too, since this is also its column type; cast to
+                // Float64, a duration was refused.
+                "SUM" | "AVG"
+                    if fold_argument_type(&fold.aggregate, schema, var_labels, node_vars)
+                        == Some(DataType::LargeBinary) =>
+                {
+                    return DataType::LargeBinary;
                 }
                 _ => {}
             }
@@ -2622,11 +2633,12 @@ impl<'a> LocyPlanBuilder<'a> {
                 expr
             };
             projections.push((expr, Some(fb.name.clone())));
-            // `COLLECT` keeps its elements' type: its input is not cast (its
-            // output is a list, typed separately).
+            // `COLLECT` keeps its elements' values: its input is carried as a
+            // Cypher value, which every column type encodes to (its output is
+            // a list, typed separately). Passed through in its column type, a
+            // declared `Int32`, `Date` or `DateTime` column was refused.
             let collect_input = (fold_function_name(&fb.aggregate).as_deref() == Some("COLLECT"))
-                .then(|| fold_argument_type(&fb.aggregate, graph_schema, &var_labels, node_vars))
-                .flatten();
+                .then_some(DataType::LargeBinary);
             let unified = || ctx.seed_types.get(&fb.name).cloned();
             target_types.push(collect_input.or_else(unified).unwrap_or_else(|| {
                 infer_yield_type(

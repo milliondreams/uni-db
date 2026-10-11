@@ -391,7 +391,7 @@ fn aggregate(expr: &Expr, group: &[FactRow]) -> Result<Value, LocyError> {
             if name == "sum" {
                 Ok(total.sum())
             } else {
-                total.avg(values.len() as u64).map_err(type_error)
+                Ok(total.avg(values.len() as u64))
             }
         }
         "min" | "max" => {

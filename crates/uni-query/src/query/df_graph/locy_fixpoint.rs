@@ -5135,8 +5135,8 @@ fn apply_having_filter(
     // Cypher Expr → DataFusion DfExpr → type-coerced DfExpr → PhysicalExpr.
     //
     // Type coercion is needed because FOLD aggregates produce Float64 (SUM,
-    // AVG) or Int64 (COUNT), and literal comparisons like `total >= 100`
-    // may mix Float64 columns with Int64 literals.
+    // AVG), Int64 (COUNT) or a Cypher value, and literal comparisons like
+    // `total >= 100` may mix those columns with Int64 literals.
     let physical_exprs: Vec<Arc<dyn datafusion::physical_expr::PhysicalExpr>> = having_exprs
         .iter()
         .map(|expr| {
@@ -5146,6 +5146,17 @@ fn apply_having_filter(
                         "HAVING expression conversion: {e}"
                     ))
                 })?;
+            // A Cypher-value FOLD output (`MIN`, `COLLECT`, or `SUM` / `AVG`
+            // over a schemaless or duration property) compares through the
+            // Cypher comparison UDFs, as before a FOLD: DataFusion's own
+            // coercion has no `LargeBinary > Int64`.
+            let df_expr = crate::query::df_expr::apply_type_coercion(&df_expr, &df_schema)
+                .map_err(|e| {
+                    datafusion::common::DataFusionError::Internal(format!(
+                        "HAVING type coercion: {e}"
+                    ))
+                })?;
+            let df_expr = resolve_registered_udfs(df_expr, task_ctx.scalar_functions())?;
 
             // Run DataFusion's type coercion by wrapping in a Filter plan,
             // applying the TypeCoercion analyzer rule, then extracting the
@@ -6224,6 +6235,35 @@ fn nullable_discriminators(schema: &SchemaRef) -> SchemaRef {
         fields,
         schema.metadata().clone(),
     ))
+}
+
+/// Replaces each placeholder Cypher UDF in `expr` (`dummy_udf_expr`) with the
+/// one registered under its name.
+///
+/// # Errors
+///
+/// When the expression tree cannot be rewritten.
+fn resolve_registered_udfs(
+    expr: datafusion::logical_expr::Expr,
+    registered: &HashMap<String, Arc<datafusion::logical_expr::ScalarUDF>>,
+) -> DFResult<datafusion::logical_expr::Expr> {
+    use datafusion::common::tree_node::{Transformed, TreeNode};
+    use datafusion::logical_expr::Expr as DfExpr;
+
+    expr.transform_up(|node| {
+        if let DfExpr::ScalarFunction(func) = &node
+            && let Some(udf) = registered.get(func.func.name())
+        {
+            return Ok(Transformed::yes(DfExpr::ScalarFunction(
+                datafusion::logical_expr::expr::ScalarFunction {
+                    func: Arc::clone(udf),
+                    args: func.args.clone(),
+                },
+            )));
+        }
+        Ok(Transformed::no(node))
+    })
+    .map(|t| t.data)
 }
 
 #[cfg(test)]

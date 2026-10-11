@@ -20,6 +20,7 @@ use std::sync::Arc;
 use arrow_array::{Array, Float64Array, Int64Array};
 use arrow_schema::DataType;
 use datafusion::scalar::ScalarValue;
+use uni_common::cypher_sum::CypherSum;
 use uni_plugin::traits::locy::{
     FoldContext, FoldDirection, FoldSemiring, LocyAggState, LocyAggregate, Semilattice, ValueOrder,
 };
@@ -391,6 +392,10 @@ impl LocyAggregate for SumAgg {
     fn output_type(&self) -> DataType {
         DataType::Float64
     }
+    /// A Cypher-value column sums to a Cypher value: a float, or a duration.
+    fn output_type_for_input(&self, input: &DataType) -> DataType {
+        cypher_total_type(input)
+    }
     fn create(&self) -> Box<dyn LocyAggState> {
         Box::new(SumState::default())
     }
@@ -432,7 +437,12 @@ impl LocyAggregate for MSumAgg {
         DataType::Float64
     }
     fn create(&self) -> Box<dyn LocyAggState> {
-        Box::new(SumState::default())
+        // A recursive sum is monotone only over non-negative numbers: no
+        // durations.
+        Box::new(SumState {
+            numbers_only: true,
+            ..SumState::default()
+        })
     }
     fn initial_accum_f64(&self) -> Option<f64> {
         Some(0.0)
@@ -446,10 +456,15 @@ impl LocyAggregate for MSumAgg {
 ///
 /// A group with no non-null value sums to 0.0, as Cypher's `sum` does: the
 /// same aggregate means the same thing in both languages. It used to finalise
-/// to NULL there.
+/// to NULL there. A Cypher-value column (a schemaless or duration property)
+/// accumulates through [`CypherSum`], as Cypher's `sum` does, so durations add
+/// up and anything that is neither a number nor a duration is an error;
+/// `MSUM` (`numbers_only`) reads numbers alone.
 #[derive(Debug, Default)]
 struct SumState {
     value: f64,
+    cypher: Option<CypherSum>,
+    numbers_only: bool,
 }
 
 impl LocyAggState for SumState {
@@ -462,6 +477,15 @@ impl LocyAggState for SumState {
         indices: &[usize],
         _cx: &FoldContext,
     ) -> Result<(), FnError> {
+        if col.data_type() == &DataType::LargeBinary && !self.numbers_only {
+            let total = self.cypher.get_or_insert_default();
+            for &i in indices {
+                if !col.is_null(i) {
+                    add_cypher_cell(total, col, i, "SUM")?;
+                }
+            }
+            return Ok(());
+        }
         for &i in indices {
             if col.is_null(i) {
                 continue;
@@ -478,11 +502,64 @@ impl LocyAggState for SumState {
     fn merge(&mut self, other: &dyn LocyAggState) -> Result<(), FnError> {
         let o = downcast_state::<SumState>(other)?;
         self.value += o.value;
+        if let Some(other_total) = &o.cypher {
+            self.cypher
+                .get_or_insert_default()
+                .merge(other_total)
+                .map_err(|e| cypher_total_error("SUM", &e))?;
+        }
         Ok(())
     }
     fn finalize(&self) -> Result<ScalarValue, FnError> {
-        Ok(ScalarValue::Float64(Some(self.value)))
+        Ok(match &self.cypher {
+            Some(total) => cypher_total_value(total.sum()),
+            None => ScalarValue::Float64(Some(self.value)),
+        })
     }
+}
+
+/// A Cypher-value column (`LargeBinary`) folds by `SUM` / `AVG` to a Cypher
+/// value; any other column to Float64.
+fn cypher_total_type(input: &DataType) -> DataType {
+    if input == &DataType::LargeBinary {
+        DataType::LargeBinary
+    } else {
+        DataType::Float64
+    }
+}
+
+/// Adds the Cypher value in row `i` of `col` to `total`.
+fn add_cypher_cell(
+    total: &mut CypherSum,
+    col: &dyn Array,
+    i: usize,
+    agg: &str,
+) -> Result<(), FnError> {
+    use arrow_array::cast::AsArray;
+    let value =
+        uni_common::cypher_value_codec::decode(col.as_binary::<i64>().value(i)).map_err(|e| {
+            FnError::new(
+                CODE_UNREADABLE_CELL,
+                format!("{agg}: cannot decode a non-null cell: {e}"),
+            )
+        })?;
+    total.add(&value).map_err(|e| cypher_total_error(agg, &e))
+}
+
+fn cypher_total_error(agg: &str, e: &anyhow::Error) -> FnError {
+    FnError::new(CODE_UNREADABLE_CELL, format!("{agg}: {e}"))
+}
+
+/// A `SUM` / `AVG` over Cypher values, as a Cypher value: a float for numbers,
+/// as over a numeric column, a duration for durations, NULL for no average.
+fn cypher_total_value(value: uni_common::Value) -> ScalarValue {
+    let value = match value {
+        uni_common::Value::Int(i) => uni_common::Value::Float(i as f64),
+        other => other,
+    };
+    ScalarValue::LargeBinary(
+        (!value.is_null()).then(|| uni_common::cypher_value_codec::encode(&value)),
+    )
 }
 
 // =========================================================================
@@ -621,16 +698,23 @@ impl LocyAggregate for AvgAgg {
     fn output_type(&self) -> DataType {
         DataType::Float64
     }
+    /// A Cypher-value column averages to a Cypher value: a float, or a
+    /// duration.
+    fn output_type_for_input(&self, input: &DataType) -> DataType {
+        cypher_total_type(input)
+    }
     fn create(&self) -> Box<dyn LocyAggState> {
         Box::new(AvgState::default())
     }
 }
 
-/// Accumulates non-null count and numeric sum; finalizes `sum / count`.
+/// Accumulates non-null count and numeric sum; finalizes `sum / count`. A
+/// Cypher-value column accumulates through [`CypherSum`], as for `SUM`.
 #[derive(Debug, Default)]
 struct AvgState {
     sum: f64,
     count: i64,
+    cypher: Option<CypherSum>,
 }
 
 impl LocyAggState for AvgState {
@@ -643,6 +727,16 @@ impl LocyAggState for AvgState {
         indices: &[usize],
         _cx: &FoldContext,
     ) -> Result<(), FnError> {
+        if col.data_type() == &DataType::LargeBinary {
+            let total = self.cypher.get_or_insert_default();
+            for &i in indices {
+                if !col.is_null(i) {
+                    add_cypher_cell(total, col, i, "AVG")?;
+                    self.count += 1;
+                }
+            }
+            return Ok(());
+        }
         for &i in indices {
             if col.is_null(i) {
                 continue;
@@ -662,9 +756,18 @@ impl LocyAggState for AvgState {
         let o = downcast_state::<AvgState>(other)?;
         self.sum += o.sum;
         self.count += o.count;
+        if let Some(other_total) = &o.cypher {
+            self.cypher
+                .get_or_insert_default()
+                .merge(other_total)
+                .map_err(|e| cypher_total_error("AVG", &e))?;
+        }
         Ok(())
     }
     fn finalize(&self) -> Result<ScalarValue, FnError> {
+        if let Some(total) = &self.cypher {
+            return Ok(cypher_total_value(total.avg(self.count.unsigned_abs())));
+        }
         if self.count == 0 {
             return Ok(ScalarValue::Float64(None));
         }

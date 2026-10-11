@@ -6100,7 +6100,7 @@ impl DfAccumulator for CypherSumAccumulator {
         // `sum` over nothing is 0, as in Cypher (Neo4j), not NULL; `avg` over
         // nothing is NULL.
         let val = if self.avg {
-            self.total.avg(self.count).map_err(sum_error)?
+            self.total.avg(self.count)
         } else {
             self.total.sum()
         };

@@ -9,7 +9,7 @@
 //! downstream callers keep using `uni_query::query::<name>::*`.
 
 pub mod custom_functions;
-pub mod cypher_sum;
+pub use uni_common::cypher_sum;
 pub mod cypher_type_coerce;
 pub mod datetime;
 pub mod df_expr;

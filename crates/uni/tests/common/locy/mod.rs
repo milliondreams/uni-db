@@ -86,5 +86,7 @@ pub mod locy_single_engine;
 pub mod locy_entity_functions;
 // A numeric FOLD refuses a string or a duration instead of summing it to 0.
 pub mod locy_fold_reads_numbers;
+// FOLD COLLECT/MIN/MAX/COUNT over every declared column type, Cypher as the oracle.
+pub mod locy_fold_any_column_type;
 pub mod locy_value_types;
 pub mod locy_yield_list_values;

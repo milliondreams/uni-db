@@ -23,7 +23,7 @@ use super::locy_traits::DerivedFactSource;
 /// A tuple of key column values used for indexing derived facts.
 pub type KeyTuple = Vec<Value>;
 
-/// A minimal row-based relation for SLG/EXPLAIN command dispatch.
+/// A minimal row-based relation for command dispatch (QUERY, EXPLAIN, ABDUCE).
 #[derive(Debug, Clone)]
 pub struct RowRelation {
     pub columns: Vec<String>,
@@ -44,7 +44,7 @@ impl RowRelation {
     }
 }
 
-/// A map from rule name to its RowRelation (row-based store for SLG/EXPLAIN).
+/// A map from rule name to its RowRelation (the row-based store commands read).
 pub type RowStore = HashMap<String, RowRelation>;
 
 /// Extracts the key tuple from a row given key column names.
@@ -297,7 +297,7 @@ pub fn multiply_prob_factors_rows(
 
 /// Resolve a clause by executing its MATCH pattern and applying IS-ref joins in memory.
 ///
-/// Replaces the serialize-UNWIND-execute round-trip used by SLG and EXPLAIN Mode B.
+/// Replaces the serialize-UNWIND-execute round-trip EXPLAIN Mode B used.
 /// IS-refs are resolved as in-memory semi-joins (positive) or anti-joins (negated).
 /// ALONG expressions are evaluated last using `__prev_*` stash from semi-join results.
 pub async fn resolve_clause_with_is_refs(

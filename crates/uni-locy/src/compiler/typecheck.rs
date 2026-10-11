@@ -265,7 +265,7 @@ pub fn check(
 
             clauses.push(CompiledClause {
                 match_pattern: def.match_pattern.clone(),
-                where_conditions: def.where_conditions.clone(),
+                where_conditions: qualify_is_references(&def.where_conditions, module_ctx),
                 along: extracted.along,
                 fold: extracted.fold,
                 require: def.require.clone(),
@@ -397,6 +397,35 @@ pub fn check(
     super::scope::check_rule_scopes(rule_groups, &compiled_rules, module_ctx)?;
 
     Ok((compiled_rules, warnings))
+}
+
+// ─── Module-qualified references ─────────────────────────────────────────────
+
+/// `conditions` with every IS reference naming its rule as the catalog keys
+/// it: qualified by the enclosing `MODULE`, or by a `USE` import.
+///
+/// The compiler resolves a bare name inside a module for its own checks, but
+/// handed the bare name on, so the planner, which looks rules up by catalog
+/// key, failed every IS reference in a module with "unknown rule".
+fn qualify_is_references(
+    conditions: &[RuleCondition],
+    module_ctx: &super::modules::ModuleContext,
+) -> Vec<RuleCondition> {
+    conditions
+        .iter()
+        .map(|condition| match condition {
+            RuleCondition::IsReference(is_ref) => {
+                let qualified =
+                    super::modules::resolve_rule_name(module_ctx, &is_ref.rule_name.to_string());
+                let mut is_ref = is_ref.clone();
+                is_ref.rule_name = uni_cypher::locy_ast::QualifiedName {
+                    parts: qualified.split('.').map(str::to_string).collect(),
+                };
+                RuleCondition::IsReference(is_ref)
+            }
+            other => other.clone(),
+        })
+        .collect()
 }
 
 // ─── Mixed priority ──────────────────────────────────────────────────────────

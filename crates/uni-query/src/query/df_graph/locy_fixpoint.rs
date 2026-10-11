@@ -2271,11 +2271,7 @@ async fn record_provenance(
 
     for delta_batch in state.all_delta() {
         for row_idx in 0..delta_batch.num_rows() {
-            let row_hash = format!(
-                "{:?}",
-                extract_scalar_key(delta_batch, &all_indices, row_idx)
-            )
-            .into_bytes();
+            let row_hash = provenance_fact_hash(&rule.name, delta_batch, &all_indices, row_idx);
             let fact_row = batch_row_to_value_map(delta_batch, row_idx);
             let clause_index =
                 find_clause_for_row(delta_batch, row_idx, &all_indices, clause_candidates);
@@ -2746,11 +2742,12 @@ fn collect_is_ref_inputs(
                     },
                 );
                 if matches {
-                    let fact_hash = format!(
-                        "{:?}",
-                        extract_scalar_key(src_batch, &all_src_indices, src_row)
-                    )
-                    .into_bytes();
+                    let fact_hash = provenance_fact_hash(
+                        &binding.rule_name,
+                        src_batch,
+                        &all_src_indices,
+                        src_row,
+                    );
                     inputs.push(ProofTerm {
                         source_rule: binding.rule_name.clone(),
                         base_fact_id: fact_hash,
@@ -2836,6 +2833,25 @@ pub(crate) fn fact_hash_key(batch: &RecordBatch, all_indices: &[usize], row_idx:
     format!("{:?}", extract_scalar_key(batch, all_indices, row_idx)).into_bytes()
 }
 
+/// The key a derived fact's provenance is recorded and looked up under: its
+/// rule's name and its row.
+///
+/// Two rules can derive the same tuple. Keyed by the row alone, the provenance
+/// store kept whichever rule recorded it first, so EXPLAIN of the other rule
+/// silently lost that fact, and a support term could point at the wrong rule's
+/// derivation.
+pub(crate) fn provenance_fact_hash(
+    rule_name: &str,
+    batch: &RecordBatch,
+    all_indices: &[usize],
+    row_idx: usize,
+) -> Vec<u8> {
+    let mut key = rule_name.as_bytes().to_vec();
+    key.push(0);
+    key.extend(fact_hash_key(batch, all_indices, row_idx));
+    key
+}
+
 /// Emits at most one `SharedProbabilisticDependency` warning per rule.
 /// Returns `Some(SharedLineageInfo)` if any group has shared proofs.
 fn detect_shared_lineage(
@@ -2867,7 +2883,7 @@ fn detect_shared_lineage(
     for batch in pre_fold_facts {
         for row_idx in 0..batch.num_rows() {
             let key = extract_scalar_key(batch, key_indices, row_idx);
-            let fact_hash = fact_hash_key(batch, &all_indices, row_idx);
+            let fact_hash = provenance_fact_hash(&rule.name, batch, &all_indices, row_idx);
             groups.entry(key).or_default().push(fact_hash);
         }
     }
@@ -3079,7 +3095,7 @@ pub(crate) async fn record_and_detect_lineage_nonrecursive(
     for (clause_index, batches) in tagged_clause_facts {
         for batch in batches {
             for row_idx in 0..batch.num_rows() {
-                let row_hash = fact_hash_key(batch, &all_indices, row_idx);
+                let row_hash = provenance_fact_hash(&rule.name, batch, &all_indices, row_idx);
                 let fact_row = batch_row_to_value_map(batch, row_idx);
 
                 let support = collect_is_ref_inputs(rule, *clause_index, batch, row_idx, registry);
@@ -3216,7 +3232,7 @@ pub(crate) fn apply_exact_wmc(
         for row_idx in 0..batch.num_rows() {
             let key = extract_scalar_key(batch, key_indices, row_idx);
             if shared_keys.contains(&key) {
-                let fact_hash = fact_hash_key(batch, &all_indices, row_idx);
+                let fact_hash = provenance_fact_hash(&rule.name, batch, &all_indices, row_idx);
                 let bases = compute_lineage(&fact_hash, tracker, &mut HashSet::new());
 
                 let accum = group_accums.entry(key).or_insert_with(|| GroupAccum {

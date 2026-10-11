@@ -1582,7 +1582,8 @@ impl Executor {
             | LogicalPlan::LocyBestBy { input, .. }
             | LogicalPlan::LocyPriority { input, .. }
             | LogicalPlan::LocyProject { input, .. }
-            | LogicalPlan::LocyModelInvoke { input, .. } => vec![input.as_ref()],
+            | LogicalPlan::LocyModelInvoke { input, .. }
+            | LogicalPlan::LocyGenerate { input, .. } => vec![input.as_ref()],
 
             // ── Leaves ───────────────────────────────────────────────────
             //
@@ -3615,7 +3616,8 @@ impl Executor {
                 | LogicalPlan::LocyPriority { .. }
                 | LogicalPlan::LocyDerivedScan { .. }
                 | LogicalPlan::LocyProject { .. }
-                | LogicalPlan::LocyModelInvoke { .. } => {
+                | LogicalPlan::LocyModelInvoke { .. }
+                | LogicalPlan::LocyGenerate { .. } => {
                     unreachable!("Locy operators are handled by DataFusion engine")
                 }
             }

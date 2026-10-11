@@ -10,7 +10,9 @@ pub mod modules;
 
 use std::collections::HashMap;
 
-use uni_cypher::locy_ast::{LocyProgram, LocyStatement, RuleDefinition};
+use uni_cypher::locy_ast::{
+    AbduceQuery, DeriveCommand, ExplainRule, GoalQuery, LocyProgram, LocyStatement, RuleDefinition,
+};
 
 use crate::config::LocyConfig;
 use crate::types::{CompiledAssume, CompiledCommand, CompiledProgram, Stratum};
@@ -317,6 +319,16 @@ fn check_query_variables(
     }
 }
 
+/// A rule name as the catalog keys it, for a compiled command.
+///
+/// Inside a `MODULE`, a command names its rule bare; every runtime layer looks
+/// rules up by catalog key, so the command carries the resolved name.
+fn qualified_name(resolved: &str) -> uni_cypher::locy_ast::QualifiedName {
+    uni_cypher::locy_ast::QualifiedName {
+        parts: resolved.split('.').map(str::to_string).collect(),
+    }
+}
+
 /// Rejects an EXPLAIN, ABDUCE or DERIVE `WHERE` that names a variable its rule's
 /// facts do not carry.
 ///
@@ -391,7 +403,10 @@ fn extract_commands(
                 if let Some(rule) = rule_catalog.get(&resolved) {
                     check_query_variables(&resolved, rule, gq)?;
                 }
-                commands.push(CompiledCommand::GoalQuery(gq.clone()));
+                commands.push(CompiledCommand::GoalQuery(GoalQuery {
+                    rule_name: qualified_name(&resolved),
+                    ..gq.clone()
+                }));
             }
             LocyStatement::ExplainRule(eq) => {
                 validate_rule(&eq.rule_name.to_string())?;
@@ -404,7 +419,10 @@ fn extract_commands(
                         "EXPLAIN RULE WHERE",
                     )?;
                 }
-                commands.push(CompiledCommand::ExplainRule(eq.clone()));
+                commands.push(CompiledCommand::ExplainRule(ExplainRule {
+                    rule_name: qualified_name(&resolved),
+                    ..eq.clone()
+                }));
             }
             LocyStatement::AbduceQuery(aq) => {
                 validate_rule(&aq.rule_name.to_string())?;
@@ -412,7 +430,10 @@ fn extract_commands(
                 if let Some(rule) = rule_catalog.get(&resolved) {
                     check_command_where(&resolved, rule, aq.where_expr.as_ref(), "ABDUCE WHERE")?;
                 }
-                commands.push(CompiledCommand::Abduce(aq.clone()));
+                commands.push(CompiledCommand::Abduce(AbduceQuery {
+                    rule_name: qualified_name(&resolved),
+                    ..aq.clone()
+                }));
             }
             LocyStatement::DeriveCommand(dc) => {
                 validate_rule(&dc.rule_name.to_string())?;
@@ -420,7 +441,10 @@ fn extract_commands(
                 if let Some(rule) = rule_catalog.get(&resolved) {
                     check_command_where(&resolved, rule, dc.where_expr.as_ref(), "DERIVE WHERE")?;
                 }
-                commands.push(CompiledCommand::DeriveCommand(dc.clone()));
+                commands.push(CompiledCommand::DeriveCommand(DeriveCommand {
+                    rule_name: qualified_name(&resolved),
+                    ..dc.clone()
+                }));
             }
             LocyStatement::AssumeBlock(ab) => {
                 // Compile the ASSUME body as a sub-program

@@ -4111,7 +4111,7 @@ Both kinds of row share the column, so both must carry one type:
 
 A FOLD emits one row per distinct KEY: the KEY columns plus one column per FOLD binding. `KEY` marks a **single** YIELD item, so a composite key is `YIELD KEY a, KEY b, total`; `YIELD KEY a, b, total` declares one KEY and a plain column `b`. A plain column has no single value per group, and `FoldExec` used to drop it without a diagnostic — a later `QUERY ... RETURN b` then read the absent column as NULL (issue #293). `check_fold_yield_is_grouped` now rejects, with `UngroupedFoldYield`, any YIELD item of a FOLD clause that is not a KEY, not a FOLD output, and does not mention one (`total * 2.0 AS score` is still allowed; the planner evaluates it after the fold). A clause *without* FOLD is unconstrained: a base clause `YIELD KEY e, 100.0 AS agg` seeds the column its sibling folds into.
 
-For the same reason a QUERY is checked against its rule's YIELD columns: `check_query_variables` rejects, with `UnknownQueryVariable`, a WHERE / RETURN / ORDER BY variable the rule does not yield (ORDER BY may also name a RETURN alias). The in-memory evaluator in `locy_query.rs` would otherwise return NULL for it on every row.
+For the same reason a QUERY is checked against its rule's YIELD columns: `check_query_variables` rejects, with `UnknownQueryVariable`, a WHERE / RETURN / ORDER BY variable the rule does not yield (ORDER BY may also name a RETURN alias). The row-level evaluator in `locy_query.rs` would otherwise return NULL for it on every row.
 
 The post-FOLD `WHERE` runs after all FOLD aggregates are computed and before BEST BY. It can reference FOLD output columns and KEY columns. Multiple conditions are combined with `AND`.
 
@@ -7437,16 +7437,45 @@ publishes a program's facts, `QUERY`, `EXPLAIN RULE`, `ABDUCE` and `ASSUME`
 body commands receive that store by shared reference (`&RowStore`), at the top
 level (`impl_locy.rs`, `dispatch_native_command`) and inside an `ASSUME` body,
 so a command that writes it does not compile. `EXPLAIN RULE` without provenance
-to read (its WHERE matches no fact, or the rule has none) re-derives the rule
-through the in-memory SLG evaluator, which implements neither FOLD, BEST BY,
-post-FOLD WHERE nor set semantics; it used to merge those rows into the shared
+to read (its WHERE matches no fact, or the rule has none) used to re-derive the
+rule through an in-memory SLG evaluator, which implemented neither FOLD, BEST
+BY, post-FOLD WHERE nor set semantics, and merged those rows into the shared
 store, so one non-matching `EXPLAIN` changed every later answer: a FOLD came
 back as NULL rows, a BEST BY loser reappeared, an `IS NOT` against a filtered
-FOLD dropped a node, mutual recursion returned nothing. The re-derivation now
-lives in a store local to the `EXPLAIN` (`locy_command_noninterference`; the
-`locy_commands` relation of `metamorphic::dqp::topo`; the oracle differential's
-`QUERY`-after-`EXPLAIN` check). Found while triaging #298; see
-`docs/proposals/locy_contract_drift_class_2026-10-09.md`.
+FOLD dropped a node, mutual recursion returned nothing
+(`locy_command_noninterference`; the `locy_commands` relation of
+`metamorphic::dqp::topo`; the oracle differential's `QUERY`-after-`EXPLAIN`
+check). That evaluator no longer exists; see the next entry. Found while
+triaging #298; see `docs/proposals/locy_contract_drift_class_2026-10-09.md`.
+
+**Locy has one evaluator.** Every rule, a rule with a generator included, is
+derived by the fixpoint, and every command reads what it published. A generator
+condition is a columnar operator (`LocyGenerateExec`, planned after the
+IS-reference joins, with any WHERE over its outputs deferred above it); the
+fixpoint used to skip such rules, so a rule referencing one saw no facts and
+its own FOLD, BEST BY and post-FOLD WHERE were ignored. QUERY reads the rule's
+relation and treats a missing one as a fault. EXPLAIN reads recorded provenance
+(Mode A) or rebuilds the tree from the published facts (Mode B), never
+re-deriving. A rule's facts carry a node as its VID and a single-hop
+relationship as its EID (`plan_locy_project` projects `{var}._eid`); both are
+hydrated after the fixpoint (`enrich_vids_with_nodes`), and since the ID
+spaces overlap, which columns hold EIDs comes from the rules
+(`uni_locy::entity_columns::edge_columns`), never from the column type: an EID
+resolved as a VID binds an unrelated node. Before, a yielded relationship was
+typed as a string and came back NULL, which is the only reason EXPLAIN kept its
+own re-derivation. Mode A classifies KEY columns from the hydrated published
+facts, so an integer KEY stays an integer. ABDUCE always builds its tree from
+the published facts (Mode B): recorded provenance has no children, and the
+causes ABDUCE edits are in them. Provenance is keyed by rule and row
+(`provenance_fact_hash`): keyed by row alone, a tuple two rules derive was
+recorded for the first, and EXPLAIN of the second lost it
+(`locy_single_engine`, `locy_generator_plugin`).
+
+**The compiler hands on resolved rule names.** Inside a `MODULE`, IS
+references and the rule a command names are rewritten to the catalog key
+(`qualify_is_references`, `qualified_name`); the compiler resolved them for its
+own checks only, so every IS reference, EXPLAIN, ABDUCE and DERIVE in a module
+failed with "unknown rule".
 
 **One rule decides which column an IS reference binds.** A referenced rule's
 columns form a binding sequence — its KEY columns in YIELD order, then its

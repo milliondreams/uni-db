@@ -1,6 +1,6 @@
 # Locy contract drift: one rule, several meanings
 
-**Date:** 2026-10-09 · **Status:** L1 done (`9e24aa3d6`); L2 done (`374be77f2`, closes #298); L3 done (`5d9224467`); YIELD value typing fixed (`821fcca98`); L4 implemented (uncommitted); L5–L6 proposed · **Trigger:** issue #298
+**Date:** 2026-10-09 · **Status:** L1 done (`9e24aa3d6`); L2 done (`374be77f2`, closes #298); L3 done (`5d9224467`); YIELD value typing fixed (`821fcca98`); L4 done (`8e081a882`); L5 done; L6 proposed · **Trigger:** issue #298
 
 ## Why
 
@@ -356,10 +356,61 @@ what they exist to show.)
 - Coverage: run the probes for the five predicted items in §1 first, and schedule fixes only for
   what reproduces.
 
+- *Done, further than planned:* the in-memory evaluator is **deleted** (`locy_slg.rs`, 678
+  lines), not reduced. Its two remaining callers went away at the root:
+  - **Generator rules run in the fixpoint.** A generator is a columnar operator
+    (`LocyGenerateExec`); the plugin contract was already columnar. `build_stratum` used to skip
+    every generator rule, which was the cause of the predicted "generator dependents see 0
+    rows" and more: probed, a rule referencing a generator rule got **no facts** (`IS` → none,
+    `IS NOT` → everything), and a generator rule's own **FOLD returned NULL per input row**, its
+    BEST BY and post-FOLD WHERE were ignored. QUERY's fallback to the evaluator is now an error
+    (no path reaches it: a rule with no facts has an empty relation). `prepare_locy` failed every
+    generator program ("not registered"): the generator was found through a registry only
+    `Session::locy` installed; the operator resolves it from the planner's registry, which
+    sub-plans now inherit.
+  - **EXPLAIN Mode B reads the published facts.** Its re-derivation existed because edge EIDs
+    were not hydrated; probing that found a **silent wrong answer of its own: a rule yielding a
+    relationship yielded NULL** for it (typed as a string), and a rule reading it failed. Edges
+    are now carried by EID and hydrated like nodes. The first hydration attempt resolved EIDs as
+    VIDs (the ID spaces overlap) and bound unrelated nodes, so edge columns are classified from
+    the rules (`uni_locy::entity_columns`), and DERIVE's separate hydration copy, which also
+    swallowed lookup failures, goes through the same path and fails loudly.
+  - The planned "SLG refuses FOLD / reports its iteration limit" items are moot.
+- *Probed predicted items:* MODULE IS references, EXPLAIN, ABDUCE and DERIVE all failed with
+  "unknown rule" (loud): the compiler resolved module names for its own checks only. Fixed by
+  handing on the resolved names. `COLLECT` in a recursive FOLD, which the TCK documents as
+  accepted, failed at run time: its output was typed `Float64`; typed as a list, it runs and
+  answers per the bag semantics. `prepare_locy` agreed with `locy` on every compile error.
+- *Found on the way:*
+  - EXPLAIN Mode A hydrated every integer KEY as a node (a generator output `i = 1` came back as
+    a node); it now classifies columns from the hydrated published facts.
+  - **The provenance store keyed a fact by its row alone**, keeping the first annotation: when two
+    rules derive the same tuple, EXPLAIN of the second silently lost it. Keyed by rule and row
+    now (`provenance_fact_hash`).
+  - ABDUCE never proposed a node's or edge's property (it read only map bindings) and proposed
+    `SET i.i` for scalar bindings, which cannot apply; on a generator dependent it reported no
+    valid edit where `n.k → 0` is one. Fixed, with duplicate candidates removed.
+  - **ABDUCE built its tree from recorded provenance whenever it existed** (any program with an
+    EXPLAIN or a probabilistic FOLD), and that record has no children, so a cause in a referenced
+    rule was invisible: over `risk ← MNOR(w) ← link(a, b)` it proposed nothing valid. Two TCK
+    scenarios (`TripleCombinations`, `SimilarToAbduceAssume`) passed only because of the bogus
+    `SET p.p` candidate removed above; with it gone they failed, which is how this surfaced.
+    ABDUCE now always builds the tree from the published facts.
+  - A regression in my own L4 type unification (per-clause MATCH node sets typed an IS-bound
+    node unlike a MATCH node) was latent until a projection path honoured target types; it now
+    uses the rule-level node set.
+- *Found, not fixed:* `type(e)` in a QUERY RETURN fails ("Function type not implemented"): the
+  row-level RETURN evaluator lacks it (loud). `max_slg_depth` is kept as a no-op field (Rust and
+  Python), since removing it breaks existing configurations.
+- Tests: `locy_single_engine` (7), `locy_generator_plugin` (+3, one the plan-shape proof for
+  `LocyGenerateExec`). `repro_issue_157`'s test pinning the module "known limitation" (an
+  ambiguous bare name refused) now asserts the answer comes from the enclosing module. Toggled off one at a time,
+  the rule-qualified provenance hash, the edge/node classification, ABDUCE's entity properties
+  and Mode A's classification each fail a test.
+
 **L6 — Record the invariants.** Black Book Appendix B2 gets C-IS, C-SCOPE, C-CLAUSE and
 C-NONINTERFERENCE, each with the test that pins it. The correctness-class harness proposal gains
 the "shape dimensions" table of §3 as a standing checklist for new generators.
-
 **Order.** L1 comes first because it is the smallest change with the most silent wrong answers
 (six), and its relation catches any future command that writes shared state. L2 closes the issue.
 L3 and L4 are compile-time tightening and can run in parallel. L5 is the largest and depends on

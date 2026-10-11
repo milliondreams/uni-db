@@ -352,7 +352,7 @@ pub struct LocyConfig {
     /// Maximum recursion depth for EXPLAIN derivation trees (default: 100)
     pub max_explain_depth: usize,
 
-    /// Maximum recursion depth for SLG resolution (default: 1000)
+    /// No effect; kept so existing configurations still build (default: 1000)
     pub max_slg_depth: usize,
 
     /// Maximum candidate modifications to generate during ABDUCE (default: 20)
@@ -401,7 +401,7 @@ pub struct LocyConfig {
 | `timeout` | duration | unset (300s) | Overall Locy evaluation timeout. When set, it is the whole budget and replaces `query_timeout` for the program's operators, as `query_with(..).timeout(..)` does for Cypher. When unset, strata get 300s while operators keep the database `query_timeout` |
 | `max_derived_bytes` | bytes | 256 MB | Maximum derived facts memory per relation |
 | `max_explain_depth` | count | 100 | Maximum recursion depth for EXPLAIN trees |
-| `max_slg_depth` | count | 1,000 | Maximum recursion depth for SLG resolution |
+| `max_slg_depth` | count | 1,000 | No effect; kept so existing configurations still build |
 | `max_abduce_candidates` | count | 20 | Maximum candidate modifications for ABDUCE |
 | `max_abduce_results` | count | 10 | Maximum validated ABDUCE results |
 | `strict_probability_domain` | bool | false | Reject MNOR/MPROD values outside [0,1] instead of clamping |

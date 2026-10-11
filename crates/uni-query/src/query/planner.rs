@@ -2256,6 +2256,16 @@ pub enum LogicalPlan {
             super::df_graph::locy_model_invoke::PathContextHandle,
         >,
     },
+    /// A Locy generator condition, `name(args) -> (outputs)`: each input row
+    /// becomes one output row per tuple the generator emits for it, with the
+    /// tuple bound to `outputs`. Lowered to `LocyGenerateExec`.
+    LocyGenerate {
+        input: Box<LogicalPlan>,
+        /// The generator's name as written (dotted for a plugin namespace).
+        name: String,
+        args: Vec<Expr>,
+        outputs: Vec<String>,
+    },
 }
 
 impl LogicalPlan {
@@ -2295,6 +2305,7 @@ impl LogicalPlan {
             | LogicalPlan::LocyPriority { input, .. }
             | LogicalPlan::LocyProject { input, .. }
             | LogicalPlan::LocyModelInvoke { input, .. }
+            | LogicalPlan::LocyGenerate { input, .. }
             | LogicalPlan::MultiplicityInsensitive { input } => Some(input),
             _ => None,
         }
@@ -2355,7 +2366,8 @@ impl LogicalPlan {
             | LogicalPlan::LocyBestBy { input, .. }
             | LogicalPlan::LocyPriority { input, .. }
             | LogicalPlan::LocyProject { input, .. }
-            | LogicalPlan::LocyModelInvoke { input, .. } => vec![input],
+            | LogicalPlan::LocyModelInvoke { input, .. }
+            | LogicalPlan::LocyGenerate { input, .. } => vec![input],
             _ => Vec::new(),
         }
     }
@@ -8890,6 +8902,7 @@ impl QueryPlanner {
             | LogicalPlan::LocyDerivedScan { .. }
             | LogicalPlan::LocyProject { .. }
             | LogicalPlan::LocyModelInvoke { .. }
+            | LogicalPlan::LocyGenerate { .. }
             | LogicalPlan::Empty
             | LogicalPlan::CreateVectorIndex { .. }
             | LogicalPlan::CreateSparseIndex { .. }
@@ -9376,6 +9389,7 @@ impl QueryPlanner {
             | LogicalPlan::LocyDerivedScan { .. }
             | LogicalPlan::LocyProject { .. }
             | LogicalPlan::LocyModelInvoke { .. }
+            | LogicalPlan::LocyGenerate { .. }
             | LogicalPlan::Empty
             | LogicalPlan::CreateVectorIndex { .. }
             | LogicalPlan::CreateSparseIndex { .. }
@@ -9701,7 +9715,8 @@ pub fn projection_columns(plan: &LogicalPlan) -> Option<Vec<String>> {
         | LogicalPlan::LocyPriority { .. }
         | LogicalPlan::LocyDerivedScan { .. }
         | LogicalPlan::LocyProject { .. }
-        | LogicalPlan::LocyModelInvoke { .. } => None,
+        | LogicalPlan::LocyModelInvoke { .. }
+        | LogicalPlan::LocyGenerate { .. } => None,
     }
 }
 
@@ -11385,6 +11400,12 @@ fn collect_properties_recursive(
             collect_properties_recursive(input, properties, kinds);
         }
         LogicalPlan::LocyPriority { input, .. } => {
+            collect_properties_recursive(input, properties, kinds);
+        }
+        LogicalPlan::LocyGenerate { input, args, .. } => {
+            for expr in args {
+                collect_properties_from_expr_into(expr, properties, kinds);
+            }
             collect_properties_recursive(input, properties, kinds);
         }
         LogicalPlan::LocyModelInvoke { input, .. } => {

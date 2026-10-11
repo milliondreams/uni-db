@@ -2,6 +2,7 @@ pub mod calibration;
 pub mod compiler;
 pub mod config;
 pub mod dependency_dnf;
+pub mod entity_columns;
 pub mod errors;
 pub mod is_binding;
 pub mod names;

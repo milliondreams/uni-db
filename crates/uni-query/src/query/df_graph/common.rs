@@ -1887,6 +1887,12 @@ pub async fn execute_subplan_with_outer_vars(
     }
     if let Some(registry) = graph_ctx.procedure_registry() {
         planner = planner.with_procedure_registry(registry.clone());
+        // The host's plugin registry, as the top-level planner gets it
+        // (`executor/read.rs`): without it a sub-plan, which is how a Locy
+        // rule body runs, resolves plugin surfaces against the built-ins only.
+        if let Some(plugins) = registry.plugin_registry() {
+            planner = planner.with_plugin_registry(plugins);
+        }
     }
     if let Some(runtime) = graph_ctx.xervo_runtime() {
         planner = planner.with_xervo_runtime(runtime.clone());

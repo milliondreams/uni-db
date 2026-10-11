@@ -59,7 +59,7 @@ Locy compiles rules into execution plans that run inside Uni's DataFusion-based 
 | **Datalog** | Locy adopts Datalog's recursive rules, stratified negation, and semi-naive fixpoint evaluation. Unlike pure Datalog, Locy operates over a typed property graph (not flat relations) and supports path accumulation, witness selection, and graph mutation. |
 | **ProbLog** | Locy's MNOR/MPROD with PROB annotations provide probabilistic reasoning similar to ProbLog's probabilistic facts, including BDD-based exact inference for shared proofs. |
 | **SQL Recursive CTEs** | Locy rules are like named recursive CTEs with stratified negation, priority-based overriding, and probabilistic aggregation — features absent from SQL. |
-| **Prolog** | Locy retains SLG resolution (tabled, top-down, XSB-style) for generator rules, and ABDUCE provides abductive reasoning. |
+| **Prolog** | Locy evaluates bottom-up only (generator rules included); ABDUCE provides abductive reasoning. |
 | **OpenCypher** | Locy is a superset. All Cypher MATCH/CREATE/MERGE/RETURN queries work unchanged inside a Locy program. |
 
 ## 1.2 When to Use Locy vs Plain Cypher
@@ -1047,7 +1047,7 @@ graph TB
 
     subgraph "Phase 2: Command Dispatch (Row-Level)"
         DS --> CMD{"Command Type"}
-        CMD --> QRY["QUERY → SLG resolution"]
+        CMD --> QRY["QUERY → read derived store"]
         CMD --> DER["DERIVE → Graph mutations"]
         CMD --> ASM["ASSUME → Savepoint + mutate + evaluate + rollback"]
         CMD --> ABD["ABDUCE → Generate candidates + validate"]
@@ -1069,7 +1069,7 @@ QUERY rule_name [WHERE expr] [RETURN items [ORDER BY ...] [SKIP n] [LIMIT n]]
 
 Answered from the **derived store** — the same semi-naive fixpoint result that `.derived` exposes — then filtered by WHERE and shaped by RETURN. Because both read the same rows, `QUERY` and `.derived` agree by construction.
 
-SLG resolution (top-down with tabling) is retained only as a fallback for rules containing a **generator**, which the columnar fixpoint has no row-explosion operator for.
+Every rule has a published relation, empty when it derived nothing, including a rule with a **generator**: the fixpoint runs generators as a row-explosion operator (`LocyGenerateExec`), so a generator rule's FOLD, BEST BY and post-FOLD WHERE apply and other rules can reference it. There is no second, goal-directed evaluator; a missing relation is an error.
 
 ```
 QUERY reachable WHERE a.name = 'Alice' RETURN b.name AS destination
@@ -1411,15 +1411,17 @@ DerivedStore {
 
 Accumulates converged facts from each stratum. Later strata see results from all previously completed strata via shared `DerivedScanEntry` handles injected during planning.
 
-## 15.7 SLG Resolution (QUERY Command)
+## 15.7 One Evaluator
 
-The QUERY command uses **Selective Linear Definite clause resolution** — top-down with tabling:
-- Cache key: `(rule_name, known key bindings)`
-- Checks DerivedStore first (pre-computed from bottom-up phase)
-- Falls back to demand-driven evaluation for uncomputed relations
-- Prevents infinite loops via tabling (memoization)
+Every command reads the facts the fixpoint published (Appendix B2 of the Black Book, C-NONINTERFERENCE):
 
-Bounded by `max_slg_depth` (default 1000).
+- **QUERY** filters and projects the rule's relation.
+- **EXPLAIN** reads the provenance the fixpoint recorded (Mode A) or, without it, rebuilds the tree from the published facts by re-running each clause's MATCH (Mode B). It does not re-derive the rule.
+- **ABDUCE** builds its tree as EXPLAIN does and validates each candidate by re-evaluating the strata under the edit.
+
+A rule's facts carry a node as its VID and a single-hop relationship as its EID; both are hydrated into `Node` / `Edge` values before commands run. The ID spaces overlap, so the columns holding relationships are known from the rules (`uni_locy::entity_columns`), not guessed.
+
+Locy used to keep an in-memory top-down resolver (SLG) for generator rules and EXPLAIN. It implemented no FOLD, BEST BY or post-FOLD WHERE, so its answers could differ from the fixpoint's; it was removed once generators ran in the fixpoint and edges were hydrated. `max_slg_depth` is still accepted and has no effect.
 
 ## 15.8 Expression Evaluation Paths
 
@@ -1668,7 +1670,7 @@ LocyExplainOutput {
 | `max_iterations` | `usize` | `1000` | Maximum fixpoint iterations per recursive stratum |
 | `timeout` | `Duration` | `300s` | Overall evaluation timeout |
 | `max_explain_depth` | `usize` | `100` | Maximum recursion depth for EXPLAIN derivation trees |
-| `max_slg_depth` | `usize` | `1000` | Maximum recursion depth for SLG resolution (QUERY) |
+| `max_slg_depth` | `usize` | `1000` | No effect; kept so existing configurations still build |
 | `max_abduce_candidates` | `usize` | `20` | Maximum candidate modifications generated during ABDUCE |
 | `max_abduce_results` | `usize` | `10` | Maximum validated results returned from ABDUCE |
 | `max_derived_bytes` | `usize` | `256 MiB` | Maximum bytes of derived facts per relation |
@@ -2288,7 +2290,7 @@ struct ExplainRule { rule_name: QualifiedName, where_expr: Option<Expr>, return_
 |-------|------|-----------|
 | `uni-cypher` | Grammar (cypher.pest + locy.pest), AST types, parser | `src/grammar/locy.pest`, `src/locy_ast.rs`, `src/grammar/locy_parser.rs`, `src/grammar/locy_walker.rs` |
 | `uni-locy` | Compiler pipeline, types, config, result types, errors | `src/compiler/mod.rs`, `src/compiler/stratify.rs`, `src/compiler/typecheck.rs`, `src/config.rs`, `src/types.rs`, `src/result.rs` |
-| `uni-query` | Runtime execution (fixpoint, fold, BDD, SLG, explain, assume, abduce) | `src/query/df_graph/locy_fixpoint.rs`, `locy_fold.rs`, `locy_bdd.rs`, `locy_planner.rs`, `locy_program.rs`, `locy_explain.rs`, `locy_assume.rs`, `locy_abduce.rs` |
+| `uni-query` | Runtime execution (fixpoint, fold, generators, BDD, explain, assume, abduce) | `src/query/df_graph/locy_fixpoint.rs`, `locy_fold.rs`, `locy_bdd.rs`, `locy_planner.rs`, `locy_program.rs`, `locy_explain.rs`, `locy_assume.rs`, `locy_abduce.rs` |
 | `uni` | Public API surface (Session, Transaction, builders, RuleRegistry) | `src/api/locy_builder.rs`, `src/api/impl_locy.rs`, `src/api/rule_registry.rs` |
 | `uni-locy-tck` | Feature-level conformance tests | `tck/features/*.feature` |
 | `uni-db` (Python) | PyO3 bindings for all Locy API | `bindings/uni-db/` |

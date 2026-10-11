@@ -24,7 +24,6 @@ use super::locy_delta::{
 use super::locy_eval::{
     eval_condition, normalize_graph_row, record_batches_to_locy_rows, values_equal_for_join,
 };
-use super::locy_slg::SLGResolver;
 use super::locy_traits::DerivedFactSource;
 
 /// A single term in a derivation proof: identifies one IS-ref dependency.
@@ -245,7 +244,7 @@ async fn explain_rule_mode_a(
     program: &CompiledProgram,
     tracker: &ProvenanceStore,
     fact_source: &dyn DerivedFactSource,
-    _derived_store: &RowStore,
+    derived_store: &RowStore,
     approximate_groups: Option<&HashMap<String, Vec<String>>>,
 ) -> Result<DerivationNode, LocyError> {
     let rule_name = query.rule_name.to_string();
@@ -291,38 +290,67 @@ async fn explain_rule_mode_a(
         })
         .collect();
 
-    // Collect residual Int-vid candidates from KEY columns only.
-    let mut candidate_vids: Vec<u64> = Vec::new();
-    for (_, entry) in &tracker_entries {
-        for (k, v) in &entry.fact_row {
-            if key_cols.contains(k)
-                && let Value::Int(i) = v
-                && *i >= 0
-            {
-                candidate_vids.push(*i as u64);
+    // Resolve the integer IDs left in KEY columns. Which columns hold
+    // entities, and of which kind, is read from the published facts, which
+    // hydration already turned into nodes and edges: tracker rows carry a VID,
+    // an EID and a plain integer KEY alike as an integer, and the two ID spaces
+    // overlap, so guessing would bind an unrelated entity.
+    let mut entity_cols: HashMap<String, bool> = HashMap::new();
+    if let Some(relation) = derived_store.get(&rule_name) {
+        for column in &key_cols {
+            let kind = relation.rows.iter().find_map(|row| match row.get(column) {
+                Some(Value::Node(_)) => Some(false),
+                Some(Value::Edge(_)) => Some(true),
+                _ => None,
+            });
+            if let Some(is_edge) = kind {
+                entity_cols.insert(column.clone(), is_edge);
             }
         }
     }
-    candidate_vids.sort_unstable();
-    candidate_vids.dedup();
-    let vid_to_node: HashMap<u64, Value> = if candidate_vids.is_empty() {
+    let ids_in = |edges: bool| -> Vec<u64> {
+        let mut ids: Vec<u64> = tracker_entries
+            .iter()
+            .flat_map(|(_, entry)| &entry.fact_row)
+            .filter(|(k, _)| entity_cols.get(*k) == Some(&edges))
+            .filter_map(|(_, v)| match v {
+                Value::Int(i) if *i >= 0 => Some(*i as u64),
+                _ => None,
+            })
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    };
+    let (vids, eids) = (ids_in(false), ids_in(true));
+    let vid_to_node = if vids.is_empty() {
         HashMap::new()
     } else {
         fact_source
-            .lookup_nodes_by_vids(&candidate_vids)
+            .lookup_nodes_by_vids(&vids)
             .await
             .unwrap_or_default()
     };
-    if !vid_to_node.is_empty() {
-        for (_, ann) in &mut tracker_entries {
-            for (k, v) in ann.fact_row.iter_mut() {
-                if key_cols.contains(k)
-                    && let Value::Int(i) = v
-                    && *i >= 0
-                    && let Some(node) = vid_to_node.get(&(*i as u64))
-                {
-                    *v = node.clone();
-                }
+    let eid_to_edge = if eids.is_empty() {
+        HashMap::new()
+    } else {
+        fact_source
+            .lookup_edges_by_eids(&eids)
+            .await
+            .unwrap_or_default()
+    };
+    for (_, ann) in &mut tracker_entries {
+        for (k, v) in ann.fact_row.iter_mut() {
+            let resolved = match entity_cols.get(k) {
+                Some(true) => &eid_to_edge,
+                Some(false) => &vid_to_node,
+                None => continue,
+            };
+            if let Value::Int(i) = v
+                && *i >= 0
+                && let Some(entity) = resolved.get(&(*i as u64))
+            {
+                *v = entity.clone();
             }
         }
     }
@@ -428,48 +456,13 @@ async fn explain_rule_mode_b(
         .map(|c| c.name.clone())
         .collect();
 
-    // Re-evaluate the rule via SLG to obtain rows with full node objects and properties.
-    //
-    // Top-level QUERY no longer does this — it answers from the derived store,
-    // so `QUERY r` and `.derived["r"]` are the same bytes (issue #160). Mode B
-    // EXPLAIN cannot follow yet, and the reason is narrower than the one this
-    // comment used to give: `enrich_vids_with_nodes` hydrates node VID columns
-    // into `Value::Node`, but there is **no equivalent for edge EIDs**. A rule
-    // with a KEY *edge* variable therefore yields `None` for that binding when
-    // read from the derived store, which `test_edge_binding_where_filter_works_via_mode_a`
-    // catches. Removing this block regresses exactly that test and nothing else.
-    //
-    // Closing the gap means hydrating edge columns the way node columns already
-    // are; until then EXPLAIN keeps its own re-derivation. Mode A
-    // (`explain_rule_mode_a`) reads the fixpoint's ProvenanceStore and is
-    // unaffected either way.
-    //
-    // The re-derivation lives in a store local to this EXPLAIN and is never
-    // written back. The caller's store holds the facts the fixpoint
-    // published, which every later command reads, and the in-memory
-    // evaluator does not implement FOLD, BEST BY, post-FOLD WHERE or set
-    // semantics: merging its rows there changed the answer of every later
-    // QUERY in the program (see `locy_command_noninterference`).
-    let mut explain_store = RowStore::new();
-    {
-        let slg_start = std::time::Instant::now();
-        let mut resolver =
-            SLGResolver::new(program, fact_source, config, &mut explain_store, slg_start);
-        resolver.resolve_goal(&rule_name, &HashMap::new()).await?;
-        stats.queries_executed += resolver.stats.queries_executed;
-    }
-    // A rule the re-derivation did not produce is read from the published
-    // facts, as it was when the two stores were merged.
-    for name in rules_reachable_from(&rule_name, program) {
-        if !explain_store.contains_key(&name)
-            && let Some(relation) = derived_store.get(&name)
-        {
-            explain_store.insert(name, relation.clone());
-        }
-    }
-    let derived_store = &explain_store;
-
-    // Get all derived facts for this rule (now populated with full node objects)
+    // Read the facts the fixpoint published, already hydrated: node VIDs into
+    // nodes and relationship EIDs into edges (`enrich_vids_with_nodes`). Mode
+    // B used to re-derive the rule through the in-memory evaluator instead,
+    // only because edge EIDs were not hydrated; that evaluator has no FOLD,
+    // BEST BY, post-FOLD WHERE or set semantics, so its tree could explain
+    // facts the program never derived.
+    // Get all derived facts for this rule
     let facts = derived_store
         .get(&rule_name)
         .map(|r| r.rows.clone())
@@ -529,31 +522,6 @@ async fn explain_rule_mode_b(
     }
 
     Ok(root)
-}
-
-/// Names of `rule_name` and every rule it reaches through an IS reference.
-///
-/// Negated references are included: a clause with `IS NOT r` reads `r`.
-fn rules_reachable_from(rule_name: &str, program: &CompiledProgram) -> Vec<String> {
-    let mut seen: Vec<String> = vec![rule_name.to_string()];
-    let mut next = 0;
-    while let Some(name) = seen.get(next).cloned() {
-        next += 1;
-        let Some(rule) = program.rule_catalog.get(&name) else {
-            continue;
-        };
-        for clause in &rule.clauses {
-            for cond in &clause.where_conditions {
-                if let RuleCondition::IsReference(is_ref) = cond {
-                    let target = is_ref.rule_name.to_string();
-                    if !seen.contains(&target) {
-                        seen.push(target);
-                    }
-                }
-            }
-        }
-    }
-    seen
 }
 
 /// Recursively build a derivation node for a single fact of a rule.

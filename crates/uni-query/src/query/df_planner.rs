@@ -838,6 +838,7 @@ impl HybridPhysicalPlanner {
             | LogicalPlan::LocyDerivedScan { .. }
             | LogicalPlan::LocyProject { .. }
             | LogicalPlan::LocyModelInvoke { .. }
+            | LogicalPlan::LocyGenerate { .. }
             | LogicalPlan::Empty
             | LogicalPlan::CreateVectorIndex { .. }
             | LogicalPlan::CreateSparseIndex { .. }
@@ -1675,6 +1676,13 @@ impl HybridPhysicalPlanner {
                 projections,
                 target_types,
             } => self.plan_locy_project(input, projections, target_types, all_properties),
+
+            LogicalPlan::LocyGenerate {
+                input,
+                name,
+                args,
+                outputs,
+            } => self.plan_locy_generate(input, name, args, outputs, all_properties),
 
             LogicalPlan::LocyModelInvoke {
                 input,
@@ -5228,8 +5236,19 @@ impl HybridPhysicalPlanner {
         for (i, (expr, alias)) in projections.iter().enumerate() {
             let target_type = target_types.get(i);
 
-            // Handle node/relationship variables: extract ._vid column
+            // Handle node/relationship variables: extract the identity column
             if let Expr::Variable(var_name) = expr {
+                // A relationship variable → its EID (UInt64), hydrated into the
+                // edge after the fixpoint as a node's VID is. Checked before
+                // `._vid`, which a relationship's columns can also include.
+                let eid_col_name = format!("{var_name}._eid");
+                if let Some((eid_idx, _)) = schema.column_with_name(&eid_col_name) {
+                    let col_expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
+                        Arc::new(Column::new(&eid_col_name, eid_idx));
+                    let name = alias.clone().unwrap_or_else(|| var_name.clone());
+                    exprs.push((col_expr, name));
+                    continue;
+                }
                 // Check if this is a graph-expanded node variable ({var}._vid exists)
                 let vid_col_name = format!("{}._vid", var_name);
                 let vid_col_match = schema
@@ -5248,9 +5267,19 @@ impl HybridPhysicalPlanner {
                 }
 
                 // Direct column (e.g. from derived scan)
-                if let Some((col_idx, _)) = schema.column_with_name(var_name) {
+                if let Some((col_idx, field)) = schema.column_with_name(var_name) {
                     let col_expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
                         Arc::new(Column::new(var_name, col_idx));
+                    // A column declared as a Cypher value (a generator output,
+                    // say) is encoded, so the rule's facts carry the declared
+                    // type.
+                    let col_expr = if target_type == Some(&DataType::LargeBinary)
+                        && field.data_type() != &DataType::LargeBinary
+                    {
+                        crate::query::df_graph::expr_compiler::to_cypher_value_expr(col_expr)
+                    } else {
+                        col_expr
+                    };
                     let name = alias.clone().unwrap_or_else(|| var_name.clone());
                     exprs.push((col_expr, name));
                     continue;
@@ -5321,6 +5350,94 @@ impl HybridPhysicalPlanner {
         }
 
         Ok(Arc::new(ProjectionExec::try_new(exprs, input_plan)?))
+    }
+
+    /// Plan a Locy generator condition as a [`LocyGenerateExec`].
+    ///
+    /// The generator is resolved here, so an unregistered name fails the plan
+    /// rather than a row. Each argument is compiled like a projection and
+    /// brought to the type the generator's signature declares; each output is
+    /// typed as declared.
+    ///
+    /// [`LocyGenerateExec`]: super::df_graph::locy_generate::LocyGenerateExec
+    fn plan_locy_generate(
+        &self,
+        input: &LogicalPlan,
+        name: &str,
+        args: &[Expr],
+        outputs: &[String],
+        all_properties: &HashMap<String, HashSet<String>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let entry = uni_plugin::QName::candidate_splits(name)
+            .find_map(|q| {
+                self.plugin_registry.locy_generator(&q).or_else(|| {
+                    crate::query::df_udfs_plugin::current_session_plugin_registry()
+                        .and_then(|r| r.locy_generator(&q))
+                })
+            })
+            .ok_or_else(|| anyhow!("generator '{name}' is not registered"))?;
+        let signature = entry.generator.signature();
+        if signature.args.len() != args.len() || signature.outputs.len() != outputs.len() {
+            return Err(anyhow!(
+                "generator '{name}' takes {} argument(s) and binds {} output(s), \
+                 but is called with {} and binds {}",
+                signature.args.len(),
+                signature.outputs.len(),
+                args.len(),
+                outputs.len()
+            ));
+        }
+
+        let input_plan = self.plan_internal(input, all_properties)?;
+        let schema = input_plan.schema();
+        let session = self.session_ctx.read();
+        let state = session.state();
+        let ctx = self.translation_context_for_plan(input);
+        let compiler = self.expr_compiler(&state, Some(&ctx));
+        let physical_args = args
+            .iter()
+            .zip(&signature.args)
+            .map(|(arg, declared)| {
+                let expr = compiler.compile(arg, &schema)?;
+                let actual = expr.data_type(schema.as_ref())?;
+                Ok(match declared {
+                    uni_plugin::traits::scalar::ArgType::CypherValue
+                        if actual != DataType::LargeBinary =>
+                    {
+                        crate::query::df_graph::expr_compiler::to_cypher_value_expr(expr)
+                    }
+                    uni_plugin::traits::scalar::ArgType::Primitive(dt) if actual != *dt => {
+                        coerce_physical_expr(expr, &actual, dt, schema.as_ref())
+                    }
+                    _ => expr,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let output_fields = outputs
+            .iter()
+            .zip(&signature.outputs)
+            .map(|(output, declared)| {
+                let dt = match declared {
+                    uni_plugin::traits::scalar::ArgType::Primitive(dt) => dt.clone(),
+                    uni_plugin::traits::scalar::ArgType::CypherValue => DataType::LargeBinary,
+                    other => {
+                        return Err(anyhow!(
+                            "generator '{name}' output '{output}' has unsupported type {other:?}"
+                        ));
+                    }
+                };
+                Ok(arrow_schema::Field::new(output, dt, true))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Arc::new(
+            super::df_graph::locy_generate::LocyGenerateExec::new(
+                input_plan,
+                name.to_string(),
+                Arc::clone(&entry.generator),
+                physical_args,
+                output_fields,
+            ),
+        ))
     }
 
     /// Plan an aggregation.
@@ -8010,7 +8127,8 @@ pub(crate) fn collect_variable_kinds(
         | LogicalPlan::LocyPriority { .. }
         | LogicalPlan::LocyDerivedScan { .. }
         | LogicalPlan::LocyProject { .. }
-        | LogicalPlan::LocyModelInvoke { .. } => {}
+        | LogicalPlan::LocyModelInvoke { .. }
+        | LogicalPlan::LocyGenerate { .. } => {}
         // Leaf nodes with no variables or not applicable
         LogicalPlan::Empty
         | LogicalPlan::CreateVectorIndex { .. }
@@ -8123,6 +8241,7 @@ fn collect_mutation_node_hints(plan: &LogicalPlan, hints: &mut Vec<String>) {
         | LogicalPlan::LocyDerivedScan { .. }
         | LogicalPlan::LocyProject { .. }
         | LogicalPlan::LocyModelInvoke { .. }
+        | LogicalPlan::LocyGenerate { .. }
         | LogicalPlan::Empty
         | LogicalPlan::CreateVectorIndex { .. }
         | LogicalPlan::CreateSparseIndex { .. }
@@ -8253,6 +8372,7 @@ fn collect_mutation_edge_hints(plan: &LogicalPlan, hints: &mut Vec<String>) {
         | LogicalPlan::LocyDerivedScan { .. }
         | LogicalPlan::LocyProject { .. }
         | LogicalPlan::LocyModelInvoke { .. }
+        | LogicalPlan::LocyGenerate { .. }
         | LogicalPlan::Empty
         | LogicalPlan::CreateVectorIndex { .. }
         | LogicalPlan::CreateSparseIndex { .. }
@@ -8592,7 +8712,8 @@ fn collect_plan_variables_into(plan: &LogicalPlan, out: &mut HashSet<String>) {
         | LogicalPlan::LocyBestBy { .. }
         | LogicalPlan::LocyPriority { .. }
         | LogicalPlan::LocyProject { .. }
-        | LogicalPlan::LocyModelInvoke { .. } => {}
+        | LogicalPlan::LocyModelInvoke { .. }
+        | LogicalPlan::LocyGenerate { .. } => {}
         // Leaf nodes / DDL / admin statements bind no variables.
         LogicalPlan::Empty
         | LogicalPlan::CreateVectorIndex { .. }

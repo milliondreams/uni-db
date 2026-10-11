@@ -26,7 +26,7 @@ use super::locy_delta::RowStore;
 
 use super::locy_ast_builder::value_to_expr;
 use super::locy_eval::eval_condition;
-use super::locy_explain::{ProvenanceStore, explain_rule};
+use super::locy_explain::explain_rule;
 use super::locy_traits::LocyExecutionContext;
 
 /// Evaluate an ABDUCE query using a three-phase pipeline.
@@ -37,7 +37,6 @@ pub async fn evaluate_abduce(
     config: &LocyConfig,
     derived_store: &RowStore,
     stats: &mut LocyStats,
-    tracker: Option<&ProvenanceStore>,
 ) -> Result<AbductionResult, LocyError> {
     let rule_name = query.rule_name.to_string();
     let rule = program
@@ -67,6 +66,11 @@ pub async fn evaluate_abduce(
         where_expr: query.where_expr.clone(),
         return_clause: None,
     };
+    // Without provenance, so the tree is built from the published facts with
+    // its children (Mode B). Recorded provenance (Mode A) has no children, and
+    // the causes ABDUCE edits are in the children: with a tracker present (any
+    // program with an EXPLAIN or a probabilistic FOLD) ABDUCE saw only the
+    // root and could propose nothing that changes the answer.
     let derivation_tree = explain_rule(
         &explain_query,
         program,
@@ -74,7 +78,7 @@ pub async fn evaluate_abduce(
         config,
         derived_store,
         stats,
-        tracker,
+        None,
         None,
     )
     .await?;
@@ -134,7 +138,16 @@ fn extract_removal_candidates(
 ) -> Vec<Modification> {
     let mut candidates = Vec::new();
     collect_leaf_candidates(tree, rule, program, &mut candidates);
-    candidates
+    // Two leaves can propose the same edit (one per derivation that reads the
+    // same entity); keep the first, so duplicates spend neither the candidate
+    // budget nor a validation run.
+    let mut distinct: Vec<Modification> = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        if !distinct.contains(&candidate) {
+            distinct.push(candidate);
+        }
+    }
+    distinct
 }
 
 /// Recursively collect candidates from derivation tree leaves.
@@ -161,25 +174,28 @@ fn collect_leaf_candidates(
             }
         }
 
+        // A numeric property of a bound entity is a candidate edit, applied
+        // as `SET var.prop`. A derivation binds nodes and edges as entities
+        // (`Value::Node` / `Value::Edge`), and only the map form used to be
+        // read, so no node property was ever proposed. A bare scalar binding
+        // (a generator output, `KEY e.w AS w`) is not an entity: `SET w.w`
+        // cannot be applied, so it is not a candidate.
         for (key, value) in &node.bindings {
-            if let Value::Map(props) = value {
-                for (prop_name, prop_val) in props {
-                    if prop_val.as_f64().is_some() {
-                        candidates.push(Modification::ChangeProperty {
-                            element_var: key.clone(),
-                            property: prop_name.clone(),
-                            old_value: Box::new(prop_val.clone()),
-                            new_value: Box::new(zero_like(prop_val)),
-                        });
-                    }
+            let props = match value {
+                Value::Map(props) => props,
+                Value::Node(n) => &n.properties,
+                Value::Edge(e) => &e.properties,
+                _ => continue,
+            };
+            for (prop_name, prop_val) in props {
+                if prop_name.starts_with('_') || prop_val.as_f64().is_none() {
+                    continue;
                 }
-            }
-            if value.as_f64().is_some() {
                 candidates.push(Modification::ChangeProperty {
                     element_var: key.clone(),
-                    property: key.clone(),
-                    old_value: Box::new(value.clone()),
-                    new_value: Box::new(zero_like(value)),
+                    property: prop_name.clone(),
+                    old_value: Box::new(prop_val.clone()),
+                    new_value: Box::new(zero_like(prop_val)),
                 });
             }
         }

@@ -393,6 +393,19 @@ fn undeclared_property_arrow_type(schema: &Schema, prop: &str) -> DataType {
         .unwrap_or(DataType::LargeBinary)
 }
 
+/// The variables a clause's generator conditions bind.
+fn clause_generator_outputs(clause: &CompiledClause) -> HashSet<&str> {
+    clause
+        .where_conditions
+        .iter()
+        .filter_map(|cond| match cond {
+            RuleCondition::Generator(generator) => Some(generator),
+            _ => None,
+        })
+        .flat_map(|generator| generator.outputs.iter().map(String::as_str))
+        .collect()
+}
+
 /// Infer the Arrow DataType for a yield column based on its expression in the first clause.
 ///
 /// `rule_catalog` lets a yield column that merely forwards a NON-KEY value column
@@ -459,6 +472,8 @@ fn infer_yield_type_rec(
         {
             match fn_name.to_uppercase().as_str() {
                 "COUNT" | "MCOUNT" => return DataType::Int64,
+                // A list of the inputs, carried as a Cypher value.
+                "COLLECT" => return DataType::LargeBinary,
                 "MIN" | "MAX" | "MMIN" | "MMAX" => {
                     if let Some(dt) =
                         fold_argument_type(&fold.aggregate, schema, var_labels, node_vars)
@@ -488,6 +503,25 @@ fn infer_yield_type_rec(
                     // A bare Variable naming a node var is a whole-node KEY → UInt64.
                     if node_vars.contains(v) {
                         return DataType::UInt64;
+                    }
+                    // A relationship is carried by its EID, as a node by its
+                    // VID, and hydrated into the edge after the fixpoint.
+                    // Typed by the catch-all as a string, the edge was cast
+                    // away and the rule yielded NULL for it.
+                    if let Some(edge) = match_edge_vars(first_clause, 0)
+                        .into_iter()
+                        .find(|e| e.name == *v)
+                    {
+                        return match edge.kind {
+                            DerivKind::Edge => DataType::UInt64,
+                            _ => DataType::LargeBinary,
+                        };
+                    }
+                    // A generator output carries whatever the generator emits
+                    // (`LocyGenerateExec` types it from the signature): a
+                    // Cypher value holds it whatever that is.
+                    if clause_generator_outputs(first_clause).contains(v.as_str()) {
+                        return DataType::LargeBinary;
                     }
                     // A bare Variable referencing an ALONG name takes its type.
                     // Without this, `ew AS link_weight` would infer
@@ -1169,14 +1203,17 @@ fn clause_column_types(
         .into_iter()
         .map(|(_, yield_name)| yield_name)
         .collect();
+    // The node variables the planner types every clause with: MATCH nodes
+    // and nodes an IS reference binds, over all clauses. A per-clause MATCH
+    // set would type `p` bound by `(parent, p) IS r` unlike the base clause's
+    // MATCH `p`, and unify a node column into a Cypher value.
+    let node_vars = collect_node_vars(&rule.clauses, rule_catalog);
     let mut types: HashMap<String, Vec<DataType>> = HashMap::new();
     for clause in &rule.clauses {
         let RuleOutput::Yield(yc) = &clause.output else {
             continue;
         };
         let fold_names: HashSet<&str> = clause.fold.iter().map(|f| f.name.as_str()).collect();
-        let mut node_vars = HashSet::new();
-        collect_match_node_vars(clause, &mut node_vars);
         let var_labels = clause_var_labels(clause);
         let infer = |name: &str, is_key: bool| {
             infer_yield_type(
@@ -1553,21 +1590,6 @@ impl<'a> LocyPlanBuilder<'a> {
     ) -> Result<LocyStratum> {
         let mut rules = Vec::with_capacity(stratum.rules.len());
         for rule in &stratum.rules {
-            // Generator predicates (`name(args) -> (outs)`) bind new variables
-            // 1:N and are resolved by the in-memory SLG engine
-            // (`locy_slg::apply_generators`), not the columnar fixpoint — which has
-            // no row-explosion operator. Skip such rules here so the fixpoint never
-            // plans their generator-bound yield columns (which are not produced by
-            // the MATCH body); QUERY resolution re-derives them through SLG, and
-            // the non-FOLD columnar output would be discarded regardless.
-            let has_generator = rule.clauses.iter().any(|c| {
-                c.where_conditions
-                    .iter()
-                    .any(|cond| matches!(cond, RuleCondition::Generator(_)))
-            });
-            if has_generator {
-                continue;
-            }
             rules.push(self.build_rule(
                 rule,
                 stratum.is_recursive,
@@ -1935,6 +1957,14 @@ impl<'a> LocyPlanBuilder<'a> {
                 }
             }
         }
+
+        // A generator's outputs exist only once it has run, after the
+        // IS-reference joins (its arguments may read their columns).
+        is_ref_deferred_vars.extend(
+            clause_generator_outputs(clause)
+                .into_iter()
+                .map(String::from),
+        );
 
         let all_filter_exprs: Vec<&Expr> = clause
             .where_conditions
@@ -2377,6 +2407,23 @@ impl<'a> LocyPlanBuilder<'a> {
                         }
                     }
                 }
+            }
+        }
+
+        // Step 3.4: generator conditions, in the order written, so a later
+        // generator can read an earlier one's outputs.
+        for condition in &clause.where_conditions {
+            if let RuleCondition::Generator(generator) = condition {
+                plan = LogicalPlan::LocyGenerate {
+                    input: Box::new(plan),
+                    name: generator.name.to_string(),
+                    args: generator
+                        .args
+                        .iter()
+                        .map(|arg| rewrite_is_ref_cols(arg.clone(), &is_ref_col_aliases))
+                        .collect(),
+                    outputs: generator.outputs.clone(),
+                };
             }
         }
 

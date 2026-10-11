@@ -232,7 +232,7 @@ pub struct ValidatedModification {
 }
 
 /// A proposed graph modification from ABDUCE.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub enum Modification {
     RemoveEdge {
         source_var: String,

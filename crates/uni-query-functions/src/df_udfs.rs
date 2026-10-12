@@ -6146,12 +6146,18 @@ impl DfAccumulator for CypherSumAccumulator {
     }
 }
 
-/// Cypher `sum`: see [`CypherSumUdaf`].
+/// Cypher `sum` (`_cypher_sum`) over numbers or durations, in any column type.
+///
+/// An integer sum stays an integer; any other value is a type error. The
+/// result is CypherValue-encoded `LargeBinary`.
 pub fn create_cypher_sum_udaf() -> AggregateUDF {
     AggregateUDF::from(CypherSumUdaf::new(false))
 }
 
-/// Cypher `avg`: see [`CypherSumUdaf`].
+/// Cypher `avg` (`_cypher_avg`) over numbers or durations, in any column type.
+///
+/// Any other value is a type error. The result is CypherValue-encoded
+/// `LargeBinary`.
 pub fn create_cypher_avg_udaf() -> AggregateUDF {
     AggregateUDF::from(CypherSumUdaf::new(true))
 }
@@ -6338,7 +6344,11 @@ impl DfAccumulator for DistinctAccumulator {
     }
 }
 
-/// `inner` with DISTINCT applied to its arguments; see [`DistinctUdaf`].
+/// `inner` with DISTINCT applied to its arguments.
+///
+/// Keeps the set of distinct argument tuples and folds them through `inner`
+/// when it evaluates, so DISTINCT holds even for an aggregate that ignores
+/// DataFusion's `is_distinct` flag.
 pub fn distinct_udaf(inner: AggregateUDF) -> AggregateUDF {
     let name = format!("{}_distinct", inner.name());
     AggregateUDF::from(DistinctUdaf { inner, name })

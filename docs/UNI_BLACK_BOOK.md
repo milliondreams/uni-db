@@ -6096,10 +6096,17 @@ which is polled once per *output* batch, so any slowly-read cursor over an
 `ORDER BY` or a grouped result timed out after its consumer had idled past the
 budget (`a_slow_consumer_of_a_sorted_result_is_not_charged_the_query_budget`).
 
-Still a snapshot, and not yet checked against a slow cursor:
-`QueryProcedureHost` hands `uni-store`'s `QueryContext` an `Instant` taken when
-the host is built. It is only correct if no consumer idle can fall between that
-moment and the procedure's last deadline check.
+`QueryProcedureHost` holds the clock too, so its `check_timeout` (the
+`uni.algo.*` drain checks it every 1000 rows) and the `QueryContext` it builds
+read the deadline as of the call. Credit can only arrive when the consumer asks
+for the next batch, and a procedure call today runs to completion inside one
+poll, so no slow-cursor query was found that a copied `Instant` there would have
+failed; the host held one until it was replaced as the same class of defect.
+`uni-store` itself never reads `QueryContext::deadline`: only the simple
+executor's `check_timeout` calls do.
+
+`deadline_for_host` remains a snapshot, for callers that check before any
+consumer can idle again, such as the Locy paths, which never stream.
 
 ### strict_schema
 

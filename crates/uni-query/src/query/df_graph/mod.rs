@@ -629,11 +629,12 @@ impl GraphExecutionContext {
             .or_else(|| self.storage.get_labels_from_index(vid))
     }
 
-    /// Wall-clock deadline for the surrounding query, if any.
+    /// Wall-clock deadline for the surrounding query, if any, as of now.
     ///
-    /// Internal accessor used by [`crate::query::executor::procedure_host::QueryProcedureHost`]
-    /// to snapshot the deadline so procedure plugins can implement
-    /// `check_timeout` without holding a borrow on this context.
+    /// A snapshot: it includes the idle credit granted so far and none granted
+    /// later. Only for a caller that checks it before a cursor's consumer can
+    /// idle again, such as a Locy evaluation, which does not stream; anything
+    /// checked from inside a cursor's plan holds the context's live deadline clock.
     #[must_use]
     pub fn deadline_for_host(&self) -> Option<Instant> {
         self.effective_deadline()
@@ -641,8 +642,7 @@ impl GraphExecutionContext {
 
     /// Cancellation token clone for the surrounding query, if any.
     ///
-    /// Internal accessor for [`crate::query::executor::procedure_host::QueryProcedureHost`];
-    /// see [`Self::deadline_for_host`].
+    /// Internal accessor for [`crate::query::executor::procedure_host::QueryProcedureHost`].
     #[must_use]
     pub fn cancellation_token_for_host(&self) -> Option<tokio_util::sync::CancellationToken> {
         self.cancellation_token.clone()

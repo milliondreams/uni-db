@@ -785,6 +785,12 @@ impl Executor {
         if let Some(writer) = &self.writer {
             host = host.with_writer(Arc::clone(writer));
         }
+        // A declared procedure runs its body as an inner query, inside this
+        // poll and under `block_in_place`, where the caller's timeout and
+        // cancellation cannot reach it. Without the budget the body ran to
+        // completion on a fresh `query_timeout` and ignored the token.
+        let (deadline, token) = self.procedure_budget(ctx);
+        host = host.with_budget(deadline, token);
         // Same reasoning as the graphRef resolver below: every row-path plugin
         // procedure (including `uni.graph.project`'s Cypher mode and every
         // `CypherProcedureSynthesizer`-declared procedure) runs its inner Cypher
@@ -901,6 +907,10 @@ impl Executor {
             resolver_host = resolver_host
                 .with_l0_context(crate::query::df_graph::L0Context::from_query_context(qc));
         }
+        // The resolver runs `nodeQuery` / `edgeQuery` as inner queries; they
+        // spend the caller's budget, as a declared procedure's body does.
+        let (deadline, token) = self.procedure_budget(ctx);
+        resolver_host = resolver_host.with_budget(deadline, token);
         let resolver = crate::procedures_plugin::algo::guest_graph_resolver(resolver_host);
         let mut stream = crate::procedures_plugin::algo::run_algorithm_provider(
             entry,

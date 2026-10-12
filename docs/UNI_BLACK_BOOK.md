@@ -6108,6 +6108,32 @@ executor's `check_timeout` calls do.
 `deadline_for_host` remains a snapshot, for callers that check before any
 consumer can idle again, such as the Locy paths, which never stream.
 
+#### Where the deadline can still be checked
+
+`tokio::time::timeout` and the cancellation race in `impl_query.rs` fire only
+when execution returns `Pending`, and CPU-bound work does not. Two shapes run
+entirely inside one poll, so only a check of their own can stop them:
+
+- **UNWIND under a pipeline breaker.** UNWIND makes rows without pulling input
+  for each one, and `insert_deadline_guards` places no guard in a subtree that
+  holds one of our operators (see #283 for why). `GraphUnwindExec` therefore
+  carries a `QueryBudget` (the live clock plus the token, from
+  `GraphExecutionContext::budget()`), checks it before each chunk, and keeps it
+  through `with_new_children`.
+- **Inner queries.** A declared procedure's body and a Cypher graph projection's
+  `nodeQuery` / `edgeQuery` run through `QueryProcedureHost::execute_inner_query`.
+  A declared procedure does this under `block_in_place`, so the caller's timer
+  cannot fire at all. The inner `Executor` inherits the host's clock
+  (`Executor::inherit_deadline`) and token; without them it ran on a fresh
+  `query_timeout` and ignored cancellation. A host built from components (the
+  simple executor's `CALL` dispatch and its graph-projection resolver) gets the
+  executor's budget through `Executor::procedure_budget`.
+
+The vector, full-text and hybrid search procedures still have no check of their
+own. Their long steps are Lance searches and property reads, which await, so the
+caller's timer should be able to preempt them between those awaits. No test
+measures that.
+
 ### strict_schema
 
 When enabled, CREATE and MERGE operations that reference a label or edge type not declared in the schema are rejected with an error. This enforces schema-first discipline and catches typos at write time. Properties are not affected — unknown properties still go to overflow.

@@ -352,6 +352,10 @@ pub struct Executor {
     /// Cooperative cancellation token. Passed to `QueryContext` and
     /// `GraphExecutionContext` so in-flight operators can detect cancellation.
     pub(crate) cancellation_token: Option<tokio_util::sync::CancellationToken>,
+    /// An enclosing query's deadline, when this executor runs a query on its
+    /// behalf (a procedure's inner Cypher). Replaces the fresh
+    /// `config.query_timeout` budget: the inner query spends the caller's time.
+    pub(crate) inherited_deadline: Option<crate::query::df_graph::DeadlineClock>,
     /// Shared `PropertyManager` to reuse inside `create_datafusion_planner`
     /// instead of allocating a fresh one (with empty LRU caches) per query.
     /// When `None`, the planner falls back to constructing from the
@@ -407,6 +411,7 @@ impl Clone for Executor {
             id_reservoir: self.id_reservoir.clone(),
             custom_function_registry: self.custom_function_registry.clone(),
             cancellation_token: self.cancellation_token.clone(),
+            inherited_deadline: self.inherited_deadline.clone(),
             prop_manager_arc: self.prop_manager_arc.clone(),
             df_session_template: self.df_session_template.clone(),
             read_snapshot: self.read_snapshot.clone(),
@@ -440,6 +445,7 @@ impl Executor {
             id_reservoir: None,
             custom_function_registry: None,
             cancellation_token: None,
+            inherited_deadline: None,
             prop_manager_arc: None,
             df_session_template: None,
             read_snapshot: None,
@@ -621,6 +627,45 @@ impl Executor {
         self.cancellation_token = Some(token);
     }
 
+    /// Spend an enclosing query's deadline rather than a fresh budget.
+    ///
+    /// For a query run on another query's behalf, such as a procedure's inner
+    /// Cypher. The clock is live, so idle credit granted to the enclosing
+    /// cursor reaches this executor's checks too.
+    pub(crate) fn inherit_deadline(&mut self, clock: crate::query::df_graph::DeadlineClock) {
+        self.inherited_deadline = Some(clock);
+    }
+
+    /// The deadline and cancellation token a procedure host built by this
+    /// executor should carry, so the inner queries it runs spend this query's
+    /// budget.
+    ///
+    /// The inherited clock when there is one; otherwise `ctx`'s deadline, which
+    /// is fixed because this path does not stream.
+    pub(crate) fn procedure_budget(
+        &self,
+        ctx: Option<&QueryContext>,
+    ) -> (
+        crate::query::df_graph::DeadlineClock,
+        Option<tokio_util::sync::CancellationToken>,
+    ) {
+        let deadline = self.inherited_deadline.clone().unwrap_or_else(|| {
+            crate::query::df_graph::DeadlineClock::fixed(ctx.and_then(|c| c.deadline))
+        });
+        let token = ctx
+            .and_then(|c| c.cancellation_token.clone())
+            .or_else(|| self.cancellation_token.clone());
+        (deadline, token)
+    }
+
+    /// The deadline a `QueryContext` built now should carry.
+    fn context_deadline(&self) -> Option<Instant> {
+        match &self.inherited_deadline {
+            Some(clock) => clock.effective(),
+            None => Some(Instant::now() + self.config.query_timeout),
+        }
+    }
+
     /// Build a `QueryContext` from the current writer or standalone L0 manager.
     /// When `transaction_l0_override` is set, it is used as the transaction L0 —
     /// this is how private-per-transaction L0 buffers become visible to reads
@@ -652,7 +697,9 @@ impl Executor {
                     writer.l0_manager.get_pending_flush(),
                 ),
             };
-            ctx.set_deadline(Instant::now() + self.config.query_timeout);
+            if let Some(deadline) = self.context_deadline() {
+                ctx.set_deadline(deadline);
+            }
             if let Some(ref token) = self.cancellation_token {
                 ctx.set_cancellation_token(token.clone());
             }
@@ -671,7 +718,9 @@ impl Executor {
                     self.transaction_l0_override.clone(),
                     m.get_pending_flush(),
                 );
-                ctx.set_deadline(Instant::now() + self.config.query_timeout);
+                if let Some(deadline) = self.context_deadline() {
+                    ctx.set_deadline(deadline);
+                }
                 if let Some(ref token) = self.cancellation_token {
                     ctx.set_cancellation_token(token.clone());
                 }

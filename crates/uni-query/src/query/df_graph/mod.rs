@@ -160,6 +160,17 @@ pub(crate) struct DeadlineClock {
 }
 
 impl DeadlineClock {
+    /// A clock for `deadline` with no idle credit of its own.
+    ///
+    /// For a query that does not stream, so no consumer can idle while it
+    /// runs.
+    pub(crate) fn fixed(deadline: Option<Instant>) -> Self {
+        Self {
+            deadline,
+            credit: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
     /// The deadline as of now, with all idle credit granted so far.
     pub(crate) fn effective(&self) -> Option<Instant> {
         effective_deadline(self.deadline, &self.credit)
@@ -168,6 +179,24 @@ impl DeadlineClock {
     /// Whether there is a deadline to enforce at all.
     pub(crate) fn is_set(&self) -> bool {
         self.deadline.is_some()
+    }
+}
+
+/// What an operator checks as it runs: the query's live deadline and its
+/// cancellation token.
+///
+/// For an operator that produces rows without pulling input for each of them,
+/// such as UNWIND expanding a list, so no checkpoint below it fires.
+#[derive(Debug, Clone)]
+pub(crate) struct QueryBudget {
+    deadline: DeadlineClock,
+    token: Option<tokio_util::sync::CancellationToken>,
+}
+
+impl QueryBudget {
+    /// Fail if the query has been cancelled or its deadline has passed.
+    pub(crate) fn check(&self) -> anyhow::Result<()> {
+        common::check_deadline(self.token.as_ref(), self.deadline.effective())
     }
 }
 
@@ -555,6 +584,14 @@ impl GraphExecutionContext {
         DeadlineClock {
             deadline: self.deadline,
             credit: Arc::clone(&self.deadline_credit),
+        }
+    }
+
+    /// This query's deadline and cancellation token, for an operator to check.
+    pub(crate) fn budget(&self) -> QueryBudget {
+        QueryBudget {
+            deadline: self.deadline_clock(),
+            token: self.cancellation_token.clone(),
         }
     }
 

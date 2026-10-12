@@ -2256,7 +2256,8 @@ impl HybridPhysicalPlanner {
             variable,
             self.params.clone(),
             drop_source.as_deref(),
-        );
+        )
+        .with_budget(self.graph_ctx.budget());
 
         Ok(Arc::new(unwind))
     }

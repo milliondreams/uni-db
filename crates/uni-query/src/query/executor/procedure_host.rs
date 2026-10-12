@@ -435,6 +435,17 @@ impl QueryProcedureHost {
             Executor::new(Arc::clone(&self.storage))
         };
 
+        // The inner query runs inside the outer one's poll -- and, for a
+        // declared procedure, under `block_in_place` -- so the outer
+        // `tokio::time::timeout` and cancellation race cannot interrupt it.
+        // Only its own checks can, and they must spend the caller's budget.
+        if let Some(clock) = &self.deadline {
+            executor.inherit_deadline(clock.clone());
+        }
+        if let Some(token) = &self.cancellation_token {
+            executor.set_cancellation_token(token.clone());
+        }
+
         // Mirror outer L0 visibility into the inner executor.
         if let Some(current) = self.l0_context.current_l0.as_ref() {
             let mut pending = self.l0_context.pending_flush_l0s.clone();
@@ -458,6 +469,22 @@ impl QueryProcedureHost {
         };
 
         executor.execute(plan, &prop_manager, params).await
+    }
+
+    /// Bound this host's checks, and its inner queries, by the caller's
+    /// deadline and cancellation token.
+    ///
+    /// For a host built from components rather than a graph context, which
+    /// otherwise carries neither and runs every inner query on a fresh budget.
+    #[must_use]
+    pub(crate) fn with_budget(
+        mut self,
+        deadline: DeadlineClock,
+        token: Option<CancellationToken>,
+    ) -> Self {
+        self.deadline = Some(deadline);
+        self.cancellation_token = token;
+        self
     }
 
     /// Check whether the query has timed out or been cancelled.

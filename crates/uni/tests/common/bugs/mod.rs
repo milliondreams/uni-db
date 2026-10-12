@@ -164,6 +164,7 @@ pub mod repro_registry_monotonicity_oracle;
 pub mod repro_schemaless_pattern_comprehension_empty;
 pub mod repro_stream_error_loses_abort_type;
 pub mod scan_range_walk_l0_rows;
+pub mod schemaless_search_after_flush;
 pub mod sum_of_nothing_is_zero;
 // sum/avg take numbers or durations; a string is a type error.
 pub mod sum_avg_take_numbers_or_durations;

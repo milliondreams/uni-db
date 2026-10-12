@@ -2968,8 +2968,20 @@ impl StorageManager {
 
         let mut results = Vec::new();
 
-        // Only search if the table exists
-        if backend.table_exists(&name).await? {
+        if self.is_schemaless_property(label, property) {
+            reject_schemaless_filter(label, property, filter)?;
+            let mut deadline = ctx.map(DeadlineTicker::new);
+            for (vid, props) in self.flushed_label_properties(label, ctx).await? {
+                if let Some(ticker) = deadline.as_mut() {
+                    ticker.tick()?;
+                }
+                if let Some(emb) = extract_embedding_from_props(&props, property)
+                    && emb.len() == query.len()
+                {
+                    results.push((vid, metric.compute_distance(&emb, query)));
+                }
+            }
+        } else if backend.table_exists(&name).await? {
             let backend_metric = match &metric {
                 DistanceMetric::L2 => BackendMetric::L2,
                 DistanceMetric::Cosine => BackendMetric::Cosine,
@@ -3431,7 +3443,25 @@ impl StorageManager {
         let backend = self.backend.as_ref();
         let name = table_names::vertex_table_name(label);
 
-        let mut results = if backend.table_exists(&name).await? {
+        let mut results = if self.is_schemaless_property(label, property) {
+            reject_schemaless_filter(label, property, filter)?;
+            let mut deadline = ctx.map(DeadlineTicker::new);
+            let mut hits = Vec::new();
+            for (vid, props) in self.flushed_label_properties(label, ctx).await? {
+                if let Some(ticker) = deadline.as_mut() {
+                    ticker.tick()?;
+                }
+                let score = props
+                    .get(property)
+                    .and_then(|value| value.as_str())
+                    .map_or(0.0, |text| compute_text_relevance(query, text));
+                if score > 0.0 {
+                    hits.push((vid, score));
+                }
+            }
+            hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            hits
+        } else if backend.table_exists(&name).await? {
             // Build combined filter: _deleted = false + optional user filter + HWM
             let mut filter_parts = vec![Self::build_active_filter(filter)];
             let hwm = ctx.and(self.version_high_water_mark());
@@ -3477,6 +3507,46 @@ impl StorageManager {
         results.truncate(k);
 
         Ok(results)
+    }
+
+    /// Whether flushed values of `label.property` have no column of their own.
+    ///
+    /// Only a property the schema declares on `label` is flushed to a column
+    /// named after it. An undeclared label is flushed to the main vertex table
+    /// only, and an undeclared property of a declared label to the label's
+    /// overflow column; either way the main table's `props_json` is the one
+    /// flushed copy a search can read.
+    fn is_schemaless_property(&self, label: &str, property: &str) -> bool {
+        !self
+            .schema_manager
+            .schema()
+            .properties
+            .get(label)
+            .is_some_and(|props| props.contains_key(property))
+    }
+
+    /// Latest flushed properties of every live `label` vertex.
+    ///
+    /// The flushed side of a search over a schemaless property, which has no
+    /// column for a backend search to use, so every flushed row of the label
+    /// is read and scored by the caller. Bounded by the same snapshot ceiling
+    /// as the column searches. Unflushed rows are merged in afterwards by the
+    /// L0 merges, exactly as for a declared property.
+    ///
+    /// # Errors
+    /// Propagates backend scan and decode failures.
+    async fn flushed_label_properties(
+        &self,
+        label: &str,
+        ctx: Option<&QueryContext>,
+    ) -> Result<HashMap<Vid, uni_common::Properties>> {
+        MainVertexDataset::find_label_props_counted(
+            self.backend.as_ref(),
+            label,
+            ctx.and(self.version_high_water_mark()),
+            ctx.and_then(|c| c.counters.as_ref()),
+        )
+        .await
     }
 
     /// `batches` narrowed to rows that are their vertex's latest version.
@@ -4140,6 +4210,24 @@ pub fn collect_l0_label_candidates(ctx: &QueryContext, label: &str) -> (Vec<Vid>
     }
 
     (live.into_iter().collect(), tombstoned)
+}
+
+/// Refuses a backend filter on a search over a schemaless property.
+///
+/// The filter is an expression over the label table's columns, and the rows
+/// such a search reads come from the main vertex table, which has none of
+/// them. Ignoring it would return rows the caller excluded.
+///
+/// # Errors
+/// Returns an error when `filter` is set.
+fn reject_schemaless_filter(label: &str, property: &str, filter: Option<&str>) -> Result<()> {
+    match filter {
+        Some(expr) => Err(anyhow!(
+            "a filter ('{expr}') is not supported when searching '{label}.{property}', \
+             which the schema does not declare; declare the property to filter its search"
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Computes a simple token-overlap relevance score between a query and text.

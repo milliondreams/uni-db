@@ -3325,6 +3325,55 @@ CREATE FULLTEXT INDEX article_fts FOR (a:Article) ON EACH [a.content] OPTIONS {
 
 18-language stemming and stop-words plus ngram tokenization are supported (`TokenizerConfig::Analyzer`); CJK requires dictionary files under `LANCE_LANGUAGE_MODEL_HOME`.
 
+### Searching a schemaless property
+
+A vector or full-text search over a property the schema does not declare on the
+label is served by brute force, flushed or not. Only a declared property is
+flushed to a column named after it, which is what a Lance nearest-neighbour or
+inverted-index scan needs. An undeclared label is flushed to the main vertex
+table only, and an undeclared property of a declared label goes to the label's
+`overflow_json` column. Either way, the main table's `props_json` is the one
+flushed copy that holds the value.
+
+`StorageManager::vector_search` and `fts_search` check
+`is_schemaless_property(label, property)` first. If it is true, they read every
+live flushed vertex of the label with `MainVertexDataset::find_label_props_counted`
+and score each one directly. Unflushed rows are then merged in by the same L0
+merges as for a declared property.
+
+- **Scoring.** A vector is scored with the same `compute_distance` (L2: no index
+  can be declared on the property) and the same length guard as unflushed rows.
+  Text is scored by `compute_text_relevance`, the fraction of query tokens the
+  text holds. This is not BM25. A row therefore scores the same before and
+  after a flush, which BM25 over the flushed rows could not promise.
+- **Which rows count.** A vertex counts only if its latest row is live and
+  still carries the label. The read filters on the label to find candidates,
+  then re-reads all their rows. A label filter alone would also match the
+  older row of a vertex relabeled away since.
+- **A relabel has a version.** `L0Buffer::set_vertex_labels`, the commit merge
+  and WAL replay record it in `vertex_label_versions`, and the flush stamps
+  rows with `L0Buffer::vertex_write_version` (the later of the property and
+  label versions). Before that, the flush re-appended a relabeled vertex's row
+  at version 0, and its old row, with the old labels, won every latest-version
+  read, so `labels(n)` reverted after a flush. It is not stored in
+  `vertex_versions`. The L0 scans read an entry there as "this buffer holds the
+  vertex's newest properties", and a relabel holds none, so stamping it there
+  made the scans drop the flushed properties.
+- **Filters are refused.** The `filter` argument is an expression over the label
+  table's columns, which these rows do not have, so a search with one returns
+  an error instead of ignoring it. This applies to unflushed rows too: before,
+  an undeclared label's unflushed rows were returned with the filter silently
+  ignored.
+- **Cost.** The read is O(rows of the label) per query, plus decoding each
+  vertex's latest `props_json`. It is checked against the query deadline every
+  1024 rows (`DeadlineTicker`). Declare the property, and index it, when the
+  label is large.
+
+Before this, the flushed side of such a search returned nothing for an
+undeclared label (its table does not exist) and failed in Lance for an
+undeclared property ("column ... does not exist"). The same query found the rows
+while they were unflushed.
+
 ## Hybrid Search
 
 ```cypher

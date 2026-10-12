@@ -264,6 +264,8 @@ ORDER BY distance
 
 **Pre-filtering** searches only within the filtered subset, unlike post-filtering which searches all nodes then filters.
 
+A property the schema does not declare (on a schemaless label, or an undeclared property of a declared label) can still be searched, by `uni.vector.query` and `uni.fts.query` alike. Every row of the label is scored by brute force, before and after a flush. Such a search does not accept a pre-filter, because the filter's columns do not exist for those rows; it returns an error instead. Post-filter in Cypher, or declare the property. Full-text scores on an undeclared property are the fraction of query terms the text contains, not BM25.
+
 ### Post-Filtering (Alternative)
 
 Combine vector search with property filtering after search:

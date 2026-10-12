@@ -6166,8 +6166,12 @@ entirely inside one poll, so only a check of their own can stop them:
   each candidate up by a linear scan of a list growing with every append:
   N^2/2 comparisons, 2.2 s at 40,000 unflushed rows, against 90 ms now.
 
-The Lance side of a search (flushed rows) awaits, so the caller's timer should
-be able to preempt it between those awaits. No test measures that.
+The Lance side of a search (flushed rows) awaits, and the caller's timer does
+preempt it: measured 2026-10-12 over 50,000 flushed 512-dimension vectors with
+no index, the search took 111-118 ms unbounded and returned
+`UniError::Timeout` at 24 ms against a 20 ms budget. There is no regression test
+for it, because a fixture large enough to separate the two cleanly takes 25 s
+to load in a debug build and still leaves only a 2x margin.
 
 ### strict_schema
 

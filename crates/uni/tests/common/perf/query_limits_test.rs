@@ -723,6 +723,17 @@ fn disk_manager_default_is_a_real_directory() {
     );
 }
 
+/// Budget for a fixture's own seeding statements.
+///
+/// The same reasoning as `db_with_memory_limit` below, for time: the default
+/// `query_timeout` (30 s) applies to the seeding `UNWIND range(...) CREATE` as
+/// much as to the query under test. A 200 000-row seed takes ~5 s alone in a
+/// debug build and ran past 30 s in a loaded workspace run, failing
+/// `a_full_label_scan_does_not_pay_a_round_trip_per_batch` in its fixture
+/// before it reached the scan it guards. The queries under test keep the
+/// default.
+const SEED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// A database whose only unusual setting is a small query-memory ceiling.
 ///
 /// # Prefer `.max_memory()` on the query
@@ -1121,10 +1132,12 @@ async fn a_graph_scan_reserves_the_batch_it_builds() -> Result<()> {
         .apply()
         .await?;
     let tx = db.session().tx().await?;
-    tx.execute(
+    tx.query_with(
         "UNWIND range(0, 20000) AS i CREATE (:W {k: \
          'a-string-long-enough-to-add-up-across-twenty-thousand-rows-' + toString(i)})",
     )
+    .timeout(SEED_TIMEOUT)
+    .fetch_all()
     .await?;
     tx.commit().await?;
     db.flush().await?;
@@ -1169,11 +1182,13 @@ async fn store_and_id_list() -> Result<(Uni, String)> {
         .apply()
         .await?;
     let tx = db.session().tx().await?;
-    tx.execute(&format!(
+    tx.query_with(&format!(
         "UNWIND range(0, {}) AS i CREATE (:CH {{k: \
          'a-string-long-enough-to-add-up-across-twenty-five-thousand-rows-' + toString(i)}})",
         CHUNKED_SCAN_ROWS - 1
     ))
+    .timeout(SEED_TIMEOUT)
+    .fetch_all()
     .await?;
     tx.commit().await?;
     db.flush().await?;
@@ -1961,6 +1976,7 @@ async fn a_full_label_scan_does_not_pay_a_round_trip_per_batch() -> Result<()> {
     let tx = db.session().tx().await?;
     tx.query_with("UNWIND range(0, $n - 1) AS i CREATE (:Wide {k: i})")
         .param("n", uni_db::Value::Int(ROWS))
+        .timeout(SEED_TIMEOUT)
         .fetch_all()
         .await?;
     tx.commit().await?;

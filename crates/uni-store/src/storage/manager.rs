@@ -3048,7 +3048,7 @@ impl StorageManager {
 
         // Merge L0 buffer vertices into results for visibility of unflushed data.
         if let Some(qctx) = ctx {
-            merge_l0_into_vector_results(&mut results, qctx, label, property, query, k, &metric);
+            merge_l0_into_vector_results(&mut results, qctx, label, property, query, k, &metric)?;
         }
 
         // Exact top-k. The L1 over-fetch (and the no-L0-activity early return in
@@ -3472,7 +3472,7 @@ impl StorageManager {
 
         // Merge L0 buffer vertices for visibility of unflushed data.
         if let Some(qctx) = ctx {
-            merge_l0_into_fts_results(&mut results, qctx, label, property, query, k);
+            merge_l0_into_fts_results(&mut results, qctx, label, property, query, k)?;
         }
         results.truncate(k);
 
@@ -3976,8 +3976,9 @@ fn merge_l0_into_vector_results(
     query: &[f32],
     k: usize,
     metric: &DistanceMetric,
-) {
+) -> Result<()> {
     let buffers = l0_buffers_in_precedence(ctx);
+    let mut deadline = DeadlineTicker::new(ctx);
 
     // Maps VID → distance for L0 candidates (last writer wins).
     let mut l0_candidates: HashMap<Vid, f32> = HashMap::new();
@@ -3994,6 +3995,7 @@ fn merge_l0_into_vector_results(
 
         // Scan vertices with the target label.
         for (&vid, labels) in &buf.vertex_labels {
+            deadline.tick()?;
             if !labels.iter().any(|l| l == label) {
                 continue;
             }
@@ -4020,32 +4022,80 @@ fn merge_l0_into_vector_results(
 
     // If no L0 activity affects this search, skip merge.
     if l0_candidates.is_empty() && tombstoned.is_empty() {
-        return;
+        return Ok(());
     }
 
     // Remove tombstoned VIDs from LanceDB results.
     results.retain(|(vid, _)| !tombstoned.contains(vid));
 
-    // Overwrite or append L0 candidates.
-    for (vid, dist) in &l0_candidates {
-        // Skip a vid the precedence chain ultimately tombstoned: it can be a
-        // live candidate from an earlier buffer while a later buffer deleted it
-        // (that later buffer never revisits it in the label loop, so it stays
-        // in `l0_candidates`). Appending it here would resurrect a deleted
-        // vertex into vector-search results.
-        if tombstoned.contains(vid) {
-            continue;
-        }
-        if let Some(existing) = results.iter_mut().find(|(v, _)| v == vid) {
-            existing.1 = *dist;
-        } else {
-            results.push((*vid, *dist));
-        }
-    }
+    apply_l0_candidates(results, &l0_candidates, &tombstoned);
 
     // Re-sort by distance ascending.
     results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     results.truncate(k);
+    Ok(())
+}
+
+/// Overwrites or appends L0 candidates in `results`.
+///
+/// An L0 score replaces the flushed one for the same vid, and a vid only L0
+/// knows is appended. A vid the precedence chain ultimately tombstoned is
+/// skipped: it can be a live candidate from an earlier buffer while a later
+/// buffer deleted it (that later buffer never revisits it in the label loop, so
+/// it stays in the candidates), and appending it would resurrect a deleted
+/// vertex into the results.
+///
+/// Positions are indexed once. Looking each candidate up by a linear scan of
+/// `results`, which grows as candidates are appended, made a search over N
+/// unflushed rows cost N^2/2 comparisons: 2.2 s for 40,000 rows.
+fn apply_l0_candidates(
+    results: &mut Vec<(Vid, f32)>,
+    candidates: &HashMap<Vid, f32>,
+    tombstoned: &HashSet<Vid>,
+) {
+    let mut position: HashMap<Vid, usize> = HashMap::with_capacity(results.len());
+    for (i, (vid, _)) in results.iter().enumerate() {
+        // The first occurrence, which is the one a linear search would find.
+        position.entry(*vid).or_insert(i);
+    }
+    for (vid, score) in candidates {
+        if tombstoned.contains(vid) {
+            continue;
+        }
+        match position.get(vid) {
+            Some(&i) => results[i].1 = *score,
+            None => {
+                position.insert(*vid, results.len());
+                results.push((*vid, *score));
+            }
+        }
+    }
+}
+
+/// Checks a query's deadline and cancellation every [`Self::EVERY`] rows.
+///
+/// The L0 merges score every unflushed row of a label in one synchronous span,
+/// with no await for the caller's `tokio::time::timeout` to fire at, so a check
+/// of their own is the only thing that can stop them.
+struct DeadlineTicker<'a> {
+    ctx: &'a QueryContext,
+    rows: usize,
+}
+
+impl<'a> DeadlineTicker<'a> {
+    const EVERY: usize = 1024;
+
+    fn new(ctx: &'a QueryContext) -> Self {
+        Self { ctx, rows: 0 }
+    }
+
+    fn tick(&mut self) -> Result<()> {
+        self.rows += 1;
+        if self.rows.is_multiple_of(Self::EVERY) {
+            self.ctx.check_timeout()?;
+        }
+        Ok(())
+    }
 }
 
 /// Collects the live L0 vids carrying `label`, plus the set of vids tombstoned,
@@ -4126,8 +4176,9 @@ fn merge_l0_into_fts_results(
     property: &str,
     query: &str,
     k: usize,
-) {
+) -> Result<()> {
     let buffers = l0_buffers_in_precedence(ctx);
+    let mut deadline = DeadlineTicker::new(ctx);
 
     // Maps VID → relevance score for L0 candidates (last writer wins).
     let mut l0_candidates: HashMap<Vid, f32> = HashMap::new();
@@ -4144,6 +4195,7 @@ fn merge_l0_into_fts_results(
 
         // Scan vertices with the target label.
         for (&vid, labels) in &buf.vertex_labels {
+            deadline.tick()?;
             if !labels.iter().any(|l| l == label) {
                 continue;
             }
@@ -4171,32 +4223,20 @@ fn merge_l0_into_fts_results(
 
     // If no L0 activity affects this search, skip merge.
     if l0_candidates.is_empty() && tombstoned.is_empty() {
-        return;
+        return Ok(());
     }
 
     // Remove tombstoned VIDs from LanceDB results.
     results.retain(|(vid, _)| !tombstoned.contains(vid));
 
-    // Overwrite or append L0 candidates.
-    for (vid, score) in &l0_candidates {
-        // Skip a vid the precedence chain ultimately tombstoned (see the vector
-        // helper above): a later buffer's delete must not be resurrected into
-        // full-text-search results by an earlier buffer's live candidate.
-        if tombstoned.contains(vid) {
-            continue;
-        }
-        if let Some(existing) = results.iter_mut().find(|(v, _)| v == vid) {
-            existing.1 = *score;
-        } else {
-            results.push((*vid, *score));
-        }
-    }
+    apply_l0_candidates(results, &l0_candidates, &tombstoned);
     // A vertex whose current text does not match is not a hit.
     results.retain(|(_, score)| *score > 0.0);
 
     // Re-sort by score descending (higher relevance first).
     results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     results.truncate(k);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4340,5 +4380,112 @@ mod conflict_classification_tests {
             );
         }
         assert!(!is_lance_conflict(&anyhow::anyhow!("schema mismatch")));
+    }
+}
+
+#[cfg(test)]
+mod l0_merge_tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use uni_common::Value;
+
+    /// A context over one L0 buffer holding `n` `Doc` vertices.
+    fn ctx_with_docs(n: u64) -> QueryContext {
+        let mut buf = L0Buffer::new(0, None);
+        let labels = vec!["Doc".to_string()];
+        for i in 0..n {
+            let mut props = uni_common::Properties::new();
+            props.insert(
+                "emb".to_string(),
+                Value::List(vec![Value::Float(i as f64), Value::Float(1.0)]),
+            );
+            props.insert("body".to_string(), Value::String(format!("alpha {i}")));
+            buf.insert_vertex_with_labels(Vid::new(i), props, &labels);
+        }
+        QueryContext::new(Arc::new(parking_lot::RwLock::new(buf)))
+    }
+
+    fn expired(mut ctx: QueryContext) -> QueryContext {
+        let past = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("the clock is more than a second past its origin");
+        ctx.set_deadline(past);
+        ctx
+    }
+
+    /// Both merges score every unflushed row in one synchronous span, so
+    /// nothing above them can stop it; they must check the deadline themselves.
+    #[test]
+    fn the_l0_merges_stop_at_an_expired_deadline() {
+        let ctx = expired(ctx_with_docs(4096));
+        let mut results = Vec::new();
+        let err = merge_l0_into_vector_results(
+            &mut results,
+            &ctx,
+            "Doc",
+            "emb",
+            &[0.0, 1.0],
+            10,
+            &DistanceMetric::L2,
+        )
+        .expect_err("the deadline has passed");
+        assert!(err.to_string().contains("timed out"), "{err}");
+
+        let err = merge_l0_into_fts_results(&mut results, &ctx, "Doc", "body", "alpha", 10)
+            .expect_err("the deadline has passed");
+        assert!(err.to_string().contains("timed out"), "{err}");
+    }
+
+    #[test]
+    fn the_l0_merges_stop_when_cancelled() {
+        let mut ctx = ctx_with_docs(4096);
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        ctx.set_cancellation_token(token);
+        let mut results = Vec::new();
+        let err = merge_l0_into_fts_results(&mut results, &ctx, "Doc", "body", "alpha", 10)
+            .expect_err("the query was cancelled");
+        assert!(err.to_string().contains("cancelled"), "{err}");
+    }
+
+    /// Without a deadline the merge still answers, nearest first.
+    #[test]
+    fn the_l0_vector_merge_ranks_every_unflushed_row() {
+        let ctx = ctx_with_docs(4096);
+        let mut results = Vec::new();
+        merge_l0_into_vector_results(
+            &mut results,
+            &ctx,
+            "Doc",
+            "emb",
+            &[0.0, 1.0],
+            3,
+            &DistanceMetric::L2,
+        )
+        .unwrap();
+        let vids: Vec<u64> = results.iter().map(|(v, _)| v.as_u64()).collect();
+        assert_eq!(vids, vec![0, 1, 2]);
+    }
+
+    /// The indexed merge keeps the linear one's answers: an L0 score replaces a
+    /// flushed one (the first occurrence), a new vid is appended, and a
+    /// tombstoned vid is not resurrected.
+    #[test]
+    fn apply_l0_candidates_overwrites_appends_and_skips_tombstones() {
+        let mut results = vec![(Vid::new(1), 0.1), (Vid::new(2), 0.2), (Vid::new(1), 0.9)];
+        let candidates =
+            HashMap::from([(Vid::new(1), 0.5), (Vid::new(3), 0.3), (Vid::new(4), 0.4)]);
+        let tombstoned = HashSet::from([Vid::new(4)]);
+        apply_l0_candidates(&mut results, &candidates, &tombstoned);
+        assert_eq!(
+            results,
+            vec![
+                (Vid::new(1), 0.5),
+                (Vid::new(2), 0.2),
+                (Vid::new(1), 0.9),
+                (Vid::new(3), 0.3),
+            ]
+        );
     }
 }

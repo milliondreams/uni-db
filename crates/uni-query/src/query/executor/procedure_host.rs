@@ -360,6 +360,9 @@ impl QueryProcedureHost {
         if let Some(deadline) = self.effective_deadline() {
             ctx.set_deadline(deadline);
         }
+        if let Some(token) = self.cancellation_token.clone() {
+            ctx.set_cancellation_token(token);
+        }
         if let Some(counters) = self.counters.clone() {
             ctx.set_counters(counters);
         }
@@ -564,5 +567,23 @@ mod tests {
         assert!(host.check_timeout().is_ok());
         let store_deadline = host.query_context().deadline.expect("a deadline is set");
         assert!(store_deadline > Instant::now());
+    }
+
+    /// The store context a procedure passes to a search carries the query's
+    /// token, so the L0 merges stop on cancellation, not only on the deadline.
+    #[tokio::test]
+    async fn a_hosts_store_context_carries_the_cancellation_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = CancellationToken::new();
+        let graph_ctx = expired_graph_ctx(dir.path())
+            .await
+            .with_cancellation_token(token.clone());
+        let host = QueryProcedureHost::from_graph_ctx(&graph_ctx);
+        token.cancel();
+        let err = host
+            .query_context()
+            .check_timeout()
+            .expect_err("the query was cancelled");
+        assert!(err.to_string().contains("cancelled"), "{err}");
     }
 }

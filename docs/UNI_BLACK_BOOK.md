@@ -6129,10 +6129,16 @@ entirely inside one poll, so only a check of their own can stop them:
   simple executor's `CALL` dispatch and its graph-projection resolver) gets the
   executor's budget through `Executor::procedure_budget`.
 
-The vector, full-text and hybrid search procedures still have no check of their
-own. Their long steps are Lance searches and property reads, which await, so the
-caller's timer should be able to preempt them between those awaits. No test
-measures that.
+- **Searches over unflushed rows.** `StorageManager::vector_search` and
+  `fts_search` score every L0 row of the label in one synchronous span
+  (`merge_l0_into_vector_results` / `merge_l0_into_fts_results`). They check
+  the `QueryContext` every 1024 rows (`DeadlineTicker`), and the procedure host
+  puts both the deadline and the token on that context. The merge used to look
+  each candidate up by a linear scan of a list growing with every append:
+  N^2/2 comparisons, 2.2 s at 40,000 unflushed rows, against 90 ms now.
+
+The Lance side of a search (flushed rows) awaits, so the caller's timer should
+be able to preempt it between those awaits. No test measures that.
 
 ### strict_schema
 

@@ -321,3 +321,52 @@ async fn a_cypher_graph_projection_stops_at_the_callers_deadline() -> Result<()>
     );
     Ok(())
 }
+
+/// A vector or full-text search over unflushed rows is linear in them.
+///
+/// Both merged each unflushed candidate into the results by a linear search of
+/// a list that grew with every append, so 40,000 rows took 2.2 s in a debug
+/// build, against about 0.1 s now. The ceiling sits between the two.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_search_over_unflushed_rows_is_linear_in_them() -> Result<()> {
+    const ROWS: usize = 40_000;
+    const CEILING: Duration = Duration::from_millis(600);
+    // Keep every row in L0: a flush would move them to Lance and off this path.
+    let db = Uni::in_memory()
+        .config(uni_common::config::UniConfig {
+            auto_flush_threshold: usize::MAX,
+            auto_flush_interval: None,
+            ..Default::default()
+        })
+        .build()
+        .await?;
+    let tx = db.session().tx().await?;
+    tx.execute(&format!(
+        "UNWIND range(1, {ROWS}) AS i \
+         CREATE (:Doc {{emb: [toFloat(i), 1.0, 2.0, 3.0], body: 'alpha ' + toString(i)}})"
+    ))
+    .await?;
+    tx.commit().await?;
+
+    for (name, query) in [
+        (
+            "vector",
+            "CALL uni.vector.query('Doc', 'emb', [1.0, 1.0, 2.0, 3.0], 10) \
+             YIELD node RETURN count(*) AS c",
+        ),
+        (
+            "fts",
+            "CALL uni.fts.query('Doc', 'body', 'alpha', 10) YIELD node RETURN count(*) AS c",
+        ),
+    ] {
+        let started = Instant::now();
+        let rows = db.session().query(query).await?;
+        let elapsed = started.elapsed();
+        assert_eq!(rows.rows()[0].get::<i64>("c")?, 10, "{name}");
+        assert!(
+            elapsed < CEILING,
+            "{name} search over {ROWS} unflushed rows took {elapsed:?}"
+        );
+    }
+    Ok(())
+}

@@ -5219,7 +5219,7 @@ impl Writer {
                 };
 
             for (vid, props) in &old_l0.vertex_properties {
-                let version = old_l0.vertex_versions.get(vid).copied().unwrap_or(0);
+                let version = old_l0.vertex_write_version(*vid);
                 // Collect timestamps for this vertex
                 if let Some(&ts) = old_l0.vertex_created_at.get(vid) {
                     vertex_created_at.insert(*vid, ts);
@@ -5471,7 +5471,7 @@ impl Writer {
             // ext_id-uniqueness path; we keep the Append here. The
             // per-label Lance write IS partial via MergeInsert.
             for (vid, props) in &old_l0.vertex_properties {
-                let version = old_l0.vertex_versions.get(vid).copied().unwrap_or(0);
+                let version = old_l0.vertex_write_version(*vid);
                 let labels = old_l0.vertex_labels.get(vid).cloned().unwrap_or_default();
                 vertices.push((*vid, labels, props.clone(), false, version));
             }
@@ -5514,7 +5514,7 @@ impl Writer {
                 })
                 .map(|vid| {
                     let labels = old_l0.vertex_labels.get(vid).cloned().unwrap_or_default();
-                    let version = old_l0.vertex_versions.get(vid).copied().unwrap_or(0);
+                    let version = old_l0.vertex_write_version(*vid);
                     (*vid, labels, version)
                 })
                 .collect()

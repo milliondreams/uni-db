@@ -122,3 +122,71 @@ async fn label_only_mutation_survives_flush_and_reopen() {
         drop(db);
     }
 }
+
+/// `labels(n)` after a flushed relabel is the new label set.
+///
+/// The flush re-appended the relabeled vertex's main-table row at version 0,
+/// because a label-only mutation stamped no version. The vertex's older row,
+/// carrying the old labels, then won every latest-version read: `labels(n)`
+/// reverted, and a search over the label's flushed rows still found the
+/// vertex under the label it had left. The per-label tables hid it from
+/// `MATCH (n:B)` counts on declared labels, which is all the test above reads.
+#[tokio::test]
+async fn label_only_mutation_survives_flush_in_labels() {
+    for declared in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap().to_string();
+        let config = UniConfig {
+            auto_flush_threshold: 100_000,
+            auto_flush_interval: None,
+            disable_fork_sweeper: true,
+            disable_fork_index_builder: true,
+            ..Default::default()
+        };
+        let labels = |rows: uni_db::QueryResult| -> Vec<uni_db::Value> {
+            rows.rows().iter().map(|r| r.values()[0].clone()).collect()
+        };
+        let expected = vec![uni_db::Value::List(vec![uni_db::Value::String(
+            "B".to_string(),
+        )])];
+        let query = "MATCH (n) WHERE n.val = 42 RETURN labels(n)";
+        {
+            let db = Uni::open(&uri)
+                .config(config.clone())
+                .build()
+                .await
+                .unwrap();
+            if declared {
+                for label in ["A", "B"] {
+                    db.schema()
+                        .label(label)
+                        .property("val", DataType::Int64)
+                        .apply()
+                        .await
+                        .unwrap();
+                }
+            }
+            let session = db.session();
+            let tx = session.tx().await.unwrap();
+            tx.execute("CREATE (:A {val: 42})").await.unwrap();
+            tx.commit().await.unwrap();
+            db.flush().await.unwrap();
+            let tx = session.tx().await.unwrap();
+            tx.execute("MATCH (n:A) SET n:B REMOVE n:A").await.unwrap();
+            tx.commit().await.unwrap();
+            db.flush().await.unwrap();
+            assert_eq!(
+                labels(session.query(query).await.unwrap()),
+                expected,
+                "declared={declared}: after the flush"
+            );
+            db.shutdown().await.unwrap();
+        }
+        let db = Uni::open(&uri).config(config).build().await.unwrap();
+        assert_eq!(
+            labels(db.session().query(query).await.unwrap()),
+            expected,
+            "declared={declared}: after reopen"
+        );
+    }
+}

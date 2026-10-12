@@ -168,6 +168,15 @@ pub struct L0Buffer {
     /// (not append) these vids' labels and `WriteSet::from_l0` knows they are
     /// conflictable writes. A transaction-buffer concept; empty on main L0.
     pub vertex_label_overwrites: HashSet<Vid>,
+    /// Version of each vid's latest label mutation in this buffer.
+    ///
+    /// Kept apart from `vertex_versions` because the L0 read paths take a
+    /// `vertex_versions` entry to mean that this buffer holds the vertex's
+    /// newest *properties*; a relabel holds none, and stamping it there made
+    /// the scans drop the flushed properties. Read only by the flush, which
+    /// stamps a relabeled vertex's re-appended row with it (see
+    /// [`L0Buffer::vertex_write_version`]).
+    pub vertex_label_versions: HashMap<Vid, u64>,
     /// Edge types (EID -> type name)
     pub edge_types: HashMap<Eid, String>,
     /// Current version counter
@@ -308,6 +317,7 @@ impl Clone for L0Buffer {
             vertex_labels: self.vertex_labels.clone(),
             label_to_vids: self.label_to_vids.clone(),
             vertex_label_overwrites: self.vertex_label_overwrites.clone(),
+            vertex_label_versions: self.vertex_label_versions.clone(),
             edge_types: self.edge_types.clone(),
             current_version: self.current_version,
             mutation_count: self.mutation_count,
@@ -414,7 +424,22 @@ impl L0Buffer {
         self.index_labels_for_vid(vid, labels);
         self.vertex_label_overwrites.insert(vid);
         self.current_version += 1;
+        // Without a version the flush re-appended the relabeled row at version
+        // 0, and the vertex's older row, which still carried the old labels,
+        // won every latest-version read: the flush undid the relabel.
+        self.vertex_label_versions.insert(vid, self.current_version);
         self.mutation_count += 1;
+    }
+
+    /// Version of `vid`'s latest write in this buffer, properties or labels.
+    ///
+    /// What the flush stamps on the vertex's rows. A relabel after a property
+    /// write in the same buffer is the later write, and a pure relabel has no
+    /// `vertex_versions` entry at all.
+    pub fn vertex_write_version(&self, vid: Vid) -> u64 {
+        let props = self.vertex_versions.get(&vid).copied().unwrap_or(0);
+        let labels = self.vertex_label_versions.get(&vid).copied().unwrap_or(0);
+        props.max(labels)
     }
 
     /// Merge CRDT properties into an existing property map.
@@ -572,6 +597,7 @@ impl L0Buffer {
         total += self.vertex_tombstones.len() * 8;
         total += self.edge_versions.len() * 16;
         total += self.vertex_versions.len() * 16;
+        total += self.vertex_label_versions.len() * 16;
         total += self.edge_endpoints.len() * 28; // (Vid, Vid, u32) = 8+8+4 + overhead
 
         // Vertex labels
@@ -611,6 +637,7 @@ impl L0Buffer {
             vertex_labels: HashMap::new(),
             label_to_vids: HashMap::new(),
             vertex_label_overwrites: HashSet::new(),
+            vertex_label_versions: HashMap::new(),
             edge_types: HashMap::new(),
             current_version: start_version,
             mutation_count: 0,
@@ -1591,6 +1618,11 @@ impl L0Buffer {
             self.remove_vid_from_label_index(*vid);
             self.vertex_labels.insert(*vid, labels.clone());
             self.index_labels_for_vid(*vid, &labels);
+            // The relabel is a write at this buffer's next version, as in
+            // `set_vertex_labels`; the flush stamps the re-appended row with it.
+            self.current_version += 1;
+            self.vertex_label_versions
+                .insert(*vid, self.current_version);
             // Carry the overwrite flag into the persistent (main) buffer so a
             // pure relabel of a prior-window vid — which is absent from
             // `vertex_properties` — is still re-derived at flush (M8). The
@@ -1775,6 +1807,7 @@ impl L0Buffer {
                     // replayed removal removes; clears the old reverse-index
                     // entries first.
                     self.current_version += 1;
+                    self.vertex_label_versions.insert(vid, self.current_version);
                     self.remove_vid_from_label_index(vid);
                     self.vertex_labels.insert(vid, labels.clone());
                     self.index_labels_for_vid(vid, &labels);

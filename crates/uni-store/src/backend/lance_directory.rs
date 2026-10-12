@@ -171,13 +171,42 @@ impl LanceDirectory {
                     .with_context(|| format!("list tables under '{}'", self.base_uri));
             }
         };
-        let mut names: Vec<String> = entries
+        let mut names = Vec::new();
+        for name in entries
             .iter()
             .filter_map(|entry| entry.strip_suffix(&format!(".{LANCE_EXTENSION}")))
-            .map(String::from)
-            .collect();
+        {
+            if self.is_committed(name).await? {
+                names.push(name.to_string());
+            }
+        }
         names.sort();
         Ok(names)
+    }
+
+    /// Whether `table` has a committed version.
+    ///
+    /// A Lance dataset exists once its first manifest is committed under
+    /// `_versions/`, and creating one writes the data files first. A create cut
+    /// off midway (a crash, or a runtime shut down during a label's first
+    /// flush) therefore leaves `<table>.lance/` holding data and no manifest.
+    /// Counting that directory as a table made every open of it fail, for reads
+    /// and for the flush that would recreate it, and with the WAL on it made
+    /// the store refuse to open at all: the issue #72 guard saw WAL segments, a
+    /// table and no snapshot manifest.
+    async fn is_committed(&self, table: &str) -> Result<bool> {
+        let versions = self
+            .base_path
+            .clone()
+            .join(format!("{table}.{LANCE_EXTENSION}"))
+            .join("_versions");
+        match self.store.read_dir(versions).await {
+            Ok(entries) => Ok(entries.iter().any(|e| e.ends_with(".manifest"))),
+            Err(e) if is_not_found(&e) => Ok(false),
+            Err(e) => {
+                Err(anyhow::anyhow!(e)).with_context(|| format!("list versions of table '{table}'"))
+            }
+        }
     }
 
     /// Open `table` at its latest version.

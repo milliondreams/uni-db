@@ -1097,6 +1097,17 @@ best-effort flush stays. `storage::shutdown_test::dropping_without_shutdown_leav
 pins both halves: no manifest is written after a bare drop, and the row is
 back after a reopen.
 
+A table exists only once its first manifest is committed. Lance writes a new
+dataset's data files before that manifest, so a create cut off midway (a crash,
+or a runtime shut down during a label's first flush) leaves `<table>.lance/`
+with data and no `_versions/`. `LanceDirectory::table_names` and, on the fork
+path, `LanceBranching::table_exists` used to count the directory: every open of
+it then failed, and with the WAL on the issue #72 guard refused to open the
+store at all (WAL segments, a table, no snapshot manifest). Both now require a
+`.manifest` under `_versions/`. Pinned by
+`storage::shutdown_test::an_interrupted_first_create_does_not_wedge_the_store`
+and `a_fork_writes_past_an_interrupted_first_create`.
+
 Two teardown paths, deliberately different:
 
 - **`shutdown()` / `shutdown_in_place()`** awaits every tracked task via

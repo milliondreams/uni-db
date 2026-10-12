@@ -867,6 +867,21 @@ pub struct LanceBranching {
     base_uri: String,
 }
 
+/// Whether the local dataset at `dataset` has a committed version.
+///
+/// A Lance dataset exists once its first manifest is committed under
+/// `_versions/`; creating one writes the data files first, so a create cut off
+/// midway leaves the directory without one. Mirrors
+/// `LanceDirectory::is_committed`, which answers the same question for the
+/// primary backend.
+fn has_committed_manifest(dataset: &std::path::Path) -> bool {
+    std::fs::read_dir(dataset.join("_versions")).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().ends_with(".manifest"))
+    })
+}
+
 impl LanceBranching {
     /// Adapter over the Lance datasets under `base_uri`.
     pub fn new(base_uri: impl Into<String>) -> Self {
@@ -967,7 +982,7 @@ impl ForkBranching for LanceBranching {
         if uri.contains("://") {
             return Ok(true);
         }
-        Ok(std::path::Path::new(&uri).exists())
+        Ok(has_committed_manifest(std::path::Path::new(&uri)))
     }
 
     async fn create_tag(&self, table: &str, tag: &str, branch: &str) -> Result<()> {

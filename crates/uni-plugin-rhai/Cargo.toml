@@ -62,6 +62,11 @@ opentelemetry_sdk = "0.32"
 tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+# Thread CPU time for the guest MCTS throughput floor: wall-clock under a full
+# parallel test run counts the time the test waited for a core, not its work.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
 # Batched-descent MCTS in Rhai — the #152 question: is an interpreted body viable
 # at batch granularity, where `require_compiled_body` disqualified it per-step?
 [[bench]]

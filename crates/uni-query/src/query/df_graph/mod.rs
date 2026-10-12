@@ -148,6 +148,43 @@ pub use locy_priority::PriorityExec;
 pub use locy_program::{DerivedStore, LocyProgramExec};
 pub use locy_traits::{DerivedFactSource, LocyExecutionContext};
 
+/// A query deadline that excuses the time a cursor's consumer spent idle.
+///
+/// The configured deadline plus the idle credit the streaming drain loop
+/// accumulates. The credit is shared, so every holder sees credit granted after
+/// it took the clock — which a copied `Instant` cannot.
+#[derive(Debug, Clone)]
+pub(crate) struct DeadlineClock {
+    deadline: Option<Instant>,
+    credit: Arc<AtomicU64>,
+}
+
+impl DeadlineClock {
+    /// The deadline as of now, with all idle credit granted so far.
+    pub(crate) fn effective(&self) -> Option<Instant> {
+        effective_deadline(self.deadline, &self.credit)
+    }
+
+    /// Whether there is a deadline to enforce at all.
+    pub(crate) fn is_set(&self) -> bool {
+        self.deadline.is_some()
+    }
+}
+
+/// `deadline` pushed back by `credit` nanoseconds of consumer idle time.
+///
+/// `None` when there is no deadline, or when the credit overflows the instant —
+/// the consumer has idled longer than any representable budget, so there is
+/// nothing left to enforce.
+fn effective_deadline(deadline: Option<Instant>, credit: &AtomicU64) -> Option<Instant> {
+    let credit = Duration::from_nanos(credit.load(Ordering::Relaxed));
+    match deadline {
+        Some(deadline) if credit.is_zero() => Some(deadline),
+        Some(deadline) => deadline.checked_add(credit),
+        None => None,
+    }
+}
+
 /// Shared context for graph operators.
 ///
 /// Provides access to graph-specific resources needed during query execution:
@@ -505,12 +542,28 @@ impl GraphExecutionContext {
     /// overflow the instant, which means the consumer has idled longer than any
     /// representable budget and there is nothing left to enforce.
     fn effective_deadline(&self) -> Option<Instant> {
-        let credit = Duration::from_nanos(self.deadline_credit.load(Ordering::Relaxed));
-        match self.deadline {
-            Some(deadline) if credit.is_zero() => Some(deadline),
-            Some(deadline) => deadline.checked_add(credit),
-            None => None,
+        effective_deadline(self.deadline, &self.deadline_credit)
+    }
+
+    /// This query's deadline as a live clock rather than a snapshot.
+    ///
+    /// For a check that runs later than this call — a deadline guard inside the
+    /// plan, a sub-plan's own context. An `Instant` taken now misses every idle
+    /// credit granted after it, so a slow cursor consumer is charged its
+    /// think-time by whatever holds the snapshot.
+    pub(crate) fn deadline_clock(&self) -> DeadlineClock {
+        DeadlineClock {
+            deadline: self.deadline,
+            credit: Arc::clone(&self.deadline_credit),
         }
+    }
+
+    /// Adopt `clock` as this context's deadline, sharing its idle credit.
+    #[must_use]
+    pub(crate) fn with_deadline_clock(mut self, clock: &DeadlineClock) -> Self {
+        self.deadline = clock.deadline;
+        self.deadline_credit = Arc::clone(&clock.credit);
+        self
     }
 
     /// Excuse `idle` from this query's deadline.

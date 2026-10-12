@@ -559,6 +559,26 @@ impl HybridPhysicalPlanner {
         self
     }
 
+    /// Inherit an enclosing query's deadline clock and cancellation token.
+    ///
+    /// For a sub-plan. Unlike [`Self::with_deadline_and_cancellation`], which
+    /// takes a snapshot, the clock shares the enclosing query's idle credit, so
+    /// a sub-plan still running after a cursor's consumer paused is not charged
+    /// that pause.
+    #[must_use]
+    pub(crate) fn with_inherited_deadline(
+        mut self,
+        clock: &crate::query::df_graph::DeadlineClock,
+        token: Option<tokio_util::sync::CancellationToken>,
+    ) -> Self {
+        let mut ctx = self.take_graph_ctx().with_deadline_clock(clock);
+        if let Some(token) = token {
+            ctx = ctx.with_cancellation_token(token);
+        }
+        self.graph_ctx = Arc::new(ctx);
+        self
+    }
+
     /// Attach the per-query counter set, threading it into the graph context
     /// every physical operator receives.
     #[must_use]
@@ -929,7 +949,7 @@ impl HybridPhysicalPlanner {
     fn guard_deadlines(&self, plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
         crate::query::df_graph::deadline_guard::insert_deadline_guards(
             plan,
-            self.graph_ctx.deadline_for_host(),
+            &self.graph_ctx.deadline_clock(),
             self.graph_ctx.cancellation_token_for_host().as_ref(),
         )
         .map_err(Into::into)

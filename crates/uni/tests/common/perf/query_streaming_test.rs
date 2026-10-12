@@ -226,3 +226,40 @@ async fn a_slow_consumer_is_not_charged_the_query_budget() -> Result<()> {
     );
     Ok(())
 }
+
+/// A slow consumer is not charged the budget through the deadline guards.
+///
+/// Above a pipeline breaker every operator emits incrementally again, so a
+/// `DeadlineGuardExec` sitting over a sort is polled once per output batch —
+/// after the consumer's think-time, not only while the sort drains its input.
+#[tokio::test]
+async fn a_slow_consumer_of_a_sorted_result_is_not_charged_the_query_budget() -> Result<()> {
+    for query in [
+        "MATCH (p:P) RETURN p.n ORDER BY p.n",
+        "MATCH (p:P) RETURN p.n AS n, count(*) AS c",
+    ] {
+        let db = multi_batch_store(uni_db::UniConfig {
+            batch_size: 8192,
+            max_query_memory: 256_000_000,
+            query_timeout: std::time::Duration::from_secs(3),
+            ..Default::default()
+        })
+        .await?;
+
+        let mut cursor = db.session().query_with(query).cursor().await?;
+
+        let mut delivered = 0usize;
+        while let Some(batch) = cursor.next_batch().await {
+            delivered += batch?.len();
+            // Cumulative sleep exceeds the 3 s budget across the four batches.
+            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        }
+
+        assert_eq!(
+            delivered,
+            usize::try_from(MULTI_BATCH_ROWS).expect("fits"),
+            "{query}: a slow consumer lost rows to the query deadline"
+        );
+    }
+    Ok(())
+}

@@ -6076,6 +6076,31 @@ When a path query is refused, the three cases read as:
 | Timeout on an unbounded pattern | The path set is combinatorial; no limit was declared | Add an upper hop bound, or a `LIMIT` — see the batch-granularity table in Part VII |
 | `QueryWarning` about a safety cap, with rows returned | The *search* was abandoned; rows are incomplete | Narrow with a hop bound, a relationship type, or a target label |
 
+### What `query_timeout` charges a cursor
+
+`query_timeout` bounds the query's work, not the wall clock since a cursor
+opened. A cursor pages a result that is produced as it is read, so the time the
+caller spends between batches belongs to the caller: the streaming drain loop in
+`execute_stream` (`executor/read.rs`) credits that idle time back to the
+deadline before it asks the plan for more, and the cursor in `impl_query.rs`
+budgets only the time spent awaiting the executor.
+
+Every in-plan check must therefore read the deadline **live**.
+`GraphExecutionContext::deadline_clock()` returns a `DeadlineClock` — the
+configured deadline plus the shared credit counter — and that is what anything
+checking after planning time holds: the `DeadlineGuardExec` checkpoints (#283)
+and a sub-plan's own context (`with_inherited_deadline`). A copied `Instant`
+misses every credit granted after it was taken. That was a real defect: the
+guards held a plan-time `Instant`, and a guard sits over a sort or aggregate,
+which is polled once per *output* batch, so any slowly-read cursor over an
+`ORDER BY` or a grouped result timed out after its consumer had idled past the
+budget (`a_slow_consumer_of_a_sorted_result_is_not_charged_the_query_budget`).
+
+Still a snapshot, and not yet checked against a slow cursor:
+`QueryProcedureHost` hands `uni-store`'s `QueryContext` an `Instant` taken when
+the host is built. It is only correct if no consumer idle can fall between that
+moment and the procedure's last deadline check.
+
 ### strict_schema
 
 When enabled, CREATE and MERGE operations that reference a label or edge type not declared in the schema are rejected with an error. This enforces schema-first discipline and catches typos at write time. Properties are not affected — unknown properties still go to overflow.

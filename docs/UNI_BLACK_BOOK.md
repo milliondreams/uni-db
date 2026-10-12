@@ -1108,6 +1108,12 @@ store at all (WAL segments, a table, no snapshot manifest). Both now require a
 `storage::shutdown_test::an_interrupted_first_create_does_not_wedge_the_store`
 and `a_fork_writes_past_an_interrupted_first_create`.
 
+`UniSync` owns its runtime, so its `Drop` runs the full `shutdown()` (outside an
+async context; inside one it only signals). It used to signal and drop the
+runtime at once, which cut off the WAL-off final flush: the commit was lost, or
+the half-created dataset above was left behind
+(`e2e::api_sync_test::dropping_a_unisync_persists_its_commits_without_the_wal`).
+
 Two teardown paths, deliberately different:
 
 - **`shutdown()` / `shutdown_in_place()`** awaits every tracked task via

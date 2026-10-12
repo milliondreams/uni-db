@@ -17,7 +17,7 @@ curated regression inputs under several hundred generated files. (Measured:
 hundreds of untracked files rather than anything louder.
 
 Seeds also cover **timeouts**, not just crashes. Exponential backtracking in the
-grammar is the failure this corpus has caught twice, and a 30-second blind run
+grammar is the failure this corpus has caught three times, and a 30-second blind run
 rediscovers it only by luck — the nightly found the second instance three times
 in eight nights.
 
@@ -34,3 +34,11 @@ in eight nights.
 - `cypher_parse/nested-valid-map-pattern` — the same defect reached through a
   **valid** query, `RETURN (a {k: (a {k: ... }) })`. Worth keeping separate: a
   mitigation aimed at malformed or unclosed input would leave this one hanging.
+- `locy_parse/list-comprehension-in-timeout` — the 338-byte PR-lane artifact
+  (2026-10-11): unclosed `[x IN` runs. `list_expression` tried a comprehension,
+  then a literal, and both parsed the source after `IN`, so the work doubled per
+  level (36.7 s pre-fix). `locy_parse/list-comprehension-in-minimal` is its
+  core, `[x IN ` 18 times (35.5 s pre-fix).
+- `cypher_parse/nested-valid-in-led-literal` — the same defect through a
+  **valid** query, `RETURN [x IN [x IN ... [1], 1], 1]` at depth 16 (10.3 s
+  pre-fix).

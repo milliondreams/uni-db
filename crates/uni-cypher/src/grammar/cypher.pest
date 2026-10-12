@@ -402,11 +402,18 @@ ws_or_comment = @{
 // LIST EXPRESSIONS
 // ═══════════════════════════════════════════════════════════════════════════
 
+// `[x IN src ...` starts both a comprehension and a literal whose first element
+// is `x IN src ...`. Both readings parse `src` identically, so it is parsed once,
+// in `list_comprehension_body`, and the token after it decides: `,` / AND / XOR /
+// OR continue a literal (`list_literal_tail`), anything else a comprehension. The
+// literal alternative refuses that prefix outright. Trying the two readings in
+// turn re-parsed `src` per alternative, doubling the work per nesting level --
+// `[x IN [x IN ... [1], 1], 1]`, a valid query, took 2.6 s at depth 14.
 list_expression = {
     "[" ~ "]"                                                 // Empty list
     | "[" ~ pattern_comprehension_body ~ "]"                  // Pattern comprehension
-    | "[" ~ list_comprehension_body ~ "]"                     // List comprehension  
-    | "[" ~ expression ~ ("," ~ expression)* ~ "]"            // List literal
+    | "[" ~ list_comprehension_body ~ "]"                     // List comprehension, or a literal led by `x IN src`
+    | "[" ~ !(identifier ~ IN) ~ expression ~ ("," ~ expression)* ~ "]" // List literal
 }
 
 // Pattern comprehension: [p = (n)-->(m) WHERE ... | expr] or [(n)-->(m) | expr]
@@ -416,8 +423,22 @@ pattern_comprehension_body = {
 
 // List comprehension: [x IN list WHERE pred | expr] or [x IN list WHERE pred] or [x IN list | expr]
 list_comprehension_body = {
-    identifier ~ IN ~ comprehension_source ~ (WHERE ~ expression)? ~ (pipe ~ expression)?
+    identifier ~ IN ~ comprehension_source ~ (
+        list_literal_tail
+        | (WHERE ~ expression)? ~ (pipe ~ expression)?
+    )
 }
+
+// The rest of a list literal whose first element began `x IN src`: that
+// element's AND, XOR and OR operands, by precedence, then further elements.
+list_literal_tail = {
+    &(AND | XOR | OR | ",")
+    ~ literal_and_operands ~ literal_xor_operands ~ literal_or_operands
+    ~ ("," ~ expression)*
+}
+literal_and_operands = { (AND ~ not_expression)* }
+literal_xor_operands = { (XOR ~ and_expression)* }
+literal_or_operands  = { (OR ~ xor_expression)* }
 
 // Source expression for IN clause - stops before pipe to avoid ambiguity
 // Uses comparison_expression which doesn't include pipe

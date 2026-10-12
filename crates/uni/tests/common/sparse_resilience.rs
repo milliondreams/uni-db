@@ -427,7 +427,7 @@ async fn sparse_corrupt_wal_tail_skipped_on_reopen() -> Result<()> {
 // ── The same seams under a real process abort ────────────────────────────────
 //
 // Siblings of the three crash tests above, run under `SIGABRT` in a child
-// process instead of a panic followed by a `Drop` that still flushes. See
+// process instead of a panic followed by a `Drop`. See
 // `common/crash_harness.rs`.
 
 /// The baseline sparse vector used where the panic-path tests inline it.

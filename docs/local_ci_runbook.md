@@ -202,9 +202,11 @@ Two things worth knowing:
   `fail_point!` seam, add its test to a file matching the filter above, or it
   will be dormant on arrival.
 * **A "crash" test that panics and drops the `Uni` is not testing a crash.**
-  `Drop for Uni` broadcasts shutdown, and the auto-flush task answers with a
-  full `flush_to_l1` that nothing awaits — so the test gets graceful-close
-  semantics, racing its own reopen. For real crash semantics use the abort
+  `Drop for Uni` broadcasts shutdown and runs destructors; background tasks
+  finish what they started, and with the WAL off the auto-flush task answers
+  with a full `flush_to_l1` that nothing awaits — so the test gets
+  graceful-close semantics, racing its own reopen. (With the WAL on, the
+  default, that final flush no longer runs.) For real crash semantics use the abort
   harness in `crates/uni/tests/common/crash_harness.rs`: it re-invokes this
   test binary as a child and kills it with `SIGABRT` at the seam. Grep for
   `abort_child` for the pattern. Keep the panic-path test too where the

@@ -22,8 +22,10 @@ use uni_store::store_utils::{DEFAULT_TIMEOUT, delete_with_timeout, list_with_tim
 
 /// A fixture database with the time-based auto-flush timer disabled.
 ///
-/// `Drop for Uni` broadcasts shutdown and the auto-flush task answers with a
-/// full `flush_to_l1` that **nothing awaits**. These tests delete manifest files
+/// `Drop for Uni` broadcasts shutdown, and the auto-flush task used to answer
+/// with a full `flush_to_l1` that **nothing awaits**. With the WAL on it no
+/// longer flushes on that signal, but the timer itself would still flush
+/// mid-test, so it stays off. These tests delete manifest files
 /// after the `Uni` goes out of scope, so that un-awaited flush can land *after*
 /// the deletion and put a manifest back — turning "no manifest" into "manifest
 /// present" and the assertion into a coin flip. It passed alone and failed in

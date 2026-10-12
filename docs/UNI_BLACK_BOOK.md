@@ -1080,10 +1080,22 @@ held as an `Arc` by `UniInner` *and* by every task registered through
 `track_task_with_scratch_claim`, so the directory cannot be removed while a
 task that might write to it is still running. This is not a theoretical
 concern: several tasks write precisely *because* shutdown was signalled — the
-auto-flush task performs a final flush on its way out. With the guard owned
+index rebuild worker saves its state, compaction finishes its run, and, with
+the WAL off, the auto-flush task performs a final flush. With the guard owned
 solely by `UniInner`, teardown removed the directory *successfully* and that
 final flush then recreated the tree, leaving a directory containing exactly
 `storage/catalog/latest` plus one manifest. Measured at 39/40 bare drops.
+
+With the WAL on (the default), the auto-flush task does **not** flush on the
+shutdown signal. Every commit is in the WAL before it returns and a reopen
+replays it, so a final flush bought only a shorter replay; `shutdown()`
+flushes before it signals, so it found nothing to do there; and on a bare
+`Drop` nothing awaited it, so a runtime shutting down right after the drop cut
+it off midway (Lance panics on the cancelled `spawn_blocking`: `Background task
+failed: JoinError::Cancelled`). Without the WAL, L0 is the only copy and the
+best-effort flush stays. `storage::shutdown_test::dropping_without_shutdown_leaves_the_data_to_the_wal`
+pins both halves: no manifest is written after a bare drop, and the row is
+back after a reopen.
 
 Two teardown paths, deliberately different:
 

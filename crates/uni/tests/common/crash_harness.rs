@@ -7,9 +7,11 @@
 //!
 //! Every other "crash" test in this repo panics inside a `tokio::spawn` and then
 //! drops the `Uni`. That is not a crash. `Drop for Uni` broadcasts the shutdown
-//! signal, and the auto-flush task responds by running a full `flush_to_l1` —
-//! the same call `shutdown_in_place` makes. `auto_flush_interval` defaults to
-//! `Some(5s)`, so it is armed in essentially every one of those tests.
+//! signal, and the auto-flush task used to respond by running a full
+//! `flush_to_l1` — the same call `shutdown_in_place` makes. It still does when
+//! the WAL is off; with the WAL on, it no longer flushes on that signal. Even
+//! so, a drop runs destructors and lets background tasks finish what they
+//! started, which an abort does not.
 //!
 //! So they validate *graceful-close* atomicity, which is strictly weaker than
 //! crash atomicity, and the two have already diverged in practice: #167's
@@ -17,8 +19,8 @@
 //! behaviour. `ssi_resilience.rs` concedes in prose that the bug one of its
 //! tests regresses was reachable only on the graceful-close path.
 //!
-//! They are also racy rather than merely weak. `Uni::drop` does not await that
-//! final flush, so it races the reopen — which is why one test has to set
+//! They were also racy rather than merely weak. `Uni::drop` did not await that
+//! final flush, so it raced the reopen — which is why one test sets
 //! `auto_flush_interval: None` to stop a flake.
 //!
 //! A `SIGABRT` has none of that. No unwinding, no destructors, no atexit

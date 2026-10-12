@@ -1,8 +1,8 @@
 diff --git a/crates/uni-query/src/query/df_graph/mod.rs b/crates/uni-query/src/query/df_graph/mod.rs
-index b378fd073..f68d8b866 100644
+index d0be124..212f682 100644
 --- a/crates/uni-query/src/query/df_graph/mod.rs
 +++ b/crates/uni-query/src/query/df_graph/mod.rs
-@@ -548,7 +548,9 @@ impl GraphExecutionContext {
+@@ -663,7 +663,9 @@ impl GraphExecutionContext {
              return Some(Vec::new());
          }
          uni_store::runtime::l0_visibility::get_vertex_labels_optional(vid, query_ctx)
@@ -12,4 +12,4 @@ index b378fd073..f68d8b866 100644
 +            .or_else(|| None)
      }
  
-     /// Wall-clock deadline for the surrounding query, if any.
+     /// Wall-clock deadline for the surrounding query, if any, as of now.

@@ -1223,6 +1223,33 @@ A unified table containing all vertices regardless of label:
 
 The main table enables cross-label queries without scanning every per-label table.
 
+**Decoding a stored value keeps its type.** `props_json` is a CypherValue map.
+`MainVertexDataset` decodes it straight into `Value`s (`decode_props_blob`). A
+column value is decoded by `value_codec::decode_column_value`, which hands
+every type except a CRDT (or a list of CRDTs) to `arrow_to_value`. Both used to
+go through `serde_json::Value`, which kept the shape and lost the type: a
+temporal became a string, a vector a plain list, and a `List<DateTime>` a list
+of strings. That mattered because several paths read a row, change one thing
+and write the row back:
+- the flush of a relabeled vertex;
+- `SET` of another property (`insert_vertex_partial`);
+- edge `SET`;
+- semantic compaction.
+
+Each of them stored the converted value. The type was lost on disk, and where
+the column could not hold the string the value became NULL: every Duration
+column, and a declared DateTime column after a relabel.
+
+**A list column holds any element type.** Both the flush writer
+(`PropertyExtractor::build_list_column`) and the L0 batch builder
+(`build_list_property_column`) build a list's elements as one child column with
+the scalar builder for the element type. Before, the flush supported lists of
+String, Int64, Float64, Bytes and Vector only. A declared `List<DateTime>` (or
+Date, Time, Duration, Bool, Int32, Float32) was accepted, written and read in
+memory, and then failed the flush ("Unsupported inner type for List"), so the
+data could not be flushed. The L0 builder wrote each element's `Debug` text
+into a `Utf8` child, and the read failed against the declared type.
+
 ### Overflow Properties (Schemaless)
 
 Properties not defined in the schema are stored in the `overflow_json` column as JSONB binary. Queries against overflow properties are automatically rewritten to use Lance JSONB functions (`json_get_string`, `json_get_int`, etc.).
@@ -3325,6 +3352,39 @@ CREATE FULLTEXT INDEX article_fts FOR (a:Article) ON EACH [a.content] OPTIONS {
 
 18-language stemming and stop-words plus ngram tokenization are supported (`TokenizerConfig::Analyzer`); CJK requires dictionary files under `LANCE_LANGUAGE_MODEL_HOME`.
 
+### Unflushed rows in a search
+
+A vector or full-text search asks the backend about flushed rows and merges the
+unflushed (L0) rows in afterwards. Two rules make the merged answer the one the
+search gives after a flush:
+
+- **The `filter` applies to unflushed rows too.** It used to reach only the
+  backend scan, so `filter: 'id = 2'` returned every unflushed row, and an
+  unflushed update that moved a flushed row out of the filter left it matching.
+  `StorageManager::l0_rows_failing_filter` lays the label's L0 rows out as its
+  table (`build_l0_vertex_batch`) and asks `StorageBackend::filter_batch`, which
+  the Lance backend answers with Lance's own filter planner. A vertex that fails
+  is dropped like a tombstone. Lance's planner is used, not DataFusion's alone,
+  because the two disagree on `"col"`: Lance reads it as a string literal.
+- **Full-text scores come from the backend.** Unflushed rows used to score the
+  share of query words their text holds, split on whitespace. That is not BM25,
+  and it ignores the index's tokenizer, so the ranking (and which rows made the
+  top `k`) changed at the flush. `StorageBackend::score_unstored_text` scores
+  them as the backend will once they are stored. The Lance implementation
+  (`backend/lance_fts.rs`) runs Lance's flat BM25 pass, the one it uses for
+  rows its index does not cover yet. The pass starts from the index's global
+  statistics and tokenizer, or with no index from the stored rows' statistics
+  and a bare simple tokenizer. Because BM25 is relative to the corpus, it then
+  re-scores the flushed hits on the combined statistics. Measured: identical
+  rankings and scores (to 1e-6) before and after the flush, with and without an
+  index (`bugs::fts_rank_survives_flush`).
+
+  One case does not match exactly: rows already flushed but not yet indexed add
+  to Lance's statistics for unindexed rows, and they are not counted here.
+  Unflushed scores can then differ in the idf term until the index catches up.
+  A schemaless property keeps the word-overlap score on both sides, since it
+  has no column for Lance to search.
+
 ### Searching a schemaless property
 
 A vector or full-text search over a property the schema does not declare on the
@@ -3359,6 +3419,16 @@ merges as for a declared property.
   `vertex_versions`. The L0 scans read an entry there as "this buffer holds the
   vertex's newest properties", and a relabel holds none, so stamping it there
   made the scans drop the flushed properties.
+- **The label scans apply the same rules.** The schemaless `MATCH (n:L)` scan
+  filters the main table on the label, so it runs `drop_superseded_pushdown_rows`
+  whenever it has a label, not only for a pushed-down property predicate.
+  Before that, a vertex relabeled away from an undeclared label still matched
+  it after a flush. Both label scans (`columnar_scan_vertex_batch` and the
+  schemaless one) start a vertex whose only L0 state is a relabel from its
+  flushed properties (`label_only_l0_base_props`), at the relabel's version.
+  Before that, `MATCH (n:New)` found a vertex freshly relabeled to `New` with
+  every property NULL until the next flush, and an id lookup did not find it
+  at all.
 - **Filters are refused.** The `filter` argument is an expression over the label
   table's columns, which these rows do not have, so a search with one returns
   an error instead of ignoring it. This applies to unflushed rows too: before,

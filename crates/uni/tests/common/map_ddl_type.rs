@@ -176,24 +176,32 @@ async fn map_non_string_key_rejected() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `LIST<MAP<…>>` parses but the List writer can't store a Map inner — it must fail with a
-/// clear error, never panic (the parser-vs-writer asymmetry).
+/// `LIST<MAP<…>>` round-trips, before and after the flush and after a reopen.
+///
+/// The parser accepted it while the List writer could not store a Map
+/// element, so the write used to fail at the flush (this test asserted that
+/// it failed cleanly rather than panicking). The writer now builds any element
+/// type with the scalar builder for it, which closes the asymmetry.
 #[tokio::test]
-async fn list_of_map_rejected_cleanly() -> anyhow::Result<()> {
-    let db = db_with_ddl("CREATE LABEL Doc (attrs LIST<MAP<STRING, INT>>)").await?;
-    // The unsupported combination surfaces when the column is built (write/flush).
-    let attempt = async {
+async fn list_of_map_round_trips() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let uri = dir.path().to_str().unwrap().to_string();
+    let expected = serde_json::json!([{"a": 1}, {"b": 2, "c": 3}]);
+    {
+        let db = Uni::open(&uri).build().await?;
         let tx = db.session().tx().await?;
-        tx.execute("CREATE (:Doc {attrs: [{a: 1}]})").await?;
+        tx.execute("CREATE LABEL Doc (attrs LIST<MAP<STRING, INT>>)")
+            .await?;
+        tx.execute("CREATE (:Doc {attrs: [{a: 1}, {b: 2, c: 3}]})")
+            .await?;
         tx.commit().await?;
+        assert_eq!(read_attrs_json(&db).await?, expected, "unflushed");
         db.flush().await?;
-        anyhow::Ok(())
+        assert_eq!(read_attrs_json(&db).await?, expected, "flushed");
+        db.shutdown().await?;
     }
-    .await;
-    assert!(
-        attempt.is_err(),
-        "LIST<MAP<…>> write should fail cleanly (unsupported List inner)"
-    );
+    let db = Uni::open(&uri).build().await?;
+    assert_eq!(read_attrs_json(&db).await?, expected, "reopened");
     Ok(())
 }
 

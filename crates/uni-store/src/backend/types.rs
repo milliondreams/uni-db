@@ -946,3 +946,15 @@ impl std::ops::AddAssign for OptimizeReport {
         self.old_versions_removed += rhs.old_versions_removed;
     }
 }
+
+/// Full-text scores once documents not yet stored join a table's corpus.
+///
+/// See [`StorageBackend::score_unstored_text`](super::traits::StorageBackend::score_unstored_text).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TextScores {
+    /// `(id, score)` for each matching unstored document.
+    pub unstored: Vec<(u64, f32)>,
+    /// `(id, score)` for each matching stored hit, re-scored on the same
+    /// statistics; `None` when the backend keeps its own scores for them.
+    pub stored: Option<Vec<(u64, f32)>>,
+}

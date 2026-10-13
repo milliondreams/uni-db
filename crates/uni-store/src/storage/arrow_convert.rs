@@ -2133,7 +2133,7 @@ impl<'a> PropertyExtractor<'a> {
         len: usize,
         deleted: &[bool],
         get_props: F,
-        inner: &DataType,
+        inner: &'a DataType,
     ) -> Result<ArrayRef>
     where
         F: Fn(usize) -> Option<&'a Value>,
@@ -2251,7 +2251,49 @@ impl<'a> PropertyExtractor<'a> {
                 }
                 Ok(Arc::new(builder.finish()))
             }
-            _ => Err(anyhow!("Unsupported inner type for List: {:?}", inner)),
+            // Every other element type. The schema accepts a list of any type,
+            // and a `List<DateTime>` (or Date, Duration, Bool, Int32, ...) was
+            // written and read in memory but failed the flush, which left the
+            // data unflushable. The elements are built as one child column by the
+            // scalar builder for `inner`, so each type is stored exactly as a
+            // top-level column of that type is.
+            _ => {
+                let mut offsets: Vec<i32> = Vec::with_capacity(len + 1);
+                let mut valid: Vec<bool> = Vec::with_capacity(len);
+                let mut elements: Vec<&'a Value> = Vec::new();
+                offsets.push(0);
+                for i in 0..len {
+                    match get_props(i).and_then(|v| v.as_array()) {
+                        Some(arr) => {
+                            elements.extend(arr.iter());
+                            valid.push(true);
+                        }
+                        None => valid.push(false),
+                    }
+                    offsets.push(
+                        i32::try_from(elements.len())
+                            .map_err(|_| anyhow!("list column '{}' is too large", self.name))?,
+                    );
+                }
+                // A `dyn` accessor, so a nested list instantiates `build_column`
+                // once rather than once per nesting level, without bound.
+                let element: &dyn Fn(usize) -> Option<&'a Value> = &|j| Some(elements[j]);
+                let child = PropertyExtractor::new(self.name, inner).build_column(
+                    elements.len(),
+                    &vec![false; elements.len()],
+                    element,
+                )?;
+                let item = Arc::new(Field::new("item", inner.to_arrow(), true));
+                Ok(Arc::new(
+                    arrow_array::ListArray::try_new(
+                        item,
+                        arrow::buffer::OffsetBuffer::new(offsets.into()),
+                        child,
+                        Some(arrow::buffer::NullBuffer::from(valid)),
+                    )
+                    .map_err(|e| anyhow!("list column '{}': {}", self.name, e))?,
+                ))
+            }
         }
     }
 

@@ -136,6 +136,7 @@ pub mod delete_sees_tx_local_edges;
 pub mod duplicate_property_projection;
 pub mod element_id_of_bound_variables;
 pub mod ext_id_lookup_sees_everything;
+pub mod fts_rank_survives_flush;
 pub mod fts_sees_current_text;
 pub mod inline_element_where;
 pub mod issue_225_merge_bound_anchor;
@@ -156,6 +157,7 @@ pub mod optional_traverse_chunked;
 pub mod pattern_fast_path_constraints;
 pub mod reachability_trail_any_predecessor;
 pub mod reduce_accumulator_types;
+pub mod relabel_reads;
 pub mod repro_distinct_entity_over_counts;
 pub mod repro_issue_249_add_property_to_existing_label;
 pub mod repro_optional_match_over_unwound_entity;
@@ -165,7 +167,9 @@ pub mod repro_schemaless_pattern_comprehension_empty;
 pub mod repro_stream_error_loses_abort_type;
 pub mod scan_range_walk_l0_rows;
 pub mod schemaless_search_after_flush;
+pub mod search_filter_on_unflushed;
 pub mod sum_of_nothing_is_zero;
+pub mod typed_values_survive_rewrites;
 // sum/avg take numbers or durations; a string is a type error.
 pub mod sum_avg_take_numbers_or_durations;
 // Numeric functions and statistics reject a non-number instead of answering NULL.

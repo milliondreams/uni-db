@@ -546,7 +546,23 @@ pub fn decode_column_value(
         // `try_reconstruct_map` path inside `arrow_to_value`, which handles typed scalar
         // value children, raw-`Bytes` (uni_raw_bytes-marked) children, and CV-encoded
         // nested-value fallback children uniformly by runtime Arrow type.
-        | DataType::Map(_, _) => super::arrow_convert::arrow_to_value(col, row, Some(data_type)),
+        | DataType::Map(_, _)
+        // These four went through `serde_json` too, which kept the shape and lost
+        // the type: a Duration (stored as a CypherValue blob) or a CypherValue
+        // holding a temporal came back as a string, a vector as a plain list, a
+        // `List<DateTime>` as a list of strings. Every read-modify-write (`SET` of
+        // another property, compaction) then wrote the converted value back, so
+        // the type was lost on disk, and a Duration column, which only accepts a
+        // `Duration`, stored NULL. `arrow_to_value` decodes them natively: the
+        // CypherValue codec for the blob, `Value::Vector` for a `Float32`
+        // fixed-size list, and each list element by its own Arrow type. A list of
+        // CRDTs stays on the path below, which applies `crdt_mode`.
+        | DataType::Duration
+        | DataType::CypherValue
+        | DataType::Vector { .. } => super::arrow_convert::arrow_to_value(col, row, Some(data_type)),
+        DataType::List(inner) if !matches!(**inner, DataType::Crdt(_)) => {
+            super::arrow_convert::arrow_to_value(col, row, Some(data_type))
+        }
         _ => value_from_column(col, data_type, row, crdt_mode).map(uni_common::Value::from),
     }
 }

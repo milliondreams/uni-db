@@ -3060,7 +3060,17 @@ impl StorageManager {
 
         // Merge L0 buffer vertices into results for visibility of unflushed data.
         if let Some(qctx) = ctx {
-            merge_l0_into_vector_results(&mut results, qctx, label, property, query, k, &metric)?;
+            let excluded = self.l0_rows_failing_filter(label, filter, qctx).await?;
+            merge_l0_into_vector_results(
+                &mut results,
+                qctx,
+                label,
+                property,
+                query,
+                k,
+                &metric,
+                &excluded,
+            )?;
         }
 
         // Exact top-k. The L1 over-fetch (and the no-L0-activity early return in
@@ -3443,6 +3453,9 @@ impl StorageManager {
         let backend = self.backend.as_ref();
         let name = table_names::vertex_table_name(label);
 
+        // The text of each flushed hit, for re-scoring once unflushed rows join
+        // the corpus (see `score_unstored_text`).
+        let mut stored_texts: Vec<(u64, String)> = Vec::new();
         let mut results = if self.is_schemaless_property(label, property) {
             reject_schemaless_filter(label, property, filter)?;
             let mut deadline = ctx.map(DeadlineTicker::new);
@@ -3492,6 +3505,7 @@ impl StorageManager {
                 fetch = fetch.saturating_mul(2);
             };
 
+            stored_texts = extract_vid_text_pairs(&batches, property)?;
             let mut fts_results = extract_vid_score_pairs(&batches, "_vid", "_score")?;
             // Results should already be sorted by score from backend, but ensure descending order
             fts_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -3502,11 +3516,133 @@ impl StorageManager {
 
         // Merge L0 buffer vertices for visibility of unflushed data.
         if let Some(qctx) = ctx {
-            merge_l0_into_fts_results(&mut results, qctx, label, property, query, k)?;
+            let excluded = self.l0_rows_failing_filter(label, filter, qctx).await?;
+            let l0 = collect_l0_texts(qctx, label, property)?;
+            let docs: Vec<(u64, String)> = l0
+                .texts
+                .iter()
+                .filter(|(vid, _)| !excluded.contains(vid))
+                .filter_map(|(vid, text)| text.as_ref().map(|t| (vid.as_u64(), t.clone())))
+                .collect();
+            // Scored by the backend, on the scale, tokenizer and statistics its
+            // search will use once these rows are flushed, and the flushed hits
+            // re-scored on the same statistics, so the ranking does not move at
+            // the flush. A schemaless property has no column to search, so both
+            // sides use the word-overlap score, which needs no statistics.
+            let scores: HashMap<Vid, f32> = if self.is_schemaless_property(label, property) {
+                docs.into_iter()
+                    .map(|(vid, text)| (Vid::new(vid), compute_text_relevance(query, &text)))
+                    .filter(|(_, score)| *score > 0.0)
+                    .collect()
+            } else if docs.is_empty() {
+                HashMap::new()
+            } else {
+                let mut parts = vec![Self::build_active_filter(filter)];
+                if let Some(hwm) = self.version_high_water_mark() {
+                    parts.push(FilterExpr::version_at_most(hwm));
+                }
+                let scored = self
+                    .backend
+                    .score_unstored_text(
+                        &name,
+                        property,
+                        query,
+                        &FilterExpr::all(parts),
+                        docs,
+                        std::mem::take(&mut stored_texts),
+                    )
+                    .await?;
+                if let Some(stored) = scored.stored {
+                    let rescored: HashMap<Vid, f32> = stored
+                        .into_iter()
+                        .map(|(vid, score)| (Vid::new(vid), score))
+                        .collect();
+                    results = results
+                        .into_iter()
+                        .filter_map(|(vid, _)| rescored.get(&vid).map(|s| (vid, *s)))
+                        .collect();
+                }
+                scored
+                    .unstored
+                    .into_iter()
+                    .map(|(vid, score)| (Vid::new(vid), score))
+                    .collect()
+            };
+            merge_l0_text_scores(&mut results, l0, &scores, k, &excluded);
         }
         results.truncate(k);
 
         Ok(results)
+    }
+
+    /// Vids of `label`'s unflushed rows whose current values fail `filter`.
+    ///
+    /// A search's `filter` reaches only the backend scan of flushed rows. The
+    /// unflushed rows merged in afterwards were never filtered: a search with
+    /// `filter: 'id = 2'` returned every unflushed row, and a row whose
+    /// flushed version matched kept matching after an unflushed update moved
+    /// it out. The unflushed rows are laid out as the label's table and judged
+    /// by the backend's own rules (`StorageBackend::filter_batch`), so a row
+    /// passes before a flush exactly when it would after one.
+    ///
+    /// # Errors
+    /// Propagates a filter the backend cannot evaluate, and read failures.
+    async fn l0_rows_failing_filter(
+        &self,
+        label: &str,
+        filter: Option<&str>,
+        ctx: &QueryContext,
+    ) -> Result<HashSet<Vid>> {
+        let Some(filter) = filter else {
+            return Ok(HashSet::new());
+        };
+        let schema = self.schema_manager.schema();
+        let table = self.vertex_dataset(label)?.get_arrow_schema(&schema)?;
+        // Every column nullable: an L0 row need not carry a column that the
+        // table's writer fills in at flush. `_uid` is left out: it is derived
+        // at flush and L0 has no value for it, and a filter on it fails to
+        // plan here rather than being skipped.
+        let table: arrow_schema::SchemaRef = Arc::new(arrow_schema::Schema::new(
+            table
+                .fields()
+                .iter()
+                .filter(|f| f.name() != "_uid")
+                .map(|f| f.as_ref().clone().with_nullable(true))
+                .collect::<Vec<_>>(),
+        ));
+        let l0_ctx = crate::runtime::l0_visibility::L0Context::from_query_context(ctx);
+        let label_only = crate::runtime::columnar_scan::label_only_l0_base_props(
+            self,
+            &l0_ctx,
+            label,
+            |_| true,
+            ctx.counters.as_ref(),
+        )
+        .await?;
+        let batch = crate::runtime::columnar_scan::build_l0_vertex_batch(
+            &l0_ctx,
+            label,
+            &table,
+            schema.properties.get(label),
+            crate::runtime::columnar_scan::L0VertexTargets::All,
+            &label_only,
+        )?;
+        if batch.num_rows() == 0 {
+            return Ok(HashSet::new());
+        }
+        let passes = self
+            .backend
+            .filter_batch(&batch, &FilterExpr::Raw(filter.to_string()))?;
+        let vids = batch
+            .column_by_name("_vid")
+            .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| anyhow!("unflushed rows have no _vid column"))?;
+        Ok(passes
+            .iter()
+            .enumerate()
+            .filter(|(_, pass)| !**pass)
+            .map(|(row, _)| Vid::new(vids.value(row)))
+            .collect())
     }
 
     /// Whether flushed values of `label.property` have no column of their own.
@@ -3920,6 +4056,39 @@ impl StorageManager {
     }
 }
 
+/// `(vid, text)` for each row of `batches` whose `column` holds a string.
+///
+/// # Errors
+/// Returns an error if `_vid` is missing or `column` cannot be read as text.
+fn extract_vid_text_pairs(
+    batches: &[arrow_array::RecordBatch],
+    column: &str,
+) -> Result<Vec<(u64, String)>> {
+    let mut out = Vec::new();
+    for batch in batches {
+        let (Some(vids), Some(texts)) =
+            (batch.column_by_name("_vid"), batch.column_by_name(column))
+        else {
+            continue;
+        };
+        let vids = vids
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| anyhow!("_vid is not UInt64"))?;
+        let texts = arrow::compute::cast(texts, &arrow_schema::DataType::Utf8)?;
+        let texts = texts
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .ok_or_else(|| anyhow!("'{column}' is not text"))?;
+        for i in 0..batch.num_rows() {
+            if vids.is_valid(i) && texts.is_valid(i) {
+                out.push((vids.value(i), texts.value(i).to_string()));
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Extracts `(Vid, f32)` pairs from record batches using the given VID and score column names.
 fn extract_vid_score_pairs(
     batches: &[arrow_array::RecordBatch],
@@ -4038,6 +4207,7 @@ fn l0_buffers_in_precedence(ctx: &QueryContext) -> Vec<Arc<parking_lot::RwLock<L
 /// - VIDs present in both L0 and LanceDB use the L0 distance.
 /// - New L0-only VIDs are appended.
 /// - Results are re-sorted by distance ascending and truncated to `k`.
+#[expect(clippy::too_many_arguments)]
 fn merge_l0_into_vector_results(
     results: &mut Vec<(Vid, f32)>,
     ctx: &QueryContext,
@@ -4046,6 +4216,7 @@ fn merge_l0_into_vector_results(
     query: &[f32],
     k: usize,
     metric: &DistanceMetric,
+    excluded: &HashSet<Vid>,
 ) -> Result<()> {
     let buffers = l0_buffers_in_precedence(ctx);
     let mut deadline = DeadlineTicker::new(ctx);
@@ -4089,6 +4260,10 @@ fn merge_l0_into_vector_results(
             }
         }
     }
+
+    // A vertex whose current (unflushed) row fails the search's filter is out,
+    // however its flushed row scored: drop it exactly like a tombstone.
+    tombstoned.extend(excluded.iter().copied());
 
     // If no L0 activity affects this search, skip merge.
     if l0_candidates.is_empty() && tombstoned.is_empty() {
@@ -4234,7 +4409,7 @@ fn reject_schemaless_filter(label: &str, property: &str, filter: Option<&str>) -
 ///
 /// Returns the fraction of query tokens found in the text (case-insensitive),
 /// producing a score in [0.0, 1.0]. Sufficient for the small L0 buffer.
-fn compute_text_relevance(query: &str, text: &str) -> f32 {
+pub(crate) fn compute_text_relevance(query: &str, text: &str) -> f32 {
     let query_tokens: HashSet<String> =
         query.split_whitespace().map(|t| t.to_lowercase()).collect();
     if query_tokens.is_empty() {
@@ -4248,40 +4423,31 @@ fn compute_text_relevance(query: &str, text: &str) -> f32 {
     hits as f32 / query_tokens.len() as f32
 }
 
-/// Merges L0 buffer vertices into LanceDB full-text search results.
+/// The unflushed side of a full-text search: each L0 vertex of the label
+/// whose text L0 now determines, and the vids L0 tombstoned.
 ///
-/// Follows the same pattern as [`merge_l0_into_vector_results`]: visits L0
-/// buffers in precedence order, collects tombstoned VIDs and text-match
-/// candidates, then merges them so that:
-/// - Tombstoned VIDs are removed (unless re-created in a later L0).
-/// - VIDs present in both L0 and LanceDB use the L0 score.
-/// - New L0-only VIDs are appended.
-/// - Results are re-sorted by score **descending** and truncated to `k`.
-fn merge_l0_into_fts_results(
-    results: &mut Vec<(Vid, f32)>,
-    ctx: &QueryContext,
-    label: &str,
-    property: &str,
-    query: &str,
-    k: usize,
-) -> Result<()> {
-    let buffers = l0_buffers_in_precedence(ctx);
+/// `texts` maps a vid to its current text, or to `None` when the property is
+/// now NULL or not a string. Every such vertex is recorded, because its score
+/// replaces the flushed hit's: recording only matching ones left a flushed hit
+/// standing after an update removed the match. A partial update that does not
+/// touch the property says nothing about it and is skipped.
+#[derive(Debug, Default)]
+struct L0Texts {
+    texts: HashMap<Vid, Option<String>>,
+    tombstoned: HashSet<Vid>,
+}
+
+/// Collects [`L0Texts`] across the L0 chain, later buffers winning.
+///
+/// # Errors
+/// Returns the query's timeout or cancellation, checked every
+/// [`DeadlineTicker::EVERY`] rows.
+fn collect_l0_texts(ctx: &QueryContext, label: &str, property: &str) -> Result<L0Texts> {
     let mut deadline = DeadlineTicker::new(ctx);
-
-    // Maps VID → relevance score for L0 candidates (last writer wins).
-    let mut l0_candidates: HashMap<Vid, f32> = HashMap::new();
-    // Tombstoned VIDs across all L0 buffers.
-    let mut tombstoned: HashSet<Vid> = HashSet::new();
-
-    for buf_arc in &buffers {
+    let mut out = L0Texts::default();
+    for buf_arc in &l0_buffers_in_precedence(ctx) {
         let buf = buf_arc.read();
-
-        // Accumulate tombstones.
-        for &vid in &buf.vertex_tombstones {
-            tombstoned.insert(vid);
-        }
-
-        // Scan vertices with the target label.
+        out.tombstoned.extend(buf.vertex_tombstones.iter().copied());
         for (&vid, labels) in &buf.vertex_labels {
             deadline.tick()?;
             if !labels.iter().any(|l| l == label) {
@@ -4290,41 +4456,48 @@ fn merge_l0_into_fts_results(
             let Some(props) = buf.vertex_properties.get(&vid) else {
                 continue;
             };
-            // Record every vertex whose indexed text L0 now determines — with
-            // a score of 0 when it no longer matches. Recording only positive
-            // scores left the flushed hit standing after an update removed the
-            // match, so the old text kept being found. A partial update that
-            // does not touch the property says nothing about it and is skipped.
-            let score = match props.get(property) {
-                Some(value) if !value.is_null() => value
-                    .as_str()
-                    .map_or(0.0, |text| compute_text_relevance(query, text)),
-                Some(_) => 0.0,
+            let text = match props.get(property) {
+                Some(value) => value.as_str().map(str::to_string),
                 None => continue,
             };
-            // Last writer wins: later buffer overwrites earlier.
-            l0_candidates.insert(vid, score);
-            // If re-created in a later L0, remove from tombstones.
-            tombstoned.remove(&vid);
+            out.texts.insert(vid, text);
+            // A re-creation in a later buffer clears an earlier tombstone.
+            out.tombstoned.remove(&vid);
         }
     }
+    Ok(out)
+}
 
-    // If no L0 activity affects this search, skip merge.
-    if l0_candidates.is_empty() && tombstoned.is_empty() {
-        return Ok(());
+/// Merges scored L0 vertices into the flushed full-text hits.
+///
+/// Follows [`merge_l0_into_vector_results`]: a tombstoned or `excluded` vid is
+/// removed, an L0 score replaces the flushed one, an L0-only vid is appended,
+/// a vertex whose current text does not match (absent from `scores`) is
+/// dropped, and the result is re-sorted descending and cut to `k`.
+fn merge_l0_text_scores(
+    results: &mut Vec<(Vid, f32)>,
+    l0: L0Texts,
+    scores: &HashMap<Vid, f32>,
+    k: usize,
+    excluded: &HashSet<Vid>,
+) {
+    let L0Texts {
+        texts,
+        mut tombstoned,
+    } = l0;
+    tombstoned.extend(excluded.iter().copied());
+    if texts.is_empty() && tombstoned.is_empty() {
+        return;
     }
-
-    // Remove tombstoned VIDs from LanceDB results.
+    let candidates: HashMap<Vid, f32> = texts
+        .keys()
+        .map(|vid| (*vid, scores.get(vid).copied().unwrap_or(0.0)))
+        .collect();
     results.retain(|(vid, _)| !tombstoned.contains(vid));
-
-    apply_l0_candidates(results, &l0_candidates, &tombstoned);
-    // A vertex whose current text does not match is not a hit.
+    apply_l0_candidates(results, &candidates, &tombstoned);
     results.retain(|(_, score)| *score > 0.0);
-
-    // Re-sort by score descending (higher relevance first).
     results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     results.truncate(k);
-    Ok(())
 }
 
 #[cfg(test)]
@@ -4516,12 +4689,12 @@ mod l0_merge_tests {
             &[0.0, 1.0],
             10,
             &DistanceMetric::L2,
+            &HashSet::new(),
         )
         .expect_err("the deadline has passed");
         assert!(err.to_string().contains("timed out"), "{err}");
 
-        let err = merge_l0_into_fts_results(&mut results, &ctx, "Doc", "body", "alpha", 10)
-            .expect_err("the deadline has passed");
+        let err = collect_l0_texts(&ctx, "Doc", "body").expect_err("the deadline has passed");
         assert!(err.to_string().contains("timed out"), "{err}");
     }
 
@@ -4531,9 +4704,7 @@ mod l0_merge_tests {
         let token = tokio_util::sync::CancellationToken::new();
         token.cancel();
         ctx.set_cancellation_token(token);
-        let mut results = Vec::new();
-        let err = merge_l0_into_fts_results(&mut results, &ctx, "Doc", "body", "alpha", 10)
-            .expect_err("the query was cancelled");
+        let err = collect_l0_texts(&ctx, "Doc", "body").expect_err("the query was cancelled");
         assert!(err.to_string().contains("cancelled"), "{err}");
     }
 
@@ -4550,6 +4721,7 @@ mod l0_merge_tests {
             &[0.0, 1.0],
             3,
             &DistanceMetric::L2,
+            &HashSet::new(),
         )
         .unwrap();
         let vids: Vec<u64> = results.iter().map(|(v, _)| v.as_u64()).collect();

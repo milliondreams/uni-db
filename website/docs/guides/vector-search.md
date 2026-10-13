@@ -266,6 +266,8 @@ ORDER BY distance
 
 A property the schema does not declare (on a schemaless label, or an undeclared property of a declared label) can still be searched, by `uni.vector.query` and `uni.fts.query` alike. Every row of the label is scored by brute force, before and after a flush. Such a search does not accept a pre-filter, because the filter's columns do not exist for those rows; it returns an error instead. Post-filter in Cypher, or declare the property. Full-text scores on an undeclared property are the fraction of query terms the text contains, not BM25.
 
+Search results include rows that are not yet flushed. The pre-filter applies to them too, and full-text scores for them are the BM25 scores they will have once flushed, so a ranking does not change when a flush happens.
+
 ### Post-Filtering (Alternative)
 
 Combine vector search with property filtering after search:

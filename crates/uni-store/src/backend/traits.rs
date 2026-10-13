@@ -113,6 +113,23 @@ pub trait StorageBackend: Send + Sync + 'static {
     /// Scan a table, collecting all matching rows into batches.
     async fn scan(&self, request: ScanRequest) -> Result<Vec<RecordBatch>>;
 
+    /// Which rows of an in-memory `batch` satisfy `filter`, judged as this
+    /// backend's scans judge them: a row whose result is false or NULL fails.
+    ///
+    /// A filter handed to a scan sometimes also has to be applied to rows not
+    /// yet in storage, such as the unflushed rows a search merges in. Judging
+    /// them by the scan's own rules keeps the two halves of one answer
+    /// consistent. The default uses [`FilterExpr::eval`], which refuses a
+    /// [`FilterExpr::Raw`]; a backend whose scans accept raw SQL overrides it.
+    ///
+    /// # Errors
+    /// Returns an error if the filter cannot be evaluated against `batch`.
+    fn filter_batch(&self, batch: &RecordBatch, filter: &FilterExpr) -> Result<Vec<bool>> {
+        (0..batch.num_rows())
+            .map(|row| Ok(filter.eval(&super::eval::ArrowRow::new(batch, row))? == Some(true)))
+            .collect()
+    }
+
     /// Scan a table, returning a streaming iterator over record batches.
     async fn scan_stream(&self, request: ScanRequest) -> Result<RecordBatchStream>;
 
@@ -343,6 +360,43 @@ pub trait StorageBackend: Send + Sync + 'static {
     /// Perform a full-text search.
     ///
     /// See [`StorageBackend::vector_search`] for what `counters` records.
+    /// Full-text scores, for `query` on `column`, as this backend's search
+    /// would give them once `unstored` documents (id, text) were rows of
+    /// `table`: for each unstored document, and for each `stored` hit (id,
+    /// text) a search already returned.
+    ///
+    /// A search merges unflushed rows into the hits for stored ones. Scoring
+    /// them on another scale, or with the stored hits' statistics left out of
+    /// date, made the ranking change when they were flushed. `filter` is the
+    /// predicate the stored-row search runs with. A document that does not
+    /// match is absent. The default scores an unstored document by the
+    /// fraction of query words it contains (lowercased, whitespace-split) and
+    /// keeps the stored scores, for a backend that cannot say how it ranks.
+    ///
+    /// # Errors
+    /// Returns an error if the backend cannot score the documents.
+    async fn score_unstored_text(
+        &self,
+        table: &str,
+        column: &str,
+        query: &str,
+        filter: &FilterExpr,
+        unstored: Vec<(u64, String)>,
+        stored: Vec<(u64, String)>,
+    ) -> Result<TextScores> {
+        let _ = (table, column, filter, stored);
+        Ok(TextScores {
+            unstored: unstored
+                .into_iter()
+                .filter_map(|(id, text)| {
+                    let score = crate::storage::manager::compute_text_relevance(query, &text);
+                    (score > 0.0).then_some((id, score))
+                })
+                .collect(),
+            stored: None,
+        })
+    }
+
     async fn full_text_search(
         &self,
         _table: &str,

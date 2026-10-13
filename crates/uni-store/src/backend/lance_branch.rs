@@ -23,7 +23,7 @@
 use std::sync::Arc;
 
 use crate::backend::branching::ForkBranching;
-use crate::backend::types::{FilterExpr, VectorQueryOpts};
+use crate::backend::types::{FilterExpr, TextScores, VectorQueryOpts};
 use anyhow::{Context, Result};
 use arrow_schema::{Field, Schema as ArrowSchema};
 use lance::Dataset;
@@ -1151,6 +1151,36 @@ impl ForkBranching for LanceBranching {
         filter: &FilterExpr,
     ) -> Result<Vec<arrow_array::RecordBatch>> {
         full_text_search_on_branch(&self.dataset_uri(table), branch, column, query, k, filter).await
+    }
+
+    async fn score_unstored_text_on_branch(
+        &self,
+        table: &str,
+        branch: &str,
+        column: &str,
+        query: &str,
+        filter: &FilterExpr,
+        unstored: Vec<(u64, String)>,
+        stored: Vec<(u64, String)>,
+    ) -> Result<TextScores> {
+        if unstored.is_empty() {
+            return Ok(TextScores::default());
+        }
+        let sql = if filter.is_trivially_true() {
+            None
+        } else {
+            Some(filter.to_sql()?)
+        };
+        let on_branch = open_branch(&self.dataset_uri(table), branch).await?;
+        super::lance_fts::score_unstored_documents(
+            Some(&on_branch),
+            column,
+            query,
+            sql.as_deref(),
+            unstored,
+            stored,
+        )
+        .await
     }
 }
 

@@ -870,8 +870,11 @@ pub fn build_list_property_column(
             }
             Ok(Arc::new(builder.finish()))
         }
-        DataType::Struct(fields) => {
-            // Map types are List(Struct(key, value)) — build struct inner elements
+        // Map types are List(Struct(key, value)) — build struct inner elements.
+        // Any other struct element (a DateTime or Time) is a value of its own.
+        DataType::Struct(fields)
+            if fields.len() == 2 && fields[0].name() == "key" && fields[1].name() == "value" =>
+        {
             build_list_of_structs_column(vids, props_map, prop_name, fields)
         }
         DataType::LargeBinary
@@ -919,24 +922,47 @@ pub fn build_list_property_column(
                 *dim as usize,
             ))
         }
-        // Fallback: serialize inner elements as strings
+        // Every other element type: built as one child column by the scalar
+        // builder for that Arrow type, so an element is laid out exactly as a
+        // top-level column of its type. The previous fallback wrote each
+        // element's `Debug` text into a `Utf8` child, which did not match the
+        // declared type: a `List<DateTime>` read from L0 failed with "expected
+        // Timestamp(ns) got Utf8".
         _ => {
-            let mut builder = ListBuilder::new(StringBuilder::new());
+            let mut offsets: Vec<i32> = Vec::with_capacity(vids.len() + 1);
+            let mut valid: Vec<bool> = Vec::with_capacity(vids.len());
+            let mut element_vids: Vec<Vid> = Vec::new();
+            let mut elements: HashMap<Vid, Properties> = HashMap::new();
+            offsets.push(0);
             for vid in vids {
                 match get_property_value(vid, props_map, prop_name) {
                     Some(Value::List(arr)) => {
                         for v in arr {
-                            match v {
-                                Value::Null => builder.values().append_null(),
-                                other => builder.values().append_value(format!("{other:?}")),
-                            }
+                            let key = Vid::new(element_vids.len() as u64);
+                            elements.insert(key, HashMap::from([("item".to_string(), v)]));
+                            element_vids.push(key);
                         }
-                        builder.append(true);
+                        valid.push(true);
                     }
-                    _ => builder.append(false),
+                    _ => valid.push(false),
                 }
+                offsets.push(
+                    i32::try_from(element_vids.len())
+                        .map_err(|_| anyhow::anyhow!("list column '{prop_name}' is too large"))?,
+                );
             }
-            Ok(Arc::new(builder.finish()))
+            let child = build_property_column_static(
+                &element_vids,
+                &elements,
+                "item",
+                inner_field.data_type(),
+            )?;
+            Ok(Arc::new(arrow_array::ListArray::try_new(
+                inner_field.clone(),
+                arrow::buffer::OffsetBuffer::new(offsets.into()),
+                child,
+                Some(arrow::buffer::NullBuffer::from(valid)),
+            )?))
         }
     }
 }
@@ -1647,6 +1673,76 @@ pub fn filter_l0_label_overwrites(
     arrow::compute::filter_record_batch(batch, &mask).map_err(anyhow::Error::from)
 }
 
+/// Flushed properties of the L0 vertices a label mutation alone put under
+/// `label`, with each one's label-mutation version.
+///
+/// A `SET n:L` / `REMOVE n:L` on a flushed vertex leaves L0 holding its new
+/// labels but no property row, and the vertex's flushed row sits under its
+/// old labels, so a scan of a label it gained found neither: the L0 row came
+/// back with every property NULL. These are the vids the L0 builders must
+/// start from the flushed properties (with types intact, from the main
+/// table's `props_json`) and stamp with the relabel's version, so the row
+/// they emit is the vertex's complete, newest one.
+///
+/// `label` may be `"A:B"` (all required) or empty. `in_targets` mirrors the
+/// scan's vid pushdown or range. A vid with a property row in any buffer is
+/// skipped: L0 property rows are always complete.
+///
+/// # Errors
+/// Propagates the main-table read's failures.
+pub async fn label_only_l0_base_props(
+    storage: &StorageManager,
+    l0_ctx: &L0Context,
+    label: &str,
+    in_targets: impl Fn(u64) -> bool,
+    counters: Option<&Arc<crate::QueryCounters>>,
+) -> anyhow::Result<HashMap<u64, (Properties, u64)>> {
+    let required: Vec<&str> = label.split(':').filter(|l| !l.is_empty()).collect();
+    let mut has_props: HashSet<u64> = HashSet::new();
+    let mut tombstoned: HashSet<u64> = HashSet::new();
+    // vid -> (newest resolved label set, newest label-mutation version)
+    let mut relabeled: HashMap<u64, (Vec<String>, u64)> = HashMap::new();
+    for l0 in l0_ctx.iter_l0_buffers() {
+        let guard = l0.read();
+        tombstoned.extend(guard.vertex_tombstones.iter().map(|v| v.as_u64()));
+        has_props.extend(guard.vertex_properties.keys().map(|v| v.as_u64()));
+        for vid in &guard.vertex_label_overwrites {
+            let labels = guard.vertex_labels.get(vid).cloned().unwrap_or_default();
+            let version = guard.vertex_label_versions.get(vid).copied().unwrap_or(0);
+            let entry = relabeled.entry(vid.as_u64()).or_insert((Vec::new(), 0));
+            entry.0 = labels;
+            entry.1 = entry.1.max(version);
+        }
+    }
+    let vids: Vec<Vid> = relabeled
+        .iter()
+        .filter(|(vid, (labels, _))| {
+            !has_props.contains(vid)
+                && !tombstoned.contains(vid)
+                && in_targets(**vid)
+                && required.iter().all(|r| labels.iter().any(|l| l == r))
+        })
+        .map(|(vid, _)| Vid::from(*vid))
+        .collect();
+    if vids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let props = crate::storage::main_vertex::MainVertexDataset::find_batch_props_by_vids_counted(
+        storage.backend(),
+        &vids,
+        storage.version_high_water_mark(),
+        counters,
+    )
+    .await?;
+    Ok(props
+        .into_iter()
+        .map(|(vid, p)| {
+            let raw = vid.as_u64();
+            (raw, (p, relabeled[&raw].1))
+        })
+        .collect())
+}
+
 /// Which of a label's L0 rows one scan call wants.
 ///
 /// Replaces an `Option<&[u64]>`, where `None` meant "the whole label". A range
@@ -1662,6 +1758,17 @@ pub enum L0VertexTargets<'a> {
     Range(u64, u64),
     /// Every vid of the label.
     All,
+}
+
+impl L0VertexTargets<'_> {
+    /// Whether `vid` is one of the rows these targets select.
+    pub fn contains(&self, vid: u64) -> bool {
+        match self {
+            Self::Vids(vids) => vids.contains(&vid),
+            Self::Range(lo, hi) => vid >= *lo && vid < *hi,
+            Self::All => true,
+        }
+    }
 }
 
 /// Build a RecordBatch from L0 buffer data for a given label, matching the
@@ -1680,6 +1787,7 @@ pub fn build_l0_vertex_batch(
     lance_schema: &SchemaRef,
     label_props: Option<&HashMap<String, uni_common::core::schema::PropertyMeta>>,
     targets: L0VertexTargets<'_>,
+    label_only: &HashMap<u64, (Properties, u64)>,
 ) -> anyhow::Result<RecordBatch> {
     // Collect all L0 vertex data, merging in visibility order
     let mut vid_data: HashMap<u64, (Properties, u64)> = HashMap::new(); // vid -> (props, version)
@@ -1708,7 +1816,7 @@ pub fn build_l0_vertex_batch(
                 let mut out = Vec::with_capacity(tvs.len());
                 for &tv in tvs {
                     let vid = Vid::from(tv);
-                    if guard.vertex_properties.contains_key(&vid)
+                    if (guard.vertex_properties.contains_key(&vid) || label_only.contains_key(&tv))
                         && (label.is_empty()
                             || guard
                                 .label_to_vids
@@ -1773,6 +1881,15 @@ pub fn build_l0_vertex_batch(
                     })
                     .or_insert(ts);
             }
+        }
+    }
+
+    // A relabeled vertex with no L0 property row starts from its flushed
+    // properties, at the relabel's version (see `label_only_l0_base_props`).
+    for (vid, (base, version)) in label_only {
+        if let Some(entry) = vid_data.get_mut(vid) {
+            entry.0 = base.clone();
+            entry.1 = entry.1.max(*version);
         }
     }
 
@@ -2375,7 +2492,22 @@ pub async fn columnar_scan_vertex_batch(
             None => L0VertexTargets::All,
         },
     };
-    let l0_batch = build_l0_vertex_batch(l0_ctx, label, &internal_schema, label_props, l0_targets)?;
+    let label_only = label_only_l0_base_props(
+        storage,
+        l0_ctx,
+        label,
+        |vid| l0_targets.contains(vid),
+        counters,
+    )
+    .await?;
+    let l0_batch = build_l0_vertex_batch(
+        l0_ctx,
+        label,
+        &internal_schema,
+        label_props,
+        l0_targets,
+        &label_only,
+    )?;
 
     // Merge Lance + L0
     let Some(merged) =

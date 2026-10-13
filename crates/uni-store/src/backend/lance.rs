@@ -375,6 +375,33 @@ impl StorageBackend for LanceDbBackend {
     // Read Operations
     // ========================
 
+    /// Evaluates the filter with Lance's own SQL planner, so a row of an
+    /// in-memory batch passes exactly when a scan would have returned it.
+    /// DataFusion's planner alone would not do: Lance reads `"col"` as a string
+    /// literal, DataFusion as a column.
+    fn filter_batch(&self, batch: &RecordBatch, filter: &FilterExpr) -> Result<Vec<bool>> {
+        use arrow_array::Array;
+        let planner = lance::io::exec::Planner::new(batch.schema());
+        let expr = planner
+            .parse_filter(&filter.to_sql()?)
+            .and_then(|e| planner.optimize_expr(e))
+            .map_err(|e| anyhow!("filter '{}': {}", filter.to_sql().unwrap_or_default(), e))?;
+        let physical = planner
+            .create_physical_expr(&expr)
+            .map_err(|e| anyhow!("filter: {e}"))?;
+        let result = physical
+            .evaluate(batch)
+            .and_then(|v| v.into_array(batch.num_rows()))
+            .map_err(|e| anyhow!("filter: {e}"))?;
+        let mask = result
+            .as_any()
+            .downcast_ref::<arrow_array::BooleanArray>()
+            .ok_or_else(|| anyhow!("filter did not evaluate to a boolean"))?;
+        Ok((0..mask.len())
+            .map(|i| mask.is_valid(i) && mask.value(i))
+            .collect())
+    }
+
     async fn scan(&self, request: ScanRequest) -> Result<Vec<RecordBatch>> {
         // Fail closed (review C1): a scan error — transient I/O, an unparsable
         // filter, a corrupt fragment — MUST propagate, never collapse into an
@@ -1034,6 +1061,50 @@ impl StorageBackend for LanceDbBackend {
                     e
                 )
             })
+    }
+
+    async fn score_unstored_text(
+        &self,
+        table: &str,
+        column: &str,
+        query: &str,
+        filter: &FilterExpr,
+        unstored: Vec<(u64, String)>,
+        stored: Vec<(u64, String)>,
+    ) -> Result<TextScores> {
+        if unstored.is_empty() {
+            return Ok(TextScores::default());
+        }
+        let sql = if filter.is_trivially_true() {
+            None
+        } else {
+            Some(filter.to_sql()?)
+        };
+        let exists = self.table_exists(table).await?;
+        let directory = self.directory.clone();
+        let table = table.to_string();
+        let column = column.to_string();
+        let query = query.to_string();
+        // The process-wide runtime, for the reason `full_text_search` gives
+        // (#290): opening an inverted index binds its readers to the runtime
+        // that first loads it.
+        crate::runtime::io_runtime::run_on_io_runtime(async move {
+            let dataset = if exists {
+                Some(directory.open(&table).await?)
+            } else {
+                None
+            };
+            super::lance_fts::score_unstored_documents(
+                dataset.as_ref(),
+                &column,
+                &query,
+                sql.as_deref(),
+                unstored,
+                stored,
+            )
+            .await
+        })
+        .await?
     }
 
     async fn full_text_search(

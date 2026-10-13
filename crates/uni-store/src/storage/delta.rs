@@ -321,19 +321,18 @@ impl DeltaDataset {
             if col.is_null(row) {
                 continue;
             }
-            let val = Self::value_from_column(col.as_ref(), dtype, row)?;
-            properties.insert(name.to_string(), uni_common::Value::from(val));
+            // `decode_column_value`, not the `serde_json` decoder: these entries
+            // are written back into delta batches, and the JSON round trip turns
+            // a temporal into a string.
+            let val = crate::storage::value_codec::decode_column_value(
+                col.as_ref(),
+                dtype,
+                row,
+                CrdtDecodeMode::Lenient,
+            )?;
+            properties.insert(name.to_string(), val);
         }
         Ok(properties)
-    }
-
-    /// Decode an Arrow column value to JSON with lenient CRDT error handling.
-    fn value_from_column(
-        col: &dyn arrow_array::Array,
-        dtype: &uni_common::DataType,
-        row: usize,
-    ) -> Result<serde_json::Value> {
-        crate::storage::value_codec::value_from_column(col, dtype, row, CrdtDecodeMode::Lenient)
     }
 
     /// Returns the filter column name based on direction ("src_vid" for fwd, "dst_vid" for bwd).

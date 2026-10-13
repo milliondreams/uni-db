@@ -19,6 +19,8 @@ pub mod lance;
 pub mod lance_branch;
 #[cfg(feature = "lance-backend")]
 pub mod lance_directory;
+#[cfg(feature = "lance-backend")]
+pub(crate) mod lance_fts;
 pub mod table_names;
 pub mod traits;
 pub mod types;

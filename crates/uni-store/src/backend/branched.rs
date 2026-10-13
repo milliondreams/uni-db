@@ -221,6 +221,32 @@ impl StorageBackend for BranchedBackend {
         self.inner.scan_stream(self.apply_branch(request)).await
     }
 
+    async fn score_unstored_text(
+        &self,
+        table: &str,
+        column: &str,
+        query: &str,
+        filter: &FilterExpr,
+        unstored: Vec<(u64, String)>,
+        stored: Vec<(u64, String)>,
+    ) -> Result<TextScores> {
+        if let Some(branch) = self.scope.branch_for(table) {
+            return self
+                .branching()?
+                .score_unstored_text_on_branch(
+                    table, &branch, column, query, filter, unstored, stored,
+                )
+                .await;
+        }
+        self.inner
+            .score_unstored_text(table, column, query, filter, unstored, stored)
+            .await
+    }
+
+    fn filter_batch(&self, batch: &RecordBatch, filter: &FilterExpr) -> Result<Vec<bool>> {
+        self.inner.filter_batch(batch, filter)
+    }
+
     async fn count_rows(&self, table_name: &str, filter: Option<&FilterExpr>) -> Result<usize> {
         // Primary path counts via `Table::count_rows`. Branched count
         // delegates by scanning the branch and summing row counts; the

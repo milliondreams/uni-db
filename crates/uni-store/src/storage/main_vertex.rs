@@ -54,6 +54,25 @@ pub struct MainVertexDataset {
 
 use super::with_version_bound;
 
+/// A vertex's properties from its `props_json` blob, with their types.
+///
+/// The blob is a CypherValue map, decoded straight into `Value`s. These
+/// readers used to pass it through `serde_json::Value`, which turned a
+/// temporal into a string; the flush of a relabeled vertex then wrote that
+/// string back as the property's value, losing the type for good (a NULL in
+/// a declared column, a string in a schemaless one).
+///
+/// # Errors
+/// Returns an error if the blob does not decode or is not a map.
+fn decode_props_blob(bytes: &[u8]) -> Result<Properties> {
+    match uni_common::cypher_value_codec::decode(bytes)
+        .map_err(|e| anyhow!("Failed to decode CypherValue: {}", e))?
+    {
+        uni_common::Value::Map(map) => Ok(map),
+        other => Err(anyhow!("props_json is not a map: {:?}", other)),
+    }
+}
+
 /// Extract a label vector from one row of a `List<Utf8>` labels column.
 ///
 /// Returns `None` when the row's values are not a `StringArray`. Nulls within
@@ -762,12 +781,7 @@ impl MainVertexDataset {
                         if deleted || props_arr.is_null(i) || props_arr.value(i).is_empty() {
                             Properties::new()
                         } else {
-                            let bytes = props_arr.value(i);
-                            let uni_val = uni_common::cypher_value_codec::decode(bytes)
-                                .map_err(|e| anyhow!("Failed to decode CypherValue: {}", e))?;
-                            let json_val: serde_json::Value = uni_val.into();
-                            serde_json::from_value(json_val)
-                                .map_err(|e| anyhow!("Failed to parse props_json: {}", e))?
+                            decode_props_blob(props_arr.value(i))?
                         };
                     best.insert(vid, (version, deleted, props));
                 }
@@ -875,13 +889,7 @@ impl MainVertexDataset {
                         if best_deleted || props_arr.is_null(i) || props_arr.value(i).is_empty() {
                             best_props = Some(Properties::new());
                         } else {
-                            let bytes = props_arr.value(i);
-                            let uni_val = uni_common::cypher_value_codec::decode(bytes)
-                                .map_err(|e| anyhow!("Failed to decode CypherValue: {}", e))?;
-                            let json_val: serde_json::Value = uni_val.into();
-                            let parsed: Properties = serde_json::from_value(json_val)
-                                .map_err(|e| anyhow!("Failed to parse props_json: {}", e))?;
-                            best_props = Some(parsed);
+                            best_props = Some(decode_props_blob(props_arr.value(i))?);
                         }
                     }
                 }
@@ -1126,19 +1134,7 @@ impl MainVertexDataset {
                 props_map.insert(vid, Properties::new());
                 continue;
             }
-            let props = match uni_common::cypher_value_codec::decode(props_arr.value(i))
-                .map_err(|e| anyhow!("Failed to decode CypherValue: {}", e))?
-            {
-                uni_common::Value::Map(map) => map,
-                other => {
-                    return Err(anyhow!(
-                        "props_json of vid {} is not a map: {:?}",
-                        vid.as_u64(),
-                        other
-                    ));
-                }
-            };
-            props_map.insert(vid, props);
+            props_map.insert(vid, decode_props_blob(props_arr.value(i))?);
         }
 
         Ok(props_map)

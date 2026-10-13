@@ -559,6 +559,26 @@ impl HybridPhysicalPlanner {
         self
     }
 
+    /// Inherit an enclosing query's deadline clock and cancellation token.
+    ///
+    /// For a sub-plan. Unlike [`Self::with_deadline_and_cancellation`], which
+    /// takes a snapshot, the clock shares the enclosing query's idle credit, so
+    /// a sub-plan still running after a cursor's consumer paused is not charged
+    /// that pause.
+    #[must_use]
+    pub(crate) fn with_inherited_deadline(
+        mut self,
+        clock: &crate::query::df_graph::DeadlineClock,
+        token: Option<tokio_util::sync::CancellationToken>,
+    ) -> Self {
+        let mut ctx = self.take_graph_ctx().with_deadline_clock(clock);
+        if let Some(token) = token {
+            ctx = ctx.with_cancellation_token(token);
+        }
+        self.graph_ctx = Arc::new(ctx);
+        self
+    }
+
     /// Attach the per-query counter set, threading it into the graph context
     /// every physical operator receives.
     #[must_use]
@@ -838,6 +858,7 @@ impl HybridPhysicalPlanner {
             | LogicalPlan::LocyDerivedScan { .. }
             | LogicalPlan::LocyProject { .. }
             | LogicalPlan::LocyModelInvoke { .. }
+            | LogicalPlan::LocyGenerate { .. }
             | LogicalPlan::Empty
             | LogicalPlan::CreateVectorIndex { .. }
             | LogicalPlan::CreateSparseIndex { .. }
@@ -928,7 +949,7 @@ impl HybridPhysicalPlanner {
     fn guard_deadlines(&self, plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
         crate::query::df_graph::deadline_guard::insert_deadline_guards(
             plan,
-            self.graph_ctx.deadline_for_host(),
+            &self.graph_ctx.deadline_clock(),
             self.graph_ctx.cancellation_token_for_host().as_ref(),
         )
         .map_err(Into::into)
@@ -1676,6 +1697,13 @@ impl HybridPhysicalPlanner {
                 target_types,
             } => self.plan_locy_project(input, projections, target_types, all_properties),
 
+            LogicalPlan::LocyGenerate {
+                input,
+                name,
+                args,
+                outputs,
+            } => self.plan_locy_generate(input, name, args, outputs, all_properties),
+
             LogicalPlan::LocyModelInvoke {
                 input,
                 invocations,
@@ -2228,7 +2256,8 @@ impl HybridPhysicalPlanner {
             variable,
             self.params.clone(),
             drop_source.as_deref(),
-        );
+        )
+        .with_budget(self.graph_ctx.budget());
 
         Ok(Arc::new(unwind))
     }
@@ -5228,8 +5257,19 @@ impl HybridPhysicalPlanner {
         for (i, (expr, alias)) in projections.iter().enumerate() {
             let target_type = target_types.get(i);
 
-            // Handle node/relationship variables: extract ._vid column
+            // Handle node/relationship variables: extract the identity column
             if let Expr::Variable(var_name) = expr {
+                // A relationship variable → its EID (UInt64), hydrated into the
+                // edge after the fixpoint as a node's VID is. Checked before
+                // `._vid`, which a relationship's columns can also include.
+                let eid_col_name = format!("{var_name}._eid");
+                if let Some((eid_idx, _)) = schema.column_with_name(&eid_col_name) {
+                    let col_expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
+                        Arc::new(Column::new(&eid_col_name, eid_idx));
+                    let name = alias.clone().unwrap_or_else(|| var_name.clone());
+                    exprs.push((col_expr, name));
+                    continue;
+                }
                 // Check if this is a graph-expanded node variable ({var}._vid exists)
                 let vid_col_name = format!("{}._vid", var_name);
                 let vid_col_match = schema
@@ -5248,9 +5288,19 @@ impl HybridPhysicalPlanner {
                 }
 
                 // Direct column (e.g. from derived scan)
-                if let Some((col_idx, _)) = schema.column_with_name(var_name) {
+                if let Some((col_idx, field)) = schema.column_with_name(var_name) {
                     let col_expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
                         Arc::new(Column::new(var_name, col_idx));
+                    // A column declared as a Cypher value (a generator output,
+                    // say) is encoded, so the rule's facts carry the declared
+                    // type.
+                    let col_expr = if target_type == Some(&DataType::LargeBinary)
+                        && field.data_type() != &DataType::LargeBinary
+                    {
+                        crate::query::df_graph::expr_compiler::to_cypher_value_expr(col_expr)
+                    } else {
+                        col_expr
+                    };
                     let name = alias.clone().unwrap_or_else(|| var_name.clone());
                     exprs.push((col_expr, name));
                     continue;
@@ -5302,7 +5352,12 @@ impl HybridPhysicalPlanner {
                 };
                 let cross_domain = (is_string(&actual_dt) && is_numeric(target_dt))
                     || (is_numeric(&actual_dt) && is_string(target_dt));
-                if actual_dt != *target_dt && !cross_domain {
+                if actual_dt != *target_dt && *target_dt == DataType::LargeBinary {
+                    // A dynamically typed column: encode the value, whatever
+                    // its type, instead of an Arrow cast that cannot carry a
+                    // list or a map.
+                    crate::query::df_graph::expr_compiler::to_cypher_value_expr(physical_expr)
+                } else if actual_dt != *target_dt && !cross_domain {
                     coerce_physical_expr(physical_expr, &actual_dt, target_dt, schema.as_ref())
                 } else {
                     physical_expr
@@ -5316,6 +5371,94 @@ impl HybridPhysicalPlanner {
         }
 
         Ok(Arc::new(ProjectionExec::try_new(exprs, input_plan)?))
+    }
+
+    /// Plan a Locy generator condition as a [`LocyGenerateExec`].
+    ///
+    /// The generator is resolved here, so an unregistered name fails the plan
+    /// rather than a row. Each argument is compiled like a projection and
+    /// brought to the type the generator's signature declares; each output is
+    /// typed as declared.
+    ///
+    /// [`LocyGenerateExec`]: super::df_graph::locy_generate::LocyGenerateExec
+    fn plan_locy_generate(
+        &self,
+        input: &LogicalPlan,
+        name: &str,
+        args: &[Expr],
+        outputs: &[String],
+        all_properties: &HashMap<String, HashSet<String>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let entry = uni_plugin::QName::candidate_splits(name)
+            .find_map(|q| {
+                self.plugin_registry.locy_generator(&q).or_else(|| {
+                    crate::query::df_udfs_plugin::current_session_plugin_registry()
+                        .and_then(|r| r.locy_generator(&q))
+                })
+            })
+            .ok_or_else(|| anyhow!("generator '{name}' is not registered"))?;
+        let signature = entry.generator.signature();
+        if signature.args.len() != args.len() || signature.outputs.len() != outputs.len() {
+            return Err(anyhow!(
+                "generator '{name}' takes {} argument(s) and binds {} output(s), \
+                 but is called with {} and binds {}",
+                signature.args.len(),
+                signature.outputs.len(),
+                args.len(),
+                outputs.len()
+            ));
+        }
+
+        let input_plan = self.plan_internal(input, all_properties)?;
+        let schema = input_plan.schema();
+        let session = self.session_ctx.read();
+        let state = session.state();
+        let ctx = self.translation_context_for_plan(input);
+        let compiler = self.expr_compiler(&state, Some(&ctx));
+        let physical_args = args
+            .iter()
+            .zip(&signature.args)
+            .map(|(arg, declared)| {
+                let expr = compiler.compile(arg, &schema)?;
+                let actual = expr.data_type(schema.as_ref())?;
+                Ok(match declared {
+                    uni_plugin::traits::scalar::ArgType::CypherValue
+                        if actual != DataType::LargeBinary =>
+                    {
+                        crate::query::df_graph::expr_compiler::to_cypher_value_expr(expr)
+                    }
+                    uni_plugin::traits::scalar::ArgType::Primitive(dt) if actual != *dt => {
+                        coerce_physical_expr(expr, &actual, dt, schema.as_ref())
+                    }
+                    _ => expr,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let output_fields = outputs
+            .iter()
+            .zip(&signature.outputs)
+            .map(|(output, declared)| {
+                let dt = match declared {
+                    uni_plugin::traits::scalar::ArgType::Primitive(dt) => dt.clone(),
+                    uni_plugin::traits::scalar::ArgType::CypherValue => DataType::LargeBinary,
+                    other => {
+                        return Err(anyhow!(
+                            "generator '{name}' output '{output}' has unsupported type {other:?}"
+                        ));
+                    }
+                };
+                Ok(arrow_schema::Field::new(output, dt, true))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Arc::new(
+            super::df_graph::locy_generate::LocyGenerateExec::new(
+                input_plan,
+                name.to_string(),
+                Arc::clone(&entry.generator),
+                physical_args,
+                output_fields,
+            ),
+        ))
     }
 
     /// Plan an aggregation.
@@ -5466,39 +5609,21 @@ impl HybridPhysicalPlanner {
         Ok(Arc::new(ProjectionExec::try_new(proj_exprs, agg_exec)?))
     }
 
-    /// Wrap a temporal aggregate argument with `get_field(arg, "nanos_since_epoch")` or
-    /// `get_field(arg, "nanos_since_midnight")` when the argument is a DateTime/Time struct.
-    ///
-    /// Returns the argument unchanged for non-temporal types.
-    fn wrap_temporal_sort_key(
-        arg: datafusion::logical_expr::Expr,
+    /// Whether `arg` is a DateTime or Time struct, which `min` / `max` must
+    /// read as a whole: reduced to its nanoseconds, the aggregate lost the
+    /// offset and zone, and failed outright ("expected Timestamp(ns) but found
+    /// LargeBinary").
+    fn is_temporal_struct(
+        arg: &datafusion::logical_expr::Expr,
         schema: &SchemaRef,
-    ) -> Result<datafusion::logical_expr::Expr> {
-        use datafusion::logical_expr::ScalarUDF;
-        if let Ok(arg_type) = arg.get_type(&datafusion::common::DFSchema::try_from(
+    ) -> Result<bool> {
+        let arg_type = arg.get_type(&datafusion::common::DFSchema::try_from(
             schema.as_ref().clone(),
-        )?) {
-            if uni_common::core::schema::is_datetime_struct(&arg_type) {
-                return Ok(datafusion::logical_expr::Expr::ScalarFunction(
-                    datafusion::logical_expr::expr::ScalarFunction::new_udf(
-                        Arc::new(ScalarUDF::from(
-                            datafusion::functions::core::getfield::GetFieldFunc::new(),
-                        )),
-                        vec![arg, datafusion::logical_expr::lit("nanos_since_epoch")],
-                    ),
-                ));
-            } else if uni_common::core::schema::is_time_struct(&arg_type) {
-                return Ok(datafusion::logical_expr::Expr::ScalarFunction(
-                    datafusion::logical_expr::expr::ScalarFunction::new_udf(
-                        Arc::new(ScalarUDF::from(
-                            datafusion::functions::core::getfield::GetFieldFunc::new(),
-                        )),
-                        vec![arg, datafusion::logical_expr::lit("nanos_since_midnight")],
-                    ),
-                ));
-            }
-        }
-        Ok(arg)
+        )?);
+        Ok(arg_type.is_ok_and(|t| {
+            uni_common::core::schema::is_datetime_struct(&t)
+                || uni_common::core::schema::is_time_struct(&t)
+        }))
     }
 
     /// Translate Cypher aggregate expressions to DataFusion.
@@ -5570,50 +5695,36 @@ impl HybridPhysicalPlanner {
                         count(get_arg()?)
                     }
                 }
+                // DataFusion's own `sum` / `avg` only for a numeric column;
+                // anything else (an encoded value, a string, a duration, any
+                // expression) folds by Cypher's rules, which take numbers or
+                // durations and reject the rest. A string column used to be
+                // cast to Int64, so `sum` over '12' answered 12.
                 "sum" => {
                     let arg = get_arg()?;
-                    if self.is_large_binary_col(&arg, schema) {
-                        let udaf = Arc::new(crate::query::df_udfs::create_cypher_sum_udaf());
-                        udaf.call(vec![arg])
-                    } else {
-                        // Widen small integers to Int64 (DataFusion doesn't support Int32 sum).
-                        // Float columns pass through unchanged so SUM preserves float type.
-                        use datafusion::logical_expr::Cast;
-                        let is_float = if let DfExpr::Column(col) = &arg
-                            && let Ok(field) = schema.field_with_name(&col.name)
-                        {
-                            matches!(
-                                field.data_type(),
-                                datafusion::arrow::datatypes::DataType::Float32
-                                    | datafusion::arrow::datatypes::DataType::Float64
-                            )
-                        } else {
-                            false
-                        };
-                        if is_float {
-                            sum(DfExpr::Cast(Cast::new(
-                                Box::new(arg),
-                                datafusion::arrow::datatypes::DataType::Float64,
-                            )))
-                        } else {
-                            sum(DfExpr::Cast(Cast::new(
-                                Box::new(arg),
-                                datafusion::arrow::datatypes::DataType::Int64,
-                            )))
-                        }
+                    match Self::numeric_column_type(&arg, schema) {
+                        Some(true) => sum(DfExpr::Cast(datafusion::logical_expr::Cast::new(
+                            Box::new(arg),
+                            datafusion::arrow::datatypes::DataType::Float64,
+                        ))),
+                        // Widen small integers to Int64 (DataFusion has no Int32 sum).
+                        Some(false) => sum(DfExpr::Cast(datafusion::logical_expr::Cast::new(
+                            Box::new(arg),
+                            datafusion::arrow::datatypes::DataType::Int64,
+                        ))),
+                        None => Arc::new(crate::query::df_udfs::create_cypher_sum_udaf())
+                            .call(vec![arg]),
                     }
                 }
                 "avg" => {
                     let arg = get_arg()?;
-                    if self.is_large_binary_col(&arg, schema) {
-                        let coerced = crate::query::df_udfs::cypher_to_float64_expr(arg);
-                        avg(coerced)
-                    } else {
-                        use datafusion::logical_expr::Cast;
-                        avg(DfExpr::Cast(Cast::new(
+                    match Self::numeric_column_type(&arg, schema) {
+                        Some(_) => avg(DfExpr::Cast(datafusion::logical_expr::Cast::new(
                             Box::new(arg),
                             datafusion::arrow::datatypes::DataType::Float64,
-                        )))
+                        ))),
+                        None => Arc::new(crate::query::df_udfs::create_cypher_avg_udaf())
+                            .call(vec![arg]),
                     }
                 }
                 // Numerically-stable standard-deviation / variance aggregates
@@ -5625,25 +5736,29 @@ impl HybridPhysicalPlanner {
                 // schemaless (LargeBinary) numeric property works directly.
                 "stdev" | "stddev" => {
                     let arg = get_arg()?;
-                    stddev(Self::coerce_numeric_for_stat(arg, schema, self))
+                    stddev(Self::coerce_numeric_for_stat(arg, schema))
                 }
                 "stdevp" | "stddevp" => {
                     let arg = get_arg()?;
-                    stddev_pop(Self::coerce_numeric_for_stat(arg, schema, self))
+                    stddev_pop(Self::coerce_numeric_for_stat(arg, schema))
                 }
                 "variance" => {
                     let arg = get_arg()?;
-                    var_sample(Self::coerce_numeric_for_stat(arg, schema, self))
+                    var_sample(Self::coerce_numeric_for_stat(arg, schema))
                 }
                 "variancep" => {
                     let arg = get_arg()?;
-                    var_pop(Self::coerce_numeric_for_stat(arg, schema, self))
+                    var_pop(Self::coerce_numeric_for_stat(arg, schema))
                 }
                 "min" => {
-                    // Use Cypher-aware min for LargeBinary columns (mixed types)
-                    let arg = Self::wrap_temporal_sort_key(get_arg()?, schema)?;
+                    // Cypher-aware min for LargeBinary columns (mixed types) and
+                    // for a DateTime / Time struct, which it orders by instant
+                    // and returns whole, offset and zone included.
+                    let arg = get_arg()?;
 
-                    if self.is_large_binary_col(&arg, schema) {
+                    if self.is_large_binary_col(&arg, schema)
+                        || Self::is_temporal_struct(&arg, schema)?
+                    {
                         let udaf = Arc::new(crate::query::df_udfs::create_cypher_min_udaf());
                         udaf.call(vec![arg])
                     } else {
@@ -5651,10 +5766,14 @@ impl HybridPhysicalPlanner {
                     }
                 }
                 "max" => {
-                    // Use Cypher-aware max for LargeBinary columns (mixed types)
-                    let arg = Self::wrap_temporal_sort_key(get_arg()?, schema)?;
+                    // Cypher-aware max for LargeBinary columns (mixed types) and
+                    // for a DateTime / Time struct, which it orders by instant
+                    // and returns whole, offset and zone included.
+                    let arg = get_arg()?;
 
-                    if self.is_large_binary_col(&arg, schema) {
+                    if self.is_large_binary_col(&arg, schema)
+                        || Self::is_temporal_struct(&arg, schema)?
+                    {
                         let udaf = Arc::new(crate::query::df_udfs::create_cypher_max_udaf());
                         udaf.call(vec![arg])
                     } else {
@@ -5667,7 +5786,7 @@ impl HybridPhysicalPlanner {
                     }
                     let expr_arg = cypher_expr_to_df(&args[0], Some(ctx))?;
                     let pct_arg = cypher_expr_to_df(&args[1], Some(ctx))?;
-                    let coerced = crate::query::df_udfs::cypher_to_float64_expr(expr_arg);
+                    let coerced = Self::coerce_numeric_for_stat(expr_arg, schema);
                     let udaf =
                         Arc::new(crate::query::df_udfs::create_cypher_percentile_disc_udaf());
                     udaf.call(vec![coerced, pct_arg])
@@ -5678,7 +5797,7 @@ impl HybridPhysicalPlanner {
                     }
                     let expr_arg = cypher_expr_to_df(&args[0], Some(ctx))?;
                     let pct_arg = cypher_expr_to_df(&args[1], Some(ctx))?;
-                    let coerced = crate::query::df_udfs::cypher_to_float64_expr(expr_arg);
+                    let coerced = Self::coerce_numeric_for_stat(expr_arg, schema);
                     let udaf =
                         Arc::new(crate::query::df_udfs::create_cypher_percentile_cont_udaf());
                     udaf.call(vec![coerced, pct_arg])
@@ -5771,16 +5890,27 @@ impl HybridPhysicalPlanner {
                 }
             };
 
-            // Apply DISTINCT if needed (collect/percentile handle their own distinct)
-            let df_agg = if *distinct
-                && !matches!(
-                    name_lower.as_str(),
-                    "collect" | "percentiledisc" | "percentilecont"
-                ) {
-                use datafusion::prelude::ExprFunctionExt;
-                df_agg.distinct().build().map_err(|e| anyhow!("{}", e))?
-            } else {
-                df_agg
+            // Apply DISTINCT (collect handles its own). DataFusion leaves
+            // DISTINCT to the aggregate's accumulator: its own count / sum /
+            // avg / min / max honour the flag, any other aggregate (Cypher's
+            // `sum` over a dynamically typed column, percentiles, plugin
+            // aggregates) would silently fold every row, so it is wrapped to
+            // fold the distinct argument tuples instead.
+            let df_agg = match df_agg {
+                _ if !*distinct || name_lower == "collect" => df_agg,
+                DfExpr::AggregateFunction(agg)
+                    if !matches!(agg.func.name(), "count" | "sum" | "avg" | "min" | "max") =>
+                {
+                    let wrapped = crate::query::df_udfs::distinct_udaf(agg.func.as_ref().clone());
+                    DfExpr::AggregateFunction(datafusion::logical_expr::expr::AggregateFunction {
+                        func: Arc::new(wrapped),
+                        params: agg.params,
+                    })
+                }
+                df_agg => {
+                    use datafusion::prelude::ExprFunctionExt;
+                    df_agg.distinct().build().map_err(|e| anyhow!("{}", e))?
+                }
             };
 
             // Resolve UDFs and apply type coercion inside aggregate arguments
@@ -6463,7 +6593,7 @@ impl HybridPhysicalPlanner {
             let name_lower = name.to_lowercase();
 
             // Resolve the window function definition: either AggregateUDF or WindowUDF
-            let (window_fn_def, is_aggregate) = match name_lower.as_str() {
+            let (mut window_fn_def, is_aggregate) = match name_lower.as_str() {
                 // Aggregate window functions → AggregateUDF
                 "count" => (WindowFunctionDefinition::AggregateUDF(count_udaf()), true),
                 "sum" => (WindowFunctionDefinition::AggregateUDF(sum_udaf()), true),
@@ -6532,6 +6662,43 @@ impl HybridPhysicalPlanner {
                 }
             };
 
+            // `sum` / `avg` over anything but a numeric column fold by Cypher's
+            // rules, as the grouped aggregates do: DataFusion's cast below
+            // summed the strings '12' and '3' to 15, and failed on durations
+            // and on every schemaless (encoded) property.
+            let cypher_sum = matches!(name_lower.as_str(), "sum" | "avg")
+                && matches!(args.as_slice(), [arg] if !matches!(arg, Expr::Wildcard))
+                && !matches!(
+                    cypher_expr_to_df(&args[0], tx_ctx.as_ref())?.get_type(&df_schema),
+                    Ok(datafusion::arrow::datatypes::DataType::Float16
+                        | datafusion::arrow::datatypes::DataType::Float32
+                        | datafusion::arrow::datatypes::DataType::Float64
+                        | datafusion::arrow::datatypes::DataType::Int8
+                        | datafusion::arrow::datatypes::DataType::Int16
+                        | datafusion::arrow::datatypes::DataType::Int32
+                        | datafusion::arrow::datatypes::DataType::Int64
+                        | datafusion::arrow::datatypes::DataType::UInt8
+                        | datafusion::arrow::datatypes::DataType::UInt16
+                        | datafusion::arrow::datatypes::DataType::UInt32
+                        | datafusion::arrow::datatypes::DataType::UInt64)
+                );
+            // A non-built-in aggregate ignores DataFusion's DISTINCT flag.
+            let mut window_distinct = *distinct;
+            if cypher_sum {
+                let udaf = if name_lower == "sum" {
+                    crate::query::df_udfs::create_cypher_sum_udaf()
+                } else {
+                    crate::query::df_udfs::create_cypher_avg_udaf()
+                };
+                let udaf = if window_distinct {
+                    window_distinct = false;
+                    crate::query::df_udfs::distinct_udaf(udaf)
+                } else {
+                    udaf
+                };
+                window_fn_def = WindowFunctionDefinition::AggregateUDF(Arc::new(udaf));
+            }
+
             // Translate argument expressions to physical expressions
             let physical_args: Vec<Arc<dyn datafusion::physical_expr::PhysicalExpr>> =
                 if args.is_empty() || matches!(args.as_slice(), [Expr::Wildcard]) {
@@ -6556,7 +6723,7 @@ impl HybridPhysicalPlanner {
                             // the grouped `sum` does — casting every argument to
                             // Int64 truncated each float before it was added
                             // (`sum(0.5, 1.25) OVER ()` returned 1). AVG needs Float64.
-                            if is_aggregate {
+                            if is_aggregate && !cypher_sum {
                                 let is_float = matches!(
                                     df_expr.get_type(&df_schema),
                                     Ok(datafusion::arrow::datatypes::DataType::Float32
@@ -6670,7 +6837,7 @@ impl HybridPhysicalPlanner {
                 window_frame,
                 input_schema.clone(),
                 false, // ignore_nulls
-                *distinct,
+                window_distinct,
                 None, // filter
             )?;
 
@@ -7341,6 +7508,27 @@ impl HybridPhysicalPlanner {
     }
 
     /// Check if a DataFusion expression refers to a LargeBinary column in the schema.
+    /// For a column of a numeric Arrow type, whether it is a float; `None`
+    /// for any other column or expression.
+    fn numeric_column_type(expr: &DfExpr, schema: &SchemaRef) -> Option<bool> {
+        use datafusion::arrow::datatypes::DataType as D;
+        let DfExpr::Column(col) = expr else {
+            return None;
+        };
+        match schema.field_with_name(&col.name).ok()?.data_type() {
+            D::Float16 | D::Float32 | D::Float64 => Some(true),
+            D::Int8
+            | D::Int16
+            | D::Int32
+            | D::Int64
+            | D::UInt8
+            | D::UInt16
+            | D::UInt32
+            | D::UInt64 => Some(false),
+            _ => None,
+        }
+    }
+
     fn is_large_binary_col(&self, expr: &DfExpr, schema: &SchemaRef) -> bool {
         if let DfExpr::Column(col) = expr
             && let Ok(field) = schema.field_with_name(&col.name)
@@ -7356,13 +7544,17 @@ impl HybridPhysicalPlanner {
     }
 
     /// Coerce an aggregate argument to `Float64` for numeric statistical
-    /// aggregates (stDev/variance). A schemaless property arrives as a
-    /// `LargeBinary` CypherValue column and is decoded via the Cypher→Float64
-    /// UDF; a schema-typed numeric column is cast directly. Mirrors the
-    /// coercion `avg` applies so the two agree on which rows are numeric.
-    fn coerce_numeric_for_stat(arg: DfExpr, schema: &SchemaRef, this: &Self) -> DfExpr {
-        if this.is_large_binary_col(&arg, schema) {
-            crate::query::df_udfs::cypher_to_float64_expr(arg)
+    /// aggregates (stDev, variance, percentiles). A numeric column is cast
+    /// directly; anything else (a schemaless property's `LargeBinary`
+    /// CypherValue, a string or duration column) reads through
+    /// `_cypher_number`, so a value that is not a number is an error, as in
+    /// `sum` and `avg`.
+    fn coerce_numeric_for_stat(arg: DfExpr, schema: &SchemaRef) -> DfExpr {
+        if Self::numeric_column_type(&arg, schema).is_none() {
+            // A Cypher value, or a column that is not numeric (a string, a
+            // duration): read as a number, an error if it is not one. A raw
+            // cast summarised a string column `'12'` as 12.
+            crate::query::df_udfs::cypher_number_expr(arg)
         } else {
             use datafusion::logical_expr::Cast;
             DfExpr::Cast(Cast::new(
@@ -7385,8 +7577,8 @@ impl HybridPhysicalPlanner {
 /// Coerce a physical expression from `actual_dt` to `target_dt`.
 ///
 /// Arrow's CastExpr cannot handle LargeBinary→Float64 because LargeBinary holds
-/// serialized CypherValue bytes. For these cases, use the `_cypher_to_float64` UDF
-/// which deserializes properly. For standard numeric coercions (Int64→Float64 etc.)
+/// serialized CypherValue bytes. For these cases, use the `_cypher_number` UDF,
+/// which decodes the number or fails. For standard numeric coercions (Int64→Float64 etc.)
 /// we use Arrow's built-in CastExpr.
 fn coerce_physical_expr(
     expr: Arc<dyn datafusion::physical_expr::PhysicalExpr>,
@@ -7396,29 +7588,35 @@ fn coerce_physical_expr(
 ) -> Arc<dyn datafusion::physical_expr::PhysicalExpr> {
     use datafusion::physical_expr::expressions::CastExpr;
 
+    // A value that is not a number is an error, not NULL: a Cypher value or a
+    // non-numeric column brought to a number reads through `_cypher_number`.
+    // `_cypher_to_float64` turned a string or a duration into NULL here, so a
+    // FOLD `SUM` over them summed to 0.
     match (actual_dt, target_dt) {
-        // LargeBinary → Float64: use Cypher value deserializer UDF
-        (DataType::LargeBinary, DataType::Float64) => wrap_cypher_to_float64(expr, schema),
-        // LargeBinary → Int64: cast through Float64 first (extract number, then truncate)
+        (DataType::LargeBinary, DataType::Float64) => wrap_cypher_number(expr, schema),
+        // Read the number, then truncate.
         (DataType::LargeBinary, DataType::Int64) => {
-            let float_expr = wrap_cypher_to_float64(expr, schema);
+            let float_expr = wrap_cypher_number(expr, schema);
             Arc::new(CastExpr::new(float_expr, DataType::Int64, None))
+        }
+        (actual, DataType::Float64) if !actual.is_numeric() && actual != &DataType::Null => {
+            wrap_cypher_number(expr, schema)
         }
         // Standard Arrow casts (Int64→Float64, Float64→Int64, etc.)
         _ => Arc::new(CastExpr::new(expr, target_dt.clone(), None)),
     }
 }
 
-/// Wrap a physical expression with `_cypher_to_float64` UDF.
-fn wrap_cypher_to_float64(
+/// Wrap a physical expression with the `_cypher_number` UDF.
+fn wrap_cypher_number(
     expr: Arc<dyn datafusion::physical_expr::PhysicalExpr>,
     schema: &arrow_schema::Schema,
 ) -> Arc<dyn datafusion::physical_expr::PhysicalExpr> {
-    let udf = Arc::new(super::df_udfs::cypher_to_float64_udf());
+    let udf = Arc::new(super::df_udfs::cypher_number_udf());
     let config = Arc::new(datafusion::common::config::ConfigOptions::default());
     Arc::new(
         datafusion::physical_expr::ScalarFunctionExpr::try_new(udf, vec![expr], schema, config)
-            .expect("CypherToFloat64Udf accepts Any(1) signature"),
+            .expect("CypherNumberUdf accepts Any(1) signature"),
     )
 }
 
@@ -7543,7 +7741,12 @@ fn resolve_fold_bindings(
         .map(|(output_name, expr)| {
             // Parse aggregate expression: FunctionCall { name, args }
             match expr {
-                Expr::FunctionCall { name, args, .. } => {
+                Expr::FunctionCall {
+                    name,
+                    args,
+                    distinct,
+                    ..
+                } => {
                     let upper = name.to_uppercase();
                     let is_count = matches!(upper.as_str(), "COUNT" | "MCOUNT");
 
@@ -7589,6 +7792,7 @@ fn resolve_fold_bindings(
                             aggregate,
                             input_col_index: 0,
                             input_col_name: None,
+                            distinct: false,
                         });
                     }
 
@@ -7625,6 +7829,7 @@ fn resolve_fold_bindings(
                         aggregate,
                         input_col_index,
                         input_col_name: Some(output_name.clone()),
+                        distinct: *distinct,
                     })
                 }
                 _ => Err(anyhow::anyhow!(
@@ -7987,7 +8192,8 @@ pub(crate) fn collect_variable_kinds(
         | LogicalPlan::LocyPriority { .. }
         | LogicalPlan::LocyDerivedScan { .. }
         | LogicalPlan::LocyProject { .. }
-        | LogicalPlan::LocyModelInvoke { .. } => {}
+        | LogicalPlan::LocyModelInvoke { .. }
+        | LogicalPlan::LocyGenerate { .. } => {}
         // Leaf nodes with no variables or not applicable
         LogicalPlan::Empty
         | LogicalPlan::CreateVectorIndex { .. }
@@ -8100,6 +8306,7 @@ fn collect_mutation_node_hints(plan: &LogicalPlan, hints: &mut Vec<String>) {
         | LogicalPlan::LocyDerivedScan { .. }
         | LogicalPlan::LocyProject { .. }
         | LogicalPlan::LocyModelInvoke { .. }
+        | LogicalPlan::LocyGenerate { .. }
         | LogicalPlan::Empty
         | LogicalPlan::CreateVectorIndex { .. }
         | LogicalPlan::CreateSparseIndex { .. }
@@ -8230,6 +8437,7 @@ fn collect_mutation_edge_hints(plan: &LogicalPlan, hints: &mut Vec<String>) {
         | LogicalPlan::LocyDerivedScan { .. }
         | LogicalPlan::LocyProject { .. }
         | LogicalPlan::LocyModelInvoke { .. }
+        | LogicalPlan::LocyGenerate { .. }
         | LogicalPlan::Empty
         | LogicalPlan::CreateVectorIndex { .. }
         | LogicalPlan::CreateSparseIndex { .. }
@@ -8569,7 +8777,8 @@ fn collect_plan_variables_into(plan: &LogicalPlan, out: &mut HashSet<String>) {
         | LogicalPlan::LocyBestBy { .. }
         | LogicalPlan::LocyPriority { .. }
         | LogicalPlan::LocyProject { .. }
-        | LogicalPlan::LocyModelInvoke { .. } => {}
+        | LogicalPlan::LocyModelInvoke { .. }
+        | LogicalPlan::LocyGenerate { .. } => {}
         // Leaf nodes / DDL / admin statements bind no variables.
         LogicalPlan::Empty
         | LogicalPlan::CreateVectorIndex { .. }

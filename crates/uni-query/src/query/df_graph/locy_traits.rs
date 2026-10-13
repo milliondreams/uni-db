@@ -43,7 +43,7 @@ pub trait DerivedFactSource: Send + Sync {
     /// Returns raw `RecordBatch`es so the native path stays columnar.
     /// Callers that need `Vec<FactRow>` must convert via `record_batches_to_locy_rows`.
     ///
-    /// Used by SLG clause resolution, EXPLAIN re-execution, and delta resolution.
+    /// Used by EXPLAIN derivation trees and delta resolution.
     /// AST construction happens inside the adapter via `build_match_return_query`.
     async fn execute_pattern(
         &self,
@@ -62,6 +62,16 @@ pub trait DerivedFactSource: Send + Sync {
     /// vids gracefully — typically by leaving the original
     /// `Value::Int(vid)` in place. Native adapters override this.
     async fn lookup_nodes_by_vids(&self, _vids: &[u64]) -> Result<HashMap<u64, Value>, LocyError> {
+        Ok(HashMap::new())
+    }
+
+    /// Resolve relationship EIDs to their `Value::Edge`, as
+    /// [`Self::lookup_nodes_by_vids`] resolves VIDs.
+    ///
+    /// A rule's facts carry a single-hop relationship as its EID, and EIDs
+    /// overlap VIDs numerically, so an EID must never be resolved as a VID.
+    /// Default impl returns an empty map; native adapters override this.
+    async fn lookup_edges_by_eids(&self, _eids: &[u64]) -> Result<HashMap<u64, Value>, LocyError> {
         Ok(HashMap::new())
     }
 }

@@ -665,8 +665,15 @@ impl Executor {
         // this hop they never reach a physical operator and every
         // `graph_ctx.check_timeout()` below is a no-op. See #207.
         if let Some(ref ctx) = query_ctx {
-            planner = planner
-                .with_deadline_and_cancellation(ctx.deadline, ctx.cancellation_token.clone());
+            planner = match &self.inherited_deadline {
+                // Live, so the operators see credit the enclosing cursor earns
+                // while this query runs.
+                Some(clock) => {
+                    planner.with_inherited_deadline(clock, ctx.cancellation_token.clone())
+                }
+                None => planner
+                    .with_deadline_and_cancellation(ctx.deadline, ctx.cancellation_token.clone()),
+            };
         }
         planner = planner.with_algo_registry(self.algo_registry.clone());
         if let Some(ref registry) = self.procedure_registry {
@@ -1582,7 +1589,8 @@ impl Executor {
             | LogicalPlan::LocyBestBy { input, .. }
             | LogicalPlan::LocyPriority { input, .. }
             | LogicalPlan::LocyProject { input, .. }
-            | LogicalPlan::LocyModelInvoke { input, .. } => vec![input.as_ref()],
+            | LogicalPlan::LocyModelInvoke { input, .. }
+            | LogicalPlan::LocyGenerate { input, .. } => vec![input.as_ref()],
 
             // ── Leaves ───────────────────────────────────────────────────
             //
@@ -2551,57 +2559,11 @@ impl Executor {
                 }
                 Expr::Wildcard => Ok(Value::Null),
                 Expr::FunctionCall { name, args, .. } => {
-                    // Special case: id() returns VID for nodes and EID for relationships
-                    if name.eq_ignore_ascii_case("ID") {
-                        if args.len() != 1 {
-                            return Err(anyhow!("id() requires exactly 1 argument"));
-                        }
-                        let val = this
-                            .evaluate_expr(&args[0], row, prop_manager, params, ctx)
-                            .await?;
-                        // Only the map encoding was handled, so `id(n)` on a
-                        // native `Value::Node` returned NULL — an entity right
-                        // there in the row reading as "not an entity" (#233,
-                        // #234). `entity_vid` is the one definition of vertex
-                        // identity and covers `Node` and every map form; edges
-                        // stay explicit because it has no `Edge`/`_eid` arm.
-                        if let Some(vid) = val.entity_vid() {
-                            return Ok(Value::Int(vid.as_u64() as i64));
-                        }
-                        // The edge half now has an accessor too. The map arm it
-                        // replaces returned `_eid` *verbatim*, so an id carried as
-                        // the string `"Eid(7)"` came back as that string while the
-                        // vertex arm beside it returned an `Int` — one function,
-                        // two return types, decided by how a row was encoded.
-                        if let Some(eid) = val.entity_eid() {
-                            return Ok(Value::Int(eid.as_u64() as i64));
-                        }
-                        // A genuinely non-entity argument, `id(null)` included,
-                        // is NULL by Cypher's rules.
-                        return Ok(Value::Null);
-                    }
-
-                    // Special case: elementId() returns string format "label_id:local_offset"
-                    if name.eq_ignore_ascii_case("ELEMENTID") {
-                        if args.len() != 1 {
-                            return Err(anyhow!("elementId() requires exactly 1 argument"));
-                        }
-                        let val = this
-                            .evaluate_expr(&args[0], row, prop_manager, params, ctx)
-                            .await?;
-                        // Same two gaps as `id()` above, plus one of its own: the
-                        // `_vid` arm required `as_u64`, so a map carrying the id
-                        // only as `_id` fell through to NULL even though the
-                        // entity was present. `entity_vid` accepts every form.
-                        if let Some(vid) = val.entity_vid() {
-                            return Ok(Value::String(vid.as_u64().to_string()));
-                        }
-                        if let Some(eid) = val.entity_eid() {
-                            return Ok(Value::String(eid.as_u64().to_string()));
-                        }
-                        return Ok(Value::Null);
-                    }
-
+                    // `id`, `elementId`, `labels` and `properties` are
+                    // `eval_scalar_function`'s, through the generic path below,
+                    // so every row evaluator answers them alike. `type()`
+                    // stays here: an edge carried by its type id is named
+                    // through the schema.
                     // Special case: type() returns the relationship type name
                     if name.eq_ignore_ascii_case("TYPE") {
                         if args.len() != 1 {
@@ -2628,48 +2590,6 @@ impl Executor {
                                 }
                             }
                             None => {}
-                        }
-                        return Ok(Value::Null);
-                    }
-
-                    // Special case: labels() returns the labels of a node
-                    if name.eq_ignore_ascii_case("LABELS") {
-                        if args.len() != 1 {
-                            return Err(anyhow!("labels() requires exactly 1 argument"));
-                        }
-                        let val = this
-                            .evaluate_expr(&args[0], row, prop_manager, params, ctx)
-                            .await?;
-                        // `labels(n)` answered `Null` for a native node, for
-                        // the same reason `type(r)` did.
-                        if let Some(labels) = val.entity_labels() {
-                            return Ok(Value::List(
-                                labels.into_iter().map(Value::String).collect(),
-                            ));
-                        }
-                        return Ok(Value::Null);
-                    }
-
-                    // Special case: properties() returns the properties map of a node/edge
-                    if name.eq_ignore_ascii_case("PROPERTIES") {
-                        if args.len() != 1 {
-                            return Err(anyhow!("properties() requires exactly 1 argument"));
-                        }
-                        let val = this
-                            .evaluate_expr(&args[0], row, prop_manager, params, ctx)
-                            .await?;
-                        if let Some(props) = val.entity_properties() {
-                            return Ok(Value::Map(props));
-                        }
-                        // A plain map is its own properties; only a non-map,
-                        // non-entity is `Null`.
-                        if let Value::Map(map) = &val {
-                            return Ok(Value::Map(
-                                map.iter()
-                                    .filter(|(k, _)| !k.starts_with('_'))
-                                    .map(|(k, v)| (k.clone(), v.clone()))
-                                    .collect(),
-                            ));
                         }
                         return Ok(Value::Null);
                     }
@@ -3615,7 +3535,8 @@ impl Executor {
                 | LogicalPlan::LocyPriority { .. }
                 | LogicalPlan::LocyDerivedScan { .. }
                 | LogicalPlan::LocyProject { .. }
-                | LogicalPlan::LocyModelInvoke { .. } => {
+                | LogicalPlan::LocyModelInvoke { .. }
+                | LogicalPlan::LocyGenerate { .. } => {
                     unreachable!("Locy operators are handled by DataFusion engine")
                 }
             }
@@ -4403,7 +4324,7 @@ impl Executor {
                     self.evaluate_expr(&args[0], row, prop_manager, params, ctx)
                         .await?
                 };
-                accs[i].update(&val, is_wildcard);
+                accs[i].update(&val, is_wildcard)?;
             }
         }
         Ok(())

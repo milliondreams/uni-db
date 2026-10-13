@@ -62,6 +62,26 @@ A key seeded with 100 that also receives a stake of 20 comes out as 120. For
 other rows count **1**, and the compiler warns about it. Seed with `NULL AS n`
 to make a key present without counting it.
 
+A rule has one FOLD: every clause that folds states the same FOLD names and
+aggregates, post-FOLD `WHERE`, `REQUIRE` and `BEST BY`, and a seeding clause
+states none of them. Clauses differing there are a compile error
+(`ClauseMismatch`), where the rule used to keep the first folding clause's tail
+and silently drop the others'.
+
+### Distinct values
+
+`AGG(DISTINCT expr)` folds each distinct value once per key, as Cypher's
+`count(DISTINCT x)` does:
+
+```locy
+CREATE RULE reach AS MATCH (x:N)-[:E]->(y:N)
+FOLD k = COUNT(DISTINCT y) YIELD KEY x, k
+```
+
+counts `x`'s distinct neighbours, however many parallel edges lead to each.
+A recursive rule cannot use `DISTINCT` (`DistinctFoldInRecursion`): its FOLD
+folds each iteration's new rows and never sees a key's whole set of values.
+
 ### FOLD in a recursive rule
 
 A recursive `FOLD` rolls up **per KEY, one level at a time**: a self-reference

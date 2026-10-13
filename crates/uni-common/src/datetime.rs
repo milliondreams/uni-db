@@ -58,3 +58,43 @@ pub fn parse_datetime_utc(s: &str) -> Result<DateTime<Utc>> {
         })
         .map_err(|_| anyhow!("Invalid datetime format: {}", s))
 }
+
+/// Scales a duration by `factor`, as `duration * n` and `duration / n` do.
+///
+/// Months and days scale separately; the fraction of a month cascades into
+/// days and seconds at the average Gregorian month (2 629 746 s), and the
+/// fraction of a day into nanoseconds. Returns `(months, days, nanos)`.
+///
+/// # Examples
+///
+/// ```
+/// use uni_common::datetime::scale_duration;
+///
+/// // Half of 1 month and 1 day: 15 days, 5 h 14 min 33 s of the month, 12 h.
+/// assert_eq!(scale_duration(1, 1, 0, 0.5), (0, 15, 62_073_000_000_000));
+/// ```
+#[must_use]
+pub fn scale_duration(months: i64, days: i64, nanos: i64, factor: f64) -> (i64, i64, i64) {
+    const SECONDS_PER_DAY: f64 = 86_400.0;
+    const NANOS_PER_SECOND: f64 = 1_000_000_000.0;
+    const NANOS_PER_DAY: f64 = SECONDS_PER_DAY * NANOS_PER_SECOND;
+
+    let months_f = months as f64 * factor;
+    let whole_months = months_f.trunc() as i64;
+    let frac_months = months_f.fract();
+
+    // Cascade fractional months via average Gregorian month (2629746 seconds).
+    let frac_month_seconds = frac_months * 2_629_746.0;
+    let extra_days_from_months = (frac_month_seconds / SECONDS_PER_DAY).trunc();
+    let remaining_secs_from_months = frac_month_seconds - extra_days_from_months * SECONDS_PER_DAY;
+
+    let days_f = days as f64 * factor + extra_days_from_months;
+    let whole_days = days_f.trunc() as i64;
+    let frac_days = days_f.fract();
+
+    let nanos_f = nanos as f64 * factor
+        + remaining_secs_from_months * NANOS_PER_SECOND
+        + frac_days * NANOS_PER_DAY;
+
+    (whole_months, whole_days, nanos_f.trunc() as i64)
+}

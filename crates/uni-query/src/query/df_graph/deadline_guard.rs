@@ -37,13 +37,17 @@ use datafusion::physical_plan::{
 use futures::Stream;
 use tokio_util::sync::CancellationToken;
 
+use super::DeadlineClock;
 use super::common::check_deadline;
 
 /// Wraps `input` and checks the deadline before yielding each of its batches.
 #[derive(Debug)]
 pub(crate) struct DeadlineGuardExec {
     input: Arc<dyn ExecutionPlan>,
-    deadline: Option<std::time::Instant>,
+    /// Live, not a snapshot: the guard is polled long after planning, and a
+    /// cursor's consumer may have idled in between. That idle time is credited
+    /// to the clock, and a copied `Instant` would charge it to the query.
+    deadline: DeadlineClock,
     token: Option<CancellationToken>,
     properties: Arc<PlanProperties>,
 }
@@ -51,7 +55,7 @@ pub(crate) struct DeadlineGuardExec {
 impl DeadlineGuardExec {
     pub(crate) fn new(
         input: Arc<dyn ExecutionPlan>,
-        deadline: Option<std::time::Instant>,
+        deadline: DeadlineClock,
         token: Option<CancellationToken>,
     ) -> Self {
         // Inherit the child's properties wholesale. This is a pure pass-through,
@@ -101,7 +105,7 @@ impl ExecutionPlan for DeadlineGuardExec {
                 .into_iter()
                 .next()
                 .ok_or_else(|| DataFusionError::Internal("guard needs one child".into()))?,
-            self.deadline,
+            self.deadline.clone(),
             self.token.clone(),
         )))
     }
@@ -113,7 +117,7 @@ impl ExecutionPlan for DeadlineGuardExec {
     ) -> DFResult<SendableRecordBatchStream> {
         Ok(Box::pin(DeadlineGuardStream {
             input: self.input.execute(partition, context)?,
-            deadline: self.deadline,
+            deadline: self.deadline.clone(),
             token: self.token.clone(),
         }))
     }
@@ -121,7 +125,7 @@ impl ExecutionPlan for DeadlineGuardExec {
 
 struct DeadlineGuardStream {
     input: SendableRecordBatchStream,
-    deadline: Option<std::time::Instant>,
+    deadline: DeadlineClock,
     token: Option<CancellationToken>,
 }
 
@@ -129,7 +133,7 @@ impl Stream for DeadlineGuardStream {
     type Item = DFResult<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if let Err(e) = check_deadline(self.token.as_ref(), self.deadline) {
+        if let Err(e) = check_deadline(self.token.as_ref(), self.deadline.effective()) {
             return Poll::Ready(Some(Err(DataFusionError::Execution(e.to_string()))));
         }
         Pin::new(&mut self.input).poll_next(cx)
@@ -215,10 +219,10 @@ fn subtree_is_insertable(plan: &Arc<dyn ExecutionPlan>) -> bool {
 /// node that is itself already a guard.
 pub(crate) fn insert_deadline_guards(
     plan: Arc<dyn ExecutionPlan>,
-    deadline: Option<std::time::Instant>,
+    deadline: &DeadlineClock,
     token: Option<&CancellationToken>,
 ) -> DFResult<Arc<dyn ExecutionPlan>> {
-    if deadline.is_none() && token.is_none() {
+    if !deadline.is_set() && token.is_none() {
         return Ok(plan);
     }
 
@@ -251,7 +255,7 @@ pub(crate) fn insert_deadline_guards(
 
 fn insert_inner(
     plan: Arc<dyn ExecutionPlan>,
-    deadline: Option<std::time::Instant>,
+    deadline: &DeadlineClock,
     token: Option<&CancellationToken>,
 ) -> DFResult<Arc<dyn ExecutionPlan>> {
     use datafusion::physical_plan::execution_plan::EmissionType;
@@ -290,8 +294,11 @@ fn insert_inner(
         let child_is_insertable = subtree_is_insertable(&rewritten);
         let guarded = if breaks_pipeline && child_is_insertable && !already_guarded {
             changed = true;
-            Arc::new(DeadlineGuardExec::new(rewritten, deadline, token.cloned()))
-                as Arc<dyn ExecutionPlan>
+            Arc::new(DeadlineGuardExec::new(
+                rewritten,
+                deadline.clone(),
+                token.cloned(),
+            )) as Arc<dyn ExecutionPlan>
         } else {
             rewritten
         };

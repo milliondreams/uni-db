@@ -1080,10 +1080,39 @@ held as an `Arc` by `UniInner` *and* by every task registered through
 `track_task_with_scratch_claim`, so the directory cannot be removed while a
 task that might write to it is still running. This is not a theoretical
 concern: several tasks write precisely *because* shutdown was signalled — the
-auto-flush task performs a final flush on its way out. With the guard owned
+index rebuild worker saves its state, compaction finishes its run, and, with
+the WAL off, the auto-flush task performs a final flush. With the guard owned
 solely by `UniInner`, teardown removed the directory *successfully* and that
 final flush then recreated the tree, leaving a directory containing exactly
 `storage/catalog/latest` plus one manifest. Measured at 39/40 bare drops.
+
+With the WAL on (the default), the auto-flush task does **not** flush on the
+shutdown signal. Every commit is in the WAL before it returns and a reopen
+replays it, so a final flush bought only a shorter replay; `shutdown()`
+flushes before it signals, so it found nothing to do there; and on a bare
+`Drop` nothing awaited it, so a runtime shutting down right after the drop cut
+it off midway (Lance panics on the cancelled `spawn_blocking`: `Background task
+failed: JoinError::Cancelled`). Without the WAL, L0 is the only copy and the
+best-effort flush stays. `storage::shutdown_test::dropping_without_shutdown_leaves_the_data_to_the_wal`
+pins both halves: no manifest is written after a bare drop, and the row is
+back after a reopen.
+
+A table exists only once its first manifest is committed. Lance writes a new
+dataset's data files before that manifest, so a create cut off midway (a crash,
+or a runtime shut down during a label's first flush) leaves `<table>.lance/`
+with data and no `_versions/`. `LanceDirectory::table_names` and, on the fork
+path, `LanceBranching::table_exists` used to count the directory: every open of
+it then failed, and with the WAL on the issue #72 guard refused to open the
+store at all (WAL segments, a table, no snapshot manifest). Both now require a
+`.manifest` under `_versions/`. Pinned by
+`storage::shutdown_test::an_interrupted_first_create_does_not_wedge_the_store`
+and `a_fork_writes_past_an_interrupted_first_create`.
+
+`UniSync` owns its runtime, so its `Drop` runs the full `shutdown()` (outside an
+async context; inside one it only signals). It used to signal and drop the
+runtime at once, which cut off the WAL-off final flush: the commit was lost, or
+the half-created dataset above was left behind
+(`e2e::api_sync_test::dropping_a_unisync_persists_its_commits_without_the_wal`).
 
 Two teardown paths, deliberately different:
 
@@ -1193,6 +1222,33 @@ A unified table containing all vertices regardless of label:
 | `_created_at`, `_updated_at` | Timestamp(ns) | Timestamps |
 
 The main table enables cross-label queries without scanning every per-label table.
+
+**Decoding a stored value keeps its type.** `props_json` is a CypherValue map.
+`MainVertexDataset` decodes it straight into `Value`s (`decode_props_blob`). A
+column value is decoded by `value_codec::decode_column_value`, which hands
+every type except a CRDT (or a list of CRDTs) to `arrow_to_value`. Both used to
+go through `serde_json::Value`, which kept the shape and lost the type: a
+temporal became a string, a vector a plain list, and a `List<DateTime>` a list
+of strings. That mattered because several paths read a row, change one thing
+and write the row back:
+- the flush of a relabeled vertex;
+- `SET` of another property (`insert_vertex_partial`);
+- edge `SET`;
+- semantic compaction.
+
+Each of them stored the converted value. The type was lost on disk, and where
+the column could not hold the string the value became NULL: every Duration
+column, and a declared DateTime column after a relabel.
+
+**A list column holds any element type.** Both the flush writer
+(`PropertyExtractor::build_list_column`) and the L0 batch builder
+(`build_list_property_column`) build a list's elements as one child column with
+the scalar builder for the element type. Before, the flush supported lists of
+String, Int64, Float64, Bytes and Vector only. A declared `List<DateTime>` (or
+Date, Time, Duration, Bool, Int32, Float32) was accepted, written and read in
+memory, and then failed the flush ("Unsupported inner type for List"), so the
+data could not be flushed. The L0 builder wrote each element's `Debug` text
+into a `Utf8` child, and the read failed against the declared type.
 
 ### Overflow Properties (Schemaless)
 
@@ -1862,6 +1918,25 @@ stateDiagram-v2
 | `Building` | No (old Online serves) | Queued | Rebuild in progress |
 | `Stale` | No (old Online serves) | Queued | Scheduled for rebuild after transient failure |
 | `Failed` | No (old Online serves) | Retry if under max_retries | Exhausted retry attempts |
+
+**An index declared before the label has data is built at its first flush.**
+With no table to build against, `create_scalar_index`, `create_fts_index` and
+`create_json_fts_index` record `BuildOutcome::NotAttempted`, which is `Online`
+with no `last_built_at`. Every vertex flush calls
+`IndexManager::ensure_declared_indexes`, which builds each declared scalar,
+full-text or JSON full-text index on the label that has no physical artifact
+(scalar matched by covered columns, full-text by name) and is a no-op once it
+exists. Full-text indexes used to be left out on the belief that they are
+updated incrementally; that holds for uni's own inverted index, not for the
+Lance index behind `CREATE FULLTEXT INDEX`, which stayed unbuilt until a
+rebuild or compaction. Searches meanwhile ran Lance's flat scan, whose bare
+tokenizer does not lowercase, so `'GRAPH'` did not match `graph`
+(`index_lifecycle_test::a_fulltext_index_declared_before_any_data_is_built_at_the_first_flush`).
+
+A flush does not add the rows it writes to an existing Lance full-text index.
+They stay in fragments the index does not cover until compaction's
+`optimize_indices`, a growth-triggered rebuild (off by default), or an explicit
+rebuild; Lance searches them with a flat pass meanwhile.
 
 ## Predicate Pushdown Priority
 
@@ -3296,6 +3371,113 @@ CREATE FULLTEXT INDEX article_fts FOR (a:Article) ON EACH [a.content] OPTIONS {
 
 18-language stemming and stop-words plus ngram tokenization are supported (`TokenizerConfig::Analyzer`); CJK requires dictionary files under `LANCE_LANGUAGE_MODEL_HOME`.
 
+### Unflushed rows in a search
+
+A vector or full-text search asks the backend about flushed rows and merges the
+unflushed (L0) rows in afterwards. Two rules make the merged answer the one the
+search gives after a flush:
+
+- **The `filter` applies to unflushed rows too.** It used to reach only the
+  backend scan, so `filter: 'id = 2'` returned every unflushed row, and an
+  unflushed update that moved a flushed row out of the filter left it matching.
+  `StorageManager::l0_rows_failing_filter` lays the label's L0 rows out as its
+  table (`build_l0_vertex_batch`) and asks `StorageBackend::filter_batch`, which
+  the Lance backend answers with Lance's own filter planner. A vertex that fails
+  is dropped like a tombstone. Lance's planner is used, not DataFusion's alone,
+  because the two disagree on `"col"`: Lance reads it as a string literal.
+- **Full-text scores come from the backend, split as Lance splits them.**
+  Unflushed rows used to score the share of query words their text holds,
+  split on whitespace. That is not BM25 and ignores the index's tokenizer, so
+  the ranking (and which rows made the top `k`) changed at the flush.
+
+  Lance scores the rows its inverted index covers on the index's statistics
+  alone, and the rows it does not cover (fragments flushed since the index was
+  built, or every row with no index) by a flat BM25 pass whose statistics are
+  the index's plus those rows', counted after the filter, with the index's
+  tokenizer (or a bare simple tokenizer with no index). A flush leaves the
+  covered rows' scores alone, and its rows join the uncovered ones.
+
+  `StorageBackend::full_text_search_with_unstored` runs that split with the
+  unflushed rows in place (`backend/lance_fts.rs`): the index search
+  restricted to the covered fragments; the unflushed documents added to the
+  index's statistics; one flat pass over the uncovered fragments starting
+  from those, which scores the uncovered rows on exactly the statistics Lance
+  will use after the flush; and the unflushed documents scored on the same
+  final statistics. Fragment coverage is the union of the index segments'
+  `fragment_bitmap`s, as Lance's `unindexed_fragments` computes it. The
+  search used to re-score the covered hits with the unflushed rows counted
+  (row 1 of the test: 0.835 before the flush, 0.859 after) and to leave the
+  uncovered flushed rows out of the statistics. Measured now: identical
+  rankings and scores (to 1e-6) across two flushes, the second with uncovered
+  flushed rows present, filtered and not, with and without an index
+  (`bugs::fts_rank_survives_flush`).
+
+  Two things still move a score. An index optimization that brings a row
+  under the index switches it to the index's statistics, in Lance itself.
+  And rows tying on score are ordered by vid, so which of two tied rows makes
+  the top `k` at the boundary depends on Lance's own cut. A schemaless
+  property keeps the word-overlap score on both sides, since it has no column
+  for Lance to search.
+
+### Searching a schemaless property
+
+A vector or full-text search over a property the schema does not declare on the
+label is served by brute force, flushed or not. Only a declared property is
+flushed to a column named after it, which is what a Lance nearest-neighbour or
+inverted-index scan needs. An undeclared label is flushed to the main vertex
+table only, and an undeclared property of a declared label goes to the label's
+`overflow_json` column. Either way, the main table's `props_json` is the one
+flushed copy that holds the value.
+
+`StorageManager::vector_search` and `fts_search` check
+`is_schemaless_property(label, property)` first. If it is true, they read every
+live flushed vertex of the label with `MainVertexDataset::find_label_props_counted`
+and score each one directly. Unflushed rows are then merged in by the same L0
+merges as for a declared property.
+
+- **Scoring.** A vector is scored with the same `compute_distance` (L2: no index
+  can be declared on the property) and the same length guard as unflushed rows.
+  Text is scored by `compute_text_relevance`, the fraction of query tokens the
+  text holds. This is not BM25. A row therefore scores the same before and
+  after a flush, which BM25 over the flushed rows could not promise.
+- **Which rows count.** A vertex counts only if its latest row is live and
+  still carries the label. The read filters on the label to find candidates,
+  then re-reads all their rows. A label filter alone would also match the
+  older row of a vertex relabeled away since.
+- **A relabel has a version.** `L0Buffer::set_vertex_labels`, the commit merge
+  and WAL replay record it in `vertex_label_versions`, and the flush stamps
+  rows with `L0Buffer::vertex_write_version` (the later of the property and
+  label versions). Before that, the flush re-appended a relabeled vertex's row
+  at version 0, and its old row, with the old labels, won every latest-version
+  read, so `labels(n)` reverted after a flush. It is not stored in
+  `vertex_versions`. The L0 scans read an entry there as "this buffer holds the
+  vertex's newest properties", and a relabel holds none, so stamping it there
+  made the scans drop the flushed properties.
+- **The label scans apply the same rules.** The schemaless `MATCH (n:L)` scan
+  filters the main table on the label, so it runs `drop_superseded_pushdown_rows`
+  whenever it has a label, not only for a pushed-down property predicate.
+  Before that, a vertex relabeled away from an undeclared label still matched
+  it after a flush. Both label scans (`columnar_scan_vertex_batch` and the
+  schemaless one) start a vertex whose only L0 state is a relabel from its
+  flushed properties (`label_only_l0_base_props`), at the relabel's version.
+  Before that, `MATCH (n:New)` found a vertex freshly relabeled to `New` with
+  every property NULL until the next flush, and an id lookup did not find it
+  at all.
+- **Filters are refused.** The `filter` argument is an expression over the label
+  table's columns, which these rows do not have, so a search with one returns
+  an error instead of ignoring it. This applies to unflushed rows too: before,
+  an undeclared label's unflushed rows were returned with the filter silently
+  ignored.
+- **Cost.** The read is O(rows of the label) per query, plus decoding each
+  vertex's latest `props_json`. It is checked against the query deadline every
+  1024 rows (`DeadlineTicker`). Declare the property, and index it, when the
+  label is large.
+
+Before this, the flushed side of such a search returned nothing for an
+undeclared label (its table does not exist) and failed in Lance for an
+undeclared property ("column ... does not exist"). The same query found the rows
+while they were unflushed.
+
 ## Hybrid Search
 
 ```cypher
@@ -4111,7 +4293,7 @@ Both kinds of row share the column, so both must carry one type:
 
 A FOLD emits one row per distinct KEY: the KEY columns plus one column per FOLD binding. `KEY` marks a **single** YIELD item, so a composite key is `YIELD KEY a, KEY b, total`; `YIELD KEY a, b, total` declares one KEY and a plain column `b`. A plain column has no single value per group, and `FoldExec` used to drop it without a diagnostic — a later `QUERY ... RETURN b` then read the absent column as NULL (issue #293). `check_fold_yield_is_grouped` now rejects, with `UngroupedFoldYield`, any YIELD item of a FOLD clause that is not a KEY, not a FOLD output, and does not mention one (`total * 2.0 AS score` is still allowed; the planner evaluates it after the fold). A clause *without* FOLD is unconstrained: a base clause `YIELD KEY e, 100.0 AS agg` seeds the column its sibling folds into.
 
-For the same reason a QUERY is checked against its rule's YIELD columns: `check_query_variables` rejects, with `UnknownQueryVariable`, a WHERE / RETURN / ORDER BY variable the rule does not yield (ORDER BY may also name a RETURN alias). The in-memory evaluator in `locy_query.rs` would otherwise return NULL for it on every row.
+For the same reason a QUERY is checked against its rule's YIELD columns: `check_query_variables` rejects, with `UnknownQueryVariable`, a WHERE / RETURN / ORDER BY variable the rule does not yield (ORDER BY may also name a RETURN alias). The row-level evaluator in `locy_query.rs` would otherwise return NULL for it on every row.
 
 The post-FOLD `WHERE` runs after all FOLD aggregates are computed and before BEST BY. It can reference FOLD output columns and KEY columns. Multiple conditions are combined with `AND`.
 
@@ -4402,7 +4584,8 @@ Commands execute in **Phase 2** (row-level dispatch) after strata have converged
 QUERY reachable WHERE start.name = 'Alice' RETURN node, distance
 ```
 
-Evaluates rules using SLG (Selective Linear Definite clause) resolution.
+Reads the rule's facts as the fixpoint derived them, keeps the rows the WHERE
+holds for, and projects RETURN. It never derives a rule itself.
 
 ### DERIVE (Fact Derivation)
 
@@ -4476,7 +4659,7 @@ LocyConfig {
     max_iterations: usize,          // Max fixpoint iterations per recursive stratum
     timeout: Duration,              // Overall evaluation timeout
     max_explain_depth: usize,       // Max derivation tree depth
-    max_slg_depth: usize,           // Max SLG resolution depth
+    max_slg_depth: usize,           // Deprecated: no effect
     max_abduce_candidates: usize,   // Candidate modifications to explore
     max_abduce_results: usize,      // Validated ABDUCE results to return
     max_derived_bytes: usize,       // Memory bound per derived relation
@@ -6075,6 +6258,74 @@ When a path query is refused, the three cases read as:
 | Timeout on an unbounded pattern | The path set is combinatorial; no limit was declared | Add an upper hop bound, or a `LIMIT` — see the batch-granularity table in Part VII |
 | `QueryWarning` about a safety cap, with rows returned | The *search* was abandoned; rows are incomplete | Narrow with a hop bound, a relationship type, or a target label |
 
+### What `query_timeout` charges a cursor
+
+`query_timeout` bounds the query's work, not the wall clock since a cursor
+opened. A cursor pages a result that is produced as it is read, so the time the
+caller spends between batches belongs to the caller: the streaming drain loop in
+`execute_stream` (`executor/read.rs`) credits that idle time back to the
+deadline before it asks the plan for more, and the cursor in `impl_query.rs`
+budgets only the time spent awaiting the executor.
+
+Every in-plan check must therefore read the deadline **live**.
+`GraphExecutionContext::deadline_clock()` returns a `DeadlineClock` — the
+configured deadline plus the shared credit counter — and that is what anything
+checking after planning time holds: the `DeadlineGuardExec` checkpoints (#283)
+and a sub-plan's own context (`with_inherited_deadline`). A copied `Instant`
+misses every credit granted after it was taken. That was a real defect: the
+guards held a plan-time `Instant`, and a guard sits over a sort or aggregate,
+which is polled once per *output* batch, so any slowly-read cursor over an
+`ORDER BY` or a grouped result timed out after its consumer had idled past the
+budget (`a_slow_consumer_of_a_sorted_result_is_not_charged_the_query_budget`).
+
+`QueryProcedureHost` holds the clock too, so its `check_timeout` (the
+`uni.algo.*` drain checks it every 1000 rows) and the `QueryContext` it builds
+read the deadline as of the call. Credit can only arrive when the consumer asks
+for the next batch, and a procedure call today runs to completion inside one
+poll, so no slow-cursor query was found that a copied `Instant` there would have
+failed; the host held one until it was replaced as the same class of defect.
+`uni-store` itself never reads `QueryContext::deadline`: only the simple
+executor's `check_timeout` calls do.
+
+`deadline_for_host` remains a snapshot, for callers that check before any
+consumer can idle again, such as the Locy paths, which never stream.
+
+#### Where the deadline can still be checked
+
+`tokio::time::timeout` and the cancellation race in `impl_query.rs` fire only
+when execution returns `Pending`, and CPU-bound work does not. Two shapes run
+entirely inside one poll, so only a check of their own can stop them:
+
+- **UNWIND under a pipeline breaker.** UNWIND makes rows without pulling input
+  for each one, and `insert_deadline_guards` places no guard in a subtree that
+  holds one of our operators (see #283 for why). `GraphUnwindExec` therefore
+  carries a `QueryBudget` (the live clock plus the token, from
+  `GraphExecutionContext::budget()`), checks it before each chunk, and keeps it
+  through `with_new_children`.
+- **Inner queries.** A declared procedure's body and a Cypher graph projection's
+  `nodeQuery` / `edgeQuery` run through `QueryProcedureHost::execute_inner_query`.
+  A declared procedure does this under `block_in_place`, so the caller's timer
+  cannot fire at all. The inner `Executor` inherits the host's clock
+  (`Executor::inherit_deadline`) and token; without them it ran on a fresh
+  `query_timeout` and ignored cancellation. A host built from components (the
+  simple executor's `CALL` dispatch and its graph-projection resolver) gets the
+  executor's budget through `Executor::procedure_budget`.
+
+- **Searches over unflushed rows.** `StorageManager::vector_search` and
+  `fts_search` score every L0 row of the label in one synchronous span
+  (`merge_l0_into_vector_results` / `merge_l0_into_fts_results`). They check
+  the `QueryContext` every 1024 rows (`DeadlineTicker`), and the procedure host
+  puts both the deadline and the token on that context. The merge used to look
+  each candidate up by a linear scan of a list growing with every append:
+  N^2/2 comparisons, 2.2 s at 40,000 unflushed rows, against 90 ms now.
+
+The Lance side of a search (flushed rows) awaits, and the caller's timer does
+preempt it: measured 2026-10-12 over 50,000 flushed 512-dimension vectors with
+no index, the search took 111-118 ms unbounded and returned
+`UniError::Timeout` at 24 ms against a 20 ms budget. There is no regression test
+for it, because a fixture large enough to separate the two cleanly takes 25 s
+to load in a debug build and still leaves only a 2x margin.
+
 ### strict_schema
 
 When enabled, CREATE and MERGE operations that reference a label or edge type not declared in the schema are rejected with an error. This enforces schema-first discipline and catches typos at write time. Properties are not affected — unknown properties still go to overflow.
@@ -7300,6 +7551,60 @@ same wrap in `plan_window_functions`, and sums a float argument as Float64
 (it had cast every argument to Int64, truncating each float before adding).
 `min`/`max`/`avg` of nothing stay NULL (`bugs::sum_of_nothing_is_zero`).
 
+**`sum` and `avg` take numbers or durations, and nothing else** (Neo4j). One
+running total, `uni_query_functions::cypher_sum::CypherSum`, serves every
+evaluator: the `_cypher_sum` / `_cypher_avg` aggregates, the row executor's
+`Accumulator` and Locy's `QUERY` aggregates. Integers stay exact until one
+overflows, then continue as a float; durations add component by component and
+average with the same division as `duration / n`; a string, a boolean, or
+numbers mixed with durations are a type error. Only a numeric *column* goes to
+DataFusion's own `sum` / `avg`, grouped or in a window
+(`numeric_column_type`). Before, the Cypher-value sum skipped every
+non-number, so `sum` over durations or strings was 0 and `avg` NULL; a typed
+string column was cast to an integer (`sum` over `'12'` and `'3'` was 15); a
+window failed with "Unsupported CAST from LargeBinary" on durations and on
+every schemaless property; Locy's `QUERY` rejected durations and errored on
+an integer overflow Cypher continues past
+(`bugs::sum_avg_take_numbers_or_durations`). `CypherSum` lives in
+`uni-common` so Locy's FOLD `SUM` / `AVG` (in `uni-plugin-builtin`) share it:
+over a Cypher-value column they add durations and refuse strings, and the
+planner types their result as a Cypher value (`infer_yield_type_rec`).
+
+**A number is read strictly, or not at all.** `_cypher_number` reads a
+value as Float64: NULL stays NULL, every number is read, and anything else is
+an error. It is the argument conversion of Cypher's math functions (`ceil`,
+`sqrt`, `^`, `atan2`, ...), of `stDev` / `variance` / percentiles over a
+non-numeric column, and of a Locy projection bringing a column to Float64
+(`coerce_physical_expr`), which is where a FOLD `MSUM`, `MNOR` or `MPROD`
+reads its input. It replaced `_cypher_to_float64`, which turned a non-number
+into NULL: `ceil('x')` and `sqrt(duration)` answered NULL while `abs('x')` and
+the row evaluator failed, `stDev` over a string column `'12'` read 12, and a
+FOLD over strings or durations summed to 0.0 with `AVG` / `MNOR` NULL,
+recursive or not (`bugs::numeric_functions_take_numbers`,
+`locy::locy_fold_reads_numbers`). `sign()` returns an integer on every path.
+
+**One order of values: `ORDER BY`'s.** `encode_cypher_sort_key` defines it,
+and `cypher_value_order` compares two values by it. Cypher `min` / `max`
+use it, and so do Locy `MIN` / `MAX` / `MMIN` / `MMAX` over a Cypher-value
+column, through `FoldContext::order` (`uni-plugin`), which the host fills:
+the aggregate cannot depend on the query crate. Before, Cypher `min` / `max`
+ranked every pair of temporal values equal, answering whichever came first,
+and Locy compared encoded bytes (`MIN(-1, 1)` was 1, `MIN('b', 'aa')` was
+`'b'`). Durations sort by length, as Neo4j orders them: a month is
+30.436875 days, a day 24 hours; components break a tie. `<` between two
+durations is null, as in Neo4j (`bugs::duration_order`,
+`locy::locy_fold_any_column_type`).
+
+**`min` / `max` over a DateTime or Time column return the value whole.**
+`_cypher_min` / `_cypher_max` take the struct and return it with its offset;
+the planner reduced it to nanoseconds, and the aggregate promised its input's
+type while producing a Cypher value, so every such query failed
+("expected Timestamp(ns) but found LargeBinary"). The aggregate's return type
+is now the input's only where `evaluate` produces that type
+(`bugs::min_max_keep_temporal_values`). A FOLD `COLLECT` receives its input
+as a Cypher value, so it reads every column type (`Int32`, `Date`,
+`DateTime`).
+
 **An entity map is recognised by structure, never by an id key alone.**
 `entity_ref_from_map` is the one definition: a vertex needs `_labels` (every
 vertex encoding carries it), an edge a type (`_type`, `_type_name`,
@@ -7351,7 +7656,7 @@ Locy↔Cypher relations of `metamorphic::dqp::topo`):
 Every Locy filter goes through `locy_eval::eval_condition`: true keeps the
 row, false and NULL drop it, and an evaluation error or a non-boolean is a
 `LocyError`. That covers `QUERY`, `DERIVE`, `ABDUCE` and `EXPLAIN RULE`
-`WHERE`, and a rule body's target-dependent conditions on the SLG path; each
+`WHERE`; each
 had mapped both to "drop the row", so `DERIVE` wrote fewer facts and `ABDUCE`
 reported a conclusion that no longer held. In the same evaluator, `<`, `<=`,
 `>`, `>=` between types with no order (`1 < 'x'`) are NULL, not false
@@ -7359,9 +7664,9 @@ reported a conclusion that no longer held. In the same evaluator, `<`, `<=`,
 `QUERY ... ORDER BY` evaluates its keys on the row before projection, with
 the returned aliases over it, and propagates errors. It evaluated them on the
 projected row, so `ORDER BY a.age` read a missing column, every key became
-NULL, and the clause did nothing. The SLG goal binding compares by
-`values_equal`, and is injected into the body only for a key yielded as a bare
-variable; an aliased key (`YIELD KEY n.k AS k`) is checked after projection.
+NULL, and the clause did nothing. A `QUERY` WHERE over a key compares
+by `values_equal`, so `k = 3.0` matches an integer `k`
+(`locy_generator_goal_binding_uses_value_equality`).
 On the Cypher side `_cv_to_bool` reads an encoded NULL as NULL and a
 non-boolean as a type error; both read as `false`, so `NOT n.b` kept a row
 whose `b` is `1`. `CypherPhysicalExprCompiler::compile_predicate` wraps a
@@ -7431,6 +7736,140 @@ purely relative rounding was tried first and broke convergence on cyclic
 `MPROD` folds (`issue_162_cyclic_recursive_fold_terminates`). The hash anti-join
 path compares the key view with a candidate row index carried outside the join
 keys, and maps the survivors back to exact rows.
+
+**A Locy command never changes what a later command reads (C-NONINTERFERENCE).** Once the fixpoint
+publishes a program's facts, `QUERY`, `EXPLAIN RULE`, `ABDUCE` and `ASSUME`
+body commands receive that store by shared reference (`&RowStore`), at the top
+level (`impl_locy.rs`, `dispatch_native_command`) and inside an `ASSUME` body,
+so a command that writes it does not compile. `EXPLAIN RULE` without provenance
+to read (its WHERE matches no fact, or the rule has none) used to re-derive the
+rule through an in-memory SLG evaluator, which implemented neither FOLD, BEST
+BY, post-FOLD WHERE nor set semantics, and merged those rows into the shared
+store, so one non-matching `EXPLAIN` changed every later answer: a FOLD came
+back as NULL rows, a BEST BY loser reappeared, an `IS NOT` against a filtered
+FOLD dropped a node, mutual recursion returned nothing
+(`locy_command_noninterference`; the `locy_commands` relation of
+`metamorphic::dqp::topo`; the oracle differential's `QUERY`-after-`EXPLAIN`
+check). That evaluator no longer exists; see the next entry. Found while
+triaging #298; see `docs/proposals/locy_contract_drift_class_2026-10-09.md`.
+
+**Locy has one evaluator.** Every rule, a rule with a generator included, is
+derived by the fixpoint, and every command reads what it published. A generator
+condition is a columnar operator (`LocyGenerateExec`, planned after the
+IS-reference joins, with any WHERE over its outputs deferred above it); the
+fixpoint used to skip such rules, so a rule referencing one saw no facts and
+its own FOLD, BEST BY and post-FOLD WHERE were ignored. QUERY reads the rule's
+relation and treats a missing one as a fault. EXPLAIN reads recorded provenance
+(Mode A) or rebuilds the tree from the published facts (Mode B), never
+re-deriving. A rule's facts carry a node as its VID and a single-hop
+relationship as its EID (`plan_locy_project` projects `{var}._eid`); both are
+hydrated after the fixpoint (`enrich_vids_with_nodes`), and since the ID
+spaces overlap, which columns hold EIDs comes from the rules
+(`uni_locy::entity_columns::edge_columns`), never from the column type: an EID
+resolved as a VID binds an unrelated node. Before, a yielded relationship was
+typed as a string and came back NULL, which is the only reason EXPLAIN kept its
+own re-derivation. Mode A classifies KEY columns from the hydrated published
+facts, so an integer KEY stays an integer. ABDUCE always builds its tree from
+the published facts (Mode B): recorded provenance has no children, and the
+causes ABDUCE edits are in them. Provenance is keyed by rule and row
+(`provenance_fact_hash`): keyed by row alone, a tuple two rules derive was
+recorded for the first, and EXPLAIN of the second lost it
+(`locy_single_engine`, `locy_generator_plugin`).
+
+**The compiler hands on resolved rule names.** Inside a `MODULE`, IS
+references and the rule a command names are rewritten to the catalog key
+(`qualify_is_references`, `qualified_name`); the compiler resolved them for its
+own checks only, so every IS reference, EXPLAIN, ABDUCE and DERIVE in a module
+failed with "unknown rule".
+
+**One rule decides which column an IS reference binds (C-IS).** A referenced rule's
+columns form a binding sequence — its KEY columns in YIELD order, then its
+value columns in YIELD order — and an IS reference's subjects take columns from
+the front, a `TO` target the next one (`uni_locy::is_binding`). The compiler's
+arity check, the planner's positive join, IS NOT and provenance
+(`LocyIsRef::binding_columns`, resolved at planning time) and EXPLAIN
+children all bind through it; before, they used four
+rules, so `(o, e, pct) IS stake` failed to plan (#298), `IS NOT` against a rule
+yielding `b, KEY a` tested `b` and returned exactly the wrong nodes, and ABDUCE
+over a `TO` with interleaved KEYs found no valid edit. `IS NOT` cannot compare
+a bound variable with a value column (`IsNotBindsValueColumn`); an unbound one
+there is existentially quantified and dropped from the anti-join. The compiler stores every rule's
+schema in binding order (`into_binding_order`), so KEY columns are a prefix for
+every consumer: the FOLD operator emits KEYs before aggregates and derived
+scans were declared in YIELD order, so a value yielded before a KEY failed a
+seeded or recursive FOLD. A clause that seeds a sibling FOLD lays out its
+columns as the FOLD clause does (`rule_fold_layout`), which also fixed two
+FOLD outputs yielded in a different order from their FOLD bindings
+(`locy_is_ref_binding`; the `locy_binding` topo relation; the oracle
+differential reorders every generated rule's YIELD in its second run).
+
+**Every Locy expression is scope-checked at compile time (C-SCOPE).** Locy reparses every
+slot but the inside of ALONG as plain Cypher, so a misspelt variable or a
+`prev.x` outside ALONG failed late ("No field named …" from DataFusion) or, in a
+command WHERE (evaluated row by row by `locy_eval`), evaluated to NULL and
+silently matched nothing. `compiler/scope.rs` checks each slot against what it sees at
+run time: the rule body (MATCH variables, positive IS subjects and targets,
+generator outputs, referenced rules' value columns by name), plus ALONG names
+for ALONG, FOLD arguments and YIELD; and, for a YIELD item over a FOLD output,
+the post-FOLD WHERE and REQUIRE, only the folded batch (KEY columns by YIELD
+name, FOLD outputs by name and alias). EXPLAIN, ABDUCE and DERIVE WHERE are
+checked against the rule's facts. A clause referencing a rule the compiler has
+no schema for is checked only for `prev`. The pass runs last, so existing
+errors keep precedence. REQUIRE in recursion splits `AND` and refuses a fold
+output inside an expression (fail closed); a FOLD that is not one aggregate
+call is refused. Guards: `locy_scope_check` (a hand matrix, and a generated
+slot × candidate sweep asserting no scope error reaches the planner) and the
+TCK compile step, which now also plans every program it compiles.
+
+**A Locy YIELD returns the value its expression has in Cypher.** The YIELD
+projection casts each column to a type `infer_expr_type` derives from the
+expression. A list, comprehension, map, `reduce` or pattern comprehension is
+typed as a Cypher value (`LargeBinary`), as is a property no label or edge type
+declares, and `plan_locy_project` encodes into that type value by value
+(`to_cypher_value_expr`) rather than Arrow-casting. The old catch-all typed
+those expressions as strings, so every yielded list came back as its text (or
+its encoded bytes, schemaless), and an undeclared relationship property was
+guessed `Float64` (`locy_yield_list_values`, with plain Cypher as the oracle).
+Clauses of one rule infer their column types independently and are unioned, so
+`clause_column_types` unifies a column the clauses type differently (mixed
+integer and float to `Float64`, anything else to a Cypher value) and every
+clause projects that type; a column the clauses agree on keeps its own type.
+
+**The clauses of one Locy rule agree on what the rule is (C-CLAUSE).** The
+planner maps each clause's YIELD onto the rule's columns by name, falling back
+to a body variable of the same name, and reads FOLD, post-FOLD WHERE, REQUIRE
+and BEST BY from the first clause that folds. The compiler therefore requires
+(`typecheck.rs`): the same column names with the same KEY and PROB flags, order
+free (`check_yield_agreement`, `YieldSchemaMismatch`); and one FOLD tail
+(`check_fold_tail_agreement`, `ClauseMismatch`): every folding clause states the
+same FOLD names, aggregates and DISTINCT flags (arguments are per clause), the
+same post-FOLD WHERE, REQUIRE and BEST BY; a seeding clause states none; without
+FOLD, every clause states the same BEST BY. Before, `KEY a, KEY c` beside
+`KEY a, KEY b` filled `b` from the clause's own `b`, and a REQUIRE on a later
+clause was dropped (`locy_clause_contract`).
+
+**A FOLD aggregate honours DISTINCT.** `parse_fold_aggregate` and
+`resolve_fold_bindings` set `FoldBinding::distinct`, and `FoldExec` keeps one
+row per distinct input value in each key group (`distinct_value_groups`) before
+the aggregate sees it. A recursive rule rejects it (`DistinctFoldInRecursion`):
+`MonotonicAggState` folds deltas and never sees the whole bag. In Cypher,
+DataFusion leaves DISTINCT to the accumulator (`AccumulatorArgs::is_distinct`);
+only its own count / sum / avg / min / max honour it, so every other aggregate
+(`_cypher_sum` over a dynamically typed column, percentiles, `stdev`, plugin
+aggregates) is wrapped in `distinct_udaf`, which folds the distinct argument
+tuples. `sum(DISTINCT e.w)` over a schemaless property used to sum every row.
+
+**Entity functions have one definition.** `id`, `elementId`, `type`, `labels`
+and `properties` live in `eval_scalar_function` (`eval_entity_function`),
+over a `Value::Node` / `Value::Edge` or an entity map, and `keys` accepts a
+native node or edge. The row executor kept private copies and Locy's
+evaluator, which falls back to `eval_scalar_function`, had none, though
+`is_scalar_function` listed them all: `type(e)` in a Locy `QUERY ... RETURN`
+failed with "not implemented", and `keys(n)` rejected a hydrated node. The row
+executor keeps only `type()`, which names an edge carried by its type id
+through the schema (the shared function refuses one); `startNode` / `endNode`
+read the row's bindings, so Locy's `eval_expr` has its own
+(`locy::locy_entity_functions`, with plain Cypher as the oracle).
 
 ## Appendix C: Anti-Pattern Summary
 

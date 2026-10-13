@@ -541,6 +541,16 @@ fn encode_temporal_payload(tv: &uni_common::TemporalValue, buf: &mut Vec<u8>) {
             nanos,
         } => {
             buf.push(0x05); // variant rank: Duration
+            // By total length first, as Neo4j orders durations: a month is
+            // 30.436875 days (2 629 746 s) and a day 24 hours. Months, days and
+            // nanoseconds compared in turn put `PT48H` before `P1D`. The
+            // components break a tie (`P1D` and `PT24H`), so the order is total.
+            const MONTH_NANOS: i128 = 2_629_746 * 1_000_000_000;
+            const DAY_NANOS: i128 = 86_400 * 1_000_000_000;
+            let length = i128::from(*months) * MONTH_NANOS
+                + i128::from(*days) * DAY_NANOS
+                + i128::from(*nanos);
+            buf.extend_from_slice(&((length as u128) ^ (1 << 127)).to_be_bytes());
             buf.extend_from_slice(&encode_order_preserving_i64(*months));
             buf.extend_from_slice(&encode_order_preserving_i64(*days));
             buf.extend_from_slice(&encode_order_preserving_i64(*nanos));

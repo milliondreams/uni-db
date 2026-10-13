@@ -25,19 +25,14 @@ use super::procedure::ProcedureRegistry;
 #[derive(Debug)]
 pub(crate) enum Accumulator {
     Count(i64),
-    /// Running sum kept exact for integers: `int_sum` accumulates i64 values
-    /// while `all_ints` holds; `float_sum` mirrors every value as f64 for the
-    /// float/overflow fallback. Summing purely in f64 lost precision above 2^53.
-    Sum {
-        int_sum: i64,
-        float_sum: f64,
-        all_ints: bool,
-    },
+    /// Cypher's running sum, shared with the DataFusion aggregate: exact for
+    /// integers, numbers or durations, anything else an error.
+    Sum(uni_query_functions::cypher_sum::CypherSum),
     Min(Option<Value>),
     Max(Option<Value>),
     Avg {
-        sum: f64,
-        count: i64,
+        sum: uni_query_functions::cypher_sum::CypherSum,
+        count: u64,
     },
     Collect(Vec<Value>),
     CountDistinct(HashSet<Value>),
@@ -169,14 +164,13 @@ impl Accumulator {
         match op_upper.as_str() {
             "COUNT" if distinct => Accumulator::CountDistinct(HashSet::new()),
             "COUNT" => Accumulator::Count(0),
-            "SUM" => Accumulator::Sum {
-                int_sum: 0,
-                float_sum: 0.0,
-                all_ints: true,
-            },
+            "SUM" => Accumulator::Sum(Default::default()),
             "MIN" => Accumulator::Min(None),
             "MAX" => Accumulator::Max(None),
-            "AVG" => Accumulator::Avg { sum: 0.0, count: 0 },
+            "AVG" => Accumulator::Avg {
+                sum: Default::default(),
+                count: 0,
+            },
             "COLLECT" => Accumulator::Collect(Vec::new()),
             "PERCENTILEDISC" => Accumulator::PercentileDisc {
                 values: Vec::new(),
@@ -190,33 +184,20 @@ impl Accumulator {
         }
     }
 
-    pub(crate) fn update(&mut self, val: &Value, is_wildcard: bool) {
+    /// Adds one row's value.
+    ///
+    /// # Errors
+    ///
+    /// When `sum` or `avg` receives a value that is neither a number nor a
+    /// duration, or mixes the two, or a percentile receives a non-number.
+    pub(crate) fn update(&mut self, val: &Value, is_wildcard: bool) -> anyhow::Result<()> {
         match self {
             Accumulator::Count(c) => {
                 if is_wildcard || !val.is_null() {
                     *c += 1;
                 }
             }
-            Accumulator::Sum {
-                int_sum,
-                float_sum,
-                all_ints,
-            } => match val {
-                Value::Int(i) => {
-                    *float_sum += *i as f64;
-                    // Exact while it fits; on i64 overflow fall back to the f64 sum.
-                    match int_sum.checked_add(*i) {
-                        Some(s) => *int_sum = s,
-                        None => *all_ints = false,
-                    }
-                }
-                _ => {
-                    if let Some(n) = val.as_f64() {
-                        *float_sum += n;
-                        *all_ints = false;
-                    }
-                }
-            },
+            Accumulator::Sum(total) => total.add(val)?,
             Accumulator::Min(current) => {
                 if !val.is_null() {
                     *current = Some(match current.take() {
@@ -236,8 +217,8 @@ impl Accumulator {
                 }
             }
             Accumulator::Avg { sum, count } => {
-                if let Some(n) = val.as_f64() {
-                    *sum += n;
+                sum.add(val)?;
+                if !val.is_null() {
                     *count += 1;
                 }
             }
@@ -252,37 +233,30 @@ impl Accumulator {
                 }
             }
             Accumulator::PercentileDisc { values, .. }
-            | Accumulator::PercentileCont { values, .. } => {
-                if let Some(n) = val.as_f64() {
-                    values.push(n);
+            | Accumulator::PercentileCont { values, .. } => match val {
+                Value::Null => {}
+                Value::Int(i) => values.push(*i as f64),
+                Value::Float(f) => values.push(*f),
+                // It skipped a value that is not a number, as `sum` did.
+                other => {
+                    return Err(anyhow::anyhow!(
+                        "percentileDisc() and percentileCont() take numbers, got a {}",
+                        other.type_name()
+                    ));
                 }
-            }
+            },
         }
+        Ok(())
     }
 
+    /// The aggregate's value.
     pub(crate) fn finish(&self) -> Value {
         match self {
             Accumulator::Count(c) => Value::Int(*c),
-            Accumulator::Sum {
-                int_sum,
-                float_sum,
-                all_ints,
-            } => {
-                if *all_ints {
-                    Value::Int(*int_sum)
-                } else {
-                    numeric_to_value(*float_sum)
-                }
-            }
+            Accumulator::Sum(total) => total.sum(),
             Accumulator::Min(opt) => opt.as_ref().cloned().unwrap_or(Value::Null),
             Accumulator::Max(opt) => opt.as_ref().cloned().unwrap_or(Value::Null),
-            Accumulator::Avg { sum, count } => {
-                if *count > 0 {
-                    Value::Float(*sum / (*count as f64))
-                } else {
-                    Value::Null
-                }
-            }
+            Accumulator::Avg { sum, count } => sum.avg(*count),
             Accumulator::Collect(v) => Value::List(v.clone()),
             Accumulator::CountDistinct(s) => Value::Int(s.len() as i64),
             Accumulator::PercentileDisc { values, percentile } => {
@@ -378,6 +352,10 @@ pub struct Executor {
     /// Cooperative cancellation token. Passed to `QueryContext` and
     /// `GraphExecutionContext` so in-flight operators can detect cancellation.
     pub(crate) cancellation_token: Option<tokio_util::sync::CancellationToken>,
+    /// An enclosing query's deadline, when this executor runs a query on its
+    /// behalf (a procedure's inner Cypher). Replaces the fresh
+    /// `config.query_timeout` budget: the inner query spends the caller's time.
+    pub(crate) inherited_deadline: Option<crate::query::df_graph::DeadlineClock>,
     /// Shared `PropertyManager` to reuse inside `create_datafusion_planner`
     /// instead of allocating a fresh one (with empty LRU caches) per query.
     /// When `None`, the planner falls back to constructing from the
@@ -433,6 +411,7 @@ impl Clone for Executor {
             id_reservoir: self.id_reservoir.clone(),
             custom_function_registry: self.custom_function_registry.clone(),
             cancellation_token: self.cancellation_token.clone(),
+            inherited_deadline: self.inherited_deadline.clone(),
             prop_manager_arc: self.prop_manager_arc.clone(),
             df_session_template: self.df_session_template.clone(),
             read_snapshot: self.read_snapshot.clone(),
@@ -466,6 +445,7 @@ impl Executor {
             id_reservoir: None,
             custom_function_registry: None,
             cancellation_token: None,
+            inherited_deadline: None,
             prop_manager_arc: None,
             df_session_template: None,
             read_snapshot: None,
@@ -647,6 +627,45 @@ impl Executor {
         self.cancellation_token = Some(token);
     }
 
+    /// Spend an enclosing query's deadline rather than a fresh budget.
+    ///
+    /// For a query run on another query's behalf, such as a procedure's inner
+    /// Cypher. The clock is live, so idle credit granted to the enclosing
+    /// cursor reaches this executor's checks too.
+    pub(crate) fn inherit_deadline(&mut self, clock: crate::query::df_graph::DeadlineClock) {
+        self.inherited_deadline = Some(clock);
+    }
+
+    /// The deadline and cancellation token a procedure host built by this
+    /// executor should carry, so the inner queries it runs spend this query's
+    /// budget.
+    ///
+    /// The inherited clock when there is one; otherwise `ctx`'s deadline, which
+    /// is fixed because this path does not stream.
+    pub(crate) fn procedure_budget(
+        &self,
+        ctx: Option<&QueryContext>,
+    ) -> (
+        crate::query::df_graph::DeadlineClock,
+        Option<tokio_util::sync::CancellationToken>,
+    ) {
+        let deadline = self.inherited_deadline.clone().unwrap_or_else(|| {
+            crate::query::df_graph::DeadlineClock::fixed(ctx.and_then(|c| c.deadline))
+        });
+        let token = ctx
+            .and_then(|c| c.cancellation_token.clone())
+            .or_else(|| self.cancellation_token.clone());
+        (deadline, token)
+    }
+
+    /// The deadline a `QueryContext` built now should carry.
+    fn context_deadline(&self) -> Option<Instant> {
+        match &self.inherited_deadline {
+            Some(clock) => clock.effective(),
+            None => Some(Instant::now() + self.config.query_timeout),
+        }
+    }
+
     /// Build a `QueryContext` from the current writer or standalone L0 manager.
     /// When `transaction_l0_override` is set, it is used as the transaction L0 —
     /// this is how private-per-transaction L0 buffers become visible to reads
@@ -678,7 +697,9 @@ impl Executor {
                     writer.l0_manager.get_pending_flush(),
                 ),
             };
-            ctx.set_deadline(Instant::now() + self.config.query_timeout);
+            if let Some(deadline) = self.context_deadline() {
+                ctx.set_deadline(deadline);
+            }
             if let Some(ref token) = self.cancellation_token {
                 ctx.set_cancellation_token(token.clone());
             }
@@ -697,7 +718,9 @@ impl Executor {
                     self.transaction_l0_override.clone(),
                     m.get_pending_flush(),
                 );
-                ctx.set_deadline(Instant::now() + self.config.query_timeout);
+                if let Some(deadline) = self.context_deadline() {
+                    ctx.set_deadline(deadline);
+                }
                 if let Some(ref token) = self.cancellation_token {
                     ctx.set_cancellation_token(token.clone());
                 }
@@ -1170,29 +1193,39 @@ mod tests {
     // ── Accumulator tests ────────────────────────────────────────────
 
     #[test]
+    fn test_accumulator_percentile_rejects_a_non_number() {
+        for op in ["PERCENTILECONT", "PERCENTILEDISC"] {
+            let mut acc = Accumulator::new_with_percentile(op, false, 0.5);
+            acc.update(&Value::Int(1), false).unwrap();
+            acc.update(&Value::Null, false).unwrap();
+            assert!(acc.update(&Value::String("x".into()), false).is_err());
+        }
+    }
+
+    #[test]
     fn test_accumulator_count_basic() {
         let mut acc = Accumulator::new("COUNT", false);
-        acc.update(&Value::Int(1), false);
-        acc.update(&Value::Null, false); // null skipped
-        acc.update(&Value::Int(2), false);
+        acc.update(&Value::Int(1), false).unwrap();
+        acc.update(&Value::Null, false).unwrap(); // null skipped
+        acc.update(&Value::Int(2), false).unwrap();
         assert_eq!(acc.finish(), Value::Int(2));
     }
 
     #[test]
     fn test_accumulator_count_wildcard() {
         let mut acc = Accumulator::new("COUNT", false);
-        acc.update(&Value::Int(1), true);
-        acc.update(&Value::Null, true); // wildcard counts nulls
-        acc.update(&Value::Int(2), true);
+        acc.update(&Value::Int(1), true).unwrap();
+        acc.update(&Value::Null, true).unwrap(); // wildcard counts nulls
+        acc.update(&Value::Int(2), true).unwrap();
         assert_eq!(acc.finish(), Value::Int(3));
     }
 
     #[test]
     fn test_accumulator_sum() {
         let mut acc = Accumulator::new("SUM", false);
-        acc.update(&Value::Int(10), false);
-        acc.update(&Value::Float(2.5), false);
-        acc.update(&Value::Null, false); // null skipped
+        acc.update(&Value::Int(10), false).unwrap();
+        acc.update(&Value::Float(2.5), false).unwrap();
+        acc.update(&Value::Null, false).unwrap(); // null skipped
         assert_eq!(acc.finish(), Value::Float(12.5));
     }
 
@@ -1216,8 +1249,8 @@ mod tests {
         let mut min_acc = Accumulator::new("MIN", false);
         let mut max_acc = Accumulator::new("MAX", false);
         for v in [&y2020, &y2010, &y2030] {
-            min_acc.update(v, false);
-            max_acc.update(v, false);
+            min_acc.update(v, false).unwrap();
+            max_acc.update(v, false).unwrap();
         }
         assert_eq!(
             min_acc.finish(),
@@ -1234,9 +1267,9 @@ mod tests {
     #[test]
     fn test_accumulator_avg() {
         let mut acc = Accumulator::new("AVG", false);
-        acc.update(&Value::Int(10), false);
-        acc.update(&Value::Int(20), false);
-        acc.update(&Value::Int(30), false);
+        acc.update(&Value::Int(10), false).unwrap();
+        acc.update(&Value::Int(20), false).unwrap();
+        acc.update(&Value::Int(30), false).unwrap();
         assert_eq!(acc.finish(), Value::Float(20.0));
     }
 
@@ -1251,8 +1284,8 @@ mod tests {
         let mut min_acc = Accumulator::new("MIN", false);
         let mut max_acc = Accumulator::new("MAX", false);
         for v in &[Value::Int(3), Value::Int(1), Value::Int(2)] {
-            min_acc.update(v, false);
-            max_acc.update(v, false);
+            min_acc.update(v, false).unwrap();
+            max_acc.update(v, false).unwrap();
         }
         assert_eq!(min_acc.finish(), Value::Int(1));
         assert_eq!(max_acc.finish(), Value::Int(3));
@@ -1261,9 +1294,9 @@ mod tests {
     #[test]
     fn test_accumulator_collect() {
         let mut acc = Accumulator::new("COLLECT", false);
-        acc.update(&Value::String("a".into()), false);
-        acc.update(&Value::Null, false); // null skipped
-        acc.update(&Value::String("b".into()), false);
+        acc.update(&Value::String("a".into()), false).unwrap();
+        acc.update(&Value::Null, false).unwrap(); // null skipped
+        acc.update(&Value::String("b".into()), false).unwrap();
         assert_eq!(
             acc.finish(),
             Value::List(vec![Value::String("a".into()), Value::String("b".into()),])
@@ -1273,10 +1306,10 @@ mod tests {
     #[test]
     fn test_accumulator_count_distinct() {
         let mut acc = Accumulator::new("COUNT", true);
-        acc.update(&Value::String("a".into()), false);
-        acc.update(&Value::String("b".into()), false);
-        acc.update(&Value::String("a".into()), false); // duplicate
-        acc.update(&Value::Null, false); // null skipped
+        acc.update(&Value::String("a".into()), false).unwrap();
+        acc.update(&Value::String("b".into()), false).unwrap();
+        acc.update(&Value::String("a".into()), false).unwrap(); // duplicate
+        acc.update(&Value::Null, false).unwrap(); // null skipped
         assert_eq!(acc.finish(), Value::Int(2));
     }
 
@@ -1336,29 +1369,29 @@ mod tests {
     #[test]
     fn test_count_distinct_type_identity() {
         let mut acc = Accumulator::new("COUNT", true);
-        acc.update(&Value::Int(1), false);
-        acc.update(&Value::Float(1.0), false);
+        acc.update(&Value::Int(1), false).unwrap();
+        acc.update(&Value::Float(1.0), false).unwrap();
         assert_eq!(acc.finish(), Value::Int(1), "1 and 1.0 count once");
 
         let mut acc = Accumulator::new("COUNT", true);
-        acc.update(&Value::Int(1), false);
-        acc.update(&Value::String("1".to_string()), false);
+        acc.update(&Value::Int(1), false).unwrap();
+        acc.update(&Value::String("1".to_string()), false).unwrap();
         assert_eq!(acc.finish(), Value::Int(2), "1 and '1' are distinct");
 
         let mut acc = Accumulator::new("COUNT", true);
-        acc.update(&Value::Int(1), false);
-        acc.update(&Value::Bool(true), false);
+        acc.update(&Value::Int(1), false).unwrap();
+        acc.update(&Value::Bool(true), false).unwrap();
         assert_eq!(acc.finish(), Value::Int(2), "1 and true are distinct");
 
         // Non-integral and non-finite floats keep float identity; NaN and
         // signed zero follow Value's normalized Hash/Eq (one bucket each).
         let mut acc = Accumulator::new("COUNT", true);
-        acc.update(&Value::Float(1.5), false);
-        acc.update(&Value::Float(1.5), false);
-        acc.update(&Value::Float(f64::NAN), false);
-        acc.update(&Value::Float(f64::NAN), false);
-        acc.update(&Value::Float(0.0), false);
-        acc.update(&Value::Float(-0.0), false);
+        acc.update(&Value::Float(1.5), false).unwrap();
+        acc.update(&Value::Float(1.5), false).unwrap();
+        acc.update(&Value::Float(f64::NAN), false).unwrap();
+        acc.update(&Value::Float(f64::NAN), false).unwrap();
+        acc.update(&Value::Float(0.0), false).unwrap();
+        acc.update(&Value::Float(-0.0), false).unwrap();
         assert_eq!(acc.finish(), Value::Int(3), "1.5, NaN, 0 -> 3 buckets");
     }
 }

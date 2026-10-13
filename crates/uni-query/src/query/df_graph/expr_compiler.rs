@@ -223,6 +223,15 @@ struct ToCypherValueExpr {
     child: Arc<dyn PhysicalExpr>,
 }
 
+/// Encodes `child`'s value as a Cypher value (`LargeBinary`), row by row.
+///
+/// For a column whose type is not fixed — a list, a map, a value of mixed or
+/// unknown type — this keeps the value; an Arrow cast to a single type would
+/// change it (a list cast to a string is its text).
+pub(crate) fn to_cypher_value_expr(child: Arc<dyn PhysicalExpr>) -> Arc<dyn PhysicalExpr> {
+    Arc::new(ToCypherValueExpr { child })
+}
+
 impl std::fmt::Display for ToCypherValueExpr {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "ToCypherValue({})", self.child)

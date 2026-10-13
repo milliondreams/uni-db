@@ -6,8 +6,6 @@
 //! Ported from `uni-locy/src/orchestrator/assume.rs`. Uses `LocyExecutionContext`
 //! for L0 fork/restore, mutations, and strata re-evaluation.
 
-use std::time::Instant;
-
 use uni_cypher::ast::Query;
 use uni_locy::result::CommandResult;
 use uni_locy::types::{CompiledAssume, CompiledCommand};
@@ -138,18 +136,20 @@ pub async fn evaluate_assume(
         ..parent_program.clone()
     };
 
+    // The body's facts are fixed from here on: body commands read them by
+    // shared reference, as top-level commands do.
+    let assume_derived_store = assume_derived_store;
+
     // 5. Execute body commands and collect results
     let mut result_rows = Vec::new();
-    let assume_start = Instant::now();
     for cmd in &assume.body_commands {
         let cmd_result = dispatch_body_command(
             cmd,
             &command_program,
             ctx,
             config,
-            &mut assume_derived_store,
+            &assume_derived_store,
             stats,
-            assume_start,
         )
         .await?;
         match cmd_result {
@@ -184,63 +184,17 @@ fn dispatch_body_command<'a>(
     program: &'a CompiledProgram,
     ctx: &'a dyn LocyExecutionContext,
     config: &'a LocyConfig,
-    derived_store: &'a mut RowStore,
+    derived_store: &'a RowStore,
     stats: &'a mut LocyStats,
-    start: Instant,
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<CommandResult, LocyError>> + Send + 'a>,
 > {
     Box::pin(async move {
         match cmd {
             CompiledCommand::GoalQuery(gq) => {
-                // For FOLD rules (MNOR/MPROD), the SLG resolver does not apply
-                // post-fixpoint aggregation and would return raw pre-FOLD match rows.
-                // Use the pre-computed `derived_store` (which ran the full native fixpoint
-                // including FOLD aggregation and VID→Node enrichment).
-                let rule_name_str = gq.rule_name.to_string();
-                let is_fold_rule = program
-                    .rule_catalog
-                    .get(&rule_name_str)
-                    .map(|r| r.clauses.iter().any(|c| !c.fold.is_empty()))
-                    .unwrap_or(false);
-
-                let fold_relation = if is_fold_rule {
-                    derived_store.get(&rule_name_str)
-                } else {
-                    None
-                };
-                if let Some(relation) = fold_relation {
-                    let rows = relation.rows.clone();
-                    // Apply the QUERY WHERE filter before RETURN — this FOLD path
-                    // (like the one in `locy_query::evaluate_query`) does not reach
-                    // the shared filter, so omitting it silently ignored the
-                    // predicate for FOLD rules queried inside an ASSUME block.
-                    let filtered = super::locy_query::filter_where(
-                        rows,
-                        gq.where_expr.as_ref(),
-                        &config.params,
-                    )?;
-                    let projected = super::locy_query::apply_return_clause(
-                        filtered,
-                        &gq.return_clause,
-                        &config.params,
-                    )
-                    .map_err(|e| LocyError::QueryResolutionError {
-                        message: format!("ASSUME FOLD query projection: {e}"),
-                    })?;
-                    return Ok(CommandResult::Query(projected));
-                }
-
-                let rows = super::locy_query::evaluate_query(
-                    gq,
-                    program,
-                    ctx,
-                    config,
-                    derived_store,
-                    stats,
-                    start,
-                )
-                .await?;
+                // The same path as a top-level QUERY: the facts this body's
+                // re-evaluation published, filtered and projected.
+                let rows = super::locy_query::evaluate_query(gq, program, config, derived_store)?;
                 Ok(CommandResult::Query(rows))
             }
             CompiledCommand::DeriveCommand(dc) => {
@@ -269,7 +223,6 @@ fn dispatch_body_command<'a>(
                     config,
                     derived_store,
                     stats,
-                    None,
                 )
                 .await?;
                 Ok(CommandResult::Abduce(result))

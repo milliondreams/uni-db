@@ -12,66 +12,40 @@
 //! instead of `CypherExecutor`.
 
 use std::collections::HashMap;
-use std::time::Instant;
 
 use uni_common::Value;
 use uni_cypher::ast::{Expr, ReturnItem};
 use uni_cypher::locy_ast::GoalQuery;
-use uni_locy::{CompiledProgram, FactRow, LocyConfig, LocyError, LocyStats};
+use uni_locy::{CompiledProgram, FactRow, LocyConfig, LocyError};
 
 use super::locy_delta::RowStore;
 
 use super::locy_eval::{eval_condition, eval_expr, value_cmp};
-use super::locy_slg::{SLGResolver, extract_goal_bindings};
-use super::locy_traits::DerivedFactSource;
 
 /// Entry point for goal-directed QUERY evaluation.
 ///
-/// Reads the fixpoint's `derived_store` for every rule it produced, then
-/// applies the WHERE filter and RETURN clause. Falls back to SLG resolution
-/// only for generator rules, which the fixpoint cannot evaluate.
-pub async fn evaluate_query(
+/// Reads the rule's facts from `derived_store`, the facts the fixpoint
+/// published, then applies the WHERE filter and RETURN clause.
+///
+/// # Errors
+///
+/// Returns an error if the rule is unknown or has no published relation, or if
+/// WHERE or RETURN cannot be evaluated.
+pub fn evaluate_query(
     query: &GoalQuery,
     program: &CompiledProgram,
-    fact_source: &dyn DerivedFactSource,
     config: &LocyConfig,
-    derived_store: &mut RowStore,
-    stats: &mut LocyStats,
-    start: Instant,
+    derived_store: &RowStore,
 ) -> Result<Vec<FactRow>, LocyError> {
     // `QUERY adult` inside `MODULE m` names the rule bare, but the catalog keys
     // it as `m.adult`. The compiler validates the reference module-aware, so a
     // plain lookup here accepts the program at compile time and then fails at
     // run time. Resolve with the same policy the derived store uses.
     let rule_name = query.rule_name.to_string();
-    let catalog_key = uni_locy::names::resolve_unique(
-        program.rule_catalog.keys().map(String::as_str),
-        &rule_name,
-    )
-    .ok_or_else(|| LocyError::QueryResolutionError {
-        message: format!("rule '{}' not found", rule_name),
-    })?
-    .to_string();
-    let rule =
-        program
-            .rule_catalog
-            .get(&catalog_key)
-            .ok_or_else(|| LocyError::QueryResolutionError {
-                message: format!("rule '{}' not found", rule_name),
-            })?;
-
-    let key_columns: Vec<String> = rule
-        .yield_schema
-        .iter()
-        .filter(|c| c.is_key)
-        .map(|c| c.name.clone())
-        .collect();
-
-    // Extract goal bindings from WHERE for goal-directed resolution
-    let goal_bindings = match &query.where_expr {
-        Some(expr) => extract_goal_bindings(expr, &key_columns),
-        None => std::collections::HashMap::new(),
-    };
+    uni_locy::names::resolve_unique(program.rule_catalog.keys().map(String::as_str), &rule_name)
+        .ok_or_else(|| LocyError::QueryResolutionError {
+            message: format!("rule '{}' not found", rule_name),
+        })?;
 
     // Answer from the facts the fixpoint already derived.
     //
@@ -107,34 +81,16 @@ pub async fn evaluate_query(
         return apply_return_clause(filtered, &query.return_clause, &config.params);
     }
 
-    // Fallback: the fixpoint produced nothing for this rule.
-    //
-    // In practice that means a rule containing a generator, which the planner
-    // skips when building strata because the columnar engine has no
-    // row-explosion operator (`locy_planner.rs`, `locy_slg::apply_generators`).
-    // Generators are the one capability the fixpoint genuinely lacks, so the
-    // SLG path survives for exactly that case. Seed the store with FOLD
-    // relations so an IS NOT across a FOLD boundary can still resolve.
-    let mut fresh_store = RowStore::new();
-    for (name, relation) in derived_store.iter() {
-        if let Some(r) = program.rule_catalog.get(name)
-            && r.clauses.iter().any(|c| !c.fold.is_empty())
-        {
-            fresh_store.insert(name.clone(), relation.clone());
-        }
-    }
-    let mut resolver = SLGResolver::new(program, fact_source, config, &mut fresh_store, start);
-    let results = resolver.resolve_goal(&rule_name, &goal_bindings).await?;
-
-    // Merge SLG stats
-    stats.queries_executed += resolver.stats.queries_executed;
-    stats.mutations_executed += resolver.stats.mutations_executed;
-
-    // Apply WHERE filter (SLG may return superset if goal bindings are partial).
-    let filtered = filter_where(results, query.where_expr.as_ref(), &config.params)?;
-
-    // Apply RETURN clause if present
-    apply_return_clause(filtered, &query.return_clause, &config.params)
+    // Every rule the program defines has a published relation, empty when it
+    // derived nothing; a generator rule too, now that the fixpoint plans
+    // generators (`LocyGenerateExec`). There used to be a fallback here that
+    // re-derived a missing rule through the in-memory evaluator, which has no
+    // FOLD, BEST BY or post-FOLD WHERE, so it answered such a rule with its
+    // pre-FOLD rows. A missing relation is now a fault, not a cue to derive
+    // the rule a second way.
+    Err(LocyError::EvaluationError {
+        message: format!("QUERY {rule_name}: no facts were published for this rule"),
+    })
 }
 
 /// Apply a RETURN clause (projection, ordering, skip, limit) to results.
@@ -418,42 +374,25 @@ fn aggregate(expr: &Expr, group: &[FactRow]) -> Result<Value, LocyError> {
             values.push(v);
         }
     }
-    let numbers = |values: &[Value]| -> Result<Vec<f64>, LocyError> {
-        values
-            .iter()
-            .map(|v| {
-                v.as_f64().ok_or_else(|| LocyError::TypeError {
-                    message: format!("{name}() requires numbers, got {v:?}"),
-                })
-            })
-            .collect()
-    };
     match name.as_str() {
         "count" => Ok(Value::Int(values.len() as i64)),
         "collect" => Ok(Value::List(values)),
-        "sum" => {
-            if values.iter().all(|v| matches!(v, Value::Int(_))) {
-                let mut total = 0i64;
-                for v in &values {
-                    let Value::Int(i) = v else { unreachable!() };
-                    total = total
-                        .checked_add(*i)
-                        .ok_or_else(|| LocyError::EvaluationError {
-                            message: "integer overflow in sum()".to_string(),
-                        })?;
-                }
-                Ok(Value::Int(total))
-            } else {
-                Ok(Value::Float(numbers(&values)?.iter().sum()))
+        // Cypher's `sum` / `avg`, shared with the Cypher aggregates: numbers
+        // or durations. A duration used to be a type error here, and an
+        // integer overflow an error where Cypher continues in floats.
+        "sum" | "avg" => {
+            let type_error = |e: anyhow::Error| LocyError::TypeError {
+                message: e.to_string(),
+            };
+            let mut total = uni_query_functions::cypher_sum::CypherSum::default();
+            for v in &values {
+                total.add(v).map_err(type_error)?;
             }
-        }
-        "avg" => {
-            let ns = numbers(&values)?;
-            Ok(if ns.is_empty() {
-                Value::Null
+            if name == "sum" {
+                Ok(total.sum())
             } else {
-                Value::Float(ns.iter().sum::<f64>() / ns.len() as f64)
-            })
+                Ok(total.avg(values.len() as u64))
+            }
         }
         "min" | "max" => {
             let want = if name == "min" {

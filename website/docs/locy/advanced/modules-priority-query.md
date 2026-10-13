@@ -25,15 +25,18 @@ CREATE RULE classify PRIORITY 1 AS MATCH (n) WHERE n.risk > 0.8 YIELD KEY n, 'hi
 CREATE RULE classify PRIORITY 2 AS MATCH (n) YIELD KEY n, 'normal' AS level
 ```
 
-## QUERY (Goal-Directed)
+## QUERY
 
-`QUERY` asks for targeted answers rather than full materialization-first workflows.
+`QUERY` reads a rule's facts as the fixpoint derived them, then filters and
+projects them; it returns exactly what `.derived` holds for that rule.
 
 ```locy
 QUERY classify WHERE n.name = 'service-a' RETURN level
 ```
 
-## Choosing Bottom-Up vs Goal-Directed
+## Evaluation
 
-- Bottom-up: broad materialization, repeated downstream reuse.
-- Goal-directed: targeted questions with narrower evaluation focus.
+Locy evaluates bottom-up: every rule is derived to its fixpoint before any
+command runs. A `QUERY ... WHERE` filters the derived facts; it does not narrow
+what is derived. To derive less, constrain the rule itself (a `WHERE` in its
+body, or a `REQUIRE`).

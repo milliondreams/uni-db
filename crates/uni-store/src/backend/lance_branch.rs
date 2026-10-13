@@ -23,7 +23,7 @@
 use std::sync::Arc;
 
 use crate::backend::branching::ForkBranching;
-use crate::backend::types::{FilterExpr, VectorQueryOpts};
+use crate::backend::types::{FilterExpr, TextSearch, VectorQueryOpts};
 use anyhow::{Context, Result};
 use arrow_schema::{Field, Schema as ArrowSchema};
 use lance::Dataset;
@@ -867,6 +867,21 @@ pub struct LanceBranching {
     base_uri: String,
 }
 
+/// Whether the local dataset at `dataset` has a committed version.
+///
+/// A Lance dataset exists once its first manifest is committed under
+/// `_versions/`; creating one writes the data files first, so a create cut off
+/// midway leaves the directory without one. Mirrors
+/// `LanceDirectory::is_committed`, which answers the same question for the
+/// primary backend.
+fn has_committed_manifest(dataset: &std::path::Path) -> bool {
+    std::fs::read_dir(dataset.join("_versions")).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().ends_with(".manifest"))
+    })
+}
+
 impl LanceBranching {
     /// Adapter over the Lance datasets under `base_uri`.
     pub fn new(base_uri: impl Into<String>) -> Self {
@@ -967,7 +982,7 @@ impl ForkBranching for LanceBranching {
         if uri.contains("://") {
             return Ok(true);
         }
-        Ok(std::path::Path::new(&uri).exists())
+        Ok(has_committed_manifest(std::path::Path::new(&uri)))
     }
 
     async fn create_tag(&self, table: &str, tag: &str, branch: &str) -> Result<()> {
@@ -1136,6 +1151,34 @@ impl ForkBranching for LanceBranching {
         filter: &FilterExpr,
     ) -> Result<Vec<arrow_array::RecordBatch>> {
         full_text_search_on_branch(&self.dataset_uri(table), branch, column, query, k, filter).await
+    }
+
+    async fn full_text_search_with_unstored_on_branch(
+        &self,
+        table: &str,
+        branch: &str,
+        column: &str,
+        query: &str,
+        k: usize,
+        filter: &FilterExpr,
+        unstored: Vec<(u64, String)>,
+    ) -> Result<TextSearch> {
+        let sql = if filter.is_trivially_true() {
+            None
+        } else {
+            Some(filter.to_sql()?)
+        };
+        let on_branch = open_branch(&self.dataset_uri(table), branch).await?;
+        super::lance_fts::search_with_unstored(
+            Some(&on_branch),
+            column,
+            query,
+            k,
+            sql.as_deref(),
+            unstored,
+            |_| {},
+        )
+        .await
     }
 }
 

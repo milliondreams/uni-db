@@ -1757,8 +1757,12 @@ async fn columnar_scan_schemaless_vertex_batch_static(
 
     // A pushed property predicate hides a vid's CURRENT row from the scan when
     // that row no longer matches (MVCC-append: the stale still-matching row
-    // would win the dedup by default) — drop superseded rows first.
-    let lance_batch = match (lance_batch, extra_lance_filter.is_some()) {
+    // would win the dedup by default) — drop superseded rows first. The label
+    // filter does the same to a vertex relabeled away from `label`: its
+    // current row lacks the label, so its older row, which has it, was the
+    // only one left and the vertex matched a label it no longer carries.
+    let row_filtered = extra_lance_filter.is_some() || !label.is_empty();
+    let lance_batch = match (lance_batch, row_filtered) {
         (Some(b), true) => Some(
             drop_superseded_pushdown_rows(storage, None, b)
                 .await
@@ -1801,7 +1805,21 @@ async fn columnar_scan_schemaless_vertex_batch_static(
             None => SchemalessL0Targets::All,
         },
     };
-    let l0_batch = build_l0_schemaless_vertex_batch(l0_ctx, label, &internal_schema, l0_targets)?;
+    let label_only = uni_store::runtime::columnar_scan::label_only_l0_base_props(
+        storage,
+        l0_ctx,
+        label,
+        |vid| match l0_targets {
+            SchemalessL0Targets::Vids(vids) => vids.contains(&vid),
+            SchemalessL0Targets::Range(lo, hi) => vid >= lo && vid < hi,
+            SchemalessL0Targets::All => true,
+        },
+        graph_ctx.counters(),
+    )
+    .await
+    .map_err(exec_err)?;
+    let l0_batch =
+        build_l0_schemaless_vertex_batch(l0_ctx, label, &internal_schema, l0_targets, &label_only)?;
 
     // Merge Lance + L0
     let Some(merged) = merge_lance_and_l0(
@@ -1870,6 +1888,7 @@ fn build_l0_schemaless_vertex_batch(
     label: &str,
     internal_schema: &SchemaRef,
     targets: SchemalessL0Targets<'_>,
+    label_only: &HashMap<u64, (Properties, u64)>,
 ) -> DFResult<RecordBatch> {
     // Collect all L0 vertex data, merging in visibility order
     // vid -> (merged_props, highest_version, labels)
@@ -1899,7 +1918,7 @@ fn build_l0_schemaless_vertex_batch(
             let mut out = Vec::with_capacity(tvs.len());
             for &tv in tvs {
                 let vid = Vid::from(tv);
-                if !guard.vertex_properties.contains_key(&vid) {
+                if !guard.vertex_properties.contains_key(&vid) && !label_only.contains_key(&tv) {
                     continue;
                 }
                 let label_ok = if label_filter.is_empty() {
@@ -1957,6 +1976,15 @@ fn build_l0_schemaless_vertex_batch(
             if let Some(labels) = guard.vertex_labels.get(&vid) {
                 entry.2 = labels.clone();
             }
+        }
+    }
+
+    // A relabeled vertex with no L0 property row starts from its flushed
+    // properties, at the relabel's version (see `label_only_l0_base_props`).
+    for (vid, (base, version)) in label_only {
+        if let Some(entry) = vid_data.get_mut(vid) {
+            entry.0 = base.clone();
+            entry.1 = entry.1.max(*version);
         }
     }
 

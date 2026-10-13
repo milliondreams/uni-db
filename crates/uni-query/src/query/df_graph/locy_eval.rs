@@ -81,7 +81,12 @@ pub fn eval_expr(expr: &Expr, bindings: &FactRow) -> Result<Value, LocyError> {
         Expr::FunctionCall { name, args, .. } => {
             let evaluated_args: Result<Vec<Value>, _> =
                 args.iter().map(|a| eval_expr(a, bindings)).collect();
-            eval_function(name, &evaluated_args?)
+            let evaluated_args = evaluated_args?;
+            let upper = name.to_uppercase();
+            if upper == "STARTNODE" || upper == "ENDNODE" {
+                return endpoint_node(&upper, &evaluated_args, bindings);
+            }
+            eval_function(name, &evaluated_args)
         }
         Expr::Parameter(name) => Ok(bindings.get(name).cloned().unwrap_or(Value::Null)),
         Expr::IsNull(inner) => {
@@ -164,134 +169,6 @@ pub fn eval_expr(expr: &Expr, bindings: &FactRow) -> Result<Value, LocyError> {
         }
         _ => Err(LocyError::EvaluationError {
             message: format!("unsupported expression in in-memory evaluation: {expr:?}"),
-        }),
-    }
-}
-
-/// Evaluate an aggregate function over a group of rows.
-pub fn eval_aggregate_over_group(
-    func_name: &str,
-    arg_expr: &Expr,
-    group: &[FactRow],
-    rule_name: &str,
-    fold_name: &str,
-) -> Result<Value, LocyError> {
-    let upper = func_name.to_uppercase();
-    match upper.as_str() {
-        "SUM" => {
-            let mut total = 0.0_f64;
-            for row in group {
-                let v = eval_expr(arg_expr, row)?;
-                if let Some(f) = v.as_f64() {
-                    total += f;
-                }
-            }
-            if total == total.floor() && total.abs() < i64::MAX as f64 {
-                Ok(Value::Int(total as i64))
-            } else {
-                Ok(Value::Float(total))
-            }
-        }
-        "MSUM" => {
-            let mut total = 0.0_f64;
-            for row in group {
-                let v = eval_expr(arg_expr, row)?;
-                if let Some(f) = v.as_f64() {
-                    if f < 0.0 {
-                        return Err(LocyError::MsumNegativeValue {
-                            rule: rule_name.to_string(),
-                            fold: fold_name.to_string(),
-                            value: f,
-                        });
-                    }
-                    total += f;
-                }
-            }
-            if total == total.floor() && total.abs() < i64::MAX as f64 {
-                Ok(Value::Int(total as i64))
-            } else {
-                Ok(Value::Float(total))
-            }
-        }
-        "COUNT" | "MCOUNT" => {
-            let count = group
-                .iter()
-                .filter(|row| {
-                    eval_expr(arg_expr, row)
-                        .map(|v| !v.is_null())
-                        .unwrap_or(false)
-                })
-                .count();
-            Ok(Value::Int(count as i64))
-        }
-        "MIN" | "MMIN" => {
-            let mut min_val: Option<Value> = None;
-            for row in group {
-                let v = eval_expr(arg_expr, row)?;
-                if v.is_null() {
-                    continue;
-                }
-                min_val = Some(match min_val {
-                    None => v,
-                    Some(cur) => {
-                        if value_less_than(&v, &cur) {
-                            v
-                        } else {
-                            cur
-                        }
-                    }
-                });
-            }
-            Ok(min_val.unwrap_or(Value::Null))
-        }
-        "MAX" | "MMAX" => {
-            let mut max_val: Option<Value> = None;
-            for row in group {
-                let v = eval_expr(arg_expr, row)?;
-                if v.is_null() {
-                    continue;
-                }
-                max_val = Some(match max_val {
-                    None => v,
-                    Some(cur) => {
-                        if value_less_than(&cur, &v) {
-                            v
-                        } else {
-                            cur
-                        }
-                    }
-                });
-            }
-            Ok(max_val.unwrap_or(Value::Null))
-        }
-        "AVG" => {
-            let mut total = 0.0_f64;
-            let mut count = 0;
-            for row in group {
-                let v = eval_expr(arg_expr, row)?;
-                if let Some(f) = v.as_f64() {
-                    total += f;
-                    count += 1;
-                }
-            }
-            if count == 0 {
-                Ok(Value::Null)
-            } else {
-                Ok(Value::Float(total / count as f64))
-            }
-        }
-        "COLLECT" => {
-            let mut vals = Vec::new();
-            for row in group {
-                let v = eval_expr(arg_expr, row)?;
-                if !v.is_null() {
-                    vals.push(v);
-                }
-            }
-            Ok(Value::List(vals))
-        }
-        _ => Err(LocyError::EvaluationError {
-            message: format!("unknown aggregate function: {func_name}"),
         }),
     }
 }
@@ -507,6 +384,34 @@ fn numeric_op(
     }
 }
 
+/// `startNode(e)` / `endNode(e)`: the endpoint as the row binds it, or a node
+/// carrying only its identity when the row binds no such node, as the Cypher
+/// executor answers.
+fn endpoint_node(name: &str, args: &[Value], bindings: &FactRow) -> Result<Value, LocyError> {
+    let [edge] = args else {
+        return Err(LocyError::EvaluationError {
+            message: format!("{}() requires exactly 1 argument", name.to_lowercase()),
+        });
+    };
+    let Some((src, dst)) = edge.edge_endpoints() else {
+        return Ok(Value::Null);
+    };
+    let Some(vid) = (if name == "STARTNODE" { src } else { dst }) else {
+        return Ok(Value::Null);
+    };
+    Ok(bindings
+        .values()
+        .find(|v| v.entity_vid() == Some(vid) && v.entity_labels().is_some())
+        .cloned()
+        .unwrap_or_else(|| {
+            Value::Node(uni_common::Node {
+                vid,
+                labels: Vec::new(),
+                properties: std::collections::HashMap::new(),
+            })
+        }))
+}
+
 fn eval_function(name: &str, args: &[Value]) -> Result<Value, LocyError> {
     let upper = name.to_uppercase();
     match upper.as_str() {
@@ -653,57 +558,6 @@ fn invoke_locy_predicate(
     } else {
         Value::Bool(arr.value(0))
     })
-}
-
-/// Resolve `name` to a registered [`LocyGenerator`] and evaluate it over the
-/// single-row `args`, returning the emitted output tuples (one inner `Vec` per
-/// generated row, each of length `signature().outputs.len()`). Returns `None`
-/// when no generator with that name is registered.
-///
-/// Mirrors [`try_dispatch_locy_predicate`] — same `candidate_splits` lookup
-/// against the session-local plugin registry — but is table-valued (1:N).
-pub(crate) fn dispatch_locy_generator(
-    name: &str,
-    args: &[Value],
-) -> Option<Result<Vec<Vec<Value>>, LocyError>> {
-    let session_pr = crate::query::df_udfs_plugin::current_session_plugin_registry()?;
-    let entry = uni_plugin::QName::candidate_splits(name)
-        .find_map(|cand| session_pr.locy_generator(&cand))?;
-    Some(invoke_locy_generator(&entry, name, args))
-}
-
-/// Bridge Locy `Value` args into a one-row Arrow batch, invoke the generator,
-/// and read its table-valued output back as `Vec<Vec<Value>>` (one inner `Vec`
-/// per emitted tuple, columns in `signature().outputs` order).
-fn invoke_locy_generator(
-    entry: &uni_plugin::registry::LocyGeneratorEntry,
-    name: &str,
-    args: &[Value],
-) -> Result<Vec<Vec<Value>>, LocyError> {
-    let columnar: Vec<datafusion::logical_expr::ColumnarValue> =
-        args.iter().map(value_to_single_row_columnar).collect();
-
-    let err = |e: uni_plugin::FnError| LocyError::EvaluationError {
-        message: format!("{name}: {e}"),
-    };
-
-    let out = entry.generator.generate(&columnar, 1).map_err(err)?;
-    let emitted = out.row_map.len();
-    let mut tuples = Vec::with_capacity(emitted);
-    for i in 0..emitted {
-        let mut tuple = Vec::with_capacity(out.columns.len());
-        for col in &out.columns {
-            let decoded =
-                uni_store::storage::arrow_convert::arrow_to_value(col, i, None).map_err(|e| {
-                    LocyError::EvaluationError {
-                        message: e.to_string(),
-                    }
-                })?;
-            tuple.push(decoded.canonical_entity());
-        }
-        tuples.push(tuple);
-    }
-    Ok(tuples)
 }
 
 /// Encode one Locy `Value` as a length-1 Arrow column for predicate input.

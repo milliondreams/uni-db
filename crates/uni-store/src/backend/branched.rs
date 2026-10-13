@@ -221,6 +221,33 @@ impl StorageBackend for BranchedBackend {
         self.inner.scan_stream(self.apply_branch(request)).await
     }
 
+    async fn full_text_search_with_unstored(
+        &self,
+        table: &str,
+        column: &str,
+        query: &str,
+        k: usize,
+        filter: FilterExpr,
+        unstored: Vec<(u64, String)>,
+        counters: Option<Arc<crate::runtime::counters::QueryCounters>>,
+    ) -> Result<TextSearch> {
+        if let Some(branch) = self.scope.branch_for(table) {
+            return self
+                .branching()?
+                .full_text_search_with_unstored_on_branch(
+                    table, &branch, column, query, k, &filter, unstored,
+                )
+                .await;
+        }
+        self.inner
+            .full_text_search_with_unstored(table, column, query, k, filter, unstored, counters)
+            .await
+    }
+
+    fn filter_batch(&self, batch: &RecordBatch, filter: &FilterExpr) -> Result<Vec<bool>> {
+        self.inner.filter_batch(batch, filter)
+    }
+
     async fn count_rows(&self, table_name: &str, filter: Option<&FilterExpr>) -> Result<usize> {
         // Primary path counts via `Table::count_rows`. Branched count
         // delegates by scanning the branch and summing row counts; the

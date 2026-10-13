@@ -34,6 +34,34 @@ WHERE a IS reachable TO b
 WHERE (x, y, c) IS control
 ```
 
+Variables bind the referenced rule's columns in one order: its `KEY` columns, then its other
+columns, each in `YIELD` order. Subjects take columns from the front and a `TO` target takes the
+next one, so against `YIELD KEY o, KEY e, pct` both `(o, e, v) IS stake` and `(o, e) IS stake TO v`
+bind `v` to each matching fact's `pct`. An unbound variable is bound; a bound one is tested.
+`IS NOT` cannot test a value column: an unbound variable there is ignored, a bound one is an error.
+
+### Reading Another Rule's Values
+
+A positive reference also exposes the referenced rule's value columns by name, so a second rule can
+aggregate what a first one computed:
+
+<!-- doctest: skip -->
+```cypher
+CREATE RULE stake AS
+MATCH (o:E)-[r:OWNS]->(e:E)
+FOLD pct = MAX(r.pct)
+YIELD KEY o, KEY e, pct
+
+CREATE RULE exposure AS
+MATCH (o:E), (e:E)
+WHERE o IS stake TO e
+FOLD total = MSUM(pct)
+YIELD KEY e, total
+```
+
+If two references in one clause expose the same name, the first wins; bind the value explicitly to
+choose.
+
 ## Expression Functions in Rules
 
 Cypher expression functions work inside `WHERE`, `ALONG`, `FOLD`, `BEST BY`, and `YIELD`. The `similar_to()` function is particularly useful for semantic scoring in rules:

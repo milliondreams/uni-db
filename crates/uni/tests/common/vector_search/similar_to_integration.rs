@@ -556,6 +556,7 @@ async fn test_similar_to_in_locy_along() -> Result<()> {
             "CREATE RULE sim_path AS \
              MATCH (a:Doc)-[:LINKS]->(b:Doc) \
              ALONG score = similar_to(b.embedding, [1.0, 0.0, 0.0]) \
+             BEST BY score DESC \
              YIELD KEY a, KEY b, score \n\
              CREATE RULE sim_path AS \
              MATCH (a:Doc)-[:LINKS]->(mid:Doc) \

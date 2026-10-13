@@ -837,10 +837,11 @@ impl IndexManager {
         Ok(())
     }
 
-    /// Build any declared scalar index for `label` whose physical artifact is
-    /// missing, now that the table exists.
+    /// Build any declared scalar or full-text index for `label` whose physical
+    /// artifact is missing, now that the table exists.
     ///
-    /// [`Self::create_scalar_index`] records `BuildOutcome::NotAttempted` when
+    /// [`Self::create_scalar_index`], [`Self::create_fts_index`] and
+    /// [`Self::create_json_fts_index`] record `BuildOutcome::NotAttempted` when
     /// the label has not been flushed, because there is no Lance table to build
     /// against. That left the deferral with nowhere to resolve: the flush path
     /// built only the `_vid`/`_uid`/`ext_id` defaults
@@ -851,24 +852,28 @@ impl IndexManager {
     /// resolution point.
     ///
     /// Idempotent, and cheap when there is nothing to do: the schema is
-    /// consulted first, so a label with no declared scalar index costs no
-    /// backend call at all. Only when one is declared do we list the physical
-    /// indexes and build what is absent.
+    /// consulted first, so a label with no declared index of these kinds costs
+    /// no backend call at all. Only when one is declared do we list the
+    /// physical indexes and build what is absent.
     ///
-    /// Scalar indexes only. Vector indexes are materialized by the flush-time
-    /// FDE path, and inverted/sparse are updated incrementally, so neither is
-    /// stranded the way scalar was.
+    /// Vector indexes are materialized by the flush-time FDE path, and uni's
+    /// own inverted and sparse indexes are updated incrementally, so none of
+    /// them is stranded this way. The Lance index behind `CREATE FULLTEXT
+    /// INDEX` is not updated at flush, so it was.
     #[cfg(feature = "lance-backend")]
-    pub async fn ensure_declared_scalar_indexes(&self, label: &str) -> Result<()> {
-        let declared: Vec<ScalarIndexConfig> = {
+    pub async fn ensure_declared_indexes(&self, label: &str) -> Result<()> {
+        let declared: Vec<IndexDefinition> = {
             let schema = self.schema_manager.schema();
             schema
                 .indexes
                 .iter()
-                .filter_map(|idx| match idx {
-                    IndexDefinition::Scalar(cfg) if cfg.label == label => Some(cfg.clone()),
-                    _ => None,
+                .filter(|idx| match idx {
+                    IndexDefinition::Scalar(cfg) => cfg.label == label,
+                    IndexDefinition::FullText(cfg) => cfg.label == label,
+                    IndexDefinition::JsonFullText(cfg) => cfg.label == label,
+                    _ => false,
                 })
+                .cloned()
                 .collect()
         };
         if declared.is_empty() {
@@ -884,26 +889,47 @@ impl IndexManager {
         }
 
         let existing = backend.list_indexes(&table).await?;
-        // Match on the covered column set, not the index name: the physical
-        // artifact may have been created by a path that named it differently
-        // (e.g. `ensure_default_indexes` passes `None`).
-        let already_built = |props: &[String]| {
+        // A scalar index is matched on the covered column set, not the name:
+        // the physical artifact may have been created by a path that named it
+        // differently (e.g. `ensure_default_indexes` passes `None`). A
+        // full-text index is matched by name, because a scalar index on the
+        // same column would otherwise pass for it; the build path always names
+        // it after the declaration.
+        let covers = |props: &[String]| {
             existing.iter().any(|idx| {
                 idx.columns.len() == props.len() && props.iter().all(|p| idx.columns.contains(p))
             })
         };
+        let named = |name: &str| existing.iter().any(|idx| idx.name == name);
 
-        for config in declared {
-            if already_built(&config.properties) {
-                continue;
+        for def in declared {
+            // Reuse the single build path for each kind so the outcome-to-status
+            // mapping stays in one place; it re-registers the definition with
+            // fresh metadata.
+            match def {
+                IndexDefinition::Scalar(config) if !covers(&config.properties) => {
+                    info!(
+                        "Resolving deferred scalar index '{}' on '{}' at flush",
+                        config.name, table
+                    );
+                    self.create_scalar_index(config).await?;
+                }
+                IndexDefinition::FullText(config) if !named(&config.name) => {
+                    info!(
+                        "Resolving deferred full-text index '{}' on '{}' at flush",
+                        config.name, table
+                    );
+                    self.create_fts_index(config).await?;
+                }
+                IndexDefinition::JsonFullText(config) if !named(&config.name) => {
+                    info!(
+                        "Resolving deferred JSON full-text index '{}' on '{}' at flush",
+                        config.name, table
+                    );
+                    self.create_json_fts_index(config).await?;
+                }
+                _ => {}
             }
-            info!(
-                "Resolving deferred scalar index '{}' on '{}' at flush",
-                config.name, table
-            );
-            // Reuse the single build path so outcome-to-status mapping stays in
-            // one place; it re-registers the definition with fresh metadata.
-            self.create_scalar_index(config).await?;
         }
 
         Ok(())

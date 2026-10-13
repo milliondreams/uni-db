@@ -63,7 +63,7 @@ Common fields:
 - `max_iterations`
 - `timeout` (`Option<Duration>`; `None` = 300s between strata, database `query_timeout` inside operators)
 - `max_explain_depth`
-- `max_slg_depth`
+- `max_slg_depth` (deprecated, no effect; using it is a deprecation warning)
 - `max_abduce_candidates`
 - `max_abduce_results`
 - `max_derived_bytes`

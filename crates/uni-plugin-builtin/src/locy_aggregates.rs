@@ -20,8 +20,9 @@ use std::sync::Arc;
 use arrow_array::{Array, Float64Array, Int64Array};
 use arrow_schema::DataType;
 use datafusion::scalar::ScalarValue;
+use uni_common::cypher_sum::CypherSum;
 use uni_plugin::traits::locy::{
-    FoldContext, FoldDirection, FoldSemiring, LocyAggState, LocyAggregate, Semilattice,
+    FoldContext, FoldDirection, FoldSemiring, LocyAggState, LocyAggregate, Semilattice, ValueOrder,
 };
 use uni_plugin::{FnError, PluginError, PluginRegistrar, QName};
 
@@ -202,7 +203,10 @@ impl LocyAggregate for MaxAgg {
 /// Type-preserving min/max state shared by [`MinAgg`] / [`MaxAgg`].
 ///
 /// `Int64` / `Float64` columns use native `min`/`max` (byte-identical to the
-/// pre-trait executor, including its NaN handling). Other column types fall
+/// pre-trait executor, including its NaN handling). A Cypher-value
+/// (`LargeBinary`) column is decoded and ordered by the host's
+/// [`ValueOrder`]: its encoded bytes do not sort as its values do, so
+/// `MIN(-1, 1)` was 1 and `MIN('b', 'aa')` was `'b'`. Other column types fall
 /// back to [`ScalarValue`] ordering and preserve the input type. `proto`
 /// records the input type so an all-null group finalizes to a typed null.
 #[derive(Debug)]
@@ -213,6 +217,7 @@ struct MinMaxState {
     f64_acc: Option<f64>,
     other_acc: Option<ScalarValue>,
     proto: Option<ScalarValue>,
+    order: Option<ValueOrder>,
 }
 
 impl MinMaxState {
@@ -224,7 +229,36 @@ impl MinMaxState {
             f64_acc: None,
             other_acc: None,
             proto: None,
+            order: None,
         }
+    }
+
+    /// Whether `v` replaces `cur` as the running minimum (or maximum).
+    fn replaces(&self, v: &ScalarValue, cur: &ScalarValue) -> Result<bool, FnError> {
+        let ord = match (v, cur) {
+            (ScalarValue::LargeBinary(Some(a)), ScalarValue::LargeBinary(Some(b))) => {
+                let order = self.order.ok_or_else(|| {
+                    FnError::new(
+                        CODE_UNREADABLE_CELL,
+                        "MIN/MAX: ordering Cypher values needs the host's value order",
+                    )
+                })?;
+                let decode = |bytes: &[u8]| {
+                    uni_common::cypher_value_codec::decode(bytes).map_err(|e| {
+                        FnError::new(
+                            CODE_UNREADABLE_CELL,
+                            format!("MIN/MAX: cannot decode a non-null cell: {e}"),
+                        )
+                    })
+                };
+                Some((order.0)(&decode(a)?, &decode(b)?))
+            }
+            _ => v.partial_cmp(cur),
+        };
+        Ok(matches!(
+            (ord, self.is_min),
+            (Some(Ordering::Less), true) | (Some(Ordering::Greater), false)
+        ))
     }
 }
 
@@ -236,10 +270,13 @@ impl LocyAggState for MinMaxState {
         &mut self,
         col: &dyn Array,
         indices: &[usize],
-        _cx: &FoldContext,
+        cx: &FoldContext,
     ) -> Result<(), FnError> {
         if self.dtype.is_none() {
             self.dtype = Some(col.data_type().clone());
+        }
+        if self.order.is_none() {
+            self.order = cx.order;
         }
         for &i in indices {
             if self.proto.is_none() {
@@ -273,13 +310,8 @@ impl LocyAggState for MinMaxState {
                     let v = scalar_from_array(col, i)?;
                     self.other_acc = Some(match self.other_acc.take() {
                         None => v,
-                        Some(cur) => {
-                            let keep_v = matches!(
-                                (v.partial_cmp(&cur), self.is_min),
-                                (Some(Ordering::Less), true) | (Some(Ordering::Greater), false)
-                            );
-                            if keep_v { v } else { cur }
-                        }
+                        Some(cur) if self.replaces(&v, &cur)? => v,
+                        Some(cur) => cur,
                     });
                 }
             }
@@ -293,6 +325,17 @@ impl LocyAggState for MinMaxState {
         }
         if self.proto.is_none() {
             self.proto = o.proto.clone();
+        }
+        if self.order.is_none() {
+            self.order = o.order;
+        }
+        // The other column types' running value was not merged at all.
+        if let Some(v) = o.other_acc.clone() {
+            self.other_acc = Some(match self.other_acc.take() {
+                None => v,
+                Some(cur) if self.replaces(&v, &cur)? => v,
+                Some(cur) => cur,
+            });
         }
         if let Some(v) = o.i64_acc {
             self.i64_acc = Some(match self.i64_acc {
@@ -349,6 +392,10 @@ impl LocyAggregate for SumAgg {
     fn output_type(&self) -> DataType {
         DataType::Float64
     }
+    /// A Cypher-value column sums to a Cypher value: a float, or a duration.
+    fn output_type_for_input(&self, input: &DataType) -> DataType {
+        cypher_total_type(input)
+    }
     fn create(&self) -> Box<dyn LocyAggState> {
         Box::new(SumState::default())
     }
@@ -390,7 +437,12 @@ impl LocyAggregate for MSumAgg {
         DataType::Float64
     }
     fn create(&self) -> Box<dyn LocyAggState> {
-        Box::new(SumState::default())
+        // A recursive sum is monotone only over non-negative numbers: no
+        // durations.
+        Box::new(SumState {
+            numbers_only: true,
+            ..SumState::default()
+        })
     }
     fn initial_accum_f64(&self) -> Option<f64> {
         Some(0.0)
@@ -404,10 +456,15 @@ impl LocyAggregate for MSumAgg {
 ///
 /// A group with no non-null value sums to 0.0, as Cypher's `sum` does: the
 /// same aggregate means the same thing in both languages. It used to finalise
-/// to NULL there.
+/// to NULL there. A Cypher-value column (a schemaless or duration property)
+/// accumulates through [`CypherSum`], as Cypher's `sum` does, so durations add
+/// up and anything that is neither a number nor a duration is an error;
+/// `MSUM` (`numbers_only`) reads numbers alone.
 #[derive(Debug, Default)]
 struct SumState {
     value: f64,
+    cypher: Option<CypherSum>,
+    numbers_only: bool,
 }
 
 impl LocyAggState for SumState {
@@ -420,6 +477,15 @@ impl LocyAggState for SumState {
         indices: &[usize],
         _cx: &FoldContext,
     ) -> Result<(), FnError> {
+        if col.data_type() == &DataType::LargeBinary && !self.numbers_only {
+            let total = self.cypher.get_or_insert_default();
+            for &i in indices {
+                if !col.is_null(i) {
+                    add_cypher_cell(total, col, i, "SUM")?;
+                }
+            }
+            return Ok(());
+        }
         for &i in indices {
             if col.is_null(i) {
                 continue;
@@ -436,11 +502,64 @@ impl LocyAggState for SumState {
     fn merge(&mut self, other: &dyn LocyAggState) -> Result<(), FnError> {
         let o = downcast_state::<SumState>(other)?;
         self.value += o.value;
+        if let Some(other_total) = &o.cypher {
+            self.cypher
+                .get_or_insert_default()
+                .merge(other_total)
+                .map_err(|e| cypher_total_error("SUM", &e))?;
+        }
         Ok(())
     }
     fn finalize(&self) -> Result<ScalarValue, FnError> {
-        Ok(ScalarValue::Float64(Some(self.value)))
+        Ok(match &self.cypher {
+            Some(total) => cypher_total_value(total.sum()),
+            None => ScalarValue::Float64(Some(self.value)),
+        })
     }
+}
+
+/// A Cypher-value column (`LargeBinary`) folds by `SUM` / `AVG` to a Cypher
+/// value; any other column to Float64.
+fn cypher_total_type(input: &DataType) -> DataType {
+    if input == &DataType::LargeBinary {
+        DataType::LargeBinary
+    } else {
+        DataType::Float64
+    }
+}
+
+/// Adds the Cypher value in row `i` of `col` to `total`.
+fn add_cypher_cell(
+    total: &mut CypherSum,
+    col: &dyn Array,
+    i: usize,
+    agg: &str,
+) -> Result<(), FnError> {
+    use arrow_array::cast::AsArray;
+    let value =
+        uni_common::cypher_value_codec::decode(col.as_binary::<i64>().value(i)).map_err(|e| {
+            FnError::new(
+                CODE_UNREADABLE_CELL,
+                format!("{agg}: cannot decode a non-null cell: {e}"),
+            )
+        })?;
+    total.add(&value).map_err(|e| cypher_total_error(agg, &e))
+}
+
+fn cypher_total_error(agg: &str, e: &anyhow::Error) -> FnError {
+    FnError::new(CODE_UNREADABLE_CELL, format!("{agg}: {e}"))
+}
+
+/// A `SUM` / `AVG` over Cypher values, as a Cypher value: a float for numbers,
+/// as over a numeric column, a duration for durations, NULL for no average.
+fn cypher_total_value(value: uni_common::Value) -> ScalarValue {
+    let value = match value {
+        uni_common::Value::Int(i) => uni_common::Value::Float(i as f64),
+        other => other,
+    };
+    ScalarValue::LargeBinary(
+        (!value.is_null()).then(|| uni_common::cypher_value_codec::encode(&value)),
+    )
 }
 
 // =========================================================================
@@ -579,16 +698,23 @@ impl LocyAggregate for AvgAgg {
     fn output_type(&self) -> DataType {
         DataType::Float64
     }
+    /// A Cypher-value column averages to a Cypher value: a float, or a
+    /// duration.
+    fn output_type_for_input(&self, input: &DataType) -> DataType {
+        cypher_total_type(input)
+    }
     fn create(&self) -> Box<dyn LocyAggState> {
         Box::new(AvgState::default())
     }
 }
 
-/// Accumulates non-null count and numeric sum; finalizes `sum / count`.
+/// Accumulates non-null count and numeric sum; finalizes `sum / count`. A
+/// Cypher-value column accumulates through [`CypherSum`], as for `SUM`.
 #[derive(Debug, Default)]
 struct AvgState {
     sum: f64,
     count: i64,
+    cypher: Option<CypherSum>,
 }
 
 impl LocyAggState for AvgState {
@@ -601,6 +727,16 @@ impl LocyAggState for AvgState {
         indices: &[usize],
         _cx: &FoldContext,
     ) -> Result<(), FnError> {
+        if col.data_type() == &DataType::LargeBinary {
+            let total = self.cypher.get_or_insert_default();
+            for &i in indices {
+                if !col.is_null(i) {
+                    add_cypher_cell(total, col, i, "AVG")?;
+                    self.count += 1;
+                }
+            }
+            return Ok(());
+        }
         for &i in indices {
             if col.is_null(i) {
                 continue;
@@ -620,9 +756,18 @@ impl LocyAggState for AvgState {
         let o = downcast_state::<AvgState>(other)?;
         self.sum += o.sum;
         self.count += o.count;
+        if let Some(other_total) = &o.cypher {
+            self.cypher
+                .get_or_insert_default()
+                .merge(other_total)
+                .map_err(|e| cypher_total_error("AVG", &e))?;
+        }
         Ok(())
     }
     fn finalize(&self) -> Result<ScalarValue, FnError> {
+        if let Some(total) = &self.cypher {
+            return Ok(cypher_total_value(total.avg(self.count.unsigned_abs())));
+        }
         if self.count == 0 {
             return Ok(ScalarValue::Float64(None));
         }
@@ -1072,6 +1217,42 @@ fn check_domain(val: f64, strict: bool, agg: &str) -> Result<f64, FnError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Cypher-value column is ordered by the host's order, not its bytes:
+    /// `-1` encodes after `1`, so a byte comparison made `MIN(-1, 1)` 1.
+    #[test]
+    fn min_max_order_cypher_values_by_the_host_order() {
+        fn by_number(a: &uni_common::Value, b: &uni_common::Value) -> Ordering {
+            a.as_f64()
+                .partial_cmp(&b.as_f64())
+                .unwrap_or(Ordering::Equal)
+        }
+        let col = arrow_array::LargeBinaryArray::from(vec![
+            Some(uni_common::cypher_value_codec::encode(&uni_common::Value::Int(1)).as_slice()),
+            Some(uni_common::cypher_value_codec::encode(&uni_common::Value::Int(-1)).as_slice()),
+        ]);
+        let cx = FoldContext {
+            order: Some(ValueOrder(by_number)),
+            ..FoldContext::default()
+        };
+        for (agg, want) in [(MinAgg.create(), -1), (MaxAgg.create(), 1)] {
+            let mut s = agg;
+            s.ingest_indices(&col, &[0, 1], &cx).unwrap();
+            let ScalarValue::LargeBinary(Some(bytes)) = s.finalize().unwrap() else {
+                panic!("expected a Cypher value");
+            };
+            assert_eq!(
+                uni_common::cypher_value_codec::decode(&bytes).unwrap(),
+                uni_common::Value::Int(want)
+            );
+        }
+        // Without an order, the column is refused rather than byte-ordered.
+        let mut s = MinAgg.create();
+        assert!(
+            s.ingest_indices(&col, &[0, 1], &FoldContext::default())
+                .is_err()
+        );
+    }
     use arrow_array::Float64Array;
     use arrow_schema::{Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
@@ -1296,6 +1477,7 @@ mod tests {
             strict: true,
             epsilon: 1e-15,
             semiring: FoldSemiring::AddMult,
+            ..FoldContext::default()
         };
         let mut s = MnorAgg.create();
         let col = Float64Array::from(vec![Some(1.5)]);
@@ -1311,6 +1493,7 @@ mod tests {
             strict: false,
             epsilon: 1e-15,
             semiring: FoldSemiring::AddMult,
+            ..FoldContext::default()
         };
         let mut s = MprodAgg.create();
         let col = Float64Array::from(vec![Some(0.5); 50]);

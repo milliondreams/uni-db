@@ -29,7 +29,7 @@ use uni_store::runtime::writer::Writer;
 use uni_store::storage::manager::StorageManager;
 use uni_xervo::runtime::ModelRuntime;
 
-use crate::query::df_graph::{GraphExecutionContext, L0Context};
+use crate::query::df_graph::{DeadlineClock, GraphExecutionContext, L0Context};
 use crate::query::executor::procedure::ProcedureRegistry;
 
 // Rust guideline compliant
@@ -56,7 +56,11 @@ pub struct QueryProcedureHost {
     xervo_runtime: Option<Arc<ModelRuntime>>,
     property_manager: Option<Arc<PropertyManager>>,
     l0_context: L0Context,
-    deadline: Option<Instant>,
+    /// The surrounding query's deadline, read live at each use.
+    ///
+    /// A clock rather than an `Instant` so a check made after the host was
+    /// built still sees idle credit a cursor's consumer earned since.
+    deadline: Option<DeadlineClock>,
     /// Per-query counters, inherited from the `GraphExecutionContext`.
     ///
     /// Procedures reach storage through [`Self::query_context`] rather than a
@@ -145,7 +149,7 @@ impl QueryProcedureHost {
             property_manager: Some(Arc::clone(graph_ctx.property_manager())),
             l0_context: graph_ctx.l0_context().clone(),
             counters: graph_ctx.counters().cloned(),
-            deadline: graph_ctx.deadline_for_host(),
+            deadline: Some(graph_ctx.deadline_clock()),
             cancellation_token: graph_ctx.cancellation_token_for_host(),
             target_properties,
             yield_items,
@@ -353,8 +357,11 @@ impl QueryProcedureHost {
             self.l0_context.transaction_l0.clone(),
             self.l0_context.pending_flush_l0s.clone(),
         );
-        if let Some(deadline) = self.deadline {
+        if let Some(deadline) = self.effective_deadline() {
             ctx.set_deadline(deadline);
+        }
+        if let Some(token) = self.cancellation_token.clone() {
+            ctx.set_cancellation_token(token);
         }
         if let Some(counters) = self.counters.clone() {
             ctx.set_counters(counters);
@@ -431,6 +438,17 @@ impl QueryProcedureHost {
             Executor::new(Arc::clone(&self.storage))
         };
 
+        // The inner query runs inside the outer one's poll -- and, for a
+        // declared procedure, under `block_in_place` -- so the outer
+        // `tokio::time::timeout` and cancellation race cannot interrupt it.
+        // Only its own checks can, and they must spend the caller's budget.
+        if let Some(clock) = &self.deadline {
+            executor.inherit_deadline(clock.clone());
+        }
+        if let Some(token) = &self.cancellation_token {
+            executor.set_cancellation_token(token.clone());
+        }
+
         // Mirror outer L0 visibility into the inner executor.
         if let Some(current) = self.l0_context.current_l0.as_ref() {
             let mut pending = self.l0_context.pending_flush_l0s.clone();
@@ -456,6 +474,22 @@ impl QueryProcedureHost {
         executor.execute(plan, &prop_manager, params).await
     }
 
+    /// Bound this host's checks, and its inner queries, by the caller's
+    /// deadline and cancellation token.
+    ///
+    /// For a host built from components rather than a graph context, which
+    /// otherwise carries neither and runs every inner query on a fresh budget.
+    #[must_use]
+    pub(crate) fn with_budget(
+        mut self,
+        deadline: DeadlineClock,
+        token: Option<CancellationToken>,
+    ) -> Self {
+        self.deadline = Some(deadline);
+        self.cancellation_token = token;
+        self
+    }
+
     /// Check whether the query has timed out or been cancelled.
     ///
     /// # Errors
@@ -465,13 +499,91 @@ impl QueryProcedureHost {
     pub fn check_timeout(&self) -> anyhow::Result<()> {
         crate::query::df_graph::common::check_deadline(
             self.cancellation_token.as_ref(),
-            self.deadline,
+            self.effective_deadline(),
         )
+    }
+
+    /// The deadline as of now, with all idle credit granted so far.
+    fn effective_deadline(&self) -> Option<Instant> {
+        self.deadline.as_ref().and_then(DeadlineClock::effective)
     }
 }
 
 impl ProcedureHost for QueryProcedureHost {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use uni_common::core::schema::SchemaManager;
+    use uni_store::runtime::l0::L0Buffer;
+
+    use super::*;
+
+    /// A context whose deadline has already passed.
+    async fn expired_graph_ctx(dir: &std::path::Path) -> GraphExecutionContext {
+        let schema_manager = Arc::new(SchemaManager::load(dir.join("schema.json")).await.unwrap());
+        let storage = Arc::new(
+            StorageManager::new(
+                dir.join("storage").to_str().unwrap(),
+                Arc::clone(&schema_manager),
+            )
+            .await
+            .unwrap(),
+        );
+        let property_manager = Arc::new(PropertyManager::new(
+            Arc::clone(&storage),
+            schema_manager,
+            100,
+        ));
+        let l0 = Arc::new(parking_lot::RwLock::new(L0Buffer::new(0, None)));
+        let past = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("the clock is more than a second past its origin");
+        GraphExecutionContext::new(storage, l0, property_manager).with_deadline(past)
+    }
+
+    /// Idle credit granted after the host was built still reaches its checks.
+    ///
+    /// A procedure host built inside a cursor's plan outlives the moment it
+    /// was built; holding a copied `Instant` would charge the consumer's idle
+    /// time to the query, as `DeadlineGuardExec` once did.
+    #[tokio::test]
+    async fn a_host_sees_idle_credit_granted_after_it_was_built() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph_ctx = expired_graph_ctx(dir.path()).await;
+        let host = QueryProcedureHost::from_graph_ctx(&graph_ctx);
+        assert!(
+            host.check_timeout().is_err(),
+            "the deadline has passed and nothing has been credited"
+        );
+
+        graph_ctx.credit_idle_time(Duration::from_secs(3600));
+
+        assert!(host.check_timeout().is_ok());
+        let store_deadline = host.query_context().deadline.expect("a deadline is set");
+        assert!(store_deadline > Instant::now());
+    }
+
+    /// The store context a procedure passes to a search carries the query's
+    /// token, so the L0 merges stop on cancellation, not only on the deadline.
+    #[tokio::test]
+    async fn a_hosts_store_context_carries_the_cancellation_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = CancellationToken::new();
+        let graph_ctx = expired_graph_ctx(dir.path())
+            .await
+            .with_cancellation_token(token.clone());
+        let host = QueryProcedureHost::from_graph_ctx(&graph_ctx);
+        token.cancel();
+        let err = host
+            .query_context()
+            .check_timeout()
+            .expect_err("the query was cancelled");
+        assert!(err.to_string().contains("cancelled"), "{err}");
     }
 }

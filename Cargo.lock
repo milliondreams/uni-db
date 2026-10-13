@@ -12959,6 +12959,7 @@ dependencies = [
  "criterion",
  "datafusion",
  "futures",
+ "libc",
  "opentelemetry",
  "opentelemetry_sdk",
  "parking_lot",

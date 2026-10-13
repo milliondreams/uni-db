@@ -15,12 +15,13 @@
 
 // Rust guideline compliant
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use anyhow::Result;
 use proptest::prelude::*;
 use uni_common::{LocyIncompleteReason, Value};
+use uni_db::locy::CommandResult;
 use uni_db::{Uni, UniError};
 
 use uni_locy_oracle::eval::{Relation, evaluate, evaluate_bags};
@@ -487,7 +488,122 @@ async fn all_divergences(
             out.push(format!("{rel}: engine {raw:?}\n    oracle {want:?}"));
         }
     }
+    out.extend(query_divergences(&db, generated, &oracle).await?);
     Ok(out)
+}
+
+/// Runs the program again with an `EXPLAIN RULE` on every relation before any
+/// `QUERY`, then a `QUERY` per relation, and returns every `QUERY` whose rows
+/// differ from the oracle.
+///
+/// This run also reorders every rule's `YIELD` with [`interleave_yield`]. A
+/// reference binds a rule's KEY columns first, in YIELD order, then its value
+/// columns (`uni_locy::is_binding`), and values are read by name, so moving
+/// value columns among the KEYs changes no answer, and the oracle, which
+/// knows only the KEY-first form, still applies.
+///
+/// Each `EXPLAIN` matches no fact, so it re-derives its rule through the
+/// in-memory evaluator; that evaluator's rows once landed in the store every
+/// later `QUERY` reads. Holding the `QUERY`s to the oracle, rather than
+/// `result.derived`, also checks that a `QUERY` answers what the fixpoint
+/// derived.
+async fn query_divergences(
+    db: &Uni,
+    generated: &Generated,
+    oracle: &HashMap<String, Vec<Tuple>>,
+) -> Result<Vec<String>> {
+    let mut rels: Vec<&String> = generated.key_schema.keys().collect();
+    rels.sort();
+    let mut program = generated
+        .program_text
+        .lines()
+        .map(interleave_yield)
+        .collect::<Vec<_>>()
+        .join("\n");
+    for rel in &rels {
+        let first = &generated.key_schema[*rel][0];
+        program.push_str(&format!("\nEXPLAIN RULE {rel} WHERE {first} IS NULL"));
+    }
+    for rel in &rels {
+        program.push_str(&format!("\nQUERY {rel}"));
+    }
+    let result = db.session().locy(&program).await?;
+    let queries: Vec<&Vec<HashMap<String, Value>>> = result
+        .command_results
+        .iter()
+        .filter_map(|c| match c {
+            CommandResult::Query(rows) => Some(rows),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(queries.len(), rels.len(), "one QUERY result per relation");
+    let mut out = Vec::new();
+    for (rel, rows) in rels.iter().zip(queries) {
+        let cols = &generated.key_schema[*rel];
+        let mut got: Vec<Tuple> = rows
+            .iter()
+            .map(|row| {
+                cols.iter()
+                    .map(|c| {
+                        row.get(c)
+                            .and_then(|v| column_to_i64(c, v))
+                            .unwrap_or(i64::MIN)
+                    })
+                    .collect()
+            })
+            .collect();
+        got.sort();
+        let want = oracle.get(rel.as_str()).cloned().unwrap_or_default();
+        if !bags_agree(&got, &want, cols) {
+            out.push(format!(
+                "QUERY {rel} after EXPLAIN: engine {got:?}\n    oracle {want:?}"
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// Moves a rule line's value columns among its KEY columns, keeping the KEYs
+/// in their order and the values in theirs: after the first KEY when there
+/// are two or more, otherwise before the KEY. Every clause of a rule has the
+/// same YIELD shape, so every clause is reordered alike.
+fn interleave_yield(line: &str) -> String {
+    let Some(at) = line.find(" YIELD ") else {
+        return line.to_string();
+    };
+    let (head, items) = line.split_at(at + " YIELD ".len());
+    let items: Vec<&str> = items.split(", ").collect();
+    let (keys, values): (Vec<&str>, Vec<&str>) = items.iter().partition(|i| i.starts_with("KEY "));
+    if values.is_empty() {
+        return line.to_string();
+    }
+    let reordered: Vec<&str> = if keys.len() >= 2 {
+        keys[..1]
+            .iter()
+            .chain(&values)
+            .chain(&keys[1..])
+            .copied()
+            .collect()
+    } else {
+        values.iter().chain(&keys).copied().collect()
+    };
+    format!("{head}{}", reordered.join(", "))
+}
+
+#[test]
+fn interleave_yield_keeps_key_and_value_order() {
+    assert_eq!(
+        interleave_yield("CREATE RULE r AS MATCH (a) YIELD KEY a, KEY b, q"),
+        "CREATE RULE r AS MATCH (a) YIELD KEY a, q, KEY b"
+    );
+    assert_eq!(
+        interleave_yield("CREATE RULE f AS MATCH (a) FOLD n = COUNT(*) YIELD KEY a, n, s"),
+        "CREATE RULE f AS MATCH (a) FOLD n = COUNT(*) YIELD n, s, KEY a"
+    );
+    assert_eq!(
+        interleave_yield("CREATE RULE u AS MATCH (a) YIELD KEY a, KEY b"),
+        "CREATE RULE u AS MATCH (a) YIELD KEY a, KEY b"
+    );
 }
 
 fn random_cases(default: u32) -> u32 {
@@ -536,7 +652,9 @@ fn drive_random_programs(cases: u32) {
     });
     let tally = tally.into_inner();
     eprintln!("[oracle:random] cases={cases} non-empty per relation: {tally:?}");
-    outcome.expect("a random program's derived facts diverged from the oracle");
+    outcome.expect(
+        "a random program diverged from the oracle (derived facts, or a QUERY after EXPLAIN)",
+    );
     for rel in [
         "link", "reach", "un", "deg", "span", "flow", "cost", "tot", "roll", "opt", "pr", "nor",
         "prd", "safe",

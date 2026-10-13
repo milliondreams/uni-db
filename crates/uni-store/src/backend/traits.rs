@@ -113,6 +113,23 @@ pub trait StorageBackend: Send + Sync + 'static {
     /// Scan a table, collecting all matching rows into batches.
     async fn scan(&self, request: ScanRequest) -> Result<Vec<RecordBatch>>;
 
+    /// Which rows of an in-memory `batch` satisfy `filter`, judged as this
+    /// backend's scans judge them: a row whose result is false or NULL fails.
+    ///
+    /// A filter handed to a scan sometimes also has to be applied to rows not
+    /// yet in storage, such as the unflushed rows a search merges in. Judging
+    /// them by the scan's own rules keeps the two halves of one answer
+    /// consistent. The default uses [`FilterExpr::eval`], which refuses a
+    /// [`FilterExpr::Raw`]; a backend whose scans accept raw SQL overrides it.
+    ///
+    /// # Errors
+    /// Returns an error if the filter cannot be evaluated against `batch`.
+    fn filter_batch(&self, batch: &RecordBatch, filter: &FilterExpr) -> Result<Vec<bool>> {
+        (0..batch.num_rows())
+            .map(|row| Ok(filter.eval(&super::eval::ArrowRow::new(batch, row))? == Some(true)))
+            .collect()
+    }
+
     /// Scan a table, returning a streaming iterator over record batches.
     async fn scan_stream(&self, request: ScanRequest) -> Result<RecordBatchStream>;
 
@@ -338,6 +355,53 @@ pub trait StorageBackend: Send + Sync + 'static {
         _counters: Option<std::sync::Arc<crate::runtime::counters::QueryCounters>>,
     ) -> Result<Vec<RecordBatch>> {
         anyhow::bail!("Multi-vector search not supported by this backend")
+    }
+
+    /// A full-text search of `table` that also scores `unstored` documents
+    /// (id, text), all ranked as this backend's search would rank them once
+    /// those documents were rows of `table`.
+    ///
+    /// A search merges unflushed rows into the hits for stored ones. Scoring
+    /// them on another scale or other statistics than the backend will use
+    /// once they are flushed made the ranking, and which rows made the top
+    /// `k`, change at the flush. `filter` applies to stored rows; the caller
+    /// filters the unstored documents. A document that does not match is
+    /// absent. `table` need not exist yet.
+    ///
+    /// The default runs [`Self::full_text_search`] and scores an unstored
+    /// document by the fraction of query words it contains (lowercased,
+    /// whitespace-split), for a backend that cannot say how it ranks.
+    ///
+    /// # Errors
+    /// Returns an error if the search fails or the documents cannot be
+    /// scored.
+    #[expect(clippy::too_many_arguments, reason = "mirrors full_text_search")]
+    async fn full_text_search_with_unstored(
+        &self,
+        table: &str,
+        column: &str,
+        query: &str,
+        k: usize,
+        filter: FilterExpr,
+        unstored: Vec<(u64, String)>,
+        counters: Option<std::sync::Arc<crate::runtime::counters::QueryCounters>>,
+    ) -> Result<TextSearch> {
+        let stored = if self.table_exists(table).await? {
+            self.full_text_search(table, column, query, k, filter, counters)
+                .await?
+        } else {
+            Vec::new()
+        };
+        Ok(TextSearch {
+            stored,
+            unstored: unstored
+                .into_iter()
+                .filter_map(|(id, text)| {
+                    let score = crate::storage::manager::compute_text_relevance(query, &text);
+                    (score > 0.0).then_some((id, score))
+                })
+                .collect(),
+        })
     }
 
     /// Perform a full-text search.

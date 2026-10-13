@@ -40,7 +40,7 @@ use arrow_schema::Schema as ArrowSchema;
 use async_trait::async_trait;
 use uni_common::core::schema::TokenizerConfig;
 
-use super::types::{FilterExpr, VectorQueryOpts};
+use super::types::{FilterExpr, TextSearch, VectorQueryOpts};
 
 /// Copy-on-write branching over individual tables, as required by the fork
 /// engine.
@@ -251,6 +251,21 @@ pub trait ForkBranching: Send + Sync + 'static {
         filter: &FilterExpr,
         opts: VectorQueryOpts,
     ) -> Result<Vec<RecordBatch>>;
+
+    /// [`StorageBackend::full_text_search_with_unstored`](crate::backend::traits::StorageBackend::full_text_search_with_unstored)
+    /// against `branch`, whose rows and statistics include the parent
+    /// chain's.
+    #[allow(clippy::too_many_arguments)]
+    async fn full_text_search_with_unstored_on_branch(
+        &self,
+        table: &str,
+        branch: &str,
+        column: &str,
+        query: &str,
+        k: usize,
+        filter: &FilterExpr,
+        unstored: Vec<(u64, String)>,
+    ) -> Result<TextSearch>;
 
     /// Full-text search against `branch`, fused across the parent chain.
     #[allow(clippy::too_many_arguments)]

@@ -202,9 +202,11 @@ Two things worth knowing:
   `fail_point!` seam, add its test to a file matching the filter above, or it
   will be dormant on arrival.
 * **A "crash" test that panics and drops the `Uni` is not testing a crash.**
-  `Drop for Uni` broadcasts shutdown, and the auto-flush task answers with a
-  full `flush_to_l1` that nothing awaits — so the test gets graceful-close
-  semantics, racing its own reopen. For real crash semantics use the abort
+  `Drop for Uni` broadcasts shutdown and runs destructors; background tasks
+  finish what they started, and with the WAL off the auto-flush task answers
+  with a full `flush_to_l1` that nothing awaits — so the test gets
+  graceful-close semantics, racing its own reopen. (With the WAL on, the
+  default, that final flush no longer runs.) For real crash semantics use the abort
   harness in `crates/uni/tests/common/crash_harness.rs`: it re-invokes this
   test binary as a child and kills it with `SIGABRT` at the seam. Grep for
   `abort_child` for the pattern. Keep the panic-path test too where the
@@ -563,6 +565,18 @@ cargo metadata --format-version=1 --manifest-path bindings/uni-db-cuda/Cargo.tom
   `write_paths::l0_to_l1_flush` (8,331 Ir of 1.97 M) and **+0.05%** on the read paths
   it does not touch — the read-path number being the control that says the write-path
   number is signal rather than drift.
+- **Several tests timing out at 30 s at once: check the disk before the code.** On
+  2026-10-11 nine tests in two bursts failed with `Operation timed out after 30000ms`
+  (one with a commit timeout on the writer lock); each passed alone and in four later
+  full runs. The kernel log had two `nvme nvme1: I/O tag ... timeout, completion
+  polled` lines in the same window: the drive completed the I/O, but the driver missed
+  the interrupt and only found it when its own 30 s `io_timeout` fired, so every test
+  waiting on that disk stalled for 30 s. The later runs had no such events. That is a
+  correlation (two events, two bursts), not a reproduction. Check with
+  `journalctl -k --since <run start> | grep "completion polled"`. Since each test runs
+  in its own process, a burst across many tests points at the machine, while a single
+  30 s failure points at the test: that same day, one turned out to be a real cursor
+  deadline bug.
 - **loom timeout** — always pass `LOOM_MAX_PREEMPTIONS=2`; without it the exhaustive model runs past
   the nextest `terminate-after` and reports a false TIMEOUT.
 - **A version bump does not reach the editable install.** `bindings/uni-db` declares

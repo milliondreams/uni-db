@@ -3079,25 +3079,9 @@ impl CypherDuration {
 
     /// Multiply duration by a factor with fractional cascading.
     pub fn multiply(&self, factor: f64) -> CypherDuration {
-        let months_f = self.months as f64 * factor;
-        let whole_months = months_f.trunc() as i64;
-        let frac_months = months_f.fract();
-
-        // Cascade fractional months via average Gregorian month (2629746 seconds).
-        let frac_month_seconds = frac_months * 2_629_746.0;
-        let extra_days_from_months = (frac_month_seconds / SECONDS_PER_DAY as f64).trunc();
-        let remaining_secs_from_months =
-            frac_month_seconds - extra_days_from_months * SECONDS_PER_DAY as f64;
-
-        let days_f = self.days as f64 * factor + extra_days_from_months;
-        let whole_days = days_f.trunc() as i64;
-        let frac_days = days_f.fract();
-
-        let nanos_f = self.nanos as f64 * factor
-            + remaining_secs_from_months * NANOS_PER_SECOND as f64
-            + frac_days * NANOS_PER_DAY as f64;
-
-        CypherDuration::new(whole_months, whole_days, nanos_f.trunc() as i64)
+        let (months, days, nanos) =
+            uni_common::datetime::scale_duration(self.months, self.days, self.nanos, factor);
+        CypherDuration::new(months, days, nanos)
     }
 
     /// Divide duration by a divisor with fractional cascading.

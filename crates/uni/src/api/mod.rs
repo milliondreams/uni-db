@@ -1250,7 +1250,8 @@ impl Uni {
 ///
 /// Every tracked task is a potential writer, and several of them write
 /// precisely *because* shutdown was signalled — the auto-flush task performs a
-/// final flush on its way out. Teardown removes the directory as soon as the
+/// final flush on its way out when the WAL is off, the index rebuild worker
+/// saves its state, and compaction finishes the run it started. Teardown removes the directory as soon as the
 /// last claim is released, so wrapping each handle in a claim is what orders
 /// the removal after the last writer instead of racing it. Issue #167.
 fn track_task_with_scratch_claim(
@@ -1278,7 +1279,8 @@ fn track_task_with_scratch_claim(
 /// With the guard owned solely by `UniInner`, teardown removed the directory
 /// *successfully* and the auto-flush task — waking on that very same broadcast
 /// to perform its final flush — then wrote a catalog manifest and recreated the
-/// tree. Measured at 39/40 drops. Sharing the guard orders the removal after
+/// tree. Measured at 39/40 drops. (That flush now runs only with the WAL off,
+/// but other tasks still write on the signal.) Sharing the guard orders the removal after
 /// the last writer instead of racing it. Issue #167.
 pub(crate) struct ScratchDir {
     dir: TempDir,
@@ -2019,6 +2021,18 @@ impl UniBuilder {
         {
             let writer_clone = writer.clone();
             let mut shutdown_rx = shutdown_handle.subscribe();
+            // Flush on the shutdown signal only when nothing else holds L0.
+            //
+            // With the WAL on, every commit is durable before it returns and a
+            // reopen replays it, so a final flush buys only a shorter replay.
+            // `shutdown()` flushes before it signals, which leaves this one
+            // nothing to do. `Drop` signals without waiting, so this flush ran
+            // unawaited: a runtime shutting down after the drop cut it off
+            // midway (Lance panics on the cancelled task), and on a temporary
+            // database it raced the directory's deletion (#167). Without the
+            // WAL, L0 is the only copy, and a best-effort flush is still better
+            // than none.
+            let flush_on_shutdown = !self.config.wal_enabled;
             let handle = tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(interval);
                 loop {
@@ -2029,8 +2043,12 @@ impl UniBuilder {
                             }
                         }
                         _ = shutdown_rx.recv() => {
-                            tracing::info!("Auto-flush shutting down, performing final flush");
-                            let _ = writer_clone.flush_to_l1(None).await;
+                            if flush_on_shutdown {
+                                tracing::info!("Auto-flush shutting down, performing final flush");
+                                let _ = writer_clone.flush_to_l1(None).await;
+                            } else {
+                                tracing::info!("Auto-flush shutting down; the WAL holds L0");
+                            }
                             break;
                         }
                     }

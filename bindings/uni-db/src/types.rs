@@ -172,8 +172,12 @@ impl PyQueryResult {
 // Graph element types
 // ============================================================================
 
+/// Warning for the `max_slg_depth` option, which has no effect.
+pub(crate) const MAX_SLG_DEPTH_DEPRECATED: &str = "LocyConfig.max_slg_depth has no effect and will be removed: \
+     Locy has one evaluator, bounded by max_iterations and timeout";
+
 /// Emit a Python DeprecationWarning.
-fn deprecation_warning(py: Python, msg: &str) -> PyResult<()> {
+pub(crate) fn deprecation_warning(py: Python, msg: &str) -> PyResult<()> {
     let warnings = py.import("warnings")?;
     warnings.call_method1(
         "warn",
@@ -3181,6 +3185,7 @@ impl PyLocyConfig {
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
+        py: Python<'_>,
         max_iterations: Option<usize>,
         timeout_secs: Option<f64>,
         allow_partial: Option<bool>,
@@ -3196,7 +3201,7 @@ impl PyLocyConfig {
         max_bdd_variables: Option<usize>,
         top_k_proofs: Option<usize>,
         top_k_proofs_training: Option<usize>,
-    ) -> Self {
+    ) -> PyResult<Self> {
         let mut cfg = ::uni_locy::LocyConfig::default();
         if let Some(v) = max_iterations {
             cfg.max_iterations = v;
@@ -3211,7 +3216,11 @@ impl PyLocyConfig {
             cfg.max_explain_depth = v;
         }
         if let Some(v) = max_slg_depth {
-            cfg.max_slg_depth = v;
+            deprecation_warning(py, MAX_SLG_DEPTH_DEPRECATED)?;
+            #[expect(deprecated, reason = "accepted so existing configurations still run")]
+            {
+                cfg.max_slg_depth = v;
+            }
         }
         if let Some(v) = max_abduce_candidates {
             cfg.max_abduce_candidates = v;
@@ -3241,7 +3250,7 @@ impl PyLocyConfig {
             cfg.top_k_proofs = v;
         }
         cfg.top_k_proofs_training = top_k_proofs_training;
-        Self { inner: cfg }
+        Ok(Self { inner: cfg })
     }
 
     #[getter]
@@ -3257,8 +3266,10 @@ impl PyLocyConfig {
         self.inner.max_explain_depth
     }
     #[getter]
-    fn max_slg_depth(&self) -> usize {
-        self.inner.max_slg_depth
+    fn max_slg_depth(&self, py: Python<'_>) -> PyResult<usize> {
+        deprecation_warning(py, MAX_SLG_DEPTH_DEPRECATED)?;
+        #[expect(deprecated, reason = "read so existing code still runs")]
+        Ok(self.inner.max_slg_depth)
     }
     #[getter]
     fn max_abduce_candidates(&self) -> usize {

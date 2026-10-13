@@ -128,6 +128,7 @@ pub fn check(
         let is_recursive = strat.is_recursive[scc_idx];
 
         check_mixed_priority(rule_name, definitions)?;
+        check_fold_tail_agreement(rule_name, definitions)?;
         check_count_fold_seed(rule_name, definitions, &mut warnings);
 
         let mut yield_schema = infer_yield_schema(rule_name, definitions)?;
@@ -204,6 +205,7 @@ pub fn check(
             }
 
             if is_recursive {
+                check_no_distinct_fold(rule_name, def)?;
                 check_non_monotonic_in_recursion(rule_name, def, is_monotonic)?;
                 check_msum_warning(rule_name, def, &mut warnings);
                 check_probability_domain_warning(rule_name, def, &mut warnings);
@@ -263,7 +265,7 @@ pub fn check(
 
             clauses.push(CompiledClause {
                 match_pattern: def.match_pattern.clone(),
-                where_conditions: def.where_conditions.clone(),
+                where_conditions: qualify_is_references(&def.where_conditions, module_ctx),
                 along: extracted.along,
                 fold: extracted.fold,
                 require: def.require.clone(),
@@ -302,21 +304,51 @@ pub fn check(
 
             let mut has_self_is = false;
             let mut is_ref_targets = Vec::new();
+            // Variables bound before each condition: MATCH variables, then
+            // whatever earlier positive IS references bind.
+            let mut bound_vars =
+                super::warded::extract_pattern_node_variables(&clause.match_pattern);
 
             for cond in &clause.where_conditions {
                 if let RuleCondition::IsReference(is_ref) = cond {
                     let target_name = is_ref.rule_name.to_string();
                     if let Some(target_rule) = compiled_rules.get(&target_name) {
-                        let binding_count =
-                            is_ref.subjects.len() + is_ref.target.is_some() as usize;
-                        if binding_count > target_rule.yield_schema.len() {
+                        let Some(bound) = crate::is_binding::bound_columns(
+                            &target_rule.yield_schema,
+                            is_ref.subjects.len(),
+                            is_ref.target.is_some(),
+                        ) else {
                             return Err(LocyCompileError::IsArityMismatch {
                                 rule: rule_name.clone(),
                                 target: target_name,
                                 expected: target_rule.yield_schema.len(),
-                                actual: binding_count,
+                                actual: is_ref.subjects.len()
+                                    + usize::from(is_ref.target.is_some()),
                             });
+                        };
+                        // An unbound variable on a value column is existentially
+                        // quantified and ignored (`b IS NOT stake TO agg` reads "no
+                        // `stake` fact for `b`, whatever `agg` is"). A bound one
+                        // would need a value comparison, which negation over facts
+                        // identified by their KEY cannot make.
+                        if is_ref.negated {
+                            let vars = is_ref.subjects.iter().chain(is_ref.target.iter());
+                            if let Some((var, col)) = vars
+                                .zip(bound.iter())
+                                .find(|(var, col)| !col.is_key && bound_vars.contains(*var))
+                            {
+                                return Err(LocyCompileError::IsNotBindsValueColumn {
+                                    rule: rule_name.clone(),
+                                    target: target_name.clone(),
+                                    variable: var.clone(),
+                                    column: col.name.clone(),
+                                });
+                            }
                         }
+                    }
+                    if !is_ref.negated {
+                        bound_vars.extend(is_ref.subjects.iter().cloned());
+                        bound_vars.extend(is_ref.target.iter().cloned());
                     }
 
                     if scc_rules.contains(&target_name) {
@@ -361,7 +393,39 @@ pub fn check(
         }
     }
 
+    // Last, so a program the checks above reject keeps their error.
+    super::scope::check_rule_scopes(rule_groups, &compiled_rules, module_ctx)?;
+
     Ok((compiled_rules, warnings))
+}
+
+// ─── Module-qualified references ─────────────────────────────────────────────
+
+/// `conditions` with every IS reference naming its rule as the catalog keys
+/// it: qualified by the enclosing `MODULE`, or by a `USE` import.
+///
+/// The compiler resolves a bare name inside a module for its own checks, but
+/// handed the bare name on, so the planner, which looks rules up by catalog
+/// key, failed every IS reference in a module with "unknown rule".
+fn qualify_is_references(
+    conditions: &[RuleCondition],
+    module_ctx: &super::modules::ModuleContext,
+) -> Vec<RuleCondition> {
+    conditions
+        .iter()
+        .map(|condition| match condition {
+            RuleCondition::IsReference(is_ref) => {
+                let qualified =
+                    super::modules::resolve_rule_name(module_ctx, &is_ref.rule_name.to_string());
+                let mut is_ref = is_ref.clone();
+                is_ref.rule_name = uni_cypher::locy_ast::QualifiedName {
+                    parts: qualified.split('.').map(str::to_string).collect(),
+                };
+                RuleCondition::IsReference(is_ref)
+            }
+            other => other.clone(),
+        })
+        .collect()
 }
 
 // ─── Mixed priority ──────────────────────────────────────────────────────────
@@ -383,11 +447,190 @@ fn check_mixed_priority(
     Ok(())
 }
 
+// ─── Cross-clause FOLD tail ──────────────────────────────────────────────────
+
+/// Checks that a rule's clauses state one FOLD, post-FOLD WHERE, REQUIRE and
+/// BEST BY.
+///
+/// They apply to the union of the clauses, and the planner reads them from the
+/// first clause that folds, so another clause's differing REQUIRE or post-FOLD
+/// WHERE used to be ignored without an error. Every clause that folds states
+/// the same ones (FOLD arguments may differ, since each clause computes its
+/// own input). A clause without FOLD seeds the fold and states none of them.
+/// In a rule without FOLD, BEST BY ranks the union, so every clause states the
+/// same BEST BY or none does.
+fn check_fold_tail_agreement(
+    rule_name: &str,
+    definitions: &[&RuleDefinition],
+) -> Result<(), LocyCompileError> {
+    let mismatch = |part: &str, detail: String| LocyCompileError::ClauseMismatch {
+        rule: rule_name.to_string(),
+        part: part.to_string(),
+        detail,
+    };
+    let differ = |part: &str, a: usize, x: String, b: usize, y: String| {
+        mismatch(
+            part,
+            format!("clause {a} states `{x}`, clause {b} states `{y}`"),
+        )
+    };
+    let numbered = || definitions.iter().enumerate().map(|(i, d)| (i + 1, *d));
+    let Some((first_no, first)) = numbered().find(|(_, d)| !d.fold.is_empty()) else {
+        let Some((_, first)) = numbered().next() else {
+            return Ok(());
+        };
+        for (no, def) in numbered().skip(1) {
+            if def.best_by != first.best_by {
+                return Err(differ(
+                    "BEST BY",
+                    1,
+                    describe_best_by(first.best_by.as_ref()),
+                    no,
+                    describe_best_by(def.best_by.as_ref()),
+                ));
+            }
+        }
+        return Ok(());
+    };
+    for (no, def) in numbered() {
+        if def.fold.is_empty() {
+            if def.best_by.is_some() {
+                return Err(mismatch(
+                    "BEST BY",
+                    format!(
+                        "clause {no} states BEST BY without FOLD; state it on the clauses \
+                         that fold"
+                    ),
+                ));
+            }
+            continue;
+        }
+        if no == first_no {
+            continue;
+        }
+        let (expected, got) = (fold_signature(first), fold_signature(def));
+        if expected != got {
+            return Err(differ(
+                "FOLD",
+                first_no,
+                describe_fold_signature(&expected),
+                no,
+                describe_fold_signature(&got),
+            ));
+        }
+        for (part, a, b) in [
+            ("post-FOLD WHERE", &first.having, &def.having),
+            ("REQUIRE", &first.require, &def.require),
+        ] {
+            if a != b {
+                return Err(differ(
+                    part,
+                    first_no,
+                    describe_conjuncts(a),
+                    no,
+                    describe_conjuncts(b),
+                ));
+            }
+        }
+        if def.best_by != first.best_by {
+            return Err(differ(
+                "BEST BY",
+                first_no,
+                describe_best_by(first.best_by.as_ref()),
+                no,
+                describe_best_by(def.best_by.as_ref()),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A clause's FOLD bindings as `(name, aggregate, DISTINCT, has argument)`,
+/// sorted by name: what the rule's single FOLD needs every clause to share.
+fn fold_signature(def: &RuleDefinition) -> Vec<(String, String, bool, bool)> {
+    let mut signature: Vec<(String, String, bool, bool)> = def
+        .fold
+        .iter()
+        .map(|fold| match &fold.aggregate {
+            Expr::FunctionCall {
+                name,
+                args,
+                distinct,
+                ..
+            } => (
+                fold.name.clone(),
+                name.to_uppercase(),
+                *distinct,
+                !args.is_empty(),
+            ),
+            other => (fold.name.clone(), other.to_string_repr(), false, false),
+        })
+        .collect();
+    signature.sort();
+    signature
+}
+
+fn describe_fold_signature(signature: &[(String, String, bool, bool)]) -> String {
+    let items: Vec<String> = signature
+        .iter()
+        .map(|(name, agg, distinct, has_arg)| {
+            let arg = match (*distinct, *has_arg) {
+                (true, _) => "DISTINCT ...",
+                (false, true) => "...",
+                (false, false) => "",
+            };
+            format!("{name} = {agg}({arg})")
+        })
+        .collect();
+    format!("FOLD {}", items.join(", "))
+}
+
+fn describe_conjuncts(exprs: &[Expr]) -> String {
+    if exprs.is_empty() {
+        return "nothing".to_string();
+    }
+    exprs
+        .iter()
+        .map(Expr::to_string_repr)
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
+fn describe_best_by(best_by: Option<&uni_cypher::locy_ast::BestByClause>) -> String {
+    let Some(best_by) = best_by else {
+        return "no BEST BY".to_string();
+    };
+    let items: Vec<String> = best_by
+        .items
+        .iter()
+        .map(|item| {
+            let order = if item.ascending { "ASC" } else { "DESC" };
+            format!("{} {order}", item.expr.to_string_repr())
+        })
+        .collect();
+    format!("BEST BY {}", items.join(", "))
+}
+
+/// Rejects `DISTINCT` inside a FOLD aggregate of a recursive rule.
+fn check_no_distinct_fold(rule_name: &str, def: &RuleDefinition) -> Result<(), LocyCompileError> {
+    match def
+        .fold
+        .iter()
+        .find(|fold| matches!(fold.aggregate, Expr::FunctionCall { distinct: true, .. }))
+    {
+        Some(fold) => Err(LocyCompileError::DistinctFoldInRecursion {
+            rule: rule_name.to_string(),
+            fold: fold.name.clone(),
+        }),
+        None => Ok(()),
+    }
+}
+
 /// Warns when a clause without FOLD seeds a `COUNT` / `MCOUNT` column with a
 /// non-NULL literal. See [`WarningCode::CountFoldSeedCounted`].
 ///
-/// Clauses line up by YIELD position (the rule's schema is positional), so the
-/// seed for a fold column is the item at the same index in a sibling clause.
+/// Clauses line up by YIELD column name, so the seed for a fold column is the
+/// sibling clause's item of the same name.
 fn check_count_fold_seed(
     rule_name: &str,
     definitions: &[&RuleDefinition],
@@ -397,7 +640,8 @@ fn check_count_fold_seed(
         let RuleOutput::Yield(fold_yield) = &fold_def.output else {
             continue;
         };
-        for (idx, item) in fold_yield.items.iter().enumerate() {
+        let fold_names = resolve_yield_column_names(&fold_yield.items);
+        for (column, item) in fold_names.iter().zip(&fold_yield.items) {
             let Expr::Variable(name) = &item.expr else {
                 continue;
             };
@@ -417,7 +661,10 @@ fn check_count_fold_seed(
                 matches!(
                     &d.output,
                     RuleOutput::Yield(y) if matches!(
-                        y.items.get(idx).map(|i| &i.expr),
+                        resolve_yield_column_names(&y.items)
+                            .iter()
+                            .position(|n| n == column)
+                            .map(|i| &y.items[i].expr),
                         Some(Expr::Literal(lit)) if !matches!(lit, CypherLiteral::Null)
                     )
                 )
@@ -447,7 +694,7 @@ fn infer_yield_schema(
 ) -> Result<Vec<YieldColumn>, LocyCompileError> {
     let mut schema: Option<Vec<YieldColumn>> = None;
 
-    for def in definitions {
+    for (clause, def) in definitions.iter().enumerate() {
         if let RuleOutput::Yield(yc) = &def.output {
             let columns = yield_columns_from_items(&yc.items);
             if let Some(ref existing) = schema {
@@ -461,25 +708,62 @@ fn infer_yield_schema(
                         ),
                     });
                 }
-                // Check is_prob consistency across clauses
-                for (i, (e, c)) in existing.iter().zip(columns.iter()).enumerate() {
-                    if e.is_prob != c.is_prob {
-                        return Err(LocyCompileError::YieldSchemaMismatch {
-                            rule: rule_name.to_string(),
-                            detail: format!(
-                                "column {} '{}' has inconsistent PROB annotation across clauses",
-                                i, e.name
-                            ),
-                        });
-                    }
-                }
+                check_yield_agreement(rule_name, existing, &columns, clause + 1)?;
             } else {
                 schema = Some(columns);
             }
         }
     }
 
-    Ok(schema.unwrap_or_default())
+    // Stored in binding order (KEY columns first, each group in YIELD order):
+    // see `crate::is_binding::into_binding_order`.
+    Ok(schema
+        .map(crate::is_binding::into_binding_order)
+        .unwrap_or_default())
+}
+
+/// Checks that a clause yields the first YIELD clause's columns.
+///
+/// The planner maps every clause's outputs onto the rule's columns by name, so
+/// clauses must agree on the names and on each name's KEY and PROB flags. The
+/// order may differ. A name the first clause lacks used to be filled from
+/// whatever body variable carried the first clause's name, a silently wrong
+/// fact.
+fn check_yield_agreement(
+    rule_name: &str,
+    first: &[YieldColumn],
+    columns: &[YieldColumn],
+    clause: usize,
+) -> Result<(), LocyCompileError> {
+    let mismatch = |detail: String| LocyCompileError::YieldSchemaMismatch {
+        rule: rule_name.to_string(),
+        detail,
+    };
+    for column in columns {
+        let Some(expected) = first.iter().find(|e| e.name == column.name) else {
+            let names: Vec<&str> = first.iter().map(|e| e.name.as_str()).collect();
+            return Err(mismatch(format!(
+                "clause {clause} yields '{}', which the first clause does not. Clauses are \
+                 matched by column name, so name it with AS as the first clause does \
+                 ({})",
+                column.name,
+                names.join(", ")
+            )));
+        };
+        if expected.is_key != column.is_key {
+            return Err(mismatch(format!(
+                "column '{}' is a KEY in one clause and not in clause {clause}",
+                column.name
+            )));
+        }
+        if expected.is_prob != column.is_prob {
+            return Err(mismatch(format!(
+                "column '{}' has inconsistent PROB annotation across clauses",
+                column.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn yield_columns_from_items(items: &[LocyYieldItem]) -> Vec<YieldColumn> {
@@ -953,7 +1237,28 @@ fn check_require_direction(
         })
     };
 
+    // `REQUIRE a AND b` parses as one conjunction; each conjunct is a bound
+    // of its own and must be one-way on its own.
+    fn conjuncts<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
+        match expr {
+            Expr::BinaryOp {
+                left,
+                op: BinaryOp::And,
+                right,
+            } => {
+                conjuncts(left, out);
+                conjuncts(right, out);
+            }
+            other => out.push(other),
+        }
+    }
+    let mut predicates = Vec::new();
     for predicate in &def.require {
+        conjuncts(predicate, &mut predicates);
+    }
+    let fold_names: HashSet<&str> = def.fold.iter().map(|f| f.name.as_str()).collect();
+
+    for predicate in predicates {
         let Expr::BinaryOp { left, op, right } = predicate else {
             return reject(format!(
                 "`{predicate:?}` is not a comparison against a fold output"
@@ -969,6 +1274,15 @@ fn check_require_direction(
                 return reject(
                     "both sides name a fold output, so neither bound is fixed".to_string(),
                 );
+            }
+            // A fold output inside an expression (`t * 1.0 <= 50`): which way
+            // the expression moves with the output is not known, so neither
+            // is which way the bound points. Refused rather than guessed.
+            (None, None) if expr_mentions_any(predicate, &fold_names) => {
+                return reject(format!(
+                    "`{predicate:?}` uses a fold output inside an expression; compare the \
+                     output itself with a value (`t <= 50`), so the bound's direction is known"
+                ));
             }
             // No fold output mentioned: constant across iterations, so it can
             // never flip. Admitted.

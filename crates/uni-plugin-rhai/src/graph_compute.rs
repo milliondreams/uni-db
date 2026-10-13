@@ -1459,6 +1459,35 @@ mod tests {
         );
     }
 
+    /// CPU time the calling thread has used.
+    ///
+    /// The guest's work runs entirely on this thread, so this is the time that
+    /// work took. Wall-clock time also counts the time the thread waited for a
+    /// core: beside the full parallel suite the same 4096 rollouts that take
+    /// ~0.08 s alone took 2 s, and failed a floor set 5x below the solo rate.
+    #[cfg(unix)]
+    fn work_clock() -> std::time::Duration {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is a valid, writable `timespec`, and
+        // `CLOCK_THREAD_CPUTIME_ID` names the calling thread's own clock.
+        let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &raw mut ts) };
+        assert_eq!(rc, 0, "clock_gettime(CLOCK_THREAD_CPUTIME_ID) failed");
+        let secs = u64::try_from(ts.tv_sec).expect("a thread's CPU time is not negative");
+        let nanos = u32::try_from(ts.tv_nsec).expect("tv_nsec is below one second");
+        std::time::Duration::new(secs, nanos)
+    }
+
+    /// Wall-clock time, where no thread CPU clock is available.
+    #[cfg(not(unix))]
+    fn work_clock() -> std::time::Duration {
+        static ORIGIN: std::sync::LazyLock<std::time::Instant> =
+            std::sync::LazyLock::new(std::time::Instant::now);
+        ORIGIN.elapsed()
+    }
+
     /// §7 acceptance: a **guest-authored** MCTS at usable absolute throughput.
     ///
     /// This is the check that #152 was ultimately about — a third party writing
@@ -1471,6 +1500,9 @@ mod tests {
     /// is necessarily slower than in-process Rust, so a ratio cannot decide
     /// shippability — and the same guest measured 9.2x or 41.6x purely by choice
     /// of denominator (proposal §7 / §12).
+    ///
+    /// The rate is over the test thread's CPU time (`work_clock`), not wall
+    /// time, so it measures the guest rather than the load on the box.
     ///
     /// Timing note: this runs in a **debug** build, so the floor is set well
     /// below both the release bench figure (~1.9M rollouts/s) and §7's stated
@@ -1550,11 +1582,11 @@ mod tests {
             sess.arena_freeze(arena)
         "#;
 
-        let started = std::time::Instant::now();
+        let started = work_clock();
         let frozen = engine
             .eval_with_scope::<i64>(&mut scope, script)
             .expect("the guest program must run to completion");
-        let elapsed = started.elapsed();
+        let elapsed = work_clock() - started;
 
         // Correctness before timing: a script that errored into a fast no-op
         // must not read as a spectacular result.

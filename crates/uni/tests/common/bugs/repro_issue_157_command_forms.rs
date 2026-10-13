@@ -189,23 +189,15 @@ async fn a_fully_qualified_reference_retains_the_registered_rule() {
 
 /// Two modules exporting the same leaf name.
 ///
-/// The *pruner* handles this correctly — it retains every candidate stratum
-/// rather than refusing, so nothing the program needs is dropped. Query
-/// resolution then refuses the ambiguity and errors.
-///
-/// That error is a **known limitation, not the behaviour we want**: the compiler
-/// resolves `adult` to `m1.adult` using the enclosing `MODULE m1`, so the
-/// program is unambiguous in principle. The module context is not carried into
-/// the runtime — `GoalQuery::rule_name` keeps the bare spelling — so the lookup
-/// has only suffix matching to work with and cannot tell the two apart. Fixing
-/// it means threading the compiler-resolved name through to `evaluate_query`,
-/// which is a larger change than #157 and is tracked separately.
-///
-/// This test pins the current behaviour so the limitation is visible and cannot
-/// regress into a *wrong answer* — refusing is safe, silently picking `m2.adult`
-/// would not be.
+/// The *pruner* retains every candidate stratum rather than refusing, so
+/// nothing the program needs is dropped. The compiler resolves `adult` to
+/// `m1.adult` through the enclosing `MODULE m1`, and the compiled command now
+/// carries that resolved name, so the query answers from `m1.adult`. It used to
+/// keep the bare spelling, leaving the runtime only suffix matching, which
+/// could not tell the two apart and refused the program. `m2.adult` derives
+/// nothing here, so an answer from the wrong module would show.
 #[tokio::test]
-async fn an_ambiguous_bare_reference_is_refused_rather_than_guessed() {
+async fn a_bare_reference_resolves_through_the_enclosing_module() {
     let db = db_with_tripwire().await;
     seed_pair(&db).await;
     db.rules()
@@ -213,18 +205,20 @@ async fn an_ambiguous_bare_reference_is_refused_rather_than_guessed() {
         .await
         .unwrap();
     db.rules()
-        .register("MODULE m2\nCREATE RULE adult AS MATCH (a:X) YIELD KEY a")
+        .register("MODULE m2\nCREATE RULE adult AS MATCH (a:X) WHERE a.name = 'none' YIELD KEY a")
         .await
         .unwrap();
 
-    let result = db.session().locy_with("MODULE m1\nQUERY adult").run().await;
-
-    let err = result
-        .expect_err("an ambiguous bare name is currently refused at query resolution")
-        .to_string();
-    assert!(
-        err.contains("not found"),
-        "ambiguity must be refused, never guessed at; got: {err}"
+    let result = db
+        .session()
+        .locy_with("MODULE m1\nQUERY adult")
+        .run()
+        .await
+        .expect("the enclosing module resolves the bare name");
+    let rows = result.rows().map_or(0, |r| r.len());
+    assert_eq!(
+        rows, 2,
+        "QUERY adult in MODULE m1 must answer from m1.adult"
     );
 }
 

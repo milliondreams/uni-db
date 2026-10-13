@@ -61,13 +61,13 @@ pub mod locy_eval;
 pub mod locy_explain;
 pub mod locy_fixpoint;
 pub mod locy_fold;
+pub mod locy_generate;
 pub mod locy_model_invoke;
 pub mod locy_priority;
 pub mod locy_profile;
 pub mod locy_program;
 pub mod locy_query;
 pub mod locy_row_hash;
-pub mod locy_slg;
 pub mod locy_traits;
 pub mod locy_validate;
 pub mod mutation_common;
@@ -147,6 +147,72 @@ pub use locy_fold::FoldExec;
 pub use locy_priority::PriorityExec;
 pub use locy_program::{DerivedStore, LocyProgramExec};
 pub use locy_traits::{DerivedFactSource, LocyExecutionContext};
+
+/// A query deadline that excuses the time a cursor's consumer spent idle.
+///
+/// The configured deadline plus the idle credit the streaming drain loop
+/// accumulates. The credit is shared, so every holder sees credit granted after
+/// it took the clock — which a copied `Instant` cannot.
+#[derive(Debug, Clone)]
+pub(crate) struct DeadlineClock {
+    deadline: Option<Instant>,
+    credit: Arc<AtomicU64>,
+}
+
+impl DeadlineClock {
+    /// A clock for `deadline` with no idle credit of its own.
+    ///
+    /// For a query that does not stream, so no consumer can idle while it
+    /// runs.
+    pub(crate) fn fixed(deadline: Option<Instant>) -> Self {
+        Self {
+            deadline,
+            credit: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// The deadline as of now, with all idle credit granted so far.
+    pub(crate) fn effective(&self) -> Option<Instant> {
+        effective_deadline(self.deadline, &self.credit)
+    }
+
+    /// Whether there is a deadline to enforce at all.
+    pub(crate) fn is_set(&self) -> bool {
+        self.deadline.is_some()
+    }
+}
+
+/// What an operator checks as it runs: the query's live deadline and its
+/// cancellation token.
+///
+/// For an operator that produces rows without pulling input for each of them,
+/// such as UNWIND expanding a list, so no checkpoint below it fires.
+#[derive(Debug, Clone)]
+pub(crate) struct QueryBudget {
+    deadline: DeadlineClock,
+    token: Option<tokio_util::sync::CancellationToken>,
+}
+
+impl QueryBudget {
+    /// Fail if the query has been cancelled or its deadline has passed.
+    pub(crate) fn check(&self) -> anyhow::Result<()> {
+        common::check_deadline(self.token.as_ref(), self.deadline.effective())
+    }
+}
+
+/// `deadline` pushed back by `credit` nanoseconds of consumer idle time.
+///
+/// `None` when there is no deadline, or when the credit overflows the instant —
+/// the consumer has idled longer than any representable budget, so there is
+/// nothing left to enforce.
+fn effective_deadline(deadline: Option<Instant>, credit: &AtomicU64) -> Option<Instant> {
+    let credit = Duration::from_nanos(credit.load(Ordering::Relaxed));
+    match deadline {
+        Some(deadline) if credit.is_zero() => Some(deadline),
+        Some(deadline) => deadline.checked_add(credit),
+        None => None,
+    }
+}
 
 /// Shared context for graph operators.
 ///
@@ -505,12 +571,36 @@ impl GraphExecutionContext {
     /// overflow the instant, which means the consumer has idled longer than any
     /// representable budget and there is nothing left to enforce.
     fn effective_deadline(&self) -> Option<Instant> {
-        let credit = Duration::from_nanos(self.deadline_credit.load(Ordering::Relaxed));
-        match self.deadline {
-            Some(deadline) if credit.is_zero() => Some(deadline),
-            Some(deadline) => deadline.checked_add(credit),
-            None => None,
+        effective_deadline(self.deadline, &self.deadline_credit)
+    }
+
+    /// This query's deadline as a live clock rather than a snapshot.
+    ///
+    /// For a check that runs later than this call — a deadline guard inside the
+    /// plan, a sub-plan's own context. An `Instant` taken now misses every idle
+    /// credit granted after it, so a slow cursor consumer is charged its
+    /// think-time by whatever holds the snapshot.
+    pub(crate) fn deadline_clock(&self) -> DeadlineClock {
+        DeadlineClock {
+            deadline: self.deadline,
+            credit: Arc::clone(&self.deadline_credit),
         }
+    }
+
+    /// This query's deadline and cancellation token, for an operator to check.
+    pub(crate) fn budget(&self) -> QueryBudget {
+        QueryBudget {
+            deadline: self.deadline_clock(),
+            token: self.cancellation_token.clone(),
+        }
+    }
+
+    /// Adopt `clock` as this context's deadline, sharing its idle credit.
+    #[must_use]
+    pub(crate) fn with_deadline_clock(mut self, clock: &DeadlineClock) -> Self {
+        self.deadline = clock.deadline;
+        self.deadline_credit = Arc::clone(&clock.credit);
+        self
     }
 
     /// Excuse `idle` from this query's deadline.
@@ -576,11 +666,12 @@ impl GraphExecutionContext {
             .or_else(|| self.storage.get_labels_from_index(vid))
     }
 
-    /// Wall-clock deadline for the surrounding query, if any.
+    /// Wall-clock deadline for the surrounding query, if any, as of now.
     ///
-    /// Internal accessor used by [`crate::query::executor::procedure_host::QueryProcedureHost`]
-    /// to snapshot the deadline so procedure plugins can implement
-    /// `check_timeout` without holding a borrow on this context.
+    /// A snapshot: it includes the idle credit granted so far and none granted
+    /// later. Only for a caller that checks it before a cursor's consumer can
+    /// idle again, such as a Locy evaluation, which does not stream; anything
+    /// checked from inside a cursor's plan holds the context's live deadline clock.
     #[must_use]
     pub fn deadline_for_host(&self) -> Option<Instant> {
         self.effective_deadline()
@@ -588,8 +679,7 @@ impl GraphExecutionContext {
 
     /// Cancellation token clone for the surrounding query, if any.
     ///
-    /// Internal accessor for [`crate::query::executor::procedure_host::QueryProcedureHost`];
-    /// see [`Self::deadline_for_host`].
+    /// Internal accessor for [`crate::query::executor::procedure_host::QueryProcedureHost`].
     #[must_use]
     pub fn cancellation_token_for_host(&self) -> Option<tokio_util::sync::CancellationToken> {
         self.cancellation_token.clone()

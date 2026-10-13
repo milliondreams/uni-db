@@ -345,7 +345,7 @@ async fn multivector_corrupt_wal_tail_skipped_on_reopen() -> Result<()> {
 // ── The same seams under a real process abort ────────────────────────────────
 //
 // Siblings of the three crash tests above, run under `SIGABRT` in a child
-// process instead of a panic followed by a `Drop` that still flushes. See
+// process instead of a panic followed by a `Drop`. See
 // `common/crash_harness.rs`.
 
 /// The child half of the abort tests in this file. Never returns.

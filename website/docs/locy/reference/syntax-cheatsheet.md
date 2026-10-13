@@ -27,12 +27,12 @@ The second `WHERE` (after `FOLD`) filters on aggregated values — equivalent to
 | Operator | Semantics | Use In Recursion? |
 |----------|-----------|-------------------|
 | `COUNT(*)` / `COUNT(expr)` | Row count | Safe (unbounded) |
-| `SUM(expr)` | Arithmetic sum | Non-recursive only |
-| `AVG(expr)` | Arithmetic mean | Non-recursive only |
-| `MIN(expr)` | Minimum value | Safe in recursion |
-| `MAX(expr)` | Maximum value | Safe in recursion |
+| `SUM(expr)` | Sum of numbers or of durations (anything else is an error) | Non-recursive only |
+| `AVG(expr)` | Mean of numbers or of durations | Non-recursive only |
+| `MIN(expr)` | Minimum value, in Cypher's `ORDER BY` order | Safe in recursion |
+| `MAX(expr)` | Maximum value, in Cypher's `ORDER BY` order | Safe in recursion |
 | `COLLECT(expr)` | Collect into list | Safe (unbounded) |
-| `MSUM(expr)` | Monotonic sum (non-decreasing) | Safe (unbounded) |
+| `MSUM(expr)` | Monotonic sum of non-negative numbers | Safe (unbounded) |
 | `MMAX(expr)` | Monotonic maximum | Safe in recursion |
 | `MMIN(expr)` | Monotonic minimum | Safe in recursion |
 | `MCOUNT(expr)` | Monotonic count | Safe (unbounded) |

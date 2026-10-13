@@ -359,14 +359,23 @@ mod tests {
         assert!(cb.allow_request(), "CB should stay closed with 4 failures");
     }
 
+    /// Reset timeout for the tests that assert the breaker is *open*.
+    ///
+    /// It has to outlast scheduling jitter between `report_failure` and
+    /// `allow_request`: with 1 ms, a thread preempted for a millisecond under a
+    /// loaded test run found the breaker already half-open and failed "CB should
+    /// be open". `HALF_OPEN_WAIT` sleeps past it.
+    const RESET: Duration = Duration::from_millis(200);
+    const HALF_OPEN_WAIT: Duration = Duration::from_millis(300);
+
     #[test]
     fn test_cb_open_to_half_open_after_timeout() {
-        let cb = CircuitBreaker::new(2, Duration::from_millis(1));
+        let cb = CircuitBreaker::new(2, RESET);
         cb.report_failure();
         cb.report_failure();
         assert!(!cb.allow_request(), "CB should be open");
 
-        std::thread::sleep(Duration::from_millis(5));
+        std::thread::sleep(HALF_OPEN_WAIT);
         assert!(
             cb.allow_request(),
             "CB should allow probe after reset timeout"
@@ -388,10 +397,11 @@ mod tests {
 
     #[test]
     fn test_cb_half_open_to_open_on_failure() {
-        let cb = CircuitBreaker::new(2, Duration::from_millis(1));
+        let cb = CircuitBreaker::new(2, RESET);
         cb.report_failure();
         cb.report_failure();
-        std::thread::sleep(Duration::from_millis(5));
+        std::thread::sleep(HALF_OPEN_WAIT);
+        assert!(cb.allow_request(), "CB should be half-open after the reset");
 
         // In half-open state, report another failure
         cb.report_failure();

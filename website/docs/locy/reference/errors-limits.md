@@ -24,7 +24,7 @@ Cancelling the token attached to an evaluation aborts it with `UniError::Cancell
 - `timeout`: overall evaluation budget. When set, it also replaces the database `query_timeout` for the program's operators, whether above or below it.
 - `max_derived_bytes`: derived fact memory bound.
 - `max_explain_depth`: derivation tree depth bound.
-- `max_slg_depth`: goal-directed recursion bound.
+- `max_slg_depth`: deprecated, no effect (QUERY reads the fixpoint's facts); setting it warns, and it will be removed.
 - `max_abduce_candidates` / `max_abduce_results`: abduction search bounds.
 - `deterministic_best_by`: enforce deterministic tie-breaking in `BEST BY` clauses.
 - `strict_probability_domain`: reject probability inputs outside `[0, 1]` instead of clamping.

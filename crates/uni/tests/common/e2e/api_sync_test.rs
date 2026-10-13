@@ -196,3 +196,54 @@ fn shutdown_does_not_leak_runtime_threads() {
         "shutdown leaked runtime threads: {before} before, {after} after 8 cycles"
     );
 }
+
+/// Dropping a `UniSync` shuts the database down, as `shutdown()` does.
+///
+/// It used to send the shutdown signal and return, so whatever the background
+/// tasks did in answer ran on a runtime about to go away. With the WAL off,
+/// L0 is the only copy of a commit, and the auto-flush task's final flush is
+/// what persists it: cut off, the commit was lost, though the caller never
+/// saw an error.
+#[test]
+fn dropping_a_unisync_persists_its_commits_without_the_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_string_lossy().to_string();
+    let config = || uni_db::UniConfig {
+        wal_enabled: false,
+        ..Default::default()
+    };
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let uni = rt
+        .block_on(uni_db::Uni::open(&path).config(config()).build())
+        .unwrap();
+    let db = UniSync::new(uni).unwrap();
+    let tx = db.session().tx().unwrap();
+    tx.execute("CREATE (:Kept {n: 1})").unwrap();
+    tx.commit().unwrap();
+    drop(db);
+    // The database was built on `rt`, so its background tasks run there; an
+    // embedder's runtime ending right after the drop is the case at issue.
+    drop(rt);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let rows = rt.block_on(async {
+        let db = uni_db::Uni::open(&path)
+            .config(config())
+            .build()
+            .await
+            .unwrap();
+        let rows = db
+            .session()
+            .query("MATCH (k:Kept) RETURN k.n AS n")
+            .await
+            .unwrap();
+        db.shutdown().await.unwrap();
+        rows
+    });
+    assert_eq!(
+        rows.len(),
+        1,
+        "the commit did not survive dropping the UniSync"
+    );
+}

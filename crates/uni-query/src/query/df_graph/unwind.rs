@@ -23,6 +23,7 @@
 //!           {"list": [1,2,3], "item": 3}]
 //! ```
 
+use crate::query::df_graph::QueryBudget;
 use crate::query::df_graph::common::{arrow_err, batch_bytes, compute_plan_properties, exec_err};
 use arrow::compute::take;
 use arrow_array::builder::{
@@ -90,6 +91,15 @@ pub struct GraphUnwindExec {
     /// without anyone inserting anything.
     drop_source: Option<String>,
 
+    /// The query's deadline and cancellation token, checked as the list is
+    /// expanded. `None` leaves the operator unbounded.
+    ///
+    /// UNWIND makes rows without pulling input for each, so under an aggregate
+    /// or a sort it can run for the whole query inside one poll, and no
+    /// checkpoint below it fires. Carried through `with_new_children` for the
+    /// reason `drop_source` is.
+    budget: Option<QueryBudget>,
+
     /// Cached plan properties.
     properties: Arc<PlanProperties>,
 
@@ -122,6 +132,13 @@ impl GraphUnwindExec {
         params: HashMap<String, Value>,
     ) -> Self {
         Self::new_dropping_source(input, expr, variable, params, None)
+    }
+
+    /// Check `budget` as the list is expanded.
+    #[must_use]
+    pub(crate) fn with_budget(mut self, budget: QueryBudget) -> Self {
+        self.budget = Some(budget);
+        self
     }
 
     /// [`Self::new`], additionally dropping the source variable's columns from
@@ -170,6 +187,7 @@ impl GraphUnwindExec {
             schema,
             kept,
             drop_source: drop_source.map(str::to_string),
+            budget: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -294,13 +312,15 @@ impl ExecutionPlan for GraphUnwindExec {
         // every input column, so rebuilding through it would discard this
         // operator's pruning and change its output schema. Recomputed against
         // the new child rather than copied, so a reshaped child is handled.
-        Ok(Arc::new(Self::new_dropping_source(
+        let mut rebuilt = Self::new_dropping_source(
             Arc::clone(&children[0]),
             self.expr.clone(),
             self.variable.clone(),
             self.params.clone(),
             self.drop_source.as_deref(),
-        )))
+        );
+        rebuilt.budget = self.budget.clone();
+        Ok(Arc::new(rebuilt))
     }
 
     fn execute(
@@ -324,6 +344,7 @@ impl ExecutionPlan for GraphUnwindExec {
             kept: self.kept.clone(),
             chunk_size,
             pending: None,
+            budget: self.budget.clone(),
             metrics,
             // #261. Unlike the other operators on that list this one is already
             // bounded -- #241 chunked the output to `chunk_size x columns` -- so
@@ -365,6 +386,9 @@ struct GraphUnwindStream {
 
     /// An input batch part way through its expansion, carried across polls.
     pending: Option<Pending>,
+
+    /// Checked before each chunk; see `GraphUnwindExec::budget`.
+    budget: Option<QueryBudget>,
 
     /// Metrics.
     metrics: BaselineMetrics,
@@ -814,6 +838,12 @@ impl Stream for GraphUnwindStream {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
+            if let Some(budget) = &self.budget
+                && let Err(e) = budget.check()
+            {
+                self.pending = None;
+                return Poll::Ready(Some(Err(exec_err(e))));
+            }
             if let Some(mut pending) = self.pending.take() {
                 let metrics = self.metrics.clone();
                 let _timer = metrics.elapsed_compute().timer();
@@ -1202,6 +1232,7 @@ mod tests {
             ])),
             chunk_size: 8192,
             pending: None,
+            budget: None,
             metrics: BaselineMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
             // Unit fixtures: an unbounded pool, so the accounting is exercised
             // without any of these asserting a ceiling.
@@ -1268,6 +1299,7 @@ mod tests {
             ])),
             chunk_size: 8192,
             pending: None,
+            budget: None,
             metrics: BaselineMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
             // Unit fixtures: an unbounded pool, so the accounting is exercised
             // without any of these asserting a ceiling.
@@ -1336,6 +1368,7 @@ mod tests {
             ])),
             chunk_size: 8192,
             pending: None,
+            budget: None,
             metrics: BaselineMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
             // Unit fixtures: an unbounded pool, so the accounting is exercised
             // without any of these asserting a ceiling.
@@ -1397,6 +1430,7 @@ mod tests {
             schema,
             chunk_size: 8192,
             pending: None,
+            budget: None,
             metrics: BaselineMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
             // Unit fixtures: an unbounded pool, so the accounting is exercised
             // without any of these asserting a ceiling.
@@ -1488,6 +1522,7 @@ mod tests {
             schema,
             chunk_size,
             pending: None,
+            budget: None,
             metrics: BaselineMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
             // Unit fixtures: an unbounded pool, so the accounting is exercised
             // without any of these asserting a ceiling.

@@ -47,7 +47,6 @@ out = (
     .max_iterations(500)
     .with_config({
         "max_explain_depth": 50,
-        "max_slg_depth": 500,
         "max_abduce_candidates": 30,
         "max_abduce_results": 10,
         "max_derived_bytes": 64 * 1024 * 1024,

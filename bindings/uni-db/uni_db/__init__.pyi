@@ -15,6 +15,8 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, TypeVar
 
+from typing_extensions import deprecated
+
 _T = TypeVar("_T")
 
 # =============================================================================
@@ -1728,6 +1730,7 @@ class LocyConfig:
         self,
         max_iterations: int | None = None,
         timeout_secs: float | None = None,
+        allow_partial: bool | None = None,
         max_explain_depth: int | None = None,
         max_slg_depth: int | None = None,
         max_abduce_candidates: int | None = None,
@@ -1748,6 +1751,7 @@ class LocyConfig:
     @property
     def max_explain_depth(self) -> int: ...
     @property
+    @deprecated("max_slg_depth has no effect and will be removed")
     def max_slg_depth(self) -> int: ...
     @property
     def max_abduce_candidates(self) -> int: ...

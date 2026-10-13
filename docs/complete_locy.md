@@ -59,7 +59,7 @@ Locy compiles rules into execution plans that run inside Uni's DataFusion-based 
 | **Datalog** | Locy adopts Datalog's recursive rules, stratified negation, and semi-naive fixpoint evaluation. Unlike pure Datalog, Locy operates over a typed property graph (not flat relations) and supports path accumulation, witness selection, and graph mutation. |
 | **ProbLog** | Locy's MNOR/MPROD with PROB annotations provide probabilistic reasoning similar to ProbLog's probabilistic facts, including BDD-based exact inference for shared proofs. |
 | **SQL Recursive CTEs** | Locy rules are like named recursive CTEs with stratified negation, priority-based overriding, and probabilistic aggregation — features absent from SQL. |
-| **Prolog** | Locy retains SLG resolution (tabled, top-down, XSB-style) for generator rules, and ABDUCE provides abductive reasoning. |
+| **Prolog** | Locy evaluates bottom-up only (generator rules included); ABDUCE provides abductive reasoning. |
 | **OpenCypher** | Locy is a superset. All Cypher MATCH/CREATE/MERGE/RETURN queries work unchanged inside a Locy program. |
 
 ## 1.2 When to Use Locy vs Plain Cypher
@@ -367,7 +367,22 @@ CREATE RULE reachable AS
     YIELD KEY a, KEY b
 ```
 
-Results are the **union** of all clause evaluations. All clauses must have the **same YIELD schema** — same number of columns, same KEY positions, same PROB annotations. Violations produce `YieldSchemaMismatch`.
+Results are the **union** of all clause evaluations, so the clauses must agree on what the rule is:
+
+- **The same YIELD columns.** Clauses are matched by column **name**, so every clause yields the
+  same names, each with the same KEY flag and PROB annotation; the order may differ. A clause
+  that names a column differently is `YieldSchemaMismatch`: alias it with `AS`
+  (`YIELD KEY a, KEY c AS b`).
+- **One FOLD tail.** FOLD, the post-FOLD WHERE, REQUIRE and BEST BY apply to the union of the
+  clauses, so every clause that folds states the same ones: the same FOLD names and aggregates
+  (each clause folds its own argument expression), the same post-FOLD WHERE, REQUIRE and BEST BY.
+  A clause without FOLD seeds the fold and states none of them. In a rule without FOLD, BEST BY
+  ranks the union, so every clause states the same BEST BY or none does. Violations are
+  `ClauseMismatch`.
+
+Before this check, a clause yielding `KEY a, KEY c` beside one yielding `KEY a, KEY b` filled
+`b` from its own body variable `b`, and a REQUIRE or post-FOLD WHERE on any clause but the first
+that folds was ignored.
 
 ## 4.4 MATCH Clause
 
@@ -403,6 +418,18 @@ IS references are how rules compose — one rule references another rule's deriv
 
 ## 5.1 Positive IS References
 
+### Binding Order
+
+Every form below binds variables to the referenced rule's columns in one order, its **binding
+sequence**: the rule's KEY columns in YIELD order, then its other columns in YIELD order. Subjects
+take columns from the front of the sequence, and a `TO` target takes the next one. For a rule whose
+KEY columns are yielded first, the binding sequence is simply YIELD order. The same order is used
+by `IS`, `IS NOT`, EXPLAIN and every evaluation path (`uni_locy::is_binding`).
+
+A variable that is not yet bound is bound to the column; one that is already bound is tested
+against it. A KEY column of a node binds a node; a value column (a FOLD result, an ALONG
+accumulation, a projected property) binds a value.
+
 ### Unary Form
 
 ```
@@ -417,7 +444,9 @@ WHERE x IS flagged
 WHERE x IS reachable TO y
 ```
 
-`x` and `y` are bound to the first two columns of the `reachable` rule. Succeeds if the pair `(x, y)` exists in the derived relation.
+`x` binds the first column of `reachable`'s binding sequence and `y` the second: the second KEY
+column, or the first value column when `reachable` has one KEY. Succeeds if the pair `(x, y)`
+exists in the derived relation.
 
 ### Tuple Form
 
@@ -425,11 +454,38 @@ WHERE x IS reachable TO y
 WHERE (x, y, cost) IS weighted_path
 ```
 
-All variables are bound positionally to the `weighted_path` rule's yield columns. The number of bindings must not exceed the target rule's yield schema width (compiler error: `IsArityMismatch`).
+All variables bind `weighted_path`'s binding sequence positionally, so with `YIELD KEY x, KEY y,
+cost` the third variable reads the `cost` value of each matching fact. The number of bindings must
+not exceed the rule's column count (compiler error: `IsArityMismatch`). `(x, y) IS weighted_path TO
+cost` binds the same columns.
+
+### Reading a Value Column by Name
+
+A positive IS reference also makes each of the referenced rule's value columns available under its
+own name, without binding it:
+
+```
+CREATE RULE stake AS
+    MATCH (o:E)-[r:OWNS]->(e:E)
+    FOLD pct = MAX(r.pct)
+    YIELD KEY o, KEY e, pct
+
+CREATE RULE exposure AS
+    MATCH (o:E), (e:E)
+    WHERE o IS stake TO e
+    FOLD total = MSUM(pct)
+    YIELD KEY e, total
+```
+
+When two references in one clause expose the same name, the first one wins; bind the value
+explicitly (tuple form or `TO`) to choose.
 
 ### Semantics
 
-A positive IS reference is a **semi-join**: for each row from the MATCH clause, check if the subject(s) exist in the target rule's derived relation. If found, the row passes through; if not, it's filtered out. When the target rule has additional yield columns beyond the bound subjects, those columns become available as `__prev_*` variables for ALONG expressions.
+A positive IS reference is a **semi-join**: for each row from the MATCH clause, check if the
+subject(s) exist in the target rule's derived relation. If found, the row passes through, once per
+matching fact; if not, it's filtered out. `prev.<column>` inside ALONG reads a column of the
+referenced fact in a recursive clause (§6).
 
 ## 5.2 IS NOT References (Negation)
 
@@ -441,6 +497,12 @@ WHERE NOT x IS blocked            -- Prefix form
 WHERE x IS NOT rule TO y          -- Binary with negation
 WHERE (x, y) IS NOT rule          -- Tuple with negation
 ```
+
+Variables bind the same binding sequence as a positive reference (§5.1). A fact is identified by its
+KEY, and negation asks whether a fact exists, so `IS NOT` cannot compare a value: a variable that is
+already bound and lands on a value column is a compile error (`IsNotBindsValueColumn`); test the
+value in WHERE after a positive reference instead. An unbound variable on a value column is
+existentially quantified and ignored, so `b IS NOT stake TO agg` means `b IS NOT stake`.
 
 ### Boolean Semantics (Default)
 
@@ -538,12 +600,14 @@ PROB marks a column as carrying a **probability value** in [0, 1]:
 
 ## 6.4 Schema Consistency
 
-All clauses of a multi-clause rule must produce the same YIELD schema:
-- Same number of columns
-- Same KEY positions
-- Same PROB annotations
+All clauses of a multi-clause rule must produce the same YIELD schema, matched by column name:
+- Same number of columns, with the same names (alias with `AS` where a clause's expression
+  would name a column differently)
+- The same KEY flag for each name
+- The same PROB annotation for each name
 
-Violations produce `YieldSchemaMismatch`.
+The order of the columns may differ between clauses. Violations produce `YieldSchemaMismatch`.
+See [Section 4.3](#43-multi-clause-rules-union-semantics) for the FOLD tail the clauses share.
 
 ---
 
@@ -628,6 +692,12 @@ CREATE RULE spending AS
     FOLD total = SUM(r.amount), count = COUNT(*)
     YIELD KEY p, total, count
 ```
+
+`AGG(DISTINCT expr)` folds each distinct value of `expr` once per KEY group, as Cypher's
+`count(DISTINCT x)` does: `FOLD k = COUNT(DISTINCT y)` counts a group's distinct `y`, however
+many rows reach each one. A recursive rule cannot use it (`DistinctFoldInRecursion`): its FOLD
+folds each iteration's new rows and never sees a group's whole set of values. Fold the distinct
+values in a non-recursive rule that reads the recursive one.
 
 ## 8.2 Monotonic Aggregates (Safe in Recursion)
 
@@ -977,7 +1047,7 @@ graph TB
 
     subgraph "Phase 2: Command Dispatch (Row-Level)"
         DS --> CMD{"Command Type"}
-        CMD --> QRY["QUERY → SLG resolution"]
+        CMD --> QRY["QUERY → read derived store"]
         CMD --> DER["DERIVE → Graph mutations"]
         CMD --> ASM["ASSUME → Savepoint + mutate + evaluate + rollback"]
         CMD --> ABD["ABDUCE → Generate candidates + validate"]
@@ -999,7 +1069,7 @@ QUERY rule_name [WHERE expr] [RETURN items [ORDER BY ...] [SKIP n] [LIMIT n]]
 
 Answered from the **derived store** — the same semi-naive fixpoint result that `.derived` exposes — then filtered by WHERE and shaped by RETURN. Because both read the same rows, `QUERY` and `.derived` agree by construction.
 
-SLG resolution (top-down with tabling) is retained only as a fallback for rules containing a **generator**, which the columnar fixpoint has no row-explosion operator for.
+Every rule has a published relation, empty when it derived nothing, including a rule with a **generator**: the fixpoint runs generators as a row-explosion operator (`LocyGenerateExec`), so a generator rule's FOLD, BEST BY and post-FOLD WHERE apply and other rules can reference it. There is no second, goal-directed evaluator; a missing relation is an error.
 
 ```
 QUERY reachable WHERE a.name = 'Alice' RETURN b.name AS destination
@@ -1198,7 +1268,8 @@ A two-pass algorithm:
 
 **Pass 1 (per-rule):**
 - Mixed priority check → `MixedPriority`
-- YIELD schema inference — collect items from all clauses, verify consistency → `YieldSchemaMismatch`
+- YIELD schema inference — collect items from all clauses, verify the names, KEY and PROB flags agree by name → `YieldSchemaMismatch`
+- FOLD tail agreement across clauses → `ClauseMismatch`; DISTINCT in a recursive FOLD → `DistinctFoldInRecursion`
 - Implicit PROB annotation from MNOR/MPROD folds
 - Multiple PROB validation → `MultipleProbColumns`
 - `prev` in base case check → `PrevInBaseCase`
@@ -1208,7 +1279,7 @@ A two-pass algorithm:
 - MNOR/MPROD domain warning → `ProbabilityDomainViolation`
 
 **Pass 2 (IS-ref validation):**
-- IS-ref arity check → `IsArityMismatch`
+- IS-ref arity check → `IsArityMismatch`; `IS NOT` comparing a bound variable with a value column → `IsNotBindsValueColumn`
 - `prev.field` validation → `PrevFieldNotInSchema`
 
 ## 14.7 Program Assembly
@@ -1340,15 +1411,17 @@ DerivedStore {
 
 Accumulates converged facts from each stratum. Later strata see results from all previously completed strata via shared `DerivedScanEntry` handles injected during planning.
 
-## 15.7 SLG Resolution (QUERY Command)
+## 15.7 One Evaluator
 
-The QUERY command uses **Selective Linear Definite clause resolution** — top-down with tabling:
-- Cache key: `(rule_name, known key bindings)`
-- Checks DerivedStore first (pre-computed from bottom-up phase)
-- Falls back to demand-driven evaluation for uncomputed relations
-- Prevents infinite loops via tabling (memoization)
+Every command reads the facts the fixpoint published (Appendix B2 of the Black Book, C-NONINTERFERENCE):
 
-Bounded by `max_slg_depth` (default 1000).
+- **QUERY** filters and projects the rule's relation.
+- **EXPLAIN** reads the provenance the fixpoint recorded (Mode A) or, without it, rebuilds the tree from the published facts by re-running each clause's MATCH (Mode B). It does not re-derive the rule.
+- **ABDUCE** builds its tree as EXPLAIN does and validates each candidate by re-evaluating the strata under the edit.
+
+A rule's facts carry a node as its VID and a single-hop relationship as its EID; both are hydrated into `Node` / `Edge` values before commands run. The ID spaces overlap, so the columns holding relationships are known from the rules (`uni_locy::entity_columns`), not guessed.
+
+Locy used to keep an in-memory top-down resolver (SLG) for generator rules and EXPLAIN. It implemented no FOLD, BEST BY or post-FOLD WHERE, so its answers could differ from the fixpoint's; it was removed once generators ran in the fixpoint and edges were hydrated. `max_slg_depth` is still accepted, has no effect, and is deprecated: setting it warns.
 
 ## 15.8 Expression Evaluation Paths
 
@@ -1597,7 +1670,7 @@ LocyExplainOutput {
 | `max_iterations` | `usize` | `1000` | Maximum fixpoint iterations per recursive stratum |
 | `timeout` | `Duration` | `300s` | Overall evaluation timeout |
 | `max_explain_depth` | `usize` | `100` | Maximum recursion depth for EXPLAIN derivation trees |
-| `max_slg_depth` | `usize` | `1000` | Maximum recursion depth for SLG resolution (QUERY) |
+| `max_slg_depth` | `usize` | `1000` | Deprecated, no effect; will be removed. Setting or reading it warns (a Rust deprecation warning, a Python `DeprecationWarning`) |
 | `max_abduce_candidates` | `usize` | `20` | Maximum candidate modifications generated during ABDUCE |
 | `max_abduce_results` | `usize` | `10` | Maximum validated results returned from ABDUCE |
 | `max_derived_bytes` | `usize` | `256 MiB` | Maximum bytes of derived facts per relation |
@@ -1670,10 +1743,16 @@ session.locy_with(program) \
 | `NonMonotonicInRecursion` | `rule: String, aggregate: String` | SUM/COUNT/AVG/etc. used in a recursive stratum | Use monotonic variant (MSUM/MCOUNT/etc.) or restructure |
 | `BestByWithMonotonicFold` | `rule: String, fold: String` | BEST BY combined with MSUM/MNOR/etc. | Remove BEST BY or use non-monotonic fold |
 | `WardednessViolation` | `rule: String, variable: String` | NEW node's companion not bound by MATCH | Bind companion variable in the MATCH pattern |
-| `YieldSchemaMismatch` | `rule: String, detail: String` | Clauses of same rule differ in column count or PROB | Align all clauses' YIELD schemas |
+| `YieldSchemaMismatch` | `rule: String, detail: String` | Clauses of same rule differ in column count, column names, or a column's KEY or PROB flag | Name every clause's columns alike, with `AS` |
+| `ClauseMismatch` | `rule, part, detail` | Clauses that fold state different FOLD aggregates, post-FOLD WHERE, REQUIRE or BEST BY; a seeding clause states BEST BY; or, without FOLD, clauses state different BEST BY | State the tail identically on every folding clause |
+| `DistinctFoldInRecursion` | `rule, fold` | `AGG(DISTINCT ...)` in a recursive rule | Fold the distinct values in a non-recursive rule reading this one |
 | `MixedPriority` | `rule: String` | Some clauses have PRIORITY, others don't | Add PRIORITY to all or remove from all |
 | `MultipleProbColumns` | `rule: String, count: usize` | More than one PROB annotation per rule | Use at most one PROB column |
 | `IsArityMismatch` | `rule, target, expected, actual` | IS reference provides wrong number of bindings | Match binding count to target rule's yield width |
+| `IsNotBindsValueColumn` | `rule, target, variable, column` | `IS NOT` compares an already-bound variable with a value column | Test the value in WHERE after a positive reference |
+| `PrevOutsideAlong` | `rule, slot` | `prev.<column>` anywhere but as a direct operand of ALONG (including under a function call or parentheses inside ALONG) | Read a referenced rule's value by its column name |
+| `UnboundVariable` | `rule, slot, variable, available` | An expression names a variable not visible in its slot (rule body, ALONG, FOLD, YIELD, BEST BY, post-FOLD WHERE, REQUIRE, or an EXPLAIN / ABDUCE / DERIVE WHERE) | Use a name from `available` |
+| `FoldNotAnAggregateCall` | `rule, name` | A FOLD binding is not a single aggregate call (`SUM(e.w) * 1.0`) | Fold the call, compute with its result in YIELD |
 | `PrevFieldNotInSchema` | `rule, field, available` | `prev.field` references a nonexistent column | Check field name against target rule's yield schema |
 | `ModuleNotFound` | `name: String` | USE references unknown module | Ensure module is available |
 | `ImportNotFound` | `module, rule: String` | Selective import for nonexistent rule | Check rule name in import list |
@@ -2211,7 +2290,7 @@ struct ExplainRule { rule_name: QualifiedName, where_expr: Option<Expr>, return_
 |-------|------|-----------|
 | `uni-cypher` | Grammar (cypher.pest + locy.pest), AST types, parser | `src/grammar/locy.pest`, `src/locy_ast.rs`, `src/grammar/locy_parser.rs`, `src/grammar/locy_walker.rs` |
 | `uni-locy` | Compiler pipeline, types, config, result types, errors | `src/compiler/mod.rs`, `src/compiler/stratify.rs`, `src/compiler/typecheck.rs`, `src/config.rs`, `src/types.rs`, `src/result.rs` |
-| `uni-query` | Runtime execution (fixpoint, fold, BDD, SLG, explain, assume, abduce) | `src/query/df_graph/locy_fixpoint.rs`, `locy_fold.rs`, `locy_bdd.rs`, `locy_planner.rs`, `locy_program.rs`, `locy_explain.rs`, `locy_assume.rs`, `locy_abduce.rs` |
+| `uni-query` | Runtime execution (fixpoint, fold, generators, BDD, explain, assume, abduce) | `src/query/df_graph/locy_fixpoint.rs`, `locy_fold.rs`, `locy_bdd.rs`, `locy_planner.rs`, `locy_program.rs`, `locy_explain.rs`, `locy_assume.rs`, `locy_abduce.rs` |
 | `uni` | Public API surface (Session, Transaction, builders, RuleRegistry) | `src/api/locy_builder.rs`, `src/api/impl_locy.rs`, `src/api/rule_registry.rs` |
 | `uni-locy-tck` | Feature-level conformance tests | `tck/features/*.feature` |
 | `uni-db` (Python) | PyO3 bindings for all Locy API | `bindings/uni-db/` |

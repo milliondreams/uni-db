@@ -75,6 +75,36 @@ pub enum LocyCompileError {
     #[error("mixed priority in rule '{rule}': some clauses have PRIORITY, others don't")]
     MixedPriority { rule: String },
 
+    /// Clauses of one rule state different FOLD, post-FOLD WHERE, REQUIRE or
+    /// BEST BY.
+    ///
+    /// These apply to the whole rule, after its clauses are unioned, so a rule
+    /// has one of each. The planner used to take them from the first clause
+    /// that folds and silently ignore what any other clause stated.
+    #[error(
+        "clauses of rule '{rule}' disagree on {part}: {detail}. A rule's FOLD, \
+         post-FOLD WHERE, REQUIRE and BEST BY apply to all of its clauses at \
+         once, so every clause that folds must state the same ones; a clause \
+         without FOLD seeds the fold and states none of them"
+    )]
+    ClauseMismatch {
+        rule: String,
+        part: String,
+        detail: String,
+    },
+
+    /// A FOLD aggregate in a recursive rule uses `DISTINCT`.
+    ///
+    /// A recursive FOLD is computed incrementally, one iteration's new rows at
+    /// a time, so it never sees the whole bag a distinct count would need.
+    #[error(
+        "FOLD '{fold}' in recursive rule '{rule}' uses DISTINCT, which only a \
+         non-recursive rule supports: a recursive FOLD folds each iteration's \
+         new rows and never sees the whole set of values. Fold the distinct \
+         values in a non-recursive rule that reads this one"
+    )]
+    DistinctFoldInRecursion { rule: String, fold: String },
+
     #[error("module not found: {name}")]
     ModuleNotFound { name: String },
 
@@ -89,6 +119,63 @@ pub enum LocyCompileError {
         target: String,
         expected: usize,
         actual: usize,
+    },
+
+    /// `prev` written anywhere but as a direct operand of an ALONG expression.
+    ///
+    /// `prev.<column>` reads the referenced fact in a recursive clause, and
+    /// only ALONG gives it that meaning. Every other slot (and an ALONG under
+    /// a function call or parentheses) is plain Cypher, where `prev` is just an
+    /// unbound variable that failed at run time with "No field named prev".
+    #[error(
+        "`prev` in the {slot} of rule '{rule}': `prev.<column>` reads the referenced fact only \
+         as a direct operand of an ALONG expression in a recursive clause (for example \
+         `ALONG c = prev.c + e.w`). To read a referenced rule's value elsewhere, use its \
+         column name."
+    )]
+    PrevOutsideAlong { rule: String, slot: String },
+
+    /// An expression names a variable that is not bound where it is written.
+    #[error(
+        "variable `{variable}` in the {slot} of rule '{rule}' is not bound there. Visible: \
+         {available:?}"
+    )]
+    UnboundVariable {
+        rule: String,
+        slot: String,
+        variable: String,
+        available: Vec<String>,
+    },
+
+    /// A FOLD binding whose value is not a single aggregate call.
+    ///
+    /// The runtime folds the call's argument, so `FOLD t = SUM(e.w) * 1.0`
+    /// has nothing to fold, and the recursion checks only see top-level calls.
+    #[error(
+        "FOLD `{name}` in rule '{rule}' must be a single aggregate call such as \
+         `SUM(e.w)`; compute with its result in YIELD instead (`... YIELD {name} * 1.0 AS x`)"
+    )]
+    FoldNotAnAggregateCall { rule: String, name: String },
+
+    /// An `IS NOT` reference compares an already-bound variable with one of
+    /// the referenced rule's value columns.
+    ///
+    /// A fact is identified by its KEY columns, and negation asks whether a
+    /// fact exists, so it cannot compare a value. An *unbound* variable on a
+    /// value column is legal: it is existentially quantified and ignored, so
+    /// `b IS NOT stake TO agg` means `b IS NOT stake`. Bindings follow
+    /// [`crate::is_binding::binding_sequence`].
+    #[error(
+        "IS NOT reference to '{target}' in rule '{rule}' compares the bound variable \
+         `{variable}` with `{column}`, which is not a KEY column of '{target}'. Negation asks \
+         whether a fact exists, and a fact is identified by its KEY, so IS NOT cannot compare a \
+         value; test it in WHERE after a positive IS reference instead."
+    )]
+    IsNotBindsValueColumn {
+        rule: String,
+        target: String,
+        variable: String,
+        column: String,
     },
 
     /// The subject of an `IS NOT` reference is not a node.

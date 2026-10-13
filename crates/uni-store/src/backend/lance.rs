@@ -375,6 +375,33 @@ impl StorageBackend for LanceDbBackend {
     // Read Operations
     // ========================
 
+    /// Evaluates the filter with Lance's own SQL planner, so a row of an
+    /// in-memory batch passes exactly when a scan would have returned it.
+    /// DataFusion's planner alone would not do: Lance reads `"col"` as a string
+    /// literal, DataFusion as a column.
+    fn filter_batch(&self, batch: &RecordBatch, filter: &FilterExpr) -> Result<Vec<bool>> {
+        use arrow_array::Array;
+        let planner = lance::io::exec::Planner::new(batch.schema());
+        let expr = planner
+            .parse_filter(&filter.to_sql()?)
+            .and_then(|e| planner.optimize_expr(e))
+            .map_err(|e| anyhow!("filter '{}': {}", filter.to_sql().unwrap_or_default(), e))?;
+        let physical = planner
+            .create_physical_expr(&expr)
+            .map_err(|e| anyhow!("filter: {e}"))?;
+        let result = physical
+            .evaluate(batch)
+            .and_then(|v| v.into_array(batch.num_rows()))
+            .map_err(|e| anyhow!("filter: {e}"))?;
+        let mask = result
+            .as_any()
+            .downcast_ref::<arrow_array::BooleanArray>()
+            .ok_or_else(|| anyhow!("filter did not evaluate to a boolean"))?;
+        Ok((0..mask.len())
+            .map(|i| mask.is_valid(i) && mask.value(i))
+            .collect())
+    }
+
     async fn scan(&self, request: ScanRequest) -> Result<Vec<RecordBatch>> {
         // Fail closed (review C1): a scan error — transient I/O, an unparsable
         // filter, a corrupt fragment — MUST propagate, never collapse into an
@@ -1036,6 +1063,49 @@ impl StorageBackend for LanceDbBackend {
             })
     }
 
+    async fn full_text_search_with_unstored(
+        &self,
+        table: &str,
+        column: &str,
+        query: &str,
+        k: usize,
+        filter: FilterExpr,
+        unstored: Vec<(u64, String)>,
+        counters: Option<Arc<QueryCounters>>,
+    ) -> Result<TextSearch> {
+        let sql = if filter.is_trivially_true() {
+            None
+        } else {
+            Some(filter.to_sql()?)
+        };
+        let exists = self.table_exists(table).await?;
+        let directory = self.directory.clone();
+        let table = table.to_string();
+        let column = column.to_string();
+        let query = query.to_string();
+        // The process-wide runtime, for the reason `full_text_search` gives
+        // (#290): opening an inverted index binds its readers to the runtime
+        // that first loads it.
+        crate::runtime::io_runtime::run_on_io_runtime(async move {
+            let dataset = if exists {
+                Some(directory.open(&table).await?)
+            } else {
+                None
+            };
+            super::lance_fts::search_with_unstored(
+                dataset.as_ref(),
+                &column,
+                &query,
+                k,
+                sql.as_deref(),
+                unstored,
+                |scanner| attach_search_stats(scanner, counters, SearchKind::FullText),
+            )
+            .await
+        })
+        .await?
+    }
+
     async fn full_text_search(
         &self,
         table: &str,
@@ -1045,9 +1115,6 @@ impl StorageBackend for LanceDbBackend {
         filter: FilterExpr,
         counters: Option<Arc<QueryCounters>>,
     ) -> Result<Vec<RecordBatch>> {
-        use lance_index::scalar::FullTextSearchQuery;
-        use lance_index::scalar::inverted::query::MatchQuery;
-
         let sql = if filter.is_trivially_true() {
             None
         } else {
@@ -1066,40 +1133,9 @@ impl StorageBackend for LanceDbBackend {
         // query for an uncached term waits on a loop that no longer exists.
         crate::runtime::io_runtime::run_on_io_runtime(async move {
             let dataset = directory.open(&table).await?;
-
-            // These are `lance_index` types already — lancedb only forwarded
-            // them to the same scanner, so the query object is unchanged.
-            let match_query = MatchQuery::new(query).with_column(Some(column));
-            let fts_query = FullTextSearchQuery {
-                query: match_query.into(),
-                limit: Some(k as i64),
-                wand_factor: None,
-            };
-
             let mut scanner = dataset.scan();
-            scanner
-                .full_text_search(fts_query)
-                .map_err(|e| anyhow!("FTS query on '{}': {}", table, e))?;
-            // `k` is applied both inside the FTS query and as a scan limit, as
-            // before — the inner bound caps the BM25 candidate set, the outer
-            // one the returned rows.
-            scanner
-                .limit(Some(k as i64), None)
-                .map_err(|e| anyhow!("FTS limit on '{}': {}", table, e))?;
-
-            if let Some(sql) = sql {
-                // Prefilter, for the same reason `vector_search` does: the FTS
-                // query is bounded by `k` *before* the filter runs, so
-                // postfiltering lets excluded rows consume top-k slots. Measured
-                // without this, on 50 high-scoring excluded docs and 50 matching
-                // ones, `k = 10` with a filter returned **zero** rows while the
-                // same query unfiltered returned ten.
-                scanner.prefilter(true);
-                scanner
-                    .filter(&sql)
-                    .map_err(|e| anyhow!("FTS filter '{}' on '{}': {}", sql, table, e))?;
-            }
-
+            super::lance_fts::configure_search(&mut scanner, &column, &query, k, sql.as_deref())
+                .map_err(|e| anyhow!("{e} (table '{table}')"))?;
             attach_search_stats(&mut scanner, counters, SearchKind::FullText);
 
             scanner

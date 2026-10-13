@@ -46,7 +46,7 @@ pub struct LocyConfig {
     pub max_iterations: usize,
     /// Overall evaluation timeout, when the caller set one.
     ///
-    /// `Some(t)` is the whole budget: the strata / fixpoint / SLG checks and
+    /// `Some(t)` is the whole budget: the strata / fixpoint checks and
     /// the deadline every operator inside a clause body checks are both `t`,
     /// exactly as `query_with(..).timeout(t)` replaces `query_timeout` for a
     /// Cypher statement. `None` evaluates under [`Self::DEFAULT_TIMEOUT`]
@@ -70,7 +70,14 @@ pub struct LocyConfig {
     pub allow_partial: bool,
     /// Maximum recursion depth for EXPLAIN derivation trees.
     pub max_explain_depth: usize,
-    /// Maximum recursion depth for SLG resolution.
+    /// Has no effect, and is kept so existing configurations still build.
+    ///
+    /// It bounded the in-memory goal-directed resolver, which no longer
+    /// exists: every command reads the facts the fixpoint published, and the
+    /// fixpoint is bounded by `max_iterations` and `timeout`.
+    #[deprecated(
+        note = "has no effect: Locy has one evaluator, bounded by `max_iterations` and `timeout`"
+    )]
     pub max_slg_depth: usize,
     /// Maximum candidate modifications to generate during ABDUCE.
     pub max_abduce_candidates: usize,
@@ -228,6 +235,10 @@ impl LocyConfig {
 }
 
 impl Default for LocyConfig {
+    #[expect(
+        deprecated,
+        reason = "the field is kept so existing configurations still build"
+    )]
     fn default() -> Self {
         Self {
             max_iterations: 1000,

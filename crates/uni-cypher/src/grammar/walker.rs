@@ -689,8 +689,19 @@ fn build_not_expression(pair: Pair<Rule>) -> Result<Expr, ParseError> {
 fn build_comparison_expression(pair: Pair<Rule>) -> Result<Expr, ParseError> {
     let mut inner = pair.into_inner();
     let first = build_expression(inner.next().unwrap())?;
+    build_comparison_chain(first, inner.map(ComparisonTail::Parsed).collect())
+}
 
-    let tails: Vec<Pair<Rule>> = inner.collect();
+/// One link of a comparison chain after its first operand.
+enum ComparisonTail<'i> {
+    /// A `comparison_tail` pair.
+    Parsed(Pair<'i, Rule>),
+    /// `IN rhs`, already built: the leading `x IN src` of a list literal, whose
+    /// `IN` belongs to `list_comprehension_body` rather than to a tail.
+    In(Expr),
+}
+
+fn build_comparison_chain(first: Expr, tails: Vec<ComparisonTail>) -> Result<Expr, ParseError> {
     if tails.is_empty() {
         return Ok(first);
     }
@@ -700,6 +711,26 @@ fn build_comparison_expression(pair: Pair<Rule>) -> Result<Expr, ParseError> {
     let mut last_was_predicate = false;
 
     for tail in tails {
+        let tail = match tail {
+            ComparisonTail::Parsed(tail) => tail,
+            ComparisonTail::In(list) => {
+                // Not chainable, and not a label, exactly as a parsed `IN` tail.
+                if last_was_predicate {
+                    return Err(ParseError::new(
+                        "InvalidPredicateChain: cannot stack multiple predicates \
+                         without a comparison operator between them"
+                            .to_string(),
+                    ));
+                }
+                let last = operands.pop().unwrap();
+                operands.push(Expr::In {
+                    expr: Box::new(last),
+                    list: Box::new(list),
+                });
+                last_was_predicate = true;
+                continue;
+            }
+        };
         let mut tail_inner = tail.into_inner();
         let op_pair = tail_inner.next().unwrap();
         let rule = op_pair.as_rule();
@@ -1333,13 +1364,21 @@ fn build_list_expression(pair: Pair<Rule>) -> Result<Expr, ParseError> {
             let mut l_inner = first.into_inner();
             let var = l_inner.next().unwrap().as_str().to_string();
             l_inner.next(); // IN
-            let list = build_expression(l_inner.next().unwrap())?;
+            let source = l_inner.next().unwrap();
+
+            let next = l_inner.next();
+            if let Some(tail) = next.clone()
+                && tail.as_rule() == Rule::list_literal_tail
+            {
+                return build_list_literal_led_by_in(var, source, tail);
+            }
+            let list = build_expression(source)?;
 
             let mut where_clause = None;
             let mut map_expr = None;
 
             // Process optional WHERE clause
-            if let Some(next) = l_inner.next() {
+            if let Some(next) = next {
                 if next.as_rule() == Rule::WHERE {
                     where_clause = Some(build_expression(l_inner.next().unwrap())?);
                     // After WHERE, check for optional pipe
@@ -1373,6 +1412,50 @@ fn build_list_expression(pair: Pair<Rule>) -> Result<Expr, ParseError> {
         }
         _ => unreachable!("Unexpected list rule: {:?}", first.as_rule()),
     }
+}
+
+/// The list literal `[x IN src ..., e2, ...]`, parsed through
+/// `list_comprehension_body` so that `src` is parsed once (see `list_expression`
+/// in the grammar). Builds exactly what the literal alternative would have: the
+/// first element is the comparison chain `x IN src`, then its AND, XOR and OR
+/// operands, left-associative.
+fn build_list_literal_led_by_in(
+    var: String,
+    source: Pair<Rule>,
+    tail: Pair<Rule>,
+) -> Result<Expr, ParseError> {
+    // `comprehension_source` -> `comparison_expression` -> first operand, tails.
+    let comparison = source.into_inner().next().unwrap();
+    let mut links = comparison.into_inner();
+    let in_rhs = build_expression(links.next().unwrap())?;
+    let mut chain = vec![ComparisonTail::In(in_rhs)];
+    chain.extend(links.map(ComparisonTail::Parsed));
+    let mut element = build_comparison_chain(Expr::Variable(var), chain)?;
+
+    let mut elements = Vec::new();
+    for part in tail.into_inner() {
+        let op = match part.as_rule() {
+            Rule::literal_and_operands => BinaryOp::And,
+            Rule::literal_xor_operands => BinaryOp::Xor,
+            Rule::literal_or_operands => BinaryOp::Or,
+            _ => {
+                elements.push(build_expression(part)?);
+                continue;
+            }
+        };
+        for operand in part
+            .into_inner()
+            .filter(|p| !matches!(p.as_rule(), Rule::AND | Rule::XOR | Rule::OR))
+        {
+            element = Expr::BinaryOp {
+                left: Box::new(element),
+                op,
+                right: Box::new(build_expression(operand)?),
+            };
+        }
+    }
+    elements.insert(0, element);
+    Ok(Expr::List(elements))
 }
 
 fn build_case_expression(pair: Pair<Rule>) -> Result<Expr, ParseError> {

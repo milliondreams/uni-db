@@ -39,6 +39,7 @@ pub mod locy_issue_158_is_not_subject_scope;
 // Issue #159: aggregation inside a recursive rule dedups equal values.
 pub mod locy_issue_159_recursive_fold_dedup;
 // A seed clause alongside a COUNT fold: the seed is one counted row.
+pub mod locy_command_noninterference;
 pub mod locy_count_fold_seed;
 // Mutually recursive rules in one stratum keep their own facts.
 pub mod locy_mutual_recursion_per_rule_facts;
@@ -53,6 +54,7 @@ pub mod locy_issue_160_query_derived_parity;
 // reports NULL for strings and floats for ints while QUERY reports the real
 // value. Found by the generic QUERY/derived parity guard.
 pub mod locy_schemaless_property_type_inference;
+pub mod locy_scope_check;
 // A string literal in YIELD is NULL in `derived` while QUERY returns it.
 // Same class as the schemaless property defect, different cause.
 pub mod locy_string_literal_yield;
@@ -74,7 +76,17 @@ pub mod locy_issue_272_is_ref_to_value_column;
 pub mod locy_issue_273_post_fold_param;
 // A negated IS-ref whose TO target lands on a scalar column excluded nothing.
 pub mod locy_is_not_scalar_to_target;
+pub mod locy_is_ref_binding;
 // W4: a fact is a row; QUERY WHERE is three-valued; a sum of nothing is 0.
 pub mod locy_facts_and_filters;
 // W4: MIN/MAX/COLLECT and yielded properties keep their value types.
+pub mod locy_clause_contract;
+pub mod locy_single_engine;
+// Entity functions (type, labels, id, keys, startNode, ...) in a Locy QUERY RETURN.
+pub mod locy_entity_functions;
+// A numeric FOLD refuses a string or a duration instead of summing it to 0.
+pub mod locy_fold_reads_numbers;
+// FOLD COLLECT/MIN/MAX/COUNT over every declared column type, Cypher as the oracle.
+pub mod locy_fold_any_column_type;
 pub mod locy_value_types;
+pub mod locy_yield_list_values;

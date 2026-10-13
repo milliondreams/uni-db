@@ -54,6 +54,25 @@ pub struct MainVertexDataset {
 
 use super::with_version_bound;
 
+/// A vertex's properties from its `props_json` blob, with their types.
+///
+/// The blob is a CypherValue map, decoded straight into `Value`s. These
+/// readers used to pass it through `serde_json::Value`, which turned a
+/// temporal into a string; the flush of a relabeled vertex then wrote that
+/// string back as the property's value, losing the type for good (a NULL in
+/// a declared column, a string in a schemaless one).
+///
+/// # Errors
+/// Returns an error if the blob does not decode or is not a map.
+fn decode_props_blob(bytes: &[u8]) -> Result<Properties> {
+    match uni_common::cypher_value_codec::decode(bytes)
+        .map_err(|e| anyhow!("Failed to decode CypherValue: {}", e))?
+    {
+        uni_common::Value::Map(map) => Ok(map),
+        other => Err(anyhow!("props_json is not a map: {:?}", other)),
+    }
+}
+
 /// Extract a label vector from one row of a `List<Utf8>` labels column.
 ///
 /// Returns `None` when the row's values are not a `StringArray`. Nulls within
@@ -762,12 +781,7 @@ impl MainVertexDataset {
                         if deleted || props_arr.is_null(i) || props_arr.value(i).is_empty() {
                             Properties::new()
                         } else {
-                            let bytes = props_arr.value(i);
-                            let uni_val = uni_common::cypher_value_codec::decode(bytes)
-                                .map_err(|e| anyhow!("Failed to decode CypherValue: {}", e))?;
-                            let json_val: serde_json::Value = uni_val.into();
-                            serde_json::from_value(json_val)
-                                .map_err(|e| anyhow!("Failed to parse props_json: {}", e))?
+                            decode_props_blob(props_arr.value(i))?
                         };
                     best.insert(vid, (version, deleted, props));
                 }
@@ -875,13 +889,7 @@ impl MainVertexDataset {
                         if best_deleted || props_arr.is_null(i) || props_arr.value(i).is_empty() {
                             best_props = Some(Properties::new());
                         } else {
-                            let bytes = props_arr.value(i);
-                            let uni_val = uni_common::cypher_value_codec::decode(bytes)
-                                .map_err(|e| anyhow!("Failed to decode CypherValue: {}", e))?;
-                            let json_val: serde_json::Value = uni_val.into();
-                            let parsed: Properties = serde_json::from_value(json_val)
-                                .map_err(|e| anyhow!("Failed to parse props_json: {}", e))?;
-                            best_props = Some(parsed);
+                            best_props = Some(decode_props_blob(props_arr.value(i))?);
                         }
                     }
                 }
@@ -996,6 +1004,140 @@ impl MainVertexDataset {
             .collect();
 
         Ok(label_map)
+    }
+
+    /// Latest properties of every live flushed vertex that carries `label`.
+    ///
+    /// This is the only flushed copy of a schemaless value: an undeclared
+    /// label has no table of its own, and an undeclared property of a
+    /// declared label has no column of its own. A vertex counts only if its
+    /// latest row (within `version`) is live and still carries `label`. A
+    /// label filter alone would also match an older row of a vertex that has
+    /// since been relabeled away from `label`, so the candidates it finds are
+    /// re-read with all their rows. Superseded rows are never decoded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a scan fails or a `props_json` blob does not decode.
+    pub async fn find_label_props_counted(
+        backend: &dyn StorageBackend,
+        label: &str,
+        version: Option<u64>,
+        counters: Option<&Arc<QueryCounters>>,
+    ) -> Result<HashMap<Vid, Properties>> {
+        let table_name = table_names::main_vertex_table_name();
+
+        if !backend.table_exists(table_name).await? {
+            return Ok(HashMap::new());
+        }
+
+        let candidates = backend
+            .scan(
+                ScanRequest::all(table_name)
+                    .with_filter(with_version_bound(
+                        FilterExpr::array_contains("labels", Scalar::Str(label.to_string())),
+                        version,
+                    ))
+                    .with_columns(vec!["_vid".to_string()])
+                    .with_counters(counters.cloned()),
+            )
+            .await?;
+        let mut vids: Vec<u64> = Vec::new();
+        for batch in &candidates {
+            if let Some(arr) = batch
+                .column_by_name("_vid")
+                .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+            {
+                vids.extend(arr.iter().flatten());
+            }
+        }
+        vids.sort_unstable();
+        vids.dedup();
+        if vids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let rows = backend
+            .scan(
+                ScanRequest::all(table_name)
+                    .with_filter(with_version_bound(
+                        FilterExpr::one_of("_vid", vids.into_iter().map(Scalar::UInt)),
+                        version,
+                    ))
+                    .with_columns(vec![
+                        "_vid".to_string(),
+                        "labels".to_string(),
+                        "props_json".to_string(),
+                        "_version".to_string(),
+                        "_deleted".to_string(),
+                    ])
+                    .with_counters(counters.cloned()),
+            )
+            .await?;
+
+        // Per-vid highest-version winner, as (version, batch, row). `>=` lets
+        // a later equal-version row win, as in `find_batch_props_by_vids`.
+        let mut best: HashMap<Vid, (u64, usize, usize)> = HashMap::new();
+        for (b, batch) in rows.iter().enumerate() {
+            let (Some(vid_arr), Some(ver_arr)) = (
+                batch
+                    .column_by_name("_vid")
+                    .and_then(|c| c.as_any().downcast_ref::<UInt64Array>()),
+                batch
+                    .column_by_name("_version")
+                    .and_then(|c| c.as_any().downcast_ref::<UInt64Array>()),
+            ) else {
+                continue;
+            };
+            for i in 0..batch.num_rows() {
+                if vid_arr.is_null(i) {
+                    continue;
+                }
+                let vid = Vid::new(vid_arr.value(i));
+                let version = if ver_arr.is_null(i) {
+                    0
+                } else {
+                    ver_arr.value(i)
+                };
+                if best.get(&vid).is_some_and(|(bv, _, _)| version < *bv) {
+                    continue;
+                }
+                best.insert(vid, (version, b, i));
+            }
+        }
+
+        let mut props_map = HashMap::with_capacity(best.len());
+        for (vid, (_, b, i)) in best {
+            let batch = &rows[b];
+            let deleted = batch
+                .column_by_name("_deleted")
+                .and_then(|c| c.as_any().downcast_ref::<BooleanArray>())
+                .is_some_and(|d| d.is_valid(i) && d.value(i));
+            if deleted {
+                continue;
+            }
+            let carries_label = batch
+                .column_by_name("labels")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::ListArray>())
+                .and_then(|l| list_array_to_labels(l, i))
+                .is_some_and(|labels| labels.iter().any(|l| l == label));
+            if !carries_label {
+                continue;
+            }
+            let Some(props_arr) = batch
+                .column_by_name("props_json")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::LargeBinaryArray>())
+            else {
+                continue;
+            };
+            if props_arr.is_null(i) || props_arr.value(i).is_empty() {
+                props_map.insert(vid, Properties::new());
+                continue;
+            }
+            props_map.insert(vid, decode_props_blob(props_arr.value(i))?);
+        }
+
+        Ok(props_map)
     }
 }
 

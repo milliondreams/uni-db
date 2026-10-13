@@ -428,6 +428,15 @@ pub const OPERATORS: &[Operator] = &[
             in_file: "crates/uni/tests/common/plan_shape/proofs.rs",
         },
     },
+    // A generator condition (`name(args) -> (outs)`) in a rule body.
+    Operator {
+        ty: "LocyGenerateExec",
+        runtime_name: "LocyGenerateExec",
+        status: Status::Proven {
+            by: "a_generator_rule_runs_the_generate_operator",
+            in_file: "crates/uni/tests/common/locy/locy_generator_plugin.rs",
+        },
+    },
     // A clause calling a `CREATE MODEL` name emits it, with a `MockClassifier`
     // standing in for the service. Proving it turned up a real defect first:
     // `LocyBuilder::profile` compiled its explain half through the no-config

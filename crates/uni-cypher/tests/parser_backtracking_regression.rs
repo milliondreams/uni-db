@@ -29,6 +29,16 @@
 //! that every `relationship_pattern` alternative starts with, so the parser
 //! never descends into an interior it is about to discard.
 //!
+//! **A third instance**, found by the PR fuzz lane on 2026-10-11:
+//! `list_expression` tried a list comprehension and then a list literal, and
+//! `[x IN src ...` starts both — `x IN src` is a comparison, so a valid first
+//! element. When the comprehension failed after parsing `src`, the literal parsed
+//! `src` again, doubling the work per nesting level. Valid input was exposed as
+//! well: `RETURN [x IN [x IN ... [1], 1], 1]` took 2.6 s at depth 14. Both
+//! readings parse `src` identically, so `list_comprehension_body` now parses it
+//! once and lets the next token decide (`,` / AND / XOR / OR continue a literal),
+//! and the literal alternative refuses the `x IN` prefix.
+//!
 //! These tests assert the pathological inputs parse near-instantly and that the
 //! index/slice/comprehension and pattern/parenthesis surfaces still parse, so a
 //! future grammar edit that reintroduces either ambiguity fails loudly instead
@@ -172,6 +182,129 @@ fn pattern_and_parenthesis_surface_still_parses() {
         assert!(
             uni_cypher::parse(q).is_ok(),
             "expected {q:?} to parse after the pattern_ahead guard"
+        );
+    }
+}
+
+// ── 2026-10-11: list comprehension vs list literal ────────────────────────────
+
+/// The PR-lane `locy_parse` artifact (timeout-231f8bed8a1a3ff4e85491cfe8e4dea560e8b0b3):
+/// unclosed `[x IN` runs, 36 s under the fuzz build before the fix.
+#[test]
+fn list_comprehension_fuzz_artifact_parses_fast() {
+    let bytes: &[u8] = &[
+        117, 110, 119, 105, 110, 100, 13, 13, 91, 45, 91, 91, 91, 110, 119, 100, 13, 105, 110, 13,
+        91, 114, 114, 122, 100, 13, 13, 91, 91, 91, 91, 100, 13, 105, 110, 32, 32, 32, 32, 32, 100,
+        13, 13, 91, 91, 91, 91, 100, 13, 105, 110, 32, 32, 91, 45, 91, 91, 91, 100, 13, 105, 110,
+        32, 32, 91, 45, 91, 91, 91, 110, 119, 100, 13, 105, 110, 13, 91, 114, 114, 122, 100, 13,
+        13, 91, 91, 91, 91, 100, 13, 105, 110, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 100,
+        13, 13, 91, 91, 91, 91, 91, 110, 119, 100, 13, 105, 110, 13, 91, 114, 114, 122, 100, 13,
+        13, 91, 91, 91, 91, 100, 13, 105, 110, 32, 32, 32, 32, 45, 91, 91, 91, 110, 119, 100, 13,
+        105, 110, 13, 91, 114, 114, 122, 100, 13, 13, 91, 91, 91, 91, 100, 13, 105, 110, 32, 32,
+        32, 32, 32, 100, 13, 13, 91, 91, 91, 91, 100, 13, 105, 110, 32, 32, 91, 45, 91, 91, 91,
+        100, 13, 105, 110, 32, 32, 91, 45, 91, 91, 91, 110, 119, 100, 13, 105, 110, 13, 91, 114,
+        114, 122, 100, 13, 13, 91, 91, 91, 91, 100, 13, 105, 110, 32, 32, 32, 32, 32, 32, 32, 32,
+        32, 32, 32, 32, 100, 13, 13, 91, 91, 91, 91, 91, 110, 119, 100, 13, 105, 110, 13, 91, 114,
+        114, 122, 100, 13, 13, 91, 91, 91, 91, 100, 13, 105, 110, 32, 32, 32, 32, 32, 32, 32, 32,
+        32, 32, 32, 32, 100, 13, 13, 91, 91, 91, 91, 58, 100, 13, 105, 110, 32, 32, 32, 32, 32, 32,
+        32, 32, 83, 0, 0, 0, 32, 32, 32, 32, 32, 32, 32, 32, 100, 13, 13, 91, 91, 91, 91, 58, 100,
+        13, 105, 110, 32, 32, 32, 32, 32, 32, 32, 32, 83, 0, 0, 0, 0, 0, 0, 0, 32, 32, 61, 120, 79,
+    ];
+    let input = String::from_utf8_lossy(bytes);
+    assert_parses_within(&input, Duration::from_secs(5));
+}
+
+#[test]
+fn unclosed_nested_comprehension_sources_parse_fast() {
+    let input = format!("UNWIND {}", "[x IN ".repeat(60));
+    assert_parses_within(&input, Duration::from_secs(5));
+}
+
+/// Valid literals led by `x IN src`, nested: each level's comprehension reading
+/// fails only after its whole interior is parsed.
+#[test]
+fn deeply_nested_valid_in_led_literals_parse_fast() {
+    for tail in [", 1]", " AND true]", " OR false]", " XOR true]"] {
+        let q = format!("RETURN {}[1]{}", "[x IN ".repeat(40), tail.repeat(40));
+        assert_parses_within(&q, Duration::from_secs(5));
+        assert!(uni_cypher::parse(&q).is_ok(), "expected {q:?} to parse");
+    }
+}
+
+/// The factored path must build what the literal alternative built. The oracle
+/// parenthesises the first element, which keeps it off the `x IN` path entirely.
+#[test]
+fn in_led_list_literals_build_the_same_ast() {
+    let cases = [
+        ("[x IN l, 1]", "[(x IN l), 1]"),
+        ("[x IN l AND a]", "[(x IN l AND a)]"),
+        ("[x IN l AND a, 2, 3]", "[(x IN l AND a), 2, 3]"),
+        ("[x IN l OR a AND b XOR c]", "[(x IN l OR a AND b XOR c)]"),
+        (
+            "[x IN l AND NOT a XOR b OR c, d]",
+            "[(x IN l AND NOT a XOR b OR c), d]",
+        ),
+        ("[x IN l = y, 1]", "[(x IN l = y), 1]"),
+        ("[x IN l < y <= z AND a]", "[(x IN l < y <= z AND a)]"),
+        ("[x IN l IS NULL, 1]", "[(x IN l IS NULL), 1]"),
+        ("[x IN l + [2], 1]", "[(x IN l + [2]), 1]"),
+        ("[x IN [y IN m, 1], 2]", "[(x IN [(y IN m), 1]), 2]"),
+        ("[`x` IN l, 1]", "[(`x` IN l), 1]"),
+        ("[count IN l, 1]", "[(count IN l), 1]"),
+    ];
+    for (q, oracle) in cases {
+        // Compare whole results: a refusal must match too. `x IN l IS NULL`
+        // stacks two predicates, which the literal path always refused.
+        let built = uni_cypher::parse_expression(q).map_err(|e| e.to_string());
+        let expected = uni_cypher::parse_expression(oracle).map_err(|e| e.to_string());
+        assert_eq!(built, expected, "{q:?} must build what {oracle:?} builds");
+    }
+    assert!(uni_cypher::parse_expression("[x IN l, 1]").is_ok());
+}
+
+/// A comprehension stays a comprehension, including when its source is a chain
+/// that a literal could also have read (`[x IN l = y]`).
+#[test]
+fn list_comprehensions_still_parse_as_comprehensions() {
+    let cases = [
+        ("[x IN l]", "[x IN (l)]"),
+        ("[x IN l WHERE x > 1]", "[x IN (l) WHERE x > 1]"),
+        ("[x IN l | x * 2]", "[x IN (l) | x * 2]"),
+        (
+            "[x IN l WHERE x > 1 | x * 2]",
+            "[x IN (l) WHERE x > 1 | x * 2]",
+        ),
+        ("[x IN l = y]", "[x IN (l = y)]"),
+        ("[x IN l IS NULL | x]", "[x IN (l IS NULL) | x]"),
+        ("[x IN [y IN m | y] | x]", "[x IN ([y IN (m) | y]) | x]"),
+    ];
+    for (q, oracle) in cases {
+        let built = uni_cypher::parse_expression(q).unwrap_or_else(|e| panic!("{q:?}: {e}"));
+        assert!(
+            matches!(built, uni_cypher::ast::Expr::ListComprehension { .. }),
+            "{q:?} must be a comprehension, got {built:?}"
+        );
+        assert_eq!(
+            built,
+            uni_cypher::parse_expression(oracle).unwrap_or_else(|e| panic!("{oracle:?}: {e}")),
+            "{q:?} must build the same AST as {oracle:?}"
+        );
+    }
+}
+
+/// Malformed `x IN`-led lists are still refused.
+#[test]
+fn malformed_in_led_lists_are_still_refused() {
+    for q in [
+        "[x IN l WHERE p, 1]",
+        "[x IN l | x, 1]",
+        "[x IN l AND]",
+        "[x IN , 1]",
+        "[x IN l",
+    ] {
+        assert!(
+            uni_cypher::parse_expression(q).is_err(),
+            "expected {q:?} to be refused"
         );
     }
 }

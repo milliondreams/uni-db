@@ -79,8 +79,8 @@ impl UniSync {
     /// implicit drop when you want the shutdown error rather than a silent
     /// best-effort one.
     pub fn shutdown(mut self) -> Result<()> {
-        // Taking the inner Uni is what disarms `Drop` — its guard is
-        // `if let Some(ref uni) = self.inner`, so after this the Drop impl is
+        // Taking the inner Uni is what disarms `Drop` — it returns at once
+        // when `self.inner` is `None`, so after this the Drop impl is
         // already a no-op and `self` can fall out of scope normally. It must:
         // dropping `self` is what shuts down and joins `rt`'s worker threads.
         if let Some(uni) = self.inner.take() {
@@ -91,11 +91,28 @@ impl UniSync {
     }
 }
 
+/// Dropping a `UniSync` shuts the database down, as [`UniSync::shutdown`]
+/// does, logging rather than returning a failure.
+///
+/// It used to send the shutdown signal and return, so whatever the background
+/// tasks did in answer ran on a runtime about to go away. With the WAL off,
+/// L0 is the only copy of a commit and the auto-flush task's final flush is
+/// what persists it: cut off, the commit was lost, and a first flush cut off
+/// midway left a dataset directory with no manifest. Blocking here is safe
+/// because the caller is synchronous. Inside an async context `block_on`
+/// would panic, so there it falls back to the signal alone.
 impl Drop for UniSync {
     fn drop(&mut self) {
-        if let Some(ref uni) = self.inner {
+        let Some(uni) = self.inner.take() else {
+            return;
+        };
+        if tokio::runtime::Handle::try_current().is_ok() {
             uni.inner.shutdown_handle.shutdown_blocking();
-            tracing::debug!("UniSync dropped");
+            tracing::debug!("UniSync dropped inside a runtime; shutdown signalled only");
+            return;
+        }
+        if let Err(e) = self.rt.block_on(uni.shutdown()) {
+            tracing::warn!("UniSync dropped: shutdown failed: {e}");
         }
     }
 }

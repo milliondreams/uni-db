@@ -11,7 +11,7 @@ Locy is Uni's logic programming layer: **Logic + Cypher**. It extends OpenCypher
 ## What You Get
 
 - Declarative rules with recursion (`CREATE RULE`).
-- Goal-directed evaluation (`QUERY`).
+- Queries over the derived facts (`QUERY`).
 - Hypothetical analysis (`ASSUME ... THEN`).
 - Remediation search (`ABDUCE`).
 - Derivation/proof explainability (`EXPLAIN RULE`).

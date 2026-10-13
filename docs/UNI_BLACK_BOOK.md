@@ -1919,6 +1919,25 @@ stateDiagram-v2
 | `Stale` | No (old Online serves) | Queued | Scheduled for rebuild after transient failure |
 | `Failed` | No (old Online serves) | Retry if under max_retries | Exhausted retry attempts |
 
+**An index declared before the label has data is built at its first flush.**
+With no table to build against, `create_scalar_index`, `create_fts_index` and
+`create_json_fts_index` record `BuildOutcome::NotAttempted`, which is `Online`
+with no `last_built_at`. Every vertex flush calls
+`IndexManager::ensure_declared_indexes`, which builds each declared scalar,
+full-text or JSON full-text index on the label that has no physical artifact
+(scalar matched by covered columns, full-text by name) and is a no-op once it
+exists. Full-text indexes used to be left out on the belief that they are
+updated incrementally; that holds for uni's own inverted index, not for the
+Lance index behind `CREATE FULLTEXT INDEX`, which stayed unbuilt until a
+rebuild or compaction. Searches meanwhile ran Lance's flat scan, whose bare
+tokenizer does not lowercase, so `'GRAPH'` did not match `graph`
+(`index_lifecycle_test::a_fulltext_index_declared_before_any_data_is_built_at_the_first_flush`).
+
+A flush does not add the rows it writes to an existing Lance full-text index.
+They stay in fragments the index does not cover until compaction's
+`optimize_indices`, a growth-triggered rebuild (off by default), or an explicit
+rebuild; Lance searches them with a flat pass meanwhile.
+
 ## Predicate Pushdown Priority
 
 When executing a query, the planner pushes predicates down to the most efficient index:
@@ -3366,24 +3385,39 @@ search gives after a flush:
   the Lance backend answers with Lance's own filter planner. A vertex that fails
   is dropped like a tombstone. Lance's planner is used, not DataFusion's alone,
   because the two disagree on `"col"`: Lance reads it as a string literal.
-- **Full-text scores come from the backend.** Unflushed rows used to score the
-  share of query words their text holds, split on whitespace. That is not BM25,
-  and it ignores the index's tokenizer, so the ranking (and which rows made the
-  top `k`) changed at the flush. `StorageBackend::score_unstored_text` scores
-  them as the backend will once they are stored. The Lance implementation
-  (`backend/lance_fts.rs`) runs Lance's flat BM25 pass, the one it uses for
-  rows its index does not cover yet. The pass starts from the index's global
-  statistics and tokenizer, or with no index from the stored rows' statistics
-  and a bare simple tokenizer. Because BM25 is relative to the corpus, it then
-  re-scores the flushed hits on the combined statistics. Measured: identical
-  rankings and scores (to 1e-6) before and after the flush, with and without an
-  index (`bugs::fts_rank_survives_flush`).
+- **Full-text scores come from the backend, split as Lance splits them.**
+  Unflushed rows used to score the share of query words their text holds,
+  split on whitespace. That is not BM25 and ignores the index's tokenizer, so
+  the ranking (and which rows made the top `k`) changed at the flush.
 
-  One case does not match exactly: rows already flushed but not yet indexed add
-  to Lance's statistics for unindexed rows, and they are not counted here.
-  Unflushed scores can then differ in the idf term until the index catches up.
-  A schemaless property keeps the word-overlap score on both sides, since it
-  has no column for Lance to search.
+  Lance scores the rows its inverted index covers on the index's statistics
+  alone, and the rows it does not cover (fragments flushed since the index was
+  built, or every row with no index) by a flat BM25 pass whose statistics are
+  the index's plus those rows', counted after the filter, with the index's
+  tokenizer (or a bare simple tokenizer with no index). A flush leaves the
+  covered rows' scores alone, and its rows join the uncovered ones.
+
+  `StorageBackend::full_text_search_with_unstored` runs that split with the
+  unflushed rows in place (`backend/lance_fts.rs`): the index search
+  restricted to the covered fragments; the unflushed documents added to the
+  index's statistics; one flat pass over the uncovered fragments starting
+  from those, which scores the uncovered rows on exactly the statistics Lance
+  will use after the flush; and the unflushed documents scored on the same
+  final statistics. Fragment coverage is the union of the index segments'
+  `fragment_bitmap`s, as Lance's `unindexed_fragments` computes it. The
+  search used to re-score the covered hits with the unflushed rows counted
+  (row 1 of the test: 0.835 before the flush, 0.859 after) and to leave the
+  uncovered flushed rows out of the statistics. Measured now: identical
+  rankings and scores (to 1e-6) across two flushes, the second with uncovered
+  flushed rows present, filtered and not, with and without an index
+  (`bugs::fts_rank_survives_flush`).
+
+  Two things still move a score. An index optimization that brings a row
+  under the index switches it to the index's statistics, in Lance itself.
+  And rows tying on score are ordered by vid, so which of two tied rows makes
+  the top `k` at the boundary depends on Lance's own cut. A schemaless
+  property keeps the word-overlap score on both sides, since it has no column
+  for Lance to search.
 
 ### Searching a schemaless property
 

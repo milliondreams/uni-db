@@ -5,6 +5,8 @@
 
 use std::sync::Arc;
 
+use arrow_array::RecordBatch;
+
 use crate::runtime::counters::QueryCounters;
 
 /// Canonical column names the engine filters on.
@@ -947,14 +949,16 @@ impl std::ops::AddAssign for OptimizeReport {
     }
 }
 
-/// Full-text scores once documents not yet stored join a table's corpus.
+/// A full-text search's stored hits and the scores of documents not yet
+/// stored, ranked together.
 ///
-/// See [`StorageBackend::score_unstored_text`](super::traits::StorageBackend::score_unstored_text).
+/// See [`StorageBackend::full_text_search_with_unstored`](super::traits::StorageBackend::full_text_search_with_unstored).
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct TextScores {
+pub struct TextSearch {
+    /// The stored hits, as [`StorageBackend::full_text_search`](super::traits::StorageBackend::full_text_search)
+    /// returns them: the table's rows with a `_score` column, not
+    /// necessarily sorted.
+    pub stored: Vec<RecordBatch>,
     /// `(id, score)` for each matching unstored document.
     pub unstored: Vec<(u64, f32)>,
-    /// `(id, score)` for each matching stored hit, re-scored on the same
-    /// statistics; `None` when the backend keeps its own scores for them.
-    pub stored: Option<Vec<(u64, f32)>>,
 }

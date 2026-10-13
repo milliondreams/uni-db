@@ -357,35 +357,43 @@ pub trait StorageBackend: Send + Sync + 'static {
         anyhow::bail!("Multi-vector search not supported by this backend")
     }
 
-    /// Perform a full-text search.
-    ///
-    /// See [`StorageBackend::vector_search`] for what `counters` records.
-    /// Full-text scores, for `query` on `column`, as this backend's search
-    /// would give them once `unstored` documents (id, text) were rows of
-    /// `table`: for each unstored document, and for each `stored` hit (id,
-    /// text) a search already returned.
+    /// A full-text search of `table` that also scores `unstored` documents
+    /// (id, text), all ranked as this backend's search would rank them once
+    /// those documents were rows of `table`.
     ///
     /// A search merges unflushed rows into the hits for stored ones. Scoring
-    /// them on another scale, or with the stored hits' statistics left out of
-    /// date, made the ranking change when they were flushed. `filter` is the
-    /// predicate the stored-row search runs with. A document that does not
-    /// match is absent. The default scores an unstored document by the
-    /// fraction of query words it contains (lowercased, whitespace-split) and
-    /// keeps the stored scores, for a backend that cannot say how it ranks.
+    /// them on another scale or other statistics than the backend will use
+    /// once they are flushed made the ranking, and which rows made the top
+    /// `k`, change at the flush. `filter` applies to stored rows; the caller
+    /// filters the unstored documents. A document that does not match is
+    /// absent. `table` need not exist yet.
+    ///
+    /// The default runs [`Self::full_text_search`] and scores an unstored
+    /// document by the fraction of query words it contains (lowercased,
+    /// whitespace-split), for a backend that cannot say how it ranks.
     ///
     /// # Errors
-    /// Returns an error if the backend cannot score the documents.
-    async fn score_unstored_text(
+    /// Returns an error if the search fails or the documents cannot be
+    /// scored.
+    #[expect(clippy::too_many_arguments, reason = "mirrors full_text_search")]
+    async fn full_text_search_with_unstored(
         &self,
         table: &str,
         column: &str,
         query: &str,
-        filter: &FilterExpr,
+        k: usize,
+        filter: FilterExpr,
         unstored: Vec<(u64, String)>,
-        stored: Vec<(u64, String)>,
-    ) -> Result<TextScores> {
-        let _ = (table, column, filter, stored);
-        Ok(TextScores {
+        counters: Option<std::sync::Arc<crate::runtime::counters::QueryCounters>>,
+    ) -> Result<TextSearch> {
+        let stored = if self.table_exists(table).await? {
+            self.full_text_search(table, column, query, k, filter, counters)
+                .await?
+        } else {
+            Vec::new()
+        };
+        Ok(TextSearch {
+            stored,
             unstored: unstored
                 .into_iter()
                 .filter_map(|(id, text)| {
@@ -393,10 +401,12 @@ pub trait StorageBackend: Send + Sync + 'static {
                     (score > 0.0).then_some((id, score))
                 })
                 .collect(),
-            stored: None,
         })
     }
 
+    /// Perform a full-text search.
+    ///
+    /// See [`StorageBackend::vector_search`] for what `counters` records.
     async fn full_text_search(
         &self,
         _table: &str,

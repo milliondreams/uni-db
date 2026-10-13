@@ -255,3 +255,100 @@ async fn fork_local_fts_auto_built_for_new_rows() -> Result<()> {
     db.shutdown().await?;
     Ok(())
 }
+
+/// `(title, score)` for 'zebra story', best first, from `session`.
+async fn zebra_ranking(session: &uni_db::Session) -> Result<Vec<(String, f64)>> {
+    let res = session
+        .query(
+            "CALL uni.fts.query('Doc', 'body', 'zebra story', 10)
+             YIELD node, score
+             RETURN node.title AS title, score",
+        )
+        .await?;
+    Ok(res
+        .rows()
+        .iter()
+        .map(|r| {
+            (
+                r.get::<String>("title").unwrap(),
+                r.get::<f64>("score").unwrap(),
+            )
+        })
+        .collect())
+}
+
+/// A fork's full-text ranking does not move when the fork flushes.
+///
+/// The fork's search routes through its branch
+/// (`ForkBranching::full_text_search_with_unstored_on_branch`), which scores
+/// the fork's unflushed rows as its branch search will once they are stored:
+/// index-covered rows on the index's statistics, the rest on those plus their
+/// own. Checked twice: with the branch fully indexed, then with fork rows the
+/// branch index does not cover.
+#[tokio::test]
+async fn fork_fts_ranking_survives_a_fork_flush() -> Result<()> {
+    let cfg = UniConfig {
+        disable_fork_sweeper: true,
+        disable_fork_index_builder: true,
+        ..UniConfig::default()
+    };
+    let db = Uni::in_memory().config(cfg).build().await?;
+    db.schema()
+        .label("Doc")
+        .property("title", DataType::String)
+        .property("body", DataType::String)
+        .apply()
+        .await?;
+    let primary = db.session();
+    let tx = primary.tx().await?;
+    for i in 0..10 {
+        tx.execute(&format!(
+            "CREATE (:Doc {{title: 'P{i}', body: 'filler text about item {i}'}})"
+        ))
+        .await?;
+    }
+    tx.execute("CREATE (:Doc {title: 'P-zebra', body: 'a primary zebra story story'})")
+        .await?;
+    tx.commit().await?;
+    db.flush().await?;
+
+    let forked = primary.fork("ranking").await?;
+    let tx = forked.tx().await?;
+    tx.execute("CREATE (:Doc {title: 'F1', body: 'a fork zebra'})")
+        .await?;
+    tx.commit().await?;
+    forked.flush().await?;
+    forked
+        .build_fork_local_index("Doc", "body", ForkLocalIndexKind::FullText)
+        .await?;
+
+    for (stage, rows) in [
+        (
+            "indexed branch",
+            "(:Doc {title: 'F2', body: 'zebra story'})",
+        ),
+        (
+            "uncovered fork rows",
+            "(:Doc {title: 'F3', body: 'one long zebra story with many other words'})",
+        ),
+    ] {
+        let tx = forked.tx().await?;
+        tx.execute(&format!("CREATE {rows}")).await?;
+        tx.commit().await?;
+        let before = zebra_ranking(&forked).await?;
+        forked.flush().await?;
+        let after = zebra_ranking(&forked).await?;
+        let titles = |r: &[(String, f64)]| r.iter().map(|(t, _)| t.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            titles(&before),
+            titles(&after),
+            "{stage}: {before:?} vs {after:?}"
+        );
+        for ((title, b), (_, a)) in before.iter().zip(&after) {
+            assert!((b - a).abs() < 1e-6, "{stage}: {title} scored {b} then {a}");
+        }
+    }
+
+    db.shutdown().await?;
+    Ok(())
+}

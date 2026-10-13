@@ -3077,7 +3077,11 @@ impl StorageManager {
         // the merge) can leave more than `k` candidates; rank by distance
         // ascending and truncate. Idempotent for the ANN paths, which already
         // return `k` sorted.
-        results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
         results.truncate(k);
 
         Ok(results)
@@ -3452,12 +3456,38 @@ impl StorageManager {
     ) -> Result<Vec<(Vid, f32)>> {
         let backend = self.backend.as_ref();
         let name = table_names::vertex_table_name(label);
-
-        // The text of each flushed hit, for re-scoring once unflushed rows join
-        // the corpus (see `score_unstored_text`).
-        let mut stored_texts: Vec<(u64, String)> = Vec::new();
-        let mut results = if self.is_schemaless_property(label, property) {
+        let schemaless = self.is_schemaless_property(label, property);
+        if schemaless {
             reject_schemaless_filter(label, property, filter)?;
+        }
+
+        // The unflushed rows, with those failing `filter` set aside. They are
+        // scored together with the flushed rows below, so that the ranking
+        // does not move when they are flushed.
+        let unflushed = match ctx {
+            Some(qctx) => {
+                let excluded = self.l0_rows_failing_filter(label, filter, qctx).await?;
+                let l0 = collect_l0_texts(qctx, label, property)?;
+                Some((excluded, l0))
+            }
+            None => None,
+        };
+        let docs: Vec<(u64, String)> = unflushed
+            .as_ref()
+            .map(|(excluded, l0)| {
+                l0.texts
+                    .iter()
+                    .filter(|(vid, _)| !excluded.contains(vid))
+                    .filter_map(|(vid, text)| text.as_ref().map(|t| (vid.as_u64(), t.clone())))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut scores: HashMap<Vid, f32> = HashMap::new();
+        let mut results = if schemaless {
+            // A schemaless property has no column to search, so flushed and
+            // unflushed rows both use the word-overlap score, which needs no
+            // statistics.
             let mut deadline = ctx.map(DeadlineTicker::new);
             let mut hits = Vec::new();
             for (vid, props) in self.flushed_label_properties(label, ctx).await? {
@@ -3472,9 +3502,20 @@ impl StorageManager {
                     hits.push((vid, score));
                 }
             }
-            hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            hits.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.0.cmp(&b.0))
+            });
+            scores = docs
+                .into_iter()
+                .map(|(vid, text)| (Vid::new(vid), compute_text_relevance(query, &text)))
+                .filter(|(_, score)| *score > 0.0)
+                .collect();
             hits
-        } else if backend.table_exists(&name).await? {
+        } else if docs.is_empty() && !backend.table_exists(&name).await? {
+            Vec::new()
+        } else {
             // Build combined filter: _deleted = false + optional user filter + HWM
             let mut filter_parts = vec![Self::build_active_filter(filter)];
             let hwm = ctx.and(self.version_high_water_mark());
@@ -3487,17 +3528,44 @@ impl StorageManager {
             // happened and left the answer short is the search widened.
             let mut fetch = k;
             let batches = loop {
-                let raw = backend
-                    .full_text_search(
-                        &name,
-                        property,
-                        query,
-                        fetch,
-                        combined_filter.clone(),
-                        ctx.and_then(|c| c.counters.clone()),
-                    )
-                    .await?;
+                let counters = ctx.and_then(|c| c.counters.clone());
+                let raw = if docs.is_empty() {
+                    backend
+                        .full_text_search(
+                            &name,
+                            property,
+                            query,
+                            fetch,
+                            combined_filter.clone(),
+                            counters,
+                        )
+                        .await?
+                } else {
+                    // Scored by the backend, on the scale, tokenizer and
+                    // statistics its search will use once these rows are
+                    // flushed, together with the flushed rows.
+                    let searched = backend
+                        .full_text_search_with_unstored(
+                            &name,
+                            property,
+                            query,
+                            fetch,
+                            combined_filter.clone(),
+                            docs.clone(),
+                            counters,
+                        )
+                        .await?;
+                    scores = searched
+                        .unstored
+                        .into_iter()
+                        .map(|(vid, score)| (Vid::new(vid), score))
+                        .collect();
+                    searched.stored
+                };
                 let returned: usize = raw.iter().map(|b| b.num_rows()).sum();
+                if returned == 0 {
+                    break raw;
+                }
                 let (kept, dropped) = self.keep_latest_row_versions(&name, raw, hwm).await?;
                 if dropped == 0 || returned < fetch || fetch >= k.saturating_mul(8) {
                     break kept;
@@ -3505,69 +3573,16 @@ impl StorageManager {
                 fetch = fetch.saturating_mul(2);
             };
 
-            stored_texts = extract_vid_text_pairs(&batches, property)?;
             let mut fts_results = extract_vid_score_pairs(&batches, "_vid", "_score")?;
-            // Results should already be sorted by score from backend, but ensure descending order
-            fts_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            fts_results.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.0.cmp(&b.0))
+            });
             fts_results
-        } else {
-            Vec::new()
         };
 
-        // Merge L0 buffer vertices for visibility of unflushed data.
-        if let Some(qctx) = ctx {
-            let excluded = self.l0_rows_failing_filter(label, filter, qctx).await?;
-            let l0 = collect_l0_texts(qctx, label, property)?;
-            let docs: Vec<(u64, String)> = l0
-                .texts
-                .iter()
-                .filter(|(vid, _)| !excluded.contains(vid))
-                .filter_map(|(vid, text)| text.as_ref().map(|t| (vid.as_u64(), t.clone())))
-                .collect();
-            // Scored by the backend, on the scale, tokenizer and statistics its
-            // search will use once these rows are flushed, and the flushed hits
-            // re-scored on the same statistics, so the ranking does not move at
-            // the flush. A schemaless property has no column to search, so both
-            // sides use the word-overlap score, which needs no statistics.
-            let scores: HashMap<Vid, f32> = if self.is_schemaless_property(label, property) {
-                docs.into_iter()
-                    .map(|(vid, text)| (Vid::new(vid), compute_text_relevance(query, &text)))
-                    .filter(|(_, score)| *score > 0.0)
-                    .collect()
-            } else if docs.is_empty() {
-                HashMap::new()
-            } else {
-                let mut parts = vec![Self::build_active_filter(filter)];
-                if let Some(hwm) = self.version_high_water_mark() {
-                    parts.push(FilterExpr::version_at_most(hwm));
-                }
-                let scored = self
-                    .backend
-                    .score_unstored_text(
-                        &name,
-                        property,
-                        query,
-                        &FilterExpr::all(parts),
-                        docs,
-                        std::mem::take(&mut stored_texts),
-                    )
-                    .await?;
-                if let Some(stored) = scored.stored {
-                    let rescored: HashMap<Vid, f32> = stored
-                        .into_iter()
-                        .map(|(vid, score)| (Vid::new(vid), score))
-                        .collect();
-                    results = results
-                        .into_iter()
-                        .filter_map(|(vid, _)| rescored.get(&vid).map(|s| (vid, *s)))
-                        .collect();
-                }
-                scored
-                    .unstored
-                    .into_iter()
-                    .map(|(vid, score)| (Vid::new(vid), score))
-                    .collect()
-            };
+        if let Some((excluded, l0)) = unflushed {
             merge_l0_text_scores(&mut results, l0, &scores, k, &excluded);
         }
         results.truncate(k);
@@ -4056,39 +4071,6 @@ impl StorageManager {
     }
 }
 
-/// `(vid, text)` for each row of `batches` whose `column` holds a string.
-///
-/// # Errors
-/// Returns an error if `_vid` is missing or `column` cannot be read as text.
-fn extract_vid_text_pairs(
-    batches: &[arrow_array::RecordBatch],
-    column: &str,
-) -> Result<Vec<(u64, String)>> {
-    let mut out = Vec::new();
-    for batch in batches {
-        let (Some(vids), Some(texts)) =
-            (batch.column_by_name("_vid"), batch.column_by_name(column))
-        else {
-            continue;
-        };
-        let vids = vids
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| anyhow!("_vid is not UInt64"))?;
-        let texts = arrow::compute::cast(texts, &arrow_schema::DataType::Utf8)?;
-        let texts = texts
-            .as_any()
-            .downcast_ref::<arrow_array::StringArray>()
-            .ok_or_else(|| anyhow!("'{column}' is not text"))?;
-        for i in 0..batch.num_rows() {
-            if vids.is_valid(i) && texts.is_valid(i) {
-                out.push((vids.value(i), texts.value(i).to_string()));
-            }
-        }
-    }
-    Ok(out)
-}
-
 /// Extracts `(Vid, f32)` pairs from record batches using the given VID and score column names.
 fn extract_vid_score_pairs(
     batches: &[arrow_array::RecordBatch],
@@ -4276,7 +4258,11 @@ fn merge_l0_into_vector_results(
     apply_l0_candidates(results, &l0_candidates, &tombstoned);
 
     // Re-sort by distance ascending.
-    results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|a, b| {
+        a.1.partial_cmp(&b.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
     results.truncate(k);
     Ok(())
 }
@@ -4496,7 +4482,11 @@ fn merge_l0_text_scores(
     results.retain(|(vid, _)| !tombstoned.contains(vid));
     apply_l0_candidates(results, &candidates, &tombstoned);
     results.retain(|(_, score)| *score > 0.0);
-    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
     results.truncate(k);
 }
 

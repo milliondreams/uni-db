@@ -340,7 +340,7 @@ async fn an_index_declared_before_any_flush_still_reports_online() -> Result<()>
 /// artifact at the first flush.
 ///
 /// This is the resolution of the `NotAttempted` deferral. Before
-/// `IndexManager::ensure_declared_scalar_indexes`, nothing ever built such an
+/// `IndexManager::ensure_declared_indexes`, nothing ever built such an
 /// index: `create_scalar_index` recorded `NotAttempted` because the Lance table
 /// did not exist yet, and the flush path built only the `_vid`/`_uid`/`ext_id`
 /// defaults. The declaration survived in the registry with no artifact behind
@@ -412,7 +412,7 @@ async fn an_index_declared_before_any_data_is_built_at_the_first_flush() -> Resu
 
 /// The flush-time build is idempotent: a second flush must not rebuild.
 ///
-/// `ensure_declared_scalar_indexes` runs on every flush of every label, so a
+/// `ensure_declared_indexes` runs on every flush of every label, so a
 /// missing skip-if-present check would rebuild every declared index on every
 /// flush — quadratic work that would show up as a flush-latency regression
 /// rather than a failure.
@@ -533,5 +533,77 @@ async fn index_build_records_the_row_count_it_indexed() -> Result<()> {
     );
 
     db.shutdown().await?;
+    Ok(())
+}
+
+/// The `last_built_at` of the index named `name` on `label`.
+fn last_built(db: &Uni, label: &str, name: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    db.indexes()
+        .list(Some(label))
+        .into_iter()
+        .find(|i| i.name() == name)
+        .unwrap_or_else(|| panic!("index '{name}' not registered"))
+        .metadata()
+        .last_built_at
+}
+
+/// A full-text index declared before the label has any data must gain a
+/// physical artifact at the first flush, and not be rebuilt at later ones.
+///
+/// The flush resolved only the scalar deferral; full-text indexes were left
+/// out of `ensure_declared_indexes` on the belief that they are "updated
+/// incrementally". That is true of uni's own
+/// inverted index, not of the Lance index behind `CREATE FULLTEXT INDEX`: it
+/// was recorded `Online` with no artifact and searched by a flat scan, with a
+/// tokenizer that does not lowercase, until something rebuilt it.
+#[tokio::test]
+async fn a_fulltext_index_declared_before_any_data_is_built_at_the_first_flush() -> Result<()> {
+    let db = Uni::temporary().build().await?;
+    db.schema()
+        .label("Doc")
+        .property("body", uni_db::core::schema::DataType::String)
+        .done()
+        .apply()
+        .await?;
+    let s = db.session();
+    let tx = s.tx().await?;
+    tx.execute("CREATE FULLTEXT INDEX doc_fts FOR (d:Doc) ON EACH [d.body]")
+        .await?;
+    tx.commit().await?;
+    assert!(
+        last_built(&db, "Doc", "doc_fts").is_none(),
+        "precondition: the index must NOT be built yet, or this test proves nothing \
+         about the flush"
+    );
+
+    let tx = s.tx().await?;
+    tx.query("CREATE (:Doc {body: 'graph database'})").await?;
+    tx.commit().await?;
+    db.flush().await?;
+    let first = last_built(&db, "Doc", "doc_fts");
+    assert!(
+        first.is_some(),
+        "a full-text index declared before the table existed was never built"
+    );
+
+    // The index's tokenizer lowercases; the flat scan used without one does not.
+    let hits = s
+        .query("CALL uni.fts.query('Doc', 'body', 'GRAPH', 10) YIELD node RETURN node.body")
+        .await?;
+    assert_eq!(
+        hits.rows().len(),
+        1,
+        "an upper-case query must match through the index"
+    );
+
+    let tx = s.tx().await?;
+    tx.query("CREATE (:Doc {body: 'more text'})").await?;
+    tx.commit().await?;
+    db.flush().await?;
+    assert_eq!(
+        first,
+        last_built(&db, "Doc", "doc_fts"),
+        "the second flush rebuilt a full-text index that was already present"
+    );
     Ok(())
 }

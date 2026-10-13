@@ -10,6 +10,14 @@
 //! long text that mentions each word once. Unflushed rows are now scored by
 //! the backend, as its search will score them once stored.
 //!
+//! With an index, Lance scores the rows it covers on the index's statistics
+//! and the rows written since (a flush does not index them) on the index's
+//! plus theirs. Re-scoring the covered rows with the unflushed ones counted
+//! moved their scores at the flush (row 1: 0.835 before, 0.859 after), and
+//! counting the unflushed rows without the uncovered flushed ones moved the
+//! uncovered rows'. The second stage below runs with uncovered flushed rows
+//! in place.
+//!
 //! Run with:
 //!   cargo nextest run -p uni-db --test integration -E 'test(fts_rank_survives_flush)'
 
@@ -26,11 +34,12 @@ async fn run(db: &Uni, stmt: &str) -> Result<()> {
     Ok(())
 }
 
-async fn ranked(db: &Uni, k: usize) -> Result<Vec<(i64, f64)>> {
+/// The top `k` for 'graph database', as (id, score), filtered by `filter`.
+async fn ranked_where(db: &Uni, k: usize, filter: &str) -> Result<Vec<(i64, f64)>> {
     let result = db
         .session()
         .query(&format!(
-            "CALL uni.fts.query('Doc', 'body', 'graph database', {k}) \
+            "CALL uni.fts.query('Doc', 'body', 'graph database', {k}, '{filter}') \
              YIELD node, score RETURN node.id, score"
         ))
         .await?;
@@ -42,6 +51,15 @@ async fn ranked(db: &Uni, k: usize) -> Result<Vec<(i64, f64)>> {
             other => panic!("row: {other:?}"),
         })
         .collect())
+}
+
+/// Every query a stage compares: the top 10, the top 2, and a filtered top 10.
+async fn snapshot(db: &Uni) -> Result<Vec<Vec<(i64, f64)>>> {
+    Ok(vec![
+        ranked_where(db, 10, "id >= 0").await?,
+        ranked_where(db, 2, "id >= 0").await?,
+        ranked_where(db, 10, "id <> 2").await?,
+    ])
 }
 
 async fn open(indexed: bool) -> Result<Uni> {
@@ -82,6 +100,12 @@ async fn open(indexed: bool) -> Result<Uni> {
     );
     run(&db, &format!("CREATE {}", rows.join(", "))).await?;
     db.flush().await?;
+    let built = db
+        .indexes()
+        .list(Some("Doc"))
+        .into_iter()
+        .any(|i| i.name() == "doc_fts" && i.metadata().last_built_at.is_some());
+    assert_eq!(built, indexed, "the index must exist exactly when declared");
     run(
         &db,
         "CREATE (:Doc {id: 3, body: 'graph database'}), (:Doc {id: 4, body: 'database'})",
@@ -102,24 +126,35 @@ fn assert_same(before: &[(i64, f64)], after: &[(i64, f64)], what: &str) {
     }
 }
 
-#[tokio::test]
-async fn fts_rank_survives_flush_with_an_index() -> Result<()> {
-    let db = open(true).await?;
-    let before = ranked(&db, 10).await?;
-    let top2 = ranked(&db, 2).await?;
-    db.flush().await?;
-    assert_same(&before, &ranked(&db, 10).await?, "k = 10");
-    assert_same(&top2, &ranked(&db, 2).await?, "k = 2");
+/// Each query ranks and scores the same before and after a flush, first
+/// with every flushed row indexed, then with flushed rows the index does not
+/// cover beside the unflushed ones.
+async fn check(indexed: bool) -> Result<()> {
+    let db = open(indexed).await?;
+    let names = ["k = 10", "k = 2", "filtered"];
+    for stage in ["first flush", "second flush"] {
+        let before = snapshot(&db).await?;
+        db.flush().await?;
+        let after = snapshot(&db).await?;
+        for ((b, a), name) in before.iter().zip(&after).zip(names) {
+            assert_same(b, a, &format!("{stage}, {name}"));
+        }
+        run(
+            &db,
+            "CREATE (:Doc {id: 5, body: 'graph database graph'}), \
+             (:Doc {id: 6, body: 'database graph and more'})",
+        )
+        .await?;
+    }
     Ok(())
 }
 
 #[tokio::test]
+async fn fts_rank_survives_flush_with_an_index() -> Result<()> {
+    check(true).await
+}
+
+#[tokio::test]
 async fn fts_rank_survives_flush_without_an_index() -> Result<()> {
-    let db = open(false).await?;
-    let before = ranked(&db, 10).await?;
-    let top2 = ranked(&db, 2).await?;
-    db.flush().await?;
-    assert_same(&before, &ranked(&db, 10).await?, "k = 10");
-    assert_same(&top2, &ranked(&db, 2).await?, "k = 2");
-    Ok(())
+    check(false).await
 }

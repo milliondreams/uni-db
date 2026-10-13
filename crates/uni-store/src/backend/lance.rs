@@ -1063,18 +1063,16 @@ impl StorageBackend for LanceDbBackend {
             })
     }
 
-    async fn score_unstored_text(
+    async fn full_text_search_with_unstored(
         &self,
         table: &str,
         column: &str,
         query: &str,
-        filter: &FilterExpr,
+        k: usize,
+        filter: FilterExpr,
         unstored: Vec<(u64, String)>,
-        stored: Vec<(u64, String)>,
-    ) -> Result<TextScores> {
-        if unstored.is_empty() {
-            return Ok(TextScores::default());
-        }
+        counters: Option<Arc<QueryCounters>>,
+    ) -> Result<TextSearch> {
         let sql = if filter.is_trivially_true() {
             None
         } else {
@@ -1094,13 +1092,14 @@ impl StorageBackend for LanceDbBackend {
             } else {
                 None
             };
-            super::lance_fts::score_unstored_documents(
+            super::lance_fts::search_with_unstored(
                 dataset.as_ref(),
                 &column,
                 &query,
+                k,
                 sql.as_deref(),
                 unstored,
-                stored,
+                |scanner| attach_search_stats(scanner, counters, SearchKind::FullText),
             )
             .await
         })
@@ -1116,9 +1115,6 @@ impl StorageBackend for LanceDbBackend {
         filter: FilterExpr,
         counters: Option<Arc<QueryCounters>>,
     ) -> Result<Vec<RecordBatch>> {
-        use lance_index::scalar::FullTextSearchQuery;
-        use lance_index::scalar::inverted::query::MatchQuery;
-
         let sql = if filter.is_trivially_true() {
             None
         } else {
@@ -1137,40 +1133,9 @@ impl StorageBackend for LanceDbBackend {
         // query for an uncached term waits on a loop that no longer exists.
         crate::runtime::io_runtime::run_on_io_runtime(async move {
             let dataset = directory.open(&table).await?;
-
-            // These are `lance_index` types already — lancedb only forwarded
-            // them to the same scanner, so the query object is unchanged.
-            let match_query = MatchQuery::new(query).with_column(Some(column));
-            let fts_query = FullTextSearchQuery {
-                query: match_query.into(),
-                limit: Some(k as i64),
-                wand_factor: None,
-            };
-
             let mut scanner = dataset.scan();
-            scanner
-                .full_text_search(fts_query)
-                .map_err(|e| anyhow!("FTS query on '{}': {}", table, e))?;
-            // `k` is applied both inside the FTS query and as a scan limit, as
-            // before — the inner bound caps the BM25 candidate set, the outer
-            // one the returned rows.
-            scanner
-                .limit(Some(k as i64), None)
-                .map_err(|e| anyhow!("FTS limit on '{}': {}", table, e))?;
-
-            if let Some(sql) = sql {
-                // Prefilter, for the same reason `vector_search` does: the FTS
-                // query is bounded by `k` *before* the filter runs, so
-                // postfiltering lets excluded rows consume top-k slots. Measured
-                // without this, on 50 high-scoring excluded docs and 50 matching
-                // ones, `k = 10` with a filter returned **zero** rows while the
-                // same query unfiltered returned ten.
-                scanner.prefilter(true);
-                scanner
-                    .filter(&sql)
-                    .map_err(|e| anyhow!("FTS filter '{}' on '{}': {}", sql, table, e))?;
-            }
-
+            super::lance_fts::configure_search(&mut scanner, &column, &query, k, sql.as_deref())
+                .map_err(|e| anyhow!("{e} (table '{table}')"))?;
             attach_search_stats(&mut scanner, counters, SearchKind::FullText);
 
             scanner

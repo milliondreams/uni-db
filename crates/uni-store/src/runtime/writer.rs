@@ -5911,13 +5911,13 @@ impl Writer {
 
             ds.ensure_default_indexes(backend).await?;
 
-            // Resolve any scalar index declared before this label had a table.
-            // `create_scalar_index` records NotAttempted in that case, and until
-            // this call nothing ever built it — the declaration survived in the
-            // registry with no artifact behind it.
+            // Resolve any scalar or full-text index declared before this label
+            // had a table. Their build paths record NotAttempted in that case,
+            // and until this call nothing ever built it — the declaration
+            // survived in the registry with no artifact behind it.
             self.storage
                 .index_manager()
-                .ensure_declared_scalar_indexes(label_name)
+                .ensure_declared_indexes(label_name)
                 .await?;
 
             // VidLabelsIndex maintenance is centralized at the main-vertex

@@ -221,25 +221,26 @@ impl StorageBackend for BranchedBackend {
         self.inner.scan_stream(self.apply_branch(request)).await
     }
 
-    async fn score_unstored_text(
+    async fn full_text_search_with_unstored(
         &self,
         table: &str,
         column: &str,
         query: &str,
-        filter: &FilterExpr,
+        k: usize,
+        filter: FilterExpr,
         unstored: Vec<(u64, String)>,
-        stored: Vec<(u64, String)>,
-    ) -> Result<TextScores> {
+        counters: Option<Arc<crate::runtime::counters::QueryCounters>>,
+    ) -> Result<TextSearch> {
         if let Some(branch) = self.scope.branch_for(table) {
             return self
                 .branching()?
-                .score_unstored_text_on_branch(
-                    table, &branch, column, query, filter, unstored, stored,
+                .full_text_search_with_unstored_on_branch(
+                    table, &branch, column, query, k, &filter, unstored,
                 )
                 .await;
         }
         self.inner
-            .score_unstored_text(table, column, query, filter, unstored, stored)
+            .full_text_search_with_unstored(table, column, query, k, filter, unstored, counters)
             .await
     }
 

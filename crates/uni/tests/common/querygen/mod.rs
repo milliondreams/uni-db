@@ -21,6 +21,7 @@
 //! property test [`render_roundtrips_generated_queries`] to hold.
 
 pub mod render;
+pub mod transform;
 
 use proptest::collection::vec as prop_vec;
 use proptest::prelude::*;
@@ -430,6 +431,20 @@ impl Case {
         ])
     }
 
+    /// The base query filtered by `base AND p AND (p IS NOT NULL)`: a `WHERE`
+    /// of two or three conjuncts in every case, for the conjunct-permutation
+    /// guard (`metamorphic::binding`). Same rows as the `True` partition.
+    pub fn conjunctive_query(&self) -> Query {
+        let guarded = and_expr(
+            self.predicate.clone(),
+            Expr::IsNotNull(Box::new(self.predicate.clone())),
+        );
+        build_query(vec![
+            match_clause(&self.shape, Some(conj(self.base_where.clone(), guarded))),
+            return_clause(self.projection.clone()),
+        ])
+    }
+
     /// NoREC optimized form: predicate in `WHERE`, reachable by pushdown.
     pub fn norec_optimized(&self) -> Query {
         let where_clause = Some(conj(self.base_where.clone(), self.predicate.clone()));
@@ -470,6 +485,71 @@ impl Case {
             match_clause(&self.shape, self.base_where.clone()),
             Clause::Return(ret),
         ])
+    }
+
+    /// The base query ordered by `<firstVar>.name` and cut to `n` rows.
+    ///
+    /// Deterministic: `name` is non-null and unique per Person and per
+    /// Company, and every Person has at most one `WORKS_AT` edge, so the sort
+    /// key is unique per row and `LIMIT` has no ties to break. A resolver that
+    /// read the sort key from a projection alias named `name` instead (the
+    /// `ORDER BY`-alias shape) would keep different rows.
+    pub fn ordered_limited_query(&self, n: u32) -> Query {
+        let first_var = self.shape.bounds()[0].var;
+        let ret = ReturnClause {
+            distinct: false,
+            items: self.projection.clone(),
+            order_by: Some(vec![SortItem {
+                expr: prop_expr(first_var, "name"),
+                ascending: true,
+            }]),
+            skip: None,
+            limit: Some(Expr::Literal(CypherLiteral::Integer(i64::from(n)))),
+        };
+        build_query(vec![
+            match_clause(&self.shape, self.base_where.clone()),
+            Clause::Return(ret),
+        ])
+    }
+
+    /// The base query ordered by its first projection **alias**, then by
+    /// `<firstVar>.name`, and cut to `n` rows; `None` when the first item is
+    /// not a property (a node value has no stable order).
+    ///
+    /// The `name` tiebreak makes the order total (see
+    /// [`Self::ordered_limited_query`]), so the bag is deterministic. The
+    /// sort reads an alias and a property side by side, which a renaming of
+    /// the alias onto a property key turns into a collision.
+    pub fn alias_ordered_limited_query(&self, n: u32) -> Option<Query> {
+        let ReturnItem::Expr {
+            expr: Expr::Property(..),
+            alias: Some(alias),
+            ..
+        } = self.projection.first()?
+        else {
+            return None;
+        };
+        let first_var = self.shape.bounds()[0].var;
+        let ret = ReturnClause {
+            distinct: false,
+            items: self.projection.clone(),
+            order_by: Some(vec![
+                SortItem {
+                    expr: Expr::Variable(alias.clone()),
+                    ascending: true,
+                },
+                SortItem {
+                    expr: prop_expr(first_var, "name"),
+                    ascending: true,
+                },
+            ]),
+            skip: None,
+            limit: Some(Expr::Literal(CypherLiteral::Integer(i64::from(n)))),
+        };
+        Some(build_query(vec![
+            match_clause(&self.shape, self.base_where.clone()),
+            Clause::Return(ret),
+        ]))
     }
 
     /// The base query with `LIMIT n` appended.
@@ -994,12 +1074,14 @@ mod roundtrip {
                 case.norec_unoptimized(),
                 case.ordered_query(),
                 case.limited_query(5),
+                case.ordered_limited_query(3),
+                case.conjunctive_query(),
                 case.count_query(),
                 // The `EXPLAIN` wrapper must survive the same round trip, since
                 // the routing assertions render through it.
                 Query::Explain(Box::new(case.base_query())),
             ];
-            for q in variants {
+            for q in variants.into_iter().chain(case.alias_ordered_limited_query(3)) {
                 let rendered = render(&q);
                 let reparsed = parse(&rendered).map_err(|e| {
                     TestCaseError::fail(format!("parse failed for `{rendered}`: {e:?}"))

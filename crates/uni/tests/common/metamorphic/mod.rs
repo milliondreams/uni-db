@@ -8,8 +8,10 @@
 //!   multiset union of its three predicate partitions (TRUE / FALSE / NULL).
 //! - [`norec`] — No-Optimization Reference Comparison: a predicate yields the
 //!   same answer whether or not the optimizer can push it into the scan.
+//! - [`binding`] — a query's rows do not depend on its conjunct order or on
+//!   the names of its variables and aliases (the Cypher guard for #300).
 //!
-//! Both consume the [`seed`] fixture and the `diff` row-bag comparator, and
+//! All consume the [`seed`] fixture and the `diff` row-bag comparator, and
 //! build queries via `querygen`.
 //!
 //! # Case budgets
@@ -28,6 +30,7 @@
 //! identical, deterministic state — and amortizing the build (the dominating
 //! per-case cost) is what makes the ≥100k nightly volume feasible.
 
+pub mod binding;
 pub mod dense;
 pub mod dqp;
 pub mod multi;

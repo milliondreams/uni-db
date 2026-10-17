@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use crate::binding_plan::ClauseBinding;
+
 use uni_cypher::ast::{Clause, Expr, Pattern, Query};
 use uni_cypher::locy_ast::{
     AbduceQuery, AlongBinding, BestByClause, DeriveCommand, ExplainRule, FoldBinding, GoalQuery,
@@ -149,6 +151,10 @@ pub struct CompiledClause {
     /// `apply_model_invocations`, then get stripped from the final
     /// `LocyResult` rows by the runtime.
     pub hidden_yield_cols: Vec<String>,
+    /// Which occurrence of each body variable binds it and which ones test
+    /// it; see [`crate::binding_plan`]. [`ClauseBinding::Pending`] until the
+    /// compiler knows every rule the clause references.
+    pub binding: ClauseBinding,
 }
 
 /// A single neural-model invocation site extracted from a clause body.

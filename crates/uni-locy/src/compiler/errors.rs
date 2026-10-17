@@ -180,22 +180,101 @@ pub enum LocyCompileError {
 
     /// The subject of an `IS NOT` reference is not a node.
     ///
-    /// Negation joins on node identity, so the subject has to be something that
-    /// has a vid: a node variable bound by MATCH, or one bound by an earlier
-    /// positive `IS ... TO` target in the same WHERE. A scalar (a YIELD alias,
-    /// an ALONG or FOLD name, a generator output) or a relationship variable
-    /// cannot be one, and the runtime already rejects all of them — this just
-    /// says so at compile time instead of after evaluation starts.
+    /// Negation joins on node identity, so a subject on a node KEY column has
+    /// to be something that has a vid: a node variable bound by MATCH, a node
+    /// a positive IS reference binds anywhere in the body (before or after
+    /// the negation — binding does not depend on conjunct order), or a YIELD
+    /// alias of either. A scalar (an ALONG or FOLD name, a generator output, a
+    /// YIELD alias of a non-node) or a relationship variable cannot be one,
+    /// and neither can a name bound nowhere. Decided by the clause's binding
+    /// plan ([`crate::binding_plan`]).
     ///
     /// The message deliberately contains the literal `IS NOT`; callers and
     /// tests match on it to identify negation failures regardless of phase.
     #[error(
-        "IS NOT subject '{variable}' in rule '{rule}' is not a node bound by MATCH. \
+        "IS NOT subject '{variable}' in rule '{rule}' is not a bound node. \
          Negation joins on node identity, so the subject must be a node variable \
-         bound by the rule's MATCH pattern (or by an earlier positive `IS ... TO` \
-         target); a scalar value or a relationship variable cannot be one."
+         bound by the rule's MATCH pattern or by a positive IS reference anywhere \
+         in the body; a scalar value or a relationship variable cannot be one."
     )]
     IsNotSubjectNotANode { rule: String, variable: String },
+
+    /// A clause reads a bare name that two or more IS references expose.
+    ///
+    /// A referenced rule's value column that no subject or target binds is
+    /// readable by its bare name. When two references expose the same name,
+    /// nothing says which one a read means, and the planner used to pick
+    /// whichever reference came first in the WHERE, so swapping two conjuncts
+    /// changed the answer (issue #300). Exposing a duplicate without reading
+    /// it stays legal.
+    #[error(
+        "column `{column}` read in the {slot} of rule '{rule}' is ambiguous: it is a value \
+         column of {}. Bind it positionally to a name of its own instead, for example \
+         `(o, e, p1) IS stake`",
+        refs.join(" and ")
+    )]
+    AmbiguousRuleColumn {
+        rule: String,
+        column: String,
+        slot: String,
+        refs: Vec<String>,
+    },
+
+    /// An IS-reference position joins a node, a relationship and a scalar.
+    ///
+    /// Each column of a rule holds one kind of value: a node, a relationship,
+    /// or an ordinary scalar, decided by the rule's YIELD expression. A
+    /// variable of one kind on a column of another can never match correctly:
+    /// a node's id compared with an integer column matches whichever integers
+    /// happen to equal a node id (issue #300).
+    #[error(
+        "IS reference to '{target}' in rule '{rule}' puts `{variable}`, a {found}, on \
+         column `{column}`, which holds a {expected}"
+    )]
+    IsRefKindMismatch {
+        rule: String,
+        target: String,
+        variable: String,
+        column: String,
+        expected: crate::binding_plan::ColumnKind,
+        found: crate::binding_plan::ColumnKind,
+    },
+
+    /// Generators whose arguments can only be bound by each other's outputs.
+    #[error(
+        "generators in rule '{rule}' depend on each other's outputs and can never run: {}",
+        generators.join(", ")
+    )]
+    GeneratorCycle {
+        rule: String,
+        generators: Vec<String>,
+    },
+
+    /// A KEY variable of an `IS NOT` reference is bound nowhere in the body.
+    ///
+    /// Negation asks whether a fact with these KEY values exists, so every
+    /// KEY value must come from somewhere: MATCH, a positive IS reference or
+    /// a generator.
+    #[error(
+        "IS NOT reference to '{target}' in rule '{rule}': KEY variable `{variable}` is not \
+         bound by MATCH, a positive IS reference or a generator, so negation has no value \
+         to test"
+    )]
+    IsNotKeyUnbound {
+        rule: String,
+        target: String,
+        variable: String,
+    },
+
+    /// `prev.<field>` in a clause with several recursive IS references.
+    ///
+    /// `prev` names the fact of the one IS reference that recurses; with two
+    /// of them it is unclear which fact it reads.
+    #[error(
+        "prev.{field} in rule '{rule}' is ambiguous: the clause has more than one IS \
+         reference to a rule of its own recursive group"
+    )]
+    AmbiguousPrevRef { rule: String, field: String },
 
     #[error(
         "prev.{field} in rule '{rule}' references unknown column; available columns from IS references: {available}"

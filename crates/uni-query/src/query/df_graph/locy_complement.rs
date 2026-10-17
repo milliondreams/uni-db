@@ -17,9 +17,11 @@
 //! used by the SLG / EXPLAIN dispatch path.
 
 use crate::query::df_graph::common::arrow_err;
+use crate::query::planner_locy_types::NegationKey;
 use arrow_array::RecordBatch;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use uni_locy::ColumnKind;
 
 /// Which side of a negation join key is being resolved. Error messages only.
 #[derive(Clone, Copy)]
@@ -45,15 +47,15 @@ enum KeySide {
 /// reported, neither is swallowed.
 fn resolve_key_indices(
     batch: &RecordBatch,
-    join_cols: &[(String, String)],
+    join_cols: &[NegationKey],
     side: KeySide,
 ) -> datafusion::error::Result<Vec<usize>> {
     let schema = batch.schema();
     let mut indices = Vec::with_capacity(join_cols.len());
-    for (left, right) in join_cols {
+    for key in join_cols {
         let name = match side {
-            KeySide::Body => left,
-            KeySide::NegatedFacts => right,
+            KeySide::Body => &key.body_column,
+            KeySide::NegatedFacts => &key.fact_column,
         };
         let Ok(idx) = schema.index_of(name) else {
             let available = schema
@@ -63,21 +65,15 @@ fn resolve_key_indices(
                 .collect::<Vec<_>>()
                 .join(", ");
             return Err(datafusion::error::DataFusionError::Plan(match side {
-                // A MATCH-bound node variable no longer reaches this arm: the
-                // planner carries a hidden `{var}._vid` column through
-                // `LocyProject` so the anti-join resolves it by node identity
-                // whatever YIELD called it. Non-node subjects are now rejected
-                // at compile time (`LocyCompileError::IsNotSubjectNotANode`).
-                // So this is a defensive backstop, and its advice must not
-                // repeat the old "add it to your YIELD" suggestion, which is
-                // both unnecessary for node subjects and useless for the rest.
+                // The planner carries every key component's binder through
+                // `LocyProject` under a hidden name, whatever YIELD called it,
+                // so this is a defensive backstop: its advice must not repeat
+                // the old "add it to your YIELD" suggestion.
                 KeySide::Body => format!(
-                    "Locy `IS NOT` cannot resolve subject column `{name}`. Available \
-                     columns: [{available}]. Negation joins on node identity, so the \
-                     subject must be a node variable bound by the rule's MATCH \
-                     pattern (or by an earlier positive `IS ... TO` target), which \
-                     the planner carries through projection as a hidden `_vid` \
-                     column. Reaching this point means that column was expected but \
+                    "Locy `IS NOT` cannot resolve key column `{name}`. Available \
+                     columns: [{available}]. The planner carries the binder of every \
+                     KEY position of a negation through projection as a hidden \
+                     column; reaching this point means that column was expected but \
                      is absent from the projected batch."
                 ),
                 KeySide::NegatedFacts => format!(
@@ -93,108 +89,104 @@ fn resolve_key_indices(
     Ok(indices)
 }
 
-/// Verifies every negation key column is `UInt64` (a node id).
+/// Verifies every node component of a negation key is a `UInt64` vid column.
 ///
 /// Like [`resolve_key_indices`], a mismatch used to pass the batch through
-/// unfiltered. It now fails, for the same reason.
+/// unfiltered. It now fails, for the same reason. Relationship and scalar
+/// components are compared by value and need no such check.
 fn verify_key_columns_are_vids(
     batch: &RecordBatch,
+    join_cols: &[NegationKey],
     indices: &[usize],
 ) -> datafusion::error::Result<()> {
-    use arrow_array::{Array as _, UInt64Array};
-    for &ci in indices {
+    use arrow_schema::DataType;
+    for (key, &ci) in join_cols.iter().zip(indices) {
+        if key.kind != ColumnKind::Node {
+            continue;
+        }
         let col = batch.column(ci);
-        if col.as_any().downcast_ref::<UInt64Array>().is_none() {
+        if col.data_type() != &DataType::UInt64 {
             let field = batch.schema().field(ci).clone();
             return Err(datafusion::error::DataFusionError::Plan(format!(
                 "Locy `IS NOT` key column `{}` has type {:?}, expected UInt64 (a node \
-                 id). Negation keys join on node identity; a scalar property cannot be \
-                 used as an `IS NOT` subject.",
+                 id). The negated rule's KEY column `{}` holds a node, so the key \
+                 component joins on node identity.",
                 field.name(),
-                col.data_type()
+                col.data_type(),
+                key.fact_column,
             )));
         }
     }
     Ok(())
 }
 
-/// Narrows a composite negation key to the components an identity join can
-/// actually compare.
+/// The composite negation key of every row of `batch`, encoded as bytes that
+/// compare equal exactly when every component is equal by value.
 ///
-/// The key joins on node identity: every component is a `UInt64` VID on both
-/// sides, and both key builders below skip any negated fact whose key columns
-/// are not. A `TO` target that lands on a **scalar** column of the negated rule
-/// — a FOLD output, an ALONG accumulation, a projected property — therefore
-/// invalidated *every* fact, leaving the banned set (or the probability map)
-/// empty, and the "nothing to exclude" fast path then handed back every body
-/// row. That is the same laundering of "we could not compare this" into
-/// "nothing was excluded" that [`resolve_key_indices`] exists to prevent,
-/// re-entering through the column's *type* rather than through a missing name.
-///
-/// Such a component is dropped rather than compared, because an unbound `TO`
-/// target is existentially quantified: `b IS NOT stake TO agg` reads "no
-/// `stake` fact for `b`, whatever `agg` is", which is exactly the key without
-/// that component. When the body *does* bind the column the variable is not
-/// existential, the composite key cannot express value equality over it, and
-/// dropping it would over-exclude — so that case is an error instead.
-///
-/// Subjects are node variables by compile-time check
-/// (`LocyCompileError::IsNotSubjectNotANode`), so a key cannot narrow to
-/// nothing in practice; an empty result would ban every row, and is rejected.
-fn identity_join_cols(
-    body: Option<&RecordBatch>,
-    neg_facts: &[RecordBatch],
-    join_cols: &[(String, String)],
-) -> datafusion::error::Result<Vec<(String, String)>> {
-    use arrow_schema::DataType;
+/// Each key column is cast to `types` — the negated facts' column types — so
+/// a body column and the fact column it is compared with share one encoding;
+/// a column that cannot be cast is an error, never a silently empty key. A
+/// row with a NULL component has no key (`None`): it is never banned, and a
+/// negated fact with one bans nothing.
+fn negation_key_rows(
+    batch: &RecordBatch,
+    join_cols: &[NegationKey],
+    side: KeySide,
+    types: &[arrow_schema::DataType],
+) -> datafusion::error::Result<Vec<Option<Box<[u8]>>>> {
+    use arrow_array::Array as _;
+    use arrow_row::{RowConverter, SortField};
 
-    let Some(neg) = neg_facts.first() else {
-        return Ok(join_cols.to_vec());
-    };
-    let neg_schema = neg.schema();
-
-    let mut kept: Vec<(String, String)> = Vec::with_capacity(join_cols.len());
-    let mut dropped: Vec<&str> = Vec::new();
-    for (left, right) in join_cols {
-        // An absent column is `resolve_key_indices`'s diagnostic to report, not
-        // this one's — keep the component so it reaches that error.
-        let Ok(right_idx) = neg_schema.index_of(right) else {
-            kept.push((left.clone(), right.clone()));
-            continue;
+    let indices = resolve_key_indices(batch, join_cols, side)?;
+    verify_key_columns_are_vids(batch, join_cols, &indices)?;
+    let mut columns: Vec<arrow_array::ArrayRef> = Vec::with_capacity(indices.len());
+    for ((key, &ci), ty) in join_cols.iter().zip(&indices).zip(types) {
+        let col = batch.column(ci);
+        let col = if col.data_type() == ty {
+            Arc::clone(col)
+        } else {
+            arrow::compute::cast(col, ty).map_err(|e| {
+                datafusion::error::DataFusionError::Plan(format!(
+                    "Locy `IS NOT` cannot compare `{}` ({:?}) with the negated rule's KEY \
+                     column `{}` ({ty:?}): {e}",
+                    key.body_column,
+                    col.data_type(),
+                    key.fact_column,
+                ))
+            })?
         };
-        let right_type = neg_schema.field(right_idx).data_type();
-        if *right_type == DataType::UInt64 {
-            kept.push((left.clone(), right.clone()));
-            continue;
-        }
-        if body.is_some_and(|b| b.schema().index_of(left).is_ok()) {
-            return Err(datafusion::error::DataFusionError::Plan(format!(
-                "Locy `IS NOT` cannot compare `TO` target `{left}`: it is bound by \
-                 the rule's body and the negated rule yields it as {right_type:?}, not a node \
-                 id. Negation keys join on node identity, so a bound scalar target \
-                 cannot be matched by value. Bind the target to a node column of the \
-                 negated rule, or drop `TO {left}` to negate on the subject alone."
-            )));
-        }
-        dropped.push(left.as_str());
+        columns.push(col);
     }
+    let converter = RowConverter::new(types.iter().cloned().map(SortField::new).collect())
+        .map_err(arrow_err)?;
+    let rows = converter.convert_columns(&columns).map_err(arrow_err)?;
+    Ok((0..batch.num_rows())
+        .map(|row| {
+            columns
+                .iter()
+                .all(|c| !c.is_null(row))
+                .then(|| Box::<[u8]>::from(rows.row(row).as_ref()))
+        })
+        .collect())
+}
 
-    if kept.is_empty() {
-        return Err(datafusion::error::DataFusionError::Plan(format!(
-            "Locy `IS NOT` has no node-identity column left to join on after \
-             dropping existentially-quantified scalar target(s) [{}]. An empty \
-             composite key matches every row, which would exclude the entire body.",
-            dropped.join(", ")
-        )));
-    }
-    Ok(kept)
+/// The key column types of the negated facts, from their first batch.
+fn negation_key_types(
+    neg: &RecordBatch,
+    join_cols: &[NegationKey],
+) -> datafusion::error::Result<Vec<arrow_schema::DataType>> {
+    let indices = resolve_key_indices(neg, join_cols, KeySide::NegatedFacts)?;
+    Ok(indices
+        .iter()
+        .map(|&ci| neg.column(ci).data_type().clone())
+        .collect())
 }
 
 /// Drops the hidden `IS NOT` subject-`_vid` columns after the anti-join has run.
 ///
-/// The planner projects `{var}._vid` under a reserved name so the anti-join can
-/// resolve its subject by node identity rather than by whatever YIELD called it
-/// (issue #158, see `LocyIsRef::subject_vid_cols`). Those columns must not
+/// The planner projects each negation key component's binder under a reserved
+/// name so the anti-join resolves it by identity rather than by whatever YIELD
+/// called it (issue #158, see `LocyIsRef::negation_keys`). Those columns must not
 /// outlive the anti-join.
 ///
 /// **Placement is load-bearing.** This must run before the batches reach
@@ -285,96 +277,81 @@ pub fn strip_derivation_discriminator_columns(
 
 /// Probabilistic complement for composite (multi-column) join keys.
 ///
-/// Builds a composite key from all `join_cols` right-side columns in
-/// `neg_facts`, maps each composite key to a probability via noisy-OR
-/// combination, then adds a single `complement_col_name` column with
-/// `1 - p` for matched keys and `1.0` for absent keys.
+/// Builds a composite key from all `join_cols` fact columns in `neg_facts`,
+/// maps each composite key to a probability via noisy-OR combination, then
+/// adds a single `complement_col_name` column with `1 - p` for matched keys
+/// and `1.0` for absent keys.
 pub fn apply_prob_complement_composite(
     batches: Vec<RecordBatch>,
     neg_facts: &[RecordBatch],
-    join_cols: &[(String, String)],
+    join_cols: &[NegationKey],
     prob_col: &str,
     complement_col_name: &str,
 ) -> datafusion::error::Result<Vec<RecordBatch>> {
-    use arrow_array::{Array as _, Float64Array, UInt64Array};
+    use arrow_array::{Array as _, Float64Array};
 
-    let join_cols = &identity_join_cols(batches.first(), neg_facts, join_cols)?;
+    let types = match neg_facts.first() {
+        Some(neg) => Some(negation_key_types(neg, join_cols)?),
+        None => None,
+    };
 
     // Build composite-key → probability lookup from negative facts.
-    let mut prob_map: HashMap<Vec<u64>, f64> = HashMap::new();
-    for batch in neg_facts {
-        let right_indices = resolve_key_indices(batch, join_cols, KeySide::NegatedFacts)?;
-        let prob_idx = batch.schema().index_of(prob_col).map_err(|_| {
-            datafusion::error::DataFusionError::Plan(format!(
-                "Locy `IS NOT` probabilistic complement cannot resolve PROB column \
-                 `{prob_col}` in the negated rule's derived facts. Dropping the batch \
-                 would silently yield a complement factor of 1.0, i.e. no negation."
-            ))
-        })?;
-        let prob_arr = batch.column(prob_idx);
-        let probs = prob_arr.as_any().downcast_ref::<Float64Array>();
-        for row in 0..batch.num_rows() {
-            let mut key = Vec::with_capacity(right_indices.len());
-            let mut valid = true;
-            for &ci in &right_indices {
-                let col = batch.column(ci);
-                if let Some(vids) = col.as_any().downcast_ref::<UInt64Array>() {
-                    if vids.is_null(row) {
-                        valid = false;
-                        break;
-                    }
-                    key.push(vids.value(row));
-                } else {
-                    valid = false;
-                    break;
-                }
+    let mut prob_map: HashMap<Box<[u8]>, f64> = HashMap::new();
+    if let Some(types) = &types {
+        for batch in neg_facts {
+            let keys = negation_key_rows(batch, join_cols, KeySide::NegatedFacts, types)?;
+            let prob_idx = batch.schema().index_of(prob_col).map_err(|_| {
+                datafusion::error::DataFusionError::Plan(format!(
+                    "Locy `IS NOT` probabilistic complement cannot resolve PROB column \
+                     `{prob_col}` in the negated rule's derived facts. Dropping the batch \
+                     would silently yield a complement factor of 1.0, i.e. no negation."
+                ))
+            })?;
+            let prob_arr = batch.column(prob_idx);
+            let probs = prob_arr.as_any().downcast_ref::<Float64Array>();
+            for (row, key) in keys.into_iter().enumerate() {
+                let Some(key) = key else {
+                    continue;
+                };
+                let p = probs
+                    .and_then(|arr| {
+                        if arr.is_null(row) {
+                            None
+                        } else {
+                            Some(arr.value(row))
+                        }
+                    })
+                    .unwrap_or(0.0);
+                // Noisy-OR combination for duplicate composite keys.
+                prob_map
+                    .entry(key)
+                    .and_modify(|existing| {
+                        *existing = 1.0 - (1.0 - *existing) * (1.0 - p);
+                    })
+                    .or_insert(p);
             }
-            if !valid {
-                continue;
-            }
-            let p = probs
-                .and_then(|arr| {
-                    if arr.is_null(row) {
-                        None
-                    } else {
-                        Some(arr.value(row))
-                    }
-                })
-                .unwrap_or(0.0);
-            // Noisy-OR combination for duplicate composite keys.
-            prob_map
-                .entry(key)
-                .and_modify(|existing| {
-                    *existing = 1.0 - (1.0 - *existing) * (1.0 - p);
-                })
-                .or_insert(p);
         }
     }
 
     // Add complement column to each batch.
     let mut result = Vec::new();
     for batch in batches {
-        let left_indices = resolve_key_indices(&batch, join_cols, KeySide::Body)?;
-        verify_key_columns_are_vids(&batch, &left_indices)?;
-
-        let complements: Vec<f64> = (0..batch.num_rows())
-            .map(|row| {
-                let mut key = Vec::with_capacity(left_indices.len());
-                for &ci in &left_indices {
-                    let vids = batch
-                        .column(ci)
-                        .as_any()
-                        .downcast_ref::<UInt64Array>()
-                        .unwrap();
-                    if vids.is_null(row) {
-                        return 1.0;
-                    }
-                    key.push(vids.value(row));
-                }
-                let p = prob_map.get(&key).copied().unwrap_or(0.0);
-                1.0 - p
-            })
-            .collect();
+        let complements: Vec<f64> = match &types {
+            Some(types) => negation_key_rows(&batch, join_cols, KeySide::Body, types)?
+                .into_iter()
+                .map(|key| {
+                    let p = key
+                        .and_then(|key| prob_map.get(&key).copied())
+                        .unwrap_or(0.0);
+                    1.0 - p
+                })
+                .collect(),
+            None => {
+                let indices = resolve_key_indices(&batch, join_cols, KeySide::Body)?;
+                verify_key_columns_are_vids(&batch, join_cols, &indices)?;
+                vec![1.0; batch.num_rows()]
+            }
+        };
 
         let complement_arr = Float64Array::from(complements);
         let mut columns: Vec<arrow_array::ArrayRef> = batch.columns().to_vec();
@@ -397,43 +374,31 @@ pub fn apply_prob_complement_composite(
 
 /// Boolean anti-join for composite (multi-column) join keys.
 ///
-/// Builds a `HashSet<Vec<u64>>` from `neg_facts` using all right-side
-/// columns in `join_cols`, then filters `batches` to keep only rows
-/// whose composite left-side key is NOT in the set.
+/// Builds the set of composite keys of `neg_facts` from the `join_cols` fact
+/// columns, then filters `batches` to keep only rows whose composite body key
+/// is NOT in the set. Node components compare by vid, every other component
+/// by value.
 pub fn apply_anti_join_composite(
     batches: Vec<RecordBatch>,
     neg_facts: &[RecordBatch],
-    join_cols: &[(String, String)],
+    join_cols: &[NegationKey],
 ) -> datafusion::error::Result<Vec<RecordBatch>> {
     use arrow::compute::filter_record_batch;
-    use arrow_array::{Array as _, BooleanArray, UInt64Array};
+    use arrow_array::BooleanArray;
 
-    let join_cols = &identity_join_cols(batches.first(), neg_facts, join_cols)?;
+    let Some(first) = neg_facts.first() else {
+        return Ok(batches);
+    };
+    let types = negation_key_types(first, join_cols)?;
 
     // Collect composite keys from the negated rule's derived facts.
-    let mut banned: HashSet<Vec<u64>> = HashSet::new();
+    let mut banned: HashSet<Box<[u8]>> = HashSet::new();
     for batch in neg_facts {
-        let right_indices = resolve_key_indices(batch, join_cols, KeySide::NegatedFacts)?;
-        for row in 0..batch.num_rows() {
-            let mut key = Vec::with_capacity(right_indices.len());
-            let mut valid = true;
-            for &ci in &right_indices {
-                let col = batch.column(ci);
-                if let Some(vids) = col.as_any().downcast_ref::<UInt64Array>() {
-                    if vids.is_null(row) {
-                        valid = false;
-                        break;
-                    }
-                    key.push(vids.value(row));
-                } else {
-                    valid = false;
-                    break;
-                }
-            }
-            if valid {
-                banned.insert(key);
-            }
-        }
+        banned.extend(
+            negation_key_rows(batch, join_cols, KeySide::NegatedFacts, &types)?
+                .into_iter()
+                .flatten(),
+        );
     }
 
     // Returning every row is correct here *only* because the loop above can no
@@ -448,25 +413,10 @@ pub fn apply_anti_join_composite(
     // Filter body batches: keep rows where composite left key NOT IN banned.
     let mut result = Vec::new();
     for batch in batches {
-        let left_indices = resolve_key_indices(&batch, join_cols, KeySide::Body)?;
-        verify_key_columns_are_vids(&batch, &left_indices)?;
-
-        let keep: Vec<bool> = (0..batch.num_rows())
-            .map(|row| {
-                let mut key = Vec::with_capacity(left_indices.len());
-                for &ci in &left_indices {
-                    let vids = batch
-                        .column(ci)
-                        .as_any()
-                        .downcast_ref::<UInt64Array>()
-                        .unwrap();
-                    if vids.is_null(row) {
-                        return true; // null keys are never banned
-                    }
-                    key.push(vids.value(row));
-                }
-                !banned.contains(&key)
-            })
+        let keep: Vec<bool> = negation_key_rows(&batch, join_cols, KeySide::Body, &types)?
+            .into_iter()
+            // A null key is never banned.
+            .map(|key| key.is_none_or(|key| !banned.contains(&key)))
             .collect();
         let keep_arr = BooleanArray::from(keep);
         let filtered = filter_record_batch(&batch, &keep_arr).map_err(arrow_err)?;
@@ -635,6 +585,15 @@ mod tests {
     use arrow_array::Float64Array;
     use arrow_schema::{DataType, Field, Schema};
 
+    fn node_key(column: &str) -> NegationKey {
+        NegationKey {
+            variable: column.to_string(),
+            body_column: column.to_string(),
+            fact_column: column.to_string(),
+            kind: ColumnKind::Node,
+        }
+    }
+
     fn make_vid_prob_batch(vids: &[u64], probs: &[f64]) -> RecordBatch {
         use arrow_array::UInt64Array;
         let schema = Arc::new(Schema::new(vec![
@@ -656,7 +615,7 @@ mod tests {
         // neg has VID=1 with prob=0.7 → complement=0.3; VID=2 absent → complement=1.0
         let body = make_vid_prob_batch(&[1, 2], &[0.9, 0.8]);
         let neg = make_vid_prob_batch(&[1], &[0.7]);
-        let join_cols = vec![("vid".to_string(), "vid".to_string())];
+        let join_cols = vec![node_key("vid")];
         let result = apply_prob_complement_composite(
             vec![body],
             &[neg],
@@ -694,7 +653,7 @@ mod tests {
         // Complement = 1 - 0.65 = 0.35
         let body = make_vid_prob_batch(&[1], &[0.9]);
         let neg = make_vid_prob_batch(&[1, 1], &[0.3, 0.5]);
-        let join_cols = vec![("vid".to_string(), "vid".to_string())];
+        let join_cols = vec![node_key("vid")];
         let result = apply_prob_complement_composite(
             vec![body],
             &[neg],
@@ -721,7 +680,7 @@ mod tests {
     fn test_prob_complement_empty_neg() {
         // Empty neg_facts → body passes through with complement=1.0
         let body = make_vid_prob_batch(&[1, 2], &[0.5, 0.6]);
-        let join_cols = vec![("vid".to_string(), "vid".to_string())];
+        let join_cols = vec![node_key("vid")];
         let result =
             apply_prob_complement_composite(vec![body], &[], &join_cols, "prob", "__complement_0")
                 .unwrap();
@@ -748,7 +707,7 @@ mod tests {
         use arrow_array::UInt64Array;
         let body = make_vid_prob_batch(&[1, 2, 3], &[0.5, 0.6, 0.7]);
         let neg = make_vid_prob_batch(&[2], &[0.0]);
-        let join_cols = vec![("vid".to_string(), "vid".to_string())];
+        let join_cols = vec![node_key("vid")];
         let result = apply_anti_join_composite(vec![body], &[neg], &join_cols).unwrap();
         assert_eq!(result.len(), 1);
         let batch = &result[0];
@@ -767,7 +726,7 @@ mod tests {
     fn test_anti_join_empty_neg() {
         // Empty neg → all rows kept
         let body = make_vid_prob_batch(&[1, 2, 3], &[0.5, 0.6, 0.7]);
-        let join_cols = vec![("vid".to_string(), "vid".to_string())];
+        let join_cols = vec![node_key("vid")];
         let result = apply_anti_join_composite(vec![body], &[], &join_cols).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].num_rows(), 3);
@@ -778,7 +737,7 @@ mod tests {
         // neg covers all body rows → empty result
         let body = make_vid_prob_batch(&[1, 2], &[0.5, 0.6]);
         let neg = make_vid_prob_batch(&[1, 2], &[0.0, 0.0]);
-        let join_cols = vec![("vid".to_string(), "vid".to_string())];
+        let join_cols = vec![node_key("vid")];
         let result = apply_anti_join_composite(vec![body], &[neg], &join_cols).unwrap();
         let total: usize = result.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 0);

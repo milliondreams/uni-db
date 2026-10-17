@@ -54,7 +54,7 @@
 //! matched nothing. The subject branch now distinguishes the two, and
 //! `semi_join_is_ref` binds absent subjects from the derived fact — the outer
 //! loop was already a cross product, so an IS-ref becomes a generator for free.
-//! The negation paths keep the strict comparison (see `SubjectMode`): relaxing
+//! The negation paths compare only KEY positions the binding plan binds: relaxing
 //! them would flip `IS NOT` with an unbindable subject from keep-all to
 //! keep-nothing.
 //!

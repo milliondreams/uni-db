@@ -48,7 +48,7 @@
 //! 1 is closed by projecting a hidden `{var}._vid` column for every negated
 //! subject that is a MATCH-bound node variable, so resolution keys on node
 //! identity rather than on whatever YIELD chose to call things — see
-//! `LocyIsRef::subject_vid_cols` and `strip_isnot_vid_columns`.
+//! `LocyIsRef::negation_keys` and `strip_isnot_vid_columns`.
 //!
 //! Subjects that are *not* MATCH-bound node variables have no `._vid` column
 //! (relationship variables expose `._eid`; scalar subjects have neither), so
@@ -203,7 +203,7 @@ async fn issue_158_positive_is_ref_is_unaffected() -> Result<()> {
 //
 // The planner now projects a hidden `{var}._vid` column for every negated
 // subject that is a MATCH-bound node variable, and the anti-join keys on that
-// (see `LocyIsRef::subject_vid_cols`). Both programs below are semantically
+// (see `LocyIsRef::negation_keys`). Both programs below are semantically
 // valid — `a` is bound in MATCH — and now filter correctly regardless of what
 // YIELD named it.
 //

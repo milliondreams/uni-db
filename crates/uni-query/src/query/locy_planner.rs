@@ -25,129 +25,73 @@ use uni_cypher::ast::{BinaryOp, CypherLiteral, Expr, PatternElement};
 use uni_cypher::locy_ast::{
     LocyBinaryOp, LocyExpr, RuleCondition, RuleOutput, resolve_yield_column_names,
 };
+use uni_locy::binding_plan::{
+    BindingStep, ClauseBindingPlan, ColumnKind, Exposure, PositionAction, VarSource,
+};
 use uni_locy::types::{
     CompiledClause, CompiledCommand, CompiledProgram, CompiledRule, Stratum, YieldColumn,
 };
 
-/// Collect all node-typed variable names from a rule's clauses.
+/// The variables of a rule's clauses that hold an entity id, over every clause.
 ///
-/// This includes MATCH pattern node variables AND IS-ref subject/target variables,
-/// all of which hold node VIDs (UInt64). Used for yield column type inference.
-///
-/// NOTE: For IS-ref predicate building (where `{var}._vid` column references are
-/// needed), use `collect_match_node_vars` instead — only MATCH pattern variables
-/// have expanded `._vid` columns in the graph scan output.
-fn collect_node_vars(
-    clauses: &[CompiledClause],
-    rule_catalog: &HashMap<String, CompiledRule>,
-) -> HashSet<String> {
-    collect_node_vars_guarded(clauses, rule_catalog, &mut HashSet::new())
-}
-
-/// Body of [`collect_node_vars`], carrying the cycle guard that
-/// [`is_ref_binds_node`] needs to walk into the referenced rule.
-fn collect_node_vars_guarded(
-    clauses: &[CompiledClause],
-    rule_catalog: &HashMap<String, CompiledRule>,
-    visiting: &mut HashSet<String>,
-) -> HashSet<String> {
+/// MATCH node variables, and variables an IS reference binds to a node or a
+/// relationship column of the referenced rule: all of them are carried as a
+/// `UInt64` id. The kind of an IS-reference position comes from the clause's
+/// binding plan (`uni_locy::binding_plan`), which infers it from the
+/// referenced rule's YIELD expression — never from whether the column is a
+/// KEY, which mis-typed a scalar KEY as a node (issue #300). A clause without
+/// a plan contributes its MATCH nodes only.
+fn collect_node_vars(clauses: &[CompiledClause]) -> HashSet<String> {
     let mut node_vars = HashSet::new();
     for clause in clauses {
-        collect_match_node_vars(clause, &mut node_vars);
-        // A subject that binds a KEY column is a node VID (UInt64). A variable
-        // bound past the KEY columns (a later subject, or the TO target) only
-        // sometimes is; ask the referenced rule (issues #272, #298).
-        for condition in &clause.where_conditions {
-            if let RuleCondition::IsReference(is_ref) = condition {
-                let rule_name = is_ref.rule_name.to_string();
-                let key_count = rule_catalog.get(&rule_name).map_or(usize::MAX, |r| {
-                    r.yield_schema.iter().filter(|c| c.is_key).count()
-                });
-                let bound = is_ref
-                    .subjects
-                    .iter()
-                    .chain(is_ref.target.as_ref())
-                    .enumerate();
-                for (position, var) in bound {
-                    let is_target = position == is_ref.subjects.len();
-                    if (!is_target && position < key_count)
-                        || is_ref_binds_node(&rule_name, position, rule_catalog, visiting)
-                    {
-                        node_vars.insert(var.clone());
-                    }
+        let Some(plan) = clause.binding.plan() else {
+            collect_match_node_vars(clause, &mut node_vars);
+            continue;
+        };
+        for (var, source) in &plan.scope {
+            let id = match source {
+                VarSource::Match(kind) => *kind == ColumnKind::Node,
+                VarSource::RefPosition { r, pos } => {
+                    plan.refs[*r].positions[*pos].kind != ColumnKind::Scalar
                 }
+                VarSource::Generator { .. } | VarSource::YieldAlias(_) => false,
+            };
+            if id {
+                node_vars.insert(var.clone());
             }
         }
     }
     node_vars
 }
 
-/// Whether the IS-reference variable at `position` binds a **node VID** rather
-/// than an ordinary scalar.
+/// The referenced rule and column a clause variable reads through an IS
+/// reference: the column a position binds it to, or the value column it
+/// names bare (`Exposure`).
 ///
-/// Positions follow [`uni_locy::is_binding::binding_sequence`]: subject `i` is
-/// at `i`, a `TO` target at the subject count.
-///
-/// A KEY column always holds a VID. A value column usually does not — a FOLD
-/// result, an ALONG accumulation, a projected property — but it can: `YIELD KEY
-/// a, b` over `MATCH (a:N)-[:E]->(b:N)` carries `b` as a VID in a non-KEY
-/// column. So the test is the one [`infer_yield_type_rec`] uses to type a
-/// column UInt64: the yield expression is a bare variable naming one of the
-/// source rule's node variables.
-///
-/// The answer decides how the target is bound: a node is materialized with a
-/// `ScanAll` and joined on `target._vid`, a scalar is aliased to the derived
-/// scan's column. Getting it wrong is silent — the VID equality simply matches
-/// nothing (issue #272).
-///
-/// `visiting` breaks the cycle a recursive rule creates by reaching its own
-/// yield columns; a target reached only through a cycle keeps the pre-#272
-/// node assumption, which is what `reachable(a,b) :- reachable(a,mid),
-/// reachable(mid,b)` needs.
-fn is_ref_binds_node(
-    rule_name: &str,
-    position: usize,
-    rule_catalog: &HashMap<String, CompiledRule>,
-    visiting: &mut HashSet<String>,
-) -> bool {
-    // An unknown rule, or one with no column left to bind, errors in
-    // `build_clause`; until then keep the pre-#272 assumption.
-    let Some(target_rule) = rule_catalog.get(rule_name) else {
-        return true;
-    };
-    let Some((col_name, is_key)) = is_ref_binding_column(position, &target_rule.yield_schema)
-    else {
-        return true;
-    };
-    if is_key {
-        return true;
+/// `None` when the variable has another source, or the clause has no plan.
+/// An ambiguous exposure has no source either: reading one is the compile
+/// error `AmbiguousRuleColumn`, and should a read reach the planner anyway,
+/// [`ClauseScope`] refuses the projection that reads it as an internal error,
+/// so the type inferred here is never used.
+fn plan_sourced_column<'p>(clause: &'p CompiledClause, var: &str) -> Option<(&'p str, &'p str)> {
+    let plan = clause.binding.plan()?;
+    match plan.scope.get(var) {
+        Some(VarSource::RefPosition { r, pos }) => {
+            let binding = &plan.refs[*r];
+            Some((
+                binding.rule.as_str(),
+                binding.positions[*pos].column.as_str(),
+            ))
+        }
+        Some(_) => None,
+        None => {
+            let (column, exposure) = plan.exposure.get_key_value(var)?;
+            match exposure {
+                Exposure::Unique { r, .. } => Some((plan.refs[*r].rule.as_str(), column.as_str())),
+                Exposure::Ambiguous(_) => None,
+            }
+        }
     }
-    let Some(first_clause) = target_rule.clauses.first() else {
-        return true;
-    };
-    // A FOLD output or an ALONG binding is a scalar whatever its name.
-    if first_clause.fold.iter().any(|fb| fb.name == col_name)
-        || first_clause.along.iter().any(|a| a.name == col_name)
-    {
-        return false;
-    }
-    let RuleOutput::Yield(yc) = &first_clause.output else {
-        return true;
-    };
-    if !visiting.insert(rule_name.to_string()) {
-        return true; // cycle
-    }
-    let source_node_vars = collect_node_vars_guarded(&target_rule.clauses, rule_catalog, visiting);
-    visiting.remove(rule_name);
-
-    let item_names = resolve_yield_column_names(&yc.items);
-    yc.items
-        .iter()
-        .zip(item_names.iter())
-        .any(|(item, item_name)| {
-            *item_name == col_name
-                && matches!(&item.expr, Expr::Variable(v) if source_node_vars.contains(v))
-        })
 }
 
 /// Collect node variable names from a single clause's MATCH pattern only.
@@ -627,60 +571,45 @@ fn infer_yield_type_rec(
     DataType::LargeUtf8
 }
 
-/// If `col` is a NON-KEY value column produced by one of `clause`'s positive
-/// IS-references, return that column's type as inferred from the referenced
-/// rule. `visited` (keyed `rule::col`) guards against cyclic inference through
-/// recursive rules.
+/// The type of the referenced column `var` reads through one of `clause`'s
+/// positive IS references (see [`plan_sourced_column`]), inferred from the
+/// referenced rule. `visited` (keyed `rule::col`) guards against cyclic
+/// inference through recursive rules.
 fn infer_is_ref_value_col_type(
-    col: &str,
+    var: &str,
     clause: &CompiledClause,
     rule_catalog: &HashMap<String, CompiledRule>,
     schema: &Schema,
     visited: &mut HashSet<String>,
 ) -> Option<DataType> {
-    for cond in &clause.where_conditions {
-        let RuleCondition::IsReference(ir) = cond else {
-            continue;
-        };
-        if ir.negated {
-            continue;
-        }
-        let rule_name = ir.rule_name.to_string();
-        let Some(rule) = rule_catalog.get(&rule_name) else {
-            continue;
-        };
-        if !rule
-            .yield_schema
-            .iter()
-            .any(|yc| !yc.is_key && yc.name == col)
-        {
-            continue;
-        }
-        if !visited.insert(format!("{rule_name}::{col}")) {
-            return Some(DataType::LargeUtf8); // cycle guard
-        }
-        let Some(src_clause) = rule.clauses.first() else {
-            return Some(DataType::LargeUtf8);
-        };
-        let src_node_vars = collect_node_vars(&rule.clauses, rule_catalog);
-        let src_fold: HashSet<&str> = src_clause.fold.iter().map(|fb| fb.name.as_str()).collect();
-        let src_along = along_column_types(&rule.clauses, schema);
-        let src_var_labels = clause_var_labels(src_clause);
-        // Forwarded columns are NON-KEY (filtered above), so `is_key = false`.
-        return Some(infer_yield_type_rec(
-            col,
-            src_clause,
-            &src_node_vars,
-            &src_fold,
-            &src_along,
-            rule_catalog,
-            false,
-            schema,
-            &src_var_labels,
-            visited,
-        ));
+    let (rule_name, col) = plan_sourced_column(clause, var)?;
+    let rule = rule_catalog.get(rule_name)?;
+    if !visited.insert(format!("{rule_name}::{col}")) {
+        return Some(DataType::LargeUtf8); // cycle guard
     }
-    None
+    let Some(src_clause) = rule.clauses.first() else {
+        return Some(DataType::LargeUtf8);
+    };
+    let is_key = rule
+        .yield_schema
+        .iter()
+        .any(|yc| yc.is_key && yc.name == col);
+    let src_node_vars = collect_node_vars(&rule.clauses);
+    let src_fold: HashSet<&str> = src_clause.fold.iter().map(|fb| fb.name.as_str()).collect();
+    let src_along = along_column_types(&rule.clauses, schema);
+    let src_var_labels = clause_var_labels(src_clause);
+    Some(infer_yield_type_rec(
+        col,
+        src_clause,
+        &src_node_vars,
+        &src_fold,
+        &src_along,
+        rule_catalog,
+        is_key,
+        schema,
+        &src_var_labels,
+        visited,
+    ))
 }
 
 /// Infer Arrow DataType from a Cypher expression.
@@ -788,7 +717,7 @@ use super::planner::{
 };
 use super::planner_locy_types::{
     FOLD_DISCRIMINATOR_COL_PREFIX, ISNOT_VID_COL_PREFIX, LocyClausePlan, LocyCommand, LocyIsRef,
-    LocyRulePlan, LocyStratum, LocyYieldColumn,
+    LocyRulePlan, LocyStratum, LocyYieldColumn, NegationKey,
 };
 
 // ---------------------------------------------------------------------------
@@ -1218,7 +1147,7 @@ fn clause_column_types(
     // and nodes an IS reference binds, over all clauses. A per-clause MATCH
     // set would type `p` bound by `(parent, p) IS r` unlike the base clause's
     // MATCH `p`, and unify a node column into a Cypher value.
-    let node_vars = collect_node_vars(&rule.clauses, rule_catalog);
+    let node_vars = collect_node_vars(&rule.clauses);
     let mut types: HashMap<String, Vec<DataType>> = HashMap::new();
     for clause in &rule.clauses {
         let RuleOutput::Yield(yc) = &clause.output else {
@@ -1629,7 +1558,7 @@ impl<'a> LocyPlanBuilder<'a> {
         classifiers: &ClassifierContext,
     ) -> Result<LocyRulePlan> {
         // Collect node variable names from match patterns for VID-based joins
-        let node_vars = collect_node_vars(&rule.clauses, rule_catalog);
+        let node_vars = collect_node_vars(&rule.clauses);
 
         // Derivation discriminators for a recursive FOLD / ALONG rule (#159).
         // See `derivation_discriminator_columns`.
@@ -1928,13 +1857,83 @@ impl<'a> LocyPlanBuilder<'a> {
             }
         }
 
-        // Collect node variables from THIS clause's MATCH pattern only.
-        // Used for IS-ref predicates: only variables in the current MATCH
-        // have expanded {var}._vid columns in the graph scan output.
-        let mut clause_node_vars = HashSet::new();
-        collect_match_node_vars(clause, &mut clause_node_vars);
+        // Validate every IS reference before consulting the binding plan, so a
+        // clause naming an unknown rule, or binding more columns than the rule
+        // yields, fails with that error. The compiler checks the same; this
+        // guards programs built without it.
+        for condition in &clause.where_conditions {
+            let RuleCondition::IsReference(is_ref) = condition else {
+                continue;
+            };
+            let target_rule_name = is_ref.rule_name.to_string();
+            let target_rule = rule_catalog
+                .get(&target_rule_name)
+                .with_context(|| format!("IS-reference to unknown rule '{}'", target_rule_name))?;
+            if uni_locy::is_binding::bound_columns(
+                &target_rule.yield_schema,
+                is_ref.subjects.len(),
+                is_ref.target.is_some(),
+            )
+            .is_none()
+            {
+                bail!(
+                    "IS-reference to '{}': arity mismatch — {} bindings \
+                     provided but rule yields only {} columns",
+                    target_rule_name,
+                    is_ref.subjects.len() + usize::from(is_ref.target.is_some()),
+                    target_rule.yield_schema.len(),
+                );
+            }
+        }
 
-        // Step 1: decide which WHERE conjuncts can reach the pattern.
+        // The one binding decision for this clause (`uni_locy::binding_plan`):
+        // which occurrence of each variable binds it, and in which order the
+        // body's conditions run. Every name below is resolved through it.
+        let binding = clause.binding.plan().with_context(|| {
+            format!(
+                "internal error: clause {} reached the Locy planner without a binding plan",
+                ctx.clause_index
+            )
+        })?;
+
+        // An `IS NOT` never compares a value column: the binding plan reports
+        // a bound variable there as `IsNotBindsValueColumn`, a compile error
+        // raised wherever plans are attached, so no plan reaching here has one.
+        debug_assert!(
+            binding.refs.iter().filter(|r| r.negated).all(|r| r
+                .positions
+                .iter()
+                .all(|p| p.is_key || p.action == PositionAction::Existential)),
+            "an IS NOT value comparison reached the planner; the binding plan rejects it"
+        );
+
+        // The body's names, resolved through the plan, plus the columns
+        // `LocyModelInvoke` adds, which the plan does not source.
+        let scope = ClauseScope {
+            plan: binding,
+            passthrough: clause
+                .model_invocations
+                .iter()
+                .map(|m| m.output_column.clone())
+                .collect(),
+        };
+        // A projected expression (YIELD, a FOLD input) also reads ALONG names,
+        // which shadow the body's and are inlined after resolution. A FOLD
+        // output is never resolved: a YIELD over one is produced after the
+        // fold, and a FOLD input reads the body's name (`FOLD cost =
+        // MSUM(cost * e.q)` reads the referenced `cost`).
+        let projection_scope = ClauseScope {
+            plan: binding,
+            passthrough: scope
+                .passthrough
+                .iter()
+                .cloned()
+                .chain(clause.along.iter().map(|a| a.name.clone()))
+                .collect(),
+        };
+
+        // Step 1: the WHERE conjuncts that read MATCH variables only reach the
+        // pattern.
         //
         // This used to run *after* the pattern was planned, which forced the
         // predicate into a hand-built `Filter` above it. A `Filter` node is
@@ -1943,57 +1942,13 @@ impl<'a> LocyPlanBuilder<'a> {
         // fully materialised scan — the same predicate written inline as
         // `(e:Entity {blocked: true})` was measured at a fifth of the cost
         // (#226). Hoisting the partition lets the predicate be planned *with*
-        // the pattern instead.
-        //
-        // Conditions referencing IS-ref-introduced variables must still be
-        // deferred until after the IS-ref CrossJoin resolves. This includes:
-        //   - Target variables (e.g., `pub` from `c IS rule TO pub`)
-        //   - Non-KEY value columns from the target rule's yield schema
-        //     (e.g., `relevance` from a rule that YIELDs KEY c, KEY pub, relevance)
-        let mut is_ref_deferred_vars: HashSet<String> = HashSet::new();
-        for cond in &clause.where_conditions {
-            if let RuleCondition::IsReference(ir) = cond
-                && !ir.negated
-            {
-                if let Some(target) = &ir.target {
-                    is_ref_deferred_vars.insert(target.clone());
-                }
-                let target_rule_name = ir.rule_name.to_string();
-                if let Some(target_rule) = rule_catalog.get(&target_rule_name) {
-                    for col in &target_rule.yield_schema {
-                        if !col.is_key {
-                            is_ref_deferred_vars.insert(col.name.clone());
-                        }
-                    }
-                }
-            }
-        }
-
-        // A generator's outputs exist only once it has run, after the
-        // IS-reference joins (its arguments may read their columns).
-        is_ref_deferred_vars.extend(
-            clause_generator_outputs(clause)
-                .into_iter()
-                .map(String::from),
-        );
-
-        let all_filter_exprs: Vec<&Expr> = clause
-            .where_conditions
+        // the pattern instead. Every other conjunct is a `Filter` step of the
+        // plan, placed after the step that produces its last name.
+        let immediate_filter_exprs: Vec<&Expr> = binding
+            .immediate_filters
             .iter()
-            .filter_map(|c| match c {
-                RuleCondition::Expression(e) => Some(e),
-                _ => None,
-            })
-            .collect();
-
-        let (deferred_filter_exprs, immediate_filter_exprs): (Vec<&Expr>, Vec<&Expr>) =
-            if is_ref_deferred_vars.is_empty() {
-                (Vec::new(), all_filter_exprs)
-            } else {
-                all_filter_exprs
-                    .into_iter()
-                    .partition(|e| expr_references_any(e, &is_ref_deferred_vars))
-            };
+            .map(|&index| filter_condition(clause, index))
+            .collect::<Result<_>>()?;
 
         // Step 2: MATCH pattern → Scan→Traverse chain.
         //
@@ -2046,437 +2001,315 @@ impl<'a> LocyPlanBuilder<'a> {
             };
         }
 
-        // Step 3: IS-reference joins
-        let mut is_refs = Vec::new();
-        let mut along_bindings = Vec::new();
-        let mut positive_is_ref_occurrence: usize = 0;
+        // Step 3: the body's IS references, generators and remaining filters,
+        // in the binding plan's order.
+        //
+        // Every positive reference joins its derived scan under its own
+        // prefix (`__isref{k}_`), the first included, so no referenced column
+        // enters the batch under a bare name another name could capture
+        // (issue #300). A reference's tests — positions whose variable is
+        // bound elsewhere — form one conjunction directly on its CrossJoin,
+        // which the physical planner lowers to a multi-key hash join.
+        let positive_occurrence: HashMap<usize, usize> = binding
+            .refs
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| !r.negated)
+            .enumerate()
+            .map(|(occurrence, (r, _))| (r, occurrence))
+            .collect();
         // Each positive reference's scan columns, by occurrence, for its
         // referenced-fact discriminator (`DerivKind::Ref`).
         let mut ref_scan_columns: HashMap<usize, Vec<String>> = HashMap::new();
 
-        // Bare→aliased name map for non-KEY value columns of non-first positive
-        // IS-refs (whose scan columns get an `__isref{n}_` prefix). Used to
-        // rewrite FOLD inputs / YIELD exprs / deferred WHERE filters that
-        // reference those columns by bare name. `bare_is_ref_cols` tracks names
-        // already exposed unprefixed (by an occurrence-0 ref) so they keep
-        // shadowing later identically named columns.
-        let mut is_ref_col_aliases: HashMap<String, String> = HashMap::new();
-        // Scalar variables an IS reference bound (a value-column subject or a
-        // scalar `TO` target) → the scan column holding them. A later binding
-        // of the same variable is a test against that column, not a rebinding.
-        let mut scalar_bindings: HashMap<String, String> = HashMap::new();
-        let mut bare_is_ref_cols: HashSet<String> = HashSet::new();
-
-        // Hidden `{var}._vid` projections for negated IS-ref subjects, so the
-        // anti-join can resolve them by node identity instead of by whatever
-        // name YIELD gave them. Pushed onto `projections` after everything else
-        // (see `ISNOT_VID_COL_PREFIX`) and stripped once the anti-join has run.
-        let mut isnot_vid_projections: Vec<(String, String)> = Vec::new();
-        let mut isnot_ref_index: usize = 0;
-
-        for condition in &clause.where_conditions {
-            if let RuleCondition::IsReference(is_ref) = condition {
-                let target_rule_name = is_ref.rule_name.to_string();
-
-                // Validate: rule exists in catalog
-                let target_rule = rule_catalog.get(&target_rule_name).with_context(|| {
-                    format!("IS-reference to unknown rule '{}'", target_rule_name)
-                })?;
-
-                // Validate: arity. Subjects, then the optional target, bind the
-                // referenced rule's binding sequence: its KEY columns, then its
-                // value columns (`uni_locy::is_binding`). The compiler checks
-                // the same rule; this guards programs built without it.
-                let key_count = target_rule
-                    .yield_schema
-                    .iter()
-                    .filter(|yc| yc.is_key)
-                    .count();
-                let Some(bound_columns) = uni_locy::is_binding::bound_columns(
-                    &target_rule.yield_schema,
-                    is_ref.subjects.len(),
-                    is_ref.target.is_some(),
-                ) else {
-                    bail!(
-                        "IS-reference to '{}': arity mismatch — {} bindings \
-                         provided but rule yields only {} columns",
-                        target_rule_name,
-                        is_ref.subjects.len() + usize::from(is_ref.target.is_some()),
-                        target_rule.yield_schema.len(),
+        for step in &binding.steps {
+            match *step {
+                BindingStep::Ref(r) => {
+                    let ref_binding = &binding.refs[r];
+                    let target_rule_name = ref_binding.rule.as_str();
+                    let target_rule = rule_catalog.get(target_rule_name).with_context(|| {
+                        format!("IS-reference to unknown rule '{}'", target_rule_name)
+                    })?;
+                    let is_self_ref = stratum_rule_names.contains(target_rule_name);
+                    // A same-stratum handle is fed live pre-fold facts, so it
+                    // must declare the TARGET rule's discriminators — which in a
+                    // mutually-recursive stratum need not match this rule's.
+                    let target_deriv = derivation_discriminator_columns(
+                        target_rule,
+                        ctx.is_recursive,
+                        stratum_rule_names,
+                        rule_catalog,
                     );
-                };
-                // As the compiler: an unbound variable on a value column is
-                // existentially quantified and dropped from the anti-join; a
-                // bound one would need a value comparison negation cannot make.
-                if is_ref.negated
-                    && let Some((var, col)) = is_ref
-                        .subjects
-                        .iter()
-                        .chain(is_ref.target.iter())
-                        .zip(bound_columns.iter())
-                        .find(|(var, col)| {
-                            !col.is_key
-                                && (clause_node_vars.contains(*var)
-                                    || scalar_bindings.contains_key(*var))
-                        })
-                {
-                    bail!(
-                        "IS NOT reference to '{}' compares the bound variable `{}` with `{}`, \
-                         which is not a KEY column",
-                        target_rule_name,
-                        var,
-                        col.name,
-                    );
-                }
-                let binding_columns: Vec<String> =
-                    bound_columns.iter().map(|c| c.name.clone()).collect();
-
-                let is_self_ref = stratum_rule_names.contains(&target_rule_name);
-                // A same-stratum handle is fed live pre-fold facts, so it must
-                // declare the TARGET rule's discriminators — which in a
-                // mutually-recursive stratum need not match this rule's.
-                let target_deriv = derivation_discriminator_columns(
-                    target_rule,
-                    ctx.is_recursive,
-                    stratum_rule_names,
-                    rule_catalog,
-                );
-                // Issue #162: a positive same-stratum reference to a rule that
-                // carries FOLD reads the folded view, so this clause folds one
-                // value per child rather than one per child *derivation*.
-                //
-                // ALONG opts the whole clause out. `prev.x` is rewritten to a
-                // bare column reference over this same scan
-                // (`rewrite_prev_refs`), so there is no way to give the fold a
-                // folded value and `prev` a per-path one through one handle —
-                // and a path accumulator that read a KEY's aggregate would stop
-                // being a path accumulator. An ALONG clause therefore keeps
-                // contributions; a sibling clause of the same rule that folds
-                // an inherited value still gets the folded view, which is why
-                // the two views are keyed separately.
-                let target_has_fold = target_rule.clauses.iter().any(|c| !c.fold.is_empty());
-                let view =
-                    if is_self_ref && !is_ref.negated && target_has_fold && clause.along.is_empty()
-                    {
+                    // Issue #162: a positive same-stratum reference to a rule
+                    // that carries FOLD reads the folded view, so this clause
+                    // folds one value per child rather than one per child
+                    // *derivation*.
+                    //
+                    // ALONG opts the whole clause out. `prev.x` reads a column
+                    // of this same scan, so there is no way to give the fold a
+                    // folded value and `prev` a per-path one through one handle
+                    // — and a path accumulator that read a KEY's aggregate
+                    // would stop being a path accumulator. An ALONG clause
+                    // therefore keeps contributions; a sibling clause of the
+                    // same rule that folds an inherited value still gets the
+                    // folded view, which is why the two views are keyed
+                    // separately.
+                    let target_has_fold = target_rule.clauses.iter().any(|c| !c.fold.is_empty());
+                    let view = if is_self_ref && target_has_fold && clause.along.is_empty() {
                         DerivedScanView::Folded
                     } else {
                         DerivedScanView::Contributions
                     };
-                let handle = self.get_or_create_derived_scan_handle_with_deriv(
-                    &target_rule_name,
-                    target_rule,
-                    is_self_ref,
-                    rule_catalog,
-                    &target_deriv,
-                    view,
-                );
-
-                // Look up target rule's PROB column (if any)
-                let (target_has_prob, target_prob_col) = rule_catalog
-                    .get(&target_rule_name)
-                    .and_then(|r| {
-                        r.yield_schema
-                            .iter()
-                            .find(|c| c.is_prob)
-                            .map(|c| (true, Some(c.name.clone())))
-                    })
-                    .unwrap_or((false, None));
-
-                // For a negated IS-ref, mint a hidden `{var}._vid` projection
-                // for every subject (and TO target) that is a MATCH-bound node
-                // variable. Only those have an expanded `._vid` column in the
-                // scan output — relationship variables expose `._eid`, and
-                // scalar / ALONG-bound subjects have neither, so they keep the
-                // by-name resolution path (and its error) unchanged.
-                let mut subject_vid_cols: HashMap<String, String> = HashMap::new();
-                if is_ref.negated {
-                    let n = isnot_ref_index;
-                    isnot_ref_index += 1;
-                    let mut record = |var: &String| {
-                        if clause_node_vars.contains(var) {
-                            let hidden = format!("{ISNOT_VID_COL_PREFIX}{n}_{var}");
-                            isnot_vid_projections.push((var.clone(), hidden.clone()));
-                            subject_vid_cols.insert(var.clone(), hidden);
-                        }
-                    };
-                    for subject in &is_ref.subjects {
-                        record(subject);
-                    }
-                    if let Some(target_var) = &is_ref.target {
-                        record(target_var);
-                    }
-                }
-
-                // Build LocyIsRef metadata
-                let locy_is_ref = LocyIsRef {
-                    rule_name: target_rule_name.clone(),
-                    subjects: is_ref
-                        .subjects
-                        .iter()
-                        .map(|s| Expr::Variable(s.clone()))
-                        .collect(),
-                    target: is_ref.target.as_ref().map(|t| Expr::Variable(t.clone())),
-                    negated: is_ref.negated,
-                    target_has_prob,
-                    target_prob_col,
-                    subject_vid_cols,
-                    binding_columns,
-                };
-                is_refs.push(locy_is_ref);
-
-                // Non-negated: CrossJoin + Filter (inner join semantics)
-                // Negated: no plan nodes — FixpointExec handles anti-join
-                if !is_ref.negated {
-                    // Each positive IS-ref joins a derived scan whose columns
-                    // are named after the target rule's yield schema. From the
-                    // second positive ref onward those names can collide with
-                    // an earlier scan's (always, for two refs to the same
-                    // rule), and the unqualified join predicate would silently
-                    // resolve against the FIRST scan's columns — contradictory
-                    // predicates, empty result. Alias every scan after the
-                    // first with a per-occurrence prefix and point its
-                    // predicates at the aliased names. The clause's final
-                    // yield projection drops non-yield columns, so aliased
-                    // names never leak into derived facts.
-                    let col_prefix = if positive_is_ref_occurrence == 0 {
-                        String::new()
-                    } else {
-                        format!("__isref{}_", positive_is_ref_occurrence)
-                    };
-                    positive_is_ref_occurrence += 1;
-
-                    // What each bare name resolved to before this reference, so
-                    // binding a name an earlier reference exposed is a test
-                    // rather than a silent rebinding.
-                    let exposed_before: HashMap<String, String> = bare_is_ref_cols
-                        .iter()
-                        .map(|name| (name.clone(), name.clone()))
-                        .chain(
-                            is_ref_col_aliases
-                                .iter()
-                                .map(|(k, v)| (k.clone(), v.clone())),
-                        )
-                        .collect();
-
-                    // Record bare→aliased names for this ref's non-KEY value
-                    // columns so later FOLD/YIELD/WHERE references resolve to
-                    // the prefixed scan column. First-occurrence wins: an
-                    // unprefixed (occurrence-0) column shadows identically
-                    // named later columns, matching join-predicate resolution.
-                    for col in target_rule.yield_schema.iter().filter(|c| !c.is_key) {
-                        if col_prefix.is_empty() {
-                            bare_is_ref_cols.insert(col.name.clone());
-                        } else if !bare_is_ref_cols.contains(&col.name)
-                            && !is_ref_col_aliases.contains_key(&col.name)
-                        {
-                            is_ref_col_aliases
-                                .insert(col.name.clone(), format!("{col_prefix}{}", col.name));
-                        }
-                    }
-
-                    let scan_schema = if col_prefix.is_empty() {
-                        handle.schema.clone()
-                    } else {
-                        alias_derived_schema(&handle.schema, &col_prefix)
-                    };
-                    ref_scan_columns.insert(
-                        positive_is_ref_occurrence - 1,
-                        scan_schema
-                            .fields()
-                            .iter()
-                            .map(|f| f.name().clone())
-                            .collect(),
+                    let handle = self.get_or_create_derived_scan_handle_with_deriv(
+                        target_rule_name,
+                        target_rule,
+                        is_self_ref,
+                        rule_catalog,
+                        &target_deriv,
+                        view,
                     );
-                    let derived_scan = LogicalPlan::LocyDerivedScan {
-                        scan_index: handle.scan_index,
-                        data: handle.data.clone(),
-                        schema: scan_schema,
-                    };
+                    let scan_schema = alias_derived_schema(&handle.schema, &ref_binding.prefix);
+                    if let Some(&occurrence) = positive_occurrence.get(&r) {
+                        ref_scan_columns.insert(
+                            occurrence,
+                            scan_schema
+                                .fields()
+                                .iter()
+                                .map(|f| f.name().clone())
+                                .collect(),
+                        );
+                    }
                     plan = LogicalPlan::CrossJoin {
                         left: Box::new(plan),
-                        right: Box::new(derived_scan),
+                        right: Box::new(LogicalPlan::LocyDerivedScan {
+                            scan_index: handle.scan_index,
+                            data: handle.data.clone(),
+                            schema: scan_schema,
+                        }),
                     };
 
-                    // Subjects that bind KEY columns test the derived scan:
-                    // `n._vid = a`.
-                    let key_subjects = &is_ref.subjects[..is_ref.subjects.len().min(key_count)];
-                    if !key_subjects.is_empty() {
-                        let predicate = build_is_ref_predicate(
-                            key_subjects,
-                            &target_rule.yield_schema,
-                            &clause_node_vars,
-                            &col_prefix,
-                        )?;
+                    // Every test of this reference, in one Filter directly on
+                    // its CrossJoin: `o._vid = __isref1_o AND ...`.
+                    let tests = ref_binding
+                        .positions
+                        .iter()
+                        .filter(|p| {
+                            matches!(
+                                p.action,
+                                PositionAction::TestNode | PositionAction::TestScalar
+                            )
+                        })
+                        .map(|p| Ok(equals(scope.identity(&p.variable)?, &p.physical)))
+                        .collect::<Result<Vec<Expr>>>()?;
+                    if !tests.is_empty() {
                         plan = LogicalPlan::Filter {
                             input: Box::new(plan),
-                            predicate,
+                            predicate: combine_with_and(&tests.iter().collect::<Vec<_>>()),
                             optional_variables: HashSet::new(),
                         };
                     }
 
-                    // Subjects past the KEY columns, then the `TO` target, bind
-                    // the rest of the binding sequence (`uni_locy::is_binding`):
-                    // `(o, e, pct) IS stake` binds `pct` exactly as
-                    // `(o, e) IS stake TO pct` does (issues #272, #298).
-                    let later_bindings = is_ref
-                        .subjects
+                    // A node the reference binds is materialized as a proper
+                    // node (with `._vid`, `._labels` and property columns), so
+                    // property access on it works: a `ScanAll` joined on its
+                    // vid. The binding plan binds each variable once, so a node
+                    // is never scanned twice — a second `ScanAll` cross-joins
+                    // the node with itself and inflates any aggregate over the
+                    // joined value columns.
+                    for position in ref_binding
+                        .positions
                         .iter()
-                        .enumerate()
-                        .skip(key_count)
-                        .chain(is_ref.target.iter().map(|t| (is_ref.subjects.len(), t)));
-                    for (position, bound_var) in later_bindings {
-                        let binding_col =
-                            is_ref_binding_column(position, &target_rule.yield_schema);
-                        let binds_node = is_ref_binds_node(
-                            &target_rule_name,
-                            position,
-                            rule_catalog,
-                            &mut HashSet::new(),
-                        );
-
-                        if let Some((col_name, _)) = &binding_col
-                            && !binds_node
-                        {
-                            // A scalar column — a FOLD result, an ALONG
-                            // accumulation, a projected property. Bind it by
-                            // name: record `bound_var` → this scan's column so
-                            // FOLD, YIELD and the deferred WHERE resolve it,
-                            // and do not scan, VID-join, or register it as a
-                            // node. Treating it as a node is issue #272 — the
-                            // emitted `var._vid = <scalar col>` matched nothing
-                            // and the rule silently returned no rows. A
-                            // variable bound already is tested instead.
-                            let scan_col = format!("{col_prefix}{col_name}");
-                            let earlier = scalar_bindings
-                                .get(bound_var)
-                                .or_else(|| exposed_before.get(bound_var))
-                                .cloned();
-                            match earlier {
-                                Some(earlier_col) => {
-                                    plan = LogicalPlan::Filter {
-                                        input: Box::new(plan),
-                                        predicate: Expr::BinaryOp {
-                                            left: Box::new(Expr::Variable(earlier_col)),
-                                            op: BinaryOp::Eq,
-                                            right: Box::new(Expr::Variable(scan_col)),
-                                        },
-                                        optional_variables: HashSet::new(),
-                                    };
-                                }
-                                None => {
-                                    if *bound_var != scan_col {
-                                        is_ref_col_aliases
-                                            .insert(bound_var.clone(), scan_col.clone());
-                                    }
-                                    scalar_bindings.insert(bound_var.clone(), scan_col);
-                                }
-                            }
-                        }
-
-                        if let Some((col_name, _)) = binding_col.filter(|_| binds_node) {
-                            // Materialize `bound_var` as a proper node (with
-                            // `._vid`, `._labels`, and property columns) the
-                            // FIRST time it appears, so property access (e.g.
-                            // `b.embedding`) works and later subjects can use it.
-                            // If it is already a node variable — a MATCH-bound
-                            // var, or the shared target of an earlier IS-ref
-                            // (`... TO ce, ... TO ce`) — do NOT re-scan it: a
-                            // second `ScanAll` cross-joins the node with itself,
-                            // inflating any aggregate over the joined value
-                            // columns (e.g. `MPROD(mapping_conf)` over the
-                            // cartesian square of the shared element set).
-                            if !clause_node_vars.contains(bound_var) {
-                                let node_scan = LogicalPlan::ScanAll {
-                                    variable: bound_var.clone(),
-                                    filter: None,
-                                    optional: false,
-                                };
-                                plan = LogicalPlan::CrossJoin {
-                                    left: Box::new(plan),
-                                    right: Box::new(node_scan),
-                                };
-                            }
-                            // Bind: bound_var._vid = derived_col (UInt64
-                            // equality). For an already-bound variable this ties
-                            // this ref's derived scan to the same node the earlier
-                            // binding chose, turning a shared `TO ce` into a join
-                            // constraint rather than a fresh cross product.
-                            let node_binding = Expr::BinaryOp {
-                                left: Box::new(Expr::Variable(format!("{}._vid", bound_var))),
-                                op: BinaryOp::Eq,
-                                right: Box::new(Expr::Variable(format!("{col_prefix}{col_name}"))),
-                            };
-                            plan = LogicalPlan::Filter {
-                                input: Box::new(plan),
-                                predicate: node_binding,
-                                optional_variables: HashSet::new(),
-                            };
-                            // Record it as a node variable so chained IS-refs
-                            // later in this clause can use it as a subject
-                            // (`x IS r TO mid, mid IS r TO z`).
-                            clause_node_vars.insert(bound_var.clone());
-                        }
+                        .filter(|p| p.action == PositionAction::BindNode)
+                    {
+                        plan = LogicalPlan::CrossJoin {
+                            left: Box::new(plan),
+                            right: Box::new(LogicalPlan::ScanAll {
+                                variable: position.variable.clone(),
+                                filter: None,
+                                optional: false,
+                            }),
+                        };
+                        plan = LogicalPlan::Filter {
+                            input: Box::new(plan),
+                            predicate: equals(
+                                Expr::Variable(format!("{}._vid", position.variable)),
+                                &position.physical,
+                            ),
+                            optional_variables: HashSet::new(),
+                        };
                     }
+                }
+                BindingStep::Generator(cond) => {
+                    let RuleCondition::Generator(generator) = &clause.where_conditions[cond] else {
+                        bail!("internal error: binding plan step {cond} is not a generator");
+                    };
+                    let generator_binding = binding
+                        .generators
+                        .iter()
+                        .find(|g| g.condition_index == cond)
+                        .with_context(|| {
+                            format!("internal error: binding plan has no generator {cond}")
+                        })?;
+                    plan = LogicalPlan::LocyGenerate {
+                        input: Box::new(plan),
+                        name: generator.name.to_string(),
+                        args: generator
+                            .args
+                            .iter()
+                            .map(|arg| scope.resolve(arg.clone()))
+                            .collect::<Result<_>>()?,
+                        outputs: generator_binding
+                            .outputs
+                            .iter()
+                            .map(|o| o.physical.clone())
+                            .collect(),
+                    };
+                    // An output another condition binds is renamed and tested.
+                    let tests = generator_binding
+                        .outputs
+                        .iter()
+                        .filter(|o| !o.binds)
+                        .map(|o| Ok(equals(scope.identity(&o.variable)?, &o.physical)))
+                        .collect::<Result<Vec<Expr>>>()?;
+                    if !tests.is_empty() {
+                        plan = LogicalPlan::Filter {
+                            input: Box::new(plan),
+                            predicate: combine_with_and(&tests.iter().collect::<Vec<_>>()),
+                            optional_variables: HashSet::new(),
+                        };
+                    }
+                }
+                BindingStep::Filter(cond) => {
+                    let predicate = scope.resolve(filter_condition(clause, cond)?.clone())?;
+                    plan = LogicalPlan::Filter {
+                        input: Box::new(plan),
+                        predicate,
+                        optional_variables: HashSet::new(),
+                    };
+                }
+                // Negations add no plan node: the fixpoint anti-joins the
+                // projected body against the negated rule's facts, which it
+                // reads through the rule's derived-scan handle.
+                BindingStep::AntiJoin(r) => {
+                    let target_rule_name = binding.refs[r].rule.as_str();
+                    let target_rule = rule_catalog.get(target_rule_name).with_context(|| {
+                        format!("IS-reference to unknown rule '{}'", target_rule_name)
+                    })?;
+                    let target_deriv = derivation_discriminator_columns(
+                        target_rule,
+                        ctx.is_recursive,
+                        stratum_rule_names,
+                        rule_catalog,
+                    );
+                    self.get_or_create_derived_scan_handle_with_deriv(
+                        target_rule_name,
+                        target_rule,
+                        stratum_rule_names.contains(target_rule_name),
+                        rule_catalog,
+                        &target_deriv,
+                        DerivedScanView::Contributions,
+                    );
                 }
             }
         }
 
-        // Step 3.4: generator conditions, in the order written, so a later
-        // generator can read an earlier one's outputs.
-        for condition in &clause.where_conditions {
-            if let RuleCondition::Generator(generator) = condition {
-                plan = LogicalPlan::LocyGenerate {
-                    input: Box::new(plan),
-                    name: generator.name.to_string(),
-                    args: generator
-                        .args
-                        .iter()
-                        .map(|arg| rewrite_is_ref_cols(arg.clone(), &is_ref_col_aliases))
-                        .collect(),
-                    outputs: generator.outputs.clone(),
-                };
-            }
-        }
-
-        // Step 3.5: Apply deferred WHERE conditions (those referencing IS-ref target vars).
-        if !deferred_filter_exprs.is_empty() {
-            let predicate = combine_with_and(&deferred_filter_exprs);
-            // Rewrite bare references to non-first IS-refs' value columns to
-            // their aliased scan names (e.g. `relevance` → `__isref1_relevance`).
-            let predicate = rewrite_is_ref_cols(predicate, &is_ref_col_aliases);
-            plan = LogicalPlan::Filter {
-                input: Box::new(plan),
-                predicate,
-                optional_variables: HashSet::new(),
+        // The IS-reference metadata, in textual order, with each negation's
+        // key: its KEY positions that some literal binds, read from a hidden
+        // column carrying the binder's identity through `LocyProject`. The
+        // anti-join runs after the projection, so a subject read by whatever
+        // YIELD called it was unresolvable when YIELD renamed or dropped it,
+        // and the negation silently became a no-op (issue #158).
+        let mut is_refs = Vec::with_capacity(binding.refs.len());
+        let mut negation_projections: Vec<(Expr, String)> = Vec::new();
+        let mut negated_index: usize = 0;
+        for ref_binding in &binding.refs {
+            let RuleCondition::IsReference(is_ref) =
+                &clause.where_conditions[ref_binding.condition_index]
+            else {
+                bail!(
+                    "internal error: binding plan reference {} is not an IS reference",
+                    ref_binding.condition_index
+                );
             };
-        }
-
-        // Collect ALONG binding names
-        for along in &clause.along {
-            along_bindings.push(along.name.clone());
-        }
-
-        // Validate ALONG prev-references against available yield schemas
-        if !clause.along.is_empty() {
-            let available_prev_fields: HashSet<&str> = is_refs
-                .iter()
-                .flat_map(|ir| {
-                    rule_catalog
-                        .get(&ir.rule_name)
-                        .map(|r| {
-                            r.yield_schema
-                                .iter()
-                                .map(|yc| yc.name.as_str())
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default()
+            let (target_has_prob, target_prob_col) = rule_catalog
+                .get(&ref_binding.rule)
+                .and_then(|r| {
+                    r.yield_schema
+                        .iter()
+                        .find(|c| c.is_prob)
+                        .map(|c| (true, Some(c.name.clone())))
                 })
-                .collect();
+                .unwrap_or((false, None));
+            let mut negation_keys = Vec::new();
+            if ref_binding.negated {
+                let k = negated_index;
+                negated_index += 1;
+                for position in ref_binding.positions.iter().filter(|p| p.is_key) {
+                    if position.action == PositionAction::Existential {
+                        bail!(
+                            "IS NOT reference to '{}' binds KEY column `{}` to `{}`, which no \
+                             MATCH pattern, positive IS reference or generator of the clause binds",
+                            ref_binding.rule,
+                            position.column,
+                            position.variable,
+                        );
+                    }
+                    let hidden = format!("{ISNOT_VID_COL_PREFIX}{k}_{}", position.variable);
+                    if !negation_projections.iter().any(|(_, h)| *h == hidden) {
+                        negation_projections
+                            .push((scope.identity(&position.variable)?, hidden.clone()));
+                    }
+                    negation_keys.push(NegationKey {
+                        variable: position.variable.clone(),
+                        body_column: hidden,
+                        fact_column: position.column.clone(),
+                        kind: position.kind,
+                    });
+                }
+            }
+            is_refs.push(LocyIsRef {
+                rule_name: ref_binding.rule.clone(),
+                subjects: is_ref
+                    .subjects
+                    .iter()
+                    .map(|s| Expr::Variable(s.clone()))
+                    .collect(),
+                target: is_ref.target.as_ref().map(|t| Expr::Variable(t.clone())),
+                negated: is_ref.negated,
+                target_has_prob,
+                target_prob_col,
+                negation_keys,
+                binding_columns: ref_binding
+                    .positions
+                    .iter()
+                    .map(|p| p.column.clone())
+                    .collect(),
+            });
+        }
 
+        let along_bindings: Vec<String> = clause.along.iter().map(|a| a.name.clone()).collect();
+
+        // ALONG's `prev` reads the one reference into the clause's own
+        // recursive group, under that reference's prefix.
+        let prev_ref = binding.prev_ref.map(|r| &binding.refs[r]);
+        if !clause.along.is_empty() {
+            let prev_fields: Option<(&str, HashSet<&str>)> = prev_ref.map(|r| {
+                let fields = rule_catalog
+                    .get(&r.rule)
+                    .map(|rule| {
+                        rule.yield_schema
+                            .iter()
+                            .map(|yc| yc.name.as_str())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (r.rule.as_str(), fields)
+            });
             for along in &clause.along {
-                validate_prev_refs(&along.expr, &available_prev_fields)?;
+                validate_prev_refs(&along.expr, prev_fields.as_ref())?;
             }
         }
+        let prev_prefix = prev_ref.map(|r| r.prefix.as_str());
 
         // Steps 4+5+6: ALONG + YIELD + PRIORITY as a single projection
         let along_map: HashMap<&str, &LocyExpr> = clause
@@ -2526,8 +2359,16 @@ impl<'a> LocyPlanBuilder<'a> {
         // in the input plan schema.
         let rewritten_along: HashMap<&str, Expr> = along_map
             .iter()
-            .filter_map(|(&name, locy_expr)| rewrite_locy_expr(locy_expr).ok().map(|e| (name, e)))
-            .collect();
+            .map(|(&name, locy_expr)| {
+                Ok((name, rewrite_locy_expr(locy_expr, prev_prefix, &scope)?))
+            })
+            .collect::<Result<_>>()?;
+        // A projected expression: its names resolved, ALONG names inlined, and
+        // a bare node or relationship read through its identity column.
+        let project = |expr: Expr| -> Result<Expr> {
+            let resolved = substitute_along_vars(projection_scope.resolve(expr)?, &rewritten_along);
+            Ok(projection_scope.top_level(resolved))
+        };
 
         let mut projections = Vec::new();
         let mut target_types = Vec::new();
@@ -2558,8 +2399,8 @@ impl<'a> LocyPlanBuilder<'a> {
             }))
             .collect();
         for (yc, column_name) in ordered_cols {
-            let expr = if let Some(locy_expr) = along_map.get(yc.name.as_str()) {
-                rewrite_locy_expr(locy_expr)?
+            let expr = if let Some(along_expr) = rewritten_along.get(yc.name.as_str()) {
+                scope.top_level(along_expr.clone())
             } else if fold_output_names.contains(yc.name.as_str()) {
                 // FOLD output column — produced by FoldExec after aggregation.
                 // Its input column is projected separately (see the FOLD-input
@@ -2567,25 +2408,20 @@ impl<'a> LocyPlanBuilder<'a> {
                 // YIELD alias, so the runtime always resolves it by name.
                 continue;
             } else if let Some(orig_expr) = yield_expr_map.get(&yc.name) {
-                let e = (*orig_expr).clone();
-                let e = substitute_along_vars(e, &rewritten_along);
                 // A YIELD expression that references a FOLD output must NOT be
                 // projected in the pre-fold body: a bare fold-output variable
                 // (`n AS support`) is produced directly by FoldExec, and a
                 // computed expression over fold outputs (`total * 2.0 AS score`)
                 // is produced by the post-fold projection stage. Either way the
                 // aggregate does not exist here yet.
-                if expr_references_fold_output(&e, &fold_output_names) {
+                let inlined = substitute_along_vars((*orig_expr).clone(), &rewritten_along);
+                if expr_references_fold_output(&inlined, &fold_output_names) {
                     continue;
                 }
-                e
+                project((*orig_expr).clone())?
             } else {
-                let e = Expr::Variable(yc.name.clone());
-                substitute_along_vars(e, &rewritten_along)
+                project(Expr::Variable(yc.name.clone()))?
             };
-            // Resolve bare references to non-first IS-refs' aliased value
-            // columns (covers FOLD aggregate inputs and plain YIELD exprs).
-            let expr = rewrite_is_ref_cols(expr, &is_ref_col_aliases);
             projections.push((expr, Some(column_name.clone())));
             // A FOLD clause never reaches here with a FOLD output, and
             // `seed_types` holds a KEY column only when the clauses type it
@@ -2623,10 +2459,7 @@ impl<'a> LocyPlanBuilder<'a> {
                 // COUNTALL / COUNT(*) has no input column to carry through.
                 continue;
             };
-            // Mirror the substitutions the YIELD path applies: inline ALONG
-            // bindings, then rewrite non-first IS-ref value columns.
-            let expr = substitute_along_vars((*fold_input).clone(), &rewritten_along);
-            let expr = rewrite_is_ref_cols(expr, &is_ref_col_aliases);
+            let expr = project((*fold_input).clone())?;
             let expr = if is_count_fold(fb) {
                 count_input_marker(expr, clause, ctx.clause_index)
             } else {
@@ -2741,24 +2574,53 @@ impl<'a> LocyPlanBuilder<'a> {
         // into `apply_model_invocations`.
         for hidden in &clause.hidden_yield_cols {
             if let Some(orig_expr) = yield_expr_map.get(hidden) {
-                let e = (*orig_expr).clone();
-                let e = substitute_along_vars(e, &rewritten_along);
-                let e = rewrite_is_ref_cols(e, &is_ref_col_aliases);
-                projections.push((e, Some(hidden.clone())));
+                projections.push((project((*orig_expr).clone())?, Some(hidden.clone())));
             }
         }
 
-        // Hidden `{var}._vid` columns for negated IS-ref subjects (issue #158).
-        // Pushed LAST and with no `target_types` entry, for the same reason as
-        // the `__feat_*` columns above: `plan_locy_project` skips the coercion
-        // cast when `target_types.get(i)` is `None`, preserving the native
-        // UInt64 the anti-join requires.
-        //
-        // `Expr::Variable("a._vid")` is a raw dotted column reference, not a
-        // property access — `plan_locy_project` resolves it against the input
-        // schema by full name, which is where the graph scan emits it.
-        for (var, hidden) in &isnot_vid_projections {
-            projections.push((Expr::Variable(format!("{var}._vid")), Some(hidden.clone())));
+        // Hidden identity columns for negated IS-ref KEY positions (issue
+        // #158). Pushed after the typed columns and with no `target_types`
+        // entry, for the same reason as the `__feat_*` columns above:
+        // `plan_locy_project` skips the coercion cast when `target_types.get(i)`
+        // is `None`, preserving the native type the anti-join compares.
+        for (expr, hidden) in negation_projections {
+            projections.push((expr, Some(hidden)));
+        }
+
+        // BEST BY over names the projection does not keep (a property of a
+        // MATCH variable, a referenced value column): each such criterion is
+        // projected under a hidden `__bestby_{i}` column, ranked on, and
+        // stripped once BEST BY has run. Only for non-FOLD clauses; see Step 8.
+        let projected_names: Vec<String> = projections
+            .iter()
+            .filter_map(|(_, alias)| alias.clone())
+            .collect();
+        let yield_names: HashSet<&str> = yield_cols.iter().map(|yc| yc.name.as_str()).collect();
+        let mut best_by_criteria: Option<Vec<(Expr, bool)>> = None;
+        let mut best_by_hidden = false;
+        if let Some(best_by) = clause.best_by.as_ref().filter(|_| clause.fold.is_empty()) {
+            let mut criteria = Vec::with_capacity(best_by.items.len());
+            for (i, item) in best_by.items.iter().enumerate() {
+                let reads_yield_only = collect_expr_variables(&item.expr)
+                    .iter()
+                    .all(|v| yield_names.contains(v.as_str()));
+                if reads_yield_only {
+                    criteria.push((item.expr.clone(), item.ascending));
+                    continue;
+                }
+                // A YIELD alias the criterion names is its YIELD expression.
+                let inlined = map_variables(item.expr.clone(), &|name| {
+                    if projection_scope.source(name).is_some() || !yield_names.contains(name) {
+                        return None;
+                    }
+                    yield_expr_map.get(name).map(|e| (*e).clone())
+                });
+                let hidden = format!("__bestby_{i}");
+                projections.push((project(inlined)?, Some(hidden.clone())));
+                best_by_hidden = true;
+                criteria.push((Expr::Variable(hidden), item.ascending));
+            }
+            best_by_criteria = Some(criteria);
         }
 
         // Phase B A4 follow-up: when the clause has neural-model
@@ -2808,9 +2670,26 @@ impl<'a> LocyPlanBuilder<'a> {
                     );
                 }
             }
+            // The feature expressions read the body batch, so their names
+            // are resolved to its columns here: the runtime resolvers look
+            // each one up by exact name. The plan's copy keeps the written
+            // expressions, which EXPLAIN evaluates against fact rows.
+            let invocations = clause
+                .model_invocations
+                .iter()
+                .map(|inv| {
+                    let mut inv = inv.clone();
+                    inv.feature_exprs = inv
+                        .feature_exprs
+                        .into_iter()
+                        .map(|e| scope.resolve_identity(e))
+                        .collect::<Result<_>>()?;
+                    Ok(inv)
+                })
+                .collect::<Result<Vec<_>>>()?;
             plan = LogicalPlan::LocyModelInvoke {
                 input: Box::new(plan),
-                invocations: clause.model_invocations.clone(),
+                invocations,
                 classifier_registry: Arc::clone(&classifier_registry),
                 classifier_cache: classifier_cache.as_ref().map(Arc::clone),
                 classifier_provenance_store: classifier_provenance_store.as_ref().map(Arc::clone),
@@ -2841,17 +2720,11 @@ impl<'a> LocyPlanBuilder<'a> {
         // the result (and, for a renamed aggregate, referencing a column that
         // only exists pre-fold). There is no sensible pre-fold reading of
         // "best by an aggregate", so skip it for FOLD clauses.
-        if let Some(best_by) = clause.best_by.as_ref().filter(|_| clause.fold.is_empty()) {
+        if let Some(criteria) = best_by_criteria {
             let key_columns: Vec<String> = yield_cols
                 .iter()
                 .filter(|yc| yc.is_key)
                 .map(|yc| yc.name.clone())
-                .collect();
-
-            let criteria: Vec<(Expr, bool)> = best_by
-                .items
-                .iter()
-                .map(|item| (item.expr.clone(), item.ascending))
                 .collect();
 
             plan = LogicalPlan::LocyBestBy {
@@ -2859,7 +2732,30 @@ impl<'a> LocyPlanBuilder<'a> {
                 key_columns,
                 criteria,
             };
+            if best_by_hidden {
+                // Strip the hidden criterion columns: every other column
+                // passes through by its exact name.
+                plan = LogicalPlan::LocyProject {
+                    input: Box::new(plan),
+                    projections: projected_names
+                        .into_iter()
+                        .map(|name| (Expr::Variable(name.clone()), Some(name)))
+                        .collect(),
+                    target_types: Vec::new(),
+                };
+            }
         }
+
+        // Structural guard (issue #300): every name the body reads is a column
+        // some node below it produced. A bare name the plan does not source
+        // fails here, in debug builds and so in CI, instead of reaching
+        // DataFusion, which resolves it by column name and captures whatever
+        // column happens to carry it.
+        #[cfg(debug_assertions)]
+        check_sources(
+            &pattern_vars.iter().map(|v| v.name.clone()).collect(),
+            &plan,
+        )?;
 
         Ok(LocyClausePlan {
             body: plan,
@@ -2971,6 +2867,185 @@ impl<'a> LocyPlanBuilder<'a> {
 }
 
 // ---------------------------------------------------------------------------
+// Structural guard: every read of a clause body is a produced column
+// ---------------------------------------------------------------------------
+
+/// The names a plan node outputs, as [`check_sources`] tracks them.
+#[cfg(any(debug_assertions, test))]
+#[derive(Default)]
+struct Produced {
+    /// Entity variables: a MATCH variable or a node a reference binds
+    /// (`ScanAll`). Read bare, through a property access, or as a dotted
+    /// expansion column (`a._vid`, `a._labels`).
+    entities: HashSet<String>,
+    /// Plain columns, read by their exact name.
+    columns: HashSet<String>,
+}
+
+#[cfg(any(debug_assertions, test))]
+impl Produced {
+    fn reads(&self, name: &str) -> bool {
+        self.columns.contains(name)
+            || self.entities.contains(name)
+            || name
+                .split_once('.')
+                .is_some_and(|(entity, _)| self.entities.contains(entity))
+    }
+
+    fn extend(&mut self, other: Self) {
+        self.entities.extend(other.entities);
+        self.columns.extend(other.columns);
+    }
+}
+
+/// The names `expr` reads from its input: variables outside a comprehension's,
+/// quantifier's or `reduce`'s own bindings.
+#[cfg(any(debug_assertions, test))]
+fn expr_reads(expr: &Expr) -> Vec<String> {
+    fn walk(expr: &Expr, out: &mut Vec<String>) {
+        if let Expr::Variable(v) = expr {
+            out.push(v.clone());
+        }
+        expr.for_each_child_in_scope(&mut |child| walk(child, out));
+    }
+    let mut out = Vec::new();
+    walk(expr, &mut out);
+    out
+}
+
+/// Whether `plan` contains a node the Locy clause builder adds above the
+/// MATCH pattern. A subtree without one is the pattern's own plan, which the
+/// Cypher planner validated against the pattern's scope.
+#[cfg(any(debug_assertions, test))]
+fn has_locy_node(plan: &LogicalPlan) -> bool {
+    matches!(
+        plan,
+        LogicalPlan::LocyDerivedScan { .. }
+            | LogicalPlan::LocyGenerate { .. }
+            | LogicalPlan::LocyModelInvoke { .. }
+            | LogicalPlan::LocyProject { .. }
+            | LogicalPlan::LocyBestBy { .. }
+    ) || plan.children().into_iter().any(has_locy_node)
+}
+
+/// Checks that every expression of a clause body reads only names a node
+/// below it produced.
+///
+/// The MATCH pattern's plan produces `pattern`, the variables the Cypher
+/// planner recorded for it (the binding plan's MATCH variables, plus the
+/// hidden names of anonymous relationships); a derived scan produces its
+/// (prefixed) schema; a `ScanAll` the node it binds;
+/// a generator its physical outputs; a model invocation its output columns;
+/// a projection its aliases. A name that is none of these is one the
+/// clause builder emitted without resolving it through [`ClauseScope`]:
+/// DataFusion would resolve it by name and capture an unrelated column
+/// (issue #300).
+///
+/// # Errors
+///
+/// An internal error naming the first unproduced name, or a node kind the
+/// clause builder never emits above the pattern.
+#[cfg(any(debug_assertions, test))]
+fn check_sources(pattern: &HashSet<String>, body: &LogicalPlan) -> Result<()> {
+    fn require(node: &str, expr: &Expr, input: &Produced) -> Result<()> {
+        if let Some(name) = expr_reads(expr).into_iter().find(|n| !input.reads(n)) {
+            bail!(
+                "internal error: a Locy clause's {node} reads `{name}`, which no input column \
+                 produces; every name must be resolved through the clause's binding plan"
+            );
+        }
+        Ok(())
+    }
+    fn produced(pattern: &HashSet<String>, plan: &LogicalPlan) -> Result<Produced> {
+        if !has_locy_node(plan) && !matches!(plan, LogicalPlan::ScanAll { .. }) {
+            return Ok(Produced {
+                entities: pattern.clone(),
+                columns: HashSet::new(),
+            });
+        }
+        Ok(match plan {
+            LogicalPlan::LocyDerivedScan { schema, .. } => Produced {
+                entities: HashSet::new(),
+                columns: schema.fields().iter().map(|f| f.name().clone()).collect(),
+            },
+            LogicalPlan::ScanAll { variable, .. } => Produced {
+                entities: HashSet::from([variable.clone()]),
+                columns: HashSet::new(),
+            },
+            LogicalPlan::CrossJoin { left, right } => {
+                let mut names = produced(pattern, left)?;
+                names.extend(produced(pattern, right)?);
+                names
+            }
+            LogicalPlan::Filter {
+                input, predicate, ..
+            } => {
+                let names = produced(pattern, input)?;
+                require("WHERE filter", predicate, &names)?;
+                names
+            }
+            LogicalPlan::LocyGenerate {
+                input,
+                args,
+                outputs,
+                ..
+            } => {
+                let mut names = produced(pattern, input)?;
+                for arg in args {
+                    require("generator argument", arg, &names)?;
+                }
+                names.columns.extend(outputs.iter().cloned());
+                names
+            }
+            LogicalPlan::LocyModelInvoke {
+                input, invocations, ..
+            } => {
+                let mut names = produced(pattern, input)?;
+                for invocation in invocations {
+                    for feature in &invocation.feature_exprs {
+                        require("model feature", feature, &names)?;
+                    }
+                }
+                names
+                    .columns
+                    .extend(invocations.iter().map(|i| i.output_column.clone()));
+                names
+            }
+            LogicalPlan::LocyProject {
+                input, projections, ..
+            } => {
+                let names = produced(pattern, input)?;
+                for (expr, _) in projections {
+                    require("projection", expr, &names)?;
+                }
+                Produced {
+                    entities: HashSet::new(),
+                    columns: projections
+                        .iter()
+                        .filter_map(|(_, alias)| alias.clone())
+                        .collect(),
+                }
+            }
+            LogicalPlan::LocyBestBy {
+                input, criteria, ..
+            } => {
+                let names = produced(pattern, input)?;
+                for (expr, _) in criteria {
+                    require("BEST BY criterion", expr, &names)?;
+                }
+                names
+            }
+            other => {
+                let node = format!("{other:?}");
+                let kind = node.split([' ', '{', '(']).next().unwrap_or_default();
+                bail!("internal error: unexpected plan node above a Locy clause's pattern: {kind}")
+            }
+        })
+    }
+    produced(pattern, body).map(|_| ())
+}
+
+// ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
 
@@ -3008,56 +3083,11 @@ fn expr_vars_all_in_scope(expr: &Expr, vars: &[VariableInfo]) -> bool {
         .all(|v| is_var_in_scope(vars, v))
 }
 
-fn expr_references_any(e: &Expr, vars: &HashSet<String>) -> bool {
-    match e {
-        Expr::Variable(v) => vars.contains(v.as_str()),
-        Expr::Property(inner, _) => expr_references_any(inner, vars),
-        Expr::BinaryOp { left, right, .. } => {
-            expr_references_any(left, vars) || expr_references_any(right, vars)
-        }
-        Expr::UnaryOp { expr, .. } => expr_references_any(expr, vars),
-        Expr::FunctionCall { args, .. } => args.iter().any(|a| expr_references_any(a, vars)),
-        Expr::IsNull(inner) | Expr::IsNotNull(inner) | Expr::IsUnique(inner) => {
-            expr_references_any(inner, vars)
-        }
-        Expr::In { expr, list } => {
-            expr_references_any(expr, vars) || expr_references_any(list, vars)
-        }
-        Expr::List(exprs) => exprs.iter().any(|a| expr_references_any(a, vars)),
-        Expr::Map(entries) => entries.iter().any(|(_, a)| expr_references_any(a, vars)),
-        Expr::Case {
-            expr,
-            when_then,
-            else_expr,
-        } => {
-            expr.as_deref()
-                .is_some_and(|a| expr_references_any(a, vars))
-                || when_then
-                    .iter()
-                    .any(|(w, t)| expr_references_any(w, vars) || expr_references_any(t, vars))
-                || else_expr
-                    .as_deref()
-                    .is_some_and(|a| expr_references_any(a, vars))
-        }
-        Expr::ArrayIndex { array, index } => {
-            expr_references_any(array, vars) || expr_references_any(index, vars)
-        }
-        Expr::ArraySlice { array, start, end } => {
-            expr_references_any(array, vars)
-                || start
-                    .as_deref()
-                    .is_some_and(|a| expr_references_any(a, vars))
-                || end.as_deref().is_some_and(|a| expr_references_any(a, vars))
-        }
-        _ => false,
-    }
-}
-
 /// Rename every field of a derived scan's schema with `prefix`.
 ///
-/// Used for the second and later positive IS-refs of a clause so their
-/// columns cannot collide with an earlier scan's identically named yield
-/// columns (see the aliasing comment in `build_clause` Step 3).
+/// Used for every positive IS reference of a clause, with the prefix its
+/// binding plan assigns, so no referenced column enters the batch under a
+/// bare name another name could capture (see `build_clause` Step 3).
 fn alias_derived_schema(schema: &SchemaRef, prefix: &str) -> SchemaRef {
     let fields: Vec<Field> = schema
         .fields()
@@ -3071,109 +3101,218 @@ fn alias_derived_schema(schema: &SchemaRef, prefix: &str) -> SchemaRef {
     Arc::new(ArrowSchema::new(fields))
 }
 
-/// The column of the referenced rule bound by the IS-reference variable at
-/// `position`, with whether it is a KEY column.
-///
-/// One rule for every binding: [`uni_locy::is_binding::binding_sequence`].
-fn is_ref_binding_column(position: usize, yield_schema: &[YieldColumn]) -> Option<(String, bool)> {
-    uni_locy::is_binding::binding_column(yield_schema, position).map(|c| (c.name.clone(), c.is_key))
+/// `left = right`, with `right` a column of the joined batch.
+fn equals(left: Expr, right: &str) -> Expr {
+    Expr::BinaryOp {
+        left: Box::new(left),
+        op: BinaryOp::Eq,
+        right: Box::new(Expr::Variable(right.to_string())),
+    }
 }
 
-/// Equality predicates tying IS-reference subjects to the KEY columns they bind.
+/// The expression of the WHERE condition at `index`, which the binding plan
+/// lists as a filter.
+fn filter_condition(clause: &CompiledClause, index: usize) -> Result<&Expr> {
+    match clause.where_conditions.get(index) {
+        Some(RuleCondition::Expression(expr)) => Ok(expr),
+        _ => bail!("internal error: binding plan filter {index} is not a WHERE expression"),
+    }
+}
+
+/// Where a name a clause expression reads gets its value in the batch.
+enum NameSource {
+    /// A node or relationship the Cypher expression compiler knows as an
+    /// entity; the column holds its identity (`_vid` / `_eid`).
+    Entity(String),
+    /// A plain column.
+    Column(String),
+    /// A name left as written: a list-valued MATCH variable, or a name
+    /// [`ClauseScope::passthrough`] lists.
+    Passthrough,
+}
+
+/// The names a clause body may read, resolved through its binding plan.
 ///
-/// `subjects` are the reference's subjects that bind KEY columns: the first
-/// `min(subjects, KEY count)` of them, whose columns are the referenced rule's
-/// KEY columns in YIELD order. Subjects past the KEY columns, and a `TO`
-/// target, are bound by the caller (they may introduce a variable rather than
-/// test one). For node variables the predicate compares `._vid` (UInt64)
-/// instead of the bare variable, which is not a column.
-///
-/// `col_prefix` is the derived scan's column alias prefix (empty for the
-/// clause's first positive IS-ref); the yield-column side of every predicate
-/// is prefixed so it resolves against the right scan.
-fn build_is_ref_predicate(
-    subjects: &[String],
-    yield_schema: &[YieldColumn],
-    node_vars: &HashSet<String>,
-    col_prefix: &str,
-) -> Result<Expr> {
-    /// Build the expression for a variable in an IS-ref predicate.
-    /// Node variables use `var._vid` as a raw column reference (UInt64);
-    /// scalars use bare `var`.
-    fn make_var_expr(var_name: &str, node_vars: &HashSet<String>) -> Expr {
-        if node_vars.contains(var_name) {
-            // Use "var._vid" as a variable name — Column::from_name won't split
-            // on the dot, so DataFusion resolves this to the physical `var._vid`
-            // column from the graph scan (UInt64). This baked form compiles
-            // correctly both as a whole predicate and as an individually
-            // extracted equi-join key, which lets the physical planner recover a
-            // HashJoinExec for the IS-ref join: `collect_plan_variables` registers
-            // this exact `var._vid` name for node scans, so `classify_join_predicate`
-            // recognizes the conjunct as a cross-side equi-pair (#131).
-            Expr::Variable(format!("{}._vid", var_name))
-        } else {
-            Expr::Variable(var_name.to_string())
+/// The single place a clause expression's names become batch columns: a
+/// name the plan does not source is an internal error that names it, never
+/// a bare column reference DataFusion would resolve by name — which captured
+/// whatever column happened to carry that name (issue #300).
+struct ClauseScope<'p> {
+    plan: &'p ClauseBindingPlan,
+    /// Names resolved later or elsewhere: the columns `LocyModelInvoke` adds,
+    /// and, in a projection, ALONG names.
+    passthrough: HashSet<String>,
+}
+
+impl ClauseScope<'_> {
+    /// Where `var` gets its value, or `None` when nothing sources it.
+    ///
+    /// An ambiguous exposure sources nothing: reading one is the compile
+    /// error `AmbiguousRuleColumn`, so a read reaching the planner is an
+    /// internal error ([`Self::unsourced`]), never a guess between the
+    /// references that expose it.
+    fn source(&self, var: &str) -> Option<NameSource> {
+        if self.passthrough.contains(var) {
+            return Some(NameSource::Passthrough);
+        }
+        let plan = self.plan;
+        match plan.scope.get(var) {
+            Some(VarSource::Match(ColumnKind::Node)) => {
+                Some(NameSource::Entity(format!("{var}._vid")))
+            }
+            Some(VarSource::Match(ColumnKind::Edge)) => {
+                Some(NameSource::Entity(format!("{var}._eid")))
+            }
+            Some(VarSource::Match(ColumnKind::Scalar)) => Some(NameSource::Passthrough),
+            Some(VarSource::RefPosition { r, pos }) => {
+                let position = &plan.refs[*r].positions[*pos];
+                // A node a reference binds is also scanned (`ScanAll`), so
+                // the expression compiler knows it as an entity.
+                Some(if position.kind == ColumnKind::Node {
+                    NameSource::Entity(position.physical.clone())
+                } else {
+                    NameSource::Column(position.physical.clone())
+                })
+            }
+            Some(VarSource::Generator { physical, .. }) => {
+                Some(NameSource::Column(physical.clone()))
+            }
+            // Only an `IS NOT` subject, which reads the node it names.
+            Some(VarSource::YieldAlias(source)) => self.source(source),
+            None => match plan.exposure.get(var)? {
+                Exposure::Unique { physical, .. } => Some(NameSource::Column(physical.clone())),
+                Exposure::Ambiguous(_) => None,
+            },
         }
     }
 
-    let mut predicates = Vec::new();
-    for (position, subject) in subjects.iter().enumerate() {
-        let (col_name, is_key) =
-            is_ref_binding_column(position, yield_schema).with_context(|| {
-                format!("IS-ref subject {position} has no column to bind in the referenced rule")
-            })?;
-        if !is_key {
-            bail!("IS-ref subject {position} binds value column `{col_name}`, not a KEY column");
+    /// The internal error for a read of `var` that nothing sources.
+    fn unsourced(&self, var: &str) -> anyhow::Error {
+        if let Some(Exposure::Ambiguous(owners)) = self.plan.exposure.get(var) {
+            let refs: Vec<&str> = owners
+                .iter()
+                .map(|&o| self.plan.refs[o].rule.as_str())
+                .collect();
+            return anyhow::anyhow!(
+                "internal error: a Locy clause reads `{var}`, which {} all expose; the \
+                 compiler rejects this read as ambiguous",
+                refs.join(" and ")
+            );
         }
-        predicates.push(Expr::BinaryOp {
-            left: Box::new(make_var_expr(subject, node_vars)),
-            op: BinaryOp::Eq,
-            right: Box::new(Expr::Variable(format!("{col_prefix}{col_name}"))),
+        anyhow::anyhow!(
+            "internal error: a Locy clause reads `{var}`, which its binding plan does not source"
+        )
+    }
+
+    /// The column holding `var`'s value or identity, for an equality test.
+    ///
+    /// A MATCH relationship is read as `e._eid` through a property access,
+    /// the form the join classifier attributes to `e`'s side of a join.
+    fn identity(&self, var: &str) -> Result<Expr> {
+        if let Some(VarSource::Match(ColumnKind::Edge)) = self.plan.scope.get(var)
+            && !self.passthrough.contains(var)
+        {
+            return Ok(Expr::Property(
+                Box::new(Expr::Variable(var.to_string())),
+                "_eid".to_string(),
+            ));
+        }
+        match self.source(var) {
+            Some(NameSource::Entity(column) | NameSource::Column(column)) => {
+                Ok(Expr::Variable(column))
+            }
+            Some(NameSource::Passthrough) => Ok(Expr::Variable(var.to_string())),
+            None => Err(self.unsourced(var)),
+        }
+    }
+
+    /// `expr` with every name resolved to the batch: plain columns are
+    /// renamed to their physical column, entities and passthrough names are
+    /// kept for the expression compiler.
+    fn resolve(&self, expr: Expr) -> Result<Expr> {
+        let missing = RefCell::new(None::<String>);
+        let resolved = map_variables(expr, &|name| match self.source(name) {
+            Some(NameSource::Column(column)) => Some(Expr::Variable(column)),
+            Some(NameSource::Entity(_) | NameSource::Passthrough) => None,
+            None => {
+                missing.borrow_mut().get_or_insert_with(|| name.to_string());
+                None
+            }
         });
+        match missing.into_inner() {
+            Some(var) => Err(self.unsourced(&var)),
+            None => Ok(resolved),
+        }
     }
 
-    if predicates.is_empty() {
-        bail!("IS-ref predicate requires at least one subject binding");
+    /// A resolved projection: a bare entity is read through its identity
+    /// column, which is how a rule's facts carry nodes and relationships.
+    fn top_level(&self, expr: Expr) -> Expr {
+        match &expr {
+            Expr::Variable(var) => match self.source(var) {
+                Some(NameSource::Entity(column)) => Expr::Variable(column),
+                _ => expr,
+            },
+            _ => expr,
+        }
     }
 
-    Ok(combine_with_and(&predicates.iter().collect::<Vec<_>>()))
+    /// `expr` with every variable outside a property access read through its
+    /// identity column, as the model-feature resolvers look columns up: a
+    /// node feature `scorer(s)` or `pagerank(s)` reads `s`'s vid.
+    fn resolve_identity(&self, expr: Expr) -> Result<Expr> {
+        match expr {
+            Expr::Variable(var) => self.identity(&var),
+            Expr::Property(object, prop) if matches!(object.as_ref(), Expr::Variable(_)) => {
+                Ok(Expr::Property(Box::new(self.resolve(*object)?), prop))
+            }
+            other => {
+                let error = RefCell::new(None::<anyhow::Error>);
+                let resolved = other.map_children_in_scope(&mut |child| match self
+                    .resolve_identity(child.clone())
+                {
+                    Ok(e) => e,
+                    Err(e) => {
+                        error.borrow_mut().get_or_insert(e);
+                        child
+                    }
+                });
+                match error.into_inner() {
+                    Some(e) => Err(e),
+                    None => Ok(resolved),
+                }
+            }
+        }
+    }
 }
 
-/// Rewrite a [`LocyExpr`] into a Cypher [`Expr`].
+/// Rewrite a [`LocyExpr`] into a Cypher [`Expr`] over the clause's batch.
 ///
-/// `PrevRef(field)` becomes `Expr::Variable(field)` — the column is available
-/// directly from the derived scan output after the CrossJoin.
-pub(crate) fn rewrite_locy_expr(expr: &LocyExpr) -> Result<Expr> {
+/// `PrevRef(field)` reads `field` of the recursive reference ALONG's `prev`
+/// denotes, under that reference's prefix (`prev_prefix`); the Cypher parts
+/// are resolved through `scope`.
+fn rewrite_locy_expr(
+    expr: &LocyExpr,
+    prev_prefix: Option<&str>,
+    scope: &ClauseScope<'_>,
+) -> Result<Expr> {
     match expr {
-        LocyExpr::PrevRef(field) => Ok(Expr::Variable(field.clone())),
-        LocyExpr::Cypher(e) => Ok(e.clone()),
+        LocyExpr::PrevRef(field) => {
+            let prefix = prev_prefix
+                .with_context(|| format!("prev.{field} has no recursive IS reference to read"))?;
+            Ok(Expr::Variable(format!("{prefix}{field}")))
+        }
+        LocyExpr::Cypher(e) => scope.resolve(e.clone()),
         LocyExpr::BinaryOp { left, op, right } => Ok(Expr::BinaryOp {
-            left: Box::new(rewrite_locy_expr(left)?),
+            left: Box::new(rewrite_locy_expr(left, prev_prefix, scope)?),
             op: locy_op_to_cypher_op(op),
-            right: Box::new(rewrite_locy_expr(right)?),
+            right: Box::new(rewrite_locy_expr(right, prev_prefix, scope)?),
         }),
         LocyExpr::UnaryOp(op, inner) => Ok(Expr::UnaryOp {
             op: *op,
-            expr: Box::new(rewrite_locy_expr(inner)?),
+            expr: Box::new(rewrite_locy_expr(inner, prev_prefix, scope)?),
         }),
     }
-}
-
-/// Recursively rename `Variable(name)` nodes that refer to a non-first
-/// positive IS-ref's non-KEY value column to that column's per-occurrence
-/// aliased name (`__isref{n}_name`).
-///
-/// The second and later positive IS-refs of a clause have their derived-scan
-/// columns aliased with an `__isref{n}_` prefix (see `alias_derived_schema`
-/// and the aliasing comment in `build_clause` Step 3). FOLD aggregate inputs,
-/// YIELD expressions, and deferred WHERE filters that reference such a column
-/// by its bare yield name — e.g. `MPROD(mapping_conf)` where `mapping_conf`
-/// is yielded by a non-first `... IS element_mapped TO ce` — must be rewritten
-/// to the prefixed name, otherwise they resolve against a field that does not
-/// exist in the aliased scan schema and planning fails with a "No field named
-/// …" DataFusion error.
-fn rewrite_is_ref_cols(expr: Expr, aliases: &HashMap<String, String>) -> Expr {
-    rename_variables(expr, aliases)
 }
 
 /// Rewrite `Variable` nodes in an expression tree.
@@ -3184,8 +3323,8 @@ fn rewrite_is_ref_cols(expr: Expr, aliases: &HashMap<String, String>) -> Expr {
 /// mapping a name onto itself cannot loop.
 ///
 /// This is the single source of truth for variable substitution in Locy
-/// planning — the ALONG-inlining, IS-ref-column and FOLD-alias rewrites are all
-/// thin wrappers over it.
+/// planning — the ALONG-inlining, clause-name resolution and FOLD-alias
+/// rewrites are all thin wrappers over it.
 ///
 /// Recursion is delegated to [`Expr::map_children_in_scope`], which reaches the
 /// full variant set through `Expr::map_children` — the canonical exhaustive
@@ -3225,10 +3364,7 @@ fn map_variables(expr: Expr, f: &dyn Fn(&str) -> Option<Expr>) -> Expr {
 
 /// Rename `Variable` nodes according to a name -> name map.
 ///
-/// Shared body of [`rewrite_is_ref_cols`] and [`substitute_fold_aliases`],
-/// which differ only in what the map means at their call sites. Keeping the two
-/// names is deliberate: their doc comments carry domain knowledge that a single
-/// call of this function would not.
+/// The body of [`substitute_fold_aliases`].
 fn rename_variables(expr: Expr, renames: &HashMap<String, String>) -> Expr {
     if renames.is_empty() {
         return expr;
@@ -3304,7 +3440,7 @@ fn yield_schema_to_arrow_from_rule(
     rule_catalog: &HashMap<String, CompiledRule>,
     schema: &Schema,
 ) -> SchemaRef {
-    let target_node_vars = collect_node_vars(&target_rule.clauses, rule_catalog);
+    let target_node_vars = collect_node_vars(&target_rule.clauses);
     let first_clause = target_rule.clauses.first();
     let fold_names: HashSet<&str> = first_clause
         .map(|c| c.fold.iter().map(|fb| fb.name.as_str()).collect())
@@ -3342,27 +3478,34 @@ fn yield_schema_to_arrow_from_rule(
     Arc::new(ArrowSchema::new(fields))
 }
 
-/// Validate that all `PrevRef` fields in a [`LocyExpr`] reference columns
-/// available in the IS-reference yield schemas.
-fn validate_prev_refs(expr: &LocyExpr, available: &HashSet<&str>) -> Result<()> {
+/// Validate that every `PrevRef` field in a [`LocyExpr`] is a column of the
+/// recursive reference ALONG's `prev` reads.
+///
+/// `prev` is `(rule, its yield columns)` for the clause's one positive
+/// reference into its own recursive group, `None` when it has none.
+fn validate_prev_refs(expr: &LocyExpr, prev: Option<&(&str, HashSet<&str>)>) -> Result<()> {
     match expr {
         LocyExpr::PrevRef(field) => {
-            if !available.contains(field.as_str()) {
+            let Some((rule, fields)) = prev else {
                 bail!(
-                    "prev.{} references field '{}' not found in any \
-                     IS-reference yield schema",
-                    field,
-                    field,
+                    "prev.{field} references field '{field}', but the clause has no \
+                     IS reference into its own recursive group for prev to read",
+                );
+            };
+            if !fields.contains(field.as_str()) {
+                bail!(
+                    "prev.{field} references field '{field}' not found in the yield \
+                     schema of IS-reference '{rule}'",
                 );
             }
             Ok(())
         }
         LocyExpr::Cypher(_) => Ok(()),
         LocyExpr::BinaryOp { left, right, .. } => {
-            validate_prev_refs(left, available)?;
-            validate_prev_refs(right, available)
+            validate_prev_refs(left, prev)?;
+            validate_prev_refs(right, prev)
         }
-        LocyExpr::UnaryOp(_, inner) => validate_prev_refs(inner, available),
+        LocyExpr::UnaryOp(_, inner) => validate_prev_refs(inner, prev),
     }
 }
 
@@ -3500,6 +3643,7 @@ mod tests {
             priority: None,
             model_invocations: vec![],
             hidden_yield_cols: vec![],
+            binding: uni_locy::ClauseBinding::Pending,
         }
     }
 
@@ -3513,17 +3657,67 @@ mod tests {
         }
     }
 
+    /// `clause` with the binding plan the compiler would attach against
+    /// `catalog`, a reference to a rule in `names` counting as recursive.
+    fn planned(
+        clause: &CompiledClause,
+        catalog: &HashMap<String, CompiledRule>,
+        names: &HashSet<String>,
+    ) -> CompiledClause {
+        let kinds = uni_locy::ColumnKinds::infer(catalog);
+        let mut clause = clause.clone();
+        clause.binding =
+            ClauseBindingPlan::compute("test", &clause, catalog, &kinds, &|t| names.contains(t))
+                .map_or(uni_locy::ClauseBinding::Pending, |p| {
+                    uni_locy::ClauseBinding::Ready(Arc::new(p))
+                });
+        clause
+    }
+
+    /// `rule` with every clause [`planned`].
+    fn planned_rule(
+        rule: &CompiledRule,
+        catalog: &HashMap<String, CompiledRule>,
+        names: &HashSet<String>,
+    ) -> CompiledRule {
+        let mut rule = rule.clone();
+        rule.clauses = rule
+            .clauses
+            .iter()
+            .map(|c| planned(c, catalog, names))
+            .collect();
+        rule
+    }
+
+    /// `stratum` with every rule [`planned_rule`].
+    fn planned_stratum(
+        stratum: &Stratum,
+        catalog: &HashMap<String, CompiledRule>,
+        names: &HashSet<String>,
+    ) -> Stratum {
+        Stratum {
+            rules: stratum
+                .rules
+                .iter()
+                .map(|r| planned_rule(r, catalog, names))
+                .collect(),
+            ..stratum.clone()
+        }
+    }
+
     fn make_program(
         strata: Vec<Stratum>,
         rule_catalog: HashMap<String, CompiledRule>,
     ) -> CompiledProgram {
-        CompiledProgram {
+        let mut program = CompiledProgram {
             strata,
             rule_catalog,
             model_catalog: HashMap::new(),
             warnings: vec![],
             commands: vec![],
-        }
+        };
+        uni_locy::attach_binding_plans(&mut program).expect("binding plans attach");
+        program
     }
 
     fn make_rule(
@@ -3570,10 +3764,29 @@ mod tests {
     // Unit Tests — LocyExpr Rewriting
     // ===================================================================
 
+    /// `rewrite_locy_expr` with an unprefixed `prev` and `x` in scope.
+    fn rewrite_bare(expr: &LocyExpr) -> Result<Expr> {
+        let plan = ClauseBindingPlan {
+            steps: vec![],
+            refs: vec![],
+            generators: vec![],
+            scope: std::collections::BTreeMap::new(),
+            exposure: std::collections::BTreeMap::new(),
+            immediate_filters: vec![],
+            prev_ref: None,
+            diagnostics: vec![],
+        };
+        let scope = ClauseScope {
+            plan: &plan,
+            passthrough: HashSet::from(["x".to_string()]),
+        };
+        rewrite_locy_expr(expr, Some(""), &scope)
+    }
+
     #[test]
     fn test_rewrite_prev_ref() {
         let expr = LocyExpr::PrevRef("cost".to_string());
-        let result = rewrite_locy_expr(&expr).unwrap();
+        let result = rewrite_bare(&expr).unwrap();
         assert_eq!(result, Expr::Variable("cost".to_string()));
     }
 
@@ -3581,7 +3794,7 @@ mod tests {
     fn test_rewrite_cypher_passthrough() {
         let inner = Expr::Literal(CypherLiteral::Integer(42));
         let expr = LocyExpr::Cypher(inner.clone());
-        let result = rewrite_locy_expr(&expr).unwrap();
+        let result = rewrite_bare(&expr).unwrap();
         assert_eq!(result, inner);
     }
 
@@ -3592,7 +3805,7 @@ mod tests {
             op: LocyBinaryOp::Add,
             right: Box::new(LocyExpr::Cypher(Expr::Literal(CypherLiteral::Integer(1)))),
         };
-        let result = rewrite_locy_expr(&expr).unwrap();
+        let result = rewrite_bare(&expr).unwrap();
         assert_eq!(
             result,
             Expr::BinaryOp {
@@ -3615,7 +3828,7 @@ mod tests {
             op: LocyBinaryOp::Mul,
             right: Box::new(LocyExpr::PrevRef("c".to_string())),
         };
-        let result = rewrite_locy_expr(&expr).unwrap();
+        let result = rewrite_bare(&expr).unwrap();
         let expected = Expr::BinaryOp {
             left: Box::new(Expr::BinaryOp {
                 left: Box::new(Expr::Variable("a".to_string())),
@@ -3634,7 +3847,7 @@ mod tests {
             UnaryOp::Not,
             Box::new(LocyExpr::Cypher(Expr::Variable("x".to_string()))),
         );
-        let result = rewrite_locy_expr(&expr).unwrap();
+        let result = rewrite_bare(&expr).unwrap();
         assert_eq!(
             result,
             Expr::UnaryOp {
@@ -3758,7 +3971,12 @@ mod tests {
         };
         let names: HashSet<String> = ["base".to_string()].into();
         let result = builder
-            .build_stratum(&stratum, &catalog, &names, &test_classifier_ctx())
+            .build_stratum(
+                &planned_stratum(&stratum, &catalog, &names),
+                &catalog,
+                &names,
+                &test_classifier_ctx(),
+            )
             .unwrap();
 
         assert_eq!(result.id, 0);
@@ -3788,7 +4006,12 @@ mod tests {
         };
         let names: HashSet<String> = ["reach".to_string()].into();
         let result = builder
-            .build_stratum(&stratum, &catalog, &names, &test_classifier_ctx())
+            .build_stratum(
+                &planned_stratum(&stratum, &catalog, &names),
+                &catalog,
+                &names,
+                &test_classifier_ctx(),
+            )
             .unwrap();
 
         assert!(result.is_recursive);
@@ -3816,7 +4039,12 @@ mod tests {
         };
         let names: HashSet<String> = ["derived".to_string()].into();
         let result = builder
-            .build_stratum(&stratum, &catalog, &names, &test_classifier_ctx())
+            .build_stratum(
+                &planned_stratum(&stratum, &catalog, &names),
+                &catalog,
+                &names,
+                &test_classifier_ctx(),
+            )
             .unwrap();
 
         assert_eq!(result.depends_on, vec![0, 1]);
@@ -3850,7 +4078,12 @@ mod tests {
         };
         let names: HashSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
         let result = builder
-            .build_stratum(&stratum, &catalog, &names, &test_classifier_ctx())
+            .build_stratum(
+                &planned_stratum(&stratum, &catalog, &names),
+                &catalog,
+                &names,
+                &test_classifier_ctx(),
+            )
             .unwrap();
 
         assert_eq!(result.rules.len(), 3);
@@ -3871,14 +4104,20 @@ mod tests {
 
         let rule = make_rule(
             "reachable",
-            vec![simple_clause(node_pattern("n"), &["n", "m"])],
+            vec![simple_clause(edge_pattern("n", "e", "m"), &["n", "m"])],
             vec![yield_col("n", true), yield_col("m", false)],
         );
         let catalog = HashMap::from([("reachable".to_string(), rule.clone())]);
         let names: HashSet<String> = ["reachable".to_string()].into();
 
         let result = builder
-            .build_rule(&rule, false, &names, &catalog, &test_classifier_ctx())
+            .build_rule(
+                &planned_rule(&rule, &catalog, &names),
+                false,
+                &names,
+                &catalog,
+                &test_classifier_ctx(),
+            )
             .unwrap();
         assert_eq!(result.name, "reachable");
         assert_eq!(result.yield_schema.len(), 2);
@@ -3903,7 +4142,13 @@ mod tests {
         let names: HashSet<String> = ["prio".to_string()].into();
 
         let result = builder
-            .build_rule(&rule, false, &names, &catalog, &test_classifier_ctx())
+            .build_rule(
+                &planned_rule(&rule, &catalog, &names),
+                false,
+                &names,
+                &catalog,
+                &test_classifier_ctx(),
+            )
             .unwrap();
         assert_eq!(result.priority, Some(5));
     }
@@ -3922,7 +4167,13 @@ mod tests {
         let names: HashSet<String> = ["noprio".to_string()].into();
 
         let result = builder
-            .build_rule(&rule, false, &names, &catalog, &test_classifier_ctx())
+            .build_rule(
+                &planned_rule(&rule, &catalog, &names),
+                false,
+                &names,
+                &catalog,
+                &test_classifier_ctx(),
+            )
             .unwrap();
         assert_eq!(result.priority, None);
     }
@@ -3945,7 +4196,13 @@ mod tests {
         let names: HashSet<String> = ["multi".to_string()].into();
 
         let result = builder
-            .build_rule(&rule, false, &names, &catalog, &test_classifier_ctx())
+            .build_rule(
+                &planned_rule(&rule, &catalog, &names),
+                false,
+                &names,
+                &catalog,
+                &test_classifier_ctx(),
+            )
             .unwrap();
         assert_eq!(result.clauses.len(), 3);
     }
@@ -3957,7 +4214,7 @@ mod tests {
 
         let rule = make_rule(
             "keyed",
-            vec![simple_clause(node_pattern("n"), &["a", "b", "c"])],
+            vec![simple_clause(edge_pattern("a", "b", "c"), &["a", "b", "c"])],
             vec![
                 yield_col("a", true),
                 yield_col("b", false),
@@ -3968,7 +4225,13 @@ mod tests {
         let names: HashSet<String> = ["keyed".to_string()].into();
 
         let result = builder
-            .build_rule(&rule, false, &names, &catalog, &test_classifier_ctx())
+            .build_rule(
+                &planned_rule(&rule, &catalog, &names),
+                false,
+                &names,
+                &catalog,
+                &test_classifier_ctx(),
+            )
             .unwrap();
         assert!(result.yield_schema[0].is_key);
         assert!(!result.yield_schema[1].is_key);
@@ -3991,7 +4254,7 @@ mod tests {
 
         let result = builder
             .build_clause(
-                &clause,
+                &planned(&clause, &catalog, &names),
                 &yield_cols,
                 false,
                 ClauseCtx {
@@ -4053,6 +4316,7 @@ mod tests {
             priority: None,
             model_invocations: vec![],
             hidden_yield_cols: vec![],
+            binding: uni_locy::ClauseBinding::Pending,
         };
         let yield_cols = [yield_col("n", true)];
         let catalog = HashMap::new();
@@ -4060,7 +4324,7 @@ mod tests {
 
         let result = builder
             .build_clause(
-                &clause,
+                &planned(&clause, &catalog, &names),
                 &yield_cols,
                 false,
                 ClauseCtx {
@@ -4119,6 +4383,7 @@ mod tests {
             priority: None,
             model_invocations: vec![],
             hidden_yield_cols: vec![],
+            binding: uni_locy::ClauseBinding::Pending,
         };
         let yield_cols = [yield_col("n", true)];
         let catalog = HashMap::new();
@@ -4126,7 +4391,7 @@ mod tests {
 
         let result = builder
             .build_clause(
-                &clause,
+                &planned(&clause, &catalog, &names),
                 &yield_cols,
                 false,
                 ClauseCtx {
@@ -4181,13 +4446,14 @@ mod tests {
             priority: None,
             model_invocations: vec![],
             hidden_yield_cols: vec![],
+            binding: uni_locy::ClauseBinding::Pending,
         };
         let yield_cols = [yield_col("x", true)];
         let names = HashSet::new();
 
         let result = builder
             .build_clause(
-                &clause,
+                &planned(&clause, &catalog, &names),
                 &yield_cols,
                 false,
                 ClauseCtx {
@@ -4252,13 +4518,14 @@ mod tests {
             priority: None,
             model_invocations: vec![],
             hidden_yield_cols: vec![],
+            binding: uni_locy::ClauseBinding::Pending,
         };
         let yield_cols = [yield_col("x", true), yield_col("y", false)];
         let names = HashSet::new();
 
         let result = builder
             .build_clause(
-                &clause,
+                &planned(&clause, &catalog, &names),
                 &yield_cols,
                 false,
                 ClauseCtx {
@@ -4311,13 +4578,14 @@ mod tests {
             priority: None,
             model_invocations: vec![],
             hidden_yield_cols: vec![],
+            binding: uni_locy::ClauseBinding::Pending,
         };
         let yield_cols = [yield_col("x", true)];
         let names = HashSet::new();
 
         let result = builder
             .build_clause(
-                &clause,
+                &planned(&clause, &catalog, &names),
                 &yield_cols,
                 false,
                 ClauseCtx {
@@ -4392,13 +4660,14 @@ mod tests {
             priority: None,
             model_invocations: vec![],
             hidden_yield_cols: vec![],
+            binding: uni_locy::ClauseBinding::Pending,
         };
         let yield_cols = [yield_col("x", true)];
         let names = HashSet::new();
 
         let result = builder
             .build_clause(
-                &clause,
+                &planned(&clause, &catalog, &names),
                 &yield_cols,
                 false,
                 ClauseCtx {
@@ -4613,17 +4882,19 @@ mod tests {
             priority: None,
             model_invocations: vec![],
             hidden_yield_cols: vec![],
+            binding: uni_locy::ClauseBinding::Pending,
         };
         let yield_cols = [
             yield_col("a", true),
             yield_col("b", false),
             yield_col("cost", false),
         ];
-        let names = HashSet::new();
+        // `prev` reads the clause's reference into its own recursive group.
+        let names: HashSet<String> = ["reachable".to_string()].into();
 
         let result = builder
             .build_clause(
-                &clause,
+                &planned(&clause, &catalog, &names),
                 &yield_cols,
                 false,
                 ClauseCtx {
@@ -4665,7 +4936,10 @@ mod tests {
                 name: "total".to_string(),
                 aggregate: Expr::FunctionCall {
                     name: "SUM".to_string(),
-                    args: vec![Expr::Variable("cost".to_string())],
+                    args: vec![Expr::Property(
+                        Box::new(Expr::Variable("n".to_string())),
+                        "cost".to_string(),
+                    )],
                     distinct: false,
                     window_spec: None,
                 },
@@ -4677,6 +4951,7 @@ mod tests {
             priority: None,
             model_invocations: vec![],
             hidden_yield_cols: vec![],
+            binding: uni_locy::ClauseBinding::Pending,
         };
         let yield_cols = [yield_col("n", true), yield_col("total", false)];
         let catalog = HashMap::new();
@@ -4684,7 +4959,7 @@ mod tests {
 
         let result = builder
             .build_clause(
-                &clause,
+                &planned(&clause, &catalog, &names),
                 &yield_cols,
                 false,
                 ClauseCtx {
@@ -4724,7 +4999,10 @@ mod tests {
                 name: "best".to_string(),
                 aggregate: Expr::FunctionCall {
                     name: "MMAX".to_string(),
-                    args: vec![Expr::Variable("cost".to_string())],
+                    args: vec![Expr::Property(
+                        Box::new(Expr::Variable("n".to_string())),
+                        "cost".to_string(),
+                    )],
                     distinct: false,
                     window_spec: None,
                 },
@@ -4736,6 +5014,7 @@ mod tests {
             priority: None,
             model_invocations: vec![],
             hidden_yield_cols: vec![],
+            binding: uni_locy::ClauseBinding::Pending,
         };
         let yield_cols = [yield_col("n", true), yield_col("best", false)];
         let catalog = HashMap::new();
@@ -4743,7 +5022,7 @@ mod tests {
 
         let result = builder
             .build_clause(
-                &clause,
+                &planned(&clause, &catalog, &names),
                 &yield_cols,
                 true,
                 ClauseCtx {
@@ -4783,10 +5062,29 @@ mod tests {
                     ascending: true,
                 }],
             }),
-            output: simple_yield_output(&["n", "cost"]),
+            output: RuleOutput::Yield(YieldClause {
+                items: vec![
+                    LocyYieldItem {
+                        is_key: false,
+                        is_prob: false,
+                        expr: Expr::Variable("n".to_string()),
+                        alias: None,
+                    },
+                    LocyYieldItem {
+                        is_key: false,
+                        is_prob: false,
+                        expr: Expr::Property(
+                            Box::new(Expr::Variable("n".to_string())),
+                            "cost".to_string(),
+                        ),
+                        alias: Some("cost".to_string()),
+                    },
+                ],
+            }),
             priority: None,
             model_invocations: vec![],
             hidden_yield_cols: vec![],
+            binding: uni_locy::ClauseBinding::Pending,
         };
         let yield_cols = [yield_col("n", true), yield_col("cost", false)];
         let catalog = HashMap::new();
@@ -4794,7 +5092,7 @@ mod tests {
 
         let result = builder
             .build_clause(
-                &clause,
+                &planned(&clause, &catalog, &names),
                 &yield_cols,
                 false,
                 ClauseCtx {
@@ -4837,7 +5135,7 @@ mod tests {
 
         let result = builder
             .build_clause(
-                &clause,
+                &planned(&clause, &catalog, &names),
                 &yield_cols,
                 false,
                 ClauseCtx {
@@ -4911,17 +5209,19 @@ mod tests {
             priority: None,
             model_invocations: vec![],
             hidden_yield_cols: vec![],
+            binding: uni_locy::ClauseBinding::Pending,
         };
         let yield_cols = [
             yield_col("x", true),
             yield_col("cost", false),
             yield_col("total", false),
         ];
-        let names = HashSet::new();
+        // `prev` reads the clause's reference into its own recursive group.
+        let names: HashSet<String> = ["reachable".to_string()].into();
 
         let result = builder
             .build_clause(
-                &clause,
+                &planned(&clause, &catalog, &names),
                 &yield_cols,
                 false,
                 ClauseCtx {
@@ -5032,6 +5332,7 @@ mod tests {
                 priority: None,
                 model_invocations: vec![],
                 hidden_yield_cols: vec![],
+                binding: uni_locy::ClauseBinding::Pending,
             }],
             vec![yield_col("a", true), yield_col("b", false)],
         );
@@ -5104,6 +5405,7 @@ mod tests {
                 priority: None,
                 model_invocations: vec![],
                 hidden_yield_cols: vec![],
+                binding: uni_locy::ClauseBinding::Pending,
             }],
             vec![yield_col("x", true)],
         );
@@ -5183,6 +5485,7 @@ mod tests {
                 priority: None,
                 model_invocations: vec![],
                 hidden_yield_cols: vec![],
+                binding: uni_locy::ClauseBinding::Pending,
             }],
             vec![yield_col("x", true)],
         );
@@ -5260,6 +5563,7 @@ mod tests {
                 priority: None,
                 model_invocations: vec![],
                 hidden_yield_cols: vec![],
+                binding: uni_locy::ClauseBinding::Pending,
             }],
             vec![yield_col("n", true)],
         );
@@ -5282,6 +5586,7 @@ mod tests {
                 priority: None,
                 model_invocations: vec![],
                 hidden_yield_cols: vec![],
+                binding: uni_locy::ClauseBinding::Pending,
             }],
             vec![yield_col("n", true)],
         );
@@ -5363,6 +5668,7 @@ mod tests {
                     priority: None,
                     model_invocations: vec![],
                     hidden_yield_cols: vec![],
+                    binding: uni_locy::ClauseBinding::Pending,
                 },
                 CompiledClause {
                     match_pattern: node_pattern("y"),
@@ -5377,10 +5683,18 @@ mod tests {
                     require: vec![],
                     having: vec![],
                     best_by: None,
-                    output: simple_yield_output(&["y"]),
+                    output: RuleOutput::Yield(YieldClause {
+                        items: vec![LocyYieldItem {
+                            is_key: false,
+                            is_prob: false,
+                            expr: Expr::Variable("y".to_string()),
+                            alias: Some("x".to_string()),
+                        }],
+                    }),
                     priority: None,
                     model_invocations: vec![],
                     hidden_yield_cols: vec![],
+                    binding: uni_locy::ClauseBinding::Pending,
                 },
             ],
             vec![yield_col("x", true)],
@@ -5537,6 +5851,7 @@ mod tests {
                 priority: None,
                 model_invocations: vec![],
                 hidden_yield_cols: vec![],
+                binding: uni_locy::ClauseBinding::Pending,
             }],
             vec![yield_col("x", true)],
         );
@@ -5567,6 +5882,7 @@ mod tests {
                 priority: None,
                 model_invocations: vec![],
                 hidden_yield_cols: vec![],
+                binding: uni_locy::ClauseBinding::Pending,
             }],
             vec![yield_col("y", true)],
         );
@@ -5670,13 +5986,14 @@ mod tests {
             priority: None,
             model_invocations: vec![],
             hidden_yield_cols: vec![],
+            binding: uni_locy::ClauseBinding::Pending,
         };
         let yield_cols = [yield_col("x", true)];
         let catalog = HashMap::new();
         let names = HashSet::new();
 
         let result = builder.build_clause(
-            &clause,
+            &planned(&clause, &catalog, &names),
             &yield_cols,
             false,
             ClauseCtx {
@@ -5725,12 +6042,13 @@ mod tests {
             priority: None,
             model_invocations: vec![],
             hidden_yield_cols: vec![],
+            binding: uni_locy::ClauseBinding::Pending,
         };
         let yield_cols = [yield_col("x", true)];
         let names = HashSet::new();
 
         let result = builder.build_clause(
-            &clause,
+            &planned(&clause, &catalog, &names),
             &yield_cols,
             false,
             ClauseCtx {
@@ -5782,12 +6100,13 @@ mod tests {
             priority: None,
             model_invocations: vec![],
             hidden_yield_cols: vec![],
+            binding: uni_locy::ClauseBinding::Pending,
         };
         let yield_cols = [yield_col("x", true), yield_col("cost", false)];
         let names = HashSet::new();
 
         let result = builder.build_clause(
-            &clause,
+            &planned(&clause, &catalog, &names),
             &yield_cols,
             false,
             ClauseCtx {
@@ -5832,13 +6151,14 @@ mod tests {
             priority: None,
             model_invocations: vec![],
             hidden_yield_cols: vec![],
+            binding: uni_locy::ClauseBinding::Pending,
         };
         let yield_cols = [yield_col("n", true), yield_col("total", false)];
         let catalog = HashMap::new();
         let names = HashSet::new();
 
         let result = builder.build_clause(
-            &clause,
+            &planned(&clause, &catalog, &names),
             &yield_cols,
             true,
             ClauseCtx {
@@ -5875,7 +6195,10 @@ mod tests {
                     name: "score".to_string(),
                     aggregate: Expr::FunctionCall {
                         name: name.to_string(),
-                        args: vec![Expr::Variable("cost".to_string())],
+                        args: vec![Expr::Property(
+                            Box::new(Expr::Variable("n".to_string())),
+                            "cost".to_string(),
+                        )],
                         distinct: false,
                         window_spec: None,
                     },
@@ -5887,13 +6210,14 @@ mod tests {
                 priority: None,
                 model_invocations: vec![],
                 hidden_yield_cols: vec![],
+                binding: uni_locy::ClauseBinding::Pending,
             };
             let yield_cols = [yield_col("n", true), yield_col("score", false)];
             let catalog = HashMap::new();
             let names = HashSet::new();
 
             let result = builder.build_clause(
-                &clause,
+                &planned(&clause, &catalog, &names),
                 &yield_cols,
                 true,
                 ClauseCtx {
@@ -5931,7 +6255,10 @@ mod tests {
                 name: "total".to_string(),
                 aggregate: Expr::FunctionCall {
                     name: "SUM".to_string(),
-                    args: vec![Expr::Variable("cost".to_string())],
+                    args: vec![Expr::Property(
+                        Box::new(Expr::Variable("n".to_string())),
+                        "cost".to_string(),
+                    )],
                     distinct: false,
                     window_spec: None,
                 },
@@ -5943,13 +6270,14 @@ mod tests {
             priority: None,
             model_invocations: vec![],
             hidden_yield_cols: vec![],
+            binding: uni_locy::ClauseBinding::Pending,
         };
         let yield_cols = [yield_col("n", true), yield_col("total", false)];
         let catalog = HashMap::new();
         let names = HashSet::new();
 
         let result = builder.build_clause(
-            &clause,
+            &planned(&clause, &catalog, &names),
             &yield_cols,
             false,
             ClauseCtx {
@@ -5965,5 +6293,251 @@ mod tests {
             &test_classifier_ctx(),
         );
         assert!(result.is_ok(), "SUM in non-recursive stratum is valid");
+    }
+
+    // ===================================================================
+    // Structural guard (`check_sources`, issue #300)
+    // ===================================================================
+
+    const N_RULES: &str = "\
+        CREATE RULE r1 AS MATCH (a:N) YIELD KEY a, a.d AS score\n\
+        CREATE RULE r2 AS MATCH (a:N) YIELD KEY a, 1 AS w\n\
+        CREATE RULE link AS MATCH (a:N)-[:R]->(b:N) YIELD KEY a, KEY b\n\
+        CREATE RULE blocked AS MATCH (n:N) WHERE n.bad = true YIELD KEY n\n\
+        CREATE RULE tag AS MATCH (n:N)-[:HAS]->(t:T) YIELD KEY n, KEY t.k AS c\n\
+        CREATE RULE er AS MATCH (a:N)-[e:R]->(b:N) YIELD KEY e, e.w AS ew\n";
+
+    /// Compiles `src` and plans it with an empty graph schema.
+    fn plan_source(src: &str) -> Result<(CompiledProgram, LogicalPlan)> {
+        let ast = uni_cypher::parse_locy(src).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let program = uni_locy::compile(&ast)?;
+        let planner = test_planner();
+        let builder = LocyPlanBuilder::new(&planner);
+        let plan = builder.build_program_plan(
+            &program,
+            1000,
+            std::time::Duration::from_secs(30),
+            256 * 1024 * 1024,
+            true,
+            false,
+            1e-15,
+            false,
+            1000,
+            0,
+        )?;
+        Ok((program, plan))
+    }
+
+    /// Runs [`check_sources`] over every planned clause of `src`, each against
+    /// its compiled clause's binding plan; returns how many it checked.
+    fn guard_every_clause(src: &str) -> usize {
+        let (program, plan) = plan_source(src).unwrap_or_else(|e| panic!("{e:#}\n{src}"));
+        let LogicalPlan::LocyProgram { strata, .. } = &plan else {
+            panic!("expected LocyProgram");
+        };
+        let mut checked = 0;
+        for rule in strata.iter().flat_map(|s| &s.rules) {
+            let compiled = &program.rule_catalog[&rule.name];
+            for (index, (clause, compiled_clause)) in
+                rule.clauses.iter().zip(&compiled.clauses).enumerate()
+            {
+                let binding = compiled_clause.binding.plan().expect("binding plan");
+                let pattern: HashSet<String> = binding
+                    .scope
+                    .iter()
+                    .filter(|(_, source)| matches!(source, VarSource::Match(_)))
+                    .map(|(name, _)| name.clone())
+                    .chain(
+                        match_edge_vars(compiled_clause, index)
+                            .into_iter()
+                            .map(|v| v.name),
+                    )
+                    .collect();
+                check_sources(&pattern, &clause.body)
+                    .unwrap_or_else(|e| panic!("{}: {e:#}\n{src}", rule.name));
+                checked += 1;
+            }
+        }
+        checked
+    }
+
+    /// Each Step 3 shape of `build_clause`, in every conjunct order where the
+    /// order matters, plans without a single unproduced read.
+    #[test]
+    fn guard_accepts_every_step3_shape() {
+        let shapes: &[(&str, &[&str])] = &[
+            // A reference anchored on a MATCH node: a node test.
+            ("anchored test", &["a IS r1"]),
+            // A unique exposure read by a filter placed after its reference.
+            ("filter on an exposure", &["a IS r1", "score > 5"]),
+            // A node the reference binds: `ScanAll` joined on its vid.
+            ("bind node", &["a IS link TO b", "b.x = 1"]),
+            // Two references: the second tests the first's node.
+            ("two references", &["a IS link TO b", "b IS r1"]),
+            // A scalar KEY bound, then tested by a second reference.
+            ("bind scalar", &["a IS tag TO col", "a IS tag TO col"]),
+            // A value position tested between two references.
+            ("test scalar", &["(a, s) IS r1", "(a, s) IS r2"]),
+            // A generator over a MATCH property.
+            ("generator", &["f(a.k) -> (x)", "x > 1"]),
+            // A reference beats a generator as binder: renamed output + test.
+            ("generator tested", &["f(a.k) -> (col)", "a IS tag TO col"]),
+            // A negation before and after its binder.
+            ("negation", &["NOT b IS blocked", "a IS link TO b"]),
+        ];
+        for (name, conditions) in shapes {
+            let n = conditions.len();
+            let mut orders = vec![(0..n).collect::<Vec<_>>()];
+            if n == 2 {
+                orders.push(vec![1, 0]);
+            }
+            for order in orders {
+                let body: Vec<&str> = order.iter().map(|&i| conditions[i]).collect();
+                let yield_items = match *name {
+                    "bind node" | "two references" | "negation" => "KEY a, KEY b",
+                    "filter on an exposure" => "KEY a, score",
+                    "bind scalar" | "generator tested" => "KEY a, col",
+                    "test scalar" => "KEY a, s",
+                    "generator" => "KEY a, x",
+                    _ => "KEY a",
+                };
+                let src = format!(
+                    "{N_RULES}CREATE RULE q AS MATCH (a:N) WHERE {} YIELD {yield_items}\n",
+                    body.join(", ")
+                );
+                assert!(guard_every_clause(&src) >= 7, "{name}");
+            }
+        }
+    }
+
+    /// The shapes outside the WHERE: a relationship tested against an edge
+    /// KEY, ALONG `prev`, a FOLD input over an exposure, BEST BY over a
+    /// referenced value column (a hidden `__bestby_` column), and #300's P1.
+    #[test]
+    fn guard_accepts_projection_shapes() {
+        let sources = [
+            format!(
+                "{N_RULES}CREATE RULE q AS MATCH (a:N)-[e:R]->(b:N) WHERE e IS er YIELD KEY a, ew\n"
+            ),
+            "CREATE RULE path AS MATCH (a:N)-[e:E]->(b:N) ALONG cost = e.w \
+             YIELD KEY a, KEY b, cost\n\
+             CREATE RULE path AS MATCH (a:N)-[e:E]->(m:N) WHERE m IS path TO b \
+             ALONG cost = prev.cost + e.w YIELD KEY a, KEY b, cost\n"
+                .to_string(),
+            format!(
+                "{N_RULES}CREATE RULE q AS MATCH (a:N) WHERE a IS r1 FOLD t = SUM(score) \
+                 YIELD KEY a, t\n"
+            ),
+            format!(
+                "{N_RULES}CREATE RULE q AS MATCH (a:N) WHERE a IS r1 BEST BY score DESC \
+                 YIELD KEY a\n"
+            ),
+            "CREATE RULE stake AS MATCH (o:E)-[r:OWNS]->(e:E) FOLD pct = MAX(r.pct) \
+             YIELD KEY o, KEY e, pct\n\
+             CREATE RULE seed AS MATCH (e:E) WHERE e.uid = 'x' YIELD KEY e, 100.0 AS agg\n\
+             CREATE RULE p1 AS MATCH (o:E) WHERE o IS seed AND (o, e, pct) IS stake \
+             YIELD KEY e, pct\n\
+             CREATE RULE p1r AS MATCH (o:E) WHERE (o, e, pct) IS stake AND o IS seed \
+             YIELD KEY e, pct\n"
+                .to_string(),
+        ];
+        for src in &sources {
+            assert!(guard_every_clause(src) > 0, "{src}");
+        }
+    }
+
+    /// Teeth: a bare `Expr::Variable` naming a referenced column the plan
+    /// only produces under its prefix is refused, naming it.
+    #[test]
+    fn guard_rejects_a_bare_variable() {
+        let plan = HashSet::from(["o".to_string()]);
+        let joined = |predicate: Expr| LogicalPlan::Filter {
+            input: Box::new(LogicalPlan::CrossJoin {
+                left: Box::new(LogicalPlan::ScanAll {
+                    variable: "o".to_string(),
+                    filter: None,
+                    optional: false,
+                }),
+                right: Box::new(LogicalPlan::LocyDerivedScan {
+                    scan_index: 0,
+                    data: Arc::new(RwLock::new(Vec::new())),
+                    schema: Arc::new(ArrowSchema::new(vec![
+                        Field::new("__isref0_e", DataType::UInt64, true),
+                        Field::new("__isref0_pct", DataType::Float64, true),
+                    ])),
+                }),
+            }),
+            predicate,
+            optional_variables: HashSet::new(),
+        };
+        let gt = |name: &str| Expr::BinaryOp {
+            left: Box::new(Expr::Variable(name.to_string())),
+            op: BinaryOp::Gt,
+            right: Box::new(Expr::Literal(CypherLiteral::Float(1.0))),
+        };
+        let error = check_sources(&plan, &joined(gt("pct")))
+            .expect_err("a bare `pct` is not a produced column");
+        assert!(error.to_string().contains("`pct`"), "{error:#}");
+        // The prefixed column and an entity expansion are produced.
+        check_sources(&plan, &joined(gt("__isref0_pct"))).expect("prefixed column");
+        check_sources(&plan, &joined(gt("o._vid"))).expect("entity expansion");
+        // A projection over a name no input produces is refused too.
+        let projected = LogicalPlan::LocyProject {
+            input: Box::new(joined(gt("__isref0_pct"))),
+            projections: vec![(Expr::Variable("e".to_string()), Some("e".to_string()))],
+            target_types: vec![],
+        };
+        let error = check_sources(&plan, &projected).expect_err("a bare `e`");
+        assert!(error.to_string().contains("`e`"), "{error:#}");
+    }
+
+    /// Teeth through the real planner: a binding plan whose exposure points
+    /// at the bare column name — the pre-#300 first-reference layout — makes
+    /// `build_clause` emit an unprefixed read, which the guard refuses.
+    #[test]
+    fn guard_rejects_a_planner_emitting_an_unprefixed_read() {
+        let src =
+            format!("{N_RULES}CREATE RULE q AS MATCH (a:N) WHERE a IS r1, score > 5 YIELD KEY a\n");
+        let ast = uni_cypher::parse_locy(&src).expect("parses");
+        let mut program = uni_locy::compile(&ast).expect("compiles");
+        let mut tamper = |rule: &mut CompiledRule| {
+            if rule.name != "q" {
+                return;
+            }
+            let clause = &mut rule.clauses[0];
+            let mut plan = clause.binding.plan().expect("plan").clone();
+            let Some(Exposure::Unique { physical, .. }) = plan.exposure.get_mut("score") else {
+                panic!("score is a unique exposure");
+            };
+            *physical = "score".to_string();
+            clause.binding = uni_locy::ClauseBinding::Ready(Arc::new(plan));
+        };
+        program.rule_catalog.values_mut().for_each(&mut tamper);
+        program
+            .strata
+            .iter_mut()
+            .flat_map(|s| &mut s.rules)
+            .for_each(&mut tamper);
+        let planner = test_planner();
+        let builder = LocyPlanBuilder::new(&planner);
+        let error = builder
+            .build_program_plan(
+                &program,
+                1000,
+                std::time::Duration::from_secs(30),
+                256 * 1024 * 1024,
+                true,
+                false,
+                1e-15,
+                false,
+                1000,
+                0,
+            )
+            .expect_err("the guard refuses the bare read");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("`score`") && message.contains("no input column"),
+            "{message}"
+        );
     }
 }

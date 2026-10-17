@@ -275,6 +275,7 @@ pub fn check(
                 priority: def.priority,
                 model_invocations: extracted.invocations,
                 hidden_yield_cols: extracted.hidden_yield_cols,
+                binding: crate::binding_plan::ClauseBinding::Pending,
             });
         }
 
@@ -297,58 +298,33 @@ pub fn check(
     for (rule_name, rule) in &compiled_rules {
         for clause in &rule.clauses {
             check_cross_predicate_correlation(rule_name, clause, &compiled_rules, &mut warnings);
-            check_is_not_subjects_are_nodes(rule_name, clause)?;
             // Collect IS references that are within the same SCC (self-IS-refs)
             let scc_idx = strat.scc_map[rule_name.as_str()];
             let scc_rules = &strat.sccs[scc_idx];
 
             let mut has_self_is = false;
             let mut is_ref_targets = Vec::new();
-            // Variables bound before each condition: MATCH variables, then
-            // whatever earlier positive IS references bind.
-            let mut bound_vars =
-                super::warded::extract_pattern_node_variables(&clause.match_pattern);
 
             for cond in &clause.where_conditions {
                 if let RuleCondition::IsReference(is_ref) = cond {
                     let target_name = is_ref.rule_name.to_string();
-                    if let Some(target_rule) = compiled_rules.get(&target_name) {
-                        let Some(bound) = crate::is_binding::bound_columns(
+                    // The `IS NOT` checks — subject kind, value comparison,
+                    // KEY safety — are binding-plan diagnostics, decided over
+                    // the whole body rather than left to right (issue #300).
+                    if let Some(target_rule) = compiled_rules.get(&target_name)
+                        && crate::is_binding::bound_columns(
                             &target_rule.yield_schema,
                             is_ref.subjects.len(),
                             is_ref.target.is_some(),
-                        ) else {
-                            return Err(LocyCompileError::IsArityMismatch {
-                                rule: rule_name.clone(),
-                                target: target_name,
-                                expected: target_rule.yield_schema.len(),
-                                actual: is_ref.subjects.len()
-                                    + usize::from(is_ref.target.is_some()),
-                            });
-                        };
-                        // An unbound variable on a value column is existentially
-                        // quantified and ignored (`b IS NOT stake TO agg` reads "no
-                        // `stake` fact for `b`, whatever `agg` is"). A bound one
-                        // would need a value comparison, which negation over facts
-                        // identified by their KEY cannot make.
-                        if is_ref.negated {
-                            let vars = is_ref.subjects.iter().chain(is_ref.target.iter());
-                            if let Some((var, col)) = vars
-                                .zip(bound.iter())
-                                .find(|(var, col)| !col.is_key && bound_vars.contains(*var))
-                            {
-                                return Err(LocyCompileError::IsNotBindsValueColumn {
-                                    rule: rule_name.clone(),
-                                    target: target_name.clone(),
-                                    variable: var.clone(),
-                                    column: col.name.clone(),
-                                });
-                            }
-                        }
-                    }
-                    if !is_ref.negated {
-                        bound_vars.extend(is_ref.subjects.iter().cloned());
-                        bound_vars.extend(is_ref.target.iter().cloned());
+                        )
+                        .is_none()
+                    {
+                        return Err(LocyCompileError::IsArityMismatch {
+                            rule: rule_name.clone(),
+                            target: target_name,
+                            expected: target_rule.yield_schema.len(),
+                            actual: is_ref.subjects.len() + usize::from(is_ref.target.is_some()),
+                        });
                     }
 
                     if scc_rules.contains(&target_name) {
@@ -392,6 +368,17 @@ pub fn check(
             }
         }
     }
+
+    // Every referenced yield schema is known now, so each clause's binding
+    // plan can be computed, and the first problem one records is the error.
+    // Before the scope check: that check reads each plan's scope, and an
+    // ambiguous read must surface as `AmbiguousRuleColumn`, not as the
+    // unbound name it looks like to a scope without the ambiguous column.
+    // The plan raises no unbound-name diagnostic of its own, so the scope
+    // check's sharper `PrevOutsideAlong` is not preempted.
+    crate::binding_plan::attach_to_catalog(&mut compiled_rules, &|name| {
+        strat.scc_map.get(name).copied()
+    })?;
 
     // Last, so a program the checks above reject keeps their error.
     super::scope::check_rule_scopes(rule_groups, &compiled_rules, module_ctx)?;
@@ -798,7 +785,7 @@ fn find_prev_ref(expr: &LocyExpr) -> Option<String> {
     collect_prev_refs(expr).into_iter().next()
 }
 
-fn collect_prev_refs(expr: &LocyExpr) -> Vec<String> {
+pub(crate) fn collect_prev_refs(expr: &LocyExpr) -> Vec<String> {
     match expr {
         LocyExpr::PrevRef(field) => vec![field.clone()],
         LocyExpr::BinaryOp { left, right, .. } => {
@@ -881,75 +868,6 @@ fn check_probability_domain_warning(
             });
         }
     });
-}
-
-// ─── IS NOT subject must be a node ─────────────────────────────────────────
-
-/// Reject an `IS NOT` whose subject cannot carry node identity.
-///
-/// The anti-join keys on vids — `verify_key_columns_are_vids` in
-/// `uni-query`'s `locy_complement.rs` enforces exactly this at runtime, with
-/// "a scalar property cannot be used as an `IS NOT` subject". So every program
-/// this rejects already fails; the only change is that it now fails at compile
-/// time, before any evaluation, with a message that names the variable.
-///
-/// Two things this must NOT do, both of which would reject valid programs:
-///
-/// 1. **Never validate `is_ref.target`.** The shape
-///    `WHERE d IS signal TO dis, d IS NOT known TO dis` binds `dis` through the
-///    *positive* reference's TO-target, not through MATCH. It appears in 11
-///    programs across the TCK, the Python binding tests and a published
-///    notebook. Only `is_ref.subjects` is checked.
-/// 2. **Accumulate bindings left to right.** A positive `x IS rule TO y` makes
-///    `y` a node for *later* conditions (the planner emits a `ScanAll` for it),
-///    so a pre-scan that ignored ordering would be wrong in the other
-///    direction — accepting a subject bound only by a later condition.
-///
-/// Tuple subjects (`(a, b) IS NOT risk`) are checked element-wise.
-///
-/// A **YIELD alias of a node** counts as a node: `YIELD KEY a AS subj` makes
-/// `subj` another name for the node `a`, and `WHERE subj IS NOT flagged`
-/// resolves fine at runtime because the projected column still holds a vid.
-/// Only aliases of non-node expressions (`YIELD a.n AS x`) are rejected. An
-/// earlier version of this check ignored aliases entirely and false-rejected
-/// two working programs.
-fn check_is_not_subjects_are_nodes(
-    rule_name: &str,
-    clause: &CompiledClause,
-) -> Result<(), LocyCompileError> {
-    let mut bound_nodes = super::warded::extract_pattern_node_variables(&clause.match_pattern);
-
-    // YIELD aliases that rename a node keep denoting that node.
-    if let RuleOutput::Yield(yield_clause) = &clause.output {
-        for item in &yield_clause.items {
-            if let (Some(alias), Expr::Variable(var)) = (&item.alias, &item.expr)
-                && bound_nodes.contains(var)
-            {
-                bound_nodes.insert(alias.clone());
-            }
-        }
-    }
-
-    for cond in &clause.where_conditions {
-        let RuleCondition::IsReference(is_ref) = cond else {
-            continue;
-        };
-        if is_ref.negated {
-            for subject in &is_ref.subjects {
-                if !bound_nodes.contains(subject) {
-                    return Err(LocyCompileError::IsNotSubjectNotANode {
-                        rule: rule_name.to_string(),
-                        variable: subject.clone(),
-                    });
-                }
-            }
-        } else if let Some(target) = &is_ref.target {
-            // A positive IS-ref's TO-target is materialized as a node, so it is
-            // a valid subject for any *subsequent* condition.
-            bound_nodes.insert(target.clone());
-        }
-    }
-    Ok(())
 }
 
 // ─── Phase D F3 case 3: positive + complement on same subject ──────────────

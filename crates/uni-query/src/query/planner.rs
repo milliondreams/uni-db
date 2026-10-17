@@ -2317,7 +2317,7 @@ impl LogicalPlan {
     /// multi-child variants so a read-only survey can reach every node. A
     /// missing arm here silently hides a subtree from any analysis built on it,
     /// so the single-input list is kept identical to `input_mut`'s.
-    fn children(&self) -> Vec<&LogicalPlan> {
+    pub(crate) fn children(&self) -> Vec<&LogicalPlan> {
         match self {
             LogicalPlan::Union { left, right, .. } | LogicalPlan::CrossJoin { left, right, .. } => {
                 vec![left, right]

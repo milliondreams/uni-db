@@ -10,11 +10,11 @@ use std::collections::HashMap;
 
 use uni_common::Value;
 use uni_cypher::ast::Expr;
-use uni_cypher::locy_ast::{IsReference, RuleCondition};
+use uni_cypher::locy_ast::RuleCondition;
+use uni_locy::binding_plan::{BindingStep, ClauseBindingPlan, Exposure, PositionAction, VarSource};
 use uni_locy::types::{CompiledClause, CompiledRule};
 use uni_locy::{FactRow, LocyError};
 
-use super::locy_ast_builder::expr_references_var;
 use super::locy_eval::{
     eval_condition, eval_locy_expr, record_batches_to_locy_rows, values_equal_for_join,
 };
@@ -68,166 +68,122 @@ pub fn extract_cypher_conditions(conditions: &[RuleCondition]) -> Vec<Expr> {
 
 // ── In-memory IS-ref join helpers ─────────────────────────────────────────────
 
-/// How an unbound subject is treated when matching an IS-ref.
-///
-/// The two modes exist because `is_ref_matches` backs both the positive
-/// semi-join and the negation paths, and relaxing it for one silently changes
-/// the semantics of the other.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SubjectMode {
-    /// A subject absent from the base row is a **generator**: it matches every
-    /// derived fact and is bound from it by [`semi_join_is_ref`].
-    ///
-    /// This is what makes `WHERE (r, p) IS role_perm` work when `p` appears
-    /// nowhere in the MATCH pattern. Previously the absent subject collapsed to
-    /// `Value::Null`, compared unequal to every fact, and the whole query
-    /// silently returned zero rows while the fixpoint derived facts normally
-    /// (issue #160).
-    Bind,
-    /// A subject absent from the base row compares as `Null` and therefore
-    /// matches nothing — the historical behaviour, kept for the negation and
-    /// probabilistic-complement paths.
-    ///
-    /// Applying `Bind` there would flip `IS NOT` with an unbindable subject
-    /// from keep-all to keep-**nothing**. That case is meaningless (an unbound
-    /// variable under negation) and is rejected at compile time instead.
-    Strict,
+/// Whether a derived fact agrees with a base row on every `(variable,
+/// column)` pair: the row's value of the variable equals the fact's value of
+/// the column. A variable absent from the row compares as `Null`.
+fn key_matches(base_row: &FactRow, derived_fact: &FactRow, pairs: &[(String, String)]) -> bool {
+    pairs.iter().all(|(variable, column)| {
+        let base_val = base_row.get(variable).cloned().unwrap_or(Value::Null);
+        let fact_val = derived_fact.get(column).cloned().unwrap_or(Value::Null);
+        values_equal_for_join(&base_val, &fact_val)
+    })
 }
 
-/// Check whether a derived fact matches the subject bindings from a base row.
-///
-/// Positional: `subjects[i]` maps to `schema[i]` and the target to the column
-/// after the subjects, where `schema` is the referenced rule's binding sequence
-/// (`uni_locy::is_binding::binding_column_names`): KEY columns first.
-fn is_ref_matches(
-    base_row: &FactRow,
-    derived_fact: &FactRow,
-    is_ref: &IsReference,
-    schema: &[String],
-    mode: SubjectMode,
-) -> bool {
-    // Check subject columns.
-    for (i, subject) in is_ref.subjects.iter().enumerate() {
-        if i >= schema.len() {
-            break;
-        }
-        // Distinguish "not bound at all" from "bound to NULL". Only the former
-        // is a generator; a genuine NULL binding must still compare.
-        //
-        // `Strict` deliberately keeps the historical `unwrap_or(Value::Null)`
-        // rather than short-circuiting: `values_equal(Null, Null)` is `true`, so
-        // an absent subject matching an absent fact column is an existing
-        // behaviour the negation paths may depend on.
-        let base_val = match base_row.get(subject) {
-            Some(v) => v.clone(),
-            None if mode == SubjectMode::Bind => continue,
-            None => Value::Null,
-        };
-        let fact_val = derived_fact.get(&schema[i]).cloned().unwrap_or(Value::Null);
-        if !values_equal_for_join(&base_val, &fact_val) {
-            return false;
-        }
-    }
-    // Also check target variable for composite-key matching (negated IS NOT).
-    // Without this, `d IS NOT known TO dis` only checks d, not (d, dis).
-    // Skip when base_val is Null (target not yet bound — positive IS-ref binding).
-    if let Some(target) = &is_ref.target {
-        let target_idx = is_ref.subjects.len();
-        if target_idx < schema.len() {
-            let base_val = base_row.get(target).cloned().unwrap_or(Value::Null);
-            let fact_val = derived_fact
-                .get(&schema[target_idx])
-                .cloned()
-                .unwrap_or(Value::Null);
-            if base_val != Value::Null
-                && fact_val != Value::Null
-                && !values_equal_for_join(&base_val, &fact_val)
-            {
-                return false;
-            }
-        }
-    }
-    true
-}
-
-/// Positive IS semi-join: for each base row, produce one output row per matching
-/// derived fact, binding the optional target variable and stashing derived fact
-/// columns under `__prev_{col}` for ALONG PrevRef resolution.
+/// Positive IS semi-join for reference `r` of `plan`: for each base row,
+/// one output row per derived fact that agrees with it on every position the
+/// plan tests, extended with the variables the plan binds there and the
+/// value columns the reference exposes by name. Columns of the reference
+/// ALONG's `prev` reads are stashed under `__prev_{col}`.
 fn semi_join_is_ref(
     base_rows: &[FactRow],
     derived_facts: &[FactRow],
-    is_ref: &IsReference,
-    schema: &[String],
+    plan: &ClauseBindingPlan,
+    r: usize,
 ) -> Vec<FactRow> {
+    let binding = &plan.refs[r];
+    let tests: Vec<(String, String)> = binding
+        .positions
+        .iter()
+        .filter(|p| {
+            matches!(
+                p.action,
+                PositionAction::TestNode | PositionAction::TestScalar
+            )
+        })
+        .map(|p| (p.variable.clone(), p.column.clone()))
+        .collect();
+    let binds: Vec<(&str, &str)> = binding
+        .positions
+        .iter()
+        .filter(|p| {
+            matches!(
+                p.action,
+                PositionAction::BindNode | PositionAction::BindScalar
+            )
+        })
+        .map(|p| (p.variable.as_str(), p.column.as_str()))
+        .collect();
+    // Value columns readable by bare name through this reference. A name
+    // several references expose is readable through none of them: reading it
+    // is the compile error `AmbiguousRuleColumn`, so nothing can ask for it.
+    let exposed: Vec<&str> = plan
+        .exposure
+        .iter()
+        .filter(|(_, exposure)| match exposure {
+            Exposure::Unique { r: owner, .. } => *owner == r,
+            Exposure::Ambiguous(_) => false,
+        })
+        .map(|(name, _)| name.as_str())
+        .collect();
+    let stash_prev = plan.prev_ref == Some(r);
+
     let mut result = Vec::new();
     for base_row in base_rows {
         for derived_fact in derived_facts {
-            if is_ref_matches(base_row, derived_fact, is_ref, schema, SubjectMode::Bind) {
-                let mut row = base_row.clone();
-
-                // Bind subject variables the MATCH pattern did not provide.
-                // This loop is what turns an IS-ref into a generator: the outer
-                // nested loop is already a cross product, so a fresh subject
-                // simply fans one base row out to one row per derived fact.
-                // Mirrors the target binding just below.
-                for (i, subject) in is_ref.subjects.iter().enumerate() {
-                    if i >= schema.len() || base_row.contains_key(subject) {
-                        continue;
-                    }
-                    if let Some(val) = derived_fact.get(&schema[i]) {
-                        row.insert(subject.clone(), val.clone());
-                    }
-                }
-
-                // Bind target variable (column after subjects in the derived schema).
-                if let Some(target) = &is_ref.target {
-                    let target_col_idx = is_ref.subjects.len();
-                    if target_col_idx < schema.len() {
-                        let val = derived_fact
-                            .get(&schema[target_col_idx])
-                            .cloned()
-                            .unwrap_or(Value::Null);
-                        row.insert(target.clone(), val);
-                    }
-                }
-
-                // Bind non-KEY value columns from the derived fact so that
-                // downstream YIELD expressions can reference them (e.g.,
-                // `WHERE d IS signal TO dis ... YIELD KEY d, KEY dis, agg`
-                // needs `agg` to be present in the row).
-                let bound_count =
-                    is_ref.subjects.len() + if is_ref.target.is_some() { 1 } else { 0 };
-                for col in schema.iter().skip(bound_count) {
-                    if let Some(val) = derived_fact.get(col) {
-                        row.entry(col.clone()).or_insert_with(|| val.clone());
-                    }
-                }
-
-                // Stash derived fact columns for ALONG PrevRef lookups.
-                for (col, val) in derived_fact {
-                    row.insert(format!("__prev_{}", col), val.clone());
-                }
-
-                result.push(row);
+            if !key_matches(base_row, derived_fact, &tests) {
+                continue;
             }
+            let mut row = base_row.clone();
+            for (variable, column) in &binds {
+                let val = derived_fact.get(*column).cloned().unwrap_or(Value::Null);
+                row.insert((*variable).to_string(), val);
+            }
+            for name in &exposed {
+                if let Some(val) = derived_fact.get(*name) {
+                    row.insert((*name).to_string(), val.clone());
+                }
+            }
+            if stash_prev {
+                for (col, val) in derived_fact {
+                    row.insert(format!("__prev_{col}"), val.clone());
+                }
+            }
+            result.push(row);
         }
     }
     result
+}
+
+/// The `(variable, column)` pairs a negated reference compares: its KEY
+/// positions some literal binds, a YIELD alias read through the node it
+/// names. Existential value positions are not compared.
+fn negation_pairs(plan: &ClauseBindingPlan, r: usize) -> Vec<(String, String)> {
+    plan.refs[r]
+        .positions
+        .iter()
+        .filter(|p| p.is_key && p.action != PositionAction::Existential)
+        .map(|p| {
+            let variable = match plan.scope.get(&p.variable) {
+                Some(VarSource::YieldAlias(source)) => source.clone(),
+                _ => p.variable.clone(),
+            };
+            (variable, p.column.clone())
+        })
+        .collect()
 }
 
 /// Negative IS anti-join: retain base rows where no derived fact matches.
 fn anti_join_is_ref(
     base_rows: &[FactRow],
     derived_facts: &[FactRow],
-    is_ref: &IsReference,
-    schema: &[String],
+    pairs: &[(String, String)],
 ) -> Vec<FactRow> {
     base_rows
         .iter()
         .filter(|base_row| {
             !derived_facts
                 .iter()
-                .any(|df| is_ref_matches(base_row, df, is_ref, schema, SubjectMode::Strict))
+                .any(|df| key_matches(base_row, df, pairs))
         })
         .cloned()
         .collect()
@@ -245,8 +201,7 @@ fn anti_join_is_ref(
 fn prob_complement_is_ref(
     base_rows: &[FactRow],
     derived_facts: &[FactRow],
-    is_ref: &IsReference,
-    schema: &[String],
+    pairs: &[(String, String)],
     target_prob_col: &str,
     complement_col_name: &str,
 ) -> Vec<FactRow> {
@@ -256,7 +211,7 @@ fn prob_complement_is_ref(
             // Find all matching derived facts and combine via noisy-OR.
             let mut combined_p = 0.0_f64;
             for df in derived_facts {
-                if is_ref_matches(base_row, df, is_ref, schema, SubjectMode::Strict) {
+                if key_matches(base_row, df, pairs) {
                     let p = df
                         .get(target_prob_col)
                         .and_then(|v| v.as_f64())
@@ -297,9 +252,18 @@ pub fn multiply_prob_factors_rows(
 
 /// Resolve a clause by executing its MATCH pattern and applying IS-ref joins in memory.
 ///
-/// Replaces the serialize-UNWIND-execute round-trip EXPLAIN Mode B used.
-/// IS-refs are resolved as in-memory semi-joins (positive) or anti-joins (negated).
-/// ALONG expressions are evaluated last using `__prev_*` stash from semi-join results.
+/// Replaces the serialize-UNWIND-execute round-trip EXPLAIN Mode B used. The
+/// clause's binding plan (`uni_locy::binding_plan`) decides everything the
+/// evaluator decides: the WHERE conjuncts over MATCH variables run in the
+/// MATCH, then the plan's steps run in order — a positive IS reference as an
+/// in-memory semi-join that binds the plan's binders and tests its tests, a
+/// filter over the names bound so far, a negation as an anti-join over the
+/// KEY positions it compares. So EXPLAIN agrees with evaluation in every
+/// conjunct order (issue #300). ALONG expressions are evaluated last, `prev`
+/// reading the plan's recursive reference.
+///
+/// A generator step is not evaluated: rows do not carry what a generator
+/// needs, and a filter over its outputs sees them absent.
 pub async fn resolve_clause_with_is_refs(
     clause: &CompiledClause,
     fact_source: &dyn DerivedFactSource,
@@ -307,101 +271,81 @@ pub async fn resolve_clause_with_is_refs(
     rule_catalog: &HashMap<String, CompiledRule>,
     calling_rule_prob_col: Option<&str>,
 ) -> Result<Vec<FactRow>, LocyError> {
-    // Collect all variable names introduced by IS-ref joins:
-    // subjects the MATCH pattern does not bind, target variables, AND non-KEY
-    // value columns from target rules. These must be deferred until after the
-    // IS-ref join resolves.
-    let match_bound = super::mutation_common::pattern_variable_names(&clause.match_pattern);
-    let mut is_ref_vars: Vec<String> = Vec::new();
-    for cond in &clause.where_conditions {
-        if let RuleCondition::IsReference(is_ref) = cond
-            && !is_ref.negated
-        {
-            // A subject the MATCH pattern does not provide is bound *by* this
-            // IS-ref (see `SubjectMode::Bind`). Without listing it here, a
-            // predicate referencing it is classified `match_safe` and pushed
-            // into the base Cypher MATCH with an unbound variable.
-            for subject in &is_ref.subjects {
-                if !match_bound.contains(subject) {
-                    is_ref_vars.push(subject.clone());
-                }
-            }
-            if let Some(target) = &is_ref.target {
-                is_ref_vars.push(target.clone());
-            }
-            let rule_name = is_ref.rule_name.to_string();
-            if let Some(target_rule) = rule_catalog.get(&rule_name) {
-                for col in &target_rule.yield_schema {
-                    if !col.is_key {
-                        is_ref_vars.push(col.name.clone());
-                    }
-                }
-            }
+    let plan = clause
+        .binding
+        .plan()
+        .ok_or_else(|| LocyError::EvaluationError {
+            message: "internal error: an EXPLAIN clause has no binding plan".into(),
+        })?;
+    let condition = |index: usize| -> Result<&Expr, LocyError> {
+        match clause.where_conditions.get(index) {
+            Some(RuleCondition::Expression(expr)) => Ok(expr),
+            _ => Err(LocyError::EvaluationError {
+                message: format!(
+                    "internal error: binding plan filter {index} is not a WHERE expression"
+                ),
+            }),
         }
-    }
+    };
 
-    // Partition Cypher conditions: match-safe vs. IS-ref-dependent.
-    let all_cypher = extract_cypher_conditions(&clause.where_conditions);
-    let mut match_safe = Vec::new();
-    let mut target_dependent = Vec::new();
-    for expr in all_cypher {
-        if is_ref_vars.iter().any(|v| expr_references_var(&expr, v)) {
-            target_dependent.push(expr);
-        } else {
-            match_safe.push(expr);
-        }
-    }
-
-    // Execute base MATCH query.
+    // Execute base MATCH query with the conjuncts over MATCH variables.
+    let match_safe = plan
+        .immediate_filters
+        .iter()
+        .map(|&index| condition(index).cloned())
+        .collect::<Result<Vec<Expr>, LocyError>>()?;
     let raw_batches = fact_source
         .execute_pattern(&clause.match_pattern, &match_safe)
         .await?;
     let mut rows = record_batches_to_locy_rows(&raw_batches);
 
-    // Apply IS-ref joins/anti-joins sequentially.
-    for cond in &clause.where_conditions {
-        if let RuleCondition::IsReference(is_ref) = cond {
-            let rule_name = is_ref.rule_name.to_string();
-            // Bind in the referenced rule's binding sequence, as the planner
-            // does: KEY columns, then value columns. The relation's own column
-            // order is YIELD order, which bound a `TO` target to a value
-            // column whenever one was yielded between two KEYs.
-            let (schema, derived_facts) = if let Some(relation) = derived_store.get(&rule_name) {
-                let schema = rule_catalog.get(&rule_name).map_or_else(
-                    || relation.columns.clone(),
-                    |r| uni_locy::is_binding::binding_column_names(&r.yield_schema),
-                );
-                (schema, relation.rows.clone())
-            } else {
-                (Vec::new(), Vec::new())
-            };
+    let facts_of = |rule_name: &str| -> Vec<FactRow> {
+        derived_store
+            .get(rule_name)
+            .map(|relation| relation.rows.clone())
+            .unwrap_or_default()
+    };
 
-            if is_ref.negated {
+    for step in &plan.steps {
+        match *step {
+            BindingStep::Ref(r) => {
+                let derived_facts = facts_of(&plan.refs[r].rule);
+                rows = semi_join_is_ref(&rows, &derived_facts, plan, r);
+            }
+            BindingStep::Filter(index) => {
+                let expr = condition(index)?;
+                let mut kept = Vec::with_capacity(rows.len());
+                for row in rows {
+                    if eval_condition(expr, &row, "rule WHERE")? {
+                        kept.push(row);
+                    }
+                }
+                rows = kept;
+            }
+            BindingStep::Generator(_) => {}
+            BindingStep::AntiJoin(r) => {
+                let rule_name = &plan.refs[r].rule;
+                let derived_facts = facts_of(rule_name);
+                let pairs = negation_pairs(plan, r);
                 // Check if target rule has PROB column for complement semantics.
-                let target_prob_col = rule_catalog.get(&rule_name).and_then(|r| {
-                    r.yield_schema
+                let target_prob_col = rule_catalog.get(rule_name).and_then(|rule| {
+                    rule.yield_schema
                         .iter()
                         .find(|c| c.is_prob)
                         .map(|c| c.name.clone())
                 });
-
-                if let (Some(tpc), Some(_)) = (&target_prob_col, &calling_rule_prob_col) {
+                rows = match (&target_prob_col, calling_rule_prob_col) {
                     // Probabilistic complement: keep all rows, compute 1-p.
-                    let complement_col = format!("__prob_complement_{}", rule_name);
-                    rows = prob_complement_is_ref(
+                    (Some(tpc), Some(_)) => prob_complement_is_ref(
                         &rows,
                         &derived_facts,
-                        is_ref,
-                        &schema,
+                        &pairs,
                         tpc,
-                        &complement_col,
-                    );
-                } else {
-                    // Boolean anti-join (existing behavior).
-                    rows = anti_join_is_ref(&rows, &derived_facts, is_ref, &schema);
-                }
-            } else {
-                rows = semi_join_is_ref(&rows, &derived_facts, is_ref, &schema);
+                        &format!("__prob_complement_{rule_name}"),
+                    ),
+                    // Boolean anti-join.
+                    _ => anti_join_is_ref(&rows, &derived_facts, &pairs),
+                };
             }
         }
     }
@@ -410,20 +354,6 @@ pub async fn resolve_clause_with_is_refs(
     // (locy_slg.rs) to multiply into the PROB column AFTER yield projections.
     // This is because apply_yield_projections() re-evaluates the YIELD expression
     // (e.g., "1.0 AS safety PROB") and would overwrite any pre-multiplied value.
-
-    // Apply target-dependent Cypher conditions.
-    if !target_dependent.is_empty() {
-        let mut kept = Vec::with_capacity(rows.len());
-        'rows: for row in rows {
-            for expr in &target_dependent {
-                if !eval_condition(expr, &row, "rule WHERE")? {
-                    continue 'rows;
-                }
-            }
-            kept.push(row);
-        }
-        rows = kept;
-    }
 
     // Evaluate ALONG expressions (using __prev_* stash for PrevRef lookups).
     if !clause.along.is_empty() {
@@ -458,17 +388,11 @@ pub async fn resolve_clause_with_is_refs(
 mod tests {
     use super::*;
     use uni_common::Value;
-    use uni_cypher::locy_ast::{IsReference, QualifiedName};
 
-    fn make_is_ref(subject: &str, rule: &str) -> IsReference {
-        IsReference {
-            subjects: vec![subject.to_string()],
-            rule_name: QualifiedName {
-                parts: vec![rule.to_string()],
-            },
-            target: None,
-            negated: true,
-        }
+    /// The anti-join key of `x IS NOT rule` on a one-KEY rule whose KEY is
+    /// named like the subject.
+    fn make_is_ref(subject: &str, _rule: &str) -> Vec<(String, String)> {
+        vec![(subject.to_string(), subject.to_string())]
     }
 
     fn row_int(pairs: &[(&str, i64)]) -> FactRow {
@@ -501,9 +425,8 @@ mod tests {
             },
         ];
         let is_ref = make_is_ref("n", "risky");
-        let schema = vec!["n".to_string(), "risk_score".to_string()];
 
-        let result = prob_complement_is_ref(&base, &derived, &is_ref, &schema, "risk_score", "__c");
+        let result = prob_complement_is_ref(&base, &derived, &is_ref, "risk_score", "__c");
 
         assert_eq!(result.len(), 3);
         let c0 = result[0].get("__c").unwrap().as_f64().unwrap();
@@ -532,9 +455,8 @@ mod tests {
             },
         ];
         let is_ref = make_is_ref("n", "rule");
-        let schema = vec!["n".to_string(), "prob".to_string()];
 
-        let result = prob_complement_is_ref(&base, &derived, &is_ref, &schema, "prob", "__c");
+        let result = prob_complement_is_ref(&base, &derived, &is_ref, "prob", "__c");
         let c = result[0].get("__c").unwrap().as_f64().unwrap();
         assert!((c - 0.35).abs() < 1e-10, "expected 0.35, got {c}");
     }
@@ -564,9 +486,8 @@ mod tests {
         let base = vec![row_int(&[("n", 1)]), row_int(&[("n", 2)])];
         let derived = vec![row_int(&[("n", 1)])];
         let is_ref = make_is_ref("n", "flagged");
-        let schema = vec!["n".to_string()];
 
-        let result = anti_join_is_ref(&base, &derived, &is_ref, &schema);
+        let result = anti_join_is_ref(&base, &derived, &is_ref);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].get("n").unwrap().as_i64(), Some(2));
     }

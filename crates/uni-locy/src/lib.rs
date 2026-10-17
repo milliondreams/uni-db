@@ -1,3 +1,4 @@
+pub mod binding_plan;
 pub mod calibration;
 pub mod compiler;
 pub mod config;
@@ -13,6 +14,10 @@ pub mod semiring;
 pub mod top_k_proofs;
 pub mod types;
 
+#[doc(inline)]
+pub use binding_plan::{
+    ClauseBinding, ClauseBindingPlan, ColumnKind, ColumnKinds, attach_binding_plans,
+};
 pub use calibration::{
     BetaCalibration, BetaFitter, CalibrationError, CalibrationMethodKind, Calibrator,
     CalibratorFitter, CredalCalibrator, DirichletCalibrator, DirichletFitter,

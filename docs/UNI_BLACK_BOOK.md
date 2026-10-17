@@ -4170,6 +4170,15 @@ WHERE (x, y) IS reachable
 WHERE x IS NOT compromised
 ```
 
+Which occurrence of a variable binds it is decided once per clause by the
+binding plan (`uni_locy::binding_plan`), independently of conjunct order: one
+binder per variable, every other occurrence a test, negations last. The plan is
+the single source of truth for the compiler's scope and IS NOT checks, the
+planner, EXPLAIN, the anti-join and the feature resolvers (C-BIND). Reading a
+value column two references expose is `AmbiguousRuleColumn`; KEY columns are
+never exposed by name; a node / relationship / scalar mismatch at a position is
+`IsRefKindMismatch`.
+
 ### ALONG (Path-Carried Values)
 
 Accumulate values along traversal paths:
@@ -7803,13 +7812,59 @@ FOLD outputs yielded in a different order from their FOLD bindings
 (`locy_is_ref_binding`; the `locy_binding` topo relation; the oracle
 differential reorders every generated rule's YIELD in its second run).
 
+**One binding plan per clause decides which occurrence binds (C-BIND).** C-IS
+fixes *which column* a position takes; `uni_locy::binding_plan::ClauseBindingPlan`
+fixes *which occurrence of a variable binds it* and in what order the body runs,
+independently of the textual order of the WHERE conditions (issue #300). MATCH
+variables bind first; a positive IS reference anchored on a bound KEY runs next
+(a hash semi-join), then ready generators, then unanchored references; the
+first scheduled occurrence binds and every other one tests; a reference beats a
+generator as binder (the generator output is renamed `__gen{c}_x` and tested);
+filters go after their last producer; `IS NOT` runs last as an anti-join. Every
+positive reference's derived scan is prefixed `__isref{k}_`, the first included.
+Each position carries a `ColumnKind` (node / relationship / scalar) inferred
+from the referenced rule's YIELD expression as a greatest fixpoint over
+recursion (`ColumnKinds::infer`) — never "KEY ⇒ vid", which joined a scalar KEY
+against `_vid` and returned unrelated nodes when an integer equalled a vid. The
+plan's `exposure` lists the value columns readable by bare name (`Unique`) or
+by none (`Ambiguous`); KEY columns are never exposed.
+
+Before the plan, four components decided "is this name bound" on their own:
+the compiler's scope check (unordered), its IS NOT checks (left to right), the
+planner (first reference bare, KEY positions always tested, unknown names left
+for DataFusion to resolve by column name) and EXPLAIN (`locy_delta`, first-wins
+and last-wins). On the #300 probe 10 of 15 shapes were wrong in at least one
+conjunct order. The plan is now the single source of truth, and its consumers
+are: the compiler's scope check (`compiler/scope.rs`: body scope = plan scope +
+`Unique` exposures; it alone reports an unbound name, so its `PrevOutsideAlong`
+is never preempted), the IS NOT checks and kind checks (plan diagnostics:
+`IsNotSubjectNotANode`, `IsNotBindsValueColumn`, `IsNotKeyUnbound`,
+`IsRefKindMismatch`, `AmbiguousRuleColumn`, `AmbiguousPrevRef`,
+`GeneratorCycle`, raised by `attach_to_catalog` in typecheck and by
+`attach_binding_plans` after registered rules are merged and for an ASSUME
+body), the planner's Step 3 and `ClauseScope` (the only place a clause name
+becomes a batch column; an unsourced name, an ambiguous one included, is an
+internal error), EXPLAIN's `locy_delta`, the anti-join's negation keys, the
+model-feature resolvers and YIELD type inference (`plan_sourced_column`). A
+clause referencing a rule the compiler has no schema for stays `Pending` until
+`attach_binding_plans` runs against a catalog that has it; the planner refuses
+a `Pending` clause. In debug builds `build_clause` ends with `check_sources`, a
+structural guard that walks the produced plan bottom-up and refuses any
+expression reading a name no node below it produced — a future bare
+`Expr::Variable` fails in CI instead of capturing. Guards:
+`locy_is_ref_name_resolution` (every case in every conjunct order, `,` and
+`AND`, flushed and unflushed), the `binding_plan` permutation unit tests, the
+planner's `guard_*` tests, and the `CrossGroupCorrelation` TCK scenario that
+reads a doubly exposed column.
+
 **Every Locy expression is scope-checked at compile time (C-SCOPE).** Locy reparses every
 slot but the inside of ALONG as plain Cypher, so a misspelt variable or a
 `prev.x` outside ALONG failed late ("No field named …" from DataFusion) or, in a
 command WHERE (evaluated row by row by `locy_eval`), evaluated to NULL and
 silently matched nothing. `compiler/scope.rs` checks each slot against what it sees at
-run time: the rule body (MATCH variables, positive IS subjects and targets,
-generator outputs, referenced rules' value columns by name), plus ALONG names
+run time: the rule body (the clause's binding-plan scope — MATCH variables,
+positive IS subjects and targets, generator outputs — plus the value columns it
+exposes uniquely by name; see C-BIND), plus ALONG names
 for ALONG, FOLD arguments and YIELD; and, for a YIELD item over a FOLD output,
 the post-FOLD WHERE and REQUIRE, only the folded batch (KEY columns by YIELD
 name, FOLD outputs by name and alias). EXPLAIN, ABDUCE and DERIVE WHERE are

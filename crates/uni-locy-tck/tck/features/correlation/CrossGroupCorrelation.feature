@@ -145,3 +145,57 @@ Feature: Cross-group correlation warnings (Phase D F3)
       """
     Then evaluation should succeed
     And the result should not contain a CrossPredicateCorrelation warning
+
+  # ── Reading a column two references expose is ambiguous (issue #300) ───
+  #
+  # The scenarios above expose `prob` through both `p` and `q` without
+  # reading it, which stays legal. Reading it names no single reference, so
+  # it is a compile error in every conjunct order; it used to resolve to
+  # whichever reference came first in the WHERE.
+
+  Scenario: Reading a value column two IS references expose fails to compile
+    When compiling the following Locy program:
+      """
+      CREATE RULE p AS
+        MATCH (s:Supplier)
+        FOLD prob = MNOR(0.7)
+        YIELD KEY s, prob
+
+      CREATE RULE q AS
+        MATCH (s:Supplier)
+        FOLD prob = MNOR(0.3)
+        YIELD KEY s, prob
+
+      CREATE RULE r AS
+        MATCH (s:Supplier)
+        WHERE prob > 0.5, s IS q, s IS p
+        YIELD KEY s
+      """
+    Then the program should fail to compile
+    And the compile error should mention 'ambiguous'
+    And the compile error should mention 'prob'
+
+  Scenario: Binding each exposed column positionally resolves the read
+    Given having executed:
+      """
+      CREATE (:Supplier {name: 'A'})
+      """
+    When evaluating the following Locy program:
+      """
+      CREATE RULE p AS
+        MATCH (s:Supplier)
+        FOLD prob = MNOR(0.7)
+        YIELD KEY s, prob
+
+      CREATE RULE q AS
+        MATCH (s:Supplier)
+        FOLD prob = MNOR(0.3)
+        YIELD KEY s, prob
+
+      CREATE RULE r AS
+        MATCH (s:Supplier)
+        WHERE pp > 0.5, (s, pq) IS q, (s, pp) IS p
+        YIELD KEY s, pp, pq
+      """
+    Then evaluation should succeed
+    And the derived relation 'r' should contain a fact where pp is approximately 0.7 within 0.000001

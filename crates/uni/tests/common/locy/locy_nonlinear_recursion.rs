@@ -16,6 +16,14 @@
 //!    re-stamping batches with the exec's schema in `DerivedScanExec`.
 //!    Chained refs (`a IS r TO mid, mid IS r TO z`) additionally needed
 //!    `TO`-bound targets registered as node variables for later subjects.
+//!
+//!    Since issue #300 *every* positive IS-ref's scan is prefixed, the first
+//!    included: leaving the first one bare let a later name capture its
+//!    columns. Which occurrence binds a variable and which ones test it is
+//!    decided once per clause by the binding plan (`uni_locy::binding_plan`),
+//!    independently of conjunct order, and a name two refs expose cannot be
+//!    read bare (`AmbiguousRuleColumn`). Conjunct-order independence is
+//!    asserted in `locy_is_ref_name_resolution.rs`.
 //! 2. **Semi-naive incompleteness:** self-ref scans received only the
 //!    latest delta, so non-linear recursion joined Δ×Δ and missed Δ×F_old
 //!    (8/10 facts on the 5-chain). Fixed by `FixpointRulePlan::non_linear`:

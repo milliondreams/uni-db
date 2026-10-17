@@ -5233,7 +5233,8 @@ impl HybridPhysicalPlanner {
     /// Plan a compact Locy YIELD projection — emits ONLY the listed expressions,
     /// without carrying through helper/property columns.
     ///
-    /// Node variables are projected as their `._vid` column (UInt64).
+    /// A bare name is an exact column of the input (the Locy planner reads a
+    /// node through its `._vid` column, a relationship through its `._eid`).
     /// Other expressions are compiled normally, then CAST to target type if needed.
     fn plan_locy_project(
         &self,
@@ -5257,55 +5258,30 @@ impl HybridPhysicalPlanner {
         for (i, (expr, alias)) in projections.iter().enumerate() {
             let target_type = target_types.get(i);
 
-            // Handle node/relationship variables: extract the identity column
-            if let Expr::Variable(var_name) = expr {
-                // A relationship variable → its EID (UInt64), hydrated into the
-                // edge after the fixpoint as a node's VID is. Checked before
-                // `._vid`, which a relationship's columns can also include.
-                let eid_col_name = format!("{var_name}._eid");
-                if let Some((eid_idx, _)) = schema.column_with_name(&eid_col_name) {
-                    let col_expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
-                        Arc::new(Column::new(&eid_col_name, eid_idx));
-                    let name = alias.clone().unwrap_or_else(|| var_name.clone());
-                    exprs.push((col_expr, name));
-                    continue;
-                }
-                // Check if this is a graph-expanded node variable ({var}._vid exists)
-                let vid_col_name = format!("{}._vid", var_name);
-                let vid_col_match = schema
-                    .fields()
-                    .iter()
-                    .enumerate()
-                    .find(|(_, f)| f.name() == &vid_col_name);
-
-                if let Some((vid_idx, _)) = vid_col_match {
-                    // Node variable → extract VID (UInt64)
-                    let col_expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
-                        Arc::new(Column::new(&vid_col_name, vid_idx));
-                    let name = alias.clone().unwrap_or_else(|| var_name.clone());
-                    exprs.push((col_expr, name));
-                    continue;
-                }
-
-                // Direct column (e.g. from derived scan)
-                if let Some((col_idx, field)) = schema.column_with_name(var_name) {
-                    let col_expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
-                        Arc::new(Column::new(var_name, col_idx));
-                    // A column declared as a Cypher value (a generator output,
-                    // say) is encoded, so the rule's facts carry the declared
-                    // type.
-                    let col_expr = if target_type == Some(&DataType::LargeBinary)
-                        && field.data_type() != &DataType::LargeBinary
-                    {
-                        crate::query::df_graph::expr_compiler::to_cypher_value_expr(col_expr)
-                    } else {
-                        col_expr
-                    };
-                    let name = alias.clone().unwrap_or_else(|| var_name.clone());
-                    exprs.push((col_expr, name));
-                    continue;
-                }
-                // Fall through to generic expression compilation
+            // A bare name is a column of the input, looked up exactly. The Locy
+            // planner resolves every name through the clause's binding plan
+            // before it gets here — a node to its `._vid`, a relationship to
+            // its `._eid`, a referenced column to its prefixed name — so a
+            // fallback that guessed (`_eid`, then `_vid`, then the bare name)
+            // could only capture an unrelated column (issue #300).
+            if let Expr::Variable(var_name) = expr
+                && let Some((col_idx, field)) = schema.column_with_name(var_name)
+            {
+                let col_expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
+                    Arc::new(Column::new(var_name, col_idx));
+                // A column declared as a Cypher value (a generator output,
+                // say) is encoded, so the rule's facts carry the declared
+                // type.
+                let col_expr = if target_type == Some(&DataType::LargeBinary)
+                    && field.data_type() != &DataType::LargeBinary
+                {
+                    crate::query::df_graph::expr_compiler::to_cypher_value_expr(col_expr)
+                } else {
+                    col_expr
+                };
+                let name = alias.clone().unwrap_or_else(|| var_name.clone());
+                exprs.push((col_expr, name));
+                continue;
             }
 
             // A recursive rule's referenced-fact discriminator (#159): a hash of

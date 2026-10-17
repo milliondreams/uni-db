@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use crate::api::UniInner;
 use crate::api::hooks::{QueryType, SessionHook};
-use crate::api::impl_locy::{LocyRuleRegistry, merge_registered_rules};
+use crate::api::impl_locy::{LocyRuleRegistry, map_compile_error, merge_registered_rules};
 use crate::api::locy_result::LocyResult;
 use uni_common::{Result, UniError, Value};
 use uni_locy::LocyConfig;
@@ -410,7 +410,8 @@ impl PreparedLocy {
         };
 
         // Merge registered rules (same logic as evaluate_with_config)
-        merge_registered_rules(&mut compiled, &self.rule_registry.read().unwrap());
+        merge_registered_rules(&mut compiled, &self.rule_registry.read().unwrap())
+            .map_err(map_compile_error)?;
 
         // Build config with params and session-level semantics
         let config = LocyConfig {

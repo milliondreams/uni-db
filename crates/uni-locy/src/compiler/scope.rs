@@ -13,10 +13,13 @@
 //!
 //! What each slot sees:
 //!
-//! * the rule body (WHERE, IS-reference arguments, DERIVE properties): the
-//!   MATCH pattern's variables, positive IS references' subjects and targets,
-//!   generator outputs, and every value column of a positive reference's
-//!   rule by its bare name;
+//! * the rule body (WHERE, generator arguments, DERIVE properties): the
+//!   clause's binding-plan scope — the MATCH pattern's variables, positive IS
+//!   references' subjects and targets, generator outputs — and the value
+//!   columns the plan exposes uniquely by their bare name
+//!   ([`crate::binding_plan`]). A value column two references expose is not
+//!   in scope; reading one is the plan's `AmbiguousRuleColumn`, raised
+//!   before this pass. KEY columns are never exposed;
 //! * ALONG, FOLD arguments and YIELD items: the body plus ALONG names;
 //! * BEST BY: also the FOLD outputs and the rule's YIELD columns;
 //! * a YIELD item over a FOLD output, the post-FOLD WHERE and REQUIRE: only
@@ -26,10 +29,13 @@
 //! Variables bound inside a comprehension, quantifier, `reduce` or subquery
 //! are local to it and not checked; `$params` are not variables.
 //!
+//! This pass is the only reporter of an unbound name; the binding plan
+//! decides what is bound, this pass says so when something is not.
+//!
 //! A clause that references a rule whose schema the compiler does not have
 //! (an external or registered rule, or an outer rule seen from an ASSUME body)
-//! cannot list that rule's value columns, so its body is checked only for
-//! `prev`.
+//! has no binding plan yet and cannot list that rule's value columns, so its
+//! body is checked only for `prev`.
 
 // Rust guideline compliant
 
@@ -43,13 +49,14 @@ use uni_cypher::locy_ast::{
 use super::errors::LocyCompileError;
 use super::modules::{self, ModuleContext};
 use super::warded::extract_pattern_variables;
+use crate::binding_plan::{ClauseBindingPlan, Exposure, VarSource};
 use crate::types::CompiledRule;
 
 /// The variables an expression reads from its enclosing scope.
 ///
 /// Variables bound inside a comprehension, quantifier, `reduce`, pattern
 /// comprehension or subquery are local to it and are not returned.
-pub(super) fn free_variables(expr: &Expr) -> Vec<String> {
+pub(crate) fn free_variables(expr: &Expr) -> Vec<String> {
     fn walk(expr: &Expr, out: &mut Vec<String>) {
         if let Expr::Variable(v) = expr {
             out.push(v.clone());
@@ -79,8 +86,12 @@ pub(super) fn check_rule_scopes(
     let mut rule_names: Vec<&String> = rule_groups.keys().collect();
     rule_names.sort();
     for rule_name in rule_names {
-        for def in &rule_groups[rule_name] {
-            check_clause(rule_name, def, compiled_rules, module_ctx)?;
+        let clauses = compiled_rules.get(rule_name).map(|r| r.clauses.as_slice());
+        for (index, def) in rule_groups[rule_name].iter().enumerate() {
+            let plan = clauses
+                .and_then(|c| c.get(index))
+                .and_then(|c| c.binding.plan());
+            check_clause(rule_name, def, plan, compiled_rules, module_ctx)?;
         }
     }
     Ok(())
@@ -93,25 +104,36 @@ struct Slot<'a> {
     visible: HashSet<String>,
 }
 
-fn check_clause(
-    rule: &str,
+/// The names the body of a clause sees, and whether that set is complete.
+///
+/// With a binding plan, the plan's scope (YIELD aliases excluded: they name
+/// a fact column, which does not exist while the body runs) plus its unique
+/// exposures. Without one, every positive reference's subjects, targets and
+/// value columns, and the set is open when a referenced rule is unknown.
+fn body_scope(
     def: &RuleDefinition,
+    plan: Option<&ClauseBindingPlan>,
+    pattern_vars: &HashSet<String>,
     compiled_rules: &HashMap<String, CompiledRule>,
     module_ctx: &ModuleContext,
-) -> Result<(), LocyCompileError> {
-    for fold in &def.fold {
-        if !matches!(fold.aggregate, Expr::FunctionCall { .. }) {
-            return Err(LocyCompileError::FoldNotAnAggregateCall {
-                rule: rule.to_string(),
-                name: fold.name.clone(),
-            });
-        }
+) -> (HashSet<String>, bool) {
+    if let Some(plan) = plan {
+        let body = plan
+            .scope
+            .iter()
+            .filter(|(_, source)| !matches!(source, VarSource::YieldAlias(_)))
+            .map(|(name, _)| name.clone())
+            .chain(
+                plan.exposure
+                    .iter()
+                    .filter(|(_, exposure)| matches!(exposure, Exposure::Unique { .. }))
+                    .map(|(name, _)| name.clone()),
+            )
+            .chain(pattern_vars.iter().cloned())
+            .collect();
+        return (body, true);
     }
-
-    let pattern_vars = extract_pattern_variables(&def.match_pattern);
-
     let mut body: HashSet<String> = pattern_vars.clone();
-    // Whether every referenced rule's value columns are known.
     let mut closed = true;
     for cond in &def.where_conditions {
         match cond {
@@ -134,6 +156,29 @@ fn check_clause(
             _ => {}
         }
     }
+    (body, closed)
+}
+
+fn check_clause(
+    rule: &str,
+    def: &RuleDefinition,
+    plan: Option<&ClauseBindingPlan>,
+    compiled_rules: &HashMap<String, CompiledRule>,
+    module_ctx: &ModuleContext,
+) -> Result<(), LocyCompileError> {
+    for fold in &def.fold {
+        if !matches!(fold.aggregate, Expr::FunctionCall { .. }) {
+            return Err(LocyCompileError::FoldNotAnAggregateCall {
+                rule: rule.to_string(),
+                name: fold.name.clone(),
+            });
+        }
+    }
+
+    let pattern_vars = extract_pattern_variables(&def.match_pattern);
+
+    // Whether every referenced rule's value columns are known.
+    let (body, closed) = body_scope(def, plan, &pattern_vars, compiled_rules, module_ctx);
 
     let along: HashSet<String> = def.along.iter().map(|a| a.name.clone()).collect();
     let folds: HashSet<String> = def.fold.iter().map(|f| f.name.clone()).collect();
@@ -193,6 +238,18 @@ fn check_clause(
                 .filter_map(|c| match c {
                     RuleCondition::Expression(e) => Some(e),
                     _ => None,
+                })
+                .collect(),
+            visible: body.clone(),
+        },
+        Slot {
+            name: "generator arguments",
+            exprs: def
+                .where_conditions
+                .iter()
+                .flat_map(|c| match c {
+                    RuleCondition::Generator(g) => g.args.iter().collect(),
+                    _ => Vec::new(),
                 })
                 .collect(),
             visible: body.clone(),

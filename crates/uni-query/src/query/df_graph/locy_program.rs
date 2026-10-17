@@ -1716,60 +1716,21 @@ fn convert_is_refs(
                     ))
                 })?;
 
-            // For negated IS-refs, compute (left_body_col, right_derived_col) pairs for
-            // anti-join filtering. The derived column is the one the planner
-            // resolved for that subject (`LocyIsRef::binding_columns`, from
-            // `uni_locy::is_binding`), so IS NOT binds what the positive join
-            // binds. Taking the registry schema's fields by position assumed
-            // KEY columns come first; for a rule yielding `b, KEY a` it tested
-            // `b` and returned exactly the wrong nodes.
-            //
-            // The left name prefers the hidden `{var}._vid` column the planner
-            // projected (`LocyIsRef::subject_vid_cols`). The anti-join runs after
-            // `LocyProject`, so the bare variable name only resolves when YIELD
-            // happened to project that exact name — an aliased or unprojected
-            // subject was previously unresolvable and the negation silently
-            // became a no-op (issue #158). The bare-name fallback remains for
-            // subjects that are not MATCH-bound node variables, which have no
-            // `._vid` column; those still error in `apply_anti_join_composite`
-            // rather than failing open.
+            // A negated reference's anti-join key comes from its binding plan
+            // (`LocyIsRef::negation_keys`): one component per KEY position some
+            // literal binds, read on the body side from the hidden column the
+            // planner projected for its binder. Nothing is resolved by name
+            // here, so a subject YIELD renamed or dropped still anti-joins
+            // (issue #158), and an existential value position is absent.
+            let anti_join_cols = is_ref.negation_keys.clone();
+            // The body column of a negated subject is its hidden identity
+            // column; a positive reference's subject keeps its own name.
             let left_col = |var: &String| {
                 is_ref
-                    .subject_vid_cols
-                    .get(var)
-                    .cloned()
-                    .unwrap_or_else(|| var.clone())
-            };
-            let anti_join_cols = if is_ref.negated {
-                let mut cols: Vec<(String, String)> = is_ref
-                    .subjects
+                    .negation_keys
                     .iter()
-                    .enumerate()
-                    .filter_map(|(i, s)| {
-                        if let uni_cypher::ast::Expr::Variable(var) = s {
-                            let right_col = is_ref
-                                .binding_columns
-                                .get(i)
-                                .cloned()
-                                .unwrap_or_else(|| var.clone());
-                            Some((left_col(var), right_col))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                // Include target variable in anti-join for composite-key IS NOT.
-                // Without this, `d IS NOT known TO dis` only checks d, not (d, dis),
-                // filtering ALL pairs where the drug has ANY indication regardless
-                // of disease.
-                if let Some(uni_cypher::ast::Expr::Variable(target_var)) = &is_ref.target
-                    && let Some(column) = is_ref.binding_columns.get(is_ref.subjects.len())
-                {
-                    cols.push((left_col(target_var), column.clone()));
-                }
-                cols
-            } else {
-                Vec::new()
+                    .find(|k| k.variable == *var)
+                    .map_or_else(|| var.clone(), |k| k.body_column.clone())
             };
 
             // Provenance join cols: for ALL IS-refs (not just negated), compute

@@ -17,6 +17,7 @@ use uni_cypher::locy_ast::{
 use crate::config::LocyConfig;
 use crate::types::{CompiledAssume, CompiledCommand, CompiledProgram, Stratum};
 use errors::LocyCompileError;
+pub(crate) use scope::free_variables;
 pub use typecheck::{MonotonicityOracle, default_monotonicity_oracle};
 
 /// Validate and stratify a parsed Locy program into a `CompiledProgram`.
@@ -1624,23 +1625,29 @@ mod tests {
         );
     }
 
-    /// A subject bound by an earlier positive `IS ... TO` target is itself a
-    /// node, so it is a valid negation subject. Binding is order-sensitive:
-    /// `mid` exists only because the positive reference precedes the negation.
+    /// A subject bound by a positive `IS ... TO` target is itself a node, so
+    /// it is a valid negation subject — in either conjunct order. Binding is
+    /// order-independent (issue #300): `mid` is bound by the positive
+    /// reference wherever it appears, and the negation runs last.
     #[test]
     fn is_not_subject_bound_by_earlier_positive_is_ref_compiles() {
-        let prog = parse_locy(
-            "CREATE RULE link AS MATCH (a:N)-[:R]->(b:N) YIELD KEY a, KEY b \
-             CREATE RULE blocked AS MATCH (n:N) WHERE n.bad = true YIELD KEY n \
-             CREATE RULE ok AS MATCH (a:N) \
-             WHERE a IS link TO mid, mid IS NOT blocked \
-             YIELD KEY a, KEY mid",
-        )
-        .unwrap();
-        assert!(
-            compile(&prog).is_ok(),
-            "a subject bound by an earlier positive IS ... TO target is a node"
-        );
+        for conditions in [
+            "a IS link TO mid, mid IS NOT blocked",
+            "mid IS NOT blocked, a IS link TO mid",
+        ] {
+            let prog = parse_locy(&format!(
+                "CREATE RULE link AS MATCH (a:N)-[:R]->(b:N) YIELD KEY a, KEY b \
+                 CREATE RULE blocked AS MATCH (n:N) WHERE n.bad = true YIELD KEY n \
+                 CREATE RULE ok AS MATCH (a:N) \
+                 WHERE {conditions} \
+                 YIELD KEY a, KEY mid"
+            ))
+            .unwrap();
+            assert!(
+                compile(&prog).is_ok(),
+                "a subject bound by a positive IS ... TO target is a node: {conditions}"
+            );
+        }
     }
 
     /// A YIELD alias that renames a MATCH-bound **node** is still a node.
@@ -1780,19 +1787,87 @@ mod tests {
         }
     }
 
-    /// Only the *negated* form is constrained — a positive `IS` resolves in the
-    /// body plan before projection and does not join on node identity.
+    /// A positive `IS` also joins on the referenced column's kind: a
+    /// relationship variable on a node KEY column can never match a fact
+    /// correctly (an eid compared with a vid matches whichever ids happen to
+    /// coincide), so it is a compile error, as for the negated form.
+    ///
+    /// This used to compile — the check covered only `IS NOT`. The binding
+    /// plan types every IS position from the referenced rule's YIELD
+    /// expression (issue #300).
     #[test]
-    fn positive_is_ref_with_non_node_subject_still_compiles() {
+    fn positive_is_ref_with_non_node_subject_is_a_kind_mismatch() {
         let prog = parse_locy(
             "CREATE RULE flagged AS MATCH (n:N) WHERE n.bad = true YIELD KEY n \
              CREATE RULE probe AS MATCH (a:N)-[e:R]->(b:N) WHERE e IS flagged \
              YIELD KEY a, KEY b",
         )
         .unwrap();
-        assert!(
-            compile(&prog).is_ok(),
-            "positive IS is unaffected by the negation-subject rule"
-        );
+        match compile(&prog).unwrap_err() {
+            LocyCompileError::IsRefKindMismatch {
+                rule,
+                target,
+                variable,
+                column,
+                expected,
+                found,
+            } => {
+                assert_eq!(rule, "probe");
+                assert_eq!(target, "flagged");
+                assert_eq!(variable, "e");
+                assert_eq!(column, "n");
+                assert_eq!(expected, crate::binding_plan::ColumnKind::Node);
+                assert_eq!(found, crate::binding_plan::ColumnKind::Edge);
+            }
+            e => panic!("expected IsRefKindMismatch, got {e:?}"),
+        }
+    }
+
+    /// `NOT x IS r` may precede the reference that binds `x` (issue #300):
+    /// before the binding plan, the negation-subject check walked the WHERE
+    /// left to right and rejected this order only.
+    #[test]
+    fn is_not_before_its_binder_compiles_in_every_order() {
+        for conditions in [
+            "NOT b IS blocked, a IS link TO b",
+            "a IS link TO b, NOT b IS blocked",
+        ] {
+            let prog = parse_locy(&format!(
+                "CREATE RULE link AS MATCH (a:N)-[:R]->(b:N) YIELD KEY a, KEY b \
+                 CREATE RULE blocked AS MATCH (n:N) WHERE n.bad = true YIELD KEY n \
+                 CREATE RULE q AS MATCH (a:N) WHERE {conditions} YIELD KEY a, KEY b"
+            ))
+            .unwrap();
+            assert!(
+                compile(&prog).is_ok(),
+                "{conditions}: {:?}",
+                compile(&prog).err()
+            );
+        }
+    }
+
+    /// The value-column comparison of an `IS NOT` is refused whichever side of
+    /// the negation binds the variable.
+    #[test]
+    fn is_not_value_comparison_is_refused_in_every_order() {
+        for conditions in [
+            "(o, e, pct) IS stake, (o, e, pct) IS NOT stake",
+            "(o, e, pct) IS NOT stake, (o, e, pct) IS stake",
+        ] {
+            let prog = parse_locy(&format!(
+                "CREATE RULE stake AS MATCH (o:N)-[r:R]->(e:N) YIELD KEY o, KEY e, r.w AS pct \
+                 CREATE RULE q AS MATCH (o:N) WHERE {conditions} YIELD KEY o, KEY e"
+            ))
+            .unwrap();
+            match compile(&prog).unwrap_err() {
+                LocyCompileError::IsNotBindsValueColumn {
+                    variable, column, ..
+                } => {
+                    assert_eq!(variable, "pct", "{conditions}");
+                    assert_eq!(column, "pct", "{conditions}");
+                }
+                e => panic!("{conditions}: expected IsNotBindsValueColumn, got {e:?}"),
+            }
+        }
     }
 }

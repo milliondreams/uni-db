@@ -16,6 +16,13 @@ use super::locy_delta::RowStore;
 use super::locy_explain::ProvenanceStore;
 use super::locy_traits::LocyExecutionContext;
 
+/// A binding error from planning an ASSUME body against its parent's rules.
+fn binding_error(e: uni_locy::LocyCompileError) -> LocyError {
+    LocyError::EvaluationError {
+        message: format!("LocyCompileError: {e}"),
+    }
+}
+
 /// Evaluate an ASSUME block: fork L0, apply mutations, re-evaluate rules,
 /// execute body commands, collect results, then restore.
 pub async fn evaluate_assume(
@@ -116,11 +123,14 @@ pub async fn evaluate_assume(
             .cloned()
             .chain(assume.body_program.strata.iter().cloned())
             .collect();
-        let body_program = CompiledProgram {
+        let mut body_program = CompiledProgram {
             rule_catalog: merged_rule_catalog.clone(),
             strata: combined_strata,
             ..assume.body_program.clone()
         };
+        // The body was compiled without the parent's schemas, so a body clause
+        // referencing a parent rule had no binding plan until this catalog.
+        uni_locy::attach_binding_plans(&mut body_program).map_err(binding_error)?;
         let body_store = ctx.re_evaluate_strata(&body_program, config).await?;
         for (name, rel) in body_store {
             assume_derived_store.insert(name, rel);
@@ -131,10 +141,11 @@ pub async fn evaluate_assume(
     // to name the body's own rules, and a nested ASSUME must still see the
     // parent's strata as its own parent, so the two are combined rather than
     // one replacing the other.
-    let command_program = CompiledProgram {
+    let mut command_program = CompiledProgram {
         rule_catalog: merged_rule_catalog,
         ..parent_program.clone()
     };
+    uni_locy::attach_binding_plans(&mut command_program).map_err(binding_error)?;
 
     // The body's facts are fixed from here on: body commands read them by
     // shared reference, as top-level commands do.

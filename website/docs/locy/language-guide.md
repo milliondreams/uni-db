@@ -37,13 +37,39 @@ WHERE (x, y, c) IS control
 Variables bind the referenced rule's columns in one order: its `KEY` columns, then its other
 columns, each in `YIELD` order. Subjects take columns from the front and a `TO` target takes the
 next one, so against `YIELD KEY o, KEY e, pct` both `(o, e, v) IS stake` and `(o, e) IS stake TO v`
-bind `v` to each matching fact's `pct`. An unbound variable is bound; a bound one is tested.
-`IS NOT` cannot test a value column: an unbound variable there is ignored, a bound one is an error.
+bind `v` to each matching fact's `pct`.
+
+**Binding does not depend on the order of the `WHERE` conditions.** Each variable has exactly one
+binder in a clause body — the `MATCH` pattern, a position of a positive `IS` reference, or a
+generator output — and every other occurrence of it is a test (an equality against the binder).
+`WHERE o IS seed AND (o, e, pct) IS stake` and `WHERE (o, e, pct) IS stake AND o IS seed` mean the
+same thing and return the same rows.
+
+A position also has a *kind* — a node, a relationship, or a plain value — taken from the referenced
+rule's `YIELD` expression, not from whether the column is a `KEY`. A `KEY` can hold a scalar
+(`YIELD KEY n, KEY t.code AS code`), and then `n IS tag TO c` binds `c` to that value, not to a
+node. Putting a variable of one kind on a column of another (a relationship variable on a node
+column, a node on a scalar column) is a compile error, `IsRefKindMismatch`: a node id compared with
+an integer column would match whichever integers happen to equal a node id.
+
+**`IS NOT`** runs after every positive condition, wherever it is written, so `NOT b IS blocked` may
+precede the reference that binds `b`:
+
+<!-- doctest: skip -->
+```cypher
+WHERE NOT b IS blocked, a IS link TO b    -- same as: a IS link TO b, NOT b IS blocked
+```
+
+Every variable on a `KEY` position of a negated reference must be bound somewhere in the body — by
+`MATCH`, a positive `IS` reference or a generator; a node `KEY` needs a bound node. `IS NOT` cannot
+test a value column: an unbound variable there is existential and ignored (`b IS NOT stake TO agg`
+means `b IS NOT stake`), a bound one is a compile error.
 
 ### Reading Another Rule's Values
 
-A positive reference also exposes the referenced rule's value columns by name, so a second rule can
-aggregate what a first one computed:
+A positive reference also exposes the referenced rule's *value* columns — the ones none of its
+subjects or target binds — by name, so a second rule can aggregate what a first one computed. `KEY`
+columns are never exposed by name: read a `KEY` by binding it to a variable of your own.
 
 <!-- doctest: skip -->
 ```cypher
@@ -59,8 +85,21 @@ FOLD total = MSUM(pct)
 YIELD KEY e, total
 ```
 
-If two references in one clause expose the same name, the first wins; bind the value explicitly to
-choose.
+If two references in one clause expose the same name, exposing it is fine, but *reading* it by its
+bare name is a compile error, `AmbiguousRuleColumn` — nothing says which reference it means. Bind
+each value positionally to a name of its own instead:
+
+<!-- doctest: skip -->
+```cypher
+-- AmbiguousRuleColumn: both r1 and r2 yield `score`
+WHERE a IS r1, a IS r2, score > 5
+
+-- explicit
+WHERE (a, s1) IS r1, (a, s2) IS r2, s1 > 5
+```
+
+(Before this rule the first reference in the `WHERE` silently won, so swapping two conditions
+changed the answer.)
 
 ## Expression Functions in Rules
 

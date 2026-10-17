@@ -106,22 +106,19 @@ pub struct LocyIsRef {
     pub target_has_prob: bool,
     /// Name of the PROB column in the target rule, if any.
     pub target_prob_col: Option<String>,
-    /// For negated IS-refs: subject/target variable → the hidden `_vid` column
-    /// the planner projected for it (`__isnot{n}_{var}`).
+    /// For a negated IS-ref: the anti-join key, one component per KEY
+    /// position some literal of the clause binds (`uni_locy::binding_plan`).
     ///
     /// The anti-join runs *after* `LocyProject`, so resolving a subject by its
-    /// bare variable name only works when YIELD happens to project that exact
-    /// name. A subject that YIELD renamed with `AS`, or did not project at all,
-    /// was previously unresolvable — and the anti-join silently emitted the
-    /// rows it was asked to exclude (issue #158).
-    ///
-    /// Carrying `{var}._vid` through the projection under a reserved name makes
-    /// resolution depend on node identity rather than on what YIELD chose to
-    /// call things. Empty for positive IS-refs, and for subjects that are not
-    /// MATCH-bound node variables (relationship variables expose `_eid`, not
-    /// `_vid`; scalar and ALONG-bound subjects have neither) — those keep the
-    /// by-name path and its error.
-    pub subject_vid_cols: std::collections::HashMap<String, String>,
+    /// bare variable name only worked when YIELD happened to project that
+    /// exact name. A subject that YIELD renamed with `AS`, or did not project
+    /// at all, was unresolvable — and the anti-join silently emitted the rows
+    /// it was asked to exclude (issue #158). So the planner carries each
+    /// binder's identity (a node's `_vid`, a relationship's `_eid`, a scalar's
+    /// column) through the projection under a reserved hidden name. A value
+    /// position bound nowhere is existentially quantified and absent. Empty
+    /// for positive IS-refs.
+    pub negation_keys: Vec<NegationKey>,
     /// The referenced rule's column bound by each subject, in order, then by
     /// the target if there is one (`uni_locy::is_binding::bound_columns`).
     ///
@@ -132,8 +129,23 @@ pub struct LocyIsRef {
     pub binding_columns: Vec<String>,
 }
 
-/// Prefix for the hidden `_vid` columns described on
-/// [`LocyIsRef::subject_vid_cols`].
+/// One component of a negated IS-reference's anti-join key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NegationKey {
+    /// The clause variable at the KEY position.
+    pub variable: String,
+    /// The hidden column of the projected clause body holding the binder's
+    /// identity (`__isnot_vid_{k}_{var}`).
+    pub body_column: String,
+    /// The negated rule's KEY column it is compared with.
+    pub fact_column: String,
+    /// What the column holds. A node component must be a `UInt64` vid on
+    /// both sides; any other component is compared by value.
+    pub kind: uni_locy::ColumnKind,
+}
+
+/// Prefix for the hidden identity columns described on
+/// [`LocyIsRef::negation_keys`].
 ///
 /// Two constraints, both load-bearing:
 /// * It must not begin with `__prob_complement_`, which the anti-join

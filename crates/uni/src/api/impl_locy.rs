@@ -86,9 +86,19 @@ pub struct LocyRuleRegistry {
 /// Reachability is computed by [`uni_locy::prune`]; a reference to a rule that
 /// does not exist is already rejected at compile time, so pruning cannot turn a
 /// missing rule into a silently empty result.
-pub(crate) fn merge_registered_rules(compiled: &mut CompiledProgram, registry: &LocyRuleRegistry) {
+///
+/// Every clause's binding plan is recomputed against the merged catalog, since
+/// a program clause referencing a registered rule had none until now.
+///
+/// # Errors
+///
+/// A binding error from [`uni_locy::attach_binding_plans`].
+pub(crate) fn merge_registered_rules(
+    compiled: &mut CompiledProgram,
+    registry: &LocyRuleRegistry,
+) -> std::result::Result<(), LocyCompileError> {
     if registry.rules.is_empty() {
-        return;
+        return Ok(());
     }
     for (name, rule) in &registry.rules {
         compiled
@@ -127,6 +137,7 @@ pub(crate) fn merge_registered_rules(compiled: &mut CompiledProgram, registry: &
     }
     merged_strata.append(&mut compiled.strata);
     compiled.strata = merged_strata;
+    uni_locy::attach_binding_plans(compiled)
 }
 
 /// Rebuilds a fresh registry by recompiling each source in order.
@@ -430,7 +441,8 @@ pub(crate) async fn evaluate_with_db_and_config_capturing(
     .map_err(map_compile_error)?;
 
     // Merge registered rules
-    merge_registered_rules(&mut compiled, &rule_registry.read().unwrap());
+    merge_registered_rules(&mut compiled, &rule_registry.read().unwrap())
+        .map_err(map_compile_error)?;
 
     // Create a LocyEngine directly from &UniInner.
     // Session-level: collect DERIVE output for deferred materialization.
@@ -676,7 +688,8 @@ impl<'a> LocyEngine<'a> {
         let mut compiled = self.compile_only_with_config(program, config)?;
 
         // Merge registered rules into the compiled program.
-        merge_registered_rules(&mut compiled, &self.db.locy_rule_registry.read().unwrap());
+        merge_registered_rules(&mut compiled, &self.db.locy_rule_registry.read().unwrap())
+            .map_err(map_compile_error)?;
 
         self.evaluate_compiled_capturing(compiled, config, profile_capture)
             .await
@@ -2241,7 +2254,7 @@ fn map_parse_error(e: uni_cypher::ParseError) -> UniError {
     }
 }
 
-fn map_compile_error(e: LocyCompileError) -> UniError {
+pub(crate) fn map_compile_error(e: LocyCompileError) -> UniError {
     UniError::Query {
         message: format!("LocyCompileError: {e}"),
         query: None,

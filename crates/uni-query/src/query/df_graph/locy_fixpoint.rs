@@ -1714,12 +1714,10 @@ pub struct IsRefBinding {
     pub is_self_ref: bool,
     /// Whether this is a negated reference (NOT IS).
     pub negated: bool,
-    /// For negated IS-refs: `(left_body_col, right_derived_col)` pairs for anti-join filtering.
-    ///
-    /// `left_body_col` is the VID column in the clause body (e.g., `"n._vid"`);
-    /// `right_derived_col` is the corresponding KEY column in the negated rule's facts (e.g., `"n"`).
+    /// For negated IS-refs: the anti-join key, from the clause's binding plan
+    /// (see [`crate::query::planner_locy_types::LocyIsRef::negation_keys`]).
     /// Empty for non-negated IS-refs.
-    pub anti_join_cols: Vec<(String, String)>,
+    pub anti_join_cols: Vec<crate::query::planner_locy_types::NegationKey>,
     /// Whether the target rule has a PROB column.
     pub target_has_prob: bool,
     /// Name of the PROB column in the target rule, if any.
@@ -3996,19 +3994,9 @@ fn build_feature_resolvers(
     // works without a hidden column for the literal vector.
     let resolve_src = |expr: &Expr| -> DFResult<FeatureValueSrc> {
         match expr {
-            Expr::Variable(name) => {
-                let col = if schema.index_of(name).is_ok() {
-                    name.clone()
-                } else {
-                    let vid_name = format!("{}._vid", name);
-                    if schema.index_of(&vid_name).is_ok() {
-                        vid_name
-                    } else {
-                        name.clone()
-                    }
-                };
-                Ok(FeatureValueSrc::Col(lookup_col(col)?))
-            }
+            // The planner resolved the name to its exact body column (a node
+            // to its `._vid`), so it is looked up as written.
+            Expr::Variable(name) => Ok(FeatureValueSrc::Col(lookup_col(name.clone())?)),
             Expr::Property(boxed, prop) if matches!(boxed.as_ref(), Expr::Variable(_)) => {
                 let Expr::Variable(v) = boxed.as_ref() else {
                     unreachable!()
@@ -4149,16 +4137,12 @@ fn build_feature_resolvers(
                         args[0]
                     )));
                 };
-                let subject_col = {
-                    let direct = schema.index_of(v).ok();
-                    let vid_name = format!("{}._vid", v);
-                    let vid_col = schema.index_of(&vid_name).ok();
-                    vid_col.or(direct).ok_or_else(|| {
-                        datafusion::error::DataFusionError::Execution(format!(
-                            "{name}: subject column '{v}' (or '{v}._vid') not in body batch schema"
-                        ))
-                    })?
-                };
+                // The planner resolved the subject to its exact vid column.
+                let subject_col = schema.index_of(v).map_err(|_| {
+                    datafusion::error::DataFusionError::Execution(format!(
+                        "{name}: subject column '{v}' not in body batch schema"
+                    ))
+                })?;
                 let vid_to_score = graph_feature_maps.get(name).cloned().ok_or_else(|| {
                     datafusion::error::DataFusionError::Execution(format!(
                         "{name}: pre-computed score map missing. This is a bug — \
@@ -4229,16 +4213,12 @@ fn build_feature_resolvers(
                         )));
                     }
                 };
-                let subject_col = {
-                    let direct = schema.index_of(v).ok();
-                    let vid_name = format!("{}._vid", v);
-                    let vid_col = schema.index_of(&vid_name).ok();
-                    vid_col.or(direct).ok_or_else(|| {
-                        datafusion::error::DataFusionError::Execution(format!(
-                            "{name}: subject column '{v}' (or '{v}._vid') not in body batch schema"
-                        ))
-                    })?
-                };
+                // The planner resolved the subject to its exact vid column.
+                let subject_col = schema.index_of(v).map_err(|_| {
+                    datafusion::error::DataFusionError::Execution(format!(
+                        "{name}: subject column '{v}' not in body batch schema"
+                    ))
+                })?;
                 let vid_to_values = neighbor_feature_maps
                     .get(&(rel_type.clone(), prop_name.clone(), direction_arg))
                     .cloned()
@@ -4686,11 +4666,10 @@ async fn precompute_neighbor_feature_maps(
         for subject_var in &subject_vars {
             for batch in batches {
                 let schema = batch.schema();
-                let col_idx = schema
-                    .index_of(&format!("{}._vid", subject_var))
-                    .ok()
-                    .or_else(|| schema.index_of(subject_var).ok());
-                let Some(col_idx) = col_idx else { continue };
+                // The planner resolved the subject to its exact vid column.
+                let Ok(col_idx) = schema.index_of(subject_var) else {
+                    continue;
+                };
                 let col = batch.column(col_idx);
                 for row in 0..batch.num_rows() {
                     if let Some(v) = extract_vid_from_column(col.as_ref(), row) {

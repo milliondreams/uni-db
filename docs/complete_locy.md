@@ -426,9 +426,19 @@ take columns from the front of the sequence, and a `TO` target takes the next on
 KEY columns are yielded first, the binding sequence is simply YIELD order. The same order is used
 by `IS`, `IS NOT`, EXPLAIN and every evaluation path (`uni_locy::is_binding`).
 
-A variable that is not yet bound is bound to the column; one that is already bound is tested
-against it. A KEY column of a node binds a node; a value column (a FOLD result, an ALONG
-accumulation, a projected property) binds a value.
+**Binding is order-independent.** Each variable of a clause body has exactly one binder — the
+MATCH pattern, a position of a positive IS reference, or a generator output — and every other
+occurrence is a test (an equality against the binder), whatever the order of the WHERE conditions.
+`WHERE o IS seed AND (o, e, pct) IS stake` and the reverse are the same clause. The compiler decides
+this once per clause in its **binding plan** (`uni_locy::binding_plan`), which the compiler's
+checks, the planner and EXPLAIN all read; before it, each decided on its own and conjunct order
+changed answers (issue #300).
+
+Each position has a **kind** — node, relationship or scalar — inferred from the referenced rule's
+YIELD expression, not from whether the column is a KEY. A scalar KEY (`YIELD KEY n, KEY t.code AS
+code`) binds a value: `n IS tag TO c` binds `c` to the code string. A variable of one kind on a
+column of another is a compile error (`IsRefKindMismatch`), for positive and negated references
+alike.
 
 ### Unary Form
 
@@ -461,8 +471,8 @@ cost` binds the same columns.
 
 ### Reading a Value Column by Name
 
-A positive IS reference also makes each of the referenced rule's value columns available under its
-own name, without binding it:
+A positive IS reference also makes each of the referenced rule's value columns that none of its
+positions binds available under its own name. KEY columns are never exposed by name; bind them.
 
 ```
 CREATE RULE stake AS
@@ -477,8 +487,11 @@ CREATE RULE exposure AS
     YIELD KEY e, total
 ```
 
-When two references in one clause expose the same name, the first one wins; bind the value
-explicitly (tuple form or `TO`) to choose.
+When two references in one clause expose the same name, exposing it is legal but *reading* it by
+its bare name — in WHERE, a generator argument, ALONG, FOLD, YIELD or BEST BY — is a compile error,
+`AmbiguousRuleColumn`. Bind each value positionally instead: `(a, s1) IS r1, (a, s2) IS r2`. (This
+replaces an earlier "first reference wins" rule, under which swapping two conjuncts changed the
+answer.)
 
 ### Semantics
 
@@ -503,6 +516,12 @@ KEY, and negation asks whether a fact exists, so `IS NOT` cannot compare a value
 already bound and lands on a value column is a compile error (`IsNotBindsValueColumn`); test the
 value in WHERE after a positive reference instead. An unbound variable on a value column is
 existentially quantified and ignored, so `b IS NOT stake TO agg` means `b IS NOT stake`.
+
+Negations run after every positive condition, wherever they are written, so `NOT b IS blocked` may
+precede the reference that binds `b`. **Safety:** every variable on a KEY position of a negated
+reference must be bound somewhere in the body by MATCH, a positive IS reference or a generator
+(`IsNotKeyUnbound`; for a node KEY, `IsNotSubjectNotANode`, whose message starts `IS NOT subject
+'x'`). A YIELD alias of a bound node (`YIELD KEY a AS subj`) counts as that node.
 
 ### Boolean Semantics (Default)
 

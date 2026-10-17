@@ -120,3 +120,14 @@ slow-timeout = { period = "120s", terminate-after = 20 }
 [[profile.soak.overrides]]
 filter = 'test(/metamorphic::dqp::/) and test(soak)'
 slow-timeout = { period = "120s", terminate-after = 27 }
+
+# The random Locy oracle soak (`uni-locy-oracle` `random_programs_soak`, 5 000
+# generated programs by default) costs about 0.5 s a case, because every case
+# builds its own database and runs each relation twice (as written, and
+# permuted/renamed). Measured alone on a 22-core box: 1 000 cases in 498 s, so
+# the default volume is about 41 minutes, past the soak profile's 40-minute
+# ceiling. It shares the DQP soaks' 54-minute ceiling for the same reason; if it
+# approaches that, cut ORACLE_RANDOM_CASES deliberately rather than bumping this.
+[[profile.soak.overrides]]
+filter = 'test(random_programs_soak)'
+slow-timeout = { period = "120s", terminate-after = 27 }

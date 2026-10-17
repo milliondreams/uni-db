@@ -21,31 +21,34 @@ use std::time::Duration;
 use anyhow::Result;
 use proptest::prelude::*;
 use uni_common::{LocyIncompleteReason, Value};
-use uni_db::locy::CommandResult;
 use uni_db::{Uni, UniError};
 
-use uni_locy_oracle::eval::{Relation, evaluate, evaluate_bags};
+use uni_locy_oracle::eval::{Relation, evaluate};
 use uni_locy_oracle::generator::{
     build_complement, build_layered_dag, build_union, expected_closure_size,
-    random_program_strategy,
 };
-use uni_locy_oracle::ir::PROB_SCALE;
-use uni_locy_oracle::ir::{Generated, Tuple};
+use uni_locy_oracle::ir::{Generated, Tuple, WireKind};
 
-/// Recovers the seeded integer id from a `YIELD KEY` column value.
+// Submodules live in `tests/differential/` but join this one test binary
+// (the crate cap is 3 integration-test binaries; see `docs/test_layout.md`).
+#[path = "differential/random.rs"]
+mod random;
+#[path = "differential/relations.rs"]
+mod relations;
+
+/// Recovers the seeded integer id from a node `YIELD KEY` column value.
 ///
-/// Per the V1 finding (issue #94), KEY columns yield whole nodes, so the scalar
-/// id is read back from the node's `properties["id"]`.
+/// Strict: a node column must come back as a node. An integer is not
+/// accepted in its place, even one equal to the expected id — seeded ids equal
+/// VIDs, so tolerating it would hide a VID where a node belongs (and the
+/// random-program harness, [`random::decode`], is strict the other way too).
+///
+/// # Panics
+/// Panics on any value other than a node carrying an integer `id`.
 fn key_to_id(value: &Value) -> i64 {
-    match value {
-        Value::Node(node) => node
-            .properties
-            .get("id")
-            .and_then(Value::as_i64)
-            .expect("seeded node is missing an integer `id` property"),
-        // Tolerated in case a future engine fixes KEY-expression projection.
-        Value::Int(i) => *i,
-        other => panic!("unexpected KEY column value: {other:?}"),
+    match random::decode(WireKind::Node, value, &HashMap::new()) {
+        Ok(id) => id,
+        Err(e) => panic!("node KEY column: {e:?}"),
     }
 }
 
@@ -412,273 +415,4 @@ fn closure_is_set_soak() {
             Ok(())
         })
         .expect("soak: engine diverged from oracle");
-}
-
-// ── W5: random programs over a multigraph, FOLD included ─────────────────────
-
-/// A relation column value as the oracle's `i64`: a node by its `id`, an
-/// integer as is, and — only in a sum column (`s`), whose `SUM`/`MSUM` is a
-/// float by definition — an integral float. Anything else is reported, not
-/// coerced: an integer `MIN` that came back as `2.0` is the defect W4 found.
-fn column_to_i64(column: &str, value: &Value) -> Option<i64> {
-    match value {
-        Value::Node(_) | Value::Int(_) if column != PROB_COLUMN => Some(key_to_id(value)),
-        Value::Float(f) if column == "s" && f.fract() == 0.0 => Some(*f as i64),
-        // A probability, in the oracle's fixed-point units.
-        Value::Float(f) if column == PROB_COLUMN => Some((f * PROB_SCALE as f64).round() as i64),
-        _ => None,
-    }
-}
-
-/// The PROB column of every probabilistic relation the generator emits.
-const PROB_COLUMN: &str = "pb";
-
-/// Whether two sorted bags agree, a probability within two fixed-point units
-/// (floating-point evaluation order differs between the two sides).
-fn bags_agree(got: &[Tuple], want: &[Tuple], cols: &[String]) -> bool {
-    got.len() == want.len()
-        && got.iter().zip(want).all(|(g, w)| {
-            g.iter().zip(w).zip(cols).all(|((a, b), c)| {
-                if c == PROB_COLUMN {
-                    (a - b).abs() <= 2
-                } else {
-                    a == b
-                }
-            })
-        })
-}
-
-/// Runs a generated program once and returns every relation that differs from
-/// the oracle, with the engine's raw rows (duplicates kept) and the oracle's.
-/// `non_empty` collects the relations the oracle derived facts for.
-async fn all_divergences(
-    generated: &Generated,
-    non_empty: &mut HashSet<String>,
-) -> Result<Vec<String>> {
-    let db = seeded_db(generated).await?;
-    let result = db.session().locy(&generated.program_text).await?;
-    let oracle = evaluate_bags(&generated.oracle_rules);
-    let mut out = Vec::new();
-    let mut rels: Vec<&String> = generated.key_schema.keys().collect();
-    rels.sort();
-    for rel in rels {
-        let cols = &generated.key_schema[rel];
-        let mut raw: Vec<Tuple> = Vec::new();
-        for row in result.derived.get(rel.as_str()).into_iter().flatten() {
-            let mut tuple = Vec::with_capacity(cols.len());
-            for c in cols {
-                match row.get(c).and_then(|v| column_to_i64(c, v)) {
-                    Some(v) => tuple.push(v),
-                    None => {
-                        out.push(format!("{rel}.{c}: unexpected value {:?}", row.get(c)));
-                        tuple.push(i64::MIN);
-                    }
-                }
-            }
-            raw.push(tuple);
-        }
-        // Bags: a plain rule's oracle relation is a set, so an engine
-        // duplicate is a divergence; an ALONG rule's has one row per path.
-        raw.sort();
-        let want = oracle.get(rel.as_str()).cloned().unwrap_or_default();
-        if !want.is_empty() {
-            non_empty.insert(rel.clone());
-        }
-        if !bags_agree(&raw, &want, cols) {
-            out.push(format!("{rel}: engine {raw:?}\n    oracle {want:?}"));
-        }
-    }
-    out.extend(query_divergences(&db, generated, &oracle).await?);
-    Ok(out)
-}
-
-/// Runs the program again with an `EXPLAIN RULE` on every relation before any
-/// `QUERY`, then a `QUERY` per relation, and returns every `QUERY` whose rows
-/// differ from the oracle.
-///
-/// This run also reorders every rule's `YIELD` with [`interleave_yield`]. A
-/// reference binds a rule's KEY columns first, in YIELD order, then its value
-/// columns (`uni_locy::is_binding`), and values are read by name, so moving
-/// value columns among the KEYs changes no answer, and the oracle, which
-/// knows only the KEY-first form, still applies.
-///
-/// Each `EXPLAIN` matches no fact, so it re-derives its rule through the
-/// in-memory evaluator; that evaluator's rows once landed in the store every
-/// later `QUERY` reads. Holding the `QUERY`s to the oracle, rather than
-/// `result.derived`, also checks that a `QUERY` answers what the fixpoint
-/// derived.
-async fn query_divergences(
-    db: &Uni,
-    generated: &Generated,
-    oracle: &HashMap<String, Vec<Tuple>>,
-) -> Result<Vec<String>> {
-    let mut rels: Vec<&String> = generated.key_schema.keys().collect();
-    rels.sort();
-    let mut program = generated
-        .program_text
-        .lines()
-        .map(interleave_yield)
-        .collect::<Vec<_>>()
-        .join("\n");
-    for rel in &rels {
-        let first = &generated.key_schema[*rel][0];
-        program.push_str(&format!("\nEXPLAIN RULE {rel} WHERE {first} IS NULL"));
-    }
-    for rel in &rels {
-        program.push_str(&format!("\nQUERY {rel}"));
-    }
-    let result = db.session().locy(&program).await?;
-    let queries: Vec<&Vec<HashMap<String, Value>>> = result
-        .command_results
-        .iter()
-        .filter_map(|c| match c {
-            CommandResult::Query(rows) => Some(rows),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(queries.len(), rels.len(), "one QUERY result per relation");
-    let mut out = Vec::new();
-    for (rel, rows) in rels.iter().zip(queries) {
-        let cols = &generated.key_schema[*rel];
-        let mut got: Vec<Tuple> = rows
-            .iter()
-            .map(|row| {
-                cols.iter()
-                    .map(|c| {
-                        row.get(c)
-                            .and_then(|v| column_to_i64(c, v))
-                            .unwrap_or(i64::MIN)
-                    })
-                    .collect()
-            })
-            .collect();
-        got.sort();
-        let want = oracle.get(rel.as_str()).cloned().unwrap_or_default();
-        if !bags_agree(&got, &want, cols) {
-            out.push(format!(
-                "QUERY {rel} after EXPLAIN: engine {got:?}\n    oracle {want:?}"
-            ));
-        }
-    }
-    Ok(out)
-}
-
-/// Moves a rule line's value columns among its KEY columns, keeping the KEYs
-/// in their order and the values in theirs: after the first KEY when there
-/// are two or more, otherwise before the KEY. Every clause of a rule has the
-/// same YIELD shape, so every clause is reordered alike.
-fn interleave_yield(line: &str) -> String {
-    let Some(at) = line.find(" YIELD ") else {
-        return line.to_string();
-    };
-    let (head, items) = line.split_at(at + " YIELD ".len());
-    let items: Vec<&str> = items.split(", ").collect();
-    let (keys, values): (Vec<&str>, Vec<&str>) = items.iter().partition(|i| i.starts_with("KEY "));
-    if values.is_empty() {
-        return line.to_string();
-    }
-    let reordered: Vec<&str> = if keys.len() >= 2 {
-        keys[..1]
-            .iter()
-            .chain(&values)
-            .chain(&keys[1..])
-            .copied()
-            .collect()
-    } else {
-        values.iter().chain(&keys).copied().collect()
-    };
-    format!("{head}{}", reordered.join(", "))
-}
-
-#[test]
-fn interleave_yield_keeps_key_and_value_order() {
-    assert_eq!(
-        interleave_yield("CREATE RULE r AS MATCH (a) YIELD KEY a, KEY b, q"),
-        "CREATE RULE r AS MATCH (a) YIELD KEY a, q, KEY b"
-    );
-    assert_eq!(
-        interleave_yield("CREATE RULE f AS MATCH (a) FOLD n = COUNT(*) YIELD KEY a, n, s"),
-        "CREATE RULE f AS MATCH (a) FOLD n = COUNT(*) YIELD n, s, KEY a"
-    );
-    assert_eq!(
-        interleave_yield("CREATE RULE u AS MATCH (a) YIELD KEY a, KEY b"),
-        "CREATE RULE u AS MATCH (a) YIELD KEY a, KEY b"
-    );
-}
-
-fn random_cases(default: u32) -> u32 {
-    std::env::var("ORACLE_RANDOM_CASES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
-}
-
-fn drive_random_programs(cases: u32) {
-    use proptest::test_runner::{Config, TestCaseError, TestRunner};
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
-    let mut runner = TestRunner::new(Config {
-        cases,
-        failure_persistence: None,
-        ..Config::default()
-    });
-    // Per relation, how many cases derived any fact: a comparison over empty
-    // relations proves nothing.
-    let tally = std::cell::RefCell::new(std::collections::BTreeMap::<String, u32>::new());
-    let outcome = runner.run(&random_program_strategy(), |g| {
-        let mut non_empty = HashSet::new();
-        let diffs = rt
-            .block_on(all_divergences(&g, &mut non_empty))
-            .map_err(|e| TestCaseError::fail(format!("{e}\n{}", g.program_text)))?;
-        if diffs.is_empty() {
-            Ok(())
-        } else {
-            Err(TestCaseError::fail(format!(
-                "{}\n  program:\n{}\n  graph: {}",
-                diffs.join("\n  "),
-                g.program_text,
-                g.base_graph_cypher
-            )))
-        }
-        .inspect(|()| {
-            let mut t = tally.borrow_mut();
-            for rel in non_empty {
-                *t.entry(rel).or_default() += 1;
-            }
-        })
-    });
-    let tally = tally.into_inner();
-    eprintln!("[oracle:random] cases={cases} non-empty per relation: {tally:?}");
-    outcome.expect(
-        "a random program diverged from the oracle (derived facts, or a QUERY after EXPLAIN)",
-    );
-    for rel in [
-        "link", "reach", "un", "deg", "span", "flow", "cost", "tot", "roll", "opt", "pr", "nor",
-        "prd", "safe",
-    ] {
-        let n = tally.get(rel).copied().unwrap_or(0);
-        assert!(
-            n * 5 >= cases,
-            "relation {rel} derived facts in only {n} of {cases} cases; the comparison is too often vacuous"
-        );
-    }
-}
-
-/// Random programs over a multigraph — parallel and identical edges, self-loops,
-/// two relationship types — with recursion, stratified negation and FOLD over
-/// bags, against the oracle. The FOLD rules are where a set where a bag is due
-/// (or the reverse) would show: parallel edges must each count.
-#[test]
-fn random_programs_match_the_oracle() {
-    drive_random_programs(random_cases(96));
-}
-
-/// The same at nightly volume (`ORACLE_RANDOM_CASES`, default 5 000).
-#[test]
-#[ignore = "soak: random oracle programs at nightly volume"]
-fn random_programs_soak() {
-    drive_random_programs(random_cases(5_000));
 }

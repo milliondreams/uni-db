@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc dfdb9623ed655b3f46b8c18ec18b9c8b153165cdacc87630596745973891b079 # shrinks to case = RandomClause { rules: [(1, 1, []), (1, 1, [[1], [0], [0]]), (3, 2, [[2, 0, 1], [1, 2, 1]])], base_vars: [1, 3], base_rows: [[0, 0]], refs: [(2, [0], true), (1, [0], true)], neg: None, filter: None }

@@ -41,11 +41,27 @@
 //! [`generator::random_program_strategy`] draws random programs over a random
 //! multigraph (self-loops, parallel and identical edges, two relationship
 //! types, integer weights) that exercise all of the above.
+//!
+//! [`surface`] holds each program's text as structured data, so a test can
+//! render it under a renaming or another conjunct order (a metamorphic
+//! relation) and map the oracle's answer through the same renaming.
+//!
+//! # Binding
+//!
+//! A clause body is an order-independent natural join: at each `IS` position
+//! a bound variable tests and an unbound one binds, so the order of the `WHERE`
+//! conditions never changes an answer. [`check_program`] computes the compile
+//! errors the engine must raise for a program — an ambiguous bare column read,
+//! an unbound `IS NOT` KEY, a node/scalar kind mismatch — before evaluation.
 
 // Rust guideline compliant
 pub mod eval;
 pub mod generator;
 pub mod ir;
+pub mod surface;
+
+#[doc(inline)]
+pub use eval::{OracleError, check_program};
 
 #[cfg(test)]
 mod tests {

@@ -6182,11 +6182,28 @@ impl Writer {
         // but before the OS flushed those writes would lose the snapshot —
         // recovery could not resolve `latest`. Make them durable now (local-fs
         // only; remote stores provide their own durability on `put`).
-        crate::snapshot::manager::fsync_snapshot_pointer(
-            shared.storage.local_fs_root().as_deref(),
-            shared.fork_id.as_ref(),
-            &manifest.snapshot_id,
-        )
+        //
+        // The barrier is up to four blocking `fsync`s, so it runs on the
+        // blocking pool: inline, a slow disk would stall the executor thread
+        // driving this flush — on a `current_thread` runtime, every task.
+        let local_root = shared.storage.local_fs_root();
+        let fork_id = shared.fork_id;
+        let barrier_id = manifest.snapshot_id.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::snapshot::manager::fsync_snapshot_pointer(
+                local_root.as_deref(),
+                fork_id.as_ref(),
+                &barrier_id,
+            )
+        })
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "fsync snapshot {} before WAL truncate: task failed: {}",
+                manifest.snapshot_id,
+                e
+            )
+        })?
         .map_err(|e| {
             anyhow!(
                 "fsync snapshot {} before WAL truncate: {}",

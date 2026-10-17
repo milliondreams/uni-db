@@ -1049,6 +1049,13 @@ guarantees contiguity, checkpoints its position, and halts on a gap rather
 than silently continuing past one. `watch()` will never provide that
 guarantee; `dropped_before` exists so you find out you need it.
 
+The checkpoint is persisted asynchronously, off the commit path, and may lag
+the last delivered commit: after a crash a provider resumes from the persisted
+position and can see some commits again (at-least-once), but never skips one.
+A provider whose `start` ignores `from_lsn` should return `false` from
+`resumes_from_checkpoint()` so the host does not persist a checkpoint nothing
+reads.
+
 ### WatchBuilder
 
 Build a filtered commit stream. Created by `session.watch_with()`.

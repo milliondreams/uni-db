@@ -1980,6 +1980,13 @@ pub struct DeferralQueue {
     /// `scheduler.rs`'s equivalent path has for free (it never rewrites its
     /// sidecar); the deferral queue has to assert it.
     load_failed: std::sync::atomic::AtomicBool,
+    /// Set when the last sidecar write failed, so the file may not match the
+    /// in-memory queue. `drain_due` rewrites the sidecar only when it removed
+    /// items or this is set: the tick task calls it every 50 ms, and an
+    /// unconditional rewrite of an unchanged (usually empty) queue cost two
+    /// blocking `fsync`s per tick on the caller's runtime for every database
+    /// with a local data path.
+    persist_dirty: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for DeferralQueue {
@@ -2161,7 +2168,10 @@ impl DeferralQueue {
             // so writing it back would destroy those rows (#233).
             return;
         }
-        if let Err(e) = sidecar.write_all(&rows) {
+        let result = sidecar.write_all(&rows);
+        self.persist_dirty
+            .store(result.is_err(), std::sync::atomic::Ordering::SeqCst);
+        if let Err(e) = result {
             tracing::warn!(
                 error = %e,
                 "DeferralQueue: sidecar write failed; drained items may fire again after a \
@@ -2188,8 +2198,12 @@ impl DeferralQueue {
             due.append(&mut items);
         }
         // FU-5: persist the remaining queue state after each drain so
-        // a restart sees only the still-pending items.
-        self.persist_locked(&guard);
+        // a restart sees only the still-pending items. A drain that removed
+        // nothing left the queue as last persisted, so skip the rewrite
+        // unless the previous write failed and the file may be stale.
+        if !due.is_empty() || self.persist_dirty.load(std::sync::atomic::Ordering::SeqCst) {
+            self.persist_locked(&guard);
+        }
         due
     }
 
@@ -2391,6 +2405,48 @@ mod tests {
             after, original,
             "a sidecar that could not be read must be left alone; overwriting it destroys \
              the deferrals the read failed to see"
+        );
+    }
+
+    /// An idle tick must not rewrite the deferral sidecar.
+    ///
+    /// The tick task calls `drain_due` every 50 ms. It used to rewrite the
+    /// sidecar unconditionally — two blocking `fsync`s per tick on the
+    /// caller's runtime for every database with a local data path, with the
+    /// queue mutex held across them.
+    #[test]
+    fn an_idle_drain_does_not_rewrite_the_sidecar() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue = DeferralQueue::with_persistence(dir.path().to_path_buf());
+        let path = queue.sidecar_path().expect("persistence is enabled");
+
+        for _ in 0..3 {
+            assert!(queue.drain_due(StdInstant::now()).is_empty());
+        }
+        assert!(
+            !path.exists(),
+            "draining an empty queue changed nothing and must not write {path:?}"
+        );
+    }
+
+    /// After a failed write, an idle drain still retries, so the file catches
+    /// up with the in-memory queue.
+    #[test]
+    fn an_idle_drain_retries_a_failed_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue = DeferralQueue::with_persistence(dir.path().to_path_buf());
+        let path = queue.sidecar_path().expect("persistence is enabled");
+
+        queue
+            .persist_dirty
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(queue.drain_due(StdInstant::now()).is_empty());
+        assert!(path.exists(), "a dirty queue must be rewritten on drain");
+        assert!(
+            !queue
+                .persist_dirty
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "a successful write clears the dirty flag"
         );
     }
 

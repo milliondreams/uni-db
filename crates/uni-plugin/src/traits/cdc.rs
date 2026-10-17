@@ -58,6 +58,20 @@ pub trait CdcOutputProvider: Send + Sync {
     ///
     /// Returns [`FnError`] if the sink cannot be initialized.
     fn start(&self, ctx: CdcStartContext<'_>) -> Result<Box<dyn CdcStream>, FnError>;
+
+    /// Whether [`Self::start`] honors [`CdcStartContext::from_lsn`].
+    ///
+    /// The host persists each stream's acknowledged LSN (an atomic, fsynced
+    /// sidecar write per commit) only so that a restart can hand it back as
+    /// `from_lsn`. A provider whose stream state lives only in process memory
+    /// ignores `from_lsn`, so that write is pure cost; such a provider returns
+    /// `false` and the host skips persisting its checkpoints.
+    ///
+    /// Defaults to `true`: a provider that resumes from `from_lsn` needs no
+    /// change to keep its checkpoints durable.
+    fn resumes_from_checkpoint(&self) -> bool {
+        true
+    }
 }
 
 /// A live CDC sink instance.

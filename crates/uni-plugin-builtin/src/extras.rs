@@ -44,6 +44,11 @@ impl CdcOutputProvider for MemoryCdcOutputProvider {
             checkpoint: CdcLsn(0),
         }))
     }
+    /// `false`: `start` ignores `from_lsn` and every stream begins empty at
+    /// LSN 0, so a persisted checkpoint is never read back.
+    fn resumes_from_checkpoint(&self) -> bool {
+        false
+    }
 }
 
 /// In-memory CDC stream. Captures every `deliver()` call into a Vec

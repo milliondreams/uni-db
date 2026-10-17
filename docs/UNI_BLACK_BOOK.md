@@ -7125,9 +7125,11 @@ Every surface trait lives in `crates/uni-plugin/src/traits/`, is `Send + Sync + 
 | Collation | `CollationProvider` (collation.rs) | `name`, `compare`, `normalize` | 5 (ascii ×2, unicode ×2, natural) |
 | Auth | `AuthProvider` (connector.rs) | `authenticate` | — |
 | Authz | `AuthzPolicy` (connector.rs) | `check` | — |
-| CDC output | `CdcOutputProvider` + `CdcStream` (cdc.rs) | `name`, `start` | — |
+| CDC output | `CdcOutputProvider` + `CdcStream` (cdc.rs) | `name`, `start` (+ `resumes_from_checkpoint`, default `true`) | `memory` (not persisted) |
 | Catalog | `CatalogProvider` + `CatalogTable` (catalog.rs) | `list_labels`, `resolve_label` | — |
 | Replacement scan | `ReplacementScanProvider` (catalog.rs) | — | — |
+
+**CDC checkpoints** (`crates/uni-plugin-host/src/cdc_runtime.rs`). After a stream accepts a commit, the driver task queues the stream's `checkpoint()` LSN with a per-runtime writer task, which persists `<data_path>/_system/cdc_checkpoints.json` on the blocking pool — never inline on the executor, where its two `fsync`s once stalled whole `current_thread` runtimes for the duration of a slow disk flush. The writer keeps only the latest LSN per provider and runs one write at a time, so a stale checkpoint never overwrites a newer one; the persisted LSN may lag (coalesced or failed writes ⇒ at-least-once redelivery after a restart) but never runs ahead of a delivered commit, and shutdown waits for queued writes. Providers whose `resumes_from_checkpoint()` is `false` (they ignore `from_lsn`, like the built-in `memory` provider) are not persisted.
 
 The authoritative *surface count* is the `Capability` enum's **26 extension variants** (3.0.0 removed `Connector` and added `LocyGenerator` + `GraphCompute`).
 

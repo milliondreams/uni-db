@@ -163,6 +163,9 @@ async fn cdc_deliver_failure_creates_permanent_gap() {
         1,
         "the flaky stream must be halted after its deliver failure"
     );
+    // Checkpoints are persisted off the commit path; wait for any queued
+    // write so the assertion below cannot pass merely because it raced one.
+    runtime.flush_checkpoints().await;
     // The durable checkpoint never advances past the undelivered commit — no
     // at-least-once violation.
     // `lookup` returns `Result` since #233: a read failure is no longer

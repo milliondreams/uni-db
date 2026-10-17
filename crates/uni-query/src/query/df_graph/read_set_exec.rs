@@ -69,6 +69,14 @@ impl ReadSetRecordingExec {
     }
 }
 
+impl ReadSetRecordingExec {
+    /// The wrapped plan whose surviving rows are recorded.
+    #[must_use]
+    pub fn input(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.input
+    }
+}
+
 impl DisplayAs for ReadSetRecordingExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "ReadSetRecordingExec")

@@ -1960,16 +1960,111 @@ impl<'a> LocyPlanBuilder<'a> {
         } else {
             QueryPlanner::equality_anchored_properties(&combine_with_and(&immediate_filter_exprs))
         };
+        // Each positive reference's scan columns, by occurrence, for its
+        // referenced-fact discriminator (`DerivKind::Ref`).
+        let mut ref_scan_columns: HashMap<usize, Vec<String>> = HashMap::new();
+        let positive_occurrence: HashMap<usize, usize> = binding
+            .refs
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| !r.negated)
+            .enumerate()
+            .map(|(occurrence, (r, _))| (r, occurrence))
+            .collect();
+        // The derived scan a positive reference joins, under its prefix.
+        let mut derived_scan = |r: usize| -> Result<LogicalPlan> {
+            let ref_binding = &binding.refs[r];
+            let target_rule_name = ref_binding.rule.as_str();
+            let target_rule = rule_catalog
+                .get(target_rule_name)
+                .with_context(|| format!("IS-reference to unknown rule '{}'", target_rule_name))?;
+            let is_self_ref = stratum_rule_names.contains(target_rule_name);
+            // A same-stratum handle is fed live pre-fold facts, so it
+            // must declare the TARGET rule's discriminators — which in a
+            // mutually-recursive stratum need not match this rule's.
+            let target_deriv = derivation_discriminator_columns(
+                target_rule,
+                ctx.is_recursive,
+                stratum_rule_names,
+                rule_catalog,
+            );
+            // Issue #162: a positive same-stratum reference to a rule
+            // that carries FOLD reads the folded view, so this clause
+            // folds one value per child rather than one per child
+            // *derivation*.
+            //
+            // ALONG opts the whole clause out. `prev.x` reads a column
+            // of this same scan, so there is no way to give the fold a
+            // folded value and `prev` a per-path one through one handle
+            // — and a path accumulator that read a KEY's aggregate
+            // would stop being a path accumulator. An ALONG clause
+            // therefore keeps contributions; a sibling clause of the
+            // same rule that folds an inherited value still gets the
+            // folded view, which is why the two views are keyed
+            // separately.
+            let target_has_fold = target_rule.clauses.iter().any(|c| !c.fold.is_empty());
+            let view = if is_self_ref && target_has_fold && clause.along.is_empty() {
+                DerivedScanView::Folded
+            } else {
+                DerivedScanView::Contributions
+            };
+            let handle = self.get_or_create_derived_scan_handle_with_deriv(
+                target_rule_name,
+                target_rule,
+                is_self_ref,
+                rule_catalog,
+                &target_deriv,
+                view,
+            );
+            let scan_schema = alias_derived_schema(&handle.schema, &ref_binding.prefix);
+            if let Some(&occurrence) = positive_occurrence.get(&r) {
+                ref_scan_columns.insert(
+                    occurrence,
+                    scan_schema
+                        .fields()
+                        .iter()
+                        .map(|f| f.name().clone())
+                        .collect(),
+                );
+            }
+            Ok(LogicalPlan::LocyDerivedScan {
+                scan_index: handle.scan_index,
+                data: handle.data.clone(),
+                schema: scan_schema,
+            })
+        };
+
+        // Issue #301: an anchored clause reads its anchoring reference first
+        // and walks the pattern from the nodes it names, so a recursive clause
+        // costs the referenced delta rather than the whole relation. The
+        // anchoring position's test is the join that seeds the walk; the
+        // reference's other positions are applied at its step below.
         let mut pattern_vars: Vec<VariableInfo> = Vec::new();
-        let mut plan = self
-            .planner
-            .plan_pattern_scoped(
-                &clause.match_pattern,
-                &[],
-                &mut pattern_vars,
-                &where_anchored,
-            )
-            .context("planning MATCH pattern")?;
+        let mut plan = match binding.anchor {
+            Some(anchor) => {
+                let position = &binding.refs[anchor.r].positions[anchor.pos];
+                let source = derived_scan(anchor.r)?;
+                self.planner
+                    .plan_pattern_from_anchor(
+                        &clause.match_pattern,
+                        &position.variable,
+                        source,
+                        &position.physical,
+                        &mut pattern_vars,
+                        &where_anchored,
+                    )
+                    .context("planning MATCH pattern from its anchoring IS reference")?
+            }
+            None => self
+                .planner
+                .plan_pattern_scoped(
+                    &clause.match_pattern,
+                    &[],
+                    &mut pattern_vars,
+                    &where_anchored,
+                )
+                .context("planning MATCH pattern")?,
+        };
 
         // Step 2b: push what the pattern's own scope can account for.
         //
@@ -2010,95 +2105,35 @@ impl<'a> LocyPlanBuilder<'a> {
         // (issue #300). A reference's tests — positions whose variable is
         // bound elsewhere — form one conjunction directly on its CrossJoin,
         // which the physical planner lowers to a multi-key hash join.
-        let positive_occurrence: HashMap<usize, usize> = binding
-            .refs
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| !r.negated)
-            .enumerate()
-            .map(|(occurrence, (r, _))| (r, occurrence))
-            .collect();
-        // Each positive reference's scan columns, by occurrence, for its
-        // referenced-fact discriminator (`DerivKind::Ref`).
-        let mut ref_scan_columns: HashMap<usize, Vec<String>> = HashMap::new();
-
         for step in &binding.steps {
             match *step {
                 BindingStep::Ref(r) => {
                     let ref_binding = &binding.refs[r];
-                    let target_rule_name = ref_binding.rule.as_str();
-                    let target_rule = rule_catalog.get(target_rule_name).with_context(|| {
-                        format!("IS-reference to unknown rule '{}'", target_rule_name)
-                    })?;
-                    let is_self_ref = stratum_rule_names.contains(target_rule_name);
-                    // A same-stratum handle is fed live pre-fold facts, so it
-                    // must declare the TARGET rule's discriminators — which in a
-                    // mutually-recursive stratum need not match this rule's.
-                    let target_deriv = derivation_discriminator_columns(
-                        target_rule,
-                        ctx.is_recursive,
-                        stratum_rule_names,
-                        rule_catalog,
-                    );
-                    // Issue #162: a positive same-stratum reference to a rule
-                    // that carries FOLD reads the folded view, so this clause
-                    // folds one value per child rather than one per child
-                    // *derivation*.
-                    //
-                    // ALONG opts the whole clause out. `prev.x` reads a column
-                    // of this same scan, so there is no way to give the fold a
-                    // folded value and `prev` a per-path one through one handle
-                    // — and a path accumulator that read a KEY's aggregate
-                    // would stop being a path accumulator. An ALONG clause
-                    // therefore keeps contributions; a sibling clause of the
-                    // same rule that folds an inherited value still gets the
-                    // folded view, which is why the two views are keyed
-                    // separately.
-                    let target_has_fold = target_rule.clauses.iter().any(|c| !c.fold.is_empty());
-                    let view = if is_self_ref && target_has_fold && clause.along.is_empty() {
-                        DerivedScanView::Folded
-                    } else {
-                        DerivedScanView::Contributions
-                    };
-                    let handle = self.get_or_create_derived_scan_handle_with_deriv(
-                        target_rule_name,
-                        target_rule,
-                        is_self_ref,
-                        rule_catalog,
-                        &target_deriv,
-                        view,
-                    );
-                    let scan_schema = alias_derived_schema(&handle.schema, &ref_binding.prefix);
-                    if let Some(&occurrence) = positive_occurrence.get(&r) {
-                        ref_scan_columns.insert(
-                            occurrence,
-                            scan_schema
-                                .fields()
-                                .iter()
-                                .map(|f| f.name().clone())
-                                .collect(),
-                        );
+                    // The anchoring reference was joined below the pattern.
+                    let anchor_pos = binding.anchor.filter(|a| a.r == r).map(|a| a.pos);
+                    if anchor_pos.is_none() {
+                        plan = LogicalPlan::CrossJoin {
+                            left: Box::new(plan),
+                            right: Box::new(derived_scan(r)?),
+                        };
                     }
-                    plan = LogicalPlan::CrossJoin {
-                        left: Box::new(plan),
-                        right: Box::new(LogicalPlan::LocyDerivedScan {
-                            scan_index: handle.scan_index,
-                            data: handle.data.clone(),
-                            schema: scan_schema,
-                        }),
-                    };
 
                     // Every test of this reference, in one Filter directly on
-                    // its CrossJoin: `o._vid = __isref1_o AND ...`.
+                    // its CrossJoin: `o._vid = __isref1_o AND ...`. For the
+                    // anchoring reference, every test but the anchoring one,
+                    // which the seeded walk already enforced.
                     let tests = ref_binding
                         .positions
                         .iter()
-                        .filter(|p| {
-                            matches!(
-                                p.action,
-                                PositionAction::TestNode | PositionAction::TestScalar
-                            )
+                        .enumerate()
+                        .filter(|&(pos, p)| {
+                            Some(pos) != anchor_pos
+                                && matches!(
+                                    p.action,
+                                    PositionAction::TestNode | PositionAction::TestScalar
+                                )
                         })
+                        .map(|(_, p)| p)
                         .map(|p| Ok(equals(scope.identity(&p.variable)?, &p.physical)))
                         .collect::<Result<Vec<Expr>>>()?;
                     if !tests.is_empty() {
@@ -3035,6 +3070,24 @@ fn check_sources(pattern: &HashSet<String>, body: &LogicalPlan) -> Result<()> {
                 }
                 names
             }
+            // A pattern walked from its anchoring reference (issue #301): the
+            // pattern planner's own nodes, over the join that seeds the walk
+            // with the referenced nodes. They produce the pattern's variables
+            // on top of whatever the seed produced; their expressions were
+            // validated by the Cypher planner against the pattern's scope.
+            LogicalPlan::Traverse { .. }
+            | LogicalPlan::TraverseMainByType { .. }
+            | LogicalPlan::BindPath { .. }
+            | LogicalPlan::BindZeroLengthPath { .. } => {
+                let mut names = Produced {
+                    entities: pattern.clone(),
+                    columns: HashSet::new(),
+                };
+                for child in plan.children() {
+                    names.extend(produced(pattern, child)?);
+                }
+                names
+            }
             other => {
                 let node = format!("{other:?}");
                 let kind = node.split([' ', '{', '(']).next().unwrap_or_default();
@@ -3774,6 +3827,7 @@ mod tests {
             exposure: std::collections::BTreeMap::new(),
             immediate_filters: vec![],
             prev_ref: None,
+            anchor: None,
             diagnostics: vec![],
         };
         let scope = ClauseScope {

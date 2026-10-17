@@ -4794,7 +4794,6 @@ impl HybridPhysicalPlanner {
         left_logical: &LogicalPlan,
         right_logical: &LogicalPlan,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        use crate::query::df_graph::scan::GraphScanExec;
         use crate::query::df_graph::vid_lookup_join::{
             EquiPair, ProbeSide, VidJoinKind, VidLookupJoinExec,
         };
@@ -4837,23 +4836,24 @@ impl HybridPhysicalPlanner {
             ProbeSide::Right => left_logical,
         };
 
-        // 2. Probe-side plan must be a top-level GraphScanExec.
+        // 2. Probe-side plan must be a top-level GraphScanExec, optionally
+        // under an SSI `ReadSetRecordingExec`.
         //
-        // We deliberately do NOT peek through an SSI `ReadSetRecordingExec`
-        // here. That wrapper is only inserted for read-write transactions with
-        // an active read-set, and `VidLookupJoinExec::try_new` requires the
-        // probe child to be a bare `GraphScanExec` — so peeking through would
-        // hand it the inner scan and drop the wrapper from the plan, silently
-        // skipping read-set capture for the probe rows. Letting the wrapper mask
-        // the scan makes this rewrite bail to `HashJoinExec`, which executes the
-        // wrapper normally and records the reads. Non-SSI / read-only contexts
-        // have no wrapper, so the optimization still fires there.
+        // That wrapper is inserted for read-write transactions with an active
+        // read-set — which includes every Locy evaluation, so a recursive
+        // clause walked from its derived delta (issue #301) could never use
+        // this operator while the wrapper masked the scan. The rewrite now
+        // looks *through* it (`vid_lookup_join::probe_scan`) but keeps it as
+        // the probe child: `VidLookupJoinExec::try_new` wires the vid slot into
+        // the inner scan and re-parents it under the same wrapper, so the probe
+        // rows are still recorded. Discarding the wrapper is what used to make
+        // peeking unsafe, and is still never done.
         //
-        // (The probe now runs through `execute()` like any other child (#179),
-        // but that does not rescue the wrapper: it is the *discarding* of it at
-        // plan time that would lose the reads, not how the scan is driven.)
+        // (The probe runs through `execute()` like any other child (#179), so
+        // the wrapper records exactly the rows the lookup returned — the read
+        // set of a vid-filtered scan.)
         //
-        // We DO peek through the `wrap_optional` wrapper, and only that one.
+        // We also peek through the `wrap_optional` wrapper, and only that one.
         // An OPTIONAL MATCH scan is wrapped in
         // `NestedLoopJoinExec(PlaceholderRowExec, GraphScanExec, Left)` whose
         // sole purpose is to emit one all-NULL row when the scan is empty
@@ -4868,7 +4868,7 @@ impl HybridPhysicalPlanner {
         // side is always wrapped. It had been dead since the commit that
         // introduced it.
         let probe_plan = Self::unwrap_optional_scan(probe_plan);
-        if probe_plan.downcast_ref::<GraphScanExec>().is_none() {
+        if crate::query::df_graph::vid_lookup_join::probe_scan(&probe_plan).is_none() {
             return Ok(None);
         }
 
@@ -4971,11 +4971,11 @@ impl HybridPhysicalPlanner {
     /// itself, so for that operator the wrapper is redundant — and because the
     /// placeholder's schema is empty, removing it is schema-neutral.
     ///
-    /// Deliberately **one level, exact match, no recursion.** The SSI
-    /// `ReadSetRecordingExec` wrapper must keep masking the scan so the rewrite
-    /// bails to `HashJoinExec` and read-set capture still happens; a recursive or
-    /// loose unwrap would defeat that. Anything that is not precisely
-    /// `NLJ(PlaceholderRowExec, _, Left)` with no filter is returned untouched.
+    /// Deliberately **one level, exact match, no recursion.** It never strips
+    /// the SSI `ReadSetRecordingExec` wrapper — the vid-lookup rewrite looks
+    /// through that one while keeping it, so read-set capture still happens.
+    /// Anything that is not precisely `NLJ(PlaceholderRowExec, _, Left)` with no
+    /// filter is returned untouched.
     fn unwrap_optional_scan(plan: &Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
         let Some(nlj) = plan.downcast_ref::<NestedLoopJoinExec>() else {
             return plan.clone();

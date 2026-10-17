@@ -5071,6 +5071,89 @@ impl QueryPlanner {
         vars_in_scope.clear();
         vars_in_scope.extend_from_slice(initial_vars);
         let vars_before_pattern = vars_in_scope.len();
+        self.plan_pattern_paths(
+            LogicalPlan::Empty,
+            pattern,
+            vars_in_scope,
+            vars_before_pattern,
+            where_anchored,
+        )
+    }
+
+    /// [`Self::plan_pattern_scoped`] with the walk seeded by rows that already
+    /// carry `anchor`'s vids.
+    ///
+    /// `source` produces one row per seed, holding the seed's vid in the column
+    /// `vid_column`. The anchor's node is materialised by its own scan joined
+    /// on `{anchor}._vid` — which the physical planner lowers to a vid lookup
+    /// rather than a full scan when the source is small (`VidLookupJoinExec`) —
+    /// and the rest of the pattern is then planned with the anchor in scope, so
+    /// every path through it is walked from the seeds instead of from a scan of
+    /// its first node. The node's own labels and properties are enforced by its
+    /// scan, exactly as they would be if it were scanned unanchored.
+    ///
+    /// Used by the Locy planner to walk a recursive clause's pattern from the
+    /// referenced delta (issue #301). The anchor counts as a variable of the
+    /// pattern, not of an earlier clause.
+    ///
+    /// # Errors
+    ///
+    /// When `anchor` is not a plain node element of a path of `pattern`, or
+    /// when planning the pattern fails.
+    pub(crate) fn plan_pattern_from_anchor(
+        &self,
+        pattern: &Pattern,
+        anchor: &str,
+        source: LogicalPlan,
+        vid_column: &str,
+        vars_in_scope: &mut Vec<VariableInfo>,
+        where_anchored: &HashMap<String, String>,
+    ) -> Result<LogicalPlan> {
+        let node = pattern
+            .paths
+            .iter()
+            .flat_map(|path| path.elements.iter())
+            .find_map(|element| match element {
+                PatternElement::Node(n) if n.variable.as_deref() == Some(anchor) => Some(n),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                anyhow!("internal error: anchor `{anchor}` is not a node element of the pattern")
+            })?;
+        let scan = self.plan_unbound_node(node, anchor, LogicalPlan::Empty, false)?;
+        let seeded = LogicalPlan::Filter {
+            input: Box::new(LogicalPlan::CrossJoin {
+                left: Box::new(source),
+                right: Box::new(scan),
+            }),
+            // `Property(anchor, "_vid")`, not the flattened `anchor._vid`
+            // column name: the vid-lookup rewrite recognises the probe side by
+            // this shape.
+            predicate: Expr::BinaryOp {
+                left: Box::new(Expr::Variable(vid_column.to_string())),
+                op: BinaryOp::Eq,
+                right: Box::new(Expr::Property(
+                    Box::new(Expr::Variable(anchor.to_string())),
+                    "_vid".to_string(),
+                )),
+            },
+            optional_variables: HashSet::new(),
+        };
+        vars_in_scope.clear();
+        add_var_to_scope(vars_in_scope, anchor, VariableType::Node)?;
+        self.plan_pattern_paths(seeded, pattern, vars_in_scope, 0, where_anchored)
+    }
+
+    /// Plans every path of `pattern` on top of `plan`, then the pattern's
+    /// inline element predicates.
+    fn plan_pattern_paths(
+        &self,
+        mut plan: LogicalPlan,
+        pattern: &Pattern,
+        vars_in_scope: &mut Vec<VariableInfo>,
+        vars_before_pattern: usize,
+        where_anchored: &HashMap<String, String>,
+    ) -> Result<LogicalPlan> {
         // As in `plan_match_clause`: without a step variable, an anonymous
         // variable-length relationship publishes no edges, and a later hop
         // reused them — a Locy rule body `(a)-[*1..2]->()-[]->(b)` derived
@@ -5083,7 +5166,6 @@ impl QueryPlanner {
             }
             None => pattern,
         };
-        let mut plan = LogicalPlan::Empty;
         for path in &pattern.paths {
             plan = self.plan_path(
                 path,

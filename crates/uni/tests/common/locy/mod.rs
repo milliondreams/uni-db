@@ -47,6 +47,9 @@ pub mod locy_mutual_recursion_per_rule_facts;
 pub mod locy_issue_293_fold_ungrouped_yield;
 // Issue #294: recursive FOLD collapsed parallel edges between one node pair.
 pub mod locy_issue_294_parallel_edge_fold;
+// Issue #301: recursive rule cost tracks the frontier, not the relation
+// (cost guard, correctness cases, and an #[ignore] measurement probe).
+pub mod locy_issue_301_fixpoint_delta;
 // Issue #160: QUERY (SLG) and derived (fixpoint) diverge when an IS-ref
 // introduces a variable binding the MATCH pattern does not provide.
 pub mod locy_issue_160_query_derived_parity;

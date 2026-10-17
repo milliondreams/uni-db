@@ -26,6 +26,11 @@
 //! * Each filter goes right after the step that makes its last name
 //!   available; filters over MATCH variables only run immediately.
 //! * `IS NOT` references run last, as anti-joins.
+//! * At most one positive reference into the clause's own recursive group,
+//!   testing a MATCH node on a KEY, is the clause's [`Anchor`]: the planner
+//!   reads it before the pattern and walks the pattern from the nodes it
+//!   names, so a fixpoint iteration costs the referenced delta rather than
+//!   the whole relation (issue #301).
 //!
 //! The plan also records, per IS-reference position, the [`ColumnKind`] the
 //! referenced column holds — a node, a relationship or a scalar — inferred
@@ -223,6 +228,26 @@ pub enum Exposure {
     Ambiguous(Vec<usize>),
 }
 
+/// The positive reference a clause's MATCH pattern is walked from.
+///
+/// The MATCH pattern is otherwise planned on its own, from a scan of its first
+/// (or best-anchored) node, and every positive reference is joined to the
+/// result afterwards. For a reference into the clause's own recursive group
+/// that walks the whole relation on every fixpoint iteration, however small the
+/// referenced delta is (issue #301). An anchored clause reads the reference
+/// first and starts the walk at the nodes it names.
+///
+/// Chosen by [`ClauseBindingPlan::compute`]; see [`ClauseBindingPlan::anchor`]
+/// for the rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Anchor {
+    /// Index into [`ClauseBindingPlan::refs`] of the anchoring reference.
+    pub r: usize,
+    /// Index into that reference's positions of the KEY position whose MATCH
+    /// node the walk starts from.
+    pub pos: usize,
+}
+
 /// The order-independent binding decision for one clause.
 ///
 /// See the module documentation for the algorithm.
@@ -247,6 +272,25 @@ pub struct ClauseBindingPlan {
     /// The positive reference ALONG's `prev` reads: the one reference to a
     /// rule of the clause's own recursive group.
     pub prev_ref: Option<usize>,
+    /// The reference the MATCH pattern is walked from, if any.
+    ///
+    /// A positive reference into the clause's own recursive group qualifies
+    /// when one of its KEY positions tests a node the MATCH pattern binds as a
+    /// plain node element (not inside a quantified group nor a shortestPath).
+    /// The planner then reads that reference before the pattern and walks the
+    /// pattern from the referenced nodes, so a fixpoint iteration costs the
+    /// referenced delta rather than the whole relation (issue #301). The
+    /// reference's other positions keep their actions; the anchoring position's
+    /// test is the join that seeds the walk.
+    ///
+    /// Only same-group references are considered. They are what a fixpoint
+    /// re-reads every iteration, and what semi-naive evaluation keeps small;
+    /// a reference to a lower stratum is read once per iteration at its full
+    /// size, and with no cardinality to compare it against a selective pattern
+    /// the planner has no basis for preferring it. Among several candidates the
+    /// one with the smallest `(rule, subject variables)` wins — deterministic,
+    /// and independent of the order of the WHERE conditions.
+    pub anchor: Option<Anchor>,
     /// What the plan found wrong with the clause.
     pub diagnostics: Vec<LocyCompileError>,
 }
@@ -987,6 +1031,7 @@ impl ClauseBindingPlan {
             exposure: BTreeMap::new(),
             immediate_filters: Vec::new(),
             prev_ref: None,
+            anchor: None,
             diagnostics: Vec::new(),
         };
         let mut var_kinds = HashMap::new();
@@ -1134,8 +1179,92 @@ impl ClauseBindingPlan {
         scheduler.schedule_body(&positive);
         scheduler.schedule_negations(&negated);
         scheduler.check_ambiguous_reads();
-        Some(scheduler.plan)
+        let mut plan = scheduler.plan;
+        plan.anchor = choose_anchor(&plan, &clause.match_pattern, &positive, same_scc);
+        Some(plan)
     }
+}
+
+/// The anchor of a scheduled plan, per [`ClauseBindingPlan::anchor`].
+fn choose_anchor(
+    plan: &ClauseBindingPlan,
+    pattern: &Pattern,
+    positive: &[usize],
+    same_scc: &dyn Fn(&str) -> bool,
+) -> Option<Anchor> {
+    let walkable = walkable_node_variables(pattern);
+    positive
+        .iter()
+        .copied()
+        .filter(|&r| same_scc(&plan.refs[r].rule))
+        .filter_map(|r| {
+            let pos = plan.refs[r].positions.iter().position(|p| {
+                p.is_key
+                    && p.action == PositionAction::TestNode
+                    && matches!(
+                        plan.scope.get(&p.variable),
+                        Some(VarSource::Match(ColumnKind::Node))
+                    )
+                    && walkable.contains(p.variable.as_str())
+            })?;
+            Some(Anchor { r, pos })
+        })
+        .min_by(|a, b| {
+            let rank = |anchor: &Anchor| {
+                let binding = &plan.refs[anchor.r];
+                (
+                    binding.rule.clone(),
+                    binding
+                        .positions
+                        .iter()
+                        .map(|p| p.variable.clone())
+                        .collect::<Vec<_>>(),
+                )
+            };
+            rank(a).cmp(&rank(b))
+        })
+}
+
+/// The node variables a walk may start from: those written as a plain node
+/// element of a path that is neither a shortestPath nor carries a path
+/// variable, and never inside a quantified group.
+///
+/// A variable that also appears where a walk cannot start from it — in a
+/// quantified group, where it names a list — is excluded altogether.
+fn walkable_node_variables(pattern: &Pattern) -> HashSet<&str> {
+    fn quantified<'a>(path: &'a PathPattern, out: &mut HashSet<&'a str>) {
+        for element in &path.elements {
+            match element {
+                PatternElement::Node(n) => out.extend(n.variable.as_deref()),
+                PatternElement::Relationship(_) => {}
+                PatternElement::Parenthesized { pattern, .. } => quantified(pattern, out),
+            }
+        }
+    }
+    let mut plain = HashSet::new();
+    let mut excluded = HashSet::new();
+    for path in &pattern.paths {
+        let walk_from = path.shortest_path_mode.is_none() && path.variable.is_none();
+        for element in &path.elements {
+            match element {
+                PatternElement::Node(n) => {
+                    if let Some(v) = n.variable.as_deref().filter(|v| !v.is_empty()) {
+                        if walk_from {
+                            plain.insert(v);
+                        } else {
+                            excluded.insert(v);
+                        }
+                    }
+                }
+                PatternElement::Relationship(_) => {}
+                PatternElement::Parenthesized { pattern, .. } => {
+                    quantified(pattern, &mut excluded);
+                }
+            }
+        }
+    }
+    plain.retain(|v| !excluded.contains(v));
+    plain
 }
 
 /// The binding of every clause of `rule`, against `catalog`.
@@ -1387,6 +1516,60 @@ mod tests {
             );
         }
         base
+    }
+
+    /// The anchor of the plan of `rule`'s first clause with WHERE conditions,
+    /// as `(referenced rule, anchored variable)`, in every WHERE order.
+    fn anchors(program: &CompiledProgram, rule: &str) -> Vec<Option<(String, String)>> {
+        let n = program.rule_catalog[rule].clauses[clause_index(program, rule)]
+            .where_conditions
+            .len();
+        permutations(n)
+            .into_iter()
+            .map(|order| {
+                let plan = plan_in_order(program, rule, &order);
+                plan.anchor.map(|a| {
+                    let binding = &plan.refs[a.r];
+                    (
+                        binding.rule.clone(),
+                        binding.positions[a.pos].variable.clone(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn issue_301_anchor_is_the_recursive_reference_in_every_order() {
+        // `seed` is a lower stratum and also tests `o` on a KEY; only the
+        // reference into `r`'s own recursive group anchors.
+        let program = compiled(&format!(
+            "{SEED}CREATE RULE r AS MATCH (e:E {{uid: 'y'}}) YIELD KEY e, 1.0 AS agg\n\
+             CREATE RULE r AS MATCH (o:E)-[x:OWNS]->(e:E) \
+             WHERE x.pct IS NOT NULL AND o IS seed AND o IS r YIELD KEY e, x.pct AS agg"
+        ));
+        let all = anchors(&program, "r");
+        assert!(
+            all.iter()
+                .all(|a| a == &Some(("r".to_string(), "o".to_string()))),
+            "{all:?}"
+        );
+    }
+
+    #[test]
+    fn issue_301_no_anchor_without_a_walkable_recursive_reference() {
+        // A lower-stratum reference never anchors.
+        let program = compiled(&format!(
+            "{STAKE}{SEED}CREATE RULE r AS MATCH (o:E) WHERE o IS seed AND (o, e, pct) IS stake \
+             YIELD KEY e, pct"
+        ));
+        assert!(anchors(&program, "r").iter().all(Option::is_none));
+        // A node bound under a path variable is not walked from.
+        let program = compiled(
+            "CREATE RULE r AS MATCH (e:E {uid: 'y'}) YIELD KEY e\n\
+             CREATE RULE r AS MATCH p = (o:E)-[:OWNS]->(e:E) WHERE o IS r YIELD KEY e",
+        );
+        assert!(anchors(&program, "r").iter().all(Option::is_none));
     }
 
     #[test]

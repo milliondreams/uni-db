@@ -24,7 +24,7 @@ use crate::query::executor::core::OperatorStats;
 use crate::query::planner::LogicalPlan;
 use arrow_array::RecordBatch;
 use arrow_row::{RowConverter, SortField};
-use arrow_schema::SchemaRef;
+use arrow_schema::{Field, Schema as ArrowSchema, SchemaRef};
 use datafusion::common::JoinType;
 use datafusion::common::Result as DFResult;
 use datafusion::datasource::memory::MemorySourceConfig;
@@ -399,20 +399,26 @@ impl RowDedupState {
     ///
     /// Used after BEST BY in-loop pruning replaces the fact set, so that delta
     /// computation in subsequent iterations correctly recognizes surviving facts.
-    fn ingest_existing(&mut self, facts: &[RecordBatch], _schema: &SchemaRef) {
+    ///
+    /// # Errors
+    ///
+    /// Fails when a fact batch does not match the converter's schema. Skipping
+    /// it would leave those facts out of the seen set, so their re-derivations
+    /// would be admitted as new facts.
+    fn ingest_existing(&mut self, facts: &[RecordBatch]) -> DFResult<()> {
         self.seen.clear();
         for batch in &float_key_view(facts) {
             if batch.num_rows() == 0 {
                 continue;
             }
             let arrays: Vec<_> = batch.columns().to_vec();
-            if let Ok(rows) = self.converter.convert_columns(&arrays) {
-                for row_idx in 0..batch.num_rows() {
-                    let row_bytes: Box<[u8]> = rows.row(row_idx).data().into();
-                    self.seen.insert(row_bytes);
-                }
+            let rows = self.converter.convert_columns(&arrays).map_err(arrow_err)?;
+            for row_idx in 0..batch.num_rows() {
+                let row_bytes: Box<[u8]> = rows.row(row_idx).data().into();
+                self.seen.insert(row_bytes);
             }
         }
+        Ok(())
     }
 
     /// Filter `candidates` to only rows not yet seen, updating the persistent set.
@@ -617,6 +623,22 @@ struct FoldViewState {
     folded: Vec<RecordBatch>,
     /// Whole-row set from the previous merge, for change detection.
     prev_rows: HashSet<Vec<ScalarKey>>,
+    /// The rows of [`Self::folded`] that the previous snapshot did not hold:
+    /// a KEY that entered it, or one whose row changed in any column (issue
+    /// #301). What a linear self-reference reads; see
+    /// [`update_derived_scan_handles`] for why that is equivalent to reading
+    /// the whole snapshot.
+    folded_delta: Vec<RecordBatch>,
+    /// Exact (unrounded) whole-row set of [`Self::folded`], for
+    /// [`Self::folded_delta`].
+    folded_rows: HashSet<Vec<ScalarKey>>,
+    /// Whether to keep the snapshot plan's operator metrics, which only the
+    /// `profile()` path reads.
+    collect_ops: bool,
+    /// The operator metrics of the last snapshot recomputation (PRIORITY,
+    /// FOLD), so a profile shows the per-iteration fold cost next to the
+    /// clause bodies' (issue #301). Empty unless [`Self::collect_ops`].
+    last_ops: Vec<OperatorStats>,
 }
 
 impl FixpointState {
@@ -693,7 +715,27 @@ impl FixpointState {
             params,
             folded: Vec::new(),
             prev_rows: HashSet::new(),
+            folded_delta: Vec::new(),
+            folded_rows: HashSet::new(),
+            collect_ops: false,
+            last_ops: Vec::new(),
         });
+    }
+
+    /// Keeps the folded snapshot's operator metrics for
+    /// [`Self::take_fold_ops`]. Only the `profile()` path asks for them.
+    pub fn collect_fold_ops(&mut self) {
+        if let Some(fv) = self.fold_view.as_mut() {
+            fv.collect_ops = true;
+        }
+    }
+
+    /// The operator metrics of the last folded-snapshot recomputation, once.
+    pub fn take_fold_ops(&mut self) -> Vec<OperatorStats> {
+        self.fold_view
+            .as_mut()
+            .map(|fv| std::mem::take(&mut fv.last_ops))
+            .unwrap_or_default()
     }
 
     /// Whether the per-iteration folded view is active.
@@ -704,6 +746,53 @@ impl FixpointState {
     /// The KEY-grouped snapshot a same-stratum reference should read.
     pub fn folded_facts(&self) -> &[RecordBatch] {
         self.fold_view.as_ref().map_or(&[], |fv| &fv.folded)
+    }
+
+    /// The rows of [`Self::folded_facts`] that are new or changed since the
+    /// previous snapshot (issue #301).
+    pub fn folded_delta(&self) -> &[RecordBatch] {
+        self.fold_view.as_ref().map_or(&[], |fv| &fv.folded_delta)
+    }
+
+    /// Replaces the folded snapshot, recording which of its rows the previous
+    /// one did not hold.
+    ///
+    /// Rows are compared exactly, over every column — not through the rounded
+    /// key view change detection uses — so a value that moves by less than the
+    /// rounding is still re-read, as it would be from the whole snapshot.
+    fn install_folded(&mut self, folded: Vec<RecordBatch>) -> DFResult<()> {
+        let Some(fv) = self.fold_view.as_mut() else {
+            return Ok(());
+        };
+        let mut rows_now: HashSet<Vec<ScalarKey>> = HashSet::new();
+        let mut delta: Vec<RecordBatch> = Vec::new();
+        for batch in &folded {
+            let all: Vec<usize> = (0..batch.num_columns()).collect();
+            let mut changed: Vec<u32> = Vec::new();
+            for row in 0..batch.num_rows() {
+                let key = extract_scalar_key(batch, &all, row);
+                if !fv.folded_rows.contains(&key) {
+                    changed.push(row as u32);
+                }
+                rows_now.insert(key);
+            }
+            if changed.len() == batch.num_rows() {
+                delta.push(batch.clone());
+            } else if !changed.is_empty() {
+                let idx = arrow_array::UInt32Array::from(changed);
+                let columns = batch
+                    .columns()
+                    .iter()
+                    .map(|c| arrow::compute::take(c.as_ref(), &idx, None))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(arrow_err)?;
+                delta.push(RecordBatch::try_new(batch.schema(), columns).map_err(arrow_err)?);
+            }
+        }
+        fv.folded_rows = rows_now;
+        fv.folded_delta = delta;
+        fv.folded = folded;
+        Ok(())
     }
 
     /// Resolve each fold binding's input column index against the live schema.
@@ -739,7 +828,7 @@ impl FixpointState {
         task_ctx: &Arc<TaskContext>,
     ) -> DFResult<bool> {
         if let Some(first) = candidates.iter().find(|b| b.num_rows() > 0) {
-            self.reconcile_schema(&first.schema());
+            self.reconcile_schema(&first.schema())?;
         }
         // Existing facts first, candidates after, so the newest row for a
         // derivation key is the one that survives.
@@ -884,10 +973,7 @@ impl FixpointState {
             return Ok(());
         }
         if self.facts.is_empty() || self.facts.iter().all(|b| b.num_rows() == 0) {
-            if let Some(fv) = self.fold_view.as_mut() {
-                fv.folded.clear();
-            }
-            return Ok(());
+            return self.install_folded(Vec::new());
         }
 
         let batches: Vec<RecordBatch> = self
@@ -977,6 +1063,11 @@ impl FixpointState {
         let mut reservation = operator_reservation("FixpointExec", 0, task_ctx);
         let folded_batches =
             collect_all_partitions(&plan, Arc::clone(task_ctx), &mut reservation).await?;
+        if let Some(fv) = self.fold_view.as_mut()
+            && fv.collect_ops
+        {
+            fv.last_ops = crate::query::executor::core::collect_plan_metrics(&plan);
+        }
         let folded_out = match folded_batches.iter().find(|b| b.num_rows() > 0) {
             Some(b) => b.clone(),
             None => {
@@ -984,10 +1075,7 @@ impl FixpointState {
                 // representative rows as they stand.
                 let folded =
                     RecordBatch::try_new(Arc::clone(&self.schema), columns).map_err(arrow_err)?;
-                if let Some(fv) = self.fold_view.as_mut() {
-                    fv.folded = vec![folded];
-                }
-                return Ok(());
+                return self.install_folded(vec![folded]);
             }
         };
 
@@ -1074,10 +1162,7 @@ impl FixpointState {
         } else {
             apply_having_filter(vec![folded], &require, &self.schema, task_ctx, &params)?
         };
-        if let Some(fv) = self.fold_view.as_mut() {
-            fv.folded = folded;
-        }
-        Ok(())
+        self.install_folded(folded)
     }
 
     /// Resolve this rule's KEY columns by name against `schema`.
@@ -1106,30 +1191,87 @@ impl FixpointState {
     /// string column).  When the first real batch arrives with a different
     /// schema, update ours so that `RowDedupState` / `RecordBatch::try_new`
     /// use the correct types.
-    fn reconcile_schema(&mut self, actual_schema: &SchemaRef) {
+    ///
+    /// # Errors
+    ///
+    /// Fails when the data types change after facts have been stored, since
+    /// the stored facts can no longer be concatenated or deduplicated against
+    /// rows of the new types.
+    fn reconcile_schema(&mut self, actual_schema: &SchemaRef) -> DFResult<()> {
         let actual_schema = &nullable_discriminators(actual_schema);
-        if self.schema.fields() != actual_schema.fields() {
-            tracing::debug!(
-                rule = %self.rule_name,
-                "Reconciling fixpoint schema from physical plan output",
-            );
-            self.schema = Arc::clone(actual_schema);
-            self.row_dedup = RowDedupState::try_new(&self.schema);
-            // Recompute key_column_indices from stored KEY column names.
-            // Without this, FoldExec groups by wrong columns when the
-            // physical plan reorders columns vs the pre-inferred schema.
-            let new_indices: Vec<usize> = self
-                .key_column_names
-                .iter()
-                .filter_map(|name| actual_schema.index_of(name).ok())
-                .collect();
-            if new_indices.len() == self.key_column_names.len() {
-                self.key_column_indices = new_indices;
-            }
-            // else: not all KEY columns found in new schema — keep original indices
-            let num_cols = actual_schema.fields().len();
-            self.all_column_indices = (0..num_cols).collect();
+        if self.schema.fields() == actual_schema.fields() {
+            return Ok(());
         }
+        // Two clauses of one rule can disagree on nothing but nullability —
+        // a node bound by a scan is non-null, the same column bound by an IS
+        // reference is nullable — and which clause's batch comes first
+        // decided the schema. Widen to the union instead: the row encoding
+        // depends only on the data types, so the dedup state stays valid.
+        //
+        // Resetting it here was a silent duplicate-fact bug (issue #301): the
+        // fresh state no longer knew the facts already derived, so a
+        // re-derivation in a later iteration was admitted as new. It stayed
+        // hidden while every iteration re-ran every clause in the same
+        // order, which always put the same clause's batch first.
+        let same_types = self.schema.fields().len() == actual_schema.fields().len()
+            && self
+                .schema
+                .fields()
+                .iter()
+                .zip(actual_schema.fields())
+                .all(|(a, b)| a.name() == b.name() && a.data_type() == b.data_type());
+        if same_types {
+            let widened: Vec<Arc<Field>> = self
+                .schema
+                .fields()
+                .iter()
+                .zip(actual_schema.fields())
+                .map(|(a, b)| {
+                    if a.is_nullable() || !b.is_nullable() {
+                        Arc::clone(a)
+                    } else {
+                        Arc::clone(b)
+                    }
+                })
+                .collect();
+            self.schema = Arc::new(ArrowSchema::new_with_metadata(
+                widened,
+                self.schema.metadata().clone(),
+            ));
+            return Ok(());
+        }
+        if self.facts.iter().any(|b| b.num_rows() > 0) {
+            return Err(datafusion::error::DataFusionError::Internal(format!(
+                "Locy rule '{}': clause output types changed after facts were stored \
+                 (stored {:?}, new {:?})",
+                self.rule_name,
+                self.schema.fields(),
+                actual_schema.fields(),
+            )));
+        }
+        tracing::debug!(
+            rule = %self.rule_name,
+            "Reconciling fixpoint schema from physical plan output",
+        );
+        self.schema = Arc::clone(actual_schema);
+        // No facts are stored yet (checked above), so the fresh state misses
+        // nothing.
+        self.row_dedup = RowDedupState::try_new(&self.schema);
+        // Recompute key_column_indices from stored KEY column names.
+        // Without this, FoldExec groups by wrong columns when the
+        // physical plan reorders columns vs the pre-inferred schema.
+        let new_indices: Vec<usize> = self
+            .key_column_names
+            .iter()
+            .filter_map(|name| actual_schema.index_of(name).ok())
+            .collect();
+        if new_indices.len() == self.key_column_names.len() {
+            self.key_column_indices = new_indices;
+        }
+        // else: not all KEY columns found in new schema — keep original indices
+        let num_cols = actual_schema.fields().len();
+        self.all_column_indices = (0..num_cols).collect();
+        Ok(())
     }
 
     /// Merge candidate rows into facts, computing delta (truly new rows).
@@ -1142,6 +1284,16 @@ impl FixpointState {
     ) -> DFResult<bool> {
         if candidates.is_empty() || candidates.iter().all(|b| b.num_rows() == 0) {
             self.delta.clear();
+            // No candidates is an empty delta too: the accumulators did not
+            // move, so they are stable from here. Without the snapshot, an
+            // iteration whose clauses all derive nothing left `is_stable`
+            // comparing against the snapshot taken *before* the last update,
+            // and the fixpoint ran to its iteration limit (issue #301: hidden
+            // while a non-recursive clause re-derived its rows every
+            // iteration, which always took the empty-delta path below).
+            if let Some(ref mut agg) = self.monotonic_agg {
+                agg.snapshot();
+            }
             return Ok(false);
         }
 
@@ -1149,7 +1301,7 @@ impl FixpointState {
         // The physical plan's output types are authoritative over the
         // planner's inferred types.
         if let Some(first) = candidates.iter().find(|b| b.num_rows() > 0) {
-            self.reconcile_schema(&first.schema());
+            self.reconcile_schema(&first.schema())?;
         }
 
         // Round floats for stable dedup
@@ -1326,7 +1478,7 @@ impl FixpointState {
 
         // Reconcile schema from the first non-empty candidate batch.
         if let Some(first) = candidates.iter().find(|b| b.num_rows() > 0) {
-            self.reconcile_schema(&first.schema());
+            self.reconcile_schema(&first.schema())?;
         }
 
         // Round floats for stable dedup.
@@ -1460,7 +1612,7 @@ impl FixpointState {
         // Rebuild row dedup from pruned facts for consistency.
         self.row_dedup = RowDedupState::try_new(&self.schema);
         if let Some(ref mut rd) = self.row_dedup {
-            rd.ingest_existing(&self.facts, &self.schema);
+            rd.ingest_existing(&self.facts)?;
         }
 
         Ok(changed)
@@ -1911,6 +2063,9 @@ async fn run_fixpoint_loop(
                     rule.require.clone(),
                     params.clone(),
                 );
+                if profile_collector.is_some() {
+                    state.collect_fold_ops();
+                }
             }
             state
         })
@@ -1938,6 +2093,23 @@ async fn run_fixpoint_loop(
             let rule_start = Instant::now();
             let mut iter_ops: Vec<OperatorStats> = Vec::new();
             for clause in &rule.clauses {
+                // Issue #301: a clause that reads nothing of this stratum —
+                // no positive or negated reference to one of its rules — reads
+                // only the graph and lower strata, which are fixed while the
+                // fixpoint runs. Its candidates are the same every iteration,
+                // and the first iteration already merged them: `merge_delta`
+                // and `merge_best_by` keep existing facts and
+                // `merge_fold_contributions` only ever replaces a contribution
+                // by a re-derivation of it, so they stay in the facts. Running
+                // it again re-scanned its whole input per iteration.
+                //
+                // An empty candidate set keeps `clause_candidates` aligned
+                // with the clause indices provenance looks rows up by.
+                let reads_stratum = clause.is_ref_bindings.iter().any(|b| b.is_self_ref);
+                if iteration > 0 && !reads_stratum {
+                    clause_candidates.push(Vec::new());
+                    continue;
+                }
                 // Phase B A4 follow-up: the planner inserts
                 // `LogicalPlan::LocyModelInvoke` between the body and
                 // `LocyProject` when this clause has neural-model
@@ -2065,6 +2237,9 @@ async fn run_fixpoint_loop(
             // Profiling: record this rule's per-iteration row (delta = net-new
             // facts merged this pass, plus the captured clause-body operators).
             if let Some(ref collector) = profile_collector {
+                // The folded snapshot's own PRIORITY/FOLD pass is part of
+                // this iteration's cost for this rule.
+                iter_ops.extend(states[rule_idx].take_fold_ops());
                 let delta_facts: usize = states[rule_idx]
                     .all_delta()
                     .iter()
@@ -4926,12 +5101,43 @@ fn update_derived_scan_handles(
         };
 
         let is_self = entry.rule_name == *current_rule_name;
-        let data = if entry.view == DerivedScanView::Folded {
+        let linear_self = is_self && !rules[current_rule_idx].non_linear;
+        let data = if entry.view == DerivedScanView::Folded && linear_self {
             // Issue #162: this scan reads one row per KEY carrying that KEY's
-            // folded value, not one row per contribution. It is a full
-            // snapshot, so semi-naive delta injection does not apply.
+            // folded value, not one row per contribution. Issue #301: a
+            // linear self-reference reads only the rows of that snapshot that
+            // are new or changed since the previous one, which derives
+            // exactly what reading the whole snapshot would.
+            //
+            // Each iteration merges the clause's candidates into the
+            // contributions by *replacement* on the derivation key — every
+            // column but the fold inputs (`merge_fold_contributions`) — and a
+            // linear clause's output is a union over the snapshot rows it
+            // reads, one referenced row per output row. So the candidates the
+            // whole snapshot S_t would yield split into those of the changed
+            // rows Δ_t = S_t \ S_{t-1}, which this scan feeds, and those of the
+            // unchanged rows, which were derived from that same row in an
+            // earlier iteration (when it entered or last changed) and are
+            // still in the contributions: re-deriving them would replace each
+            // with an identical row. A changed row is re-fed, so every
+            // contribution that depends on the referenced value is recomputed
+            // and replaces its predecessor, exactly as before.
+            //
+            // A KEY that leaves the snapshot is fed by neither: today it is
+            // simply no longer read, its earlier contributions stay in the
+            // facts (merging only replaces, never removes), and that is what
+            // happens here too. A KEY that comes back is new relative to the
+            // snapshot it left, so it is re-fed. Row *order* within the facts
+            // can differ from full feeding (an unchanged contribution keeps
+            // its slot instead of moving to the end), which only decides the
+            // representative of a KEY group's internal `__deriv_*` columns:
+            // a FOLD rule yields nothing but its KEYs and folds (#293).
+            states[source_idx].folded_delta().to_vec()
+        } else if entry.view == DerivedScanView::Folded {
+            // A cross-reference, or a non-linear self-reference (Δ×Δ would miss
+            // Δ×F_old): the whole snapshot.
             states[source_idx].folded_facts().to_vec()
-        } else if is_self && !rules[current_rule_idx].non_linear {
+        } else if linear_self {
             // Self-ref in a linear rule: inject delta for semi-naive
             states[source_idx].all_delta().to_vec()
         } else {
@@ -4965,6 +5171,11 @@ pub struct DerivedScanExec {
     data: Arc<RwLock<Vec<RecordBatch>>>,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
+    /// Rows served per execution, so a profile reports how much of a derived
+    /// relation each fixpoint iteration read (issue #301). Without it every
+    /// derived scan reported 0 rows, hiding whether a recursive clause read
+    /// the delta or the whole relation.
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl DerivedScanExec {
@@ -4974,6 +5185,7 @@ impl DerivedScanExec {
             data,
             schema,
             properties,
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 }
@@ -5011,9 +5223,12 @@ impl ExecutionPlan for DerivedScanExec {
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         Ok(self)
     }
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         _context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         let batches = {
@@ -5037,6 +5252,11 @@ impl ExecutionPlan for DerivedScanExec {
                     .collect::<DFResult<Vec<_>>>()?
             }
         };
+        // The batches are already resident, so the rows served are known up
+        // front; nothing is computed, so no elapsed time is recorded.
+        let baseline = BaselineMetrics::new(&self.metrics, partition);
+        baseline.record_output(batches.iter().map(RecordBatch::num_rows).sum());
+        baseline.done();
         Ok(Box::pin(MemoryStream::try_new(
             batches,
             Arc::clone(&self.schema),

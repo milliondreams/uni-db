@@ -2284,6 +2284,11 @@ impl AuthzFields {
         self.rel_types.insert(rel_type.to_owned());
     }
 
+    /// Adds the keys of `expr` when it is an inline map literal.
+    pub(crate) fn add_map_keys(&mut self, expr: Option<&uni_cypher::ast::Expr>) {
+        collect_map_keys(expr, &mut self.properties);
+    }
+
     /// Adds one operation (`"read"`, `"write"`, …).
     pub(crate) fn add_operation(&mut self, operation: &str) {
         self.operations.insert(operation.to_owned());

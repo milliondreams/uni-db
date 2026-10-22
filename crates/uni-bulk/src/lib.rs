@@ -24,6 +24,7 @@
 pub mod appender;
 pub mod bulk;
 mod endpoint_check;
+pub mod events;
 pub mod flush_intent;
 #[cfg(test)]
 mod tests;
@@ -32,5 +33,8 @@ pub use appender::{AppenderBuilder, StreamingAppender};
 pub use bulk::{
     BulkBackend, BulkConfig, BulkPhase, BulkProgress, BulkStats, BulkWriter, BulkWriterBuilder,
     EdgeData, IntoArrow, RebuildManagerSource, record_batch_to_property_maps,
+};
+pub use events::{
+    BULK_EVENT_CHUNK_ROWS, BulkEventSink, BulkWriteKind, LoadEventReader, VisibleLoad,
 };
 pub use flush_intent::{check_recovered_bulk_endpoints, recover_interrupted_bulk_load};

@@ -164,6 +164,12 @@ for:
   procedure, `dbms` for an administrative one (`uni.admin.*`). `ASSUME`
   mutations ask for `write` too, although they are discarded.
 
+A `DERIVE` request names what the equivalent Cypher write would: the labels,
+relationship types and inline property keys of the patterns its rule matches
+— and of every rule that rule reaches through `IS`, since those bind what it
+writes — together with those it creates (`MERGED_WITH` for `DERIVE MERGE`).
+A policy keyed on a label therefore sees a derive over that label.
+
 `tx.apply(derived)` asks for `write` for each statement it replays, with the
 path `<locy-apply>`. A refused program returns
 `UniError::AuthorizationDenied` and has no effect.

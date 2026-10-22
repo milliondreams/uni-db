@@ -357,9 +357,9 @@ impl PropertyManager {
         // Fallback to main edges table props_json for unknown/schemaless types.
         // Bounded by the same high water mark the delta tier is filtered by
         // above — otherwise this tier alone reads at HEAD while the others
-        // honour the snapshot. The hwm is `None` unless this `PropertyManager`
-        // was built over pinned storage (today: `UniInner::at_snapshot`), so
-        // for a read-write transaction both tiers read at HEAD by design.
+        // honour the snapshot. For a query against a pinned view (a
+        // read-write transaction or a time-travel snapshot) that is the
+        // view's `QueryContext::l1_visibility`; otherwise both tiers read live.
         use crate::storage::main_edge::MainEdgeDataset;
         if let Some(props) = MainEdgeDataset::find_props_by_eid_counted(
             self.storage.backend(),

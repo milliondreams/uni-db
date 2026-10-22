@@ -136,6 +136,10 @@ def _exclude_lazy_annotations(
     import annotationlib
 
     original = annotationlib.get_annotate_from_class_namespace(namespace)
+    if original is None:
+        # Only called for a namespace whose relationships were read from its
+        # lazy annotations, which therefore has an annotate function.
+        raise TypeError("class namespace has no annotate function to filter")
     owner: list[type] = []
 
     def __annotate__(format: int, /) -> dict[str, Any]:

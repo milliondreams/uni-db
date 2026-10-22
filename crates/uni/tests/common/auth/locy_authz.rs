@@ -226,7 +226,11 @@ async fn locy_authz_verbs_follow_the_program() -> Result<()> {
         ["read", "write"],
         "session DERIVE program: {checks:?}"
     );
-    assert_eq!(checks[1].rel_types, ["LINKED"], "the edge DERIVE writes");
+    assert_eq!(
+        checks[1].rel_types,
+        ["LINKED", "R"],
+        "the edge DERIVE writes and the one it matches"
+    );
 
     let tx = s.tx().await?;
     // Applied first: a DerivedFactSet is stale once the transaction writes.
@@ -255,5 +259,75 @@ async fn locy_authz_verbs_follow_the_program() -> Result<()> {
     // The administrative procedure ran, as it does through tx.execute.
     let (_, _, snapshots, via_locy) = state(&db).await?;
     assert_eq!((snapshots, via_locy), (1, true));
+    Ok(())
+}
+
+/// The `write` request of a `DERIVE` names what the rule matches as well as
+/// what it creates — as the `write` request of the equivalent Cypher
+/// statement does — so a policy keyed on a label cannot be bypassed by
+/// deriving instead of writing. Labels reached through an `IS` reference
+/// count, and `DERIVE MERGE` names the `MERGED_WITH` edge it writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn locy_authz_derive_names_what_it_writes() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db = store(dir.path().to_str().context("utf-8")?).await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:Secret {v: 3})").await?;
+    tx.commit().await?;
+    let policy = register(&db)?;
+    let s = db.session();
+
+    let tx = s.tx().await?;
+    tx.execute("MATCH (a:Item)-[:R]->(b:Item) CREATE (a)-[:LINKED]->(b)")
+        .await?;
+    tx.rollback();
+    let cypher = policy.take();
+    assert!(!cypher.is_empty(), "the Cypher write was authorized");
+
+    s.locy(DERIVE).await?;
+    let derive = policy.take();
+    let write = &derive[1];
+    assert_eq!(write.verb, "write", "{derive:?}");
+    assert_eq!(
+        (&write.labels, &write.rel_types),
+        (&cypher[0].labels, &cypher[0].rel_types),
+        "DERIVE names what the equivalent Cypher write names"
+    );
+
+    s.locy(
+        "CREATE RULE secret AS MATCH (x:Secret) YIELD KEY x\n\
+         CREATE RULE leak AS MATCH (b:Item) WHERE a IS secret \
+         DERIVE (a)-[:LINKED]->(b)\nDERIVE leak",
+    )
+    .await?;
+    let checks = policy.take();
+    let write = checks.iter().find(|c| c.verb == "write").context("write")?;
+    assert!(
+        write.labels.iter().any(|l| l == "Secret"),
+        "a label bound through IS: {checks:?}"
+    );
+
+    s.locy("CREATE RULE same AS MATCH (a:Item)-[:R]->(b:Item) DERIVE MERGE a, b\nDERIVE same")
+        .await?;
+    let checks = policy.take();
+    let write = checks.iter().find(|c| c.verb == "write").context("write")?;
+    assert_eq!(
+        (&write.labels, &write.rel_types),
+        (
+            &vec!["Item".to_owned()],
+            &vec!["MERGED_WITH".to_owned(), "R".to_owned()]
+        ),
+        "DERIVE MERGE: {checks:?}"
+    );
+    let tx = s.tx().await?;
+    tx.locy("CREATE RULE same AS MATCH (a:Item)-[:R]->(b:Item) DERIVE MERGE a, b\nDERIVE same")
+        .await?;
+    tx.commit().await?;
+    let merged: i64 = s
+        .query("MATCH (:Item)-[m:MERGED_WITH]->(:Item) RETURN count(m) AS n")
+        .await?
+        .rows()[0]
+        .get("n")?;
+    assert_eq!(merged, 1, "DERIVE MERGE writes the edge it names");
     Ok(())
 }

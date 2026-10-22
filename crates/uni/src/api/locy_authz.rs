@@ -22,13 +22,19 @@
 //!   count, as a Cypher write does whether or not its transaction commits.
 //!
 //! Each request carries the structured fields (labels, relationship types,
-//! properties, operations) of the parts it covers.
+//! properties, operations) of the parts it covers. A `DERIVE` request names
+//! what the equivalent Cypher write would: the patterns the rule matches —
+//! through every rule it reaches by `IS`, since those bind what it writes —
+//! as well as what it creates. A rule it cannot resolve refuses the program
+//! rather than send a request that names nothing.
 
-use uni_common::Result;
+use std::collections::HashSet;
+
+use uni_common::{Result, UniError};
 use uni_cypher::ast::{Query, Statement};
-use uni_cypher::locy_ast::{DeriveClause, RuleOutput};
+use uni_cypher::locy_ast::{DeriveClause, RuleCondition, RuleOutput};
 use uni_locy::CompiledProgram;
-use uni_locy::types::{CompiledCommand, CompiledRule, Stratum};
+use uni_locy::types::{CompiledCommand, Stratum};
 use uni_plugin::traits::connector::Principal;
 use uni_plugin::traits::procedure::ProcedureMode;
 
@@ -59,10 +65,10 @@ pub(crate) fn authorize_locy_program(
     requests.add_strata(&compiled.strata);
     requests.add_commands(
         &compiled.commands,
-        compiled,
+        &[compiled],
         classify_verb(program),
         &registered_mode,
-    );
+    )?;
 
     if requests.reads_anything {
         let mut fields = requests.reads;
@@ -134,15 +140,21 @@ impl Requests {
         }
     }
 
-    /// Adds `commands`, compiled within `program`. `schema_verb` is the verb
-    /// of a schema command among them (see [`cypher_command_verb`]).
+    /// Adds `commands`, compiled within `scopes` — the program that holds
+    /// them, then each program enclosing it, innermost first. `schema_verb` is
+    /// the verb of a schema command among them (see [`cypher_command_verb`]).
+    ///
+    /// # Errors
+    ///
+    /// [`UniError::AuthorizationDenied`] for a `DERIVE` whose rules cannot be
+    /// resolved ([`add_derived`]).
     fn add_commands(
         &mut self,
         commands: &[CompiledCommand],
-        program: &CompiledProgram,
+        scopes: &[&CompiledProgram],
         schema_verb: &'static str,
         registered_mode: &dyn Fn(&str) -> Option<ProcedureMode>,
-    ) {
+    ) -> Result<()> {
         for command in commands {
             match command {
                 CompiledCommand::Cypher(query) => {
@@ -153,10 +165,9 @@ impl Requests {
                     // Evaluates the rule, then writes what it derives.
                     self.reads_anything = true;
                     let mut fields = AuthzFields::default();
+                    fields.add_operation("read");
                     fields.add_operation("write");
-                    if let Some(rule) = program.rule_catalog.get(&derive.rule_name.to_string()) {
-                        add_derived(&mut fields, rule);
-                    }
+                    add_derived(&mut fields, scopes, &derive.rule_name.to_string())?;
                     self.writes.push(("write", fields));
                 }
                 CompiledCommand::Assume(assume) => {
@@ -166,12 +177,9 @@ impl Requests {
                     let verb = cypher_command_verb(&mutations, schema_verb, registered_mode);
                     self.add_statement(&mutations, verb);
                     self.add_strata(&assume.body_program.strata);
-                    self.add_commands(
-                        &assume.body_commands,
-                        &assume.body_program,
-                        schema_verb,
-                        registered_mode,
-                    );
+                    let mut inner = vec![&assume.body_program];
+                    inner.extend_from_slice(scopes);
+                    self.add_commands(&assume.body_commands, &inner, schema_verb, registered_mode)?;
                 }
                 CompiledCommand::Calibrate(c) => {
                     self.reads_anything = true;
@@ -186,6 +194,7 @@ impl Requests {
                 | CompiledCommand::ExplainRule(_) => self.reads_anything = true,
             }
         }
+        Ok(())
     }
 
     /// Adds a Cypher statement the program runs under `verb`: into the
@@ -202,18 +211,56 @@ impl Requests {
     }
 }
 
-/// The labels and relationship types a `DERIVE` of `rule` writes.
-fn add_derived(fields: &mut AuthzFields, rule: &CompiledRule) {
-    for clause in &rule.clauses {
-        if let RuleOutput::Derive(DeriveClause::Patterns(patterns)) = &clause.output {
-            for p in patterns {
-                for label in p.source.labels.iter().chain(&p.target.labels) {
-                    fields.add_label(label);
+/// Adds what a `DERIVE` of the rule `name` touches: the patterns it and every
+/// rule it reaches by `IS` match, as the `MATCH` of a Cypher write counts in
+/// that write's request, and the labels, relationship types and inline
+/// property keys it creates — `MERGED_WITH` for `DERIVE MERGE`.
+///
+/// A rule is looked up in each of `scopes` in turn.
+///
+/// # Errors
+///
+/// [`UniError::AuthorizationDenied`] when a rule cannot be resolved: a request
+/// that named nothing would let a label-keyed policy allow the write.
+fn add_derived(fields: &mut AuthzFields, scopes: &[&CompiledProgram], name: &str) -> Result<()> {
+    let mut seen = HashSet::new();
+    let mut pending = vec![name.to_owned()];
+    while let Some(name) = pending.pop() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let rule = scopes
+            .iter()
+            .find_map(|p| p.rule_catalog.get(&name))
+            .ok_or_else(|| UniError::AuthorizationDenied {
+                reason: format!("cannot authorize DERIVE: rule '{name}' is not resolvable"),
+            })?;
+        for clause in &rule.clauses {
+            fields.add_pattern(&clause.match_pattern);
+            for cond in &clause.where_conditions {
+                if let RuleCondition::IsReference(r) = cond {
+                    pending.push(r.rule_name.to_string());
                 }
-                fields.add_rel_type(&p.edge.edge_type);
+            }
+            match &clause.output {
+                RuleOutput::Derive(DeriveClause::Patterns(patterns)) => {
+                    for p in patterns {
+                        for node in [&p.source, &p.target] {
+                            for label in &node.labels {
+                                fields.add_label(label);
+                            }
+                            fields.add_map_keys(node.properties.as_ref());
+                        }
+                        fields.add_rel_type(&p.edge.edge_type);
+                        fields.add_map_keys(p.edge.properties.as_ref());
+                    }
+                }
+                RuleOutput::Derive(DeriveClause::Merge(..)) => fields.add_rel_type("MERGED_WITH"),
+                RuleOutput::Yield(_) => {}
             }
         }
     }
+    Ok(())
 }
 
 /// The verb Cypher's `tx.query` would authorize `query` under: `read` for a

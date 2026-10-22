@@ -314,6 +314,20 @@ Each commit becomes one `CdcBatch`:
 A commit with no event rows is delivered as an empty batch with the same
 schema.
 
+Batches arrive in commit order: `lsn_end` never decreases from one batch to
+the next. A commit's notification is ordered at the moment it becomes visible,
+under the writer's commit lock, so a commit that finishes its post-commit work
+first still cannot be delivered ahead of an earlier one. (Before this was
+fixed, a commit landing in that window could make an earlier commit report
+the later commit's version and be delivered after it.)
+
+A bulk load (`bulk_writer`, `appender`) is delivered as one or more batches,
+all carrying the load's LSN range (`lsn_start` the load's version, `lsn_end`
+the database version when it became visible, which can equal the previous
+commit's `lsn_end`). Its rows are split across them in chunks of at most 4096,
+and each stream is checkpointed once, after the last. See
+[Bulk loads](#bulk-loads).
+
 ### Delivery
 
 - **After commit, off the commit path.** A commit does not wait for sinks.
@@ -359,6 +373,35 @@ It keeps every batch until shutdown, ignores `from_lsn` and does not resume
 from a checkpoint. Do not leave it on in a long-running process. When it was
 registered by default it cost 236.6 MB of RSS over 20,000 small commits,
 against 55.8 MB without it.
+
+## Bulk loads
+
+A bulk load (`tx.bulk_writer()`, `tx.appender()`) writes straight to storage,
+not through a transaction, and commits on its own. Once it is visible it emits:
+
+- one commit notification, with `tx_id` the load id and `session_id`
+  `"bulk-load"`;
+- a `NODE_CREATE` row per vertex and label and an `EDGE_CREATE` row per edge,
+  read back from storage in chunks of at most 4096 rows. A load's events are
+  never held in memory at once. `old_value` and `properties_old` are null;
+  `properties_new` follows the same predicate-referenced rule as a commit.
+- After-phase triggers fire once per chunk, so a large load reaches a trigger
+  as several batches.
+- CDC gets the chunks as batches of one announcement, as described under
+  [CDC outputs](#cdc-outputs).
+
+A synchronous `BeforeMutation` / `BeforeCommit` trigger cannot veto a load: its
+events exist only after the load is visible. A load that would write rows such
+a trigger subscribes to (by event kind and label or edge type; a predicate is
+not evaluated, so a predicated trigger counts as matching) is refused with
+`UniError::BulkLoadBlockedByTrigger` before those rows are staged, or at
+`commit()` for a trigger registered mid-load, and nothing of it becomes
+visible. `BulkWriterBuilder::skip_before_triggers(true)` (and the same option on
+the appender builder) loads anyway, without running those triggers.
+
+A load completed in the background after `BulkCommitIncomplete` emits its events
+when it becomes visible. A load completed by recovery while the database opens
+emits none. See [Data ingestion](../guides/data-ingestion.md#triggers-cdc-and-the-enclosing-transaction).
 
 ## Forks
 

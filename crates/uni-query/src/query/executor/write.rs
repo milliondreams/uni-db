@@ -1002,24 +1002,35 @@ impl Executor {
                     );
                     true
                 };
+                // Storage before catalog -- before the live catalog, not just
+                // before `sm.save()` below: a Lance column the catalog does not
+                // know about is invisible, while a catalog column Lance lacks is
+                // a hard read failure -- including through a fork branch, which
+                // carries its own schema copy and is widened here too (issue
+                // #249). Any commit saves a dirty catalog, so declaring first
+                // let one persist the property ahead of its column. A property
+                // already declared is refused by `add_property_with_desc`, and
+                // is not widened to a type it does not have.
+                let declared = sm
+                    .schema()
+                    .properties
+                    .get(entity_name)
+                    .is_some_and(|props| props.contains_key(&prop.name));
+                if !declared {
+                    storage
+                        .widen_for_declared_properties(
+                            entity_name,
+                            &[(prop.name.clone(), dt.clone())],
+                        )
+                        .await?;
+                }
                 sm.add_property_with_desc(
                     entity_name,
                     &prop.name,
-                    dt.clone(),
+                    dt,
                     effective_nullable,
                     prop.description,
                 )?;
-                // Storage before catalog (`sm.save()` below): a Lance column
-                // the catalog does not know about is invisible, while a
-                // catalog column Lance lacks is a hard read failure --
-                // including through a fork branch, which carries its own
-                // schema copy and is widened here too (issue #249).
-                storage
-                    .widen_for_declared_properties(
-                        entity_name,
-                        &[arrow_schema::Field::new(&prop.name, dt.to_arrow(), true)],
-                    )
-                    .await?;
             }
             AlterAction::DropProperty(prop_name) => {
                 sm.drop_property(entity_name, &prop_name)?;

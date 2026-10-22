@@ -9,6 +9,38 @@ the version it ships in.
 
 ### Results that change
 
+**Commits are announced in commit order, with their own version.** A commit's
+version was re-read, and its notification sent, after the writer's commit lock
+was released. A commit landing in between lent its version to the earlier one
+and could be announced first: with one commit paused after its commit point
+and a second committed meanwhile, the first returned the second's version
+(`CommitResult::version` 3 for both), and `session.watch()` and CDC both saw
+`[3, 3]`. CDC checkpoints the newest `lsn_end` it delivered, so the sequence
+could also go backwards. The version is now taken, and the announcement order
+fixed, under the lock; `CommitResult::version`, `CommitNotification::version`
+and `CdcBatch::lsn_end` are each the commit's own, and `lsn_end` never
+decreases across deliveries.
+
+**Bulk loads emit trigger and CDC events.** `tx.bulk_writer()` and
+`tx.appender()` loads produced no `AfterCommit` trigger rows, no CDC batch and
+no commit notification. Once visible, a load is now announced as one commit
+notification and emits `NODE_CREATE` (per vertex and label) and `EDGE_CREATE`
+(per edge) rows to after-phase triggers and CDC, read back from storage in
+chunks of at most 4096 rows. A trigger therefore fires once per chunk, and CDC
+receives one or more `CdcBatch`es sharing the load's LSN range, checkpointed
+once after the last. `bulk.commit()` returns after the events are delivered.
+A load completed in the background after `BulkCommitIncomplete` emits them when
+it becomes visible; a load completed by recovery at open emits none.
+
+**A bulk load that a synchronous before-trigger would see is refused.** Such a
+trigger cannot veto a load that is already visible, so a load writing vertices
+under a label (or edges of a type) that a synchronous `BeforeMutation` /
+`BeforeCommit` trigger subscribes to now fails with the new
+`UniError::BulkLoadBlockedByTrigger`, before those rows are staged (or at
+`commit()` for a trigger registered mid-load), and nothing of it becomes
+visible. Opt in with `skip_before_triggers(true)` on the bulk-writer or
+appender builder to load without running those triggers.
+
 **Versioned reads return the state as of their version.** A snapshot taken
 before a `DETACH DELETE` lost the deleted vertex once the delete was flushed
 (`MATCH (x) RETURN x.v` gave `[1, 3, 4, 5]` for `[1..5]`), and so did a
@@ -40,6 +72,34 @@ It now runs only for vertices a registered node trigger or CDC can receive,
 and never for vertices the transaction created: a 1M-vertex commit beside 1M
 stored ones went from 67.5 s to 13.3 s (debug build) with no user trigger.
 
+**A transaction reads edges and properties as of its snapshot.** A
+transaction's traversals shared the live adjacency, so it saw an edge committed
+after it began (and through it a vertex outside its snapshot) and kept seeing
+an edge deleted after it began, through Cypher, Locy, algorithms and
+procedures alike; and its edge and vertex property reads used live storage and
+a shared cache, so a value another transaction updated and flushed changed
+under it. Edge reads are now filtered by the transaction's snapshot, and its
+property reads are bounded by it and bypass the shared cache. A transaction
+still sees its own uncommitted edges and properties.
+
+Compaction now respects the same snapshot: while a transaction is open, no
+pass folds an edge delta committed after it began, since folded edges carry no
+version and the transaction would see them. A long-lived transaction therefore
+holds newer edge deltas in L1 until it ends. A bulk load does not need its
+host transaction to stay open: the load commits on its own, so ending the host
+transaction early lets compaction proceed during a long load.
+
+**Promote upsert updates a vertex whose `ext_id` was reused.** After a vertex
+was deleted and another created with the same `ext_id`, the `ext_id` lookup
+could resolve to the deleted row, so `promote_from_fork_with_options` with
+upsert inserted a duplicate instead of updating the live vertex. The lookup
+now uses each vertex's newest row.
+
+**Beginning a transaction no longer scales with the database.** Each begin
+copied the whole VID-to-labels index: 67 ms at 200k vertices, 636× its cost at
+1k. The index is now copy-on-write, and a begin costs about 10 µs at either
+size.
+
 **Locy programs are authorized.** No Locy entry point consulted the
 registered `AuthzPolicy` chain: with a deny-all policy, `session.locy`,
 `tx.locy`, their builders and prepared programs all ran, a `tx.locy` Cypher
@@ -53,6 +113,15 @@ for a DDL / administrative procedure). `tx.apply` asks `write` for each
 statement it replays (path `<locy-apply>`). A refusal is
 `AuthorizationDenied`. A policy that denies an action now refuses the Locy
 programs that need it.
+A `DERIVE` request names what the equivalent Cypher write would — the
+patterns its rule (and every rule it reaches by `IS`) matches, as well as what
+it creates — so a label-keyed policy cannot be bypassed by deriving instead of
+writing.
+
+**`DERIVE MERGE a, b` runs.** It emitted `MERGE (a)-[:MERGED_WITH]->(b)` with
+neither variable bound, so every evaluation failed with "MERGE pattern node
+must have a label or be a bound variable". Both nodes are now rebound by id
+first, as the endpoints of a derived edge are.
 
 **A label write through a second binding of the same node keeps the first.**
 `SET` and `REMOVE` of a label rebuilt the node's whole label set from the
@@ -172,6 +241,32 @@ of them in `session.query`, `session.run` and `tx.query` (`write` in
 - A session `prepare()` now refuses a registered `WRITE`/`SCHEMA`/`DBMS` plugin
   procedure, as `session.query()` does. It used the registry-blind check, so a
   prepared `CALL t.mark()` (a declared `WRITE` procedure) executed and wrote.
+
+**An `AuthzPolicy` sees each Cypher statement once, under one verb.**
+`tx.execute` authorized the statement and then handed it to the `tx.query`
+body, which authorized it again, so a policy saw two identical `write` checks
+for one `tx.execute(..)` — an audit policy logged every write twice and a
+counting policy charged it twice. Every Cypher entry point — `session.query` /
+`run`, the session and transaction builders (`fetch_all`, `fetch_one`,
+`execute`, `run`, `profile`, `explain`, `cursor`), `tx.query` / `tx.execute`
+and prepared statements — now makes exactly one check per statement. Inside a
+transaction a pure read is checked as `read` on every entry point; before,
+`tx.query` said `read` while `tx.execute`, the transaction builders and
+`tx.prepare` said `write` for the same read.
+
+**Procedures called from Locy, prepared statements, transaction builders and
+cursors see the caller's principal.** Procedure capability gates read the
+principal from a task-local that each entry point installs around execution.
+`session.locy` / `locy_with().run()`, `tx.query` and `tx.execute` installed
+it; `tx.locy`, `tx.locy_with()` (`run`, `profile`), `session.locy_with().profile()`,
+`prepare_locy` (session and transaction), `prepare` (session and transaction)
+and the transaction builders (`fetch_all`, `execute`, `run`, `profile`,
+`cursor`) did not, so a procedure they called saw no principal and a
+capability-gated procedure was refused for a principal that held the
+capability. A cursor installed it only while being built, not while it streamed,
+so a procedure reached on a later poll saw no principal and no session-scoped
+plugins. All of them now run under the caller's principal, and a cursor
+re-installs the principal and session plugin registry around every poll.
 
 **A Locy program's commands run in sequence.** A command now reads the state
 every earlier command of the same program left. A `DERIVE` or a Cypher write
@@ -1431,7 +1526,51 @@ with `Timeout` (or `LocyIncomplete` when an evaluation was cut short).
 - a budget that runs out after the facts are complete skips the commands and
   reports an `incomplete` with reason `timeout` and no rule listed.
 
+**A schema change racing a snapshot restore no longer brings the old catalog
+back at the next open.** Catalog saves were not ordered: a schema change that
+had read the catalog before `restore_snapshot` (or `uni.admin.snapshot.restore`)
+installed the snapshot's, and wrote it after, left the pre-restore catalog on
+disk. The handle kept answering from the restored catalog, so nothing looked
+wrong until the database was reopened; then labels, properties and indexes
+declared after the snapshot were back over storage rewound to before them, and
+a property renamed after the snapshot read NULL on every row under its
+restored name. Saves are now written in the order they read the catalog, which
+also covers two schema changes, or a schema change and a commit, saving at
+once. A schema change still in progress when a restore installs the snapshot's
+catalog is undone along with everything else declared after the snapshot.
+
+**A crash while adding a property no longer leaves the label unreadable.**
+Adding a property to a populated label (`db.schema()...apply()` or
+`ALTER ... ADD PROPERTY`) declared it in the live catalog before adding its
+column to storage. Every commit saves the catalog if it changed, so a commit
+from another session in that window wrote the new property to disk ahead of
+its column, and a crash before the column was added made every read of the
+label fail after reopen (`column types must match schema types`). Storage is
+now widened before the property is declared. A widening that fails also leaves
+the catalog unchanged; before, the half-applied declaration stayed in the live
+catalog and the next commit saved it.
+
+**`tx.bulk_writer()`'s documentation described the load as part of the
+transaction.** It is not, and was not: `BulkWriter::commit` commits the load on
+its own, other sessions see it at once, rolling the transaction back keeps it,
+and the transaction's own reads do not see it. The rustdoc now says so.
+
 ### API changes
+
+**Commit events** (`uni-store`, `uni-plugin-host`, `uni-bulk`, `uni-common`).
+`CommitNotification` has a new field, `mutation_stream: Option<u64>` (`None`
+for every transaction commit); a struct literal must set it.
+`Writer::commit_transaction_l0_sequenced` (returns `CommittedTx { wal_lsn,
+flush_pending, version, ticket }`) and `Writer::sequence_announcement` are new,
+with `runtime::publish_sequencer::{PublishSequencer, PublishTicket}`.
+`CdcRuntime::open_mutation_stream` / `MutationStreamSender` are new.
+`BulkBackend` has a new field `events: Option<Arc<dyn BulkEventSink>>` (the
+`uni_bulk::events` module: `BulkEventSink`, `VisibleLoad`, `LoadEventReader`,
+`BulkWriteKind`, `BULK_EVENT_CHUNK_ROWS`); `BulkConfig` has
+`skip_before_triggers`. `MutationEvents::creates` with `CreatedVertex` /
+`CreatedEdge`, `TriggerRouter::synchronous_before_trigger_for` and
+`TriggerRouter::has_after_triggers` are new. `UniError::BulkLoadBlockedByTrigger
+{ trigger, target }` is new (Python: base `UniError`).
 
 **Snapshot restore** (`uni-store`). `StorageManager::restore_snapshot` is
 removed: it only moved the manifest pointer. `Writer::restore_snapshot` and

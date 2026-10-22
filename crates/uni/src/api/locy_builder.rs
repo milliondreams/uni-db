@@ -263,15 +263,21 @@ impl<'a> LocyBuilder<'a> {
                 .compile_locy_with_config(&self.program, &self.config)?,
         );
         let capture = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let result = crate::api::impl_locy::evaluate_with_db_and_config_capturing(
-            &self.session.db,
-            &self.program,
-            &self.config,
-            self.session.rule_registry(),
-            Some(&capture),
-            self.session.cancel_scope(self.cancellation_token.clone()),
-            self.max_memory,
+        // The same task-local scope `run` installs: profiling executes the
+        // program, so a procedure it calls must see the session's principal.
+        let result = uni_query::scoped_with_session_context(
+            std::sync::Arc::clone(self.session.instance_plugin_registry()),
             self.session.principal.clone(),
+            crate::api::impl_locy::evaluate_with_db_and_config_capturing(
+                &self.session.db,
+                &self.program,
+                &self.config,
+                self.session.rule_registry(),
+                Some(&capture),
+                self.session.cancel_scope(self.cancellation_token.clone()),
+                self.max_memory,
+                self.session.principal.clone(),
+            ),
         )
         .await?;
         let profile = capture
@@ -393,8 +399,8 @@ impl<'a> TxLocyBuilder<'a> {
             max_memory: self.max_memory,
             principal: self.tx.principal.clone(),
         };
-        engine
-            .evaluate_with_config(&self.program, &self.config)
+        self.tx
+            .with_locy_scope(engine.evaluate_with_config(&self.program, &self.config))
             .await
     }
 
@@ -416,8 +422,13 @@ impl<'a> TxLocyBuilder<'a> {
             &engine.compile_only(&self.program)?,
         );
         let capture = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let result = engine
-            .evaluate_with_config_capturing(&self.program, &self.config, Some(&capture))
+        let result = self
+            .tx
+            .with_locy_scope(engine.evaluate_with_config_capturing(
+                &self.program,
+                &self.config,
+                Some(&capture),
+            ))
             .await?;
         let profile = capture
             .lock()

@@ -185,6 +185,7 @@ impl Fixture {
                 config: UniConfig::default(),
                 rebuild_manager: None,
                 track_task: None,
+                events: None,
             },
         }
     }

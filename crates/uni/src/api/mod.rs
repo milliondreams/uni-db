@@ -17,6 +17,7 @@ pub mod appender {
     pub use uni_bulk::appender::*;
 }
 pub mod builder;
+pub(crate) mod bulk_events;
 /// Bulk writer engine, re-exported from `uni-bulk`.
 ///
 /// Shim kept so `crate::api::bulk::*` paths resolve unchanged after the
@@ -185,6 +186,11 @@ pub struct UniInner {
     pub(crate) start_time: Instant,
     /// Broadcast channel for commit notifications.
     pub(crate) commit_tx: tokio::sync::broadcast::Sender<Arc<notifications::CommitNotification>>,
+    /// The CDC runtime that delivers [`Self::commit_tx`]'s notifications to
+    /// CDC outputs. `Some` only on the primary inner: a derived (fork /
+    /// snapshot) inner has its own `commit_tx`, which no CDC runtime reads.
+    /// Bulk loads open their chunked mutation streams on it.
+    pub(crate) cdc_runtime: Option<Arc<crate::cdc_runtime::CdcRuntime>>,
     /// Write lease configuration for multi-agent access.
     pub(crate) write_lease: Option<multi_agent::WriteLease>,
     /// Host plugin trust policy — signature enforcement + trust root.
@@ -507,6 +513,9 @@ impl UniInner {
                     track_task_with_scratch_claim(&shutdown, scratch.as_ref(), handle);
                 })
             }),
+            // Weak, like `rebuild_manager`: the backend must not keep the
+            // database alive.
+            events: Some(Arc::new(bulk_events::DbBulkEventSink::new(self))),
         }
     }
 
@@ -563,6 +572,8 @@ impl UniInner {
             locy_rule_persister: None,
             start_time: Instant::now(),
             commit_tx,
+            // No CDC runtime reads a derived inner's `commit_tx`.
+            cdc_runtime: None,
             write_lease: None,
             plugin_trust: self.plugin_trust.clone(),
             active_session_count: AtomicUsize::new(0),
@@ -2629,7 +2640,7 @@ impl UniBuilder {
         // FU-4: spawn the CDC runtime. Snapshots registered CDC
         // providers, resumes each from its last persisted LSN, and
         // forwards every commit notification as a `CdcBatch`.
-        let _cdc_runtime = crate::cdc_runtime::CdcRuntime::spawn(
+        let cdc_runtime = crate::cdc_runtime::CdcRuntime::spawn(
             &plugin_registry,
             commit_tx.subscribe(),
             persistence_data_path.clone(),
@@ -2777,6 +2788,7 @@ impl UniBuilder {
                 locy_rule_persister: Some(locy_rule_persister),
                 start_time: Instant::now(),
                 commit_tx,
+                cdc_runtime: Some(cdc_runtime),
                 write_lease: self.write_lease,
                 plugin_trust: self.plugin_trust,
                 active_session_count: AtomicUsize::new(0),

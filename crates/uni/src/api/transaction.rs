@@ -486,7 +486,9 @@ impl Transaction {
         // before, so a write run through `tx.query` bypassed the `AuthzPolicy`
         // chain. Authorize here with a read-aware verb (a pure read must not be
         // mis-classified as a write). Gated on a registered policy so the common
-        // no-policy path skips the extra parse.
+        // no-policy path skips the extra parse. This is the only check on the
+        // `tx.query` / `tx.execute` path: `execute_inner` delegates here and must
+        // not authorize again, or a policy sees every statement twice.
         if !self.db.plugin_registry.authz_policies().is_empty() {
             self.authorize(cypher, self.authz_verb(cypher))?;
         }
@@ -504,10 +506,6 @@ impl Transaction {
                  concurrent writers are not serialized — enable SSI or guard the RMW externally"
             );
         }
-        // FU-1: thread the transaction's principal into the executor
-        // scope so procedure capability gates (e.g. ProcedureWrites
-        // for `declareProcedure WRITE`) see the authenticated user.
-        let principal = self.principal.clone();
         let fut = self.db.execute_internal_with_tx_l0(
             cypher,
             HashMap::new(),
@@ -517,7 +515,35 @@ impl Transaction {
             self.cancel_scope(None),
             None,
         );
-        uni_query::maybe_scope_with_principal(principal, fut).await
+        self.with_principal_scope(fut).await
+    }
+
+    /// Run `fut` with this transaction's principal installed as the
+    /// `CURRENT_PRINCIPAL` task-local.
+    ///
+    /// Procedure capability gates (e.g. `ProcedureWrites` for
+    /// `declareProcedure WRITE`) read the principal from that task-local, not
+    /// from the transaction, so every Cypher entry point that executes must run
+    /// inside this scope or a procedure it calls sees no principal.
+    pub(crate) async fn with_principal_scope<F: std::future::Future>(&self, fut: F) -> F::Output {
+        uni_query::maybe_scope_with_principal(self.principal.clone(), fut).await
+    }
+
+    /// Run `fut` — a Locy evaluation — with this transaction's principal and
+    /// the instance plugin registry installed as task-locals.
+    ///
+    /// Mirrors `LocyBuilder::run` on the session path: the principal reaches
+    /// procedure capability gates for a `CALL` in a Cypher command or rule body,
+    /// and the registry lets the in-memory Locy dispatch resolve registered
+    /// plugins. A transaction has no session-scoped registry, so the instance
+    /// one is scoped, as the session Locy path does.
+    pub(crate) async fn with_locy_scope<F: std::future::Future>(&self, fut: F) -> F::Output {
+        uni_query::scoped_with_session_context(
+            Arc::clone(&self.db.plugin_registry),
+            self.principal.clone(),
+            fut,
+        )
+        .await
     }
 
     /// Acquires `FOR UPDATE` pessimistic row locks for the matched keyed nodes,
@@ -636,9 +662,11 @@ impl Transaction {
     /// Inner body of [`Self::execute`]; [`Self::execute`] wraps its result in
     /// `mark_on_err` so any failure (authorization or statement execution)
     /// poisons the transaction (bug #15).
+    ///
+    /// Authorization happens once, in [`Self::query_inner`]. This body used to
+    /// authorize as well, so a policy saw every `tx.execute` statement twice.
     async fn execute_inner(&self, cypher: &str) -> Result<ExecuteResult> {
         self.check_completed()?;
-        self.authorize(cypher, self.write_verb(cypher))?;
         let before = self.snapshot_l0();
         let result = self.query_inner(cypher).await?;
         let after = self.snapshot_l0();
@@ -654,8 +682,10 @@ impl Transaction {
         crate::api::session::authorize_query(&self.db, self.principal.as_deref(), cypher, verb)
     }
 
-    /// Classify the authorization verb for a statement executed via
-    /// [`Self::query_inner`].
+    /// Classify the authorization verb for a statement run in this
+    /// transaction — by [`Self::query_inner`], the parameterized builders and
+    /// prepared statements alike, so one statement gets one verb whichever
+    /// entry point runs it.
     ///
     /// A statement with no write/schema/dbms clause authorizes under `"read"`;
     /// otherwise it uses [`statement_verb`]. Mirrors `Session::run`'s read-only
@@ -707,7 +737,7 @@ impl Transaction {
     /// Returns an authorization error, or [`UniError::LockTimeout`] if a
     /// `FOR UPDATE` lock cannot be acquired.
     async fn run_exec_guards(&self, cypher: &str, params: &HashMap<String, Value>) -> Result<()> {
-        self.authorize(cypher, self.write_verb(cypher))?;
+        self.authorize(cypher, self.authz_verb(cypher))?;
         if self.db.config.ssi_enabled {
             self.acquire_for_update_locks(cypher, params).await?;
         } else if cypher.to_ascii_lowercase().contains("for update") {
@@ -1069,11 +1099,29 @@ impl Transaction {
 
     // ── Bulk Writer / Appender ────────────────────────────────────────
 
-    /// Create a bulk writer builder for efficient data loading within this transaction.
+    /// Create a bulk writer builder for efficient data loading, created from
+    /// this transaction.
     ///
     /// The bulk writer writes directly to storage (bypassing the L0 buffer).
     /// The Transaction's write guard ensures mutual exclusion — the BulkWriter
     /// does not manage the guard itself.
+    ///
+    /// The load is not part of this transaction. `BulkWriter::commit` commits
+    /// it on its own: every other session sees it from then on, before this
+    /// transaction commits, and rolling this transaction back does not undo
+    /// it. This transaction's own reads do not see the load at all, before or
+    /// after `BulkWriter::commit`; they read the snapshot the transaction
+    /// started from plus its own Cypher writes. Use `BulkWriter::abort` to
+    /// discard a load.
+    ///
+    /// Once visible, the load is announced as one commit notification and its
+    /// rows reach after-phase triggers and CDC as `NODE_CREATE` /
+    /// `EDGE_CREATE` events, read back from storage in chunks of at most
+    /// `uni_bulk::BULK_EVENT_CHUNK_ROWS`. A load that a synchronous
+    /// before-trigger would see is refused with
+    /// `UniError::BulkLoadBlockedByTrigger` unless the builder opts in with
+    /// `skip_before_triggers(true)`: such a trigger cannot veto a load that is
+    /// already visible.
     pub fn bulk_writer(&self) -> crate::api::bulk::BulkWriterBuilder {
         crate::api::bulk::BulkWriterBuilder::new_unguarded(self.db.bulk_backend())
     }
@@ -1081,7 +1129,9 @@ impl Transaction {
     /// Create a streaming appender for row-by-row data loading within this transaction.
     ///
     /// The appender writes directly to storage (bypassing the L0 buffer).
-    /// The Transaction's write guard ensures mutual exclusion.
+    /// The Transaction's write guard ensures mutual exclusion. Like
+    /// [`Self::bulk_writer`], `finish()` commits the load on its own, outside
+    /// this transaction, and emits the same trigger and CDC events.
     pub fn appender(&self, label: &str) -> crate::api::appender::AppenderBuilder {
         crate::api::appender::AppenderBuilder::new_from_tx(self.db.bulk_backend(), label)
     }
@@ -1109,7 +1159,7 @@ impl Transaction {
             max_memory: None,
             principal: self.principal.clone(),
         };
-        engine.evaluate(program).await
+        self.with_locy_scope(engine.evaluate(program)).await
     }
 
     /// Evaluate a Locy program with parameters using a builder.
@@ -1139,7 +1189,7 @@ impl Transaction {
             self.principal.clone(),
             self.hooks.clone(),
             self.session_id.clone(),
-            self.write_verb(cypher).to_string(),
+            self.authz_verb(cypher).to_string(),
         );
         crate::api::prepared::PreparedQuery::new_tx_bound(
             self.db.clone(),
@@ -1426,8 +1476,20 @@ impl Transaction {
         // `CommitTimeout` for a transaction that is already durable and visible,
         // which a retry would double-apply. The writer surfaces `CommitTimeout`
         // with an empty `tx_id` on a lock-acquisition timeout; we fill it in.
-        let (wal_lsn, _flush_pending) = writer_lock
-            .commit_transaction_l0_with_lock_timeout(
+        //
+        // The commit's version and its place in the announcement order are
+        // fixed under the writer's lock, as it becomes visible. Both used to be
+        // decided after the lock was released: the version was re-read from
+        // the live buffer (so a commit landing in between lent this one its
+        // version) and the notification was sent directly (so it could
+        // overtake an earlier commit's, regressing CDC's LSN sequence).
+        let uni_store::runtime::writer::CommittedTx {
+            wal_lsn,
+            flush_pending: _flush_pending,
+            version,
+            ticket: announce_ticket,
+        } = writer_lock
+            .commit_transaction_l0_sequenced(
                 self.tx_l0.clone(),
                 Some(self.db.config.commit_timeout),
             )
@@ -1443,6 +1505,12 @@ impl Transaction {
                 Ok(typed) => typed,
                 Err(other) => UniError::Internal(other),
             })?;
+        // Test seam: the commit is durable and visible, the writer's
+        // serialization lock is released, and its notification is not yet
+        // published. Another commit can complete in this window, which is what
+        // the commit-notification ordering tests pause here to provoke. No-op
+        // unless built with `--features failpoints`.
+        fail::fail_point!("commit::before-notify");
         // _flush_pending is true when async_flush_enabled and the coordinator
         // accepted a flush submission. Nothing to do here — the spawned stream
         // task drives the pipeline to completion independently.
@@ -1459,7 +1527,6 @@ impl Transaction {
                 .store(l0_guard.estimated_size, Ordering::Relaxed);
         }
         self.db.cached_wal_lsn.store(wal_lsn, Ordering::Relaxed);
-        let version = writer.l0_manager.get_current().read().current_version;
 
         self.completed = true;
 
@@ -1634,12 +1701,20 @@ impl Transaction {
             causal_version: self.started_at_version,
             mutations: mutations_batch,
             mutations_failed,
+            // Only a bulk load streams its rows; a commit carries them above.
+            mutation_stream: None,
             // Always 0 at the producer. Lag is a per-consumer property — one
             // `CommitStream` may fall behind while another keeps up — so the
             // count is attached by the stream on delivery, not broadcast.
             dropped_before: 0,
         };
-        let _ = self.db.commit_tx.send(Arc::new(notif));
+        // Released in commit order: held, without blocking, until every
+        // earlier commit's notification has gone out (see `PublishSequencer`).
+        let commit_tx = self.db.commit_tx.clone();
+        let notif = Arc::new(notif);
+        announce_ticket.publish(move || {
+            let _ = commit_tx.send(notif);
+        });
 
         // Run after-commit hooks (infallible — panics caught and logged)
         if !self.hooks.is_empty() {
@@ -1829,7 +1904,9 @@ impl Transaction {
             cancel,
             None,
         );
-        let result = with_optional_timeout(timeout, fut).await?;
+        let result = self
+            .with_principal_scope(with_optional_timeout(timeout, fut))
+            .await?;
         let after = self.snapshot_l0();
         Ok(Self::compute_execute_result(&before, &after, &result))
     }
@@ -2027,7 +2104,10 @@ impl<'a> ExecuteBuilder<'a> {
             self.tx.read_snapshot(),
             None,
         );
-        let (result, profile) = with_optional_timeout(self.timeout, fut).await?;
+        let (result, profile) = self
+            .tx
+            .with_principal_scope(with_optional_timeout(self.timeout, fut))
+            .await?;
         let after = self.tx.snapshot_l0();
         Ok((
             Transaction::compute_execute_result(&before, &after, &result),
@@ -2129,7 +2209,9 @@ impl<'a> TxQueryBuilder<'a> {
             self.tx.read_snapshot(),
             self.max_memory,
         );
-        with_optional_timeout(self.timeout, fut).await
+        self.tx
+            .with_principal_scope(with_optional_timeout(self.timeout, fut))
+            .await
     }
 
     /// Inner body of [`Self::fetch_all`]; the public method wraps the result in
@@ -2147,7 +2229,9 @@ impl<'a> TxQueryBuilder<'a> {
             cancel,
             self.max_memory,
         );
-        with_optional_timeout(self.timeout, fut).await
+        self.tx
+            .with_principal_scope(with_optional_timeout(self.timeout, fut))
+            .await
     }
 
     /// Execute the query and return the first row, or `None` if empty.
@@ -2183,16 +2267,17 @@ impl<'a> TxQueryBuilder<'a> {
             config.max_query_memory = m;
         }
 
-        self.tx
-            .db
-            .execute_cursor_internal_with_tx_l0(
-                &self.cypher,
-                self.params,
-                self.tx.tx_l0.clone(),
-                config,
-                self.tx.cancel_scope(self.cancellation_token),
-            )
-            .await
+        // Built inside the principal scope: the cursor captures the scope it
+        // was built in and re-installs it around every poll, since the stream
+        // executes after this call returns.
+        let fut = self.tx.db.execute_cursor_internal_with_tx_l0(
+            &self.cypher,
+            self.params,
+            self.tx.tx_l0.clone(),
+            config,
+            self.tx.cancel_scope(self.cancellation_token),
+        );
+        self.tx.with_principal_scope(fut).await
     }
 }
 

@@ -1330,12 +1330,17 @@ impl StorageManager {
     /// Widen storage so newly declared properties on `entity` have a column
     /// everywhere they will be written **or read** (issue #249).
     ///
-    /// Call this *before* persisting the catalog. The asymmetry decides the
-    /// order: a Lance column absent from the catalog is invisible and
-    /// harmless, while a catalog column absent from Lance is a hard read
-    /// failure. There is no WAL record for schema DDL, so ordering is the only
-    /// recovery lever — and since the widening is idempotent, re-running a
-    /// half-applied DDL converges.
+    /// Call this *before* the property enters the live catalog, not merely
+    /// before this caller saves it. The asymmetry decides the order: a Lance
+    /// column absent from the catalog is invisible and harmless, while a
+    /// catalog column absent from Lance is a hard read failure. There is no WAL
+    /// record for schema DDL, so ordering is the only recovery lever — and any
+    /// commit saves a dirty catalog (`save_if_dirty`), so a property declared
+    /// in memory first could reach disk ahead of its column, and a crash before
+    /// the widening finished left the entity unreadable. Each property comes
+    /// with its declared type for that reason: the catalog does not hold it
+    /// yet. The widening is idempotent, so re-running a half-applied DDL
+    /// converges.
     ///
     /// Primary is widened first, so any fork branch cut *after* this point
     /// inherits the column from primary's current version and needs nothing.
@@ -1347,15 +1352,23 @@ impl StorageManager {
     pub async fn widen_for_declared_properties(
         &self,
         entity: &str,
-        fields: &[arrow_schema::Field],
+        properties: &[(String, uni_common::DataType)],
     ) -> anyhow::Result<()> {
-        if fields.is_empty() {
+        // Test-only seam (no-op without `fail/failpoints`): a DDL is about to
+        // widen storage, so the property must not be in the live catalog yet.
+        fail::fail_point!("storage::widen-declared-properties");
+        if properties.is_empty() {
             return Ok(());
         }
         let tables = self.property_tables_for(entity);
         if tables.is_empty() {
             return Ok(());
         }
+        let fields: Vec<arrow_schema::Field> = properties
+            .iter()
+            .map(|(name, ty)| arrow_schema::Field::new(name, ty.to_arrow(), true))
+            .collect();
+        let fields = fields.as_slice();
 
         let backend = self.backend();
         for table in &tables {
@@ -1375,22 +1388,10 @@ impl StorageManager {
         // copy-on-write sharing and corrupting anything that computes a fork's
         // own delta.
         if self.fork_scope().is_none() {
-            let schema = self.schema_manager().schema();
-            for field in fields {
-                let Some(declared) = schema
-                    .properties
-                    .get(entity)
-                    .and_then(|p| p.get(field.name()))
-                    .map(|m| m.r#type.clone())
-                else {
-                    continue;
-                };
+            for (name, declared) in properties {
                 for table in &tables {
                     crate::storage::schema_evolution::backfill_property_from_overflow(
-                        backend,
-                        table,
-                        field.name(),
-                        &declared,
+                        backend, table, name, declared,
                     )
                     .await?;
                 }
@@ -1483,8 +1484,9 @@ impl StorageManager {
     ///
     /// Used by the SCAN tier (vertex tables, property reads) to filter data
     /// by version: when set, only rows with
-    /// `_version <= version_high_water_mark` are visible. The edge/adjacency
-    /// path must use [`Self::snapshot_version_hwm`] instead.
+    /// `_version <= version_high_water_mark` are visible. Adjacency reads are
+    /// bounded by it too, through [`Self::edge_visibility`]; adjacency
+    /// WARMING must use [`Self::snapshot_version_hwm`] instead.
     pub fn version_high_water_mark(&self) -> Option<u64> {
         self.pinned_snapshot
             .as_ref()
@@ -1496,11 +1498,11 @@ impl StorageManager {
     /// `edge_tier` an edge type's deltas in one direction).
     ///
     /// The guard's [`CompactionMerge::floor`] is the oldest version an
-    /// in-flight pinned reader reads at (a transaction's L1 pin, or a session
-    /// pinned to a snapshot read from the live tables; only the latter for
-    /// edge deltas, since a transaction reads the live adjacency): the merge
-    /// must merge no row and fold no delta above it, so each such reader
-    /// still finds its rows. Before the merge writes, [`CompactionMerge::record`] persists the
+    /// in-flight pinned reader reads at (a transaction's pin, or a session
+    /// pinned to a snapshot read from the live tables; for edge deltas a
+    /// transaction's edge pin, which sits below any bulk load it excludes):
+    /// the merge must merge no row and fold no delta above it, so each such
+    /// reader still finds its rows. Before the merge writes, [`CompactionMerge::record`] persists the
     /// version below which it loses history; a session pinned below that
     /// afterwards is refused ([`Self::history_is_whole`]).
     pub fn begin_compaction_merge(&self, edge_tier: bool) -> CompactionMerge {

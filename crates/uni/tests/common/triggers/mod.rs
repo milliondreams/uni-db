@@ -1,3 +1,6 @@
+pub mod bulk_events;
+pub mod commit_order_resilience;
+pub mod event_support;
 pub mod trigger_declared;
 pub mod trigger_defer;
 pub mod trigger_dispatch;

@@ -26,9 +26,9 @@ type Shard = HashMap<Vid, Vec<String>>;
 ///
 /// Copy-on-write by shard: every transaction and fork takes its own copy of
 /// the index when it begins, so a clone must not cost a pass over every
-/// vertex. A clone shares each shard (one `Arc` per [`SHARD_BITS`]-sized block
-/// of VIDs); a write copies only the shard it touches, and only while some
-/// clone still shares it.
+/// vertex. A clone shares each shard (one `Arc` per block of
+/// `1 << SHARD_BITS` VIDs); a write copies only the shard it touches, and only
+/// while some clone still shares it.
 #[derive(Debug, Clone, Default)]
 pub struct VidLabelsIndex {
     /// VID to labels, by shard.

@@ -636,6 +636,40 @@ impl TriggerRouter {
             .collect()
     }
 
+    /// The name of a synchronous `BeforeMutation` / `BeforeCommit` trigger
+    /// that would receive a `kind` event row under `label_or_type`, if any.
+    ///
+    /// For a write that becomes visible without passing through
+    /// [`Self::dispatch_before`] (a bulk load), which therefore cannot honour
+    /// such a trigger. Selection only: a trigger's `predicate_source` cannot be
+    /// evaluated without the rows, so a predicated trigger counts as matching.
+    /// `Async` / `EventualConsistency` before-triggers never run in a before
+    /// phase (see [`Self::dispatch_before`]) and are not reported.
+    #[must_use]
+    pub fn synchronous_before_trigger_for(
+        &self,
+        kind: TriggerEventMask,
+        label_or_type: &str,
+    ) -> Option<&str> {
+        [TriggerPhase::BeforeMutation, TriggerPhase::BeforeCommit]
+            .iter()
+            .flat_map(|&phase| &self.by_phase[phase_index(phase)])
+            .find(|entry| {
+                matches!(entry.fire_mode, FireMode::Synchronous)
+                    && entry.matches(kind, label_or_type)
+            })
+            .map(|entry| entry.name.as_str())
+    }
+
+    /// True if some trigger is registered in an after phase
+    /// (`AfterMutation` / `AfterCommit`), whatever it selects.
+    #[must_use]
+    pub fn has_after_triggers(&self) -> bool {
+        [TriggerPhase::AfterMutation, TriggerPhase::AfterCommit]
+            .iter()
+            .any(|&phase| !self.by_phase[phase_index(phase)].is_empty())
+    }
+
     /// Fire `BeforeMutation` then `BeforeCommit` phases in order.
     ///
     /// Returns `Err(UniError::TriggerRejected)` if a `Synchronous`
@@ -978,6 +1012,29 @@ fn subscription_name(sub: &TriggerSubscription) -> String {
 /// across the commit boundary and filtered per-route on dispatch.
 pub struct MutationEvents {
     rows: Vec<MutationRow>,
+}
+
+/// A vertex for [`MutationEvents::creates`].
+#[derive(Debug, Clone)]
+pub struct CreatedVertex {
+    /// The vertex id.
+    pub vid: uni_common::Vid,
+    /// Its labels; one event row is emitted per label.
+    pub labels: Vec<String>,
+    /// Its properties, when they were read (only needed when some trigger
+    /// predicate references a property).
+    pub properties: Option<Properties>,
+}
+
+/// An edge for [`MutationEvents::creates`].
+#[derive(Debug, Clone)]
+pub struct CreatedEdge {
+    /// The edge id.
+    pub eid: uni_common::Eid,
+    /// Its edge type name.
+    pub edge_type: String,
+    /// Its properties, when they were read; see [`CreatedVertex::properties`].
+    pub properties: Option<Properties>,
 }
 
 struct MutationRow {
@@ -1809,6 +1866,81 @@ impl MutationEvents {
         }
 
         Self { rows }
+    }
+
+    /// Create events for entities written without a transaction buffer (a
+    /// bulk load): one `NODE_CREATE` row per vertex and label (one row with an
+    /// empty label for an unlabelled vertex, as [`Self::from_l0_with_probe`]
+    /// does), one `EDGE_CREATE` row per edge.
+    ///
+    /// A create has no pre-image, so `old_value` and `properties_old` are
+    /// null. `properties_new` carries the values of `properties_referenced`
+    /// (the keys some trigger predicate reads) and is null when that set is
+    /// empty; an entity whose properties were not read (`None`) gets an empty
+    /// map then.
+    #[must_use]
+    pub fn creates(
+        vertices: impl IntoIterator<Item = CreatedVertex>,
+        edges: impl IntoIterator<Item = CreatedEdge>,
+        properties_referenced: &HashSet<String>,
+    ) -> Self {
+        let filtered = |props: Option<&Properties>| -> Option<Properties> {
+            if properties_referenced.is_empty() {
+                return None;
+            }
+            let mut out = Properties::new();
+            if let Some(props) = props {
+                for k in properties_referenced {
+                    if let Some(v) = props.get(k) {
+                        out.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            Some(out)
+        };
+        let mut rows = Vec::new();
+        for v in vertices {
+            let new_properties = filtered(v.properties.as_ref());
+            let id = vid_to_i64(v.vid);
+            let labels = if v.labels.is_empty() {
+                vec![String::new()]
+            } else {
+                v.labels
+            };
+            for label in labels {
+                rows.push(MutationRow {
+                    event_kind: TriggerEventMask::NODE_CREATE,
+                    vid_or_eid: id,
+                    label_or_type: label,
+                    old_value: None,
+                    new_properties: new_properties.clone(),
+                    old_properties: None,
+                });
+            }
+        }
+        for e in edges {
+            rows.push(MutationRow {
+                event_kind: TriggerEventMask::EDGE_CREATE,
+                vid_or_eid: eid_to_i64(e.eid),
+                new_properties: filtered(e.properties.as_ref()),
+                label_or_type: e.edge_type,
+                old_value: None,
+                old_properties: None,
+            });
+        }
+        Self { rows }
+    }
+
+    /// Number of event rows.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// True when there are no event rows.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
     }
 
     /// Project every captured row into the canonical [`event_row_schema`]
@@ -2929,6 +3061,136 @@ mod tests {
             ec_queue: EcQueue::new(None, Duration::from_secs(1), 10_000),
             task_tracker: None,
         }
+    }
+
+    /// A route of `mask` on `labels` in `phase` with `mode`.
+    fn router_in(
+        phase: usize,
+        mode: FireMode,
+        mask: TriggerEventMask,
+        labels: Option<&[&str]>,
+    ) -> TriggerRouter {
+        let mut router = router_with(mask, labels);
+        let mut route = router.by_phase[0].pop().unwrap();
+        route.fire_mode = mode;
+        router.by_phase[phase].push(route);
+        router
+    }
+
+    /// Only a synchronous before-route that selects the row is reported.
+    #[test]
+    fn synchronous_before_trigger_selection() {
+        let sync = FireMode::Synchronous;
+        let r = router_in(2, sync, TriggerEventMask::NODE_CREATE, Some(&["A"]));
+        assert_eq!(
+            r.synchronous_before_trigger_for(TriggerEventMask::NODE_CREATE, "A"),
+            Some("probe-gate")
+        );
+        assert_eq!(
+            r.synchronous_before_trigger_for(TriggerEventMask::NODE_CREATE, "B"),
+            None
+        );
+        assert_eq!(
+            r.synchronous_before_trigger_for(TriggerEventMask::EDGE_CREATE, "A"),
+            None
+        );
+        assert!(!r.has_after_triggers());
+        let mutation = router_in(0, sync, TriggerEventMask::EDGE_CREATE, None);
+        assert!(
+            mutation
+                .synchronous_before_trigger_for(TriggerEventMask::EDGE_CREATE, "R")
+                .is_some()
+        );
+        let async_before = router_in(2, FireMode::Async, TriggerEventMask::NODE_CREATE, None);
+        assert_eq!(
+            async_before.synchronous_before_trigger_for(TriggerEventMask::NODE_CREATE, "A"),
+            None,
+            "an async before-trigger never runs before commit"
+        );
+        let after = router_in(3, sync, TriggerEventMask::NODE_CREATE, None);
+        assert_eq!(
+            after.synchronous_before_trigger_for(TriggerEventMask::NODE_CREATE, "A"),
+            None
+        );
+        assert!(after.has_after_triggers());
+    }
+
+    /// `creates` emits one create row per vertex label and per edge, with the
+    /// referenced properties only.
+    #[test]
+    fn creates_emits_create_rows() {
+        let props: Properties = [
+            ("x".to_owned(), Value::Int(1)),
+            ("y".to_owned(), Value::Int(2)),
+        ]
+        .into_iter()
+        .collect();
+        let events = MutationEvents::creates(
+            [
+                CreatedVertex {
+                    vid: uni_common::Vid::new(1),
+                    labels: vec!["A".into(), "B".into()],
+                    properties: Some(props.clone()),
+                },
+                CreatedVertex {
+                    vid: uni_common::Vid::new(2),
+                    labels: Vec::new(),
+                    properties: None,
+                },
+            ],
+            [CreatedEdge {
+                eid: uni_common::Eid::new(9),
+                edge_type: "R".into(),
+                properties: Some(props),
+            }],
+            &HashSet::from(["x".to_owned()]),
+        );
+        assert_eq!(events.len(), 4);
+        let batch = events.materialize_all().unwrap().unwrap();
+        let kinds = batch
+            .column_by_name("event_kind")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt8Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+        assert_eq!(kinds, [1, 1, 1, 4]);
+        let labels = batch
+            .column_by_name("label")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap()
+            .iter()
+            .map(|l| l.unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, ["A", "B", "", "R"]);
+        let news = batch
+            .column_by_name("properties_new")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap();
+        let decoded = cypher_value_codec::decode(news.value(0)).unwrap();
+        assert_eq!(
+            decoded,
+            Value::Map([("x".to_owned(), Value::Int(1))].into_iter().collect())
+        );
+        assert!(news.is_valid(2), "an unread vertex gets an empty bag");
+        let none = MutationEvents::creates(
+            [CreatedVertex {
+                vid: uni_common::Vid::new(1),
+                labels: vec!["A".into()],
+                properties: None,
+            }],
+            [],
+            &HashSet::new(),
+        )
+        .materialize_all()
+        .unwrap()
+        .unwrap();
+        assert!(none.column_by_name("properties_new").unwrap().is_null(0));
     }
 
     /// The vertex pre-image gate asks the routes exactly what a node event

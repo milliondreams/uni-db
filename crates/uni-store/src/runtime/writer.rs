@@ -337,6 +337,23 @@ impl Default for WriterConfig {
     }
 }
 
+/// A committed transaction, as [`Writer::commit_transaction_l0_sequenced`]
+/// returns it.
+#[derive(Debug)]
+pub struct CommittedTx {
+    /// WAL LSN of the commit (`0` when no WAL is configured).
+    pub wal_lsn: u64,
+    /// The post-commit flush trigger fired and a background flush was
+    /// submitted (async-flush mode only).
+    pub flush_pending: bool,
+    /// The database version this commit's last mutation landed at, read under
+    /// `flush_lock` as the commit became visible.
+    pub version: u64,
+    /// This commit's place in the announcement order. Publish its commit
+    /// notification through it; dropping it gives the place up.
+    pub ticket: crate::runtime::publish_sequencer::PublishTicket,
+}
+
 /// Parent state captured atomically at a fork point under `flush_lock`.
 ///
 /// Holds the allocator high-water marks and every existing dataset's
@@ -523,6 +540,10 @@ pub struct Writer {
     ///
     /// Always allocated; consulted only when `config.ssi_enabled` is `true`.
     committed_writes: Arc<PlMutex<crate::runtime::occ::CommitRegistry>>,
+    /// Orders commit announcements by commit order. Tickets are issued under
+    /// `flush_lock` (see [`Writer::commit_transaction_l0_sequenced`] and
+    /// [`Writer::sequence_announcement`]).
+    publish_sequencer: Arc<crate::runtime::publish_sequencer::PublishSequencer>,
     /// Per-row pessimistic locks for `FOR UPDATE` (SSI escape hatch), keyed by
     /// canonical (label, key-props) bytes. A transaction holds the lock from
     /// MATCH until commit/rollback, serializing concurrent `FOR UPDATE` writers
@@ -823,6 +844,7 @@ impl Writer {
             flush_coordinator,
             commit_sequence,
             committed_writes,
+            publish_sequencer: crate::runtime::publish_sequencer::PublishSequencer::new(),
             for_update_locks,
             throttle_stats: Arc::new(WriteThrottleStats::default()),
             restore_epoch: std::sync::atomic::AtomicU64::new(0),
@@ -1576,6 +1598,32 @@ impl Writer {
         tx_l0_arc: Arc<RwLock<L0Buffer>>,
         lock_timeout: Option<std::time::Duration>,
     ) -> Result<(u64, bool)> {
+        // The ticket is dropped unpublished: this caller announces nothing,
+        // and the drop releases its place in the announcement order.
+        let committed = self
+            .commit_transaction_l0_sequenced(tx_l0_arc, lock_timeout)
+            .await?;
+        Ok((committed.wal_lsn, committed.flush_pending))
+    }
+
+    /// Like [`Self::commit_transaction_l0_with_lock_timeout`], and also
+    /// returns the commit's own version and its place in the announcement
+    /// order.
+    ///
+    /// Both are fixed under `flush_lock`, at the point the commit becomes
+    /// visible. A caller that announces commits must take them from here:
+    /// once the lock is released another commit can land, so the version read
+    /// afterwards may be that commit's, and an announcement sent directly may
+    /// overtake an earlier commit's. Publish the announcement through
+    /// [`CommittedTx::ticket`] to keep commit order.
+    ///
+    /// # Errors
+    /// As [`Self::commit_transaction_l0_with_lock_timeout`].
+    pub async fn commit_transaction_l0_sequenced(
+        self: &Arc<Self>,
+        tx_l0_arc: Arc<RwLock<L0Buffer>>,
+        lock_timeout: Option<std::time::Duration>,
+    ) -> Result<CommittedTx> {
         // Hold `flush_lock` across WAL append + flush + main-L0 merge.
         // Two concurrent commits serialize here; in Phase 3 the outer
         // `Arc<RwLock<Writer>>` already provides this exclusion, so the
@@ -1912,7 +1960,7 @@ impl Writer {
         }
 
         // 3. Merge into main L0 and make visible
-        {
+        let version = {
             // Write-lock the tx buffer: `merge_take` moves its property maps
             // into main L0 instead of cloning them. The commit consumes the
             // transaction, so the drained maps are never observed afterwards;
@@ -1939,7 +1987,13 @@ impl Writer {
 
             // Replay transaction edges into the AdjacencyManager overlay.
             self.mirror_edges_into_adjacency(&tx_l0, &main_l0, main_l0.current_version);
-        }
+            // This commit's version: read under the buffer's write lock, so no
+            // other commit (or bulk-version reservation) interleaves.
+            main_l0.current_version
+        };
+        // Commit order is fixed here, under `flush_lock`: the announcement
+        // order follows it whatever the post-commit work does.
+        let ticket = self.publish_sequencer.issue();
 
         // Crash-recovery seam: durable AND merged, but the in-memory commit
         // registry has not recorded this write-set yet. A crash here is
@@ -2034,7 +2088,12 @@ impl Writer {
                                     );
                                     flush_pending = true;
                                     // Early return — flush_lock already dropped.
-                                    return Ok((wal_lsn, flush_pending));
+                                    return Ok(CommittedTx {
+                                        wal_lsn,
+                                        flush_pending,
+                                        version,
+                                        ticket,
+                                    });
                                 }
                                 Err(e) => {
                                     tracing::warn!("Async rotate failed (non-critical): {}", e);
@@ -2062,7 +2121,29 @@ impl Writer {
             }
         }
 
-        Ok((wal_lsn, flush_pending))
+        Ok(CommittedTx {
+            wal_lsn,
+            flush_pending,
+            version,
+            ticket,
+        })
+    }
+
+    /// Take a place in the commit announcement order for a write that became
+    /// visible outside [`Self::commit_transaction_l0_sequenced`] (a bulk
+    /// load), with the database version current at that point.
+    ///
+    /// Taken under `flush_lock`, as a commit's is, so the announcement it
+    /// publishes is ordered after every commit already visible and before
+    /// every later one, and the returned version is at least every such
+    /// earlier commit's version (it may equal the latest of them: no version
+    /// is consumed).
+    pub async fn sequence_announcement(
+        &self,
+    ) -> (crate::runtime::publish_sequencer::PublishTicket, u64) {
+        let _flush_lock_guard = self.flush_lock.lock().await;
+        let version = self.l0_manager.get_current().read().current_version;
+        (self.publish_sequencer.issue(), version)
     }
 
     /// Flush the WAL buffer to durable storage.

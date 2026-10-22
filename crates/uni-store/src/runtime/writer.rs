@@ -973,11 +973,22 @@ impl Writer {
     /// buffers directly). That asymmetry is issues #281 and #282 — WAL recovery
     /// was the writer that forgot.
     ///
+    /// Each edge is stamped with its version in `versions`, the buffer the
+    /// edges landed in. A commit passes main L0, which restamps every merged
+    /// edge with the version it committed at; the transaction buffer's own
+    /// versions count up from the version the transaction began at, so they
+    /// would place a late commit inside the snapshot of every transaction
+    /// that began after its writer did, for a pinned reader to see.
     /// `fallback_version` is used for edges with no recorded version; callers
     /// pass the current version of the buffer the edges are landing in.
-    fn mirror_edges_into_adjacency(&self, source: &L0Buffer, fallback_version: u64) {
+    fn mirror_edges_into_adjacency(
+        &self,
+        source: &L0Buffer,
+        versions: &L0Buffer,
+        fallback_version: u64,
+    ) {
         for (eid, (src, dst, etype)) in &source.edge_endpoints {
-            let edge_version = source
+            let edge_version = versions
                 .edge_versions
                 .get(eid)
                 .copied()
@@ -996,7 +1007,7 @@ impl Writer {
         // endpoints on the tombstone itself for exactly this case.
         for (eid, tombstone) in &source.tombstones {
             if !source.edge_endpoints.contains_key(eid) {
-                let edge_version = source
+                let edge_version = versions
                     .edge_versions
                     .get(eid)
                     .copied()
@@ -1063,7 +1074,7 @@ impl Writer {
                 // handle replaying another handle's committed-but-unflushed WAL,
                 // returns every committed vertex and none of the committed edges.
                 let fallback_version = l0_guard.current_version;
-                self.mirror_edges_into_adjacency(&l0_guard, fallback_version);
+                self.mirror_edges_into_adjacency(&l0_guard, &l0_guard, fallback_version);
             }
 
             Ok(count)
@@ -1927,7 +1938,7 @@ impl Writer {
             self.mirror_cascaded_tombstones(&cascaded, &main_l0);
 
             // Replay transaction edges into the AdjacencyManager overlay.
-            self.mirror_edges_into_adjacency(&tx_l0, main_l0.current_version);
+            self.mirror_edges_into_adjacency(&tx_l0, &main_l0, main_l0.current_version);
         }
 
         // Crash-recovery seam: durable AND merged, but the in-memory commit

@@ -66,6 +66,7 @@ use crate::shutdown::ShutdownHandle;
 use arrow_array::{BooleanArray, Int64Array, LargeBinaryArray, RecordBatch, UInt8Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::physical_plan::PhysicalExpr;
+use smol_str::SmolStr;
 use tokio::runtime::Handle;
 use tracing::warn;
 use uni_common::cypher_value_codec;
@@ -401,6 +402,25 @@ impl RouteEntry {
     }
 }
 
+/// Label or edge-type selectors as the bare names event rows carry.
+///
+/// A subscription may name a label the way Cypher writes it (`":Customer"`)
+/// or bare (`"Customer"`); both mean the label `Customer`. Event rows carry
+/// the bare name and [`RouteEntry::matches`] compares exactly, so a
+/// colon-prefixed selector matched nothing: the built-in audit trigger
+/// subscribed to `":_AuditMe"` and never fired. Declared triggers already
+/// strip the colon when parsing `ON :Label`; normalizing here, where every
+/// subscription becomes a route, covers subscriptions built in code too.
+fn normalize_selectors(selectors: &[SmolStr]) -> Vec<String> {
+    selectors
+        .iter()
+        .map(|s| {
+            let s = s.trim();
+            s.strip_prefix(':').unwrap_or(s).trim().to_owned()
+        })
+        .collect()
+}
+
 fn kind_is_node(kind: TriggerEventMask) -> bool {
     let mask = TriggerEventMask::NODE_CREATE
         .union(TriggerEventMask::NODE_UPDATE)
@@ -517,14 +537,8 @@ impl TriggerRouter {
                 name,
                 name_ordinal,
                 event_mask: sub.events.0,
-                label_filter: sub
-                    .labels
-                    .as_ref()
-                    .map(|v| v.iter().map(|s| s.to_string()).collect()),
-                edge_type_filter: sub
-                    .edge_types
-                    .as_ref()
-                    .map(|v| v.iter().map(|s| s.to_string()).collect()),
+                label_filter: sub.labels.as_deref().map(normalize_selectors),
+                edge_type_filter: sub.edge_types.as_deref().map(normalize_selectors),
                 property_filter: sub
                     .properties
                     .as_ref()
@@ -1665,6 +1679,50 @@ impl MutationEvents {
                         old_properties: old_props_map,
                     });
                 }
+            }
+        }
+
+        // Label changes (`SET n:L` / `REMOVE n:L`): one LABEL_ADDED or
+        // LABEL_REMOVED row per label that differs from the vertex's labels
+        // before the transaction's first relabel of it, routed under that
+        // label — so a trigger on `:Watched` sees the vertex leave `Watched`.
+        // A vertex this transaction created is reported by its NODE_CREATE
+        // rows, under its final labels, instead.
+        let mut relabeled: Vec<_> = l0.vertex_label_overwrites.iter().copied().collect();
+        relabeled.sort_unstable();
+        for vid in relabeled {
+            // The probe judges only vids with a property write (every
+            // created vertex has one); a pure relabel is of a vertex that
+            // already existed.
+            let created_here = l0.vertex_properties.contains_key(&vid)
+                && probe.is_some_and(|p| !p.vertex_pre_existed(vid));
+            if l0.vertex_tombstones.contains(&vid) || created_here {
+                continue;
+            }
+            let Some(before) = l0.vertex_labels_before.get(&vid) else {
+                continue;
+            };
+            let after = l0.vertex_labels.get(&vid).map(Vec::as_slice).unwrap_or(&[]);
+            let id = vid_to_i64(vid);
+            let changes = after
+                .iter()
+                .filter(|l| !before.contains(l))
+                .map(|l| (TriggerEventMask::LABEL_ADDED, l))
+                .chain(
+                    before
+                        .iter()
+                        .filter(|l| !after.contains(l))
+                        .map(|l| (TriggerEventMask::LABEL_REMOVED, l)),
+                );
+            for (kind, label) in changes {
+                rows.push(MutationRow {
+                    event_kind: kind,
+                    vid_or_eid: id,
+                    label_or_type: label.clone(),
+                    old_value: None,
+                    new_properties: None,
+                    old_properties: None,
+                });
             }
         }
 
@@ -2894,6 +2952,44 @@ mod tests {
             !property.wants_node_events_for(&labels(&["V"])),
             "no node row is a PROPERTY_CHANGE row"
         );
+    }
+
+    /// A selector written the Cypher way (`:Label`) names the same label as a
+    /// bare one once the registry's subscriptions become routes.
+    #[test]
+    fn colon_prefixed_selectors_match_bare_event_labels() {
+        assert_eq!(
+            normalize_selectors(&[
+                SmolStr::new(":_AuditMe"),
+                SmolStr::new("V"),
+                SmolStr::new(" :KNOWS ")
+            ]),
+            ["_AuditMe", "V", "KNOWS"]
+        );
+        let registry = uni_plugin::PluginRegistry::new();
+        let caps = uni_plugin::CapabilitySet::from_iter_of([uni_plugin::Capability::Trigger]);
+        let mut r = uni_plugin::PluginRegistrar::new(
+            uni_plugin::PluginId::new("selectors"),
+            &caps,
+            &registry,
+        );
+        r.trigger(Arc::new(DummyTrigger {
+            sub: TriggerSubscription {
+                phase: TriggerPhase::AfterMutation,
+                events: TriggerEventMask::NODE_CREATE,
+                labels: Some(vec![SmolStr::new(":_AuditMe")]),
+                edge_types: None,
+                properties: None,
+                predicate_source: None,
+                fire_mode: FireMode::Async,
+                docs: "colon selector".to_owned(),
+            },
+        }))
+        .expect("register");
+        r.commit_to_registry().expect("commit");
+        let router = TriggerRouter::from_registry(&registry).expect("router");
+        assert!(router.wants_node_events_for(&["_AuditMe".to_owned()]));
+        assert!(!router.wants_node_events_for(&["Other".to_owned()]));
     }
 
     /// A vertex the transaction created has no committed state to read.

@@ -377,6 +377,9 @@ pub struct PreparedLocy {
     /// The scope every execution runs under: the transaction's for a
     /// transaction-prepared program.
     cancel: crate::api::impl_query::CancelScope,
+    /// The principal of the session or transaction that prepared the
+    /// program; every execution is authorized for it.
+    principal: Option<Arc<uni_plugin::traits::connector::Principal>>,
     inner: std::sync::RwLock<PreparedLocyInner>,
 }
 
@@ -386,6 +389,7 @@ impl PreparedLocy {
         db: Arc<UniInner>,
         rule_registry: Arc<std::sync::RwLock<LocyRuleRegistry>>,
         program: &str,
+        principal: Option<Arc<uni_plugin::traits::connector::Principal>>,
     ) -> Result<Self> {
         Self::build(
             db,
@@ -395,6 +399,7 @@ impl PreparedLocy {
             // A session-prepared program is owned by the instance, not a
             // session, so it has no enclosing scope to inherit.
             crate::api::impl_query::CancelScope::default(),
+            principal,
         )
     }
 
@@ -406,8 +411,9 @@ impl PreparedLocy {
         program: &str,
         binding: PreparedTxBinding,
         cancel: crate::api::impl_query::CancelScope,
+        principal: Option<Arc<uni_plugin::traits::connector::Principal>>,
     ) -> Result<Self> {
-        Self::build(db, rule_registry, program, Some(binding), cancel)
+        Self::build(db, rule_registry, program, Some(binding), cancel, principal)
     }
 
     fn build(
@@ -416,6 +422,7 @@ impl PreparedLocy {
         program: &str,
         tx: Option<PreparedTxBinding>,
         cancel: crate::api::impl_query::CancelScope,
+        principal: Option<Arc<uni_plugin::traits::connector::Principal>>,
     ) -> Result<Self> {
         let (compiled, parameters) = compile_locy_with_registry(program, &rule_registry)?;
         let schema_version = db.schema.schema().schema_version;
@@ -426,6 +433,7 @@ impl PreparedLocy {
             program_text: program.to_string(),
             tx,
             cancel,
+            principal,
             inner: std::sync::RwLock::new(PreparedLocyInner {
                 compiled,
                 parameters,
@@ -501,9 +509,10 @@ impl PreparedLocy {
             // No per-call override on this path; the database
             // setting applies.
             max_memory: None,
+            principal: self.principal.clone(),
         };
         engine
-            .evaluate_compiled_with_config(compiled, &config)
+            .evaluate_compiled_with_config(compiled, &self.program_text, &config)
             .await
     }
 

@@ -150,8 +150,9 @@ pub struct Transaction {
     /// Hooks inherited from the session.
     hooks: Vec<Arc<dyn crate::api::hooks::SessionHook>>, // Flattened from session's HashMap
     /// Principal inherited from the session (if any). Drives the
-    /// M6a.3 write/schema/dbms authz consultation in `Self::execute`.
-    principal: Option<Arc<uni_plugin::traits::connector::Principal>>,
+    /// M6a.3 write/schema/dbms authz consultation in `Self::execute`, and
+    /// the authorization of the Locy programs this transaction runs.
+    pub(crate) principal: Option<Arc<uni_plugin::traits::connector::Principal>>,
     /// `FOR UPDATE` pessimistic lock guards, held from MATCH until the
     /// transaction ends (dropped on commit/rollback → locks released).
     ///
@@ -201,7 +202,7 @@ pub struct Transaction {
 /// - `CREATE USER` / `DROP USER` / `GRANT` / `REVOKE` / `SHOW
 ///   USERS` / `ALTER USER` → `"dbms"`.
 /// - Everything else routed through `Transaction::execute` → `"write"`.
-fn classify_verb(cypher: &str) -> &'static str {
+pub(crate) fn classify_verb(cypher: &str) -> &'static str {
     let s = cypher.trim_start();
     // Take up to 32 chars and uppercase for a cheap prefix match.
     //
@@ -246,13 +247,25 @@ pub(crate) fn statement_verb(
     cypher: &str,
     registered_mode: &dyn Fn(&str) -> Option<uni_plugin::traits::procedure::ProcedureMode>,
 ) -> &'static str {
-    use uni_plugin::traits::procedure::ProcedureMode;
     let strongest = uni_cypher::parse(cypher)
         .ok()
         .and_then(|ast| uni_query::strongest_procedure_mode(&ast, registered_mode));
+    procedure_verb(strongest, classify_verb(cypher))
+}
+
+/// The authorization verb for a statement that is not a pure read, given the
+/// most privileged procedure mode it calls and its [`classify_verb`] verb.
+///
+/// The core of [`statement_verb`], shared with Locy, whose Cypher commands
+/// are ASTs inside a program rather than statement text.
+pub(crate) fn procedure_verb(
+    strongest: Option<uni_plugin::traits::procedure::ProcedureMode>,
+    classified: &'static str,
+) -> &'static str {
+    use uni_plugin::traits::procedure::ProcedureMode;
     match strongest {
-        Some(ProcedureMode::Read | ProcedureMode::Write) | None => classify_verb(cypher),
-        Some(ProcedureMode::Schema) => match classify_verb(cypher) {
+        Some(ProcedureMode::Read | ProcedureMode::Write) | None => classified,
+        Some(ProcedureMode::Schema) => match classified {
             "dbms" => "dbms",
             _ => "schema",
         },
@@ -778,6 +791,15 @@ impl Transaction {
                 return Err(UniError::StaleDerivedFacts { version_gap });
             }
         }
+        // Authorize every statement the replay runs, before any runs, so a
+        // refusal — like the staleness check above — writes nothing and does
+        // not poison the transaction. The replay executes the statements
+        // directly, past the Cypher entry points that authorize.
+        crate::api::locy_authz::authorize_replay(
+            &self.db,
+            self.principal.as_deref(),
+            &derived.mutation_queries,
+        )?;
         if version_gap > 0 {
             info!(
                 transaction_id = %self.id,
@@ -1085,6 +1107,7 @@ impl Transaction {
             // No per-call override on this path; the database
             // setting applies.
             max_memory: None,
+            principal: self.principal.clone(),
         };
         engine.evaluate(program).await
     }
@@ -1148,6 +1171,7 @@ impl Transaction {
             program,
             binding,
             self.cancel_scope(None),
+            self.principal.clone(),
         )
     }
 

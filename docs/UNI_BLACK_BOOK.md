@@ -2091,6 +2091,7 @@ L0Buffer {
 - A *create* is counted by the buffer: `L0Buffer::insert_vertex_with_labels` (`+nodes 1`, `+labels` per label, `+properties` per non-null value) and `L0Buffer::insert_edge`. A row *rewrite* — `SET`, `REMOVE`, a `MERGE` action, a promote upsert — goes through `update_vertex_with_labels` / `update_edge` (writer and buffer) and counts nothing there. Before, every rewrite went through the create path: `MATCH … SET n.v = 7` reported `+nodes 1 +labels 1 +properties 3`, `MERGE … ON CREATE SET` reported `+nodes 2`.
 - Property effects are recorded by the executor, which holds the old row: `Writer::record_property_effects` → `L0Buffer::record_property_effect(entity, old, new)`. A property is the TCK's triple (entity, key, value): add = `+1` set, remove = `+1` removed, overwrite with a different value = both, same value = nothing.
 - Label changes (`SET n:L`, `REMOVE n:L`) are recorded where the executor writes the label set (`record_labels_added` / `record_labels_removed`), per node and only when the set changes. They counted nothing before.
+- A label write is a delta against the vertex's *current* labels (`Executor::current_vertex_labels`: the L0 chain, transaction buffer first; then the row's binding, which no write of the statement can have outdated when no L0 holds the vertex; then the `VidLabelsIndex`). `L0Buffer::set_vertex_labels` replaces the whole set, and the executor used to compute that set from the row's binding — a snapshot from match time — so a second binding of the same vertex (another variable of the row, or the same variable in a later row) rebuilt the set from labels that no longer held: `SET a:X SET b:Y` on one vertex stored `[A, Y]`, `REMOVE a:B REMOVE b:C` stored `[A, B]`. Property writes (`SET n.p`, `SET n = / += map`, `REMOVE n.p`) pass the same current labels: `L0Buffer::apply_vertex_write` appends the labels it is given, so a stale binding put back a label removed a moment earlier. After a label write every binding of the vertex in the row takes the new set (`Executor::set_labels_on_bindings`), so `RETURN a, b` projects it for both, as openCypher's by-reference node binding requires.
 - A statement's net effect: an `l0::StatementScope` (opened per statement and per bulk batch, see Write Throttling) remembers the vertices and edges the statement created. A change to one of them adjusts the create's counts instead of adding new ones (`CREATE (n {x: 1}) SET n.x = 2` is `+properties 1`, as TCK Set1 [6] expects).
 - Counters follow Neo4j's `QueryStatistics`, not the TCK's side effects. openCypher specifies no execution counters, and `uni-tck` computes `+labels`, `-properties`, ... itself by diffing the graph (`world.rs`, `capture_before` / `capture_after`), so the TCK never reads `ExecuteResult`. Hence: a deleted entity's properties are not counted in `properties_removed` (Neo4j has no such counter; counting them was measured at 1.6–2.3x on a 20k-node `DETACH DELETE`, debug build), and labels count per node (`labelsAdded`), not as labels newly in use across the graph. Pinned by `cypher_write::execute_counters_matrix::deleting_counts_entities_not_their_properties`.
 - A delete counts once (wave Q): `L0Buffer::apply_vertex_deletion` / `apply_edge_deletion` bump `nodes_deleted` / `relationships_deleted` only when the tombstone is new, so an entity named twice in one `DELETE` (or deleted by name and again by `DETACH`) is one deletion. `DETACH DELETE n, m` with `m = n` used to report `nodes_deleted 2`.
@@ -5109,6 +5110,34 @@ body refuse a Cypher command calling a `Schema`/`Dbms` procedure
 overlay. Neo4j's procedure modes carry the same names; there, admin rights are a
 separate `@Admin` privilege (`dbms.listConfig`, `db.clearQueryCaches`), which
 uni expresses as the `dbms` authorization verb.
+
+### Locy authorization
+
+Every Locy program is authorized before any of it runs
+(`api::locy_authz::authorize_locy_program`, called from
+`LocyEngine::evaluate_compiled_capturing`, which every entry point reaches:
+`Session::locy` / `locy_with().run()` / `.profile()`, the `Transaction`
+equivalents, and `PreparedLocy::execute` for a session- or
+transaction-prepared program). Before, no Locy entry point consulted the
+`AuthzPolicy` chain: with a deny-all policy, `tx.locy` ran Cypher writes and
+`tx.locy("CALL uni.admin.snapshot.create(..)")` created a snapshot. The
+principal is the session's or transaction's (`LocyEngine::principal`; a
+prepared program keeps the one that prepared it); the resource path is the
+program text. A program makes one `read` request covering what it evaluates
+(rule bodies, goal queries, `EXPLAIN RULE`, `ABDUCE`, `CALIBRATE`/`VALIDATE`,
+read-only Cypher commands), when it evaluates anything, and one request per
+writing command under the verb Cypher gives that statement
+(`transaction::procedure_verb`, the core of `statement_verb`): `write` for a
+Cypher write and for `DERIVE`, `schema` / `dbms` for a command calling a
+`Schema` / `Dbms` procedure. The mutations of an `ASSUME` block count, as a
+Cypher write counts whether or not its transaction commits. Each request
+carries the labels / relationship types / properties / operations of the
+parts it covers (`session::AuthzFields`). `Transaction::apply` authorizes each
+statement of the `DerivedFactSet` it replays (`locy_authz::authorize_replay`,
+path `<locy-apply>`) before replaying any: the set is plain data, which another
+principal's session, or a caller by hand, may have built. Administrative and
+DDL procedures stay callable from `tx.locy`, authorized as `dbms` / `schema`,
+in parity with `tx.execute`.
 
 ### Compaction
 
@@ -9212,6 +9241,7 @@ The scheduler (M11) drives durable, recurring maintenance:
 - **`TriggerPhase`**: `BeforeMutation`, `AfterMutation`, `BeforeCommit`, `AfterCommit`. Independently, **`FireMode`** ∈ `{ Synchronous, Async, EventualConsistency }` controls whether firing blocks the writer, runs on the runtime's blocking pool as a task tracked by the database's shutdown handle, or is batched. As of 3.0.0 `EventualConsistency` is a **real batched queue** (coalescing per-trigger events, draining on interval/size thresholds through a `BackgroundJobProvider`) rather than an alias for `Async` — tune with `UniConfig::ec_flush_interval` (default 1 s) and `ec_flush_threshold` (default 10,000).
 - **`TriggerOutcome`**: `Continue`, `Reject { reason }` (aborts the commit when fired in a *before* phase), `Defer { until }` (re-enqueue).
 - **`MutationBatch`** wraps an Arrow `RecordBatch` (`events: Arc<RecordBatch>`) with columns `event_kind | vid_or_eid | label | property | old_value | new_value`; event kinds are `TriggerEventMask` bit-constants (`NODE_CREATE` … `LABEL_REMOVED`).
+- **Label / edge-type selectors** (`TriggerSubscription::labels` / `edge_types`) are bare names; a leading `:` (the Cypher form, `":Customer"`) is accepted and stripped where `TriggerRouter::from_registry_with_queue` turns subscriptions into routes (`normalize_selectors`). Routes compare exactly against the bare label an event row carries, so before this a colon-prefixed selector matched nothing — including the built-in `LabelAuditTrigger`, which subscribed to `":_AuditMe"` and never fired. It now ships `"_AuditMe"`. Declared triggers already stripped the colon from `ON :Label`. Since the built-in now matches, an `_AuditMe` commit pays the vertex pre-image probe its `NODE_UPDATE` / `NODE_DELETE` routes ask for (`wants_node_events_for`); commits that touch no `_AuditMe` vertex are unaffected.
 - **`uni.plugin.declareTrigger`** now installs a real firing `TriggerPlugin` (previously a callable procedure that never fired). Declared triggers take an event filter (`CREATE|UPDATE|DELETE [ON :Label | -[:Type]-] [WHEN pred] [ASYNC]`), bind `$vid` / `$label` / `$event_kind`, run their declared Cypher action body, and replay across restart.
 
 ## Hot Reload & Multi-Version ABI

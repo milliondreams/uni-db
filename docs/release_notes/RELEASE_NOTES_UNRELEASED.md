@@ -40,6 +40,37 @@ It now runs only for vertices a registered node trigger or CDC can receive,
 and never for vertices the transaction created: a 1M-vertex commit beside 1M
 stored ones went from 67.5 s to 13.3 s (debug build) with no user trigger.
 
+**Locy programs are authorized.** No Locy entry point consulted the
+registered `AuthzPolicy` chain: with a deny-all policy, `session.locy`,
+`tx.locy`, their builders and prepared programs all ran, a `tx.locy` Cypher
+write wrote, `tx.locy("CALL uni.admin.snapshot.create(..)")` created a
+snapshot, and `tx.apply` replayed a `DerivedFactSet`. Each now asks the policy
+before anything runs, for the session's or transaction's principal, with the
+program text as the resource path: `read` for what the program evaluates, and
+for each command that writes the action Cypher uses for that statement
+(`write` for a Cypher write, `DERIVE` or `ASSUME` mutation; `schema` / `dbms`
+for a DDL / administrative procedure). `tx.apply` asks `write` for each
+statement it replays (path `<locy-apply>`). A refusal is
+`AuthorizationDenied`. A policy that denies an action now refuses the Locy
+programs that need it.
+
+**A label write through a second binding of the same node keeps the first.**
+`SET` and `REMOVE` of a label rebuilt the node's whole label set from the
+labels its row binding carried when matched, so when two bindings of one node
+wrote — two variables in a row, or one variable in two rows — the second
+undid the first: `MATCH (a:A), (b:A) WHERE id(a) = id(b) SET a:X SET b:Y` left
+`[A, Y]`, `REMOVE a:B REMOVE b:C` left `[A, B]`, and a property `SET` through
+the second binding put back a label `REMOVE` had just taken off. Label writes
+now apply to the node's current labels, both writes take effect, and every
+binding of the node returns its final labels.
+
+**The built-in audit trigger fires.** `LabelAuditTrigger`, registered by
+default, subscribed to `":_AuditMe"` while event rows carry the bare label
+`_AuditMe`, so it never matched. It now subscribes to `_AuditMe`, and a
+trigger subscription's `labels` / `edge_types` accept the Cypher form
+(`":Label"`) as the same name as the bare one. Commits that write `_AuditMe`
+vertices now pay the vertex pre-image read for that trigger.
+
 **A bulk load is invisible to every reader that started before it
 committed.** A load reserves its version when it starts staging. A
 transaction begun while it was staged saw it appear part way through once it

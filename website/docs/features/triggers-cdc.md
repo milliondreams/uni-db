@@ -143,8 +143,10 @@ attempts, after which the item is dropped with a warning.
 A `TriggerSubscription` selects events with:
 
 - `events`: a `TriggerEventMask`; combine masks with `.union()`.
-- `labels`: node events only. Exact match; `None` means every label.
-- `edge_types`: edge events only. Exact match; `None` means every type.
+- `labels`: node events only. Exact match; `None` means every label. Write
+  bare names (`"Account"`); the Cypher form `":Account"` names the same label.
+- `edge_types`: edge events only. Exact match; `None` means every type. A
+  leading `:` is accepted here too.
 - `predicate_source`: a Cypher boolean expression evaluated per event row.
   - `n.<prop>` reads the post-mutation value and `old.<prop>` the pre-image.
   - The event columns (`event_kind`, `vid_or_eid`, `label`, ...) are also in

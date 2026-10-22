@@ -49,6 +49,7 @@ pub(crate) mod host_executor;
 pub mod impl_locy;
 pub mod impl_query;
 pub mod indexes;
+pub(crate) mod locy_authz;
 pub mod locy_builder;
 pub mod locy_result;
 pub mod locy_rule_catalog;

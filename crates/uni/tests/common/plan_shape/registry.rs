@@ -84,6 +84,23 @@ pub const OPERATORS: &[Operator] = &[
         },
     },
     // ── Measured 2026-08-14 ────────────────────────────────────────────────
+    // ── Added 2026-10-18 (P9 / A7) ────────────────────────────────────────
+    Operator {
+        ty: "PropertyLookupJoinExec",
+        runtime_name: "PropertyLookupJoinExec",
+        status: Status::Proven {
+            by: "a7_anchored_disjoint_pattern_reads_only_the_matching_rows",
+            in_file: "crates/uni/tests/common/perf/anchored_lookup_test.rs",
+        },
+    },
+    Operator {
+        ty: "EdgeSourceScanExec",
+        runtime_name: "EdgeSourceScanExec",
+        status: Status::Proven {
+            by: "edge_source_scan_plan_shape",
+            in_file: "crates/uni/tests/common/cypher_read/edge_source_scan_test.rs",
+        },
+    },
     Operator {
         ty: "VidLookupJoinExec",
         runtime_name: "VidLookupJoinExec",
@@ -284,7 +301,7 @@ pub const OPERATORS: &[Operator] = &[
         ty: "GraphVectorKnnExec",
         runtime_name: "GraphVectorKnnExec",
         status: Status::Proven {
-            by: "a_vector_similarity_predicate_runs_the_vector_knn",
+            by: "an_approx_eq_predicate_runs_the_vector_knn",
             in_file: "crates/uni/tests/common/plan_shape/proofs.rs",
         },
     },

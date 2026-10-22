@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
 
-//! A command never changes what a later command reads.
+//! A command that does not write never changes what a later command reads.
+//!
+//! (Commands run in sequence, so a `DERIVE` or a Cypher write does change
+//! what later commands read; `locy_toplevel_sequencing` covers that. The
+//! commands placed here, `EXPLAIN RULE` and `ABDUCE`, write nothing.)
 //!
 //! `EXPLAIN RULE` falls back to re-deriving a rule through the in-memory
 //! evaluator when it has no provenance to read: when its WHERE matches no
@@ -46,7 +50,7 @@ fn config() -> LocyConfig {
 }
 
 /// Runs `program` over `setup` and returns the last `QUERY`'s rows (or the
-/// rows of a trailing `ASSUME`), each rendered as sorted `column=value`
+/// rows of a trailing `ASSUME`'s one body `QUERY`), each rendered as sorted `column=value`
 /// cells, the rows themselves sorted.
 async fn last_query(setup: &str, program: &str) -> Result<Vec<String>> {
     let db = Uni::in_memory().build().await?;
@@ -60,7 +64,19 @@ async fn last_query(setup: &str, program: &str) -> Result<Vec<String>> {
         .run()
         .await?;
     let Some(rows) = result.command_results.iter().rev().find_map(|c| match c {
-        CommandResult::Query(rows) | CommandResult::Assume(rows) => Some(rows),
+        CommandResult::Query(rows) => Some(rows),
+        // The body's last QUERY: an ASSUME body may run an EXPLAIN or an
+        // ABDUCE ahead of it.
+        CommandResult::Assume { results, .. } => Some(
+            results
+                .iter()
+                .rev()
+                .find_map(|r| match r {
+                    CommandResult::Query(rows) => Some(rows),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("the ASSUME body has no QUERY result: {results:?}")),
+        ),
         _ => None,
     }) else {
         bail!("program has no QUERY: {program}");
@@ -187,21 +203,30 @@ async fn command_noninterference_to_target_binding() -> Result<()> {
     .await
 }
 
-/// An `ASSUME` body keeps its own store; a command inside it must not change
-/// what a later command in the same body reads.
+/// An `ASSUME` body reads the same facts whatever command ran before it:
+/// an `EXPLAIN RULE` or `ABDUCE` at the top level ahead of the ASSUME, or
+/// inside the body ahead of its `QUERY`.
 #[tokio::test]
 async fn command_noninterference_inside_assume() -> Result<()> {
     let rules = "CREATE RULE tot AS MATCH (x:N)-[e:E]->(y:N) FOLD s = SUM(e.w) YIELD KEY x, s\n";
     let query = "QUERY tot RETURN x.name AS x, s";
-    let assume =
-        |body: &str| format!("{rules}ASSUME {{ CREATE (:N {{name: 'z'}}) }} THEN {{ {body} }}");
-    let baseline = last_query(FAN, &assume(query)).await?;
+    let assume = |body: &str| format!("ASSUME {{ CREATE (:N {{name: 'z'}}) }} THEN {{ {body} }}");
+    let baseline = last_query(FAN, &format!("{rules}{}", assume(query))).await?;
     assert_eq!(baseline, ["s=12.0 x=a"], "control");
     for command in commands("tot") {
-        let after = last_query(FAN, &assume(&format!("{command}\n{query}"))).await?;
+        let after = last_query(FAN, &format!("{rules}{command}\n{}", assume(query))).await?;
         assert_eq!(
             after, baseline,
-            "`{command}` inside ASSUME changed the answer of `{query}`"
+            "`{command}` before ASSUME changed the answer of `{query}` in its body"
+        );
+        let in_body = last_query(
+            FAN,
+            &format!("{rules}{}", assume(&format!("{command}\n{query}"))),
+        )
+        .await?;
+        assert_eq!(
+            in_body, baseline,
+            "`{command}` inside the ASSUME body changed the answer of `{query}` after it"
         );
     }
     Ok(())

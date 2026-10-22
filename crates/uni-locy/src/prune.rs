@@ -217,9 +217,11 @@ mod tests {
                 priority: None,
                 model_invocations: vec![],
                 hidden_yield_cols: vec![],
+                binding: crate::binding_plan::ClauseBinding::Pending,
             }],
             yield_schema: vec![],
             priority: None,
+            parameters: vec![],
         }
     }
 

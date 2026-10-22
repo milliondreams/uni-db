@@ -32,7 +32,12 @@
 //! * a `BEST BY` rule keeps the best row per key (shortest or longest path);
 //! * a PROB rule carries a probability (as a fixed-point integer), and an
 //!   `IS NOT` between two PROB rules multiplies by the complement of the
-//!   referenced facts' noisy-OR instead of anti-joining.
+//!   referenced facts' noisy-OR instead of anti-joining;
+//! * a positive `IS` between two PROB rules multiplies in the referenced
+//!   fact's probability, unless the clause's PROB expression already reads
+//!   it (one `ProbFactor` per multiplied reference). Where no two proofs
+//!   share an edge, that is the possible-worlds probability, which a unit
+//!   test checks by enumerating every world of small graphs.
 //!
 //! Per-path and recursive-sum rules terminate only on acyclic input, so the
 //! generator gives them the edges to a greater id. `DERIVE`, `ASSUME`,
@@ -41,11 +46,27 @@
 //! [`generator::random_program_strategy`] draws random programs over a random
 //! multigraph (self-loops, parallel and identical edges, two relationship
 //! types, integer weights) that exercise all of the above.
+//!
+//! [`surface`] holds each program's text as structured data, so a test can
+//! render it under a renaming or another conjunct order (a metamorphic
+//! relation) and map the oracle's answer through the same renaming.
+//!
+//! # Binding
+//!
+//! A clause body is an order-independent natural join: at each `IS` position
+//! a bound variable tests and an unbound one binds, so the order of the `WHERE`
+//! conditions never changes an answer. [`check_program`] computes the compile
+//! errors the engine must raise for a program — an ambiguous bare column read,
+//! an unbound `IS NOT` KEY, a node/scalar kind mismatch — before evaluation.
 
 // Rust guideline compliant
 pub mod eval;
 pub mod generator;
 pub mod ir;
+pub mod surface;
+
+#[doc(inline)]
+pub use eval::{OracleError, check_program};
 
 #[cfg(test)]
 mod tests {

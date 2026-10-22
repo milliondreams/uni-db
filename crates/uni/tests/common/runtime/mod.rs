@@ -1,4 +1,6 @@
 pub mod admin_features_test;
+pub mod background_task_lifecycle_test;
+pub mod compaction_lifecycle_test;
 pub mod error_handling_test;
 pub mod hooks_test;
 pub mod metrics_test;

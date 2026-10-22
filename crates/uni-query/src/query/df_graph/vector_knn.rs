@@ -41,8 +41,7 @@ use crate::query::df_graph::scan::{property_field, resolve_property_type};
 
 /// Vector-retrieval source for a [`GraphVectorKnnExec`].
 ///
-/// The exec is kind-agnostic above the retrieval step: threshold filter,
-/// score normalization, label / vid emission, and property hydration all
+/// The exec is kind-agnostic above the retrieval step: score normalization, label / vid emission, and property hydration all
 /// run identically on the `Vec<(Vid, f32)>` produced here. Only the
 /// retrieval call differs:
 ///
@@ -105,8 +104,12 @@ pub struct GraphVectorKnnExec {
     /// Number of results to return.
     k: usize,
 
-    /// Optional similarity threshold.
-    threshold: Option<f32>,
+    /// `k` is the configured default rather than a `LIMIT`; a search that
+    /// fills it warns that more rows may have qualified.
+    k_defaulted: bool,
+
+    /// From `OPTIONAL MATCH`: emit one all-NULL row when nothing qualifies.
+    optional: bool,
 
     /// Query parameters for expression evaluation.
     params: HashMap<String, Value>,
@@ -136,7 +139,8 @@ impl fmt::Debug for GraphVectorKnnExec {
             .field("variable", &self.variable)
             .field("property", &self.property)
             .field("k", &self.k)
-            .field("threshold", &self.threshold)
+            .field("k_defaulted", &self.k_defaulted)
+            .field("optional", &self.optional)
             .finish()
     }
 }
@@ -153,7 +157,6 @@ impl GraphVectorKnnExec {
     /// * `property` - Property containing vectors
     /// * `query_expr` - Expression evaluating to query vector
     /// * `k` - Number of results
-    /// * `threshold` - Optional similarity threshold
     /// * `params` - Query parameters
     #[expect(clippy::too_many_arguments)]
     pub fn new(
@@ -164,7 +167,6 @@ impl GraphVectorKnnExec {
         property: impl Into<String>,
         query_expr: Expr,
         k: usize,
-        threshold: Option<f32>,
         params: HashMap<String, Value>,
         target_properties: Vec<String>,
     ) -> Self {
@@ -176,7 +178,7 @@ impl GraphVectorKnnExec {
         let uni_schema = graph_ctx.storage().schema_manager().schema();
         let label_props = uni_schema.properties.get(label_name.as_str());
 
-        let schema = Self::build_schema(&variable, &target_properties, label_props);
+        let schema = Self::build_schema(&variable, &target_properties, label_props, false);
         let properties = compute_plan_properties(schema.clone());
 
         Self {
@@ -187,7 +189,8 @@ impl GraphVectorKnnExec {
             property,
             query_expr,
             k,
-            threshold,
+            k_defaulted: false,
+            optional: false,
             params,
             target_properties,
             schema,
@@ -201,7 +204,7 @@ impl GraphVectorKnnExec {
     /// retrieval through a plugin-registered [`IndexHandle`] instead of
     /// the native storage path.
     ///
-    /// All other behavior (threshold, scoring, property hydration) is
+    /// All other behavior (scoring, property hydration) is
     /// identical to [`Self::new`].
     #[expect(clippy::too_many_arguments)]
     pub fn with_plugin_source(
@@ -212,7 +215,6 @@ impl GraphVectorKnnExec {
         property: impl Into<String>,
         query_expr: Expr,
         k: usize,
-        threshold: Option<f32>,
         params: HashMap<String, Value>,
         target_properties: Vec<String>,
         kind: IndexKind,
@@ -226,12 +228,42 @@ impl GraphVectorKnnExec {
             property,
             query_expr,
             k,
-            threshold,
             params,
             target_properties,
         );
         exec.source = VectorSource::Plugin { kind, handle };
         exec
+    }
+
+    /// Mark `k` as the configured default rather than a query `LIMIT`.
+    ///
+    /// A defaulted search that returns exactly `k` rows records a
+    /// [`QueryWarning`](crate::types::QueryWarning): rows past the cap may
+    /// have qualified, and nothing in the query asked for the cap.
+    #[must_use]
+    pub fn with_k_defaulted(mut self, defaulted: bool) -> Self {
+        self.k_defaulted = defaulted;
+        self
+    }
+
+    /// Emit one all-NULL row when nothing qualifies (`OPTIONAL MATCH`).
+    ///
+    /// Makes every output column nullable.
+    #[must_use]
+    pub fn with_optional(mut self, optional: bool) -> Self {
+        if optional != self.optional {
+            let uni_schema = self.graph_ctx.storage().schema_manager().schema();
+            let label_props = uni_schema.properties.get(self.label_name.as_str());
+            self.schema = Self::build_schema(
+                &self.variable,
+                &self.target_properties,
+                label_props,
+                optional,
+            );
+            self.properties = compute_plan_properties(self.schema.clone());
+            self.optional = optional;
+        }
+        self
     }
 
     /// Build the output schema.
@@ -241,14 +273,17 @@ impl GraphVectorKnnExec {
     /// - `{variable}` - Variable identifier (as string for now)
     /// - `{variable}._score` - Similarity score
     /// - `{variable}.{prop}` - Property columns
+    ///
+    /// `optional` makes the identity columns nullable, for the NULL row.
     fn build_schema(
         variable: &str,
         target_properties: &[String],
         label_props: Option<&HashMap<String, PropertyMeta>>,
+        optional: bool,
     ) -> SchemaRef {
         let mut fields = vec![
-            Field::new(format!("{}._vid", variable), DataType::UInt64, false),
-            Field::new(variable, DataType::Utf8, false),
+            Field::new(format!("{}._vid", variable), DataType::UInt64, optional),
+            Field::new(variable, DataType::Utf8, optional),
             Field::new(format!("{}._labels", variable), labels_data_type(), true),
             Field::new(format!("{}._score", variable), DataType::Float32, true),
         ];
@@ -336,8 +371,13 @@ impl DisplayAs for GraphVectorKnnExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "GraphVectorKnnExec: label={}, property={}, k={}, variable={}",
-            self.label_name, self.property, self.k, self.variable
+            "GraphVectorKnnExec: label={}, property={}, k={}{}, variable={}{}",
+            self.label_name,
+            self.property,
+            self.k,
+            if self.k_defaulted { " (default)" } else { "" },
+            self.variable,
+            if self.optional { ", optional" } else { "" }
         )
     }
 }
@@ -394,8 +434,11 @@ impl ExecutionPlan for GraphVectorKnnExec {
             self.property.clone(),
             query_vector,
             multivec_query,
-            self.k,
-            self.threshold,
+            KnnCap {
+                k: self.k,
+                defaulted: self.k_defaulted,
+                optional: self.optional,
+            },
             self.target_properties.clone(),
             self.schema.clone(),
             self.source.clone(),
@@ -406,6 +449,17 @@ impl ExecutionPlan for GraphVectorKnnExec {
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
     }
+}
+
+/// How many rows a KNN search returns, and what happens at the edges.
+#[derive(Debug, Clone, Copy)]
+struct KnnCap {
+    /// Neighbors requested.
+    k: usize,
+    /// `k` is the configured default, not a `LIMIT`.
+    defaulted: bool,
+    /// Emit one all-NULL row when nothing qualifies.
+    optional: bool,
 }
 
 /// State machine for vector KNN stream.
@@ -439,11 +493,8 @@ struct VectorKnnStream {
     /// property is a `List<Vector>` column.
     multivec_query: Option<Vec<Vec<f32>>>,
 
-    /// Number of results.
-    k: usize,
-
-    /// Similarity threshold.
-    threshold: Option<f32>,
+    /// Number of results, and the default / optional flags.
+    cap: KnnCap,
 
     /// Target vertex properties to materialize.
     target_properties: Vec<String>,
@@ -470,8 +521,7 @@ impl VectorKnnStream {
         property: String,
         query_vector: Vec<f32>,
         multivec_query: Option<Vec<Vec<f32>>>,
-        k: usize,
-        threshold: Option<f32>,
+        cap: KnnCap,
         target_properties: Vec<String>,
         schema: SchemaRef,
         source: VectorSource,
@@ -484,8 +534,7 @@ impl VectorKnnStream {
             property,
             query_vector,
             multivec_query,
-            k,
-            threshold,
+            cap,
             target_properties,
             schema,
             source,
@@ -513,8 +562,7 @@ impl Stream for VectorKnnStream {
                     let property = self.property.clone();
                     let query_vector = self.query_vector.clone();
                     let multivec_query = self.multivec_query.clone();
-                    let k = self.k;
-                    let threshold = self.threshold;
+                    let cap = self.cap;
                     let target_properties = self.target_properties.clone();
                     let schema = self.schema.clone();
                     let source = self.source.clone();
@@ -530,8 +578,7 @@ impl Stream for VectorKnnStream {
                             &property,
                             &query_vector,
                             multivec_query.as_deref(),
-                            k,
-                            threshold,
+                            cap,
                             &target_properties,
                             &schema,
                             &source,
@@ -581,13 +628,13 @@ async fn execute_vector_search(
     property: &str,
     query_vector: &[f32],
     multivec_query: Option<&[Vec<f32>]>,
-    k: usize,
-    threshold: Option<f32>,
+    cap: KnnCap,
     target_properties: &[String],
     schema: &SchemaRef,
     source: &VectorSource,
 ) -> DFResult<Option<RecordBatch>> {
     let storage = graph_ctx.storage();
+    let k = cap.k;
 
     // Retrieve `(vid, distance)` pairs via the configured source.
     let results = retrieve_vid_scores(
@@ -600,6 +647,18 @@ async fn execute_vector_search(
         source,
     )
     .await?;
+
+    // Filling a cap nobody asked for may have cut rows off. A cap from a
+    // `LIMIT` cannot: the `LIMIT` keeps exactly those rows.
+    if cap.defaulted && results.len() >= k {
+        graph_ctx.push_warning(crate::types::QueryWarning::Other(format!(
+            "Vector search `{variable}.{property} ~= ...` on :{label_name} stopped at {k} \
+             neighbors, the default for a search no LIMIT sizes \
+             (UniConfig::vector_knn_default_k); more rows may qualify. Give the search a \
+             LIMIT it feeds directly (RETURN ... LIMIT n, optionally after ORDER BY \
+             {variable}._score DESC), or raise vector_knn_default_k."
+        )));
+    }
 
     // Look up the distance metric for this vector property so we can
     // convert raw distances into normalised similarity scores correctly.
@@ -616,30 +675,30 @@ async fn execute_vector_search(
         .map(|cfg| cfg.metric.clone())
         .unwrap_or(default_metric);
 
-    // Filter by threshold and build result
-    let mut vids = Vec::new();
-    let mut scores = Vec::new();
-
-    for (vid, value) in results {
-        // Multi-vector (ColBERT) results are already exact MaxSim similarities
-        // (higher is better); dense distances are converted to a similarity here.
-        let similarity = if multivec_query.is_some() {
-            value
-        } else {
-            calculate_score(value, &metric)
-        };
-
-        if let Some(thresh) = threshold
-            && similarity < thresh
-        {
-            continue;
-        }
-
-        vids.push(vid);
-        scores.push(similarity);
-    }
+    // Multi-vector (ColBERT) results are already exact MaxSim similarities
+    // (higher is better); dense distances are converted to a similarity here.
+    let mut scored: Vec<(Vid, f32)> = results
+        .into_iter()
+        .map(|(vid, value)| {
+            let similarity = if multivec_query.is_some() {
+                value
+            } else {
+                calculate_score(value, &metric)
+            };
+            (vid, similarity)
+        })
+        .collect();
+    // Emit best first. A `LIMIT` the search feeds without an `ORDER BY` keeps
+    // the first rows, and the planner sizes `k` from that `LIMIT` on the
+    // promise that they are the nearest. The native path already returns
+    // them in that order; a plugin handle need not.
+    scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    let (vids, scores): (Vec<Vid>, Vec<f32>) = scored.into_iter().unzip();
 
     if vids.is_empty() {
+        if cap.optional {
+            return null_row_batch(schema).map(Some);
+        }
         return Ok(Some(RecordBatch::new_empty(schema.clone())));
     }
 
@@ -811,6 +870,16 @@ async fn retrieve_vid_scores(
     }
 }
 
+/// One all-NULL row: the answer of an optional search where nothing qualifies.
+fn null_row_batch(schema: &SchemaRef) -> DFResult<RecordBatch> {
+    let columns: Vec<ArrayRef> = schema
+        .fields()
+        .iter()
+        .map(|f| arrow_array::new_null_array(f.data_type(), 1))
+        .collect();
+    RecordBatch::try_new(schema.clone(), columns).map_err(arrow_err)
+}
+
 /// Build a result batch from VIDs and scores, including hydrated properties.
 async fn build_result_batch(
     vids: &[Vid],
@@ -895,7 +964,7 @@ mod tests {
 
     #[test]
     fn test_build_schema() {
-        let schema = GraphVectorKnnExec::build_schema("n", &[], None);
+        let schema = GraphVectorKnnExec::build_schema("n", &[], None, false);
 
         assert_eq!(schema.fields().len(), 4);
         assert_eq!(schema.field(0).name(), "n._vid");
@@ -942,7 +1011,7 @@ mod tests {
     #[test]
     fn test_build_schema_with_extra_properties() {
         let extra_props = vec!["name".to_string(), "embedding".to_string()];
-        let schema = GraphVectorKnnExec::build_schema("doc", &extra_props, None);
+        let schema = GraphVectorKnnExec::build_schema("doc", &extra_props, None, false);
 
         // Should have base fields + extra properties
         assert!(schema.field_with_name("doc._vid").is_ok());
@@ -975,5 +1044,56 @@ mod tests {
             }
             _ => panic!("Expected list, got {:?}", result),
         }
+    }
+
+    fn neg(e: Expr) -> Expr {
+        Expr::UnaryOp {
+            op: uni_cypher::ast::UnaryOp::Neg,
+            expr: Box::new(e),
+        }
+    }
+
+    fn float(f: f64) -> Expr {
+        Expr::Literal(CypherLiteral::Float(f))
+    }
+
+    /// `[-1.0, 0.0]` parses as a unary minus over a literal; the KNN query
+    /// vector must evaluate it, and arithmetic over constants too.
+    #[test]
+    fn test_evaluate_negative_and_arithmetic_constants() {
+        let expr = Expr::List(vec![
+            neg(float(1.0)),
+            Expr::BinaryOp {
+                left: Box::new(float(0.0)),
+                op: uni_cypher::ast::BinaryOp::Sub,
+                right: Box::new(float(0.5)),
+            },
+            neg(Expr::Literal(CypherLiteral::Integer(2))),
+        ]);
+        assert!(crate::query::df_graph::common::is_simple_evaluable(&expr));
+        let result = evaluate_simple_expr(&expr, &HashMap::new(), &HashMap::new()).unwrap();
+        assert_eq!(
+            result,
+            Value::List(vec![Value::Float(-1.0), Value::Float(-0.5), Value::Int(-2)])
+        );
+    }
+
+    /// Negating `i64::MIN` overflows: an error, never a wrapped value.
+    #[test]
+    fn test_evaluate_negation_overflow_errors() {
+        let mut params = HashMap::new();
+        params.insert("m".to_string(), Value::Int(i64::MIN));
+        let expr = neg(Expr::Parameter("m".to_string()));
+        assert!(evaluate_simple_expr(&expr, &params, &HashMap::new()).is_err());
+    }
+
+    /// A row-dependent expression is not a constant query vector.
+    #[test]
+    fn test_property_is_not_simple_evaluable() {
+        let prop = Expr::Property(Box::new(Expr::Variable("a".to_string())), "emb".to_string());
+        assert!(!crate::query::df_graph::common::is_simple_evaluable(&prop));
+        assert!(!crate::query::df_graph::common::is_simple_evaluable(
+            &Expr::List(vec![neg(prop)])
+        ));
     }
 }

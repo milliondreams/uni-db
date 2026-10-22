@@ -212,7 +212,7 @@ impl DeltaDataset {
             &self.edge_type,
             schema,
             |i| &entries[i].properties,
-            &[],
+            |_, _| false,
         )
     }
 
@@ -367,133 +367,48 @@ impl DeltaDataset {
     /// Race-safe under async-flush — see
     /// `crate::storage::manager::write_batch_with_lance_conflict_retry`.
     pub async fn write_run(&self, backend: &dyn StorageBackend, batch: RecordBatch) -> Result<()> {
+        // Seam for the dual-write ordering check: background compaction folds
+        // whatever it finds in a delta table into L2 and expects each EID to
+        // already have its `main_edges` row, so every writer must have written
+        // `main_edges` by the time it reaches here.
+        fail::fail_point!("delta::before-write-run");
         let table_name = table_names::delta_table_name(&self.edge_type, &self.direction);
         crate::storage::manager::write_batch_with_lance_conflict_retry(backend, &table_name, batch)
             .await
     }
 
-    /// Build a partial-column RecordBatch for Lance `MergeInsert`.
-    /// Includes the join key (`eid`), the system columns (`src_vid`,
-    /// `dst_vid`, `op=0/Insert`, `_version`, `_updated_at`), and ONLY
-    /// the schema-defined property columns whose name appears in
-    /// `touched_keys`. If any of the entry's properties are NOT in the
-    /// label schema, `overflow_json` is regenerated with all overflow
-    /// properties present in the entry (the JSONB blob is one column;
-    /// it must be rewritten in full because we can't merge JSON
-    /// fragments at the storage layer).
+    /// Stage a run for this delta table without making it readable.
     ///
-    /// Used by Round-12 §A: edge SETs route through this builder so the
-    /// per-edge-type delta tables receive only the touched schema
-    /// columns; untouched columns retain their previous-version value
-    /// via Lance's MVCC `WhenMatched::UpdateAll` semantics.
-    pub fn build_partial_record_batch(
-        &self,
-        entries: &[L1Entry],
-        touched_keys: &std::collections::HashSet<String>,
-        schema: &Schema,
-    ) -> Result<RecordBatch> {
-        // Source schema: src_vid, dst_vid, eid, op, _version, _updated_at,
-        // touched schema cols, overflow_json (when any overflow key was
-        // touched).
-        let mut fields: Vec<Field> = vec![
-            Field::new("src_vid", arrow_schema::DataType::UInt64, false),
-            Field::new("dst_vid", arrow_schema::DataType::UInt64, false),
-            Field::new("eid", arrow_schema::DataType::UInt64, false),
-            Field::new("op", arrow_schema::DataType::UInt8, false),
-            Field::new("_version", arrow_schema::DataType::UInt64, false),
-            Field::new(
-                "_updated_at",
-                arrow_schema::DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
-                true,
-            ),
-        ];
-
-        let type_props = schema.properties.get(&self.edge_type);
-        let mut sorted_touched_props: Vec<(&String, &uni_common::core::schema::PropertyMeta)> =
-            if let Some(tp) = type_props {
-                tp.iter()
-                    .filter(|(name, _)| touched_keys.contains(*name))
-                    .collect()
-            } else {
-                Vec::new()
-            };
-        sorted_touched_props.sort_by_key(|(name, _)| *name);
-
-        for (name, meta) in &sorted_touched_props {
-            fields.push(Field::new(*name, meta.r#type.to_arrow(), meta.nullable));
-        }
-
-        // Determine if any touched key is a non-schema (overflow) prop —
-        // if so, regenerate overflow_json.
-        let schema_prop_names: std::collections::HashSet<&String> =
-            type_props.map(|tp| tp.keys().collect()).unwrap_or_default();
-        let any_overflow_touched = touched_keys.iter().any(|k| !schema_prop_names.contains(k));
-        if any_overflow_touched {
-            fields.push(Field::new(
-                "overflow_json",
-                arrow_schema::DataType::LargeBinary,
-                true,
-            ));
-        }
-
-        let arrow_schema = Arc::new(ArrowSchema::new(fields));
-
-        let mut columns: Vec<ArrayRef> = Vec::with_capacity(arrow_schema.fields().len());
-
-        let src_vids: Vec<u64> = entries.iter().map(|e| e.src_vid.as_u64()).collect();
-        let dst_vids: Vec<u64> = entries.iter().map(|e| e.dst_vid.as_u64()).collect();
-        let eids: Vec<u64> = entries.iter().map(|e| e.eid.as_u64()).collect();
-        let ops: Vec<u8> = entries.iter().map(|e| e.op as u8).collect();
-        let versions: Vec<u64> = entries.iter().map(|e| e.version).collect();
-        columns.push(Arc::new(UInt64Array::from(src_vids)));
-        columns.push(Arc::new(UInt64Array::from(dst_vids)));
-        columns.push(Arc::new(UInt64Array::from(eids)));
-        columns.push(Arc::new(UInt8Array::from(ops)));
-        columns.push(Arc::new(UInt64Array::from(versions)));
-        columns.push(build_timestamp_column(entries.iter().map(|e| e.updated_at)));
-
-        let default_deleted = vec![false; entries.len()];
-        for (name, meta) in &sorted_touched_props {
-            let extractor =
-                crate::storage::arrow_convert::PropertyExtractor::new(name, &meta.r#type);
-            let col = extractor.build_column(entries.len(), &default_deleted, |i| {
-                entries[i].properties.get(*name)
-            })?;
-            columns.push(col);
-        }
-
-        if any_overflow_touched {
-            let overflow_column = crate::storage::property_builder::build_overflow_json_column(
-                entries.len(),
-                &self.edge_type,
-                schema,
-                |i| &entries[i].properties,
-                &[],
-            )?;
-            columns.push(overflow_column);
-        }
-
-        RecordBatch::try_new(arrow_schema, columns).map_err(|e| anyhow!(e))
-    }
-
-    /// MergeInsert a partial-column batch via Lance. Join key is `eid`.
-    /// Matched rows have `WhenMatched::UpdateAll` applied; unmatched
-    /// source rows are dropped (a partial SET can only update an edge
-    /// that was previously CREATEd — the full-row Append path landed
-    /// the original row).
-    pub async fn merge_insert_partial_run(
+    /// Nothing staged is visible to a reader or to compaction until
+    /// [`Self::publish_runs`]. See [`crate::storage::manager::stage_batch`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table cannot be created or the run staged.
+    pub async fn stage_run(
         &self,
         backend: &dyn StorageBackend,
         batch: RecordBatch,
-    ) -> Result<()> {
+    ) -> Result<crate::backend::traits::StagedAppend> {
         let table_name = table_names::delta_table_name(&self.edge_type, &self.direction);
-        crate::storage::manager::merge_insert_batch_with_lance_conflict_retry(
-            backend,
-            &table_name,
-            batch,
-            &["eid"],
-        )
-        .await
+        crate::storage::manager::stage_batch(backend, &table_name, batch).await
+    }
+
+    /// Make runs staged by [`Self::stage_run`] readable, as one commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the commit fails; none of `runs` is then visible.
+    pub async fn publish_runs(
+        &self,
+        backend: &dyn StorageBackend,
+        runs: Vec<crate::backend::traits::StagedAppend>,
+    ) -> Result<()> {
+        // The same seam as `write_run`: this is the instant these delta rows
+        // become readable, so `main_edges` must already hold every EID in them.
+        fail::fail_point!("delta::before-write-run");
+        let table_name = table_names::delta_table_name(&self.edge_type, &self.direction);
+        backend.publish_staged(&table_name, runs).await
     }
 
     /// Ensure a BTree index exists on the 'eid' column.
@@ -613,8 +528,9 @@ impl DeltaDataset {
         backend: &dyn StorageBackend,
         vid: Vid,
         schema: &Schema,
-        version_hwm: Option<u64>,
+        version_hwm: impl crate::storage::bulk_gate::IntoRowVisibility,
     ) -> Result<Vec<L1Entry>> {
+        let visibility = version_hwm.into_row_visibility();
         let table_name = table_names::delta_table_name(&self.edge_type, &self.direction);
 
         if !backend.table_exists(&table_name).await? {
@@ -623,11 +539,8 @@ impl DeltaDataset {
 
         let base_filter = FilterExpr::equals(self.filter_column(), Scalar::UInt(vid.as_u64()));
 
-        // Add version filtering if snapshot is active
-        let final_filter = match version_hwm {
-            Some(hwm) => FilterExpr::all([base_filter, FilterExpr::version_at_most(hwm)]),
-            None => base_filter,
-        };
+        // Snapshot ceiling, and the versions of in-flight bulk publishes.
+        let final_filter = visibility.bound(base_filter);
 
         let batches = backend
             .scan(ScanRequest::all(&table_name).with_filter(final_filter))
@@ -651,8 +564,9 @@ impl DeltaDataset {
         backend: &dyn StorageBackend,
         vids: &[Vid],
         schema: &Schema,
-        version_hwm: Option<u64>,
+        version_hwm: impl crate::storage::bulk_gate::IntoRowVisibility,
     ) -> Result<HashMap<Vid, Vec<L1Entry>>> {
+        let visibility = version_hwm.into_row_visibility();
         if vids.is_empty() {
             return Ok(HashMap::new());
         }
@@ -663,15 +577,11 @@ impl DeltaDataset {
             return Ok(HashMap::new());
         }
 
-        let mut filter = FilterExpr::one_of(
+        // Snapshot ceiling, and the versions of in-flight bulk publishes.
+        let filter = visibility.bound(FilterExpr::one_of(
             self.filter_column(),
             vids.iter().map(|v| Scalar::UInt(v.as_u64())),
-        );
-
-        // Add version filtering if snapshot is active
-        if let Some(hwm) = version_hwm {
-            filter = FilterExpr::all([filter, FilterExpr::version_at_most(hwm)]);
-        }
+        ));
 
         let batches = backend
             .scan(ScanRequest::all(&table_name).with_filter(filter))

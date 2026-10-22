@@ -20,6 +20,7 @@ use crate::backend::table_names;
 use crate::backend::types::{FilterExpr, Scalar, ScalarIndexType, ScanRequest};
 use crate::runtime::counters::QueryCounters;
 use crate::storage::arrow_convert::build_timestamp_column_from_eid_map;
+use crate::storage::bulk_gate::IntoRowVisibility;
 use anyhow::{Result, anyhow};
 use arrow_array::builder::{LargeBinaryBuilder, StringBuilder};
 use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch, UInt64Array};
@@ -86,6 +87,20 @@ pub enum EndpointSide {
     Either,
 }
 
+/// An edge's identity minus its properties: stored endpoints and type name.
+///
+/// `src_vid`/`dst_vid` are the stored (start -> end) orientation, whatever
+/// direction a query traversed the edge in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdgeRecord {
+    /// Stored start vertex.
+    pub src_vid: Vid,
+    /// Stored end vertex.
+    pub dst_vid: Vid,
+    /// Relationship type name.
+    pub edge_type: String,
+}
+
 /// Main edge dataset for the unified `edges` table.
 ///
 /// This table contains all edges regardless of type, providing:
@@ -94,6 +109,17 @@ pub enum EndpointSide {
 #[derive(Debug)]
 pub struct MainEdgeDataset {
     _base_uri: String,
+}
+
+/// Adds a scanned main-edge batch to the query's row counters, if counting.
+///
+/// Counted here because this is where the batch is in hand: attaching counters
+/// to the `ScanRequest` reports index work only (see `ScanRequest::with_counters`).
+fn count_scanned_rows(counters: Option<&Arc<QueryCounters>>, batch: &RecordBatch) {
+    if let Some(c) = counters {
+        c.add_storage_rows(batch.num_rows());
+        c.add_rows_scanned(batch.num_rows());
+    }
 }
 
 impl MainEdgeDataset {
@@ -321,6 +347,11 @@ impl MainEdgeDataset {
         eid: Eid,
         counters: Option<&Arc<QueryCounters>>,
     ) -> Result<bool> {
+        // I/O-error injection for callers that must tell "absent" from "could
+        // not check" (compaction's pre-clear invariant check).
+        fail::fail_point!("main_edge::exists-by-eid", |_| Err(anyhow!(
+            "injected main_edges read failure"
+        )));
         let filter = FilterExpr::equals("_eid", Scalar::UInt(eid.as_u64()));
         let batches = Self::execute_query(backend, filter, Some(vec!["_eid"]), counters).await?;
         Ok(!batches.is_empty() && batches.iter().any(|b| b.num_rows() > 0))
@@ -389,9 +420,10 @@ impl MainEdgeDataset {
     pub async fn find_props_by_eid(
         backend: &dyn StorageBackend,
         eid: Eid,
-        version: Option<u64>,
+        version: impl IntoRowVisibility,
     ) -> Result<Option<Properties>> {
-        Self::find_props_by_eid_counted(backend, eid, version, None).await
+        let version = version.into_row_visibility();
+        Self::find_props_by_eid_counted(backend, eid, &version, None).await
     }
 
     /// [`Self::find_props_by_eid`], carrying a query's counters into the backend.
@@ -404,9 +436,10 @@ impl MainEdgeDataset {
     pub async fn find_props_by_eid_counted(
         backend: &dyn StorageBackend,
         eid: Eid,
-        version: Option<u64>,
+        version: impl IntoRowVisibility,
         counters: Option<&Arc<QueryCounters>>,
     ) -> Result<Option<Properties>> {
+        let version = version.into_row_visibility();
         // MVCC (review C2): the scan must see deletion tombstones — the
         // highest-version row wins, and a deleted winner yields `None`.
         // Filtering `_deleted = false` here would let an OLDER live version
@@ -419,7 +452,7 @@ impl MainEdgeDataset {
         // survives. This is the same composition `find_props_by_vid` uses.
         let filter = super::with_version_bound(
             FilterExpr::equals("_eid", Scalar::UInt(eid.as_u64())),
-            version,
+            &version,
         );
         let batches = Self::execute_query(
             backend,
@@ -501,9 +534,10 @@ impl MainEdgeDataset {
     pub async fn find_props_by_eids(
         backend: &dyn StorageBackend,
         eids: &[Eid],
-        version: Option<u64>,
+        version: impl IntoRowVisibility,
     ) -> Result<HashMap<Eid, Properties>> {
-        Self::find_props_by_eids_counted(backend, eids, version, None).await
+        let version = version.into_row_visibility();
+        Self::find_props_by_eids_counted(backend, eids, &version, None).await
     }
 
     /// [`Self::find_props_by_eids`], carrying a query's counters into the
@@ -517,9 +551,10 @@ impl MainEdgeDataset {
     pub async fn find_props_by_eids_counted(
         backend: &dyn StorageBackend,
         eids: &[Eid],
-        version: Option<u64>,
+        version: impl IntoRowVisibility,
         counters: Option<&Arc<QueryCounters>>,
     ) -> Result<HashMap<Eid, Properties>> {
+        let version = version.into_row_visibility();
         if eids.is_empty() {
             return Ok(HashMap::new());
         }
@@ -538,7 +573,7 @@ impl MainEdgeDataset {
             // One pass, filtered in memory. Streamed rather than collected: the
             // whole table's `props_json` would otherwise be resident at once.
             let wanted: std::collections::HashSet<u64> = eids.iter().map(Eid::as_u64).collect();
-            let filter = super::with_version_bound(FilterExpr::Literal(true), version);
+            let filter = super::with_version_bound(FilterExpr::Literal(true), &version);
             let request = ScanRequest::all(table_name)
                 .with_filter(filter)
                 .with_columns(columns.into_iter().map(String::from).collect())
@@ -552,7 +587,7 @@ impl MainEdgeDataset {
             for chunk in eids.chunks(MAX_EIDS_PER_CHUNK) {
                 let filter = super::with_version_bound(
                     FilterExpr::one_of("_eid", chunk.iter().map(|e| Scalar::UInt(e.as_u64()))),
-                    version,
+                    &version,
                 );
                 let batches =
                     Self::execute_query(backend, filter, Some(columns.clone()), counters).await?;
@@ -813,6 +848,95 @@ impl MainEdgeDataset {
         }
     }
 
+    /// The stored endpoints and type of each listed edge, by `_eid`.
+    ///
+    /// The edge-side counterpart of a vertex scan with a VID list pushed down:
+    /// it reads only the listed EIDs, through the `_eid` index in chunks of
+    /// `MAX_EIDS_PER_CHUNK`, or in one pass when `Self::prefers_full_scan`
+    /// says the request covers enough of the table. Resolving EIDs any other
+    /// way means walking the graph — `MATCH ()-[e]->() WHERE id(e) IN [...]`
+    /// visits every relationship and tests each against the whole list.
+    ///
+    /// Properties are not read: `props_json` is not authoritative on its own
+    /// (delta runs and L0 overlay it), so callers take them from
+    /// `PropertyManager::get_batch_edge_props`, which merges every tier.
+    ///
+    /// Version selection is `Self::rank_edges_from_batch`'s, per EID: the
+    /// highest `_version` wins with tombstones in the contest, ties to the
+    /// tombstone, and an EID whose winner is a tombstone is absent from the
+    /// result, as is one with no row. `version` bounds the candidates to a
+    /// pinned snapshot's `_version <= hwm` before the contest, as
+    /// [`Self::find_props_by_eids`] does. Only this table is consulted; the L0
+    /// chain is the caller's (see `StorageManager::lookup_edges_by_eids`).
+    ///
+    /// Every row the scan returns counts toward `storage_rows` and
+    /// `rows_scanned`, tombstones and superseded versions included.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table cannot be read.
+    pub async fn find_edges_by_eids_counted(
+        backend: &dyn StorageBackend,
+        eids: &[Eid],
+        version: impl IntoRowVisibility,
+        counters: Option<&Arc<QueryCounters>>,
+    ) -> Result<HashMap<Eid, EdgeRecord>> {
+        let version = version.into_row_visibility();
+        if eids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let table_name = table_names::main_edge_table_name();
+        if !backend.table_exists(table_name).await? {
+            return Ok(HashMap::new());
+        }
+
+        let columns = vec!["_eid", "src_vid", "dst_vid", "type", "_version", "_deleted"];
+        let mut winners: HashMap<Eid, VersionedEdge> = HashMap::new();
+        if Self::prefers_full_scan(backend, table_name, eids).await? {
+            let wanted: std::collections::HashSet<u64> = eids.iter().map(Eid::as_u64).collect();
+            let request = ScanRequest::all(table_name)
+                .with_filter(super::with_version_bound(
+                    FilterExpr::Literal(true),
+                    &version,
+                ))
+                .with_columns(columns.into_iter().map(String::from).collect())
+                .with_counters(counters.cloned());
+            let mut stream = backend.scan_stream(request).await?;
+            while let Some(batch) = futures::TryStreamExt::try_next(&mut stream).await? {
+                count_scanned_rows(counters, &batch);
+                Self::rank_edges_from_batch(&batch, Some(&wanted), &mut winners)?;
+            }
+        } else {
+            for chunk in eids.chunks(MAX_EIDS_PER_CHUNK) {
+                let filter = super::with_version_bound(
+                    FilterExpr::one_of("_eid", chunk.iter().map(|e| Scalar::UInt(e.as_u64()))),
+                    &version,
+                );
+                let batches =
+                    Self::execute_query(backend, filter, Some(columns.clone()), counters).await?;
+                for batch in &batches {
+                    count_scanned_rows(counters, batch);
+                    Self::rank_edges_from_batch(batch, None, &mut winners)?;
+                }
+            }
+        }
+
+        Ok(winners
+            .into_iter()
+            .filter(|(_, w)| !w.deleted)
+            .map(|(eid, w)| {
+                (
+                    eid,
+                    EdgeRecord {
+                        src_vid: w.src_vid,
+                        dst_vid: w.dst_vid,
+                        edge_type: w.edge_type,
+                    },
+                )
+            })
+            .collect())
+    }
+
     /// Find edge data (eid, src_vid, dst_vid, edge_type, props) by multiple type names in the main edges table.
     ///
     /// Returns all non-deleted edges with any of the given type names.
@@ -831,10 +955,39 @@ impl MainEdgeDataset {
 
     /// [`Self::find_edges_by_type_names`], carrying a query's counters into the
     /// backend.
+    ///
+    /// Every row the scan returns — live rows and tombstones alike, before the
+    /// per-eid ranking — counts toward `storage_rows` and `rows_scanned`. A
+    /// variable-length pattern with an inline property map scans a whole edge
+    /// type through here before its anchored walk, and was invisible to
+    /// `rows_scanned` until this counted it.
     pub async fn find_edges_by_type_names_counted(
         backend: &dyn StorageBackend,
         type_names: &[&str],
         endpoint_filter: Option<(EndpointSide, &[Vid])>,
+        counters: Option<&Arc<QueryCounters>>,
+    ) -> Result<Vec<(Eid, Vid, Vid, String, Properties)>> {
+        Self::find_visible_edges_by_type_names_counted(
+            backend,
+            type_names,
+            endpoint_filter,
+            &crate::storage::bulk_gate::RowVisibility::default(),
+            counters,
+        )
+        .await
+    }
+
+    /// [`Self::find_edges_by_type_names_counted`], reading only the rows
+    /// `visibility` admits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table cannot be read.
+    pub async fn find_visible_edges_by_type_names_counted(
+        backend: &dyn StorageBackend,
+        type_names: &[&str],
+        endpoint_filter: Option<(EndpointSide, &[Vid])>,
+        visibility: &crate::storage::bulk_gate::RowVisibility,
         counters: Option<&Arc<QueryCounters>>,
     ) -> Result<Vec<(Eid, Vid, Vid, String, Properties)>> {
         if type_names.is_empty() {
@@ -857,10 +1010,10 @@ impl MainEdgeDataset {
         // proportion to delete volume until compaction rewrites the table.
         // `not_deleted()` was a post-index row filter, never an index probe, so
         // the `type` BTree and the endpoint pushdown below still bound the scan.
-        let base_filter = FilterExpr::one_of(
+        let base_filter = visibility.bound(FilterExpr::one_of(
             "type",
             type_names.iter().map(|t| Scalar::Str((*t).to_string())),
-        );
+        ));
 
         // Winners keyed by eid, carried across every endpoint chunk below so an
         // edge whose live row and tombstone land in different chunks still ranks
@@ -872,7 +1025,8 @@ impl MainEdgeDataset {
                 let batches =
                     Self::execute_query(backend, base_filter.clone(), None, counters).await?;
                 for batch in &batches {
-                    Self::rank_edges_from_batch(batch, &mut winners)?;
+                    count_scanned_rows(counters, batch);
+                    Self::rank_edges_from_batch(batch, None, &mut winners)?;
                 }
             }
             Some((_, [])) => {}
@@ -892,7 +1046,8 @@ impl MainEdgeDataset {
                     let filter = FilterExpr::all([base_filter.clone(), endpoint_clause]);
                     let batches = Self::execute_query(backend, filter, None, counters).await?;
                     for batch in &batches {
-                        Self::rank_edges_from_batch(batch, &mut winners)?;
+                        count_scanned_rows(counters, batch);
+                        Self::rank_edges_from_batch(batch, None, &mut winners)?;
                     }
                 }
             }
@@ -915,6 +1070,72 @@ impl MainEdgeDataset {
         Ok(edges)
     }
 
+    /// The `(src, dst)` of every edge of `type_name` live at `visibility`,
+    /// reading only the identity and MVCC columns.
+    ///
+    /// The same newest-row-wins ranking as
+    /// [`Self::find_visible_edges_by_type_names_counted`] -- ties go to the
+    /// tombstone -- without fetching or decoding properties: a whole-type
+    /// pass over millions of edges that needs only endpoints (endpoint
+    /// verification) would otherwise materialize every property map.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table cannot be read.
+    pub async fn find_visible_endpoints_by_type_name(
+        backend: &dyn StorageBackend,
+        type_name: &str,
+        visibility: &crate::storage::bulk_gate::RowVisibility,
+    ) -> Result<Vec<(Vid, Vid)>> {
+        let filter = visibility.bound(FilterExpr::one_of(
+            "type",
+            [Scalar::Str(type_name.to_string())],
+        ));
+        let batches = Self::execute_query(
+            backend,
+            filter,
+            Some(vec!["_eid", "src_vid", "dst_vid", "_version", "_deleted"]),
+            None,
+        )
+        .await?;
+        // eid -> (version, deleted, src, dst)
+        let mut winners: HashMap<u64, (u64, bool, u64, u64)> = HashMap::new();
+        for batch in &batches {
+            let col = |name: &str| {
+                batch
+                    .column_by_name(name)
+                    .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+                    .ok_or_else(|| anyhow!("main edges table: column '{name}' missing"))
+            };
+            let (eids, srcs, dsts) = (col("_eid")?, col("src_vid")?, col("dst_vid")?);
+            let versions = col("_version").ok();
+            let deleted = batch
+                .column_by_name("_deleted")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::BooleanArray>());
+            for i in 0..batch.num_rows() {
+                if eids.is_null(i) || srcs.is_null(i) || dsts.is_null(i) {
+                    continue;
+                }
+                let version = versions.filter(|a| !a.is_null(i)).map_or(0, |a| a.value(i));
+                let dead = deleted.is_some_and(|a| !a.is_null(i) && a.value(i));
+                let row = (version, dead, srcs.value(i), dsts.value(i));
+                winners
+                    .entry(eids.value(i))
+                    .and_modify(|best| {
+                        if version > best.0 || (version == best.0 && dead) {
+                            *best = row;
+                        }
+                    })
+                    .or_insert(row);
+            }
+        }
+        Ok(winners
+            .into_values()
+            .filter(|(_, dead, ..)| !dead)
+            .map(|(_, _, src, dst)| (Vid::new(src), Vid::new(dst)))
+            .collect())
+    }
+
     /// Fold one batch into the per-eid winners map, keeping the highest
     /// `_version` row for each edge.
     ///
@@ -931,6 +1152,7 @@ impl MainEdgeDataset {
     /// drop is correct here and is not over-filtering.
     fn rank_edges_from_batch(
         batch: &RecordBatch,
+        wanted: Option<&std::collections::HashSet<u64>>,
         winners: &mut HashMap<Eid, VersionedEdge>,
     ) -> Result<()> {
         let Some(eid_arr) = batch
@@ -966,6 +1188,9 @@ impl MainEdgeDataset {
 
         for i in 0..batch.num_rows() {
             if eid_arr.is_null(i) || src_arr.is_null(i) || dst_arr.is_null(i) {
+                continue;
+            }
+            if wanted.is_some_and(|w| !w.contains(&eid_arr.value(i))) {
                 continue;
             }
 
@@ -1325,5 +1550,67 @@ mod tests {
             None,
             "deleted (highest-version) winner must not resurrect edge props"
         );
+    }
+
+    /// The EID lookup reads only the listed edges, keeps the highest-version
+    /// row per EID (tombstones in the contest, ties to the tombstone), and
+    /// honours a pinned snapshot's version bound before the contest.
+    #[tokio::test]
+    async fn test_eid_lookup_ranks_versions_and_bounds_snapshot() {
+        let (_dir, be) = scan_backend().await;
+        let backend: &dyn StorageBackend = &be;
+        for batch in [
+            edge_row(1, 10, 11, "R", false, 1),
+            edge_row(2, 10, 12, "R", false, 1),
+            edge_row(2, 10, 12, "R", true, 3),
+            edge_row(3, 12, 10, "U", false, 1),
+            edge_row(4, 11, 11, "R", false, 2),
+            edge_row(4, 11, 11, "R", true, 2),
+            edge_row(5, 13, 14, "R", false, 5),
+        ] {
+            MainEdgeDataset::write_batch(backend, batch).await.unwrap();
+        }
+        let eids: Vec<Eid> = [1, 2, 3, 4, 5, 99].map(Eid::new).to_vec();
+        let counters = Arc::new(QueryCounters::default());
+
+        let head =
+            MainEdgeDataset::find_edges_by_eids_counted(backend, &eids, None, Some(&counters))
+                .await
+                .unwrap();
+        let record = |src, dst, ty: &str| EdgeRecord {
+            src_vid: Vid::new(src),
+            dst_vid: Vid::new(dst),
+            edge_type: ty.to_string(),
+        };
+        assert_eq!(
+            head,
+            HashMap::from([
+                (Eid::new(1), record(10, 11, "R")),
+                (Eid::new(3), record(12, 10, "U")),
+                (Eid::new(5), record(13, 14, "R")),
+            ]),
+            "tombstoned (2), tied-tombstone (4) and unknown (99) EIDs must be absent"
+        );
+        // Every row read for the listed EIDs, tombstones included, and no other.
+        assert_eq!(counters.snapshot().rows_scanned, 7);
+
+        // Pinned at version 2: edge 2's tombstone (v3) and edge 5 (v5) are in
+        // the future, so 2 is live again and 5 does not exist yet.
+        let pinned = MainEdgeDataset::find_edges_by_eids_counted(backend, &eids, Some(2), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            pinned,
+            HashMap::from([
+                (Eid::new(1), record(10, 11, "R")),
+                (Eid::new(2), record(10, 12, "R")),
+                (Eid::new(3), record(12, 10, "U")),
+            ])
+        );
+
+        let none = MainEdgeDataset::find_edges_by_eids_counted(backend, &[], None, None)
+            .await
+            .unwrap();
+        assert!(none.is_empty());
     }
 }

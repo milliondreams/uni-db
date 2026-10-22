@@ -16,12 +16,12 @@ use crate::query::df_graph::common::{
 use crate::query::df_graph::locy_best_by::SortCriterion;
 use crate::query::df_graph::locy_explain::ProvenanceStore;
 use crate::query::df_graph::locy_fixpoint::{
-    DerivedScanRegistry, DerivedScanView, FixpointClausePlan, FixpointExec, FixpointRulePlan,
-    IsRefBinding,
+    DerivedScanEntry, DerivedScanRegistry, DerivedScanView, FixpointClausePlan, FixpointExec,
+    FixpointRulePlan, IsRefBinding,
 };
 use crate::query::df_graph::locy_fold::{FoldBinding, resolve_locy_aggregate};
 use crate::query::df_graph::locy_profile::{
-    LocyExecProfile, LocyProfileCollector, LocyStratumProfile,
+    LocyExecProfile, LocyProfileCollector, LocyStratumProfile, PlanningMark, synthetic_operator,
 };
 use crate::query::executor::core::OperatorStats;
 use crate::query::planner_locy_types::{
@@ -59,6 +59,9 @@ use uni_store::storage::manager::StorageManager;
 ///
 /// Each rule's converged facts are stored here after its stratum completes,
 /// making them available for later strata that depend on them.
+///
+/// Cloning is cheap: each relation is a list of reference-counted batches.
+#[derive(Clone)]
 pub struct DerivedStore {
     relations: HashMap<String, Vec<RecordBatch>>,
 }
@@ -120,6 +123,27 @@ impl DerivedStore {
     pub fn rule_names(&self) -> impl Iterator<Item = &str> {
         self.relations.keys().map(|s| s.as_str())
     }
+}
+
+/// Strata whose facts a run takes from an earlier evaluation instead of
+/// deriving them (incremental `ASSUME` / `ABDUCE`, A4).
+///
+/// The caller vouches that each listed stratum's facts in the state being
+/// evaluated equal `facts`' relations of the same names; see
+/// [`uni_locy::incremental`] for the criterion. A listed stratum is not
+/// evaluated: its rules' relations are copied from `facts` into the run's
+/// store, where later strata read them as they would read derived ones.
+#[derive(Clone)]
+pub struct ReusedStrata {
+    /// The earlier evaluation's facts, by rule name.
+    pub facts: Arc<DerivedStore>,
+    /// Positions, in the program's strata, of the strata to reuse.
+    pub positions: std::collections::BTreeSet<usize>,
+    /// The reused rules' facts as hydrated rows, when they are hydrated
+    /// correctly in the evaluated state too (the mutation changed no entity
+    /// that existed before it). Not read by the run itself; the caller that
+    /// hydrates the run's facts uses it instead of hydrating them again.
+    pub hydrated: Option<Arc<super::locy_delta::RowStore>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -198,6 +222,14 @@ pub struct LocyProgramExec {
     /// Shared slot written with the structured execution profile when
     /// `profile_enabled` is set. Read after execution to build `LocyProfileOutput`.
     profile_slot: Arc<StdRwLock<Option<LocyExecProfile>>>,
+    /// Strata to copy from an earlier evaluation rather than derive; set
+    /// before `execute()` by [`Self::set_reused_strata`].
+    reused_strata: StdRwLock<Option<ReusedStrata>>,
+    /// Whether the caller accepts partial results (`LocyConfig::allow_partial`):
+    /// an operator's deadline then ends the evaluation as an interruption,
+    /// recorded in `incomplete_slot`, rather than as an error. Set before
+    /// `execute()` by [`Self::set_allow_partial`].
+    allow_partial: std::sync::atomic::AtomicBool,
 }
 
 /// Encoding for the shared interruption signal threaded through the stratum
@@ -486,6 +518,27 @@ impl LocyProgramExec {
             incomplete_slot: Arc::new(StdRwLock::new(None)),
             profile_enabled: std::sync::atomic::AtomicBool::new(false),
             profile_slot: Arc::new(StdRwLock::new(None)),
+            reused_strata: StdRwLock::new(None),
+            allow_partial: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Accept partial results: an operator's deadline, like the checks
+    /// between strata and fixpoint iterations, then stops the evaluation
+    /// with its facts so far and an `incomplete` record instead of failing
+    /// it. Must be called before `execute()`.
+    pub fn set_allow_partial(&self, allow: bool) {
+        self.allow_partial
+            .store(allow, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Reuse the facts of some strata from an earlier evaluation.
+    ///
+    /// Must be called before `execute()`. See [`ReusedStrata`] for the
+    /// contract the caller takes on.
+    pub fn set_reused_strata(&self, reused: ReusedStrata) {
+        if let Ok(mut guard) = self.reused_strata.write() {
+            *guard = Some(reused);
         }
     }
 
@@ -668,6 +721,10 @@ impl ExecutionPlan for LocyProgramExec {
             .profile_enabled
             .load(std::sync::atomic::Ordering::Relaxed);
         let profile_slot = Arc::clone(&self.profile_slot);
+        let reused_strata = self.reused_strata.read().ok().and_then(|g| g.clone());
+        let allow_partial = self
+            .allow_partial
+            .load(std::sync::atomic::Ordering::Relaxed);
 
         let fut = async move {
             run_program(
@@ -705,6 +762,8 @@ impl ExecutionPlan for LocyProgramExec {
                 classifier_provenance_store,
                 profile_enabled,
                 profile_slot,
+                reused_strata,
+                allow_partial,
             )
             .await
         };
@@ -817,6 +876,28 @@ async fn execute_cypher_inline(
 // run_program — core evaluation algorithm
 // ---------------------------------------------------------------------------
 
+/// Whether `error` is an operator's deadline that, with `allow_partial`,
+/// ends the evaluation as an interruption rather than an error; records the
+/// timeout in `flag` when it does.
+///
+/// The checks between strata and between fixpoint iterations already stop
+/// a partial evaluation with its facts so far. A deadline an operator hits
+/// inside a clause body is the same condition noticed in a different layer,
+/// so under `allow_partial` it must be reported the same way, not raised.
+fn cut_by_deadline(
+    error: &datafusion::error::DataFusionError,
+    allow_partial: bool,
+    flag: &std::sync::atomic::AtomicU8,
+) -> bool {
+    // `check_deadline`'s message, which every operator's check raises.
+    let cut = allow_partial && error.to_string().contains("Query timed out");
+    if cut {
+        tracing::warn!("Locy program timeout exceeded inside a stratum (allow_partial)");
+        interruption::set(flag, interruption::TIMEOUT);
+    }
+    cut
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "program evaluation requires full graph and session context"
@@ -856,6 +937,8 @@ async fn run_program(
     classifier_provenance_store: Option<Arc<uni_locy::NeuralProvenanceStore>>,
     profile_enabled: bool,
     profile_slot: Arc<StdRwLock<Option<LocyExecProfile>>>,
+    reused_strata: Option<ReusedStrata>,
+    allow_partial: bool,
 ) -> DFResult<Vec<RecordBatch>> {
     let start = Instant::now();
     let mut derived_store = DerivedStore::new();
@@ -901,7 +984,21 @@ async fn run_program(
     let total_strata = strata.len();
     let mut completed_strata = 0usize;
     let mut partial_stratum: Option<usize> = None;
-    for (stratum_idx, stratum) in strata.iter().enumerate() {
+    'strata: for (stratum_idx, stratum) in strata.iter().enumerate() {
+        // A reused stratum is not evaluated: its rules' facts are those of the
+        // earlier evaluation, and later strata read them from the store.
+        if let Some(reused) = reused_strata
+            .as_ref()
+            .filter(|r| r.positions.contains(&stratum_idx))
+        {
+            for rule in stratum.rules.iter().filter(|r| !r.yield_schema.is_empty()) {
+                let facts = reused.facts.get(&rule.name).cloned().unwrap_or_default();
+                derived_store.insert(rule.name.clone(), facts);
+            }
+            completed_strata += 1;
+            continue;
+        }
+
         // Write cross-stratum facts into registry handles for strata we depend on
         write_cross_stratum_facts(&registry, &derived_store, stratum);
 
@@ -969,8 +1066,13 @@ async fn run_program(
             // but this accumulation sits outside it, and `peak_memory_slot` only
             // reports the total afterwards.
             let mut reservation = operator_reservation("LocyProgramExec", 0, &task_ctx);
-            let _concatenated =
-                collect_all_partitions(&exec_arc, task_ctx, &mut reservation).await?;
+            if let Err(e) = collect_all_partitions(&exec_arc, task_ctx, &mut reservation).await {
+                if cut_by_deadline(&e, allow_partial, &timeout_flag) {
+                    partial_stratum = Some(stratum_idx);
+                    break 'strata;
+                }
+                return Err(e);
+            }
             // The fixpoint driver spans the whole stratum and is a child of
             // nothing, so this is the only place it can be observed (#177).
             // Recorded only while profiling, so the walk is not paid otherwise.
@@ -1039,6 +1141,7 @@ async fn run_program(
                 // Profiling: time this rule's single pass and collect its
                 // clause-body operator trees.
                 let rule_start = Instant::now();
+                let plan_mark = PlanningMark::take(graph_ctx.counters());
                 let mut iter_ops: Vec<OperatorStats> = Vec::new();
                 let mut tagged_clause_facts: Vec<(usize, Vec<RecordBatch>)> = Vec::new();
                 for (clause_idx, (clause, fp_clause)) in
@@ -1047,7 +1150,7 @@ async fn run_program(
                     // Phase B A4 follow-up: the planner inserts
                     // `LocyModelInvoke` between body and `LocyProject`
                     // when the clause has neural invocations.
-                    let mut batches = execute_locy_clause_body(
+                    let mut batches = match execute_locy_clause_body(
                         &clause.body,
                         &params,
                         &graph_ctx,
@@ -1057,46 +1160,39 @@ async fn run_program(
                         collector.is_some(),
                         &mut iter_ops,
                     )
-                    .await?;
+                    .await
+                    {
+                        Ok(batches) => batches,
+                        Err(e) => {
+                            if cut_by_deadline(&e, allow_partial, &timeout_flag) {
+                                partial_stratum = Some(stratum_idx);
+                                break 'strata;
+                            }
+                            return Err(e);
+                        }
+                    };
+
+                    // The budget between clause bodies, as between strata: a
+                    // single-stratum program crosses no stratum boundary, and
+                    // its clause body may finish just inside an operator's
+                    // deadline with the rest of the rule still to run.
+                    if start.elapsed() >= timeout {
+                        tracing::warn!("Locy program timeout exceeded during rule evaluation");
+                        interruption::set(&timeout_flag, interruption::TIMEOUT);
+                        partial_stratum = Some(stratum_idx);
+                        break 'strata;
+                    }
 
                     // Apply negated IS-ref semantics per-clause.
-                    for binding in &fp_clause.is_ref_bindings {
-                        if binding.negated
-                            && !binding.anti_join_cols.is_empty()
-                            && let Some(entry) = registry.get(binding.derived_scan_index)
-                        {
-                            let neg_facts = entry.data.read().clone();
-                            if !neg_facts.is_empty() {
-                                if binding.target_has_prob && fp_rule.prob_column_name.is_some() {
-                                    let complement_col =
-                                        format!("__prob_complement_{}", binding.rule_name);
-                                    if let Some(prob_col) = &binding.target_prob_col {
-                                        batches =
-                                            super::locy_fixpoint::apply_prob_complement_composite(
-                                                batches,
-                                                &neg_facts,
-                                                &binding.anti_join_cols,
-                                                prob_col,
-                                                &complement_col,
-                                            )?;
-                                    } else {
-                                        // target_has_prob but no prob_col: fall back to anti-join.
-                                        batches = super::locy_fixpoint::apply_anti_join_composite(
-                                            batches,
-                                            &neg_facts,
-                                            &binding.anti_join_cols,
-                                        )?;
-                                    }
-                                } else {
-                                    batches = super::locy_fixpoint::apply_anti_join_composite(
-                                        batches,
-                                        &neg_facts,
-                                        &binding.anti_join_cols,
-                                    )?;
-                                }
-                            }
-                        }
-                    }
+                    batches = super::locy_complement::apply_negated_is_refs(
+                        batches,
+                        &fp_clause.is_ref_bindings,
+                        &registry,
+                        fp_rule.prob_column_name.as_deref(),
+                        // Each clause runs once here: nothing to reuse.
+                        None,
+                        collector.as_ref().map(|_| &mut iter_ops),
+                    )?;
 
                     // Multiply complement columns into PROB per-clause.
                     let complement_cols: Vec<String> = if !batches.is_empty() {
@@ -1117,6 +1213,12 @@ async fn run_program(
                             &complement_cols,
                         )?;
                     }
+                    // Positive references to PROB rules: multiply in each
+                    // referenced probability the clause does not already read.
+                    batches = super::locy_lineage::apply_positive_prob_factors(
+                        batches,
+                        &fp_clause.is_ref_bindings,
+                    )?;
 
                     // The anti-join has run; drop its hidden subject-`_vid`
                     // columns before `write_facts_to_registry`, which would
@@ -1126,73 +1228,78 @@ async fn run_program(
                     tagged_clause_facts.push((clause_idx, batches));
                 }
 
-                // Record provenance and detect shared proofs for non-recursive rules.
-                //
-                // TODO(C0-stage2): swap `record_and_detect_lineage_nonrecursive`
-                // for `TopKTag` DNF inspection when
-                // `semiring_kind == TopKProofs { k }`. Library-layer
-                // tag math landed in
-                // `crates/uni-locy/src/top_k_proofs.rs` (Phase C C0
-                // Stage 1); Stage 2 wires per-row tags through the
-                // runtime so dependencies are visible here.
-                //
-                // Under MaxMinProb, `plus = max` is idempotent so shared
-                // proofs don't double-count — skip the (misleading) warning.
-                let shared_info = if semiring_kind == SemiringKind::MaxMinProb {
-                    None
-                } else if let Some(ref tracker) = derivation_tracker {
-                    super::locy_fixpoint::record_and_detect_lineage_nonrecursive(
+                // Record provenance (EXPLAIN, top-k proofs) for non-recursive rules.
+                if let Some(ref tracker) = derivation_tracker {
+                    super::locy_fixpoint::record_provenance_nonrecursive(
                         fp_rule,
                         &tagged_clause_facts,
                         tracker,
                         &warnings_slot,
-                        &registry,
                         top_k_proofs,
                         super::locy_fixpoint::ClassifierRefs {
                             registry: &classifier_registry,
                             cache: classifier_cache.as_ref(),
                             provenance_store: classifier_provenance_store.as_ref(),
                         },
-                        semiring_kind,
                     )
-                    .await
-                } else {
-                    None
-                };
+                    .await?;
+                    // A PROB rule without a fold: its derivation rows, read
+                    // before the transient columns carrying them go.
+                    for (_, batches) in &tagged_clause_facts {
+                        tracker.lineage().record_rows(fp_rule, batches)?;
+                    }
+                }
 
-                // Flatten tagged facts for post-fixpoint chain.
-                let mut all_clause_facts: Vec<RecordBatch> = tagged_clause_facts
-                    .into_iter()
-                    .flat_map(|(_, batches)| batches)
-                    .collect();
-
-                // Apply BDD for shared groups if exact_probability is enabled.
-                if exact_probability
-                    && let Some(ref info) = shared_info
-                    && let Some(ref tracker) = derivation_tracker
-                {
-                    all_clause_facts = super::locy_fixpoint::apply_exact_wmc(
-                        all_clause_facts,
-                        fp_rule,
-                        info,
-                        tracker,
-                        max_bdd_variables,
-                        &warnings_slot,
-                        &approximate_slot,
+                // Flatten tagged facts for post-fixpoint chain, without the
+                // transient provenance and lineage columns.
+                let mut all_clause_facts: Vec<RecordBatch> =
+                    super::locy_lineage::strip_transient_columns(
+                        tagged_clause_facts
+                            .into_iter()
+                            .flat_map(|(_, batches)| batches)
+                            .collect(),
                     )?;
+
+                // Lineage, shared-proof detection and, with
+                // `exact_probability`, exact inference (`locy_lineage`).
+                // Under MaxMinProb, `plus = max` is idempotent so shared
+                // proofs don't double-count — skip the (misleading) warning.
+                super::locy_lineage::warn_opaque_prob_reads(fp_rule, &warnings_slot);
+                if let Some(ref tracker) = derivation_tracker {
+                    tracker.lineage().record_rule(fp_rule, &all_clause_facts)?;
+                    if semiring_kind != SemiringKind::MaxMinProb {
+                        let (corrected, _) = tracker.lineage().correct(
+                            fp_rule,
+                            all_clause_facts,
+                            &super::locy_lineage::ExactCtx {
+                                exact: exact_probability,
+                                max_bdd_variables,
+                                semiring_kind,
+                                warnings_slot: &warnings_slot,
+                                approximate_slot: &approximate_slot,
+                            },
+                        )?;
+                        all_clause_facts = corrected;
+                    }
+                }
+
+                // And before the post-fixpoint chain and the deduplication,
+                // which run outside every operator's deadline check.
+                if start.elapsed() >= timeout {
+                    tracing::warn!("Locy program timeout exceeded during rule evaluation");
+                    interruption::set(&timeout_flag, interruption::TIMEOUT);
+                    partial_stratum = Some(stratum_idx);
+                    break 'strata;
                 }
 
                 // Apply post-fixpoint operators (PRIORITY, FOLD, BEST BY) on union.
-                let facts = super::locy_fixpoint::apply_post_fixpoint_chain(
+                let facts = match super::locy_fixpoint::apply_post_fixpoint_chain(
                     all_clause_facts,
                     fp_rule,
                     &task_ctx,
                     strict_probability_domain,
                     probability_epsilon,
                     semiring_kind,
-                    derivation_tracker.as_ref().map(Arc::clone),
-                    top_k_proofs,
-                    Some(Arc::clone(&registry)),
                     // The chain's own operators join this rule's clause-body
                     // ops, so `FoldExec` and friends reach the Locy profile
                     // (#177). `None` when not profiling, so the metric walk is
@@ -1200,7 +1307,17 @@ async fn run_program(
                     collector.as_ref().map(|_| &mut iter_ops),
                     &params,
                 )
-                .await?;
+                .await
+                {
+                    Ok(facts) => facts,
+                    Err(e) => {
+                        if cut_by_deadline(&e, allow_partial, &timeout_flag) {
+                            partial_stratum = Some(stratum_idx);
+                            break 'strata;
+                        }
+                        return Err(e);
+                    }
+                };
 
                 // A fact is a row: two derivations of the same row are one fact,
                 // as the fixpoint's delta computation makes them in a recursive
@@ -1213,7 +1330,33 @@ async fn run_program(
                 let facts = if facts_are_per_path(rule) {
                     facts
                 } else {
-                    super::locy_fixpoint::dedup_fact_rows(facts)?
+                    let dedup_started = Instant::now();
+                    let facts = super::locy_fixpoint::dedup_fact_rows(facts)?;
+                    if collector.is_some() {
+                        let rows = facts.iter().map(RecordBatch::num_rows).sum();
+                        iter_ops.push(synthetic_operator(
+                            "LocyFactDedup",
+                            rows,
+                            dedup_started.elapsed(),
+                        ));
+                    }
+                    facts
+                };
+                // A PROB rule without a fold: its lineage, and its values
+                // corrected where they are not exact (`publish_rows`).
+                let facts = match derivation_tracker {
+                    Some(ref tracker) => tracker.lineage().publish_rows(
+                        fp_rule,
+                        facts,
+                        &super::locy_lineage::ExactCtx {
+                            exact: exact_probability,
+                            max_bdd_variables,
+                            semiring_kind,
+                            warnings_slot: &warnings_slot,
+                            approximate_slot: &approximate_slot,
+                        },
+                    )?,
+                    None => facts,
                 };
 
                 // Profiling: record this rule's single non-recursive pass.
@@ -1225,6 +1368,7 @@ async fn run_program(
                         fact_count,
                         rule_start.elapsed().as_secs_f64() * 1000.0,
                         std::mem::take(&mut iter_ops),
+                        plan_mark.cost(graph_ctx.counters()),
                     );
                     c.set_final_facts(&rule.name, fact_count);
                 }
@@ -1346,21 +1490,25 @@ async fn run_program(
     // plan's real output schema, and QUERY now answers from the derived store
     // rather than re-deriving. Deferral is about orchestration, not types.
     //
-    // Cypher commands that appear AFTER a DERIVE command are also deferred:
-    // they need the ephemeral L0 overlay populated by DERIVE to see derived
-    // edges, which is only available in the orchestrator's dispatch loop.
-    let first_derive_idx = commands
-        .iter()
-        .position(|c| matches!(c, LocyCommand::Derive { .. }));
+    // Commands run in sequence: a command that writes (DERIVE, a Cypher
+    // write) changes what every later command reads. The inline loop runs
+    // before any command, so only the commands before the first write run
+    // here; that write and everything after it are dispatched in order by
+    // the orchestrator, which derives the facts again after a write
+    // (`locy_sequence`). A Cypher write run here also had no mutation
+    // context to write through ("Mutation context not set").
+    let first_write_idx = commands.iter().position(|c| match c {
+        LocyCommand::Derive { .. } => true,
+        LocyCommand::Cypher { query } => uni_locy::incremental::query_may_write(query),
+        _ => false,
+    });
     let mut inline_results: Vec<(usize, CommandResult)> = Vec::new();
     for (cmd_idx, cmd) in commands.iter().enumerate() {
+        if first_write_idx.is_some_and(|wi| cmd_idx >= wi) {
+            break;
+        }
         match cmd {
             LocyCommand::Cypher { query } => {
-                // Defer Cypher commands that follow a DERIVE to the dispatch loop
-                // so they can read from the ephemeral L0 overlay.
-                if first_derive_idx.is_some_and(|di| cmd_idx > di) {
-                    continue;
-                }
                 let rows = execute_cypher_inline(
                     query,
                     &schema_info,
@@ -1584,6 +1732,7 @@ fn convert_to_fixpoint_plans(
                         priority: clause.priority,
                         along_bindings: clause.along_bindings.clone(),
                         model_invocations: clause.model_invocations.clone(),
+                        stratum_scans: clause.stratum_scans.clone(),
                     })
                 })
                 .collect::<DFResult<Vec<_>>>()?;
@@ -1702,6 +1851,11 @@ fn convert_is_refs(
             // rows: the folded snapshot has one row per KEY, so anti-joining
             // against it would under-filter and its row hashes would never
             // match the ones `record_provenance` stores.
+            // Exclusive handles (one reference of a non-linear clause) are fed
+            // per semi-naive pass and never stand for the rule; the planner
+            // always mints the shared handle beside them.
+            let entries: Vec<&DerivedScanEntry> =
+                entries.into_iter().filter(|e| !e.exclusive).collect();
             let entry = entries
                 .iter()
                 .find(|e| {
@@ -1716,87 +1870,13 @@ fn convert_is_refs(
                     ))
                 })?;
 
-            // For negated IS-refs, compute (left_body_col, right_derived_col) pairs for
-            // anti-join filtering. The derived column is the one the planner
-            // resolved for that subject (`LocyIsRef::binding_columns`, from
-            // `uni_locy::is_binding`), so IS NOT binds what the positive join
-            // binds. Taking the registry schema's fields by position assumed
-            // KEY columns come first; for a rule yielding `b, KEY a` it tested
-            // `b` and returned exactly the wrong nodes.
-            //
-            // The left name prefers the hidden `{var}._vid` column the planner
-            // projected (`LocyIsRef::subject_vid_cols`). The anti-join runs after
-            // `LocyProject`, so the bare variable name only resolves when YIELD
-            // happened to project that exact name — an aliased or unprojected
-            // subject was previously unresolvable and the negation silently
-            // became a no-op (issue #158). The bare-name fallback remains for
-            // subjects that are not MATCH-bound node variables, which have no
-            // `._vid` column; those still error in `apply_anti_join_composite`
-            // rather than failing open.
-            let left_col = |var: &String| {
-                is_ref
-                    .subject_vid_cols
-                    .get(var)
-                    .cloned()
-                    .unwrap_or_else(|| var.clone())
-            };
-            let anti_join_cols = if is_ref.negated {
-                let mut cols: Vec<(String, String)> = is_ref
-                    .subjects
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, s)| {
-                        if let uni_cypher::ast::Expr::Variable(var) = s {
-                            let right_col = is_ref
-                                .binding_columns
-                                .get(i)
-                                .cloned()
-                                .unwrap_or_else(|| var.clone());
-                            Some((left_col(var), right_col))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                // Include target variable in anti-join for composite-key IS NOT.
-                // Without this, `d IS NOT known TO dis` only checks d, not (d, dis),
-                // filtering ALL pairs where the drug has ANY indication regardless
-                // of disease.
-                if let Some(uni_cypher::ast::Expr::Variable(target_var)) = &is_ref.target
-                    && let Some(column) = is_ref.binding_columns.get(is_ref.subjects.len())
-                {
-                    cols.push((left_col(target_var), column.clone()));
-                }
-                cols
-            } else {
-                Vec::new()
-            };
-
-            // Provenance join cols: for ALL IS-refs (not just negated), compute
-            // (body_col, derived_col) pairs so shared-proof detection can trace
-            // which source facts contributed to each derived row.
-            //
-            // Uses the same `left_col` resolution as the anti-join above: for a
-            // negated ref whose subject was renamed by YIELD, the bare name does
-            // not exist post-projection and lineage would silently attribute to
-            // nothing.
-            let provenance_join_cols: Vec<(String, String)> = is_ref
-                .subjects
-                .iter()
-                .enumerate()
-                .filter_map(|(i, s)| {
-                    if let uni_cypher::ast::Expr::Variable(var) = s {
-                        let right_col = is_ref
-                            .binding_columns
-                            .get(i)
-                            .cloned()
-                            .unwrap_or_else(|| var.clone());
-                        Some((left_col(var), right_col))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+            // A negated reference's anti-join key comes from its binding plan
+            // (`LocyIsRef::negation_keys`): one component per KEY position some
+            // literal binds, read on the body side from the hidden column the
+            // planner projected for its binder. Nothing is resolved by name
+            // here, so a subject YIELD renamed or dropped still anti-joins
+            // (issue #158), and an existential value position is absent.
+            let anti_join_cols = is_ref.negation_keys.clone();
 
             Ok(IsRefBinding {
                 derived_scan_index: entry.scan_index,
@@ -1806,7 +1886,9 @@ fn convert_is_refs(
                 anti_join_cols,
                 target_has_prob: is_ref.target_has_prob,
                 target_prob_col: is_ref.target_prob_col.clone(),
-                provenance_join_cols,
+                prob_ref: is_ref.prob_ref.clone(),
+                negated_lineage: is_ref.negated_lineage.clone(),
+                support_ref: is_ref.support_ref.clone(),
             })
         })
         .collect()
@@ -1962,6 +2044,7 @@ fn convert_best_by_criteria(
                 })?;
             Ok(SortCriterion {
                 col_index,
+                column: yield_schema[col_index].name.clone(),
                 ascending: *ascending,
                 nulls_first: false,
             })
@@ -2037,6 +2120,36 @@ fn facts_are_per_path(rule: &crate::query::planner_locy_types::LocyRulePlan) -> 
 mod tests {
     use super::*;
     use arrow_array::{Int64Array, LargeBinaryArray, StringArray};
+
+    /// An operator's deadline ends a partial evaluation as a timeout
+    /// interruption; anything else, or any error without `allow_partial`,
+    /// stays an error and leaves the flag alone.
+    #[test]
+    fn cut_by_deadline_only_takes_an_operator_deadline_under_allow_partial() {
+        let deadline = datafusion::error::DataFusionError::Execution("Query timed out".into());
+        let cancelled = datafusion::error::DataFusionError::Execution("Query cancelled".into());
+
+        let flag = std::sync::atomic::AtomicU8::new(interruption::NONE);
+        assert!(!cut_by_deadline(&deadline, false, &flag));
+        assert!(!cut_by_deadline(&cancelled, true, &flag));
+        assert_eq!(interruption::reason(&flag), None);
+
+        assert!(cut_by_deadline(&deadline, true, &flag));
+        assert_eq!(
+            interruption::reason(&flag),
+            Some(uni_common::LocyIncompleteReason::Timeout)
+        );
+
+        // Wrapped, as DataFusion passes an operator's error up a plan.
+        let flag = std::sync::atomic::AtomicU8::new(interruption::NONE);
+        let wrapped = datafusion::error::DataFusionError::Context(
+            "while running a clause body".into(),
+            Box::new(datafusion::error::DataFusionError::Execution(
+                "Query timed out".into(),
+            )),
+        );
+        assert!(cut_by_deadline(&wrapped, true, &flag));
+    }
 
     #[test]
     fn test_derived_store_insert_and_get() {

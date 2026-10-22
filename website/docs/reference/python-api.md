@@ -136,6 +136,7 @@ with uni_db.Uni.open("./my_graph") as db:
 | `db.create_snapshot(name)` | `str` | Create a named snapshot, returns snapshot ID |
 | `db.list_snapshots()` | `list[SnapshotInfo]` | List all snapshots |
 | `db.restore_snapshot(snapshot_id)` | `None` | Restore database to a snapshot |
+| `db.delete_snapshot(snapshot_id)` | `None` | Delete a snapshot and release the storage versions it pins |
 | `db.write_lease()` | `WriteLease \| None` | Current write lease configuration |
 
 The `count` returned by `db.get_label_info()` / `db.get_edge_type_info()` is
@@ -174,7 +175,7 @@ Fluent builder for advanced database configuration. Exposed as `uni_db.UniBuilde
 | `.xervo_catalog_from_str(json)` | Configure Xervo models from a JSON string |
 | `.xervo_runtime(runtime)` | Reuse an existing `ModelRuntime` instead of building one ([sharing models](#sharing-models-across-databases)) |
 | `.cloud_config(config_dict)` | Cloud storage credentials (`s3`, `gcs`, `azure`) |
-| `.config(config_dict)` | Database options (`query_timeout`, `max_query_memory`, etc.) |
+| `.config(config_dict)` | Database options (`query_timeout`, `max_query_memory`, `lance_metadata_cache_bytes`, `lance_index_cache_bytes`, etc.) |
 | `.batch_size(n)` | Rows per page a query cursor hands back (default 1024) |
 | `.wal_enabled(bool)` | Enable/disable write-ahead log (default `True`) |
 | `.strict_schema(bool)` | Reject writes with undeclared labels/edge types (default `False`) |
@@ -679,8 +680,23 @@ Returned by `tx.bulk_writer()`. All methods are chainable.
 | `.stats()` | `BulkStats` | Current load statistics |
 | `.touched_labels()` | `list[str]` | Labels written to |
 | `.touched_edge_types()` | `list[str]` | Edge types written to |
-| `.commit()` | `BulkStats` | Commit data and rebuild indexes |
+| `.commit()` | `BulkStats` | Commit data and rebuild indexes (see the outcomes below) |
 | `.abort()` | `None` | Discard uncommitted changes |
+| `.load_id` *(property)* | `str` | The load's id; readable before and after `commit()`/`abort()` |
+
+`BulkStats` carries `load_id` and `warnings` (steps after the commit point that
+failed without affecting the load). What `commit()` raising means:
+
+| Raised | Applied? | What to do |
+|--------|----------|------------|
+| nothing | yes | inspect `stats.warnings` if you like |
+| `UniBulkCommitIncompleteError` | yes (committed) | **do not retry**; the next open completes it |
+| `UniBulkCommitOutcomeUnknownError` | unknown | reopen, then retry only if `db.bulk_load_applied(e.load_id)` is `False` |
+| any other `UniError` | no | nothing is visible; retrying is safe |
+
+`Uni.bulk_load_applied(load_id) -> bool` (and `await AsyncUni.bulk_load_applied(load_id)`)
+says whether a load reached its commit point; it raises `UniInvalidArgumentError`
+for a string that is not a load id.
 
 Context manager support (auto-aborts on exception):
 
@@ -897,7 +913,7 @@ result = (
 
 ### Materializing Derived Facts
 
-After evaluating a Locy program, materialize the results into the graph:
+After evaluating a Locy program at the session level, materialize its writes into the graph. `result.derived_fact_set` holds every write of the program — `DERIVE` output and Cypher write commands, in program order — and `tx.apply` replays them in one transaction. (The program's own later commands already read those writes; see [Commands run in sequence](../locy/rule-semantics.md#commands-run-in-sequence).)
 
 ```python
 result = session.locy(program)
@@ -927,12 +943,12 @@ with session.tx() as tx:
 |------------------|------|-------------|
 | `.derived` | `dict` | Derived relations: `rule_name -> list[dict]` |
 | `.stats` | `LocyStats` | Evaluation statistics |
-| `.command_results` | `list` | QUERY/ABDUCE/EXPLAIN RULE output |
+| `.command_results` | `list` | One result per command; an ASSUME's `AssumeCommandResult` has `.results` (one per body command), `.derived` and `.rows` |
 | `.warnings` | `list` | Runtime warnings |
 | `.approximate_groups` | `list` | Groups with approximate probabilities |
 | `.derived_fact_set` | `DerivedFactSet` | Opaque fact set for `tx.apply()` |
-| `.rows()` | `list \| None` | Rows from the first QUERY command |
-| `.columns()` | `list[str] \| None` | Column names from the first QUERY |
+| `.rows()` | `list \| None` | Rows from the first QUERY or Cypher command, searching an ASSUME's body results depth first |
+| `.columns()` | `list[str] \| None` | Column names of those rows |
 | `.derived_facts(rule)` | `list \| None` | Facts for a specific rule |
 | `.has_warning(code)` | `bool` | Check for a specific warning code |
 | `.iterations` | `int` | Total fixpoint iterations (property) |
@@ -1121,7 +1137,7 @@ result = prepared.execute({"start": "Alice"})
 result = prepared.bind().param("start", "Bob").execute()
 ```
 
-Prepared statements are also available on Transactions via `tx.prepare()` and `tx.prepare_locy()`.
+Prepared statements are also available on Transactions via `tx.prepare()` and `tx.prepare_locy()`. A Locy program prepared on a transaction runs as `tx.locy()` does: it reads the transaction's uncommitted writes and snapshot, and its writes land in the transaction.
 
 ---
 
@@ -1329,7 +1345,27 @@ if result:
 | `.plan_cache_hit` | `bool` | Whether the plan was cached |
 | `.l0_reads` | `int` | In-memory reads |
 | `.storage_reads` | `int` | Persistent storage reads |
-| `.cache_hits` | `int` | Cache hits |
+| `.cache_hits` | `int` | Cache hits (always 0; not populated) |
+| `.branch_scans` | `int` | Scans that executed against a fork's Lance branch |
+| `.snapshot_reads` | `int` | Reads that executed against a pinned snapshot |
+| `.index_scans` | `int` | Lance scans whose executed plan searched a scalar index |
+| `.index_comparisons` | `int` | Index comparisons across those scans |
+| `.scans_reported` | `int` | Lance scans that reported stats (denominator for `index_scans`) |
+| `.lance_iops` | `int` | Lance I/O operations issued (physical reads; moves across a compaction) |
+| `.vector_index_scans` | `int` | Vector searches that consulted a vector index |
+| `.fts_index_scans` | `int` | Full-text searches that consulted an inverted index |
+| `.searches_reported` | `int` | Vector/FTS searches that reported stats (denominator for the two above) |
+| `.subquery_executions` | `int` | Sub-plan executions by per-row fallbacks (a correlated pattern comprehension runs once per outer row) |
+| `.physical_plans` | `int` | Physical plans built: one for the query plus one per execution-time sub-plan |
+| `.physical_plan_time_ms` | `float` | Time building those plans; part of `exec_time_ms`, distinct from `plan_time_ms` |
+| `.shortest_path_searches` | `int` | BFS searches started by `shortestPath`/`allShortestPaths`, one per distinct source |
+| `.shortest_path_adjacency_reads` | `int` | Per-vertex adjacency lookups by `shortestPath`/`allShortestPaths`; bounded by the vertices searched, not the paths emitted |
+
+A counter that grows with the data where it should not is the signal these
+exist for: `physical_plans` growing with the row count is a re-plan per row,
+`shortest_path_searches` growing with the number of targets is a search
+per row, and `shortest_path_adjacency_reads` growing with the length or number
+of returned paths is output re-reading the graph.
 
 ### ExecuteResult
 
@@ -1342,10 +1378,11 @@ Returned by `tx.execute()`.
 | `.nodes_deleted` | `int` | Nodes deleted |
 | `.relationships_created` | `int` | Relationships created |
 | `.relationships_deleted` | `int` | Relationships deleted |
-| `.properties_set` | `int` | Properties set |
-| `.labels_added` | `int` | Labels added |
-| `.labels_removed` | `int` | Labels removed |
-| `.metrics` | `dict` | Execution metrics |
+| `.properties_set` | `int` | Properties added, or overwritten with a different value (`+properties`) |
+| `.properties_removed` | `int` | Properties removed by `REMOVE`, set to null, or overwritten; not the properties of a deleted node or relationship (as in Neo4j) |
+| `.labels_added` | `int` | Labels added, counted per node (see [Write Counters](../guides/cypher-querying.md#write-counters)) |
+| `.labels_removed` | `int` | Labels removed, counted per node |
+| `.metrics` | `dict` | Execution metrics, with the same keys as `QueryMetrics` |
 
 ### CommitResult
 
@@ -1456,6 +1493,11 @@ print(f"Total time: {profile.total_time_ms}ms")
 print(f"Peak memory: {profile.peak_memory_bytes} bytes")
 print(profile.plan_text)   # Plan with actual row counts
 print(profile.operators)   # Per-operator statistics
+
+# Planning cost. Logical planning happens before execution and is not part of
+# total_time_ms; physical planning (including execution-time sub-plans) is.
+print(profile.logical_planning_ms, profile.physical_planning_ms)
+print(profile.physical_plans)  # 1 + one per execution-time sub-plan
 ```
 
 ### Locy EXPLAIN
@@ -1468,6 +1510,21 @@ print(f"Strata: {explain.strata_count}")
 print(f"Rules: {explain.rule_names}")
 print(f"Recursive: {explain.has_recursive_strata}")
 print(f"Commands: {explain.command_count}")
+```
+
+### Locy PROFILE
+
+```python
+result, profile = session.locy_with(program).profile()
+
+print(profile)  # readable stratum -> rule -> iteration report
+for stratum in profile.strata:
+    for rule in stratum["rules"]:
+        for it in rule["iterations"]:
+            # Clause bodies are re-planned every fixpoint pass; planning_ms and
+            # plans are that rule's physical planning in that iteration.
+            print(rule["name"], it["iteration"], it["delta_facts"],
+                  it["elapsed_ms"], it["planning_ms"], it["plans"])
 ```
 
 ---
@@ -1484,8 +1541,11 @@ snapshot_id = db.create_snapshot("before-migration")
 for snap in db.list_snapshots():
     print(snap.snapshot_id, snap.name, snap.created_at, snap.version_hwm)
 
-# Restore to a snapshot
+# Restore to a snapshot (data and schema)
 db.restore_snapshot(snapshot_id)
+
+# Delete a snapshot; compaction then reclaims the versions only it kept
+db.delete_snapshot(snapshot_id)
 ```
 
 ### Time-Travel Reads
@@ -1512,6 +1572,7 @@ session.refresh()
 snapshot_id = await db.create_snapshot("pre-migration")
 snapshots = await db.list_snapshots()
 await db.restore_snapshot(snapshot_id)
+await db.delete_snapshot(snapshot_id)
 ```
 
 `SnapshotInfo` fields: `snapshot_id`, `name`, `created_at`, `version_hwm`.
@@ -1589,6 +1650,7 @@ except uni_db.UniError as e:
 |-----------|-------------|
 | `UniMemoryLimitExceededError` | Query exceeded memory limit |
 | `UniTimeoutError` | Operation timed out |
+| `UniRegexBacktrackLimitError` | A `=~` match exceeded `regex_backtrack_limit`; carries `pattern` and `limit` |
 
 **Access Control:**
 

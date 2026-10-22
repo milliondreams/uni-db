@@ -21,17 +21,18 @@ Cancelling the token attached to an evaluation aborts it with `UniError::Cancell
 ## Operational Limits (via `LocyConfig`)
 
 - `max_iterations`: recursion cap per recursive stratum.
-- `timeout`: overall evaluation budget. When set, it also replaces the database `query_timeout` for the program's operators, whether above or below it.
+- `timeout`: overall evaluation budget. When set, it also replaces the database `query_timeout` for the program's operators, whether above or below it. It covers the whole program: the evaluations it runs again after a write, ASSUME bodies and ABDUCE candidates share what remains of it, and every command runs within it.
 - `max_derived_bytes`: derived fact memory bound.
 - `max_explain_depth`: derivation tree depth bound.
 - `max_slg_depth`: deprecated, no effect (QUERY reads the fixpoint's facts); setting it warns, and it will be removed.
+- `goal_directed`: `Off` (default) derives every rule in full; `On` answers a `QUERY` whose WHERE pins a node KEY column by deriving only what it reaches, and leaves rules only such goals needed out of `.derived`; `Shadow` does the rewrite but keeps `.derived` complete. From Python, pass the lowercase string `"off"` / `"on"` / `"shadow"`.
 - `max_abduce_candidates` / `max_abduce_results`: abduction search bounds.
 - `deterministic_best_by`: enforce deterministic tie-breaking in `BEST BY` clauses.
 - `strict_probability_domain`: reject probability inputs outside `[0, 1]` instead of clamping.
 - `probability_epsilon`: MPROD threshold for switching to log-space accumulation.
 - `exact_probability`: enable BDD-based exact evaluation for shared-proof aggregate groups.
 - `max_bdd_variables`: cap per-group BDD complexity before fallback.
-- `top_k_proofs`: limit proof enumeration per aggregate group (controls memory/CPU for large proof spaces).
+- `top_k_proofs`: keep at most `k` recorded derivations per derived fact for `EXPLAIN RULE`, the heaviest first (0 keeps all). A derivation's weight, its `proof_probability`, is its own PROB value: its local weight times every probability it referenced.
 
 ## Warning Codes
 
@@ -44,6 +45,7 @@ Locy has two warning channels. **Runtime warnings** (`RuntimeWarningCode`) surfa
 - `CrossGroupCorrelationNotExact`: shared evidence spans multiple aggregate groups; each group is exact internally, but correlation across groups is still approximate.
 - `FuzzyNotProbabilistic`: `LocyConfig.semiring = MaxMinProb` is active and a rule emits `PROB`. Fuzzy-truth math is being applied to a column declared as a probability; either pick the right semiring or drop the `PROB` annotation.
 - `TopKPruningCrossedDependency`: under `TopKProofs(k)`, pruning dropped a proof that shared a base fact with a kept proof. The kept set is an approximation; increase `k` for exactness.
+- `ProbabilityReadNotFactor`: a clause's `PROB` expression reads the probability of a positive `IS` reference other than as one product factor (`1 - p`, `p * p`). The referenced probability is not multiplied in again, and exact mode treats each such row as one independent event. See [Probabilistic Logic](../advanced/probabilistic-logic.md#positive-is-references-to-a-prob-rule).
 
 ### Compile-time warnings (`compile_warnings`)
 

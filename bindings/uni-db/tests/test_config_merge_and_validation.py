@@ -69,6 +69,10 @@ def test_every_accepted_key_is_accepted(tmp_path):
         "fork_default_ttl": timedelta(hours=1),
         "fork_sweeper_interval": timedelta(seconds=30),
         "disable_fork_sweeper": True,
+        "vector_knn_default_k": 500,
+        "regex_backtrack_limit": 5000,
+        "lance_metadata_cache_bytes": 64 * 1024 * 1024,
+        "lance_index_cache_bytes": None,
     }
     # One at a time, so a failure names the key rather than the whole dict.
     for key, value in accepted.items():
@@ -138,3 +142,129 @@ def test_the_last_write_to_one_setting_wins(tmp_path):
     assert not _rejects_undeclared_label(db), (
         "the later write to strict_schema did not win"
     )
+
+
+# --- vector_knn_default_k -----------------------------------------------------
+
+
+def _knn_db(tmp_path, name, config):
+    db = _builder(tmp_path, name).config(config).build()
+    db.schema().label("Doc").property("id", "int").vector("emb", 2).done().apply()
+    session = db.session()
+    tx = session.tx()
+    for i in range(10):
+        tx.execute(f"CREATE (:Doc {{id: {i}, emb: [1.0, {i / 10}]}})")
+    tx.commit()
+    return db, session
+
+
+def test_vector_knn_default_k_sizes_an_unlimited_search(tmp_path):
+    """The key is honoured, not merely accepted: an `~=` search no LIMIT sizes
+    returns `vector_knn_default_k` rows and warns that it stopped there."""
+    db, session = _knn_db(tmp_path, "k3", {"vector_knn_default_k": 3})
+    assert db.config()["vector_knn_default_k"] == 3
+    result = session.query("MATCH (d:Doc) WHERE d.emb ~= [1.0, 0.0] RETURN d.id")
+    assert sorted(row["d.id"] for row in result) == [0, 1, 2]
+    assert any("vector_knn_default_k" in w.message for w in result.warnings), (
+        result.warnings
+    )
+    # A LIMIT the search feeds directly sizes it instead, with no warning.
+    result = session.query(
+        "MATCH (d:Doc) WHERE d.emb ~= [1.0, 0.0] RETURN d.id LIMIT 5"
+    )
+    assert [row["d.id"] for row in result] == [0, 1, 2, 3, 4]
+    assert not any("vector_knn_default_k" in w.message for w in result.warnings)
+
+
+def test_vector_knn_default_k_larger_than_the_label_does_not_warn(tmp_path):
+    _db, session = _knn_db(tmp_path, "k50", {"vector_knn_default_k": 50})
+    result = session.query("MATCH (d:Doc) WHERE d.emb ~= [1.0, 0.0] RETURN d.id")
+    assert len(result) == 10
+    assert not any("vector_knn_default_k" in w.message for w in result.warnings)
+
+
+# --- Lance session cache sizing ---------------------------------------------
+
+_LANCE_CAP = 16 * 1024
+
+
+def _lance_cache_bytes(tmp_path, name, config):
+    """Run a flush-and-read workload; return `(metadata, index)` cache bytes.
+
+    Each flush writes a new Lance version whose metadata the next read caches,
+    and the indexed lookup opens the scalar index, so uncapped both caches
+    grow past `_LANCE_CAP`.
+    """
+    builder = _builder(tmp_path, name)
+    if config:
+        builder = builder.config(config)
+    db = builder.build()
+    (
+        db.schema()
+        .label("Doc")
+        .property("n", "int")
+        .property("title", "string")
+        .index("n", "btree")
+        .done()
+        .apply()
+    )
+    session = db.session()
+    for r in range(12):
+        tx = session.tx()
+        tx.execute(
+            f"UNWIND range(1, 50) AS i CREATE (:Doc {{n: {r} * 100 + i, title: 'doc'}})"
+        )
+        tx.commit()
+        db.flush()
+        session.query(f"MATCH (d:Doc) WHERE d.n = {r * 100 + 7} RETURN d.title")
+        session.query("MATCH (d:Doc) RETURN count(d)")
+    m = db.metrics()
+    return db, m.storage_metadata_cache_bytes, m.storage_index_cache_bytes
+
+
+def test_lance_cache_caps_reach_the_storage_engine(tmp_path):
+    """The keys are honoured, not merely accepted: the live cache occupancy
+    stays under the cap. The uncapped run is what makes that discriminating --
+    it shows the same workload overflows the cap without it."""
+    _db, meta, index = _lance_cache_bytes(tmp_path, "uncapped", None)
+    assert meta > _LANCE_CAP and index > _LANCE_CAP, (meta, index)
+
+    db, meta, index = _lance_cache_bytes(
+        tmp_path,
+        "capped",
+        {
+            "lance_metadata_cache_bytes": _LANCE_CAP,
+            "lance_index_cache_bytes": _LANCE_CAP,
+        },
+    )
+    assert meta <= _LANCE_CAP, meta
+    assert index <= _LANCE_CAP, index
+    assert db.config()["lance_metadata_cache_bytes"] == _LANCE_CAP
+    assert db.config()["lance_index_cache_bytes"] == _LANCE_CAP
+
+
+def test_lance_cache_keys_default_to_none(tmp_path):
+    db = _builder(tmp_path).build()
+    assert db.config()["lance_metadata_cache_bytes"] is None
+    assert db.config()["lance_index_cache_bytes"] is None
+
+
+# --- regex_backtrack_limit ----------------------------------------------------
+
+# Exponential for a backtracking matcher; the look-ahead routes it there.
+_CATASTROPHIC = "(?:(a+)+)+b(?=)"
+_REGEX_QUERY = "RETURN 'aaaaaaaaaaaa' =~ '" + _CATASTROPHIC + "' AS r"
+
+
+def test_regex_backtrack_limit_raises_the_typed_error(tmp_path):
+    """A small limit refuses a match the default answers, with a typed error
+    that carries the pattern and the limit."""
+    default_db = _builder(tmp_path, "default").build()
+    assert default_db.session().query(_REGEX_QUERY).rows[0].get("r") is False
+
+    db = _builder(tmp_path, "small").config({"regex_backtrack_limit": 50}).build()
+    assert db.config()["regex_backtrack_limit"] == 50
+    with pytest.raises(uni_db.UniRegexBacktrackLimitError) as info:
+        db.session().query(_REGEX_QUERY)
+    assert info.value.pattern == _CATASTROPHIC
+    assert info.value.limit == 50

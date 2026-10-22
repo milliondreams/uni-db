@@ -7,7 +7,6 @@ use crate::query::expr_eval::{
     eval_binary_op, eval_in_op, eval_scalar_function, eval_vector_similarity,
 };
 use crate::query::planner::{LogicalPlan, QueryPlanner};
-use crate::query::pushdown::LanceFilterGenerator;
 use crate::types::Value;
 use anyhow::{Result, anyhow};
 
@@ -59,9 +58,7 @@ use datafusion::physical_plan::ExecutionPlanProperties;
 use datafusion::prelude::SessionContext;
 use parking_lot::RwLock as SyncRwLock;
 
-use arrow_array::{Array, RecordBatch};
-use csv;
-use parquet;
+use arrow_array::RecordBatch;
 
 use super::core::*;
 
@@ -69,27 +66,6 @@ use super::core::*;
 const EDGE_SYSTEM_FIELD_COUNT: usize = 5;
 /// Number of system fields on a vertex map: `_vid`, `_label`, `_uid`.
 const VERTEX_SYSTEM_FIELD_COUNT: usize = 3;
-
-/// Collect VIDs from all L0 buffers visible to a query context.
-///
-/// Applies `extractor` to each L0 buffer (main, transaction, pending flush) and
-/// collects the results. Returns an empty vec when no query context is present.
-fn collect_l0_vids(
-    ctx: Option<&QueryContext>,
-    extractor: impl Fn(&uni_store::runtime::l0::L0Buffer) -> Vec<Vid>,
-) -> Vec<Vid> {
-    let mut vids = Vec::new();
-    if let Some(ctx) = ctx {
-        vids.extend(extractor(&ctx.l0.read()));
-        if let Some(tx_l0_arc) = &ctx.transaction_l0 {
-            vids.extend(extractor(&tx_l0_arc.read()));
-        }
-        for pending_l0_arc in &ctx.pending_flush_l0s {
-            vids.extend(extractor(&pending_l0_arc.read()));
-        }
-    }
-    vids
-}
 
 /// Hydrate an entity map (vertex or edge) with properties if not already loaded.
 ///
@@ -245,7 +221,7 @@ fn merge_dotted_columns(row: &mut HashMap<String, Value>, var: &str) {
     for key in dotted_keys {
         let prop_name = key[prefix.len()..].to_string();
         let val = row.remove(&key);
-        if prop_name.starts_with('_') || prop_name == "overflow_json" {
+        if uni_common::core::schema::is_reserved_property_name(&prop_name) {
             continue;
         }
         if let (Some(val), Some(Value::Map(map))) = (val, row.get_mut(var)) {
@@ -263,15 +239,6 @@ fn merge_dotted_columns(row: &mut HashMap<String, Value>, var: &str) {
 /// execution path of every statement.
 static DUMP_PHYSICAL_PLAN: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("UNI_DUMP_PHYSICAL").is_ok());
-
-/// Rows per batched property read when exporting a whole label or edge type.
-///
-/// The export loops used to issue one property read per row (#220). Reading the
-/// whole label in one call would remove the round-trips but hold every row's
-/// properties at once, so the CSV path would stop streaming; chunking gets the
-/// batched read with the residency bounded instead. Matches the 10 000 used by
-/// the vertex and edge read paths.
-const EXPORT_BATCH: usize = 10_000;
 
 /// The DataFusion session configuration a query runs under.
 ///
@@ -292,122 +259,6 @@ pub fn datafusion_session_config(
 }
 
 impl Executor {
-    /// Helper to verify and filter candidates against an optional predicate.
-    ///
-    /// Deduplicates candidates, loads properties, and evaluates the filter expression.
-    /// Returns only VIDs that pass the filter (or are not deleted).
-    async fn verify_and_filter_candidates(
-        &self,
-        mut candidates: Vec<Vid>,
-        variable: &str,
-        filter: Option<&Expr>,
-        ctx: Option<&QueryContext>,
-        prop_manager: &PropertyManager,
-        params: &HashMap<String, Value>,
-    ) -> Result<Vec<Vid>> {
-        candidates.sort_unstable();
-        candidates.dedup();
-
-        // One batched read rather than one round-trip per candidate (#220).
-        // A vid absent from the map is the batched spelling of the singular
-        // form's `None`: deleted, or present in neither L0 nor storage. A live
-        // vertex carrying no properties is still returned, with an empty map —
-        // measured, because the two forms disagreeing on that would silently
-        // drop rows here rather than merely slow them down.
-        let props_by_vid = prop_manager
-            .get_batch_vertex_props(&candidates, &["_all_props"], ctx)
-            .await?;
-
-        let mut verified_vids = Vec::new();
-        for vid in candidates {
-            let Some(props) = props_by_vid.get(&vid).cloned() else {
-                continue; // Deleted
-            };
-
-            if let Some(expr) = filter {
-                // Labels are deliberately empty: the map form this replaced
-                // carried no `_labels` either, so a label predicate answered
-                // false then and answers false now.
-                let mut row = HashMap::new();
-                row.insert(
-                    variable.to_string(),
-                    Value::Node(uni_common::Node {
-                        vid,
-                        labels: Vec::new(),
-                        properties: props,
-                    }),
-                );
-
-                let res = self
-                    .evaluate_expr(expr, &row, prop_manager, params, ctx)
-                    .await?;
-                if res.as_bool().unwrap_or(false) {
-                    verified_vids.push(vid);
-                }
-            } else {
-                verified_vids.push(vid);
-            }
-        }
-
-        Ok(verified_vids)
-    }
-
-    pub(crate) async fn scan_storage_candidates(
-        &self,
-        label_id: u16,
-        variable: &str,
-        filter: Option<&Expr>,
-    ) -> Result<Vec<Vid>> {
-        let schema = self.storage.schema_manager().schema();
-        let label_name = schema
-            .label_name_by_id(label_id)
-            .ok_or_else(|| anyhow!("Label ID {} not found", label_id))?;
-
-        // Generate filter SQL from expression
-        let empty_props = std::collections::HashMap::new();
-        let label_props = schema.properties.get(label_name).unwrap_or(&empty_props);
-        // `sql_pushable` because this predicate is handed to a SQL backend, and
-        // `generate_expr` may include a pattern the dialect cannot render. The
-        // weakening is sound here: the caller (`scan_label_with_filter`)
-        // re-evaluates the full `filter` per row in `verify_and_filter_candidates`.
-        let pushed = filter.map(|expr| {
-            LanceFilterGenerator::generate_expr(
-                std::slice::from_ref(expr),
-                variable,
-                Some(label_props),
-            )
-            .sql_pushable()
-        });
-        let pushed = pushed.filter(|f| !f.is_trivially_true());
-
-        self.storage
-            .scan_vertex_candidates(label_name, pushed.as_ref())
-            .await
-    }
-
-    pub(crate) async fn scan_label_with_filter(
-        &self,
-        label_id: u16,
-        variable: &str,
-        filter: Option<&Expr>,
-        ctx: Option<&QueryContext>,
-        prop_manager: &PropertyManager,
-        params: &HashMap<String, Value>,
-    ) -> Result<Vec<Vid>> {
-        let mut candidates = self
-            .scan_storage_candidates(label_id, variable, filter)
-            .await?;
-
-        // Convert label_id to label_name for L0 lookup
-        let schema = self.storage.schema_manager().schema();
-        if let Some(label_name) = schema.label_name_by_id(label_id) {
-            candidates.extend(collect_l0_vids(ctx, |l0| l0.vids_for_label(label_name)));
-        }
-
-        self.verify_and_filter_candidates(candidates, variable, filter, ctx, prop_manager, params)
-            .await
-    }
-
     /// The VID a value denotes, as an entity or as a raw id.
     ///
     /// This is the write path's lenient reader — `SET`, `DELETE` and the
@@ -551,7 +402,15 @@ impl Executor {
                         .build();
                     SessionContext::new_with_state(state)
                 }
-                None => (**tmpl).clone(),
+                // A fresh state, not a clone of the template's handle: the
+                // query registers its own `_cypher_regex` below, which must
+                // not reach the shared template.
+                None => SessionContext::new_with_state(
+                    datafusion::execution::session_state::SessionStateBuilder::new_from_existing(
+                        tmpl.state(),
+                    )
+                    .build(),
+                ),
             }
         } else {
             // Cold path: build a fresh session, optionally with any
@@ -661,6 +520,7 @@ impl Executor {
         // the sense that `take_graph_ctx` preserves it either way — but it must
         // be here at all, or every operator-level count is dropped.
         planner = planner.with_counters(Some(self.counters.clone()));
+        planner = planner.with_vector_knn_default_k(self.config.vector_knn_default_k);
         // The deadline and token live on the `QueryContext` built above; without
         // this hop they never reach a physical operator and every
         // `graph_ctx.check_timeout()` below is a no-op. See #207.
@@ -704,6 +564,21 @@ impl Executor {
         if let Some(writer) = &self.writer {
             planner = planner.with_writer(Arc::clone(writer));
         }
+
+        // `=~` evaluates under this query's backtrack limit and budget. The
+        // UDF instance carries them because DataFusion runs partitions on
+        // spawned tasks, which no task-local reaches.
+        let budget = planner.graph_ctx().budget();
+        let interrupt: uni_query_functions::expr_eval::RegexInterrupt =
+            Arc::new(move || budget.check().err().map(|e| e.to_string()));
+        session_ctx.read().register_udf(
+            uni_query_functions::df_udfs::create_cypher_regex_udf_with_runtime(Arc::new(
+                uni_query_functions::expr_eval::RegexRuntime::new(
+                    self.config.regex_backtrack_limit,
+                    Some(interrupt),
+                ),
+            )),
+        );
 
         Ok((session_ctx, planner, prop_manager_arc))
     }
@@ -1499,7 +1374,6 @@ impl Executor {
             LogicalPlan::Set { .. } => "write_set",
             LogicalPlan::Remove { .. } => "write_remove",
             LogicalPlan::ProcedureCall { .. } => "call",
-            LogicalPlan::Copy { .. } => "copy",
             LogicalPlan::Backup { .. } => "backup",
             _ => "other",
         }
@@ -1612,6 +1486,7 @@ impl Executor {
             | LogicalPlan::LocyProgram { .. }
             | LogicalPlan::LocyDerivedScan { .. }
             | LogicalPlan::Empty
+            | LogicalPlan::OuterRow { .. }
             | LogicalPlan::CreateVectorIndex { .. }
             | LogicalPlan::CreateSparseIndex { .. }
             | LogicalPlan::CreateFullTextIndex { .. }
@@ -1619,7 +1494,6 @@ impl Executor {
             | LogicalPlan::CreateJsonFtsIndex { .. }
             | LogicalPlan::DropIndex { .. }
             | LogicalPlan::ShowIndexes { .. }
-            | LogicalPlan::Copy { .. }
             | LogicalPlan::Backup { .. }
             | LogicalPlan::CopyTo { .. }
             | LogicalPlan::CopyFrom { .. }
@@ -1674,7 +1548,6 @@ impl Executor {
             | LogicalPlan::ShowStatistics
             | LogicalPlan::Vacuum
             | LogicalPlan::Checkpoint
-            | LogicalPlan::Copy { .. }
             | LogicalPlan::CopyTo { .. }
             | LogicalPlan::CopyFrom { .. }
             | LogicalPlan::Backup { .. }
@@ -1684,6 +1557,25 @@ impl Executor {
             // everything else (DDL, admin, unknown) stays on fallback.
             LogicalPlan::ProcedureCall { procedure_name, .. } => {
                 !self.is_df_eligible_procedure(procedure_name)
+            }
+
+            // A procedure called with an input row (`MATCH … CALL p(…) YIELD …`).
+            // The fallback executor reads the rows around it without entity
+            // semantics — `RETURN a` gave the VID, `labels(a)` and an edge's
+            // properties NULL — and ran the call once over an empty input, so
+            // any procedure the DataFusion operator can dispatch runs there.
+            // Only the procedures the fallback alone implements stay here.
+            LogicalPlan::Apply {
+                input, subquery, ..
+            } => {
+                self.is_ddl_or_admin(input)
+                    || match subquery.as_ref() {
+                        LogicalPlan::ProcedureCall { procedure_name, .. } => {
+                            !self.is_df_eligible_procedure(procedure_name)
+                                && !self.is_df_dispatchable_procedure(procedure_name)
+                        }
+                        other => self.is_ddl_or_admin(other),
+                    }
             }
 
             // Recurse through children using plan_children
@@ -1756,6 +1648,21 @@ impl Executor {
             .as_ref()
             .and_then(|reg| reg.resolve_user_algorithm(name))
             .is_some_and(|entry| entry.provider.signature().df_composable)
+    }
+
+    /// Whether the DataFusion procedure operator can dispatch `name`.
+    ///
+    /// `GraphProcedureCallExec` resolves a procedure through the same three
+    /// registries the fallback consults after its built-in admin and DDL
+    /// procedures: plugin procedures, algorithm providers, and the TCK mock
+    /// registry. A name none of them holds is one of those built-ins, or
+    /// unknown.
+    fn is_df_dispatchable_procedure(&self, name: &str) -> bool {
+        self.procedure_registry.as_ref().is_some_and(|reg| {
+            reg.resolve_user_procedure(name).is_some()
+                || reg.resolve_user_algorithm(name).is_some()
+                || reg.get(name).is_some()
+        })
     }
 
     /// Check if a plan contains write/mutation operations anywhere in the tree.
@@ -1834,18 +1741,6 @@ impl Executor {
             .boxed()
     }
 
-    /// Converts an Arrow array element at a given row index to a Value.
-    /// Delegates to the shared implementation in arrow_convert module.
-    /// Decode one Arrow cell into a `Value` for the query layer.
-    ///
-    /// An entity struct becomes its native form rather than a map. The storage
-    /// decoder this delegates to is shared with `uni-store`, which has its own
-    /// contract, so the conversion belongs here on the query side rather than
-    /// down there (#234).
-    pub(crate) fn arrow_to_value(col: &dyn Array, row: usize) -> Result<Value> {
-        Ok(arrow_convert::arrow_to_value(col, row, None)?.canonical_entity())
-    }
-
     pub(crate) fn evaluate_expr<'a>(
         &'a self,
         expr: &'a Expr,
@@ -1915,7 +1810,11 @@ impl Executor {
                         Ok(params.get(name).cloned().unwrap_or(Value::Null))
                     }
                 }
-                Expr::Parameter(name) => Ok(params.get(name).cloned().unwrap_or(Value::Null)),
+                // A parameter the caller did not supply is an error, never a
+                // NULL: a write would store or overwrite with that NULL.
+                Expr::Parameter(name) => params.get(name).cloned().ok_or_else(|| {
+                    anyhow!(uni_common::UniError::parameter_missing_message([name]))
+                }),
                 Expr::Property(var_expr, prop_name) => {
                     // Fast path: if the base is a Variable, try flat-key lookup first.
                     // DataFusion scan results use flat keys like "d.embedding" rather than
@@ -2000,8 +1899,9 @@ impl Executor {
                         if let Some(val) = map.get(prop_name.as_str()) {
                             return Ok(val.clone());
                         }
-                        // Then check inside "properties" object (for user properties)
-                        if let Some(Value::Map(props)) = map.get("properties")
+                        // Then the entity's property container (`_all_props`, or a
+                        // serialised entity's `properties`)
+                        if let Some(props) = uni_common::value::entity_property_container(map)
                             && let Some(val) = props.get(prop_name.as_str())
                         {
                             return Ok(val.clone());
@@ -2119,6 +2019,23 @@ impl Executor {
                             ));
                         }
                     }
+                    // A declared `VECTOR` reads back as `Value::Vector`; it
+                    // indexes like the list of floats it was written as.
+                    if let Value::Vector(vec) = &arr_val {
+                        if let Some(i) = idx_val.as_i64() {
+                            let idx = if i < 0 { vec.len() as i64 + i } else { i };
+                            return Ok(usize::try_from(idx)
+                                .ok()
+                                .and_then(|i| vec.get(i))
+                                .map_or(Value::Null, |f| Value::Float(f64::from(*f))));
+                        } else if idx_val.is_null() {
+                            return Ok(Value::Null);
+                        }
+                        return Err(anyhow::anyhow!(
+                            "TypeError: InvalidArgumentType - list index must be an integer, got: {:?}",
+                            idx_val
+                        ));
+                    }
                     if let Value::Map(map) = &arr_val {
                         if let Some(key) = idx_val.as_str() {
                             return Ok(map.get(key).cloned().unwrap_or(Value::Null));
@@ -2189,9 +2106,14 @@ impl Executor {
                     ))
                 }
                 Expr::ArraySlice { array, start, end } => {
-                    let arr_val = this
+                    let mut arr_val = this
                         .evaluate_expr(array, row, prop_manager, params, ctx)
                         .await?;
+                    // A `VECTOR` slices like its list of floats, into a list.
+                    if let Value::Vector(vec) = &arr_val {
+                        arr_val =
+                            Value::List(vec.iter().map(|f| Value::Float(f64::from(*f))).collect());
+                    }
 
                     if let Value::List(arr) = &arr_val {
                         let len = arr.len();
@@ -2460,6 +2382,34 @@ impl Executor {
                                 .await?;
                             eval_binary_op(&l_val, op, &r_val)
                         }
+                        BinaryOp::Regex => {
+                            let l_val = this
+                                .evaluate_expr(left, row, prop_manager, params, ctx)
+                                .await?;
+                            let r_val = this
+                                .evaluate_expr(right, row, prop_manager, params, ctx)
+                                .await?;
+                            // `=~` under this query's backtrack limit, deadline
+                            // and cancellation.
+                            let deadline = ctx.and_then(|c| c.deadline);
+                            let token = ctx.and_then(|c| c.cancellation_token.clone());
+                            let interrupt: uni_query_functions::expr_eval::RegexInterrupt =
+                                Arc::new(move || {
+                                    crate::query::df_graph::common::check_deadline(
+                                        token.as_ref(),
+                                        deadline,
+                                    )
+                                    .err()
+                                    .map(|e| e.to_string())
+                                });
+                            let runtime =
+                                Arc::new(uni_query_functions::expr_eval::RegexRuntime::new(
+                                    this.config.regex_backtrack_limit,
+                                    Some(interrupt),
+                                ));
+                            uni_query_functions::expr_eval::REGEX_RUNTIME
+                                .sync_scope(runtime, || eval_binary_op(&l_val, op, &r_val))
+                        }
                         _ => {
                             // For all other operators, evaluate both sides
                             let l_val = this
@@ -2497,8 +2447,14 @@ impl Executor {
                             }
                         }
                         UnaryOp::Neg => {
-                            if let Some(i) = val.as_i64() {
-                                Ok(Value::Int(-i))
+                            // `-null` is null, like every other arithmetic
+                            // operator on a null operand.
+                            if val.is_null() {
+                                Ok(Value::Null)
+                            } else if let Some(i) = val.as_i64() {
+                                i.checked_neg().map(Value::Int).ok_or_else(|| {
+                                    anyhow!("ArithmeticError: integer overflow negating {i}")
+                                })
                             } else if let Some(f) = val.as_f64() {
                                 Ok(Value::Float(-f))
                             } else {
@@ -2933,9 +2889,9 @@ impl Executor {
                                 }
                             }
                             MapProjectionItem::AllProperties => {
-                                // Include all properties except internal fields (those starting with _)
+                                // Include all properties except the engine's reserved fields
                                 for (key, value) in properties.iter() {
-                                    if !key.starts_with('_') {
+                                    if !uni_common::core::schema::is_reserved_property_name(key) {
                                         result_map.insert(key.clone(), value.clone());
                                     }
                                 }
@@ -3083,7 +3039,7 @@ impl Executor {
                     options,
                 } => {
                     let count = self
-                        .execute_copy_to(&label, &path, &format, &options)
+                        .execute_copy_to(&label, &path, &format, &options, prop_manager, params)
                         .await?;
                     let mut result = HashMap::new();
                     result.insert("count".to_string(), Value::Int(count as i64));
@@ -3486,20 +3442,6 @@ impl Executor {
                 LogicalPlan::Delete { .. } => {
                     unreachable!("mutations are handled by DataFusion engine")
                 }
-                LogicalPlan::Copy {
-                    target,
-                    source,
-                    is_export,
-                    options,
-                } => {
-                    if is_export {
-                        self.execute_export(&target, &source, &options, prop_manager, ctx)
-                            .await
-                    } else {
-                        self.execute_copy(&target, &source, &options, prop_manager)
-                            .await
-                    }
-                }
                 LogicalPlan::Backup {
                     destination,
                     options,
@@ -3520,6 +3462,20 @@ impl Executor {
                     unreachable!("mutations are handled by DataFusion engine")
                 }
                 LogicalPlan::Empty => Ok(vec![HashMap::new()]),
+                // This executor runs no correlated operator, so nothing binds an
+                // import to an outer row: each is its same-named parameter.
+                LogicalPlan::OuterRow { variables } => {
+                    let projections = variables
+                        .iter()
+                        .map(|v| (Expr::Parameter(v.name.clone()), Some(v.name.clone())))
+                        .collect();
+                    let project = LogicalPlan::Project {
+                        input: Box::new(LogicalPlan::Empty),
+                        projections,
+                    };
+                    self.execute_subplan(project, prop_manager, params, ctx)
+                        .await
+                }
                 LogicalPlan::BindZeroLengthPath { .. } => {
                     unreachable!("BindZeroLengthPath is handled by DataFusion engine")
                 }
@@ -3728,8 +3684,10 @@ impl Executor {
                     } else {
                         "inf:-".to_string()
                     }
-                } else if f.fract() == 0.0 && *f >= i64::MIN as f64 && *f <= i64::MAX as f64 {
-                    format!("n:{}", *f as i64)
+                } else if let Some(i) = uni_common::f64_to_exact_i64(*f) {
+                    // Exact: the bound `f <= i64::MAX as f64` admitted `2^63`,
+                    // which the cast saturated into `i64::MAX`'s key.
+                    format!("n:{i}")
                 } else {
                     format!("f:{f}")
                 }
@@ -4324,6 +4282,14 @@ impl Executor {
                     self.evaluate_expr(&args[0], row, prop_manager, params, ctx)
                         .await?
                 };
+                if accs[i].wants_percentile()
+                    && let Some(p) = args.get(1)
+                {
+                    let p = self
+                        .evaluate_expr(p, row, prop_manager, params, ctx)
+                        .await?;
+                    accs[i].set_percentile(&p)?;
+                }
                 accs[i].update(&val, is_wildcard)?;
             }
         }
@@ -4748,583 +4714,6 @@ impl Executor {
         Ok(())
     }
 
-    pub(crate) async fn execute_copy(
-        &self,
-        target: &str,
-        source: &str,
-        options: &HashMap<String, Value>,
-        prop_manager: &PropertyManager,
-    ) -> Result<Vec<HashMap<String, Value>>> {
-        let format = options
-            .get("format")
-            .and_then(|v| v.as_str())
-            .unwrap_or_else(|| {
-                if source.ends_with(".parquet") {
-                    "parquet"
-                } else {
-                    "csv"
-                }
-            });
-
-        match format.to_lowercase().as_str() {
-            "csv" => self.execute_csv_import(target, source, options).await,
-            "parquet" => {
-                self.execute_parquet_import(target, source, options, prop_manager)
-                    .await
-            }
-            _ => Err(anyhow!("Unsupported format: {}", format)),
-        }
-    }
-
-    /// Resolve a COPY target to its label / edge-type metadata.
-    ///
-    /// Exactly one of the two is `Some` in practice; the error covers the
-    /// "neither" case so callers can branch on `label_meta` directly.
-    fn resolve_copy_target<'s>(
-        schema: &'s uni_common::core::schema::Schema,
-        target: &str,
-    ) -> Result<(
-        Option<&'s uni_common::core::schema::LabelMeta>,
-        Option<&'s uni_common::core::schema::EdgeTypeMeta>,
-    )> {
-        let label_meta = schema.labels.get(target);
-        let edge_meta = schema.edge_types.get(target);
-
-        if label_meta.is_none() && edge_meta.is_none() {
-            return Err(anyhow!("Target '{}' not found in schema", target));
-        }
-        Ok((label_meta, edge_meta))
-    }
-
-    /// Parse the CSV `delimiter` / `header` COPY options, returning
-    /// `(delimiter, has_header)`.
-    fn csv_dialect(options: &HashMap<String, Value>) -> (u8, bool) {
-        let delimiter_str = options
-            .get("delimiter")
-            .and_then(|v| v.as_str())
-            .unwrap_or(",");
-        let delimiter = if delimiter_str.is_empty() {
-            b','
-        } else {
-            delimiter_str.as_bytes()[0]
-        };
-        let has_header = options
-            .get("header")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
-        (delimiter, has_header)
-    }
-
-    pub(crate) async fn execute_csv_import(
-        &self,
-        target: &str,
-        source: &str,
-        options: &HashMap<String, Value>,
-    ) -> Result<Vec<HashMap<String, Value>>> {
-        // Validate source path against sandbox
-        let validated_source = self.validate_path(source)?;
-
-        let writer_lock = self
-            .writer
-            .as_ref()
-            .ok_or_else(|| anyhow!("COPY requires a Writer"))?;
-
-        let schema = self.storage.schema_manager().schema();
-
-        // 1. Determine if target is Label or EdgeType
-        let (label_meta, edge_meta) = Self::resolve_copy_target(&schema, target)?;
-
-        // 2. Open CSV
-        let (delimiter, has_header) = Self::csv_dialect(options);
-
-        let mut rdr = csv::ReaderBuilder::new()
-            .delimiter(delimiter)
-            .has_headers(has_header)
-            .from_path(&validated_source)?;
-
-        let headers = rdr.headers()?.clone();
-        let mut count = 0;
-
-        let writer: &uni_store::Writer = writer_lock.as_ref();
-
-        // Chunked VID/EID refill for streaming CSV: amortizes the IdAllocator
-        // mutex over `CSV_ID_CHUNK` rows. End-of-iteration may waste up to
-        // CSV_ID_CHUNK-1 IDs — harmless in the u64 space.
-        const CSV_ID_CHUNK: usize = 256;
-
-        if label_meta.is_some() {
-            let target_props = schema
-                .properties
-                .get(target)
-                .ok_or_else(|| anyhow!("Properties for label '{}' not found", target))?;
-
-            let mut vid_chunk: std::collections::VecDeque<Vid> =
-                std::collections::VecDeque::with_capacity(CSV_ID_CHUNK);
-            for result in rdr.records() {
-                let record = result?;
-                let mut props = HashMap::new();
-
-                for (i, header) in headers.iter().enumerate() {
-                    if let Some(val_str) = record.get(i)
-                        && let Some(prop_meta) = target_props.get(header)
-                    {
-                        let val = self.parse_csv_value(val_str, &prop_meta.r#type, header)?;
-                        props.insert(header.to_string(), val);
-                    }
-                }
-
-                if vid_chunk.is_empty() {
-                    vid_chunk.extend(writer.allocate_vids(CSV_ID_CHUNK).await?);
-                }
-                let vid = vid_chunk.pop_front().unwrap();
-                writer
-                    .insert_vertex_with_labels(vid, props, &[target.to_string()], None)
-                    .await?;
-                count += 1;
-            }
-        } else if let Some(meta) = edge_meta {
-            let type_id = meta.id;
-            let target_props = schema
-                .properties
-                .get(target)
-                .ok_or_else(|| anyhow!("Properties for edge type '{}' not found", target))?;
-
-            // For edges, we need src and dst VIDs.
-            // Expecting columns '_src' and '_dst' or as specified in options.
-            let src_col = options
-                .get("src_col")
-                .and_then(|v| v.as_str())
-                .unwrap_or("_src");
-            let dst_col = options
-                .get("dst_col")
-                .and_then(|v| v.as_str())
-                .unwrap_or("_dst");
-
-            let mut eid_chunk: std::collections::VecDeque<Eid> =
-                std::collections::VecDeque::with_capacity(CSV_ID_CHUNK);
-            for result in rdr.records() {
-                let record = result?;
-                let mut props = HashMap::new();
-                let mut src_vid = None;
-                let mut dst_vid = None;
-
-                for (i, header) in headers.iter().enumerate() {
-                    if let Some(val_str) = record.get(i) {
-                        if header == src_col {
-                            src_vid =
-                                Some(Self::vid_from_value(&Value::String(val_str.to_string()))?);
-                        } else if header == dst_col {
-                            dst_vid =
-                                Some(Self::vid_from_value(&Value::String(val_str.to_string()))?);
-                        } else if let Some(prop_meta) = target_props.get(header) {
-                            let val = self.parse_csv_value(val_str, &prop_meta.r#type, header)?;
-                            props.insert(header.to_string(), val);
-                        }
-                    }
-                }
-
-                let src =
-                    src_vid.ok_or_else(|| anyhow!("Missing source VID in column '{}'", src_col))?;
-                let dst = dst_vid
-                    .ok_or_else(|| anyhow!("Missing destination VID in column '{}'", dst_col))?;
-
-                if eid_chunk.is_empty() {
-                    eid_chunk.extend(writer.allocate_eids(CSV_ID_CHUNK).await?);
-                }
-                let eid = eid_chunk.pop_front().unwrap();
-                writer
-                    .insert_edge(
-                        src,
-                        dst,
-                        type_id,
-                        eid,
-                        props,
-                        Some(target.to_string()),
-                        None,
-                    )
-                    .await?;
-                count += 1;
-            }
-        }
-
-        let mut res = HashMap::new();
-        res.insert("count".to_string(), Value::Int(count as i64));
-        Ok(vec![res])
-    }
-
-    /// Imports data from Parquet file to a label or edge type.
-    ///
-    /// Supports local filesystem and cloud URLs (s3://, gs://, az://).
-    pub(crate) async fn execute_parquet_import(
-        &self,
-        target: &str,
-        source: &str,
-        options: &HashMap<String, Value>,
-        _prop_manager: &PropertyManager,
-    ) -> Result<Vec<HashMap<String, Value>>> {
-        let writer_lock = self
-            .writer
-            .as_ref()
-            .ok_or_else(|| anyhow!("COPY requires a Writer"))?;
-
-        let schema = self.storage.schema_manager().schema();
-
-        // 1. Determine if target is Label or EdgeType
-        let (label_meta, edge_meta) = Self::resolve_copy_target(&schema, target)?;
-
-        // 2. Open Parquet - support both local and cloud URLs
-        let reader = if is_cloud_url(source) {
-            self.open_parquet_from_cloud(source).await?
-        } else {
-            // Validate local source path against sandbox
-            let validated_source = self.validate_path(source)?;
-            let file = std::fs::File::open(&validated_source)?;
-            let builder =
-                parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)?;
-            builder.build()?
-        };
-        let mut reader = reader;
-
-        let mut count = 0;
-        let writer: &uni_store::Writer = writer_lock.as_ref();
-
-        if label_meta.is_some() {
-            let target_props = schema
-                .properties
-                .get(target)
-                .ok_or_else(|| anyhow!("Properties for label '{}' not found", target))?;
-
-            for batch in reader.by_ref() {
-                let batch = batch?;
-                let num_rows = batch.num_rows();
-                // Pre-allocate one VID per row in one IdAllocator mutex acquisition.
-                let vids = writer.allocate_vids(num_rows).await?;
-                for (row, &vid) in vids.iter().enumerate().take(num_rows) {
-                    let mut props = HashMap::new();
-                    for field in batch.schema().fields() {
-                        let name = field.name();
-                        if target_props.contains_key(name) {
-                            let col = batch.column_by_name(name).unwrap();
-                            if !col.is_null(row) {
-                                // Look up Uni DataType from schema for proper DateTime/Time decoding
-                                let data_type = target_props.get(name).map(|pm| &pm.r#type);
-                                let val =
-                                    arrow_convert::arrow_to_value(col.as_ref(), row, data_type)?
-                                        .canonical_entity();
-                                props.insert(name.clone(), val);
-                            }
-                        }
-                    }
-                    writer
-                        .insert_vertex_with_labels(vid, props, &[target.to_string()], None)
-                        .await?;
-                    count += 1;
-                }
-            }
-        } else if let Some(meta) = edge_meta {
-            let type_id = meta.id;
-            let target_props = schema
-                .properties
-                .get(target)
-                .ok_or_else(|| anyhow!("Properties for edge type '{}' not found", target))?;
-
-            let src_col = options
-                .get("src_col")
-                .and_then(|v| v.as_str())
-                .unwrap_or("_src");
-            let dst_col = options
-                .get("dst_col")
-                .and_then(|v| v.as_str())
-                .unwrap_or("_dst");
-
-            for batch in reader {
-                let batch = batch?;
-                let num_rows = batch.num_rows();
-                // Pre-allocate one EID per row in one IdAllocator mutex acquisition.
-                let eids = writer.allocate_eids(num_rows).await?;
-                for (row, &eid) in eids.iter().enumerate().take(num_rows) {
-                    let mut props = HashMap::new();
-                    let mut src_vid = None;
-                    let mut dst_vid = None;
-
-                    for field in batch.schema().fields() {
-                        let name = field.name();
-                        let col = batch.column_by_name(name).unwrap();
-                        if col.is_null(row) {
-                            continue;
-                        }
-
-                        if name == src_col {
-                            let val = Self::arrow_to_value(col.as_ref(), row)?;
-                            src_vid = Some(Self::vid_from_value(&val)?);
-                        } else if name == dst_col {
-                            let val = Self::arrow_to_value(col.as_ref(), row)?;
-                            dst_vid = Some(Self::vid_from_value(&val)?);
-                        } else if let Some(pm) = target_props.get(name) {
-                            // Look up Uni DataType from schema for proper DateTime/Time decoding
-                            let val =
-                                arrow_convert::arrow_to_value(col.as_ref(), row, Some(&pm.r#type))?
-                                    .canonical_entity();
-                            props.insert(name.clone(), val);
-                        }
-                    }
-
-                    let src = src_vid
-                        .ok_or_else(|| anyhow!("Missing source VID in column '{}'", src_col))?;
-                    let dst = dst_vid.ok_or_else(|| {
-                        anyhow!("Missing destination VID in column '{}'", dst_col)
-                    })?;
-
-                    writer
-                        .insert_edge(
-                            src,
-                            dst,
-                            type_id,
-                            eid,
-                            props,
-                            Some(target.to_string()),
-                            None,
-                        )
-                        .await?;
-                    count += 1;
-                }
-            }
-        }
-
-        let mut res = HashMap::new();
-        res.insert("count".to_string(), Value::Int(count as i64));
-        Ok(vec![res])
-    }
-
-    /// Opens a Parquet file from a cloud URL.
-    ///
-    /// Downloads the file to memory and creates a Parquet reader.
-    async fn open_parquet_from_cloud(
-        &self,
-        source_url: &str,
-    ) -> Result<parquet::arrow::arrow_reader::ParquetRecordBatchReader> {
-        use object_store::ObjectStoreExt;
-
-        let (store, path) = build_store_from_url(source_url)?;
-
-        // Download file contents
-        let bytes = store.get(&path).await?.bytes().await?;
-
-        // Create a Parquet reader from the bytes
-        let reader = bytes::Bytes::from(bytes.to_vec());
-        let builder =
-            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(reader)?;
-        Ok(builder.build()?)
-    }
-
-    pub(crate) async fn scan_edge_type(
-        &self,
-        edge_type: &str,
-        ctx: Option<&QueryContext>,
-    ) -> Result<Vec<(uni_common::core::id::Eid, Vid, Vid)>> {
-        let mut edges: HashMap<uni_common::core::id::Eid, (Vid, Vid)> = HashMap::new();
-
-        // 1. Scan L2 (Base)
-        self.scan_edge_type_l2(edge_type, &mut edges).await?;
-
-        // 2. Scan L1 (Delta)
-        self.scan_edge_type_l1(edge_type, &mut edges).await?;
-
-        // 3. Scan L0 (Memory) and filter tombstoned vertices
-        if let Some(ctx) = ctx {
-            self.scan_edge_type_l0(edge_type, ctx, &mut edges);
-            self.filter_tombstoned_vertex_edges(ctx, &mut edges);
-        }
-
-        Ok(edges
-            .into_iter()
-            .map(|(eid, (src, dst))| (eid, src, dst))
-            .collect())
-    }
-
-    /// Scan L2 (base) storage for edges of a given type.
-    ///
-    /// Note: Edges are now stored exclusively in delta datasets (L1) via LanceDB.
-    /// This L2 scan will typically find no data.
-    pub(crate) async fn scan_edge_type_l2(
-        &self,
-        _edge_type: &str,
-        _edges: &mut HashMap<uni_common::core::id::Eid, (Vid, Vid)>,
-    ) -> Result<()> {
-        // Edges are now stored in delta datasets (L1) via LanceDB.
-        // Legacy L2 base edge storage is no longer used.
-        Ok(())
-    }
-
-    /// Scan L1 (delta) storage for edges of a given type.
-    pub(crate) async fn scan_edge_type_l1(
-        &self,
-        edge_type: &str,
-        edges: &mut HashMap<uni_common::core::id::Eid, (Vid, Vid)>,
-    ) -> Result<()> {
-        if let Ok(Some(batch)) = self
-            .storage
-            .scan_delta_table_counted(
-                edge_type,
-                "fwd",
-                &["eid", "src_vid", "dst_vid", "op", "_version"],
-                None,
-                // Counted so an edge scan reaches `scans_reported`; see
-                // `docs/perf/index-scan-counter-2026-08-27.md`.
-                Some(&self.counters),
-            )
-            .await
-        {
-            // Collect ops with versions: eid -> (version, op, src, dst)
-            let mut versioned_ops: HashMap<uni_common::core::id::Eid, (u64, u8, Vid, Vid)> =
-                HashMap::new();
-
-            self.process_delta_batch(&batch, &mut versioned_ops)?;
-
-            // Apply the winning ops
-            for (eid, (_, op, src, dst)) in versioned_ops {
-                if op == 0 {
-                    edges.insert(eid, (src, dst));
-                } else if op == 1 {
-                    edges.remove(&eid);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Process a delta batch, tracking versioned operations.
-    pub(crate) fn process_delta_batch(
-        &self,
-        batch: &arrow_array::RecordBatch,
-        versioned_ops: &mut HashMap<uni_common::core::id::Eid, (u64, u8, Vid, Vid)>,
-    ) -> Result<()> {
-        use arrow_array::UInt64Array;
-        let eid_col = batch
-            .column_by_name("eid")
-            .ok_or(anyhow!("Missing eid"))?
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or(anyhow!("Invalid eid"))?;
-        let src_col = batch
-            .column_by_name("src_vid")
-            .ok_or(anyhow!("Missing src_vid"))?
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or(anyhow!("Invalid src_vid"))?;
-        let dst_col = batch
-            .column_by_name("dst_vid")
-            .ok_or(anyhow!("Missing dst_vid"))?
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or(anyhow!("Invalid dst_vid"))?;
-        let op_col = batch
-            .column_by_name("op")
-            .ok_or(anyhow!("Missing op"))?
-            .as_any()
-            .downcast_ref::<arrow_array::UInt8Array>()
-            .ok_or(anyhow!("Invalid op"))?;
-        let version_col = batch
-            .column_by_name("_version")
-            .ok_or(anyhow!("Missing _version"))?
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or(anyhow!("Invalid _version"))?;
-
-        for i in 0..batch.num_rows() {
-            let eid = uni_common::core::id::Eid::from(eid_col.value(i));
-            let version = version_col.value(i);
-            let op = op_col.value(i);
-            let src = Vid::from(src_col.value(i));
-            let dst = Vid::from(dst_col.value(i));
-
-            match versioned_ops.entry(eid) {
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert((version, op, src, dst));
-                }
-                std::collections::hash_map::Entry::Occupied(mut e) => {
-                    if version > e.get().0 {
-                        e.insert((version, op, src, dst));
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Scan L0 (memory) buffers for edges of a given type.
-    pub(crate) fn scan_edge_type_l0(
-        &self,
-        edge_type: &str,
-        ctx: &QueryContext,
-        edges: &mut HashMap<uni_common::core::id::Eid, (Vid, Vid)>,
-    ) {
-        let schema = self.storage.schema_manager().schema();
-        let type_id = schema.edge_types.get(edge_type).map(|m| m.id);
-
-        if let Some(type_id) = type_id {
-            // Main L0
-            self.scan_single_l0(&ctx.l0.read(), type_id, edges);
-
-            // Transaction L0
-            if let Some(tx_l0_arc) = &ctx.transaction_l0 {
-                self.scan_single_l0(&tx_l0_arc.read(), type_id, edges);
-            }
-
-            // Pending flush L0s
-            for pending_l0_arc in &ctx.pending_flush_l0s {
-                self.scan_single_l0(&pending_l0_arc.read(), type_id, edges);
-            }
-        }
-    }
-
-    /// Scan a single L0 buffer for edges and apply tombstones.
-    pub(crate) fn scan_single_l0(
-        &self,
-        l0: &uni_store::runtime::L0Buffer,
-        type_id: u32,
-        edges: &mut HashMap<uni_common::core::id::Eid, (Vid, Vid)>,
-    ) {
-        for edge_entry in l0.graph.edges() {
-            if edge_entry.edge_type == type_id {
-                edges.insert(edge_entry.eid, (edge_entry.src_vid, edge_entry.dst_vid));
-            }
-        }
-        // Process Tombstones
-        let eids_to_check: Vec<_> = edges.keys().cloned().collect();
-        for eid in eids_to_check {
-            if l0.is_tombstoned(eid) {
-                edges.remove(&eid);
-            }
-        }
-    }
-
-    /// Filter out edges connected to tombstoned vertices.
-    pub(crate) fn filter_tombstoned_vertex_edges(
-        &self,
-        ctx: &QueryContext,
-        edges: &mut HashMap<uni_common::core::id::Eid, (Vid, Vid)>,
-    ) {
-        let l0 = ctx.l0.read();
-        let mut all_vertex_tombstones = l0.vertex_tombstones.clone();
-
-        // Include tx_l0 vertex tombstones if present
-        if let Some(tx_l0_arc) = &ctx.transaction_l0 {
-            let tx_l0 = tx_l0_arc.read();
-            all_vertex_tombstones.extend(tx_l0.vertex_tombstones.iter().cloned());
-        }
-
-        // Include pending flush L0 vertex tombstones
-        for pending_l0_arc in &ctx.pending_flush_l0s {
-            let pending_l0 = pending_l0_arc.read();
-            all_vertex_tombstones.extend(pending_l0.vertex_tombstones.iter().cloned());
-        }
-
-        edges.retain(|_, (src, dst)| {
-            !all_vertex_tombstones.contains(src) && !all_vertex_tombstones.contains(dst)
-        });
-    }
-
     /// Execute a projection operation.
     pub(crate) async fn execute_project(
         &self,
@@ -5400,13 +4789,10 @@ impl Executor {
             filtered_rows = filtered;
         }
 
-        // Handle empty input: execute subquery once with empty context
-        // This is critical for standalone CALL statements at the beginning of a query
+        // No input rows, no output rows: the subquery runs once per input row.
+        // A standalone CALL is planned as the procedure itself, not an Apply.
         if filtered_rows.is_empty() {
-            let sub_rows = self
-                .execute_subplan(subquery.clone(), prop_manager, params, ctx)
-                .await?;
-            return Ok(sub_rows);
+            return Ok(Vec::new());
         }
 
         let mut results = Vec::new();
@@ -5612,381 +4998,6 @@ impl Executor {
             uni_common::core::schema::IndexDefinition::Scalar(c) => c.name == name,
             _ => false,
         })
-    }
-
-    pub(crate) async fn execute_export(
-        &self,
-        target: &str,
-        source: &str,
-        options: &HashMap<String, Value>,
-        prop_manager: &PropertyManager,
-        ctx: Option<&QueryContext>,
-    ) -> Result<Vec<HashMap<String, Value>>> {
-        let format = options
-            .get("format")
-            .and_then(|v| v.as_str())
-            .unwrap_or("csv")
-            .to_lowercase();
-
-        match format.as_str() {
-            "csv" => {
-                self.execute_csv_export(target, source, options, prop_manager, ctx)
-                    .await
-            }
-            "parquet" => {
-                self.execute_parquet_export(target, source, options, prop_manager, ctx)
-                    .await
-            }
-            _ => Err(anyhow!("Unsupported export format: {}", format)),
-        }
-    }
-
-    pub(crate) async fn execute_csv_export(
-        &self,
-        target: &str,
-        source: &str,
-        options: &HashMap<String, Value>,
-        prop_manager: &PropertyManager,
-        ctx: Option<&QueryContext>,
-    ) -> Result<Vec<HashMap<String, Value>>> {
-        // Validate destination path against sandbox
-        let validated_dest = self.validate_path(source)?;
-
-        let schema = self.storage.schema_manager().schema();
-        let (label_meta, edge_meta) = Self::resolve_copy_target(&schema, target)?;
-
-        let (delimiter, has_header) = Self::csv_dialect(options);
-
-        let mut wtr = csv::WriterBuilder::new()
-            .delimiter(delimiter)
-            .from_path(&validated_dest)?;
-
-        let mut count = 0;
-        // Empty properties map for labels/edge types without registered properties
-        let empty_props = HashMap::new();
-
-        if let Some(meta) = label_meta {
-            let label_id = meta.id;
-            let props_meta = schema.properties.get(target).unwrap_or(&empty_props);
-            let mut prop_names: Vec<_> = props_meta.keys().cloned().collect();
-            prop_names.sort();
-
-            let mut headers = vec!["_vid".to_string()];
-            headers.extend(prop_names.clone());
-
-            if has_header {
-                wtr.write_record(&headers)?;
-            }
-
-            let vids = self
-                .scan_label_with_filter(label_id, "n", None, ctx, prop_manager, &HashMap::new())
-                .await?;
-
-            for chunk in vids.chunks(EXPORT_BATCH) {
-                let props_by_vid = prop_manager
-                    .get_batch_vertex_props_for_label(chunk, target, ctx)
-                    .await?;
-                for vid in chunk {
-                    let props = props_by_vid.get(vid).cloned().unwrap_or_default();
-
-                    let mut row = Vec::with_capacity(headers.len());
-                    row.push(vid.to_string());
-                    for p_name in &prop_names {
-                        let val = props.get(p_name).cloned().unwrap_or(Value::Null);
-                        row.push(self.format_csv_value(val));
-                    }
-                    wtr.write_record(&row)?;
-                    count += 1;
-                }
-            }
-        } else if let Some(meta) = edge_meta {
-            let props_meta = schema.properties.get(target).unwrap_or(&empty_props);
-            let mut prop_names: Vec<_> = props_meta.keys().cloned().collect();
-            prop_names.sort();
-
-            // Headers for Edge: _eid, _src, _dst, _type, ...props
-            let mut headers = vec![
-                "_eid".to_string(),
-                "_src".to_string(),
-                "_dst".to_string(),
-                "_type".to_string(),
-            ];
-            headers.extend(prop_names.clone());
-
-            if has_header {
-                wtr.write_record(&headers)?;
-            }
-
-            let edges = self.scan_edge_type(target, ctx).await?;
-
-            for chunk in edges.chunks(EXPORT_BATCH) {
-                let eids: Vec<Eid> = chunk.iter().map(|(eid, ..)| *eid).collect();
-                let props_by_eid = prop_manager
-                    .get_batch_edge_props_for_type(&eids, target, ctx)
-                    .await?;
-                for (eid, src, dst) in chunk {
-                    let props = props_by_eid.get(eid).cloned().unwrap_or_default();
-
-                    let mut row = Vec::with_capacity(headers.len());
-                    row.push(eid.to_string());
-                    row.push(src.to_string());
-                    row.push(dst.to_string());
-                    row.push(meta.id.to_string());
-
-                    for p_name in &prop_names {
-                        let val = props.get(p_name).cloned().unwrap_or(Value::Null);
-                        row.push(self.format_csv_value(val));
-                    }
-                    wtr.write_record(&row)?;
-                    count += 1;
-                }
-            }
-        }
-
-        wtr.flush()?;
-        let mut res = HashMap::new();
-        res.insert("count".to_string(), Value::Int(count as i64));
-        Ok(vec![res])
-    }
-
-    /// Exports data to Parquet format.
-    ///
-    /// Supports local filesystem and cloud URLs (s3://, gs://, az://).
-    pub(crate) async fn execute_parquet_export(
-        &self,
-        target: &str,
-        destination: &str,
-        _options: &HashMap<String, Value>,
-        prop_manager: &PropertyManager,
-        ctx: Option<&QueryContext>,
-    ) -> Result<Vec<HashMap<String, Value>>> {
-        let schema_manager = self.storage.schema_manager();
-        let schema = schema_manager.schema();
-        let (label_meta, edge_meta) = Self::resolve_copy_target(&schema, target)?;
-
-        let arrow_schema = if label_meta.is_some() {
-            let dataset = self.storage.vertex_dataset(target)?;
-            dataset.get_arrow_schema(&schema)?
-        } else {
-            // Edge Schema
-            let dataset = self.storage.edge_dataset(target, "", "")?;
-            dataset.get_arrow_schema(&schema)?
-        };
-
-        let mut rows: Vec<HashMap<String, uni_common::Value>> = Vec::new();
-
-        if let Some(meta) = label_meta {
-            let label_id = meta.id;
-            let vids = self
-                .scan_label_with_filter(label_id, "n", None, ctx, prop_manager, &HashMap::new())
-                .await?;
-
-            for chunk in vids.chunks(EXPORT_BATCH) {
-                let props_by_vid = prop_manager
-                    .get_batch_vertex_props_for_label(chunk, target, ctx)
-                    .await?;
-                for vid in chunk {
-                    let mut props = props_by_vid.get(vid).cloned().unwrap_or_default();
-
-                    props.insert(
-                        "_vid".to_string(),
-                        uni_common::Value::Int(vid.as_u64() as i64),
-                    );
-                    if !props.contains_key("_uid") {
-                        props.insert(
-                            "_uid".to_string(),
-                            uni_common::Value::List(vec![uni_common::Value::Int(0); 32]),
-                        );
-                    }
-                    props.insert("_deleted".to_string(), uni_common::Value::Bool(false));
-                    props.insert("_version".to_string(), uni_common::Value::Int(1));
-                    rows.push(props);
-                }
-            }
-        } else if edge_meta.is_some() {
-            let edges = self.scan_edge_type(target, ctx).await?;
-            for chunk in edges.chunks(EXPORT_BATCH) {
-                let eids: Vec<Eid> = chunk.iter().map(|(eid, ..)| *eid).collect();
-                let props_by_eid = prop_manager
-                    .get_batch_edge_props_for_type(&eids, target, ctx)
-                    .await?;
-                for (eid, src, dst) in chunk {
-                    let mut props = props_by_eid.get(eid).cloned().unwrap_or_default();
-
-                    props.insert(
-                        "eid".to_string(),
-                        uni_common::Value::Int(eid.as_u64() as i64),
-                    );
-                    props.insert(
-                        "src_vid".to_string(),
-                        uni_common::Value::Int(src.as_u64() as i64),
-                    );
-                    props.insert(
-                        "dst_vid".to_string(),
-                        uni_common::Value::Int(dst.as_u64() as i64),
-                    );
-                    props.insert("_deleted".to_string(), uni_common::Value::Bool(false));
-                    props.insert("_version".to_string(), uni_common::Value::Int(1));
-                    rows.push(props);
-                }
-            }
-        }
-
-        // Write to cloud or local file
-        if is_cloud_url(destination) {
-            self.write_parquet_to_cloud(destination, &rows, &arrow_schema)
-                .await?;
-        } else {
-            // Validate local destination path against sandbox
-            let validated_dest = self.validate_path(destination)?;
-            let file = std::fs::File::create(&validated_dest)?;
-            let mut writer =
-                parquet::arrow::ArrowWriter::try_new(file, arrow_schema.clone(), None)?;
-
-            // Write all in one batch for now (simplification)
-            if !rows.is_empty() {
-                let batch = self.rows_to_batch(&rows, &arrow_schema)?;
-                writer.write(&batch)?;
-            }
-
-            writer.close()?;
-        }
-
-        let mut res = HashMap::new();
-        res.insert("count".to_string(), Value::Int(rows.len() as i64));
-        Ok(vec![res])
-    }
-
-    /// Writes Parquet data to a cloud storage destination.
-    async fn write_parquet_to_cloud(
-        &self,
-        dest_url: &str,
-        rows: &[HashMap<String, uni_common::Value>],
-        arrow_schema: &arrow_schema::Schema,
-    ) -> Result<()> {
-        use object_store::ObjectStoreExt;
-
-        let (store, path) = build_store_from_url(dest_url)?;
-
-        // Write to an in-memory buffer
-        let mut buffer = Vec::new();
-        {
-            let mut writer = parquet::arrow::ArrowWriter::try_new(
-                &mut buffer,
-                Arc::new(arrow_schema.clone()),
-                None,
-            )?;
-
-            if !rows.is_empty() {
-                let batch = self.rows_to_batch(rows, arrow_schema)?;
-                writer.write(&batch)?;
-            }
-
-            writer.close()?;
-        }
-
-        // Upload to cloud storage
-        store.put(&path, bytes::Bytes::from(buffer).into()).await?;
-
-        Ok(())
-    }
-
-    pub(crate) fn rows_to_batch(
-        &self,
-        rows: &[HashMap<String, uni_common::Value>],
-        schema: &arrow_schema::Schema,
-    ) -> Result<RecordBatch> {
-        let mut columns: Vec<Arc<dyn Array>> = Vec::new();
-
-        for field in schema.fields() {
-            let name = field.name();
-            let dt = field.data_type();
-
-            let values: Vec<uni_common::Value> = rows
-                .iter()
-                .map(|row| row.get(name).cloned().unwrap_or(uni_common::Value::Null))
-                .collect();
-            let array = self.values_to_array(&values, dt)?;
-            columns.push(array);
-        }
-
-        Ok(RecordBatch::try_new(Arc::new(schema.clone()), columns)?)
-    }
-
-    /// Convert a slice of Values to an Arrow array.
-    /// Delegates to the shared implementation in arrow_convert module.
-    pub(crate) fn values_to_array(
-        &self,
-        values: &[uni_common::Value],
-        dt: &arrow_schema::DataType,
-    ) -> Result<Arc<dyn Array>> {
-        arrow_convert::values_to_array(values, dt)
-    }
-
-    pub(crate) fn format_csv_value(&self, val: Value) -> String {
-        match val {
-            Value::Null => "".to_string(),
-            Value::String(s) => s,
-            Value::Int(i) => i.to_string(),
-            Value::Float(f) => f.to_string(),
-            Value::Bool(b) => b.to_string(),
-            _ => format!("{val}"),
-        }
-    }
-
-    pub(crate) fn parse_csv_value(
-        &self,
-        s: &str,
-        data_type: &uni_common::core::schema::DataType,
-        prop_name: &str,
-    ) -> Result<Value> {
-        if s.is_empty() || s.to_lowercase() == "null" {
-            return Ok(Value::Null);
-        }
-
-        use uni_common::core::schema::DataType;
-        match data_type {
-            DataType::String => Ok(Value::String(s.to_string())),
-            DataType::Int32 | DataType::Int64 => {
-                let i = s.parse::<i64>().map_err(|_| {
-                    anyhow!(
-                        "Failed to parse integer for property '{}': {}",
-                        prop_name,
-                        s
-                    )
-                })?;
-                Ok(Value::Int(i))
-            }
-            DataType::Float32 | DataType::Float64 => {
-                let f = s.parse::<f64>().map_err(|_| {
-                    anyhow!("Failed to parse float for property '{}': {}", prop_name, s)
-                })?;
-                Ok(Value::Float(f))
-            }
-            DataType::Bool => {
-                let b = s.to_lowercase().parse::<bool>().map_err(|_| {
-                    anyhow!(
-                        "Failed to parse boolean for property '{}': {}",
-                        prop_name,
-                        s
-                    )
-                })?;
-                Ok(Value::Bool(b))
-            }
-            DataType::CypherValue => {
-                let json_val: serde_json::Value = serde_json::from_str(s).map_err(|_| {
-                    anyhow!("Failed to parse JSON for property '{}': {}", prop_name, s)
-                })?;
-                Ok(Value::from(json_val))
-            }
-            DataType::Vector { .. } => {
-                let v: Vec<f32> = serde_json::from_str(s).map_err(|_| {
-                    anyhow!("Failed to parse Vector for property '{}': {}", prop_name, s)
-                })?;
-                Ok(Value::Vector(v))
-            }
-            _ => Ok(Value::String(s.to_string())),
-        }
     }
 
     pub(crate) async fn detach_delete_vertex(

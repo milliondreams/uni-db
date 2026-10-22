@@ -53,9 +53,9 @@ use uni_common::core::id::Vid;
 use uni_common::core::schema::Schema as UniSchema;
 use uni_store::backend::types::{CmpOp, FilterExpr, Scalar};
 use uni_store::runtime::columnar_scan::{
-    build_overflow_property_column, drop_superseded_pushdown_rows, extract_from_overflow_blob,
-    filter_deleted_rows, filter_l0_label_overwrites, filter_l0_tombstones, merge_lance_and_l0,
-    mvcc_dedup_to_option, resolve_l0_property,
+    L0PropertyPrefilter, build_overflow_property_column, drop_superseded_pushdown_rows,
+    extract_from_overflow_blob, filter_deleted_rows, filter_l0_label_overwrites,
+    filter_l0_tombstones, merge_lance_and_l0, mvcc_dedup_to_option, resolve_l0_property,
 };
 pub(crate) use uni_store::runtime::columnar_scan::{
     build_property_column_static, property_field, resolve_property_type,
@@ -108,6 +108,33 @@ impl DynamicVidFilter {
     /// The currently published set, if any.
     pub(crate) fn get(&self) -> Option<Vec<u64>> {
         self.vids.read().clone()
+    }
+}
+
+/// An indexed-property restriction that is not known until another operator
+/// has run — the property counterpart of [`DynamicVidFilter`].
+///
+/// `PropertyLookupJoinExec` materializes its build side, collects the distinct
+/// join-key values, and publishes them here as `prop IN (...)` in both of the
+/// forms the indexed-property pushdown uses: a Lance SQL string, which a scalar
+/// index serves for flushed rows, and an Arrow predicate applied to the merged
+/// (Lance + L0) batch, which is what keeps unflushed rows exact. The scan reads
+/// the slot on each `execute()`; `None` means "no restriction", the arm a large
+/// key set takes.
+#[derive(Debug, Default)]
+pub(crate) struct DynamicPropertyFilter {
+    filter: parking_lot::RwLock<Option<(String, Arc<dyn PhysicalExpr>)>>,
+}
+
+impl DynamicPropertyFilter {
+    /// Publish the restriction the next `execute()` should apply.
+    pub(crate) fn set(&self, filter: Option<(String, Arc<dyn PhysicalExpr>)>) {
+        *self.filter.write() = filter;
+    }
+
+    /// The currently published restriction, if any.
+    pub(crate) fn get(&self) -> Option<(String, Arc<dyn PhysicalExpr>)> {
+        self.filter.read().clone()
     }
 }
 
@@ -179,6 +206,23 @@ pub struct GraphScanExec {
     /// table beats a vid list (#237).
     dynamic_vid_filter: Option<Arc<DynamicVidFilter>>,
 
+    /// An indexed-property restriction published by an operator above at
+    /// `execute()` time. Only `PropertyLookupJoinExec` sets this. When the slot
+    /// holds a filter it is AND-ed onto `extra_lance_filter` /
+    /// `extra_runtime_filter`; an empty slot means "no restriction".
+    dynamic_property_filter: Option<Arc<DynamicPropertyFilter>>,
+
+    /// Equality constraints the scan may use to skip L0 rows that cannot
+    /// match before building them (W3b), set by the planner from the scan's
+    /// Cypher filter, which stays authoritative above the scan.
+    ///
+    /// A schemaless (main-table) scan always reads its L0 prefilter here. The
+    /// per-label path recovers its own from `extra_runtime_filter` and falls
+    /// back to this one when that yields none; the planner sets it there for
+    /// an `ext_id` equality, which is pushed to Lance as SQL only and so has
+    /// no runtime filter to recover a prefilter from.
+    planner_l0_prefilter: Option<L0PropertyPrefilter>,
+
     /// Metrics for execution tracking.
     metrics: ExecutionPlanMetricsSet,
 }
@@ -208,6 +252,22 @@ impl GraphScanExec {
     /// By reference because the caller holds the probe as a `&dyn ExecutionPlan`
     /// downcast, which it cannot move out of.
     pub(crate) fn with_dynamic_vid_filter(&self, slot: Arc<DynamicVidFilter>) -> Self {
+        self.with_dynamic_vid_filter_opt(Some(slot))
+    }
+
+    /// Attach the equality prefilter the scan applies to its L0 rows.
+    ///
+    /// See the `planner_l0_prefilter` field; `None` keeps every L0 row.
+    pub(crate) fn with_planner_l0_prefilter(
+        mut self,
+        prefilter: Option<L0PropertyPrefilter>,
+    ) -> Self {
+        self.planner_l0_prefilter = prefilter;
+        self
+    }
+
+    /// A copy of this scan with fresh metrics and the given vid slot.
+    fn with_dynamic_vid_filter_opt(&self, slot: Option<Arc<DynamicVidFilter>>) -> Self {
         Self {
             graph_ctx: self.graph_ctx.clone(),
             label: self.label.clone(),
@@ -217,13 +277,29 @@ impl GraphScanExec {
             vid_list_filter: self.vid_list_filter.clone(),
             extra_lance_filter: self.extra_lance_filter.clone(),
             extra_runtime_filter: self.extra_runtime_filter.clone(),
-            dynamic_vid_filter: Some(slot),
+            dynamic_vid_filter: slot,
+            dynamic_property_filter: self.dynamic_property_filter.clone(),
+            planner_l0_prefilter: self.planner_l0_prefilter.clone(),
             is_schemaless: self.is_schemaless,
             schema: self.schema.clone(),
             properties: self.properties.clone(),
             fetch: self.fetch,
             metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+
+    /// A copy of this scan carrying a property-restriction slot an operator
+    /// above fills in before executing it. See [`DynamicPropertyFilter`].
+    pub(crate) fn with_dynamic_property_filter(&self, slot: Arc<DynamicPropertyFilter>) -> Self {
+        let mut wired = self.with_dynamic_vid_filter_opt(self.dynamic_vid_filter.clone());
+        wired.dynamic_property_filter = Some(slot);
+        wired
+    }
+
+    /// The label this scan reads, its variable, and whether it reads the
+    /// schemaless main table rather than a per-label table.
+    pub(crate) fn scan_target(&self) -> (&str, &str, bool) {
+        (&self.label, &self.variable, self.is_schemaless)
     }
 
     pub fn with_vid_list_filter(mut self, vids: Vec<u64>) -> Self {
@@ -315,6 +391,8 @@ impl GraphScanExec {
             extra_lance_filter: None,
             extra_runtime_filter: None,
             dynamic_vid_filter: None,
+            dynamic_property_filter: None,
+            planner_l0_prefilter: None,
             is_schemaless: false,
             schema,
             properties,
@@ -365,8 +443,12 @@ impl GraphScanExec {
             .collect();
 
         let uni_schema = graph_ctx.storage().schema_manager().schema();
-        let schema =
-            Self::build_schemaless_vertex_schema(&variable, &projected_properties, &uni_schema);
+        let schema = Self::build_schemaless_vertex_schema(
+            &variable,
+            &label,
+            &projected_properties,
+            &uni_schema,
+        );
         let properties = compute_plan_properties(schema.clone());
 
         Self {
@@ -379,6 +461,8 @@ impl GraphScanExec {
             extra_lance_filter: None,
             extra_runtime_filter: None,
             dynamic_vid_filter: None,
+            dynamic_property_filter: None,
+            planner_l0_prefilter: None,
             is_schemaless: true,
             schema,
             properties,
@@ -433,22 +517,28 @@ impl GraphScanExec {
 
     /// Build schema for schemaless vertex scan.
     ///
-    /// Resolves property types from all labels in the schema. Falls back to
-    /// LargeBinary (CypherValue encoding) for properties not found in any
-    /// label's schema.
+    /// `label` is the scan's label encoding: one label, the colon-joined set
+    /// a vertex must carry all of, or empty for "scan all". A property takes
+    /// a declared type only when one of the scanned labels declares it (and
+    /// those that do agree), since every scanned vertex then carries a label
+    /// whose writes are coerced to that type. Anything else is LargeBinary
+    /// (CypherValue encoding), which keeps each value as it was written.
+    ///
+    /// It used to merge the declarations of every label in the schema by
+    /// property name, so a `v: Float64` declared on one label typed `s.v` on
+    /// an unrelated schemaless label, and an integer stored there read back
+    /// widened: `9007199254740993` as `9007199254740992.0`.
     fn build_schemaless_vertex_schema(
         variable: &str,
+        label: &str,
         properties: &[String],
         uni_schema: &uni_common::core::schema::Schema,
     ) -> SchemaRef {
-        // Merge property metadata from all labels for type resolution.
-        let mut merged: std::collections::HashMap<&str, &uni_common::core::schema::PropertyMeta> =
-            std::collections::HashMap::new();
-        for label_props in uni_schema.properties.values() {
-            for (name, meta) in label_props {
-                merged.entry(name.as_str()).or_insert(meta);
-            }
-        }
+        let scanned: Vec<&str> = label.split(':').filter(|l| !l.is_empty()).collect();
+        let declared = |prop: &str| {
+            uni_schema
+                .scoped_property_meta(uni_common::core::schema::EntityScope::AllOf(&scanned), prop)
+        };
 
         let mut fields = vec![
             Field::new(format!("{}._vid", variable), DataType::UInt64, false),
@@ -457,7 +547,7 @@ impl GraphScanExec {
 
         for prop in properties {
             let col_name = format!("{}.{}", variable, prop);
-            let uni_type = merged.get(prop.as_str()).map(|meta| &meta.r#type);
+            let uni_type = declared(prop.as_str()).map(|meta| &meta.r#type);
             let arrow_type = uni_type
                 .map(|t| t.to_arrow())
                 .unwrap_or(DataType::LargeBinary);
@@ -558,6 +648,35 @@ impl ExecutionPlan for GraphScanExec {
             None => self.vid_list_filter.clone(),
         };
 
+        // A published property restriction narrows whatever the planner pushed
+        // statically; both halves are conjoined so neither can widen the other.
+        let (extra_lance_filter, extra_runtime_filter) = match self
+            .dynamic_property_filter
+            .as_ref()
+            .and_then(|slot| slot.get())
+        {
+            Some((lance, runtime)) => (
+                Some(match &self.extra_lance_filter {
+                    Some(fixed) => format!("({fixed}) AND ({lance})"),
+                    None => lance,
+                }),
+                Some(match &self.extra_runtime_filter {
+                    Some(fixed) => {
+                        Arc::new(datafusion::physical_expr::expressions::BinaryExpr::new(
+                            Arc::clone(fixed),
+                            datafusion::logical_expr::Operator::And,
+                            runtime,
+                        )) as Arc<dyn PhysicalExpr>
+                    }
+                    None => runtime,
+                }),
+            ),
+            None => (
+                self.extra_lance_filter.clone(),
+                self.extra_runtime_filter.clone(),
+            ),
+        };
+
         Ok(Box::pin(GraphScanStream::new(
             self.graph_ctx.clone(),
             self.label.clone(),
@@ -566,14 +685,15 @@ impl ExecutionPlan for GraphScanExec {
             self.is_schemaless,
             self.filter.clone(),
             vid_list_filter,
-            self.extra_lance_filter.clone(),
-            self.extra_runtime_filter.clone(),
+            extra_lance_filter,
+            extra_runtime_filter,
             self.schema.clone(),
             metrics,
             index_consulted,
             context.session_config().batch_size(),
             context.memory_pool(),
             self.fetch,
+            self.planner_l0_prefilter.clone(),
         )))
     }
 
@@ -608,6 +728,8 @@ impl ExecutionPlan for GraphScanExec {
             extra_lance_filter: self.extra_lance_filter.clone(),
             extra_runtime_filter: self.extra_runtime_filter.clone(),
             dynamic_vid_filter: self.dynamic_vid_filter.clone(),
+            dynamic_property_filter: self.dynamic_property_filter.clone(),
+            planner_l0_prefilter: self.planner_l0_prefilter.clone(),
             is_schemaless: self.is_schemaless,
             schema: self.schema.clone(),
             properties: self.properties.clone(),
@@ -877,6 +999,9 @@ struct GraphScanStream {
     /// Arrow-side equivalent of `extra_lance_filter`. See issue #57.
     extra_runtime_filter: Option<Arc<dyn PhysicalExpr>>,
 
+    /// The schemaless scan's L0 equality prefilter (W3b).
+    planner_l0_prefilter: Option<L0PropertyPrefilter>,
+
     /// Output schema.
     schema: SchemaRef,
 
@@ -927,6 +1052,7 @@ impl GraphScanStream {
         slice_size: usize,
         pool: &Arc<dyn MemoryPool>,
         fetch: Option<usize>,
+        planner_l0_prefilter: Option<L0PropertyPrefilter>,
     ) -> Self {
         Self {
             range_target_bytes: range_target_bytes(pool),
@@ -940,6 +1066,7 @@ impl GraphScanStream {
             vid_list_filter,
             extra_lance_filter,
             extra_runtime_filter,
+            planner_l0_prefilter,
             schema,
             state: GraphScanState::Init,
             metrics,
@@ -967,6 +1094,7 @@ impl GraphScanStream {
         let filter = self.filter.clone();
         let extra_lance_filter = self.extra_lance_filter.clone();
         let extra_runtime_filter = self.extra_runtime_filter.clone();
+        let planner_l0_prefilter = self.planner_l0_prefilter.clone();
         let schema = self.schema.clone();
         let index_consulted = self.index_consulted.clone();
 
@@ -985,6 +1113,7 @@ impl GraphScanStream {
                     vid_range,
                     extra_lance_filter.as_deref(),
                     extra_runtime_filter.as_ref(),
+                    planner_l0_prefilter.as_ref(),
                 )
                 .await?
             } else {
@@ -999,6 +1128,7 @@ impl GraphScanStream {
                     vid_range,
                     extra_lance_filter.as_deref(),
                     extra_runtime_filter.as_ref(),
+                    planner_l0_prefilter.as_ref(),
                     Some(&index_consulted),
                 )
                 .await?
@@ -1491,6 +1621,7 @@ pub(crate) async fn prefetch_vids_columnar(
                 None,
                 None,
                 None,
+                None,
             )
             .await?,
         );
@@ -1506,6 +1637,7 @@ pub(crate) async fn prefetch_vids_columnar(
                     &output_schema,
                     &None,
                     Some(chunk),
+                    None,
                     None,
                     None,
                     None,
@@ -1553,9 +1685,10 @@ pub(crate) async fn prefetch_vids_columnar(
 pub(crate) async fn columnar_scan_vertex_batch_static(
     graph_ctx: &GraphExecutionContext,
     label: &str,
-    // Retained so the three call sites are untouched. Column naming is the
-    // caller's `output_schema`, which `map_to_output_schema` maps positionally.
-    _variable: &str,
+    // Column naming is the caller's `output_schema`, which
+    // `map_to_output_schema` maps positionally; the variable only names the
+    // runtime filter's columns, for recovering its equality (W3b).
+    variable: &str,
     projected_properties: &[String],
     output_schema: &SchemaRef,
     filter: &Option<Arc<dyn PhysicalExpr>>,
@@ -1565,6 +1698,9 @@ pub(crate) async fn columnar_scan_vertex_batch_static(
     vid_range: Option<(u64, u64)>,
     extra_lance_filter: Option<&str>,
     extra_runtime_filter: Option<&Arc<dyn PhysicalExpr>>,
+    // Used when `extra_runtime_filter` yields no L0 prefilter: the planner's
+    // own, for a predicate pushed to Lance without a runtime filter (`ext_id`).
+    planner_l0_prefilter: Option<&L0PropertyPrefilter>,
     // Per-node sink for `index_hits`. Separate from the query-level counters
     // because `collect_plan_metrics` reports per operator: copying a
     // query-wide total onto every node would print the same number on a
@@ -1580,6 +1716,11 @@ pub(crate) async fn columnar_scan_vertex_batch_static(
     // multi-VID list comes from the IN-list path (`UNWIND ... WHERE id(x) =
     // e.field`, issue #55 PR #4).
     let target_vid = filter.as_ref().and_then(extract_vid_from_physical_filter);
+    // The runtime filter below stays authoritative; this structured copy only
+    // lets the storage layer skip L0 rows that cannot match (W3b).
+    let l0_prefilter = extra_runtime_filter
+        .and_then(|f| l0_property_prefilter(f, &format!("{variable}.")))
+        .or_else(|| planner_l0_prefilter.cloned());
 
     let mut index_hits = 0usize;
     let mapped = uni_store::runtime::columnar_scan::columnar_scan_vertex_batch(
@@ -1595,6 +1736,7 @@ pub(crate) async fn columnar_scan_vertex_batch_static(
             vid_list_filter,
             vid_range,
             extra_lance_filter,
+            l0_prefilter: l0_prefilter.as_ref(),
         },
         Some(&mut index_hits),
     )
@@ -1608,6 +1750,309 @@ pub(crate) async fn columnar_scan_vertex_batch_static(
     // filtered the on-disk side via `extra_lance_filter`; this catches any
     // L0 rows that slipped through the merge.
     apply_runtime_filter(mapped, extra_runtime_filter)
+}
+
+/// An equality prefilter for a schemaless scan's L0 rows, read from the
+/// scan's Cypher filter (W3b).
+///
+/// A schemaless scan gets no indexed-property runtime filter to recover one
+/// from, so this reads the Cypher predicate directly. Recognized: `AND` (the
+/// first recognized conjunct is used — any one conjunct is a superset of the
+/// conjunction), `{var}.{prop} = v` with `v` a literal or a parameter on
+/// either side, `{var}.{prop} IN` a literal list or a list parameter, and an
+/// `OR` of such on the same property. A NULL value matches nothing, so it is
+/// dropped from the set; a NULL equality is not recognized. Anything else
+/// returns `None`, which keeps every L0 row — a miss costs the old read,
+/// never a row.
+pub(crate) fn schemaless_l0_prefilter(
+    filter: Option<&uni_cypher::ast::Expr>,
+    variable: &str,
+    params: &HashMap<String, Value>,
+) -> Option<L0PropertyPrefilter> {
+    use uni_cypher::ast::{BinaryOp, Expr};
+
+    fn property_of<'e>(e: &'e Expr, variable: &str) -> Option<&'e str> {
+        match e {
+            Expr::Property(base, prop)
+                if matches!(base.as_ref(), Expr::Variable(v) if v == variable)
+                    && !uni_common::core::schema::is_reserved_property_name(prop) =>
+            {
+                Some(prop.as_str())
+            }
+            _ => None,
+        }
+    }
+    fn constant(e: &Expr, params: &HashMap<String, Value>) -> Option<Value> {
+        match e {
+            Expr::Literal(lit) => Some(lit.to_value()),
+            Expr::Parameter(name) => params.get(name).cloned(),
+            _ => None,
+        }
+    }
+    fn leaf(
+        e: &Expr,
+        variable: &str,
+        params: &HashMap<String, Value>,
+    ) -> Option<(String, Vec<Value>)> {
+        match e {
+            Expr::BinaryOp {
+                left,
+                op: BinaryOp::Eq,
+                right,
+            } => {
+                let (prop, value) =
+                    match (property_of(left, variable), property_of(right, variable)) {
+                        (Some(p), None) => (p, constant(right, params)?),
+                        (None, Some(p)) => (p, constant(left, params)?),
+                        _ => return None,
+                    };
+                (!value.is_null()).then(|| (prop.to_string(), vec![value]))
+            }
+            Expr::BinaryOp {
+                left,
+                op: BinaryOp::Or,
+                right,
+            } => {
+                let (lp, mut lv) = leaf(left, variable, params)?;
+                let (rp, rv) = leaf(right, variable, params)?;
+                (lp == rp).then(|| {
+                    lv.extend(rv);
+                    (lp, lv)
+                })
+            }
+            Expr::In { expr, list } => {
+                let prop = property_of(expr, variable)?;
+                let items = match list.as_ref() {
+                    Expr::List(items) => items
+                        .iter()
+                        .map(|i| constant(i, params))
+                        .collect::<Option<Vec<_>>>()?,
+                    other => match constant(other, params)? {
+                        Value::List(items) => items,
+                        _ => return None,
+                    },
+                };
+                Some((
+                    prop.to_string(),
+                    items.into_iter().filter(|v| !v.is_null()).collect(),
+                ))
+            }
+            _ => None,
+        }
+    }
+    fn first(
+        e: &Expr,
+        variable: &str,
+        params: &HashMap<String, Value>,
+    ) -> Option<(String, Vec<Value>)> {
+        match e {
+            Expr::BinaryOp {
+                left,
+                op: BinaryOp::And,
+                right,
+            } => first(left, variable, params).or_else(|| first(right, variable, params)),
+            other => leaf(other, variable, params),
+        }
+    }
+
+    let (property, values) = first(filter?, variable, params)?;
+    Some(L0PropertyPrefilter {
+        property,
+        one_of: Some(values),
+        bounds: Vec::new(),
+    })
+}
+
+/// Recover equality and range constraints on one property from the
+/// indexed-property runtime filter, as an [`L0PropertyPrefilter`] the storage
+/// layer can apply to L0 rows before materializing them (W3b, F1).
+///
+/// The planner builds the runtime filter and the Lance string from the same
+/// indexed conjuncts but hands the scan no structured form, so this reads one
+/// back from the physical expression. Anything not recognized returns `None`,
+/// which keeps the unrestricted L0 read — the failure mode of a miss is the old
+/// cost, never a wrong row. What *is* recognized must describe a superset of
+/// the rows the filter accepts:
+///
+/// * `AND` — the conjuncts are collected and grouped by property; any one
+///   property's constraints, all of them conjoined, are a superset of the
+///   whole conjunction. A property pinned by an equality is preferred, since
+///   it is the most selective; a conjunct not recognized is simply not used;
+/// * `OR` — both sides must pin the same column by equality, and the values
+///   union; a range under an `OR` gives up;
+/// * `<`, `<=`, `>`, `>=` — one side a bare property column, the other a
+///   literal; a literal on the left mirrors the operator;
+/// * the column side must be a bare `Column` named `{prefix}{prop}`: a cast on
+///   it can make unequal stored values compare equal (`CAST(5.5 AS BIGINT)`);
+/// * the literal side may be cast, which is evaluated here exactly as
+///   DataFusion would, and a NULL or non-scalar literal gives up.
+fn l0_property_prefilter(
+    filter: &Arc<dyn PhysicalExpr>,
+    prefix: &str,
+) -> Option<L0PropertyPrefilter> {
+    let mut found: Vec<L0PropertyPrefilter> = Vec::new();
+    collect_l0_conjunct_prefilters(filter, prefix, &mut found);
+    let chosen = found
+        .iter()
+        .find(|f| f.one_of.is_some())
+        .or_else(|| found.first())?
+        .property
+        .clone();
+    let mut merged = L0PropertyPrefilter {
+        property: chosen,
+        one_of: None,
+        bounds: Vec::new(),
+    };
+    for f in found.into_iter().filter(|f| f.property == merged.property) {
+        if merged.one_of.is_none() {
+            merged.one_of = f.one_of;
+        }
+        merged.bounds.extend(f.bounds);
+    }
+    Some(merged)
+}
+
+/// Push one [`L0PropertyPrefilter`] per recognized conjunct of `filter`.
+fn collect_l0_conjunct_prefilters(
+    filter: &Arc<dyn PhysicalExpr>,
+    prefix: &str,
+    out: &mut Vec<L0PropertyPrefilter>,
+) {
+    use datafusion::logical_expr::Operator;
+    use datafusion::physical_expr::expressions::BinaryExpr;
+
+    if let Some(bin) = filter.downcast_ref::<BinaryExpr>()
+        && *bin.op() == Operator::And
+    {
+        collect_l0_conjunct_prefilters(bin.left(), prefix, out);
+        collect_l0_conjunct_prefilters(bin.right(), prefix, out);
+        return;
+    }
+    if let Some(leaf) = l0_leaf_prefilter(filter, prefix) {
+        out.push(leaf);
+    }
+}
+
+/// The prefilter a single non-`AND` conjunct describes, if recognized.
+fn l0_leaf_prefilter(filter: &Arc<dyn PhysicalExpr>, prefix: &str) -> Option<L0PropertyPrefilter> {
+    use datafusion::logical_expr::Operator;
+    use datafusion::physical_expr::expressions::{BinaryExpr, InListExpr};
+
+    let property_of = |e: &Arc<dyn PhysicalExpr>| -> Option<String> {
+        let col = e.downcast_ref::<datafusion::physical_expr::expressions::Column>()?;
+        let prop = col.name().strip_prefix(prefix)?;
+        (!prop.is_empty() && !uni_common::core::schema::is_reserved_property_name(prop))
+            .then(|| prop.to_string())
+    };
+
+    if let Some(bin) = filter.downcast_ref::<BinaryExpr>() {
+        // `(op with the property on the left, op with it on the right)`.
+        let range_ops = match bin.op() {
+            Operator::Lt => Some((CmpOp::Lt, CmpOp::Gt)),
+            Operator::LtEq => Some((CmpOp::LtEq, CmpOp::GtEq)),
+            Operator::Gt => Some((CmpOp::Gt, CmpOp::Lt)),
+            Operator::GtEq => Some((CmpOp::GtEq, CmpOp::LtEq)),
+            _ => None,
+        };
+        if let Some((left_op, right_op)) = range_ops {
+            let (property, op, lit) = match (property_of(bin.left()), property_of(bin.right())) {
+                (Some(p), None) => (p, left_op, bin.right()),
+                (None, Some(p)) => (p, right_op, bin.left()),
+                _ => return None,
+            };
+            return Some(L0PropertyPrefilter {
+                property,
+                one_of: None,
+                bounds: vec![(op, physical_literal_value(lit)?)],
+            });
+        }
+        match bin.op() {
+            Operator::Eq => {
+                let (prop, lit) = match (property_of(bin.left()), property_of(bin.right())) {
+                    (Some(p), None) => (p, bin.right()),
+                    (None, Some(p)) => (p, bin.left()),
+                    _ => return None,
+                };
+                return Some(L0PropertyPrefilter {
+                    property: prop,
+                    one_of: Some(vec![physical_literal_value(lit)?]),
+                    bounds: Vec::new(),
+                });
+            }
+            Operator::Or => {
+                let l = l0_leaf_prefilter(bin.left(), prefix)?;
+                let r = l0_leaf_prefilter(bin.right(), prefix)?;
+                let (Some(mut lv), Some(rv)) = (l.one_of, r.one_of) else {
+                    return None;
+                };
+                if l.property != r.property || !l.bounds.is_empty() || !r.bounds.is_empty() {
+                    return None;
+                }
+                lv.extend(rv);
+                return Some(L0PropertyPrefilter {
+                    property: l.property,
+                    one_of: Some(lv),
+                    bounds: Vec::new(),
+                });
+            }
+            Operator::And => {
+                // Reached only under an `OR`: one side alone is a superset.
+                return l0_leaf_prefilter(bin.left(), prefix)
+                    .or_else(|| l0_leaf_prefilter(bin.right(), prefix));
+            }
+            _ => return None,
+        }
+    }
+    if let Some(in_list) = filter.downcast_ref::<InListExpr>() {
+        if in_list.negated() {
+            return None;
+        }
+        let property = property_of(in_list.expr())?;
+        let values = in_list
+            .list()
+            .iter()
+            .map(physical_literal_value)
+            .collect::<Option<Vec<_>>>()?;
+        return Some(L0PropertyPrefilter {
+            property,
+            one_of: Some(values),
+            bounds: Vec::new(),
+        });
+    }
+    None
+}
+
+/// The value a literal operand (possibly cast) evaluates to, as a [`Value`].
+///
+/// `None` for anything but a non-null boolean, integer, float or string.
+fn physical_literal_value(e: &Arc<dyn PhysicalExpr>) -> Option<Value> {
+    use datafusion::common::ScalarValue;
+    use datafusion::physical_expr::expressions::{CastExpr, Literal};
+
+    let scalar = if let Some(lit) = e.downcast_ref::<Literal>() {
+        lit.value().clone()
+    } else {
+        let cast = e.downcast_ref::<CastExpr>()?;
+        let lit = cast.expr().downcast_ref::<Literal>()?;
+        lit.value().cast_to(cast.cast_type()).ok()?
+    };
+    match scalar {
+        ScalarValue::Utf8(Some(s))
+        | ScalarValue::LargeUtf8(Some(s))
+        | ScalarValue::Utf8View(Some(s)) => Some(Value::String(s)),
+        ScalarValue::Int8(Some(v)) => Some(Value::Int(v.into())),
+        ScalarValue::Int16(Some(v)) => Some(Value::Int(v.into())),
+        ScalarValue::Int32(Some(v)) => Some(Value::Int(v.into())),
+        ScalarValue::Int64(Some(v)) => Some(Value::Int(v)),
+        ScalarValue::UInt8(Some(v)) => Some(Value::Int(v.into())),
+        ScalarValue::UInt16(Some(v)) => Some(Value::Int(v.into())),
+        ScalarValue::UInt32(Some(v)) => Some(Value::Int(v.into())),
+        ScalarValue::UInt64(Some(v)) => i64::try_from(v).ok().map(Value::Int),
+        ScalarValue::Float32(Some(v)) => Some(Value::Float(v.into())),
+        ScalarValue::Float64(Some(v)) => Some(Value::Float(v)),
+        ScalarValue::Boolean(Some(b)) => Some(Value::Bool(b)),
+        _ => None,
+    }
 }
 
 /// Apply the indexed-property runtime filter, if present, to a `RecordBatch`.
@@ -1655,6 +2100,7 @@ async fn columnar_scan_schemaless_vertex_batch_static(
     vid_range: Option<(u64, u64)>,
     extra_lance_filter: Option<&str>,
     extra_runtime_filter: Option<&Arc<dyn PhysicalExpr>>,
+    l0_prefilter: Option<&L0PropertyPrefilter>,
 ) -> DFResult<RecordBatch> {
     let storage = graph_ctx.storage();
     let l0_ctx = graph_ctx.l0_context();
@@ -1813,11 +2259,48 @@ async fn columnar_scan_schemaless_vertex_batch_static(
             SchemalessL0Targets::Vids(vids) => vids.contains(&vid),
             SchemalessL0Targets::Range(lo, hi) => vid >= lo && vid < hi,
             SchemalessL0Targets::All => true,
+            SchemalessL0Targets::Filtered { .. } => {
+                unreachable!("the prefilter narrows the targets after this read")
+            }
         },
         graph_ctx.counters(),
     )
     .await
     .map_err(exec_err)?;
+    // W3b for the main table: skip L0 rows a pushed equality cannot match
+    // before building them. The flushed side has no property pushdown here,
+    // so its vids — every one of them stays — are the shadow set.
+    let kept: Option<HashSet<u64>> = match (l0_prefilter, l0_targets) {
+        (Some(pf), SchemalessL0Targets::All | SchemalessL0Targets::Range(..)) => {
+            let range = match l0_targets {
+                SchemalessL0Targets::Range(lo, hi) => Some((lo, hi)),
+                _ => None,
+            };
+            let shadowed = lance_deduped
+                .as_ref()
+                .and_then(|b| b.column_by_name("_vid"))
+                .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+                .map(|a| a.values().to_vec())
+                .unwrap_or_default();
+            uni_store::runtime::columnar_scan::schemaless_l0_prefilter_candidates(
+                l0_ctx,
+                label,
+                range,
+                pf,
+                &label_only,
+                shadowed,
+            )
+        }
+        _ => None,
+    };
+    let l0_targets = match (&kept, l0_targets) {
+        (Some(vids), SchemalessL0Targets::Range(lo, hi)) => SchemalessL0Targets::Filtered {
+            range: Some((lo, hi)),
+            vids,
+        },
+        (Some(vids), _) => SchemalessL0Targets::Filtered { range: None, vids },
+        (None, t) => t,
+    };
     let l0_batch =
         build_l0_schemaless_vertex_batch(l0_ctx, label, &internal_schema, l0_targets, &label_only)?;
 
@@ -1874,6 +2357,7 @@ async fn columnar_scan_schemaless_vertex_batch_static(
 /// Mirrors `uni_store::runtime::columnar_scan::L0VertexTargets`, which the
 /// labelled path uses; kept local because this builder walks `L0Context`
 /// rather than the store's own buffers.
+#[derive(Clone, Copy)]
 enum SchemalessL0Targets<'a> {
     /// Exactly these vids, from an `id(x) = ?` or `id(x) IN [...]` pushdown.
     Vids(&'a [u64]),
@@ -1881,6 +2365,14 @@ enum SchemalessL0Targets<'a> {
     Range(u64, u64),
     /// Every matching vid.
     All,
+    /// The vids `All` (or `Range`, when `range` is set) selects that are also
+    /// in `vids`: the survivors of an equality prefilter
+    /// (`columnar_scan::schemaless_l0_prefilter_candidates`), each built
+    /// exactly as the unrestricted walk would build it.
+    Filtered {
+        range: Option<(u64, u64)>,
+        vids: &'a HashSet<u64>,
+    },
 }
 
 fn build_l0_schemaless_vertex_batch(
@@ -1935,6 +2427,24 @@ fn build_l0_schemaless_vertex_batch(
                 }
             }
             out
+        } else if let SchemalessL0Targets::Filtered { range, vids } = targets {
+            // Probe the kept set with the unrestricted walk's membership rule.
+            vids.iter()
+                .filter(|raw| range.is_none_or(|(lo, hi)| **raw >= lo && **raw < hi))
+                .map(|raw| Vid::from(*raw))
+                .filter(|vid| {
+                    if label_filter.is_empty() {
+                        guard.vertex_properties.contains_key(vid)
+                    } else {
+                        label_filter.iter().all(|l| {
+                            guard
+                                .label_to_vids
+                                .get(*l)
+                                .is_some_and(|set| set.contains(vid))
+                        })
+                    }
+                })
+                .collect()
         } else {
             let mut selected = if label_filter.is_empty() {
                 guard.all_vertex_vids()
@@ -2694,6 +3204,7 @@ mod tests {
         let empty_schema = uni_common::core::schema::Schema::default();
         let schema = GraphScanExec::build_schemaless_vertex_schema(
             "n",
+            "Person",
             &["name".to_string(), "age".to_string()],
             &empty_schema,
         );
@@ -2712,7 +3223,7 @@ mod tests {
     #[test]
     fn test_schemaless_all_scan_has_empty_label() {
         let empty_schema = uni_common::core::schema::Schema::default();
-        let schema = GraphScanExec::build_schemaless_vertex_schema("n", &[], &empty_schema);
+        let schema = GraphScanExec::build_schemaless_vertex_schema("n", "", &[], &empty_schema);
 
         // Verify the schema has _vid and _labels columns for a scan with no properties
         assert_eq!(schema.fields().len(), 2);

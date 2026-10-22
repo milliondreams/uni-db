@@ -63,6 +63,14 @@ slow-timeout = { period = "60s", terminate-after = 6 }
 filter = 'test(/metamorphic::dqp::topo::topo_rewrites/) or test(flush_wide_smoke)'
 slow-timeout = { period = "60s", terminate-after = 6 }
 
+# `locy_operator_parity_matches_cypher` asks about 10,300 expressions of both
+# Locy and Cypher, each in its own statement: about 90 s alone in a debug
+# build, and 180 s beside the rest of the suite, where the default
+# three-minute ceiling killed it. 6 minutes leaves room without cutting cases.
+[[profile.default.overrides]]
+filter = 'test(locy_operator_parity_matches_cypher)'
+slow-timeout = { period = "60s", terminate-after = 6 }
+
 # CI profile: keep running after failures so one broken test surfaces the
 # full failure set in a single pipeline run. Select with `--profile ci`.
 [profile.ci]
@@ -72,6 +80,14 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 # Mirrored from the default profile; see the rationale there.
 [[profile.ci.overrides]]
 filter = 'test(/metamorphic::dqp::topo::topo_rewrites/) or test(flush_wide_smoke)'
+slow-timeout = { period = "60s", terminate-after = 6 }
+
+# `locy_operator_parity_matches_cypher` asks about 10,300 expressions of both
+# Locy and Cypher, each in its own statement: about 90 s alone in a debug
+# build, and 180 s beside the rest of the suite, where the default
+# three-minute ceiling killed it. 6 minutes leaves room without cutting cases.
+[[profile.ci.overrides]]
+filter = 'test(locy_operator_parity_matches_cypher)'
 slow-timeout = { period = "60s", terminate-after = 6 }
 
 # Mirrored explicitly rather than relying on override inheritance from
@@ -119,4 +135,15 @@ slow-timeout = { period = "120s", terminate-after = 20 }
 # case-kind combination runs at the same volume, so they share the ceiling.
 [[profile.soak.overrides]]
 filter = 'test(/metamorphic::dqp::/) and test(soak)'
+slow-timeout = { period = "120s", terminate-after = 27 }
+
+# The random Locy oracle soak (`uni-locy-oracle` `random_programs_soak`, 5 000
+# generated programs by default) costs about 0.5 s a case, because every case
+# builds its own database and runs each relation twice (as written, and
+# permuted/renamed). Measured alone on a 22-core box: 1 000 cases in 498 s, so
+# the default volume is about 41 minutes, past the soak profile's 40-minute
+# ceiling. It shares the DQP soaks' 54-minute ceiling for the same reason; if it
+# approaches that, cut ORACLE_RANDOM_CASES deliberately rather than bumping this.
+[[profile.soak.overrides]]
+filter = 'test(random_programs_soak)'
 slow-timeout = { period = "120s", terminate-after = 27 }

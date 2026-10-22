@@ -18,6 +18,11 @@
 //! - `Company { name (NOT NULL), founded? }` — 4 rows, `founded` NULL on 1.
 //! - `(:Person)-[:WORKS_AT]->(:Company)` — 10 edges; two Persons are edge-less
 //!   so relationship patterns drop them (exercised, not a bug).
+//! - `Pad` — [`PAD_NODES`] property-less nodes no generated query names. They
+//!   exist so that every `age` value is also a **live VID**: a VID-vs-integer
+//!   confusion (an integer column joined against `_vid`, issue #300's kind
+//!   axis) then binds a real node and returns rows instead of hiding behind
+//!   an empty result. The fixture test asserts the collision exists.
 
 use uni_db::{DataType, Uni};
 
@@ -26,6 +31,12 @@ use uni_db::{DataType, Uni};
 /// Several Persons sit exactly on it so off-by-one partitioning (`<` vs `<=`)
 /// is caught.
 pub const AGE_BOUNDARY: i64 = 30;
+
+/// Property-less `Pad` nodes created after the Persons and Companies.
+///
+/// With 16 labelled nodes first, VIDs `0..16 + PAD_NODES` are live, which
+/// covers the largest present `age` (65) with a few to spare.
+pub const PAD_NODES: i64 = 54;
 
 /// Write statements seeding the fixed graph, executed in one transaction.
 ///
@@ -91,6 +102,8 @@ pub async fn build_seed() -> anyhow::Result<Uni> {
     for stmt in SEED_STATEMENTS {
         tx.execute(stmt).await?;
     }
+    tx.execute(&format!("UNWIND range(1, {PAD_NODES}) AS i CREATE (:Pad)"))
+        .await?;
     tx.commit().await?;
     Ok(db)
 }
@@ -154,6 +167,18 @@ mod tests {
             .await?,
             2,
             "city NULL on 2 persons"
+        );
+        // Every one of the 7 distinct present ages (18, 22, 25, 30, 40, 50,
+        // 65) is also the VID of a live node, so a VID-vs-integer confusion
+        // returns rows rather than nothing.
+        assert_eq!(
+            scalar_count(
+                &db,
+                "MATCH (p:Person), (n) WHERE id(n) = p.age RETURN count(DISTINCT p.age) AS c"
+            )
+            .await?,
+            7,
+            "every present age must collide with a live VID"
         );
         Ok(())
     }

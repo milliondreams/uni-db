@@ -67,6 +67,41 @@ pub struct PyQueryMetrics {
     /// Vector and full-text searches for which the stats callback fired — the
     /// denominator for the two counters above.
     pub searches_reported: u64,
+    /// Lance I/O operations issued by the query's scans.
+    ///
+    /// Counts physical reads, so it moves across a compaction (fewer
+    /// fragments, fewer reads) and is sensitive to caching. Do not read it as
+    /// "did this query touch storage".
+    pub lance_iops: u64,
+    /// Sub-plan executions performed by per-row expression fallbacks.
+    ///
+    /// An unanchored pattern comprehension plans once and executes per outer
+    /// row; a count that grows with the row count while the answer does not
+    /// depend on the row is recomputation.
+    pub subquery_executions: u64,
+    /// Physical plans built while answering this query.
+    ///
+    /// One for the query's own plan plus one per sub-plan built at execution
+    /// time (a correlated subquery body per outer row, a Locy clause body per
+    /// fixpoint iteration). A count that grows with the data is a re-plan per
+    /// row or per iteration.
+    pub physical_plans: u64,
+    /// Wall time spent building those physical plans, in milliseconds.
+    ///
+    /// Distinct from `plan_time_ms`, which is the logical planning done before
+    /// execution; this is measured inside execution and so is also part of
+    /// `exec_time_ms`.
+    pub physical_plan_time_ms: f64,
+    /// Breadth-first searches started by `shortestPath` / `allShortestPaths`.
+    ///
+    /// One per distinct source searched from; a count that grows with the
+    /// number of targets is a search per row.
+    pub shortest_path_searches: u64,
+    /// Per-vertex adjacency lookups made by `shortestPath` /
+    /// `allShortestPaths`.
+    ///
+    /// Bounded by the vertices searched, not by the paths emitted.
+    pub shortest_path_adjacency_reads: u64,
 }
 
 #[pymethods]
@@ -259,9 +294,10 @@ impl PyNode {
     }
 
     fn __getitem__(&self, py: Python<'_>, key: &str) -> PyResult<Py<PyAny>> {
-        // Deprecated magic-key backward compatibility
+        // Deprecated magic-key backward compatibility. `_id` is not a reserved
+        // property name, so a stored `_id` property wins over the alias.
         match key {
-            "_id" => {
+            "_id" if !self.properties.contains_key(key) => {
                 deprecation_warning(py, "Node['_id'] is deprecated, use Node.id")?;
                 return self.id.into_py_any(py);
             }
@@ -417,8 +453,9 @@ impl PyEdge {
     }
 
     fn __getitem__(&self, py: Python<'_>, key: &str) -> PyResult<Py<PyAny>> {
+        // A stored `_id` property wins over the deprecated alias.
         match key {
-            "_id" => {
+            "_id" if !self.properties.contains_key(key) => {
                 deprecation_warning(py, "Edge['_id'] is deprecated, use Edge.id")?;
                 return self.id.into_py_any(py);
             }
@@ -650,6 +687,18 @@ pub struct PyProfileOutput {
     pub plan_text: String,
     /// Operator-level statistics (list of dicts).
     pub operators: Py<PyAny>,
+    /// Logical planning time (Cypher AST to logical plan), in milliseconds.
+    ///
+    /// Measured before execution starts, so it is not part of `total_time_ms`.
+    pub logical_planning_ms: f64,
+    /// Physical planning time in milliseconds, summed over every plan built.
+    ///
+    /// Includes sub-plans built during execution (a correlated subquery body
+    /// once per outer row), so it is part of `total_time_ms`.
+    pub physical_planning_ms: f64,
+    /// Physical plans built: one for the query plus one per execution-time
+    /// sub-plan.
+    pub physical_plans: u64,
 }
 
 #[pymethods]
@@ -726,7 +775,8 @@ impl PyLocyProfile {
 
     /// The per-stratum / per-rule / per-iteration profile as nested Python
     /// dicts and lists (snake_case keys; operators carry `operator`,
-    /// `actual_rows`, `time_ms`).
+    /// `actual_rows`, `time_ms`). Each iteration also carries `planning_ms`
+    /// and `plans`, the physical planning done for that rule in that pass.
     #[getter]
     fn strata(&self, py: Python) -> PyResult<Py<PyAny>> {
         let json = serde_json::to_value(&self.inner.profile.strata)
@@ -970,14 +1020,41 @@ pub struct BulkStats {
     pub index_task_ids: Vec<String>,
     /// Whether indexes are still building in background.
     pub indexes_pending: bool,
+    /// The load's id; pass it to `bulk_load_applied` to ask whether the load
+    /// was applied.
+    pub load_id: String,
+    /// Steps after the commit point that failed without affecting the load
+    /// (index builds, snapshot manifest, schema save, marker delete). The load
+    /// is applied regardless; each is completed later.
+    pub warnings: Vec<String>,
+}
+
+impl From<&::uni_db::api::bulk::BulkStats> for BulkStats {
+    fn from(s: &::uni_db::api::bulk::BulkStats) -> Self {
+        Self {
+            vertices_inserted: s.vertices_inserted,
+            edges_inserted: s.edges_inserted,
+            indexes_rebuilt: s.indexes_rebuilt,
+            duration_secs: s.duration.as_secs_f64(),
+            index_build_duration_secs: s.index_build_duration.as_secs_f64(),
+            index_task_ids: s.index_task_ids.clone(),
+            indexes_pending: s.indexes_pending,
+            load_id: s.load_id.clone(),
+            warnings: s.warnings.clone(),
+        }
+    }
 }
 
 #[pymethods]
 impl BulkStats {
     fn __repr__(&self) -> String {
         format!(
-            "BulkStats(vertices={}, edges={}, duration={:.2}s)",
-            self.vertices_inserted, self.edges_inserted, self.duration_secs
+            "BulkStats(vertices={}, edges={}, duration={:.2}s, load_id='{}', warnings={})",
+            self.vertices_inserted,
+            self.edges_inserted,
+            self.duration_secs,
+            self.load_id,
+            self.warnings.len()
         )
     }
 }
@@ -1028,6 +1105,20 @@ pub struct LocyStats {
     pub mutations_executed: usize,
     /// Peak memory used by derived relations in bytes.
     pub peak_memory_bytes: usize,
+    /// Strata derived by hypothetical re-evaluations (`ASSUME` bodies,
+    /// `ABDUCE` candidate checks), summed over all of them.
+    pub hypothetical_strata_evaluated: usize,
+    /// Strata those re-evaluations reused from the state before their
+    /// mutation, because the mutation could not affect them.
+    pub hypothetical_strata_reused: usize,
+    /// Facts the derived (not reused) hypothetical strata produced.
+    pub hypothetical_facts_derived: usize,
+    /// Strata derived again because an earlier top-level command wrote and
+    /// a later command read the facts, summed over every re-derivation.
+    pub sequenced_strata_evaluated: usize,
+    /// Strata those re-derivations reused because the write could not
+    /// affect them.
+    pub sequenced_strata_reused: usize,
 }
 
 #[pymethods]
@@ -1080,10 +1171,11 @@ pub struct PyLocyResult {
     ///
     /// Not every field is populated on this path. Locy assembles its metrics
     /// from the evaluation's own totals plus the execution counters, so
-    /// `total_time_ms`, `exec_time_ms`, `rows_returned` and the counter-derived
-    /// fields are real, while **`parse_time_ms` and `plan_time_ms` are always
-    /// `0.0` and `plan_cache_hit` is always `False`** -- Locy does not go
-    /// through the Cypher parse/plan/cache path those measure. A zero that
+    /// `total_time_ms`, `plan_time_ms` (the program's logical planning),
+    /// `exec_time_ms` (the remainder), `rows_returned` and the counter-derived
+    /// fields are real, while **`parse_time_ms` is always `0.0` and
+    /// `plan_cache_hit` is always `False`** -- Locy does not go through the
+    /// Cypher parse/cache path those measure. A zero that
     /// means "not measured" is indistinguishable from one that means "fast",
     /// hence this note.
     pub metrics: Py<PyQueryMetrics>,
@@ -1138,12 +1230,23 @@ impl PyLocyResult {
         }
     }
 
-    /// Get rows from the first Query/Assume/Cypher command result, if any.
+    /// Get rows from the first row-producing command result, if any.
+    ///
+    /// Row-producing results are QUERY and Cypher commands, and an ASSUME
+    /// whose body (searched depth first) has one; the same rule as Rust's
+    /// `LocyResult::rows`.
     fn rows(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         let list = self.command_results.bind(py);
         for i in 0..list.len()? {
             let item = list.get_item(i)?;
-            // Command results are dicts; Query/Assume/Cypher variants have a "rows" key.
+            if let Ok(assume) = item.cast::<PyAssumeCommandResult>() {
+                let assume = assume.get();
+                if assume.has_rows {
+                    return Ok(Some(assume.rows.clone_ref(py)));
+                }
+                continue;
+            }
+            // QUERY and Cypher results have a "rows" key.
             if let Ok(rows) = item.get_item("rows") {
                 return Ok(Some(rows.unbind()));
             }
@@ -1699,6 +1802,7 @@ pub struct PyExecuteResult {
     pub relationships_created: usize,
     pub relationships_deleted: usize,
     pub properties_set: usize,
+    pub properties_removed: usize,
     pub labels_added: usize,
     pub labels_removed: usize,
     pub metrics: Py<pyo3::types::PyDict>,
@@ -1788,14 +1892,13 @@ impl PyDerivedFactSet {
         })
     }
 
-    /// Check if no facts were derived.
+    /// Check if there is nothing to apply: no facts were derived and the
+    /// program issued no other write (a Cypher write command is replayed
+    /// too). Same as the Rust `DerivedFactSet::is_empty`.
     fn is_empty(&self) -> PyResult<bool> {
-        self.inner
-            .as_ref()
-            .map(|d| d.fact_count() == 0)
-            .ok_or_else(|| {
-                pyo3::exceptions::PyRuntimeError::new_err("DerivedFactSet already consumed")
-            })
+        self.inner.as_ref().map(|d| d.is_empty()).ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("DerivedFactSet already consumed")
+        })
     }
 
     /// Derived vertices grouped by label.
@@ -2168,11 +2271,16 @@ pub struct PyDatabaseMetrics {
     pub active_sessions: usize,
     pub l1_run_count: usize,
     pub write_throttle_pressure: f64,
+    pub write_throttle_waits: u64,
+    pub write_throttle_wait_time_secs: f64,
+    pub writes_stalled: u64,
     pub compaction_in_progress: bool,
     pub wal_size_bytes: u64,
     pub wal_lsn: u64,
     pub total_queries: u64,
     pub total_commits: u64,
+    pub storage_metadata_cache_bytes: u64,
+    pub storage_index_cache_bytes: u64,
 }
 
 #[pymethods]
@@ -3181,7 +3289,7 @@ impl PyLocyConfig {
         max_derived_bytes=None, deterministic_best_by=None,
         strict_probability_domain=None, probability_epsilon=None,
         exact_probability=None, max_bdd_variables=None,
-        top_k_proofs=None, top_k_proofs_training=None
+        top_k_proofs=None, top_k_proofs_training=None, goal_directed=None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -3201,6 +3309,7 @@ impl PyLocyConfig {
         max_bdd_variables: Option<usize>,
         top_k_proofs: Option<usize>,
         top_k_proofs_training: Option<usize>,
+        goal_directed: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let mut cfg = ::uni_locy::LocyConfig::default();
         if let Some(v) = max_iterations {
@@ -3250,6 +3359,9 @@ impl PyLocyConfig {
             cfg.top_k_proofs = v;
         }
         cfg.top_k_proofs_training = top_k_proofs_training;
+        if let Some(v) = goal_directed {
+            cfg.goal_directed = crate::convert::parse_goal_directed(v)?;
+        }
         Ok(Self { inner: cfg })
     }
 
@@ -3310,6 +3422,11 @@ impl PyLocyConfig {
     #[getter]
     fn top_k_proofs_training(&self) -> Option<usize> {
         self.inner.top_k_proofs_training
+    }
+    /// Goal-directed `QUERY` evaluation mode: `"off"`, `"on"` or `"shadow"`.
+    #[getter]
+    fn goal_directed(&self) -> &'static str {
+        crate::convert::goal_directed_name(self.inner.goal_directed)
     }
 
     /// Register a Python callable as the neural classifier for `alias`.
@@ -3489,9 +3606,20 @@ impl PyQueryCommandResult {
 }
 
 /// A Locy ASSUME command result.
+///
+/// `results` holds one result per body command, in order (a nested ASSUME's
+/// own `AssumeCommandResult` among them); `derived` maps each rule to its facts
+/// in the hypothetical state the body's first command reads, after the
+/// ASSUME's mutations. `rows` is the first row-producing body result's rows,
+/// searched depth first, or an empty list.
 #[pyclass(name = "AssumeCommandResult", frozen)]
 pub struct PyAssumeCommandResult {
+    pub(crate) results: Py<PyAny>,
+    pub(crate) derived: Py<PyAny>,
     pub(crate) rows: Py<PyAny>,
+    /// Whether some body command produced rows, so `rows` is a result's
+    /// rows rather than the empty fallback.
+    pub(crate) has_rows: bool,
 }
 
 #[pymethods]
@@ -3501,15 +3629,26 @@ impl PyAssumeCommandResult {
         "assume"
     }
     #[getter]
+    fn results(&self, py: Python<'_>) -> Py<PyAny> {
+        self.results.clone_ref(py)
+    }
+    #[getter]
+    fn derived(&self, py: Python<'_>) -> Py<PyAny> {
+        self.derived.clone_ref(py)
+    }
+    #[getter]
     fn rows(&self, py: Python<'_>) -> Py<PyAny> {
         self.rows.clone_ref(py)
     }
-    fn __repr__(&self) -> String {
-        "AssumeCommandResult(...)".to_string()
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        let n = self.results.bind(py).len()?;
+        Ok(format!("AssumeCommandResult(results={n})"))
     }
     fn __getitem__(&self, py: Python<'_>, key: &str) -> PyResult<Py<PyAny>> {
         match key {
             "type" => Ok("assume".into_pyobject(py)?.into_any().unbind()),
+            "results" => Ok(self.results.clone_ref(py)),
+            "derived" => Ok(self.derived.clone_ref(py)),
             "rows" => Ok(self.rows.clone_ref(py)),
             _ => Err(pyo3::exceptions::PyKeyError::new_err(key.to_string())),
         }

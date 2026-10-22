@@ -13,6 +13,7 @@
 
 use crate::api::error::UniError;
 use crate::core::id::{Eid, Vid};
+use crate::core::schema::is_reserved_property_name;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -762,7 +763,7 @@ impl Value {
 
         // User properties live under `_all_props` for a schemaless entity and
         // under `properties` for a serialised one; otherwise take the
-        // non-underscore keys, which is how a flattened projection spells them.
+        // non-reserved keys, which is how a flattened projection spells them.
         // A null-valued property does not exist on an entity under the property
         // graph model — `SET n.p = null` removes it — so the native form must
         // not carry one. The map form can: its flattened columns are read
@@ -777,19 +778,15 @@ impl Value {
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect()
         };
-        let properties: HashMap<String, Value> = match map
-            .get("_all_props")
-            .or_else(|| map.get("properties"))
-        {
-            Some(Value::Map(props)) => keep(props),
+        let properties: HashMap<String, Value> = match entity_property_container(map) {
+            Some(props) => keep(props),
             // Flattened projection: the user properties are the plain keys.
-            // `properties` is excluded by name as well as by the underscore
-            // rule — when it is present but null, meaning an entity with
-            // none, it is still a container key, and collecting it would
-            // invent a user property called "properties" holding null.
+            // No name beyond the reserved ones is excluded: a `properties`
+            // here (any value, see `is_serialised_entity_map`) is a user
+            // property, and a null one is dropped with the other nulls.
             _ => map
                 .iter()
-                .filter(|(k, v)| !k.starts_with('_') && k.as_str() != "properties" && !v.is_null())
+                .filter(|(k, v)| !is_reserved_property_name(k) && !v.is_null())
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
         };
@@ -905,17 +902,17 @@ impl Value {
         let (props, is_entity): (&HashMap<String, Value>, bool) = match self {
             Value::Node(node) => (&node.properties, true),
             Value::Edge(edge) => (&edge.properties, true),
-            Value::Map(map) => match map.get("_all_props") {
-                // A schemaless entity keeps its properties in `_all_props`;
-                // the top level holds system fields only.
-                Some(Value::Map(all)) => (all, true),
-                _ => (map, false),
+            // A nested container holds an entity's properties; the top level
+            // holds system fields only.
+            Value::Map(map) => match entity_property_container(map) {
+                Some(props) => (props, true),
+                None => (map, false),
             },
             _ => return None,
         };
         let mut names: Vec<String> = props
             .iter()
-            .filter(|(k, v)| !k.starts_with('_') && (!is_entity || !v.is_null()))
+            .filter(|(k, v)| !is_reserved_property_name(k) && (!is_entity || !v.is_null()))
             .map(|(k, _)| k.clone())
             .collect();
         names.sort();
@@ -936,17 +933,14 @@ impl Value {
             Value::Edge(edge) => &edge.properties,
             Value::Map(map) => {
                 entity_ref_from_map(map)?;
-                match map.get("_all_props") {
-                    Some(Value::Map(all)) => all,
-                    _ => map,
-                }
+                entity_property_container(map).unwrap_or(map)
             }
             _ => return None,
         };
         Some(
             props
                 .iter()
-                .filter(|(k, v)| !k.starts_with('_') && !v.is_null())
+                .filter(|(k, v)| !is_reserved_property_name(k) && !v.is_null())
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
         )
@@ -1418,6 +1412,29 @@ pub fn cmp_i64_f64(i: i64, f: f64) -> std::cmp::Ordering {
         Ordering::Equal => Ordering::Equal,
         other => other,
     }
+}
+
+/// The `i64` equal to `f`, or `None` when no `i64` is.
+///
+/// `f` must be integral and in `[-2^63, 2^63)`. The tempting bound
+/// `f <= i64::MAX as f64` is wrong: `i64::MAX` widens to `2^63`, so `2^63`
+/// passes and `as i64` saturates it to `i64::MAX`, making the float `2^63`
+/// and the integer `i64::MAX` one key. NaN and the infinities have no `i64`.
+///
+/// # Examples
+/// ```
+/// use uni_common::f64_to_exact_i64;
+/// assert_eq!(f64_to_exact_i64(1.0), Some(1));
+/// assert_eq!(f64_to_exact_i64(-9_223_372_036_854_775_808.0), Some(i64::MIN));
+/// assert_eq!(f64_to_exact_i64(9_223_372_036_854_775_808.0), None);
+/// assert_eq!(f64_to_exact_i64(1.5), None);
+/// ```
+#[must_use]
+pub fn f64_to_exact_i64(f: f64) -> Option<i64> {
+    const TWO_63: f64 = 9_223_372_036_854_775_808.0;
+    // `fract` of an infinity or NaN is NaN, so neither passes.
+    // Every integral float in `[-2^63, 2^63)` converts to `i64` exactly.
+    (f.fract() == 0.0 && (-TWO_63..TWO_63).contains(&f)).then_some(f as i64)
 }
 
 /// Normalized float equality used by [`Value`]'s `PartialEq`/`Hash`.
@@ -2070,6 +2087,54 @@ fn extract_properties(value: &Value) -> HashMap<String, Value> {
     }
 }
 
+/// The nested map holding an entity's user properties in its map encoding.
+///
+/// A schemaless entity keeps them under `_all_props`, and a serialised one
+/// (a path element, for one) under `properties`; a flattened projection has no
+/// container and spells them as top-level keys, for which this is `None`.
+/// `properties` counts only on a map in the serialised shape
+/// ([`is_serialised_entity_map`]), so a plain map with a `properties` entry,
+/// and a flattened entity with a user property of that name, keep it as an
+/// ordinary key. Every reader of an entity's property map asks this, so
+/// `keys()` and `properties()` agree with property access about where the
+/// properties are.
+#[must_use]
+pub fn entity_property_container(map: &HashMap<String, Value>) -> Option<&HashMap<String, Value>> {
+    match map.get("_all_props") {
+        Some(Value::Map(all)) => Some(all),
+        _ => match map.get("properties") {
+            Some(Value::Map(props)) if is_serialised_entity_map(map) => Some(props),
+            _ => None,
+        },
+    }
+}
+
+/// Identity spellings a serialised entity map may carry that are not
+/// reserved property names (see [`entity_ref_from_map`]).
+const ENTITY_ID_SPELLINGS: &[&str] = &["_id", "vid", "eid", "src", "dst", "edge_type"];
+
+/// Whether `map` is an entity in the serialised shape: identity and type
+/// fields plus one `properties` map holding every user property.
+///
+/// The serialised encodings (`Value::Node` / `Value::Edge` through JSON, a
+/// normalised path element, the canonical edge struct) carry nothing beside
+/// their system fields and `properties`. A flattened entity spells its user
+/// properties as top-level keys, so one with any key beyond those is not
+/// serialised, and a `properties` key on it is a user property — a map-valued
+/// one read as the container hid every other property. The one shape this
+/// cannot tell apart is a flattened entity whose only user property is a map
+/// named `properties`; it reads as serialised.
+#[must_use]
+pub fn is_serialised_entity_map(map: &HashMap<String, Value>) -> bool {
+    matches!(map.get("properties"), Some(Value::Map(_)))
+        && entity_ref_from_map(map).is_some()
+        && map.keys().all(|k| {
+            k == "properties"
+                || is_reserved_property_name(k)
+                || ENTITY_ID_SPELLINGS.contains(&k.as_str())
+        })
+}
+
 /// [`Value::entity_ref`] for a caller that already holds the map.
 ///
 /// Same rules, exposed separately so a hot path (a sort-key encoder, a row
@@ -2512,6 +2577,90 @@ impl From<f32> for Value {
 
 #[cfg(test)]
 mod tests {
+
+    mod property_container {
+        use std::collections::HashMap;
+
+        use super::super::{Value, entity_property_container, is_serialised_entity_map};
+
+        fn map(entries: &[(&str, Value)]) -> HashMap<String, Value> {
+            entries
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), v.clone()))
+                .collect()
+        }
+
+        fn inner() -> Value {
+            Value::Map(map(&[("inner", Value::Int(1))]))
+        }
+
+        fn labels() -> Value {
+            Value::List(vec![Value::String("A".into())])
+        }
+
+        /// The serialised encodings keep their `properties` container.
+        #[test]
+        fn serialised_entities_nest_their_properties() {
+            let node = map(&[
+                ("_id", Value::String("0".into())),
+                ("_labels", labels()),
+                ("properties", inner()),
+            ]);
+            let edge = map(&[
+                ("_id", Value::String("3".into())),
+                ("_type", Value::String("R".into())),
+                ("_src", Value::String("0".into())),
+                ("_dst", Value::String("1".into())),
+                ("properties", inner()),
+            ]);
+            for m in [&node, &edge] {
+                assert!(is_serialised_entity_map(m), "{m:?}");
+                assert_eq!(
+                    entity_property_container(m),
+                    Some(&map(&[("inner", Value::Int(1))]))
+                );
+            }
+        }
+
+        /// A flattened entity with any other user key: `properties` is one of
+        /// its user properties, not a container — even when it is a map, and
+        /// even when the other key is null.
+        #[test]
+        fn a_flattened_entity_keeps_a_map_valued_properties_property() {
+            for other in [Value::String("x".into()), Value::Null] {
+                let m = map(&[
+                    ("_vid", Value::Int(0)),
+                    ("_labels", labels()),
+                    ("name", other),
+                    ("properties", inner()),
+                ]);
+                assert!(!is_serialised_entity_map(&m), "{m:?}");
+                assert_eq!(entity_property_container(&m), None);
+                let Value::Node(node) = Value::Map(m).canonical_entity() else {
+                    panic!("not canonicalised to a node");
+                };
+                assert_eq!(node.properties.get("properties"), Some(&inner()));
+                assert!(!node.properties.contains_key("inner"));
+            }
+        }
+
+        /// A plain map is never a container holder, and `_all_props` always is.
+        #[test]
+        fn plain_maps_and_all_props() {
+            let plain = map(&[("properties", inner())]);
+            assert_eq!(entity_property_container(&plain), None);
+            let schemaless = map(&[
+                ("_vid", Value::Int(0)),
+                ("_labels", labels()),
+                ("_all_props", inner()),
+                ("properties", Value::Map(HashMap::new())),
+            ]);
+            assert_eq!(
+                entity_property_container(&schemaless),
+                Some(&map(&[("inner", Value::Int(1))]))
+            );
+        }
+    }
 
     mod type_name {
         use super::super::Value;

@@ -7,7 +7,7 @@
 3. Validate types/schema compatibility.
 4. Stratify rules.
 5. Evaluate each stratum to fixpoint.
-6. Execute command phase (`QUERY`, `DERIVE`, `EXPLAIN`, `ABDUCE`, `ASSUME` body).
+6. Execute the commands (`QUERY`, `DERIVE`, `EXPLAIN`, `ABDUCE`, `ASSUME`, Cypher) in program order. A command reads the state every earlier command left: after a `DERIVE` or a Cypher write, later commands read the facts derived again in the new state (see [Commands run in sequence](#commands-run-in-sequence)).
 
 ## Two-Phase Execution
 
@@ -19,7 +19,7 @@ Rules compile to DataFusion `LogicalPlan` nodes. The query engine runs them thro
 
 **Phase 2 — Command Dispatch (Row-Level)**
 
-After strata converge, commands (`QUERY`, `DERIVE`, `ABDUCE`, `ASSUME`) execute on materialized `Vec<Row>` facts. WHERE filters use a lightweight row-level evaluator. This path supports vector cosine similarity but not auto-embedding, FTS, or multi-source fusion.
+After strata converge, commands (`QUERY`, `DERIVE`, `ABDUCE`, `ASSUME`) execute in program order on materialized `Vec<Row>` facts. WHERE filters use a lightweight row-level evaluator. This path supports vector cosine similarity but not auto-embedding, FTS, or multi-source fusion.
 
 | Context | Execution | Vector | Auto-Embed | FTS |
 |---------|-----------|--------|------------|-----|
@@ -28,6 +28,61 @@ After strata converge, commands (`QUERY`, `DERIVE`, `ABDUCE`, `ASSUME`) execute 
 | `DERIVE ... WHERE` | In-memory | ✓ | ✗ | ✗ |
 | `ABDUCE ... WHERE` | In-memory | ✓ | ✗ | ✗ |
 | `ASSUME ... WHERE` | In-memory | ✓ | ✗ | ✗ |
+
+## Commands run in sequence
+
+A program's commands behave exactly like the same commands run one after
+another, each as its own `tx.locy(...)` call, in one transaction. A `DERIVE`
+that derived something, or a Cypher write (`CREATE`, `MERGE`, `SET`,
+`DELETE`, ...), changes the graph, and every later command reads the changed
+graph and the rule facts derived from it:
+
+```locy
+CREATE RULE link AS MATCH (a:Person)-[:KNOWS]->(b:Person) DERIVE (a)-[:LINK]->(b)
+CREATE RULE linked AS MATCH (a:Person)-[:LINK]->(b:Person) YIELD KEY a, KEY b
+
+QUERY linked RETURN a.name AS a, b.name AS b   // no LINK edges yet: no rows
+DERIVE link                                    // {affected: 3}
+QUERY linked RETURN a.name AS a, b.name AS b   // the three derived edges
+```
+
+- After a write, only the strata the write can affect are derived again, when
+  the next command that reads facts runs; the rest keep their facts.
+  Consecutive writes are folded into one re-derivation, and nothing is derived
+  after the last write. `stats.sequenced_strata_evaluated` and
+  `stats.sequenced_strata_reused` show the split. A program with no write
+  command derives nothing again.
+- `ASSUME` and `ABDUCE` write only to a hypothetical state they discard, so a
+  later command does not see their changes. `EXPLAIN RULE`, `QUERY` and
+  Cypher reads change nothing.
+- `tx.locy(...)` writes into the transaction; it commits or rolls back with
+  it. `session.locy(...)` writes nothing to the database: its writes land in an
+  overlay the program's later commands read, and come back as one
+  `derived_fact_set`, which `tx.apply(...)` replays in one transaction, so the
+  whole program's writes take effect together. A session-level `DERIVE` that
+  connects a node an earlier command of the same program created is refused
+  (the replay gives that node a new id); use `tx.locy(...)` for such programs.
+- A program's `$params` reach every command, a Cypher command after a write
+  included, and `tx.apply(...)` replays the writes with the values they ran
+  with.
+- `result.derived` holds every rule's facts as they stood before the first
+  command. Read a later state with a `QUERY` after the write.
+
+Before this, every command read the facts derived before the first command:
+a `QUERY` after a `DERIVE` answered without the derived edges, and a Cypher
+write ahead of the program's first `DERIVE` failed with "Mutation context not
+set".
+
+The row-level evaluator (also used for `QUERY ... WHERE / RETURN / ORDER BY` and
+`EXPLAIN RULE ... WHERE`) answers operators as a Cypher `RETURN` does: `+`
+concatenates strings and lists, appends to a list, concatenates a string with a
+number, boolean or temporal (`'a' + 1` is `'a1'`), and adds a duration to a
+temporal; integer overflow and integer division by zero are errors; `^` is
+always a float; `=` over lists or maps holding `NULL` is `NULL`; durations do
+not order (`duration('P1D') < duration('PT25H')` is `NULL`); `=~` matches a
+regular expression; `STARTS WITH` / `ENDS WITH` / `CONTAINS` over a non-string
+is `NULL`; any operator over `NULL` is `NULL` except Kleene `AND` / `OR`; and
+`AND` / `OR` with a non-boolean operand is a type error.
 
 ## Semi-Naive Evaluation
 
@@ -68,6 +123,8 @@ A disagreement is a compile error (`YieldSchemaMismatch` or `ClauseMismatch`).
 `IS NOT` requires stratification-safe dependencies. Cyclic negation is rejected at compile time.
 
 If the referenced rule exposes a `PROB` column, `IS NOT` becomes probabilistic complement (`1 - p`) rather than Boolean anti-join. Rules without a `PROB` column keep standard Boolean negation.
+
+Symmetrically, a positive `IS` reference to a `PROB` rule from a rule with a `PROB` column multiplies the referenced probability `p` into the row's `PROB` value, unless the row's `PROB` expression already reads `p` as a product factor (the count-once rule). See [Probabilistic Logic](advanced/probabilistic-logic.md#positive-is-references-to-a-prob-rule).
 
 ## Monotonic Recursion
 

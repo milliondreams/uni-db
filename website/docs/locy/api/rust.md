@@ -64,6 +64,7 @@ Common fields:
 - `timeout` (`Option<Duration>`; `None` = 300s between strata, database `query_timeout` inside operators)
 - `max_explain_depth`
 - `max_slg_depth` (deprecated, no effect; using it is a deprecation warning)
+- `goal_directed` (`GoalDirected::Off` default, `On`, `Shadow`): magic-sets evaluation of `QUERY ... WHERE`; see [Modules, PRIORITY, QUERY](../advanced/modules-priority-query.md#goal-directed-query)
 - `max_abduce_candidates`
 - `max_abduce_results`
 - `max_derived_bytes`
@@ -81,7 +82,7 @@ Common fields:
 - `command_results: Vec<CommandResult>`
 - `warnings: Vec<RuntimeWarning>`
 - `approximate_groups: HashMap<String, Vec<String>>`
-- `derived_fact_set: DerivedFactSet` — opaque fact set for `tx.apply()` materialization
+- `derived_fact_set: DerivedFactSet` — opaque fact set for `tx.apply()` materialization: every write of a session-level program (DERIVE output and Cypher writes), in program order
 
 Helpers:
 
@@ -92,6 +93,43 @@ Helpers:
 - `result.has_warning(...)`
 - `result.derived_facts(rule_name)`
 - `result.iterations`
+
+## Profile Output (`LocyProfileOutput`)
+
+```rust
+let (result, profile) = session.locy_with(program).profile().await?;
+println!("{profile}");
+```
+
+`profile.profile.strata[i].rules[j].iterations[k]` is one rule's evaluation in one
+fixpoint pass: `delta_facts`, `elapsed_ms`, `planning_ms` / `plans` (clause bodies are
+re-planned every pass), and `operators`. Besides the physical-plan operators of the clause
+bodies, `operators` lists the steps that run outside a plan, with `actual_rows` = rows kept:
+
+- `LocyIsNotAntiJoin` (or `LocyIsNotComplement` under PROB) — one per `IS NOT` reference applied
+- `LocyFactDedup`, `LocyBestByMerge` or `LocyFoldMerge` — the fact merge, once per pass
+
+`result.metrics().physical_plans` counts every physical plan the program built.
+
+Note: `result.rows()` returns the rows of the first row-producing command in program order:
+a `QUERY` or a Cypher statement, with an `ASSUME { ... } THEN { ... }` block searched depth
+first through its body's results. The Python `rows` follows the same rule. Use
+`result.command_results()` to reach a specific command's result.
+
+An ASSUME returns `CommandResult::Assume { results, derived }`: `results` holds one
+`CommandResult` per body command, in order (a nested ASSUME's own `Assume` among them), and
+`derived` every rule's facts in the hypothetical state the body's first command reads.
+`CommandResult::as_assume()` returns both; `CommandResult::rows()` is the first
+row-producing result, depth first.
+
+```rust
+let result = session
+    .locy("... ASSUME { CREATE (:Marker) } THEN { QUERY linked RETURN a  DERIVE link  QUERY linked RETURN a }")
+    .await?;
+let (results, derived) = result.command_results()[0].as_assume().expect("an ASSUME");
+assert!(matches!(results[1], CommandResult::Derive { .. }));
+let after_derive = results[2].rows().expect("the second QUERY's rows");
+```
 
 ## Explain Output (`LocyExplainOutput`)
 

@@ -31,6 +31,10 @@ Uni provides native vector search over embedding properties with 8 single-vector
 - **Auto-embedding**: Pass text directly and let Uni embed it using the index's configured embedding model.
 - **Multi-vector (ColBERT / late-interaction)**: store many vectors per row and rank by exact MaxSim, optionally accelerated by a MUVERA first-stage index.
 
+The `node` yielded by `uni.vector.query`, `uni.fts.query` and `uni.search` is a
+full node: `RETURN node`, `properties(node)`, `keys(node)`, `labels(node)` and
+`node {.*}` see all of its properties, declared or not.
+
 ## Example
 
 === "Rust"
@@ -125,7 +129,7 @@ ORDER BY score DESC LIMIT 10
 `~=` is **vector-only** — it cannot do FTS or hybrid search. For hybrid search, use `similar_to()` with multi-source arrays.
 
 !!! note "`=~` is regex, `~=` is vector similarity"
-    These are unrelated operators that look similar. `n.name =~  '(?i)john'` is a regex match on strings. `n.embedding ~= $vec` is vector similarity search.
+    These are unrelated operators that look similar. `n.name =~ '(?i)john.*'` is a regex match on strings (over the whole string). `n.embedding ~= $vec` is vector similarity search.
 
 ## Expression-Based Scoring: `similar_to`
 

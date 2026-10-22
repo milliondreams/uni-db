@@ -8,6 +8,7 @@ use crate::runtime::l0::L0Buffer;
 use crate::runtime::l0_visibility;
 use crate::storage::main_vertex::MainVertexDataset;
 use crate::storage::manager::StorageManager;
+use crate::storage::property_builder::EXT_ID_COLUMN;
 use crate::storage::value_codec::CrdtDecodeMode;
 use anyhow::{Result, anyhow};
 use arrow_array::{Array, BooleanArray, RecordBatch, UInt64Array};
@@ -292,7 +293,7 @@ impl PropertyManager {
                 Err(_) => continue,
             };
 
-            // Collect all rows for this edge, sorted by version
+            // Collect all rows for this edge; replayed in version order below.
             let mut rows: Vec<(u64, u8, Properties)> = Vec::new();
 
             for batch in batches {
@@ -311,22 +312,11 @@ impl PropertyManager {
                 for row in 0..batch.num_rows() {
                     let ver = ver_col.value(row);
                     let op = op_col.value(row);
-                    let mut props = Properties::new();
-
-                    if op != 1 {
-                        // Not a delete - extract properties
-                        if let Some(tp) = type_props {
-                            for (p_name, p_meta) in tp {
-                                if let Some(col) = batch.column_by_name(p_name)
-                                    && !col.is_null(row)
-                                {
-                                    let val =
-                                        Self::value_from_column(col.as_ref(), &p_meta.r#type, row)?;
-                                    props.insert(p_name.clone(), val);
-                                }
-                            }
-                        }
-                    }
+                    let props = if op == 1 {
+                        Properties::new()
+                    } else {
+                        Self::edge_delta_row_props(&batch, row, type_props)?
+                    };
                     rows.push((ver, op, props));
                 }
             }
@@ -335,54 +325,9 @@ impl PropertyManager {
                 continue;
             }
 
-            // Sort by version (ascending) so we merge in order
-            rows.sort_by_key(|(ver, _, _)| *ver);
-
-            // Merge properties across all versions
-            // For CRDT properties: merge values
-            // For non-CRDT properties: later versions overwrite earlier ones
-            let mut merged_props: Properties = Properties::new();
-            let mut is_deleted = false;
-
-            for (_, op, props) in rows {
-                if op == 1 {
-                    // Delete operation - mark as deleted
-                    is_deleted = true;
-                    merged_props.clear();
-                } else {
-                    is_deleted = false;
-                    for (p_name, p_val) in props {
-                        // Check if this is a CRDT property
-                        let is_crdt = type_props
-                            .and_then(|tp| tp.get(&p_name))
-                            .map(|pm| matches!(pm.r#type, DataType::Crdt(_)))
-                            .unwrap_or(false);
-
-                        if is_crdt {
-                            // Merge CRDT values
-                            if let Some(existing) = merged_props.get(&p_name) {
-                                // A failed merge used to drop `p_val` and keep the
-                                // older value, silently. Two other sites resolved
-                                // the same failure the opposite way; propagating
-                                // removes the choice rather than picking a winner
-                                // nobody has the information to pick (#233).
-                                let merged = self.merge_crdt_values(existing, &p_val)?;
-                                merged_props.insert(p_name, merged);
-                            } else {
-                                merged_props.insert(p_name, p_val);
-                            }
-                        } else {
-                            // Non-CRDT: later version overwrites
-                            merged_props.insert(p_name, p_val);
-                        }
-                    }
-                }
-            }
-
-            if is_deleted {
+            let Some(merged_props) = self.replay_edge_delta_rows(rows, type_props)? else {
                 return Ok(None);
-            }
-
+            };
             if !merged_props.is_empty() {
                 return Ok(Some(merged_props));
             }
@@ -398,7 +343,7 @@ impl PropertyManager {
         if let Some(props) = MainEdgeDataset::find_props_by_eid_counted(
             self.storage.backend(),
             eid,
-            self.storage.version_high_water_mark(),
+            self.storage.row_visibility(),
             counters_of(ctx),
         )
         .await?
@@ -633,8 +578,10 @@ impl PropertyManager {
             columns.push("_version".to_string());
             columns.push("_deleted".to_string());
             columns.extend(valid_props.iter().map(|s| s.to_string()));
-            // Add overflow_json to fetch non-schema properties
+            // Add overflow_json to fetch non-schema properties, and the
+            // `ext_id` column a flush moves a string `ext_id` into.
             columns.push("overflow_json".to_string());
+            columns.push(EXT_ID_COLUMN.to_string());
             retain_first_occurrences(&mut columns);
 
             use crate::backend::types::ScanRequest;
@@ -1127,7 +1074,7 @@ impl PropertyManager {
                 let fetched = MainEdgeDataset::find_props_by_eids_counted(
                     self.storage.backend(),
                     &unresolved,
-                    self.storage.version_high_water_mark(),
+                    self.storage.row_visibility(),
                     counters_of(ctx),
                 )
                 .await?;
@@ -1279,7 +1226,7 @@ impl PropertyManager {
         // Fallback to storage backend for VIDs not in the index
         if !vids_needing_lancedb.is_empty() {
             let backend = self.storage.backend();
-            let version = self.storage.version_high_water_mark();
+            let version = self.storage.row_visibility();
             let storage_labels = MainVertexDataset::find_batch_labels_by_vids(
                 backend,
                 &vids_needing_lancedb,
@@ -1400,28 +1347,11 @@ impl PropertyManager {
                 continue;
             }
             let l0_props = l0_visibility::accumulate_vertex_props(vid, ctx);
-            // Skipping storage when L0 has the vid is only sound while L0 rows
-            // are *complete* -- the invariant `insert_vertex_partial_full`
-            // documents, and the default write path upholds by merging a full
-            // map before staging.
-            //
-            // `partial_lance_writes` breaks it: `insert_vertex_partial` stages
-            // only the touched keys, so the L0 row is a delta and the stored
-            // properties are still the rest of the truth. Reading L0 alone
-            // dropped them -- and since the SET prefetch merges over this map
-            // and writes the result back, a dropped property was deleted, not
-            // just missing from one read.
-            let partial = l0_visibility::has_partial_vertex_keys(vid, ctx);
+            // Skipping storage when L0 has the vid is sound because every
+            // vertex write stores a complete row.
             match l0_props {
-                Some(props) if !partial => {
-                    result.insert(vid, props);
-                }
                 Some(props) => {
-                    // Delta row: keep it, but read storage underneath. The L0
-                    // values win on shared keys, applied after the storage
-                    // merge below.
                     result.insert(vid, props);
-                    need_storage.push(vid);
                 }
                 None => need_storage.push(vid),
             }
@@ -1464,6 +1394,7 @@ impl PropertyManager {
         ];
         columns.extend(prop_names.iter().cloned());
         columns.push("overflow_json".to_string());
+        columns.push(EXT_ID_COLUMN.to_string());
         retain_first_occurrences(&mut columns);
 
         // Build IN filter for all VIDs at once.
@@ -1558,7 +1489,7 @@ impl PropertyManager {
             }
         }
 
-        // Merge storage results with any L0 partial props already in result.
+        // Storage results for the vids L0 did not answer.
         for (vid, storage_props) in per_vid_props {
             let entry = result.entry(vid).or_default();
             for (k, v) in storage_props {
@@ -1614,7 +1545,7 @@ impl PropertyManager {
         let main_props = MainVertexDataset::find_batch_props_by_vids(
             self.storage.backend(),
             missing,
-            self.storage.version_high_water_mark(),
+            self.storage.row_visibility(),
         )
         .await?;
         for (vid, props) in main_props {
@@ -1730,20 +1661,11 @@ impl PropertyManager {
                 let eid = Eid::from(eid_col.value(row));
                 let ver = ver_col.value(row);
                 let op = op_col.value(row);
-                let mut props = Properties::new();
-
-                if op != 1
-                    && let Some(tp) = type_props
-                {
-                    for (p_name, p_meta) in tp {
-                        if let Some(col) = batch.column_by_name(p_name)
-                            && !col.is_null(row)
-                        {
-                            let val = Self::value_from_column(col.as_ref(), &p_meta.r#type, row)?;
-                            props.insert(p_name.clone(), val);
-                        }
-                    }
-                }
+                let props = if op == 1 {
+                    Properties::new()
+                } else {
+                    Self::edge_delta_row_props(&batch, row, type_props)?
+                };
                 per_eid_rows.entry(eid).or_default().push((ver, op, props));
             }
         }
@@ -1751,43 +1673,8 @@ impl PropertyManager {
         // Eids whose replay ends in a delete; gates the fallback below (C2).
         let mut replay_tombstoned: std::collections::HashSet<uni_common::core::id::Eid> =
             std::collections::HashSet::new();
-        for (eid, mut rows) in per_eid_rows {
-            rows.sort_by_key(|(ver, _, _)| *ver);
-
-            let mut merged_props: Properties = Properties::new();
-            let mut is_deleted = false;
-
-            for (_, op, props) in rows {
-                if op == 1 {
-                    is_deleted = true;
-                    merged_props.clear();
-                } else {
-                    is_deleted = false;
-                    for (p_name, p_val) in props {
-                        let is_crdt = type_props
-                            .and_then(|tp| tp.get(&p_name))
-                            .map(|pm| matches!(pm.r#type, DataType::Crdt(_)))
-                            .unwrap_or(false);
-                        if is_crdt {
-                            if let Some(existing) = merged_props.get(&p_name) {
-                                // A failed merge used to drop `p_val` and keep the
-                                // older value, silently. Two other sites resolved
-                                // the same failure the opposite way; propagating
-                                // removes the choice rather than picking a winner
-                                // nobody has the information to pick (#233).
-                                let merged = self.merge_crdt_values(existing, &p_val)?;
-                                merged_props.insert(p_name, merged);
-                            } else {
-                                merged_props.insert(p_name, p_val);
-                            }
-                        } else {
-                            merged_props.insert(p_name, p_val);
-                        }
-                    }
-                }
-            }
-
-            if is_deleted {
+        for (eid, rows) in per_eid_rows {
+            let Some(merged_props) = self.replay_edge_delta_rows(rows, type_props)? else {
                 // Deleted in storage; remove any L0 accumulation that may
                 // have been recorded under this EID by Phase 1 (matches
                 // is_edge_deleted single-EID semantics).
@@ -1798,7 +1685,7 @@ impl PropertyManager {
                 // not.
                 replay_tombstoned.insert(eid);
                 continue;
-            }
+            };
 
             // L0 takes precedence over storage for shared keys; insert
             // storage values only where L0 did not already provide them.
@@ -1841,7 +1728,7 @@ impl PropertyManager {
             let fetched = MainEdgeDataset::find_props_by_eids_counted(
                 self.storage.backend(),
                 &unresolved,
-                self.storage.version_high_water_mark(),
+                self.storage.row_visibility(),
                 counters_of(ctx),
             )
             .await?;
@@ -1901,11 +1788,25 @@ impl PropertyManager {
         Ok(props)
     }
 
-    /// Extract overflow properties from the overflow_json column.
+    /// Extract a row's undeclared properties: `overflow_json` plus `ext_id`.
     ///
-    /// Returns None if the column doesn't exist or the value is null,
-    /// otherwise parses the JSON blob and returns the properties.
+    /// A flush moves a vertex's string `ext_id` out of the blob into the
+    /// per-label `ext_id` column, so the blob alone is not the undeclared
+    /// set; the column is folded back in when the batch carries it (see
+    /// `property_builder::restore_ext_id_column`). Returns `None` when
+    /// neither holds anything for the row.
     fn extract_overflow_properties(batch: &RecordBatch, row: usize) -> Result<Option<Properties>> {
+        let mut props = Self::extract_overflow_blob(batch, row)?;
+        let mut ext_id = Properties::new();
+        crate::storage::property_builder::restore_ext_id_column(batch, row, &mut ext_id);
+        if !ext_id.is_empty() {
+            props.get_or_insert_with(Properties::new).extend(ext_id);
+        }
+        Ok(props)
+    }
+
+    /// Decode the row's `overflow_json` blob; `None` when absent or null.
+    fn extract_overflow_blob(batch: &RecordBatch, row: usize) -> Result<Option<Properties>> {
         use arrow_array::LargeBinaryArray;
 
         let overflow_col = match batch.column_by_name("overflow_json") {
@@ -1938,35 +1839,110 @@ impl PropertyManager {
         }
     }
 
+    /// One live delta row's user properties: the edge type's declared
+    /// columns plus the undeclared ones carried in `overflow_json`.
+    ///
+    /// Reading only the declared columns lost every undeclared property of
+    /// a declared-type edge as soon as the edge had been flushed: the
+    /// mutation prefetch built on this row seeded the next `SET`'s full row
+    /// without them, and that row then replaced the stored one. A declared
+    /// column wins a key it shares with the overflow blob, as on the read
+    /// path.
+    fn edge_delta_row_props(
+        batch: &RecordBatch,
+        row: usize,
+        type_props: Option<&HashMap<String, uni_common::core::schema::PropertyMeta>>,
+    ) -> Result<Properties> {
+        let mut props = Properties::new();
+        if let Some(tp) = type_props {
+            for (p_name, p_meta) in tp {
+                if let Some(col) = batch.column_by_name(p_name)
+                    && !col.is_null(row)
+                {
+                    let val = Self::value_from_column(col.as_ref(), &p_meta.r#type, row)?;
+                    props.insert(p_name.clone(), val);
+                }
+            }
+        }
+        if let Some(overflow) = Self::extract_overflow_properties(batch, row)? {
+            for (k, v) in overflow {
+                if !v.is_null() {
+                    props.entry(k).or_insert(v);
+                }
+            }
+        }
+        Ok(props)
+    }
+
+    /// Replay one edge's delta rows `(version, op, props)` into its current
+    /// property set, or `None` when the newest row is a delete.
+    ///
+    /// Every live delta row is a whole row — every edge write, a `SET`
+    /// included, flushes as a full-row append (see
+    /// `Writer::insert_edge_partial_full`) — so the newest live row *is* the
+    /// edge's state, and a key absent from
+    /// it is absent from the edge. Merging rows key by key let an older
+    /// row's value fill a key the newer row had dropped, so a removed
+    /// property came back on the next `SET`. CRDT properties are the one
+    /// exception: their values join across versions.
+    fn replay_edge_delta_rows(
+        &self,
+        mut rows: Vec<(u64, u8, Properties)>,
+        type_props: Option<&HashMap<String, uni_common::core::schema::PropertyMeta>>,
+    ) -> Result<Option<Properties>> {
+        let is_crdt = |name: &str| {
+            type_props
+                .and_then(|tp| tp.get(name))
+                .is_some_and(|pm| matches!(pm.r#type, DataType::Crdt(_)))
+        };
+        rows.sort_by_key(|(ver, _, _)| *ver);
+        let mut merged: Properties = Properties::new();
+        let mut is_deleted = false;
+        for (_, op, props) in rows {
+            if op == 1 {
+                is_deleted = true;
+                merged.clear();
+                continue;
+            }
+            is_deleted = false;
+            merged.retain(|k, _| is_crdt(k));
+            for (p_name, p_val) in props {
+                if is_crdt(&p_name)
+                    && let Some(existing) = merged.get(&p_name)
+                {
+                    // A failed merge used to drop `p_val` and keep the older
+                    // value, silently; propagating removes the choice rather
+                    // than picking a winner nobody has the information to
+                    // pick (#233).
+                    let joined = self.merge_crdt_values(existing, &p_val)?;
+                    merged.insert(p_name, joined);
+                } else {
+                    merged.insert(p_name, p_val);
+                }
+            }
+        }
+        Ok((!is_deleted).then_some(merged))
+    }
+
     /// Merge overflow properties from the overflow_json column into an existing props map.
     ///
-    /// Handles two concerns:
-    /// 1. If `overflow_json` is explicitly requested in `properties`, stores the raw JSONB
-    ///    bytes as a JSON array of u8 values.
-    /// 2. Extracts individual overflow properties and merges those that are in `properties`.
+    /// Extracts the row's individual overflow properties and merges those named
+    /// in `properties` (all of them under the `_all_props` wildcard).
+    ///
+    /// The blob itself is never stored in the map, even when a caller lists
+    /// `overflow_json` among `properties`: the map is the entity's user-facing
+    /// property set, and the blob is storage. Storing it here (as a list of
+    /// byte values) leaked it into `keys(r)`, `properties(r)` and the returned
+    /// relationship of every flushed edge whose type declares no properties,
+    /// because the planner requests `overflow_json` alongside `_all_props` for
+    /// such a type, and a SET on that edge then staged the blob back as a
+    /// property.
     fn merge_overflow_into_props(
         batch: &RecordBatch,
         row: usize,
         properties: &[&str],
         props: &mut Properties,
     ) -> Result<()> {
-        use arrow_array::LargeBinaryArray;
-
-        let overflow_col = match batch.column_by_name("overflow_json") {
-            Some(col) if !col.is_null(row) => col,
-            _ => return Ok(()),
-        };
-
-        // Store raw JSONB bytes if explicitly requested
-        if properties.contains(&"overflow_json")
-            && let Some(binary_array) = overflow_col.as_any().downcast_ref::<LargeBinaryArray>()
-        {
-            let jsonb_bytes = binary_array.value(row);
-            let bytes_list: Vec<Value> =
-                jsonb_bytes.iter().map(|&b| Value::Int(b as i64)).collect();
-            props.insert("overflow_json".to_string(), Value::List(bytes_list));
-        }
-
         // Extract and merge individual overflow properties. `_all_props` is a
         // wildcard sentinel: merge every overflow property, not just named ones.
         let wants_all = properties.contains(&"_all_props");
@@ -2076,8 +2052,10 @@ impl PropertyManager {
             // Build column selection
             let mut columns: Vec<String> = vec!["_deleted".to_string(), "_version".to_string()];
             columns.extend(prop_names.iter().cloned());
-            // Add overflow_json column to fetch non-schema properties
+            // Add overflow_json column to fetch non-schema properties, and
+            // the `ext_id` column a flush moves a string `ext_id` into.
             columns.push("overflow_json".to_string());
+            columns.push(EXT_ID_COLUMN.to_string());
 
             // Query using backend scan API
             let base_filter = FilterExpr::equals("_vid", Scalar::UInt(vid.as_u64()));
@@ -2161,7 +2139,7 @@ impl PropertyManager {
             && let Some(main_props) = MainVertexDataset::find_props_by_vid_counted(
                 self.storage.backend(),
                 vid,
-                self.storage.version_high_water_mark(),
+                self.storage.row_visibility(),
                 counters_of(ctx),
             )
             .await?
@@ -2427,6 +2405,9 @@ impl PropertyManager {
                 "_version".to_string(),
                 "overflow_json".to_string(),
             ];
+            if prop == EXT_ID_COLUMN {
+                columns.push(EXT_ID_COLUMN.to_string());
+            }
 
             // Only request the property column if it's defined in schema
             if prop_meta.is_some() {
@@ -2529,7 +2510,7 @@ impl PropertyManager {
             && let Some(main_props) = MainVertexDataset::find_props_by_vid_counted(
                 self.storage.backend(),
                 vid,
-                self.storage.version_high_water_mark(),
+                self.storage.row_visibility(),
                 counters_of(ctx),
             )
             .await?

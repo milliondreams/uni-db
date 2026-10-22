@@ -20,30 +20,49 @@ Uni's performance characteristics (indicative numbers from internal benchmarks; 
 
 ### 1. Use Predicate Pushdown
 
-Push filters to storage for massive I/O reduction:
+Let a scalar index narrow the scan instead of filtering every row:
 
 ```cypher
-// Good: Filter pushed to Lance
+// Good: with indexes on year and venue, both conjuncts narrow the scan
 MATCH (p:Paper)
 WHERE p.year > 2020 AND p.venue = 'NeurIPS'
 RETURN p.title
 
 // Bad: Filter applied after full scan
 MATCH (p:Paper)
-WHERE p.title CONTAINS 'Transformer'  // Cannot push CONTAINS
+WHERE p.title CONTAINS 'Transformer'  // No index serves CONTAINS
 RETURN p.title
 ```
 
-**Pushable Predicates:**
-- `=`, `<>`, `<`, `>`, `<=`, `>=`
-- `IN [list]`
-- `IS NULL`, `IS NOT NULL`
-- `AND` combinations of above
+**Predicates a scalar index serves** (on a property with an Online index;
+each conjunct of an `AND` is considered on its own):
 
-**Non-Pushable Predicates:**
-- `CONTAINS`, `STARTS WITH`, `ENDS WITH`
+| Predicate | BTree | Hash |
+|---|---|---|
+| `n.p = v`, `n.p IN [...]` | yes | yes |
+| `n.p < v`, `<=`, `>`, `>=`, and `AND`-ed pairs such as `n.p >= a AND n.p < b` | yes | no |
+| `n.p STARTS WITH 'prefix'` (literal or parameter) | yes, as a range | no |
+| `n.p IS NULL`, `n.p IS NOT NULL` | yes | yes |
+
+The index narrows the scan; the full `WHERE` is still applied to what it
+returns, so results are the same as without the index. An operand that cannot
+be handed to the index exactly is simply evaluated after the scan instead:
+`NULL`, `NaN`, infinite or zero bounds on a `FLOAT` property, a value of
+another type (`n.age < 'ten'`), an integer beyond 2^53 against a `FLOAT`
+property, and the empty prefix. A float bound on an `INT` property is fine
+(`n.age > 30.5` is served as `n.age > 30`).
+
+An index pays off when the predicate is selective. A range that matches most of
+the label (`n.age > 0`, `IS NOT NULL` on a mostly-set property) is somewhat
+slower through the index than a plain scan, since every row it returns is
+re-checked against newer versions.
+
+**Evaluated after the scan:**
+- Predicates on unindexed properties
+- `CONTAINS`, `ENDS WITH`
 - Function calls: `lower(x) = 'value'`
-- `OR` with different properties
+- `NOT (...)` and `OR` with different properties
+- Comparisons between two properties (`n.a < n.b`)
 
 ### 2. Limit Early
 
@@ -145,10 +164,35 @@ MATCH (a:Company {id: 'X'})-[:OWNS*1..6]->(b:Company)
 RETURN DISTINCT b
 ```
 
+A correlated `EXISTS { ... }` or `COUNT { ... }` between two nodes the outer
+query binds is evaluated once per source, not once per pair, when the body
+names one of them only as a bare node (no label, property map or `WHERE` on
+it). The other one is the source:
+
+```cypher
+// One search per a, shared by every b
+MATCH (a:Person), (b:Person)
+WHERE NOT EXISTS { MATCH (a)-[:KNOWS*1..]->(b) }
+RETURN a, b
+
+// One search per (a, b) pair: the body reads both endpoints
+MATCH (a:Person), (b:Person)
+WHERE NOT EXISTS { MATCH (a)-[:KNOWS*1..]->(b) WHERE a.active AND b.active }
+RETURN a, b
+```
+
+Move such filters to the outer query (`WHERE a.active AND b.active AND NOT
+EXISTS { ... }`) to keep the shared search. The body is planned each time it
+runs, so `result.metrics().physical_plans` minus one is how many times it ran.
+
 When you genuinely need paths:
 
 - **`shortestPath`** stops at the first path it finds — use it whenever one path
-  will do.
+  will do. An unbound target (`shortestPath((a {id: 0})-[:R*]->(b:Person))`)
+  runs one search from each source, shared by all its targets, and a `WHERE`
+  on the target alone (`WHERE b.age > 30`) narrows the targets before the
+  search. When several shortest paths tie, which one is returned is not
+  guaranteed.
 - **A `LIMIT` stops the expansion**, rather than trimming its output, so a small
   limit costs little. Two caveats: the graph search still runs in full, and the
   limit applies one batch (8192 rows) at a time, so any limit up to 8192 costs
@@ -354,7 +398,15 @@ config.compaction.check_interval = Duration::from_secs(30);// Check every 30s (d
 
 #### Manual Compaction (Optional)
 
-For on-demand compaction after bulk loads, you can trigger it manually:
+For on-demand compaction after bulk loads, you can trigger it manually.
+`CALL uni.admin.compact()` (run it with `session.run()` or the `uni query` CLI;
+`session.query()` is read-only and refuses it; Rust `StorageManager::compact`) runs the same full
+pass as background compaction -- folding L1 deltas, then optimizing every
+table -- and never at the same time as one: it waits for a running pass. It
+also lowers the flush-generation count that drives write throttling, so it
+releases writers stalled at `throttle.hard_limit`. The label- and
+edge-type-scoped calls only optimize those tables' files and leave the count
+unchanged.
 
 ```bash
 # Manual compaction (via Cypher)
@@ -391,6 +443,48 @@ let db = Uni::open("./graph")
 - Size for your "hot" working set
 - Monitor cache hit ratio
 - Increase if traversals are slow after warmup
+
+### Storage Engine (Lance) Caches
+
+Every table a database opens reads through one Lance session, shared by all
+tables and by every fork of the database. It holds two caches:
+
+| Cache | `UniConfig` field | Lance default | Holds |
+|---|---|---|---|
+| Metadata | `lance_metadata_cache_bytes` | 1 GiB | manifests, fragment and file metadata |
+| Index | `lance_index_cache_bytes` | 6 GiB | opened scalar, vector and full-text indexes |
+
+Both caches fill as tables are flushed and read and are trimmed only when
+full. A long-running process that flushes often therefore keeps growing toward
+the full 7 GiB: each flush writes a new table version whose metadata the next
+read caches. Set a capacity to bound it:
+
+```rust
+use uni_db::{Uni, UniConfig};
+
+let config = UniConfig {
+    lance_metadata_cache_bytes: Some(64 * 1024 * 1024),
+    lance_index_cache_bytes: Some(512 * 1024 * 1024),
+    ..Default::default()
+};
+let db = Uni::open("./graph").config(config).build().await?;
+
+let m = db.metrics();
+println!("{} / {}", m.storage_metadata_cache_bytes, m.storage_index_cache_bytes);
+```
+
+```python
+db = (uni_db.UniBuilder.open("./graph")
+      .config({"lance_metadata_cache_bytes": 64 << 20,
+               "lance_index_cache_bytes": 512 << 20})
+      .build())
+db.metrics().storage_metadata_cache_bytes
+```
+
+A miss is re-read from storage, so a smaller cache costs I/O, never
+correctness. Keep the index cache above the size of any vector index you
+search: an ANN index evicted from it is re-read and re-decoded on every query.
+`Some(0)` disables a cache.
 
 ### Property Cache
 
@@ -569,7 +663,7 @@ config.max_query_memory = 4 * 1024 * 1024 * 1024; // 4 GB
 ### Reducing Memory Usage
 
 1. **Smaller batch sizes**: use `UniConfig.execution_batch_size` (query execution) or `BulkWriter.batch_size()` (bulk ingest)
-2. **Smaller caches**: Reduce `UniConfig.cache_size`
+2. **Smaller caches**: Reduce `UniConfig.cache_size`, and cap the storage engine's caches with `lance_metadata_cache_bytes` / `lance_index_cache_bytes` (see [Storage Engine (Lance) Caches](#storage-engine-lance-caches))
 3. **Stream large results**: Use SKIP/LIMIT pagination
 4. **Avoid large intermediates**: Filter early
 

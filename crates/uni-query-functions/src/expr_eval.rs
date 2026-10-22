@@ -22,60 +22,54 @@ use uni_cypher::ast::BinaryOp;
 
 /// Evaluate a binary operation on two already-evaluated values.
 ///
-/// This function handles all binary operators (Eq, NotEq, And, Or, Gt, Lt, etc.)
-/// and returns the result of the operation.
+/// This is the value-level definition of every Cypher binary operator; the
+/// per-row DataFusion UDFs, the interpreted executor and Locy all call it, so
+/// it answers what openCypher specifies:
+///
+/// * NULL propagates through every operator except `AND`/`OR`/`XOR`, which
+///   use Kleene logic.
+/// * `AND`/`OR` are decided by a dominating operand whatever the other one
+///   is (`false AND x` is false, `true OR x` true, in either order), so the
+///   answer does not depend on evaluation order or batch composition.
+///   Otherwise a non-boolean, non-NULL operand is a type error, NULL
+///   included: `NULL AND 1` is an error.
+/// * `XOR` has no dominating operand: a non-boolean, non-NULL operand is a
+///   type error, even beside NULL.
+/// * `^` is always a float (`2 ^ 3` is `8.0`).
+/// * `+` of a string and a number, boolean or temporal concatenates the
+///   other operand's `toString`.
+/// * `STARTS WITH` / `ENDS WITH` / `CONTAINS` with a non-string operand is
+///   NULL.
 pub fn eval_binary_op(left: &Value, op: &BinaryOp, right: &Value) -> Result<Value> {
-    // Null propagation for most operators (except AND/OR which have three-valued logic)
-    if !matches!(op, BinaryOp::And | BinaryOp::Or) && (left.is_null() || right.is_null()) {
+    // Null propagation for every operator but the three-valued logical ones.
+    if !matches!(op, BinaryOp::And | BinaryOp::Or | BinaryOp::Xor)
+        && (left.is_null() || right.is_null())
+    {
         return Ok(Value::Null);
     }
 
     match op {
         BinaryOp::Eq => Ok(cypher_eq(left, right).map_or(Value::Null, Value::Bool)),
         BinaryOp::NotEq => Ok(cypher_eq(left, right).map_or(Value::Null, |b| Value::Bool(!b))),
-        BinaryOp::And => {
-            // Three-valued logic: false dominates, null propagates with true
-            match (left.as_bool(), right.as_bool()) {
-                (Some(false), _) | (_, Some(false)) => Ok(Value::Bool(false)),
-                (Some(true), Some(true)) => Ok(Value::Bool(true)),
-                _ if left.is_null() || right.is_null() => Ok(Value::Null),
-                _ => Err(anyhow!(
-                    "InvalidArgumentType: Expected bool for AND operands"
-                )),
-            }
-        }
-        BinaryOp::Or => {
-            // Three-valued logic: true dominates, null propagates with false
-            match (left.as_bool(), right.as_bool()) {
-                (Some(true), _) | (_, Some(true)) => Ok(Value::Bool(true)),
-                (Some(false), Some(false)) => Ok(Value::Bool(false)),
-                _ if left.is_null() || right.is_null() => Ok(Value::Null),
-                _ => Err(anyhow!(
-                    "InvalidArgumentType: Expected bool for OR operands"
-                )),
-            }
-        }
+        BinaryOp::And => eval_logical(left, right, "AND", false),
+        BinaryOp::Or => eval_logical(left, right, "OR", true),
         BinaryOp::Xor => {
-            // Three-valued logic: any null operand returns null
-            match (left.as_bool(), right.as_bool()) {
-                (Some(l), Some(r)) => Ok(Value::Bool(l ^ r)),
-                _ if left.is_null() || right.is_null() => Ok(Value::Null),
-                _ => Err(anyhow!(
-                    "InvalidArgumentType: Expected bool for XOR operands"
-                )),
-            }
+            let (l, r) = (
+                logical_operand(left, "XOR")?,
+                logical_operand(right, "XOR")?,
+            );
+            Ok(match (l, r) {
+                (Some(l), Some(r)) => Value::Bool(l ^ r),
+                _ => Value::Null,
+            })
         }
         BinaryOp::Gt => eval_comparison(left, right, |ordering| ordering.is_gt()),
         BinaryOp::Lt => eval_comparison(left, right, |ordering| ordering.is_lt()),
         BinaryOp::GtEq => eval_comparison(left, right, |ordering| ordering.is_ge()),
         BinaryOp::LtEq => eval_comparison(left, right, |ordering| ordering.is_le()),
-        BinaryOp::Contains => eval_string_predicate(left, right, "CONTAINS", |l, r| l.contains(r)),
-        BinaryOp::StartsWith => {
-            eval_string_predicate(left, right, "STARTS WITH", |l, r| l.starts_with(r))
-        }
-        BinaryOp::EndsWith => {
-            eval_string_predicate(left, right, "ENDS WITH", |l, r| l.ends_with(r))
-        }
+        BinaryOp::Contains => Ok(eval_string_predicate(left, right, |l, r| l.contains(r))),
+        BinaryOp::StartsWith => Ok(eval_string_predicate(left, right, |l, r| l.starts_with(r))),
+        BinaryOp::EndsWith => Ok(eval_string_predicate(left, right, |l, r| l.ends_with(r))),
         BinaryOp::Add => eval_add(left, right),
         BinaryOp::Sub => eval_sub(left, right),
         BinaryOp::Mul => eval_mul(left, right),
@@ -91,7 +85,19 @@ pub fn eval_binary_op(left: &Value, op: &BinaryOp, right: &Value) -> Result<Valu
                 eval_numeric_op(left, right, |a, b| a % b)
             }
         }
-        BinaryOp::Pow => eval_numeric_op(left, right, |a, b| a.powf(b)),
+        BinaryOp::Pow => match (left, right) {
+            (Value::Int(_) | Value::Float(_), Value::Int(_) | Value::Float(_)) => {
+                // Both arms are numbers, so `as_f64` cannot fail.
+                let (l, r) = (
+                    left.as_f64().unwrap_or(f64::NAN),
+                    right.as_f64().unwrap_or(f64::NAN),
+                );
+                Ok(Value::Float(l.powf(r)))
+            }
+            _ => Err(anyhow!(
+                "pow requires numeric operands, got {left:?} ^ {right:?}"
+            )),
+        },
         BinaryOp::Regex => {
             let l = left
                 .as_str()
@@ -99,10 +105,40 @@ pub fn eval_binary_op(left: &Value, op: &BinaryOp, right: &Value) -> Result<Valu
             let pattern = right
                 .as_str()
                 .ok_or_else(|| anyhow!("Right operand of =~ must be a regex pattern string"))?;
-            let matched = with_cached_regex(pattern, |re| re.is_match(l))?;
-            Ok(Value::Bool(matched))
+            Ok(Value::Bool(cypher_regex_is_match(l, pattern)?))
         }
         BinaryOp::ApproxEq => eval_vector_similarity(left, right),
+    }
+}
+
+/// A logical operand as a Kleene truth value: `Some(bool)` or `None` for
+/// NULL; any other value is a type error.
+fn logical_operand(value: &Value, op_name: &str) -> Result<Option<bool>> {
+    match value {
+        Value::Bool(b) => Ok(Some(*b)),
+        Value::Null => Ok(None),
+        other => Err(anyhow!(
+            "InvalidArgumentType: {op_name} requires boolean arguments, got {other:?}"
+        )),
+    }
+}
+
+/// `AND` (`dominant` false) or `OR` (`dominant` true) under Kleene logic.
+///
+/// An operand equal to `dominant` decides the answer whatever the other
+/// operand is, in either position; otherwise both must be boolean or NULL.
+fn eval_logical(left: &Value, right: &Value, op_name: &str, dominant: bool) -> Result<Value> {
+    if matches!(left, Value::Bool(b) if *b == dominant)
+        || matches!(right, Value::Bool(b) if *b == dominant)
+    {
+        return Ok(Value::Bool(dominant));
+    }
+    match (
+        logical_operand(left, op_name)?,
+        logical_operand(right, op_name)?,
+    ) {
+        (Some(_), Some(_)) => Ok(Value::Bool(!dominant)),
+        _ => Ok(Value::Null),
     }
 }
 
@@ -110,30 +146,170 @@ pub fn eval_binary_op(left: &Value, op: &BinaryOp, right: &Value) -> Result<Valu
 const REGEX_CACHE_CAP: usize = 64;
 
 thread_local! {
-    /// Per-thread compiled-regex cache for the interpreted `=~` path, which
-    /// previously recompiled the pattern on every row. Thread-local avoids
-    /// any cross-query lock; per-query pattern counts are tiny, so a full
-    /// clear at capacity is simpler than LRU and effectively never fires.
-    static REGEX_CACHE: std::cell::RefCell<std::collections::HashMap<String, regex::Regex>> =
+    /// Per-thread cache of compiled `=~` patterns, keyed by the pattern as
+    /// written and the backtrack limit it was compiled with. Thread-local
+    /// avoids any cross-query lock; per-query pattern counts are tiny, so a
+    /// full clear at capacity is simpler than LRU and effectively never fires.
+    static REGEX_CACHE: std::cell::RefCell<
+        std::collections::HashMap<(String, usize), crate::java_regex::CypherRegex>,
+    > =
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-/// Run `f` against the compiled regex for `pattern`, compiling and caching on
-/// first use. Only successful compiles are cached — an invalid pattern errors
-/// identically on every row.
-fn with_cached_regex<T>(pattern: &str, f: impl FnOnce(&regex::Regex) -> T) -> Result<T> {
+/// A check that fails once the running query must stop: it returns the
+/// error message (`"Query timed out"`, `"Query cancelled"`) when it should.
+pub type RegexInterrupt = std::sync::Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
+/// What a query's `=~` evaluation runs under: the backtrack limit and the
+/// query's deadline and cancellation.
+#[derive(Clone)]
+pub struct RegexRuntime {
+    backtrack_limit: usize,
+    interrupt: Option<RegexInterrupt>,
+}
+
+impl std::fmt::Debug for RegexRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegexRuntime")
+            .field("backtrack_limit", &self.backtrack_limit)
+            .field("interrupt", &self.interrupt.is_some())
+            .finish()
+    }
+}
+
+impl Default for RegexRuntime {
+    fn default() -> Self {
+        Self::new(crate::java_regex::DEFAULT_BACKTRACK_LIMIT, None)
+    }
+}
+
+impl RegexRuntime {
+    /// A runtime with `backtrack_limit` steps per match and, when given, a
+    /// deadline/cancellation check consulted while rows are evaluated.
+    pub fn new(backtrack_limit: usize, interrupt: Option<RegexInterrupt>) -> Self {
+        Self {
+            backtrack_limit,
+            interrupt,
+        }
+    }
+
+    /// The backtrack limit for the backtracking VM.
+    pub fn backtrack_limit(&self) -> usize {
+        self.backtrack_limit
+    }
+
+    /// Fails when the query has timed out or been cancelled.
+    ///
+    /// # Errors
+    ///
+    /// Returns the query's timeout or cancellation error.
+    pub fn check(&self) -> Result<()> {
+        match self.interrupt.as_ref().and_then(|f| f()) {
+            Some(msg) => Err(anyhow!(msg)),
+            None => Ok(()),
+        }
+    }
+}
+
+tokio::task_local! {
+    /// The `=~` runtime of the query running on this task, for the
+    /// row-at-a-time evaluator. The vectorized `_cypher_regex` UDF carries
+    /// its own copy instead, because DataFusion runs partitions on spawned
+    /// tasks, which do not inherit task-locals.
+    pub static REGEX_RUNTIME: std::sync::Arc<RegexRuntime>;
+}
+
+/// The runtime installed on this task, or the defaults.
+pub fn current_regex_runtime() -> std::sync::Arc<RegexRuntime> {
+    REGEX_RUNTIME
+        .try_with(std::sync::Arc::clone)
+        .unwrap_or_else(|_| std::sync::Arc::new(RegexRuntime::default()))
+}
+
+/// Compiles `pattern` for Cypher's `=~`: Java (`java.util.regex`) syntax and
+/// defaults, matching the **whole** input, as `Pattern.matches` does in
+/// Neo4j. See [`crate::java_regex`] for the semantics and the limits.
+///
+/// # Errors
+///
+/// Returns an error naming the pattern when it is not a valid Java regular
+/// expression (the `PatternSyntaxException` Java would throw).
+pub fn compile_cypher_regex(pattern: &str) -> Result<crate::java_regex::CypherRegex> {
+    compile_cypher_regex_with_limit(pattern, crate::java_regex::DEFAULT_BACKTRACK_LIMIT)
+}
+
+fn compile_cypher_regex_with_limit(
+    pattern: &str,
+    limit: usize,
+) -> Result<crate::java_regex::CypherRegex> {
+    crate::java_regex::CypherRegex::with_backtrack_limit(pattern, limit)
+        .map_err(|e| anyhow!("Invalid regex pattern '{pattern}': {e}"))
+}
+
+/// Whether `text` matches `pattern` in full under Cypher's `=~`, under the
+/// runtime installed on this task; see [`compile_cypher_regex`].
+///
+/// # Errors
+///
+/// Returns an error when `pattern` is not a valid regular expression, when a
+/// match exceeds the backtrack limit, or when the query has timed out or
+/// been cancelled.
+pub fn cypher_regex_is_match(text: &str, pattern: &str) -> Result<bool> {
+    cypher_regex_is_match_in(&current_regex_runtime(), text, pattern)
+}
+
+/// [`cypher_regex_is_match`] under `runtime`.
+///
+/// # Errors
+///
+/// As [`cypher_regex_is_match`].
+pub fn cypher_regex_is_match_in(runtime: &RegexRuntime, text: &str, pattern: &str) -> Result<bool> {
+    runtime.check()?;
+    with_cached_regex(pattern, runtime.backtrack_limit(), |re| {
+        re.is_match(text).map_err(|e| anyhow!("{e}"))
+    })?
+}
+
+/// Run `f` against the compiled full-match regex for `pattern`, compiling
+/// and caching on first use. Only successful compiles are cached — an
+/// invalid pattern errors identically on every row.
+pub(crate) fn with_cached_regex<T>(
+    pattern: &str,
+    limit: usize,
+    f: impl FnOnce(&crate::java_regex::CypherRegex) -> T,
+) -> Result<T> {
     REGEX_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        if let Some(re) = cache.get(pattern) {
+        let key = (pattern.to_string(), limit);
+        if let Some(re) = cache.get(&key) {
             return Ok(f(re));
         }
-        let re = regex::Regex::new(pattern)
-            .map_err(|e| anyhow!("Invalid regex pattern '{}': {}", pattern, e))?;
+        let re = compile_cypher_regex_with_limit(pattern, limit)?;
         if cache.len() >= REGEX_CACHE_CAP {
             cache.clear();
         }
-        let re = cache.entry(pattern.to_string()).or_insert(re);
+        let re = cache.entry(key).or_insert(re);
         Ok(f(re))
+    })
+}
+
+/// Compare two numbers by their exact mathematical value.
+///
+/// Returns `None` when either operand is not an `Int` or a `Float`, and
+/// `Some(None)` when they are numbers that do not compare (a NaN is
+/// involved). An integer against a float is compared exactly through
+/// [`uni_common::cmp_i64_f64`]: widening the integer to `f64` rounds above
+/// 2^53, under which `9007199254740993 = 9007199254740992.0` held, while
+/// openCypher compares numbers by value.
+pub fn cypher_numeric_cmp(left: &Value, right: &Value) -> Option<Option<Ordering>> {
+    Some(match (left, right) {
+        (Value::Int(l), Value::Int(r)) => Some(l.cmp(r)),
+        (Value::Float(l), Value::Float(r)) => l.partial_cmp(r),
+        (Value::Int(i), Value::Float(f)) => (!f.is_nan()).then(|| uni_common::cmp_i64_f64(*i, *f)),
+        (Value::Float(f), Value::Int(i)) => {
+            (!f.is_nan()).then(|| uni_common::cmp_i64_f64(*i, *f).reverse())
+        }
+        _ => return None,
     })
 }
 
@@ -144,17 +320,9 @@ pub fn cypher_eq(left: &Value, right: &Value) -> Option<bool> {
         return None;
     }
 
-    // Exact integer equality — avoid f64 precision loss for large i64 values
-    if let (Some(l), Some(r)) = (left.as_i64(), right.as_i64()) {
-        return Some(l == r);
-    }
-
-    // Mixed numeric equality (1 = 1.0)
-    if let (Some(l), Some(r)) = (left.as_f64(), right.as_f64()) {
-        if l.is_nan() || r.is_nan() {
-            return Some(false);
-        }
-        return Some(l == r);
+    // Numbers compare by exact value: `1 = 1.0`, `2^53 + 1 <> 2^53`.
+    if let Some(ord) = cypher_numeric_cmp(left, right) {
+        return Some(ord == Some(Ordering::Equal));
     }
 
     // Graph entities compare by identity, never structurally.
@@ -283,19 +451,12 @@ pub fn eval_in_op(left: &Value, right: &Value) -> Result<Value> {
     }
 }
 
-fn eval_string_predicate(
-    left: &Value,
-    right: &Value,
-    op_name: &str,
-    check: fn(&str, &str) -> bool,
-) -> Result<Value> {
-    let l = left
-        .as_str()
-        .ok_or_else(|| anyhow!("Left side of {} must be a string", op_name))?;
-    let r = right
-        .as_str()
-        .ok_or_else(|| anyhow!("Right side of {} must be a string", op_name))?;
-    Ok(Value::Bool(check(l, r)))
+fn eval_string_predicate(left: &Value, right: &Value, check: fn(&str, &str) -> bool) -> Value {
+    match (left, right) {
+        (Value::String(l), Value::String(r)) => Value::Bool(check(l, r)),
+        // openCypher: a non-string operand is NULL, not an error.
+        _ => Value::Null,
+    }
 }
 
 fn eval_numeric_op<F>(left: &Value, right: &Value, op: F) -> Result<Value>
@@ -458,10 +619,12 @@ fn eval_add(left: &Value, right: &Value) -> Result<Value> {
         return add_temporal_duration_to_value(right, &dur);
     }
 
-    // Temporal + Duration (supports typed temporals and map-wrapped temporals)
+    // Temporal + Duration (supports typed temporals and map-wrapped temporals).
+    // A number is not a duration: `datetime(..) + 1` is a type error, as in
+    // openCypher, not an offset in microseconds.
     if let Some(tv) = temporal_from_value(left)
         && !matches!(tv, TemporalValue::Duration { .. })
-        && (is_duration_value(right) || right.is_number())
+        && is_duration_value(right)
     {
         let dur = parse_duration_from_value(right)?;
         return add_temporal_duration_typed(&tv, &dur);
@@ -469,7 +632,7 @@ fn eval_add(left: &Value, right: &Value) -> Result<Value> {
     // Duration + Temporal
     if let Some(tv) = temporal_from_value(right)
         && !matches!(tv, TemporalValue::Duration { .. })
-        && (is_duration_value(left) || left.is_number())
+        && is_duration_value(left)
     {
         let dur = parse_duration_from_value(left)?;
         return add_temporal_duration_typed(&tv, &dur);
@@ -522,21 +685,16 @@ fn eval_add(left: &Value, right: &Value) -> Result<Value> {
         }
     }
 
-    // temporal string + integer microseconds
-    if let Value::String(_) = left
-        && right.is_number()
-        && classify_value_temporal(left).is_some_and(|t| t != TemporalType::Duration)
-    {
-        let dur = parse_duration_from_value(right)?;
-        return add_temporal_duration_to_value(left, &dur);
-    }
-    // integer microseconds + temporal string
-    if let Value::String(_) = right
-        && left.is_number()
-        && classify_value_temporal(right).is_some_and(|t| t != TemporalType::Duration)
-    {
-        let dur = parse_duration_from_value(left)?;
-        return add_temporal_duration_to_value(right, &dur);
+    // String + number, boolean or temporal: concatenate the other operand's
+    // `toString`, in either order (`'ab' + 1` is `'ab1'`).
+    match (left, right) {
+        (Value::String(s), other) if concatenates_to_string(other) => {
+            return Ok(Value::String(format!("{s}{}", cypher_to_string(other)?)));
+        }
+        (other, Value::String(s)) if concatenates_to_string(other) => {
+            return Ok(Value::String(format!("{}{s}", cypher_to_string(other)?)));
+        }
+        _ => {}
     }
 
     Err(anyhow!(
@@ -546,12 +704,20 @@ fn eval_add(left: &Value, right: &Value) -> Result<Value> {
     ))
 }
 
-/// Classify a Value's temporal type (works for both Temporal and String).
-fn classify_value_temporal(val: &Value) -> Option<TemporalType> {
-    match val {
-        Value::Temporal(tv) => Some(tv.temporal_type()),
-        Value::String(s) => classify_temporal(s),
-        _ => None,
+/// Whether `+` concatenates `value` onto a string: a number, boolean or
+/// temporal. A list appends instead; any other value is a type error.
+fn concatenates_to_string(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Temporal(_)
+    )
+}
+
+/// `toString(value)`, as the scalar function answers it.
+fn cypher_to_string(value: &Value) -> Result<String> {
+    match eval_scalar_function("toString", std::slice::from_ref(value), None)? {
+        Value::String(s) => Ok(s),
+        other => Err(anyhow!("toString returned {other:?}")),
     }
 }
 
@@ -575,7 +741,7 @@ fn eval_sub(left: &Value, right: &Value) -> Result<Value> {
             let dur = CypherDuration::new(-months, -days, -nanos);
             return add_temporal_duration_typed(tv, &dur);
         }
-        if is_duration_value(right) || right.is_number() {
+        if is_duration_value(right) {
             let dur = parse_duration_from_value(right)?.negate();
             return add_temporal_duration_typed(tv, &dur);
         }
@@ -632,15 +798,6 @@ fn eval_sub(left: &Value, right: &Value) -> Result<Value> {
             }
             _ => {}
         }
-    }
-
-    // temporal string - integer microseconds
-    if let Value::String(_) = left
-        && right.is_number()
-        && classify_value_temporal(left).is_some_and(|t| t != TemporalType::Duration)
-    {
-        let dur = parse_duration_from_value(right)?.negate();
-        return add_temporal_duration_to_value(left, &dur);
     }
 
     // Integer - integer uses checked subtraction (rejects overflow, stays exact above 2^53).
@@ -803,14 +960,9 @@ fn cypher_partial_cmp(left: &Value, right: &Value) -> Option<Ordering> {
         return None;
     }
 
-    // Exact integer ordering — avoid f64 precision loss for large i64 values
-    if let (Some(l), Some(r)) = (left.as_i64(), right.as_i64()) {
-        return Some(l.cmp(&r));
-    }
-
-    // Number vs Number
-    if let (Some(l), Some(r)) = (left.as_f64(), right.as_f64()) {
-        return l.partial_cmp(&r);
+    // Number vs Number, by exact value.
+    if let Some(ord) = cypher_numeric_cmp(left, right) {
+        return ord;
     }
 
     // String vs String (includes temporal string comparison for ISO-format strings)
@@ -1224,7 +1376,7 @@ fn eval_entity_function(name: &str, args: &[Value]) -> Result<Value> {
             // A plain map is its own properties.
             (None, Value::Map(map)) => Value::Map(
                 map.iter()
-                    .filter(|(k, _)| !k.starts_with('_'))
+                    .filter(|(k, _)| !uni_common::core::schema::is_reserved_property_name(k))
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect(),
             ),
@@ -1250,11 +1402,22 @@ fn eval_keys(arg: &Value) -> Result<Value> {
             // Entities (nodes/edges) are detected by internal fields (_vid, _eid).
             // For entities, null-valued properties don't exist (REMOVE sets them to Null).
             // For plain maps, null-valued keys are valid and must be included.
-            let is_entity =
-                map.contains_key("_vid") || map.contains_key("_eid") || map.contains_key("_labels");
-            let mut keys: Vec<&String> = map
+            // A schemaless or serialised entity nests its properties.
+            let (source, is_entity) = match uni_common::value::entity_property_container(map) {
+                Some(props) => (props, true),
+                None => (
+                    map,
+                    map.contains_key("_vid")
+                        || map.contains_key("_eid")
+                        || map.contains_key("_labels"),
+                ),
+            };
+            let mut keys: Vec<&String> = source
                 .iter()
-                .filter(|(k, v)| !k.starts_with('_') && (!is_entity || !v.is_null()))
+                .filter(|(k, v)| {
+                    !uni_common::core::schema::is_reserved_property_name(k)
+                        && (!is_entity || !v.is_null())
+                })
                 .map(|(k, _)| k)
                 .collect();
             keys.sort();
@@ -1938,21 +2101,27 @@ fn eval_range_function(args: &[Value]) -> Result<Value> {
     if args.len() < 2 || args.len() > 3 {
         return Err(anyhow!("range() requires 2 or 3 arguments"));
     }
-    let start = args[0]
-        .as_i64()
-        .ok_or_else(|| anyhow!("range() start must be an integer"))?;
-    let end = args[1]
-        .as_i64()
-        .ok_or_else(|| anyhow!("range() end must be an integer"))?;
+    // Null in, null out: an absent bound or step is not a wrong type, and it
+    // wins over every other check, including a zero step.
+    if args.iter().any(Value::is_null) {
+        return Ok(Value::Null);
+    }
+    let int_arg = |v: &Value, name: &str| {
+        v.as_i64().ok_or_else(|| {
+            anyhow!("ArgumentError: InvalidArgumentType - range() {name} must be an integer")
+        })
+    };
+    let start = int_arg(&args[0], "start")?;
+    let end = int_arg(&args[1], "end")?;
     let step = if args.len() == 3 {
-        args[2]
-            .as_i64()
-            .ok_or_else(|| anyhow!("range() step must be an integer"))?
+        int_arg(&args[2], "step")?
     } else {
         1
     };
     if step == 0 {
-        return Err(anyhow!("range() step cannot be zero"));
+        return Err(anyhow!(
+            "ArgumentError: NumberOutOfRange - range() step cannot be zero"
+        ));
     }
     let mut result = Vec::new();
     let mut i = start;
@@ -2253,7 +2422,13 @@ fn lane_to_u8(lane: f64) -> Result<u8> {
 }
 
 /// Evaluate vector similarity between two vectors (cosine similarity).
+///
+/// A NULL operand (a node without the vector) yields NULL, as in
+/// [`crate::similar_to::eval_similar_to_pure`].
 pub fn eval_vector_similarity(v1: &Value, v2: &Value) -> Result<Value> {
+    if v1.is_null() || v2.is_null() {
+        return Ok(Value::Null);
+    }
     let arr1 = vector_arg_to_f64(v1)?;
     let arr2 = vector_arg_to_f64(v2)?;
 
@@ -2288,7 +2463,13 @@ pub fn eval_vector_similarity(v1: &Value, v2: &Value) -> Result<Value> {
 }
 
 /// Evaluate vector distance between two vectors.
+///
+/// A NULL operand (a node without the vector) yields NULL rather than an
+/// error, matching `vector_similarity`.
 pub fn eval_vector_distance(v1: &Value, v2: &Value, metric: &str) -> Result<Value> {
+    if v1.is_null() || v2.is_null() {
+        return Ok(Value::Null);
+    }
     let arr1 = vector_arg_to_f64(v1)?;
     let arr2 = vector_arg_to_f64(v2)?;
 
@@ -2933,6 +3114,26 @@ mod tests {
         Value::Int(v)
     }
 
+    /// A NULL operand is NULL for both vector functions, not an error.
+    #[test]
+    fn test_vector_functions_propagate_null() {
+        let v = Value::List(vec![Value::Float(1.0), Value::Float(0.0)]);
+        for metric in ["cosine", "l2", "dot"] {
+            assert_eq!(
+                eval_vector_distance(&Value::Null, &v, metric).unwrap(),
+                Value::Null
+            );
+            assert_eq!(
+                eval_vector_distance(&v, &Value::Null, metric).unwrap(),
+                Value::Null
+            );
+        }
+        assert_eq!(
+            eval_vector_similarity(&Value::Null, &v).unwrap(),
+            Value::Null
+        );
+    }
+
     #[test]
     fn test_vector_distance_l1() {
         let a = Value::List(vec![Value::Float(0.0), Value::Float(0.0)]);
@@ -3166,35 +3367,121 @@ mod tests {
 
     #[test]
     fn test_regex_anchors() {
-        // Start anchor
-        assert_eq!(
-            eval_binary_op(&s("hello world"), &BinaryOp::Regex, &s("^hello")).unwrap(),
-            Value::Bool(true)
-        );
-        assert_eq!(
-            eval_binary_op(&s("say hello"), &BinaryOp::Regex, &s("^hello")).unwrap(),
-            Value::Bool(false)
-        );
+        // `=~` matches the whole string, so an explicit anchor is redundant
+        // and a pattern covering only part of the input does not match.
+        let cases = [
+            ("hello world", "^hello", false),
+            ("hello", "^hello", true),
+            ("say hello", "^hello", false),
+            ("hello world", "world$", false),
+            ("world", "world$", true),
+            ("hello", "^hello$", true),
+            ("hello world", "^hello$", false),
+        ];
+        for (subject, pattern, expected) in cases {
+            assert_eq!(
+                eval_binary_op(&s(subject), &BinaryOp::Regex, &s(pattern)).unwrap(),
+                Value::Bool(expected),
+                "{subject:?} =~ {pattern:?}"
+            );
+        }
+    }
 
-        // End anchor
-        assert_eq!(
-            eval_binary_op(&s("hello world"), &BinaryOp::Regex, &s("world$")).unwrap(),
-            Value::Bool(true)
-        );
-        assert_eq!(
-            eval_binary_op(&s("world hello"), &BinaryOp::Regex, &s("world$")).unwrap(),
-            Value::Bool(false)
-        );
+    /// `=~` follows Java's `Pattern.matches`: the match spans the whole
+    /// input, alternation is decided over the whole input, inline flags stay
+    /// in force, and the end is absolute (no match before a trailing
+    /// newline, in multi-line mode too).
+    #[test]
+    fn test_regex_is_a_full_match() {
+        let cases = [
+            ("abc", "b", false),
+            ("abc", "a", false),
+            ("abc", "a.*", true),
+            ("abc", ".*c", true),
+            ("ab", "a|ab", true),
+            ("ab", "ab|a", true),
+            ("ab", "(a|ab)", true),
+            ("aab", "a|ab", false),
+            ("abc", "(?i)ABC", true),
+            ("ABC", "(?i)abc", true),
+            ("abc", "(?i)AB", false),
+            ("abc", "(?i:A)bc", true),
+            ("Abc", "(?i:a)BC", false),
+            ("abc\n", "abc", false),
+            ("abc\n", "abc$", false),
+            ("abc\n", "(?m)abc$", false),
+            ("abc\n", "(?m)abc", false),
+            ("x\nabc", "(?m)^abc", false),
+            ("abc\n", "abc\n", true),
+            ("abc\n", "abc.", false),
+            ("abc\n", "(?s)abc.", true),
+            ("abc", "(?x) a b c # trailing comment", true),
+            ("ab", "(?x) a b c # trailing comment", false),
+            ("", "", true),
+            ("", "a*", true),
+            ("a", "", false),
+            ("aaa", "a+?", true),
+            // Java's `\w` is ASCII unless `(?U)` is on.
+            ("\u{e9}", r"\w", false),
+            ("\u{e9}", r"(?U)\w", true),
+            ("\u{c9}", "(?i)\u{e9}", false),
+            ("\u{c9}", "(?iu)\u{e9}", true),
+            ("\u{2028}", ".", false),
+        ];
+        for (subject, pattern, expected) in cases {
+            assert_eq!(
+                eval_binary_op(&s(subject), &BinaryOp::Regex, &s(pattern)).unwrap(),
+                Value::Bool(expected),
+                "{subject:?} =~ {pattern:?}"
+            );
+        }
+    }
 
-        // Full match with both anchors
+    /// A pattern that does not parse on its own is rejected as written, even
+    /// when wrapping it in a group would make it parse; a verbose-mode
+    /// comment does not swallow the anchor.
+    #[test]
+    fn test_regex_invalid_pattern_is_not_rescued_by_anchoring() {
+        for pattern in ["a)|(b", "[a", "a{2,1}"] {
+            let err = eval_binary_op(&s("a"), &BinaryOp::Regex, &s(pattern))
+                .expect_err(pattern)
+                .to_string();
+            assert!(err.contains("Invalid regex"), "{pattern:?}: {err}");
+        }
+        // Java constructs beyond the automaton answer as Java does (Java's
+        // answers): look-around, a backreference, an atomic group, `\Q…\E`,
+        // and possessive quantifiers, never read as a nested `(a*)+`.
+        for (pattern, expected) in [
+            ("(?=a)a", false),
+            ("(?<=a)a", false),
+            ("(a)\\1", true),
+            ("(?>a)", false),
+            ("\\Qa\\E", false),
+            ("a*+a", false),
+            ("a++", true),
+            ("a?+", false),
+            ("a{1,2}+", true),
+        ] {
+            assert_eq!(
+                eval_binary_op(&s("aa"), &BinaryOp::Regex, &s(pattern)).expect(pattern),
+                Value::Bool(expected),
+                "{pattern:?}"
+            );
+        }
+        // A case-insensitive backreference answers as Java's `CIBackRef`
+        // (Java 21: true).
         assert_eq!(
-            eval_binary_op(&s("hello"), &BinaryOp::Regex, &s("^hello$")).unwrap(),
+            eval_binary_op(&s("aA"), &BinaryOp::Regex, &s("(?i)(a)\\1")).unwrap(),
             Value::Bool(true)
         );
-        assert_eq!(
-            eval_binary_op(&s("hello world"), &BinaryOp::Regex, &s("^hello$")).unwrap(),
-            Value::Bool(false)
-        );
+        // `#)` is a comment in verbose mode, so this pattern is `a` alone.
+        for (subject, expected) in [("a", true), ("ab", false)] {
+            assert_eq!(
+                eval_binary_op(&s(subject), &BinaryOp::Regex, &s("(?x) a #)")).unwrap(),
+                Value::Bool(expected),
+                "{subject:?}"
+            );
+        }
     }
 
     #[test]
@@ -3651,5 +3938,35 @@ mod tests {
         let result = eval_scalar_function("range", &[i(i64::MAX - 1), i(i64::MAX)], None);
         // We only assert the absence of a panic; either Ok or Err is acceptable.
         let _ = result.is_ok();
+    }
+
+    /// `range` is null-in/null-out: any null argument answers null, ahead of
+    /// a non-integer or zero step in another position.
+    #[test]
+    fn test_range_null_argument_returns_null() {
+        let n = Value::Null;
+        for args in [
+            vec![i(0), n.clone()],
+            vec![n.clone(), i(3)],
+            vec![i(0), i(3), n.clone()],
+            vec![n.clone(), i(3), i(0)],
+            vec![Value::Float(0.5), n.clone()],
+        ] {
+            let result = eval_scalar_function("range", &args, None).unwrap();
+            assert_eq!(result, Value::Null, "range({args:?})");
+        }
+    }
+
+    /// A non-null, non-integer argument and a zero step keep their errors.
+    #[test]
+    fn test_range_type_and_step_errors_are_tagged() {
+        let err = eval_scalar_function("range", &[i(0), Value::String("a".into())], None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("InvalidArgumentType"), "{err}");
+        let err = eval_scalar_function("range", &[i(0), i(3), i(0)], None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("NumberOutOfRange"), "{err}");
     }
 }

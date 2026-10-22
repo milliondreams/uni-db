@@ -2,6 +2,7 @@ pub mod aggregate_window_test;
 pub mod case_test;
 pub mod collected_list_interning_test;
 pub mod comparison_test;
+pub mod constant_in_list_test;
 pub mod cypher_aggregation;
 pub mod cypher_call;
 pub mod cypher_clauses_ext;
@@ -25,13 +26,17 @@ mod entity_comparison_test;
 pub mod entity_function_binding_shapes_test;
 pub mod entity_identity_in_list_test;
 pub mod explain_test;
+pub mod expression_value_semantics_test;
+pub mod float_ieee_semantics_test;
 pub mod int_arithmetic_overflow_test;
 pub mod map_literal_test;
 pub mod map_projection_test;
+pub mod mixed_numeric_list_param_test;
 pub mod mixed_type_list_literal_test;
 pub mod normalization_test;
 pub mod not_operator_test;
 pub mod null_handling_test;
+pub mod numeric_exact_comparison_test;
 pub mod order_by_flow_test;
 pub mod order_by_sort_key_test;
 pub mod path_property_access;
@@ -58,4 +63,22 @@ pub mod where_clause_test;
 pub mod where_debug_test;
 pub mod window_execution_test;
 pub mod with_clause_test;
+// WITH … LIMIT … WHERE over scans a predicate could be pushed into.
 pub mod with_orderby_regression_test;
+pub mod with_where_after_page_scans;
+// Correlated EXISTS / COUNT bodies answered once per source, not per pair.
+pub mod exists_per_source_test;
+// percentileDisc returns an exact input; both executors read the percentile.
+pub mod percentile_exact_test;
+// A declared property type applies only to the labels that declare it.
+pub mod schemaless_property_type_scope_test;
+// Reachability consumers of a variable-length pattern decide from distances.
+pub mod trail_reachability_test;
+// range() with a null argument returns null on every evaluator.
+pub mod range_null_test;
+// `=~` matches the whole string (Java `matches()`) on every evaluator.
+pub mod regex_full_match_test;
+// COPY TO writes exactly the user-visible properties; COPY FROM reads them back.
+pub mod copy_user_properties;
+// Unconstrained traversal sources read from the edge type's adjacency.
+pub mod edge_source_scan_test;

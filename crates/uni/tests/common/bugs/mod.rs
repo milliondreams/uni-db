@@ -56,6 +56,7 @@ pub mod pattern_exists_unbound_param;
 pub mod relationship_uniqueness_invariant;
 pub mod repro_233_periodic_cancel_durability;
 pub mod repro_edge_export;
+pub mod underscore_property_reads;
 // Correctness-scan Wave 0 repros.
 pub mod repro_fork_sweeper_shutdown;
 pub mod repro_hybrid_dense_arm_swallow;
@@ -136,6 +137,7 @@ pub mod delete_sees_tx_local_edges;
 pub mod duplicate_property_projection;
 pub mod element_id_of_bound_variables;
 pub mod ext_id_lookup_sees_everything;
+pub mod ext_id_on_labelled_nodes;
 pub mod fts_rank_survives_flush;
 pub mod fts_sees_current_text;
 pub mod inline_element_where;
@@ -154,6 +156,10 @@ pub mod optional_entity_is_null;
 pub mod optional_match_clause_close;
 pub mod optional_match_row_identity;
 pub mod optional_traverse_chunked;
+pub mod optional_where_bound_var_pushdown;
+pub mod outer_variable_in_pattern_map;
+// An outer node / relationship variable supports every entity operation inside a subquery.
+pub mod outer_entity_in_subquery;
 pub mod pattern_fast_path_constraints;
 pub mod reachability_trail_any_predecessor;
 pub mod reduce_accumulator_types;
@@ -178,6 +184,7 @@ pub mod numeric_functions_take_numbers;
 pub mod duration_order;
 // min/max over a declared DateTime / Time: the earliest or latest instant, offset kept.
 pub mod min_max_keep_temporal_values;
+pub mod mixed_type_hash_join;
 pub mod unique_key_reuse;
 pub mod user_maps_are_not_entities;
 pub mod vid_lookup_join_payoff;
@@ -187,3 +194,40 @@ pub mod vlp_limit_stops_enumeration;
 pub mod vlp_pinned_endpoint_prunes;
 pub mod vlp_relationship_uniqueness;
 pub mod with_rebinds_entity_names;
+// A label check on a node that arrives as one value (`UNWIND`, a list).
+pub mod unwound_entity_label_check;
+// Two relationship types sharing a property: one `r.w` column, not two.
+pub mod edge_wildcard_shared_property;
+// A procedure called per row: void calls run, yields keep their types.
+pub mod in_query_procedure_call;
+// A WRITE procedure's writes belong to the calling transaction.
+pub mod write_procedure_in_transaction;
+// A procedure called in a transaction reads the transaction's view.
+pub mod procedure_reads_in_transaction;
+pub mod procedure_reads_in_transaction_on_fork;
+// An algorithm's list and map yields are lists and maps to every consumer.
+pub mod algorithm_list_yield_values;
+// A relationship bound earlier and matched again, with its type undeclared.
+pub mod rebound_relationship_schemaless;
+// A quoted identifier (incl. the doubled-backtick escape) denotes one name
+// across DDL, writes, reads, indexes, constraints and parameters.
+pub mod escaped_identifier_round_trip;
+// A user property named `label`, `labels`, `type` or `properties` is an
+// ordinary property on every read path, never taken for an entity field.
+pub mod call_subquery_set_declared_types;
+pub mod declared_endpoint_narrowing;
+pub mod declared_endpoint_violation_reads;
+// `SET` / `REMOVE` on a relationship cannot move it or change its type.
+pub mod update_edge_identity;
+// An older binary writing after an enforcing one voids endpoint conformance.
+pub mod endpoint_conformance_writer_features;
+pub mod entity_field_name_collision;
+pub mod graph_project_in_transaction;
+pub mod mixed_declared_undeclared_edge_types;
+pub mod search_yield_node_is_full_entity;
+pub mod unbound_parameter_in_write;
+// WAL LSNs stay above the manifest mark after a reopen.
+pub mod wal_lsn_after_reopen;
+// Mutating built-in procedures are refused in read-only contexts and are
+// authorized as `dbms` / `schema`, never `read`.
+pub mod admin_procedure_read_only;

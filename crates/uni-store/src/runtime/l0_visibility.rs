@@ -37,23 +37,6 @@ pub fn is_vertex_deleted(vid: Vid, ctx: Option<&QueryContext>) -> bool {
     visit_l0_buffers(Some(ctx), |buf| buf.vertex_tombstones.contains(&vid))
 }
 
-/// Whether any L0 buffer holds a *partial* property row for this vid.
-///
-/// `Writer::insert_vertex_partial` stages only the touched keys when
-/// `partial_lance_writes` is on, recording them in `vertex_partial_keys`. Such
-/// a row is a delta, not the complete property set, so a reader must not treat
-/// its presence as "L0 has everything" and skip storage.
-pub fn has_partial_vertex_keys(vid: Vid, ctx: Option<&QueryContext>) -> bool {
-    let Some(ctx) = ctx else {
-        return false;
-    };
-    visit_l0_buffers(Some(ctx), |buf| {
-        buf.vertex_partial_keys
-            .get(&vid)
-            .is_some_and(|keys| !keys.is_empty())
-    })
-}
-
 /// Check if an edge is deleted in the L0 chain.
 /// Returns true if a tombstone is found at any layer.
 pub fn is_edge_deleted(eid: Eid, ctx: Option<&QueryContext>) -> bool {
@@ -93,6 +76,53 @@ fn record_edge_read(ctx: &QueryContext, eid: Eid) {
     {
         read_set.lock().edges.insert(eid);
     }
+}
+
+/// Overlays one L0 buffer's edges for `vid` onto `neighbors` (`(neighbor,
+/// eid)` pairs read from the adjacency tier).
+///
+/// Adds the buffer's edges of `edge_type` in `direction`, then drops every
+/// edge the buffer tombstones, whichever layer it came from. Edges newer than
+/// `version_hwm` are skipped. The result is sorted by `(neighbor, eid)`, the
+/// order the adjacency manager returns, so a walk over buffered edges is
+/// deterministic.
+///
+/// The one place a transaction's private edges join a traversal: Cypher's
+/// expansion and algorithm projections both read through it.
+pub fn overlay_l0_neighbors(
+    vid: Vid,
+    edge_type: u32,
+    direction: crate::storage::direction::Direction,
+    l0: &L0Buffer,
+    neighbors: &mut Vec<(Vid, Eid)>,
+    version_hwm: Option<u64>,
+) {
+    use crate::storage::direction::Direction;
+    use uni_common::graph::simple_graph::Direction as SimpleDirection;
+
+    let simple: &[SimpleDirection] = match direction {
+        Direction::Outgoing => &[SimpleDirection::Outgoing],
+        Direction::Incoming => &[SimpleDirection::Incoming],
+        Direction::Both => &[SimpleDirection::Outgoing, SimpleDirection::Incoming],
+    };
+    let mut neighbor_map: HashMap<Eid, Vid> = neighbors.drain(..).map(|(v, e)| (e, v)).collect();
+    for &dir in simple {
+        for (neighbor, eid, version) in l0.get_neighbors(vid, edge_type, dir) {
+            if version_hwm.is_some_and(|hwm| version > hwm) {
+                continue;
+            }
+            if l0.is_tombstoned(eid) {
+                neighbor_map.remove(&eid);
+            } else {
+                neighbor_map.insert(eid, neighbor);
+            }
+        }
+    }
+    for eid in l0.tombstones.keys() {
+        neighbor_map.remove(eid);
+    }
+    *neighbors = neighbor_map.into_iter().map(|(e, v)| (v, e)).collect();
+    neighbors.sort_unstable();
 }
 
 /// Look up a vertex property in the L0 chain.
@@ -563,6 +593,74 @@ pub fn edge_exists_in_l0(eid: Eid, ctx: Option<&QueryContext>) -> bool {
     visit_l0_buffers(Some(ctx), |buf| buf.edge_endpoints.contains_key(&eid))
 }
 
+/// An edge as the L0 chain holds it: stored endpoints and type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct L0Edge {
+    /// Stored start vertex.
+    pub src_vid: Vid,
+    /// Stored end vertex.
+    pub dst_vid: Vid,
+    /// Schema edge-type id (unified id space, schemaless types included).
+    pub type_id: u32,
+    /// Type name, when the buffer recorded one.
+    pub type_name: Option<String>,
+}
+
+/// What the L0 chain says about a set of edges; see [`lookup_edges`].
+#[derive(Debug, Default)]
+pub struct L0EdgeLookup {
+    /// Edges resident in some layer and tombstoned in none, from the newest
+    /// layer holding each.
+    pub found: HashMap<Eid, L0Edge>,
+    /// Edges tombstoned in some layer. They do not exist, whatever flushed
+    /// storage still holds for them.
+    pub deleted: HashSet<Eid>,
+}
+
+/// Resolves each of `eids` against the L0 chain in one pass per layer.
+///
+/// The batch form of [`get_edge_endpoints`] plus [`is_edge_deleted`]. A
+/// tombstone in any layer wins, as it does for the traversal's L0 overlay and
+/// for `PropertyManager`: EIDs are never reused, so a tombstone cannot be
+/// older than a live entry it would wrongly hide. An EID in neither map is
+/// not in L0 and must be resolved against flushed storage.
+///
+/// Every requested EID joins the transaction's SSI read set, found or not,
+/// under one lock — the item-level contract of `record_edge_read`, which
+/// records the queried id rather than only the ids that turned out to exist.
+pub fn lookup_edges(eids: &[Eid], ctx: &QueryContext) -> L0EdgeLookup {
+    if let Some(tx_l0_arc) = &ctx.transaction_l0
+        && let Some(read_set) = &tx_l0_arc.read().occ_read_set
+    {
+        read_set.lock().edges.extend(eids.iter().copied());
+    }
+
+    let mut lookup = L0EdgeLookup::default();
+    visit_l0_buffers(Some(ctx), |buf| {
+        for &eid in eids {
+            if buf.tombstones.contains_key(&eid) {
+                lookup.found.remove(&eid);
+                lookup.deleted.insert(eid);
+            } else if !lookup.deleted.contains(&eid)
+                && !lookup.found.contains_key(&eid)
+                && let Some(&(src_vid, dst_vid, type_id)) = buf.edge_endpoints.get(&eid)
+            {
+                lookup.found.insert(
+                    eid,
+                    L0Edge {
+                        src_vid,
+                        dst_vid,
+                        type_id,
+                        type_name: buf.edge_types.get(&eid).cloned(),
+                    },
+                );
+            }
+        }
+        false
+    });
+    lookup
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -702,6 +800,93 @@ mod tests {
         }
     }
 
+    /// `lookup_edges` resolves a batch across all three tiers: endpoints and
+    /// type from the newest layer holding each edge, a tombstone in any layer
+    /// deleting it, and every requested EID — found or not — in the read set.
+    #[test]
+    fn l0_edge_lookup_records_every_requested_eid() {
+        use crate::runtime::l0::OccReadSet;
+
+        let mut pending = L0Buffer::new(0, None);
+        pending
+            .insert_edge(
+                Vid::from(1),
+                Vid::from(2),
+                7,
+                Eid::from(1),
+                HashMap::new(),
+                Some("R".into()),
+            )
+            .unwrap();
+        pending
+            .insert_edge(
+                Vid::from(2),
+                Vid::from(3),
+                7,
+                Eid::from(2),
+                HashMap::new(),
+                Some("R".into()),
+            )
+            .unwrap();
+        let mut main_l0 = L0Buffer::new(0, None);
+        main_l0
+            .insert_edge(
+                Vid::from(3),
+                Vid::from(3),
+                9,
+                Eid::from(3),
+                HashMap::new(),
+                None,
+            )
+            .unwrap();
+        main_l0
+            .delete_edge(Eid::from(2), Vid::from(2), Vid::from(3), 7)
+            .unwrap();
+        let mut tx_l0 = L0Buffer::new(0, None);
+        tx_l0
+            .insert_edge(
+                Vid::from(4),
+                Vid::from(1),
+                7,
+                Eid::from(4),
+                HashMap::new(),
+                Some("R".into()),
+            )
+            .unwrap();
+        let read_set = Arc::new(parking_lot::Mutex::new(OccReadSet::default()));
+        tx_l0.occ_read_set = Some(read_set.clone());
+        let ctx = QueryContext::new_with_pending(
+            Arc::new(RwLock::new(main_l0)),
+            Some(Arc::new(RwLock::new(tx_l0))),
+            vec![Arc::new(RwLock::new(pending))],
+        );
+
+        let eids: Vec<Eid> = (1..=5).map(Eid::from).collect();
+        let lookup = lookup_edges(&eids, &ctx);
+        let edge = |src: u64, dst: u64, type_id, name: Option<&str>| L0Edge {
+            src_vid: Vid::from(src),
+            dst_vid: Vid::from(dst),
+            type_id,
+            type_name: name.map(str::to_string),
+        };
+        assert_eq!(
+            lookup.found,
+            HashMap::from([
+                (Eid::from(1), edge(1, 2, 7, Some("R"))),
+                (Eid::from(3), edge(3, 3, 9, None)),
+                (Eid::from(4), edge(4, 1, 7, Some("R"))),
+            ])
+        );
+        assert_eq!(lookup.deleted, HashSet::from([Eid::from(2)]));
+        let guard = read_set.lock();
+        for e in 1..=5u64 {
+            assert!(
+                guard.edges.contains(&Eid::from(e)),
+                "edge {e} was looked up but not recorded in the SSI read set"
+            );
+        }
+    }
+
     /// The recording is a no-op outside a write-tx (no `occ_read_set`), so
     /// read-only / analytical queries pay nothing.
     #[test]
@@ -767,6 +952,29 @@ impl L0Context {
             transaction_l0: ctx.transaction_l0.clone(),
             pending_flush_l0s: ctx.pending_flush_l0s.clone(),
         }
+    }
+
+    /// A read-only [`L0Manager`] presenting exactly this visibility, for
+    /// readers that take a manager rather than a context (algorithm
+    /// projections, a procedure's inner query).
+    ///
+    /// The single way to hand a query's L0 view to such a reader: the
+    /// transaction buffer stays the newest layer
+    /// ([`L0Manager::from_view`]) instead of being listed as one more,
+    /// oldest, pending-flush generation. `None` when there is no current
+    /// buffer.
+    ///
+    /// [`L0Manager`]: crate::runtime::l0_manager::L0Manager
+    /// [`L0Manager::from_view`]: crate::runtime::l0_manager::L0Manager::from_view
+    #[must_use]
+    pub fn read_view(&self) -> Option<Arc<crate::runtime::l0_manager::L0Manager>> {
+        self.current_l0.as_ref().map(|current| {
+            Arc::new(crate::runtime::l0_manager::L0Manager::from_view(
+                Arc::clone(current),
+                self.pending_flush_l0s.clone(),
+                self.transaction_l0.clone(),
+            ))
+        })
     }
 
     /// Iterate over all L0 buffers in visibility order.

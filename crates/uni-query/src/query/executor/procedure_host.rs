@@ -250,6 +250,18 @@ impl QueryProcedureHost {
         self
     }
 
+    /// Read property values through the outer query's property manager.
+    ///
+    /// [`Self::from_components`] starts without one, and the inner query of
+    /// [`Self::execute_inner_query`] then builds one over this host's
+    /// storage. Inside a transaction that storage is version-pinned, and a
+    /// property manager over it skips the transaction's own buffer.
+    #[must_use]
+    pub fn with_property_manager(mut self, property_manager: Arc<PropertyManager>) -> Self {
+        self.property_manager = Some(property_manager);
+        self
+    }
+
     /// Attach the outer query's L0 visibility snapshot to this host.
     ///
     /// [`Self::from_components`] starts from [`L0Context::empty`] because the
@@ -390,8 +402,11 @@ impl QueryProcedureHost {
     /// - [`ProcedureMode::Write`] / [`ProcedureMode::Schema`] /
     ///   [`ProcedureMode::Dbms`] construct the inner executor with the
     ///   outer transaction's writer handle (set via
-    ///   [`Self::with_writer`]); mutations land in the outer
-    ///   transaction's L0 buffer. If no writer was threaded through,
+    ///   [`Self::with_writer`]). When the L0 context carries a
+    ///   transaction buffer, mutations land in it, so they commit or
+    ///   roll back with the outer transaction; without one (a
+    ///   declared trigger's after-commit action) they land in main L0.
+    ///   If no writer was threaded through,
     ///   write-mode invocations error with `"inner write requires a
     ///   writer-enabled procedure host"`.
     ///
@@ -449,14 +464,26 @@ impl QueryProcedureHost {
             executor.set_cancellation_token(token.clone());
         }
 
-        // Mirror outer L0 visibility into the inner executor.
+        // Inside a transaction the inner query is part of it: its writes go to
+        // the transaction's private L0 (discarded by rollback, published only
+        // by commit, conflict-checked like the transaction's own writes) and
+        // its reads see that buffer. Without this a WRITE procedure mutated
+        // the shared main L0 directly, bypassing the transaction.
+        if let Some(tx_l0) = &self.l0_context.transaction_l0 {
+            executor.set_transaction_l0(Arc::clone(tx_l0));
+        }
+
+        // Read the outer query's L0 view, not the live tier. The transaction
+        // buffer is not added here: it is already read as the transaction L0.
+        // A writer-less executor reads `l0_manager`; one with a writer reads
+        // its writer's live L0 unless a read snapshot is set, so it gets the
+        // same view as one. Without that a WRITE procedure's body inside a
+        // transaction saw rows other sessions committed after it began.
         if let Some(current) = self.l0_context.current_l0.as_ref() {
-            let mut pending = self.l0_context.pending_flush_l0s.clone();
-            if let Some(tx_l0) = &self.l0_context.transaction_l0 {
-                pending.push(tx_l0.clone());
-            }
-            executor.l0_manager =
-                Some(Arc::new(L0Manager::from_snapshot(current.clone(), pending)));
+            let pending = self.l0_context.pending_flush_l0s.clone();
+            let view = Arc::new(L0Manager::from_snapshot(current.clone(), pending));
+            executor.set_read_snapshot(Some(view.pin_snapshot()));
+            executor.l0_manager = Some(view);
         }
 
         let schema_manager_arc = self.storage.schema_manager_arc();

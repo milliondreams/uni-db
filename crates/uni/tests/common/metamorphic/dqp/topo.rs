@@ -34,6 +34,15 @@
 //! | `locy_query_where` | a `QUERY ... WHERE` filter = the same filter in the rule body |
 //! | `locy_commands` | an `EXPLAIN RULE` or `ABDUCE` before a `QUERY` leaves its answer unchanged |
 //! | `locy_binding` | a rule's value read by tuple, by `TO`, by name, and through a permuted `YIELD` |
+//! | `locy_permute_conjuncts` | a reader's IS references in any order, joined by `,` or `AND`, derive the same facts; reading a value column two references expose is a compile error in every order |
+//! | `locy_alpha_rename` | renaming the reader's variables, the rules, and their value columns changes nothing |
+//! | `locy_rename_into_collision` | renaming a reader variable onto a value column *another* referenced rule exposes changes nothing (the variable shadows the column) |
+//! | `locy_explain_agrees` | the facts `EXPLAIN RULE` derives are the facts evaluation returns |
+//!
+//! The four `locy_*` relations below `locy_binding` render their readers from a
+//! [`LocyText`] template, so the same program is produced under any conjunct
+//! order and any renaming (issue #300: the binding of IS references depended
+//! on both).
 //!
 //! The fixture ([`build_topo`]) has chains, a diamond, parallel edges (two with
 //! identical properties), self-loops, a 2-cycle and a 3-cycle, fan-in, fan-out,
@@ -55,7 +64,7 @@
 // Rust guideline compliant
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 
 use proptest::prelude::*;
@@ -213,6 +222,18 @@ pub async fn build_topo(
     let db = Uni::in_memory()
         .config(UniConfig {
             execution_batch_size,
+            // The per-query deadline is not what this harness measures, and the
+            // default 30 s one fails it spuriously under load. The `locy_negation`
+            // reference `MATCH (a:Person), (b:Person) WHERE NOT EXISTS { MATCH
+            // (a)-[:KNOWS*1..]->(b) }` once evaluated its unbounded VLP per pair
+            // (52 x 52), measured at 5.9 s alone with a two-row batch; with the
+            // machine oversubscribed (36 concurrent copies plus a build) it crossed
+            // 30 s in 34 of 36 runs and surfaced as a "divergence". It now runs
+            // once per source (0.29 s, debug build), but the deadline is still
+            // not what this harness measures. A hang or a runaway rewrite is
+            // still caught, by the six-minute nextest limit on these tests
+            // (`.config/nextest.toml`).
+            query_timeout: std::time::Duration::from_secs(300),
             // The test decides what is flushed.
             auto_flush_interval: None,
             auto_flush_threshold: usize::MAX,
@@ -366,6 +387,11 @@ pub struct TopoCase {
     items: Vec<Item>,
     /// Anchor ids an `UNWIND` feeds in, duplicates allowed.
     unwind: Vec<i64>,
+    /// A permutation of `0..3`: the order a Locy reader lists its conjuncts in
+    /// (each reader takes the order it induces on its own conjuncts).
+    perm: Vec<usize>,
+    /// Picks the renaming and the collisions the Locy relations apply.
+    renaming: usize,
 }
 
 /// ` WHERE c1 AND c2 ...`, or nothing when there are no conditions.
@@ -626,15 +652,276 @@ pub fn arb_topo_case() -> impl Strategy<Value = TopoCase> {
         proptest::option::weighted(0.4, arb_pred(Just(Var::B).boxed())),
         proptest::collection::vec(arb_item(), 1..=3),
         proptest::collection::vec(proptest::sample::select(&UNWIND_IDS[..]), 1..=4),
+        Just(vec![0, 1, 2]).prop_shuffle(),
+        0..LOCY_RENAMINGS.len(),
     )
-        .prop_map(|(anchor, hops, end, inner, items, unwind)| TopoCase {
-            anchor,
-            hops,
-            end,
-            inner,
-            items,
-            unwind,
-        })
+        .prop_map(
+            |(anchor, hops, end, inner, items, unwind, perm, renaming)| TopoCase {
+                anchor,
+                hops,
+                end,
+                inner,
+                items,
+                unwind,
+                perm,
+                renaming,
+            },
+        )
+}
+
+// ---------------------------------------------------------------------------
+// Locy reader templates
+// ---------------------------------------------------------------------------
+
+/// Placeholder names a [`LocyText`] substitutes.
+///
+/// Reader variables `a`, `b`, `v`; the reader rule `q`; referenced rules `s`,
+/// `p`, `p2`, `f`; and their value columns `k` (of `s`), `n` (of `p` and
+/// `p2`), and `m` (of `p2` and `f`). Rule bodies keep their own literal
+/// variables: those are local to each rule, so a renaming need not touch
+/// them.
+const PLACEHOLDERS: [&str; 11] = ["a", "b", "v", "q", "s", "p", "p2", "f", "k", "n", "m"];
+
+/// Placeholder → concrete name; a placeholder absent from the map keeps its
+/// own name.
+type Names = BTreeMap<&'static str, &'static str>;
+
+/// Consistent renamings for `locy_alpha_rename`, each a bijection on the
+/// placeholders it mentions.
+const LOCY_RENAMINGS: [&[(&str, &str)]; 3] = [
+    // Fresh names for everything the reader and its rules expose.
+    &[
+        ("a", "x"),
+        ("b", "y"),
+        ("v", "w"),
+        ("q", "out"),
+        ("s", "seed"),
+        ("p", "pairs"),
+        ("k", "kk"),
+        ("n", "cnt"),
+    ],
+    // Swap the reader's two node variables.
+    &[("a", "b"), ("b", "a")],
+    // Swap the variables, the two rules' names, and their value columns.
+    &[
+        ("a", "b"),
+        ("b", "a"),
+        ("s", "p"),
+        ("p", "s"),
+        ("k", "n"),
+        ("n", "k"),
+    ],
+];
+
+/// Renamings for `locy_rename_into_collision` over the two-reference reader
+/// [`p1_reader`]: a variable named like the value column `k` that `s` exposes
+/// while `p` binds the variable.
+const P1_COLLISIONS: [&[(&str, &str)]; 3] = [
+    // A KEY subject `p` binds, named like `s.k`.
+    &[("b", "k")],
+    // The value `p` binds positionally, named like `s.k`.
+    &[("v", "k")],
+    // The MATCH variable, named like `s.k`.
+    &[("a", "k")],
+];
+
+/// Renamings for `locy_rename_into_collision` over the three-reference reader
+/// [`three_ref_reader`]: a variable named like the value column `m` that both
+/// `p2` and `f` expose.
+const THREE_REF_COLLISIONS: [&[(&str, &str)]; 2] = [
+    // The value `p2` binds positionally, named like `m`.
+    &[("v", "m")],
+    // A KEY subject `p2` binds, named like `m`.
+    &[("b", "m")],
+];
+
+fn names(pairs: &[(&'static str, &'static str)]) -> Names {
+    pairs.iter().copied().collect()
+}
+
+/// Replaces each `{placeholder}` in `text` by its name in `names`.
+///
+/// Braces around anything other than a known placeholder are left as they
+/// are, so map literals and `COUNT { ... }` pass through.
+fn substitute(text: &str, names: &Names) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let token = after.split('}').next().filter(|t| after.len() > t.len());
+        match token.and_then(|t| PLACEHOLDERS.iter().find(|p| **p == t)) {
+            Some(placeholder) => {
+                out.push_str(names.get(placeholder).copied().unwrap_or(placeholder));
+                rest = &after[placeholder.len() + 1..];
+            }
+            None => {
+                out.push('{');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A Locy program ending in one reader rule, as a template.
+///
+/// Renders `{rules}CREATE RULE {q} AS MATCH {matches} WHERE c₁, c₂, … {tail}`
+/// with the conjuncts in a chosen order and every `{placeholder}` replaced by
+/// a chosen name, so one template yields every formulation a relation
+/// compares.
+#[derive(Clone, Debug)]
+pub struct LocyText {
+    /// The rules the reader references.
+    rules: String,
+    /// The reader's `MATCH` patterns.
+    matches: String,
+    /// The reader's `WHERE` conjuncts.
+    conjuncts: Vec<String>,
+    /// Everything after the reader's `WHERE`: `YIELD`, commands, `QUERY`.
+    tail: String,
+}
+
+impl LocyText {
+    /// Renders with the conjuncts in the order `order` induces on them (its
+    /// elements below the conjunct count), joined by `,`.
+    fn render(&self, order: &[usize], names: &Names) -> String {
+        self.render_joined(order, names, ", ")
+    }
+
+    /// [`Self::render`] with an explicit conjunct separator.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `order` does not induce a permutation of the conjuncts.
+    fn render_joined(&self, order: &[usize], names: &Names, joiner: &str) -> String {
+        let induced: Vec<usize> = order
+            .iter()
+            .copied()
+            .filter(|&i| i < self.conjuncts.len())
+            .collect();
+        let mut check = induced.clone();
+        check.sort_unstable();
+        assert_eq!(
+            check,
+            (0..self.conjuncts.len()).collect::<Vec<_>>(),
+            "order {order:?} does not permute {} conjuncts",
+            self.conjuncts.len()
+        );
+        let body: Vec<&str> = induced
+            .iter()
+            .map(|&i| self.conjuncts[i].as_str())
+            .collect();
+        substitute(
+            &format!(
+                "{}CREATE RULE {{q}} AS MATCH {} WHERE {} {}",
+                self.rules,
+                self.matches,
+                body.join(joiner),
+                self.tail
+            ),
+            names,
+        )
+    }
+
+    /// This template with a different tail.
+    fn with_tail(&self, tail: impl Into<String>) -> Self {
+        Self {
+            tail: tail.into(),
+            ..self.clone()
+        }
+    }
+}
+
+/// The identity order for up to three conjuncts.
+const IDENTITY: [usize; 3] = [0, 1, 2];
+
+/// The `RETURN` every Locy binding reader ends with.
+const READER_TAIL: &str = "YIELD KEY {a}, KEY {b}, {v} \
+     QUERY {q} RETURN {a}.id AS c0, {b}.id AS c1, {v} AS c2";
+
+/// `s`: every even-id Person, exposing the integer value column `k` (equal to
+/// the node's VID in this fixture, see `topo_fixture_has_its_shapes`).
+const SEED_RULE: &str = "CREATE RULE {s} AS MATCH (a:Person) WHERE a.id % 2 = 0 \
+     YIELD KEY a, a.id AS {k} ";
+
+/// `f`: each Person's degree, exposing `m`.
+const DEGREE_RULE: &str =
+    "CREATE RULE {f} AS MATCH (a:Person)-[:KNOWS]-(c) FOLD {m} = COUNT(*) YIELD KEY a, {m} ";
+
+impl TopoCase {
+    /// `p`: the case's pattern counted per `(a, b)`, exposing `n`.
+    fn pair_rule(&self) -> String {
+        format!(
+            "CREATE RULE {{p}} AS MATCH {}{} FOLD {{n}} = COUNT(*) YIELD KEY a, KEY b, {{n}} ",
+            self.locy_pattern(),
+            self.body_where()
+        )
+    }
+
+    /// `p2`: `p` plus a second value column `m`, which `f` exposes too.
+    fn pair_rule2(&self) -> String {
+        format!(
+            "CREATE RULE {{p2}} AS MATCH {}{} FOLD {{n}} = COUNT(*), {{m}} = MIN(b.id) \
+             YIELD KEY a, KEY b, {{n}}, {{m}} ",
+            self.locy_pattern(),
+            self.body_where()
+        )
+    }
+}
+
+/// The #300 shape: a seed test and a reference that binds `b` and `v`, so
+/// the reference, not the `MATCH`, is `b`'s binder.
+///
+/// The canonical order lists the binding reference first, the order that
+/// evaluated correctly before the #300 fix; with the seed test first, that
+/// build failed to plan (`No field named b`). A reference that already works
+/// there lets the other formulations show their divergence against it.
+fn p1_reader(case: &TopoCase) -> LocyText {
+    LocyText {
+        rules: format!("{SEED_RULE}{}", case.pair_rule()),
+        matches: "({a}:Person)".to_string(),
+        conjuncts: vec![
+            "({a}, {b}, {v}) IS {p}".to_string(),
+            "{a} IS {s}".to_string(),
+        ],
+        tail: READER_TAIL.to_string(),
+    }
+}
+
+/// Three references. `p2` and `f` both expose `m`, which the reader does not
+/// read, so the clause is legal; `s` exposes `k`. Every Person with a
+/// `KNOWS` edge is in `f`, and every `a` of `p2` has one, so `{a} IS {f}`
+/// keeps every row and the facts equal [`p1_reader`]'s.
+fn three_ref_reader(case: &TopoCase) -> LocyText {
+    LocyText {
+        rules: format!("{SEED_RULE}{}{DEGREE_RULE}", case.pair_rule2()),
+        matches: "({a}:Person)".to_string(),
+        conjuncts: vec![
+            "({a}, {b}, {v}) IS {p2}".to_string(),
+            "{a} IS {s}".to_string(),
+            "{a} IS {f}".to_string(),
+        ],
+        tail: READER_TAIL.to_string(),
+    }
+}
+
+/// Prefix of a formulation that runs `EXPLAIN RULE` instead of a `QUERY`; see
+/// [`explain_part`].
+const EXPLAIN_MARK: &str = "#explain-facts ";
+
+/// A formulation whose rows are the facts `EXPLAIN RULE` derives.
+///
+/// `keys` are the reader's KEY variables, returned as `c0, c1, …` (their
+/// nodes' `id`); a fact counts as derived when its derivation has a child for
+/// each rule in `refs`. The rows are a set, like `RETURN DISTINCT`.
+fn explain_part(keys: &[&str], refs: &[&str], program: &str) -> String {
+    format!(
+        "{EXPLAIN_MARK}{};{}\n{program}",
+        keys.join(","),
+        refs.join(",")
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -691,11 +978,23 @@ pub enum Relation {
     /// whose `YIELD` lists the value first and the KEYs swapped, derives the
     /// same facts.
     LocyBinding,
+    /// A reader's IS references in any order, and joined by `AND` instead of
+    /// `,`, derive the same facts; a read of a column two references expose is
+    /// a compile error in every order.
+    LocyPermuteConjuncts,
+    /// A consistent renaming of the reader's variables, the rules it reads,
+    /// and their value columns derives the same facts.
+    LocyAlphaRename,
+    /// Naming a reader variable like a value column another referenced rule
+    /// exposes derives the same facts: the variable shadows the column.
+    LocyRenameIntoCollision,
+    /// `EXPLAIN RULE` derives exactly the facts evaluation returns.
+    LocyExplainAgrees,
 }
 
 impl Relation {
     /// Every relation, in report order.
-    pub const ALL: [Relation; 16] = [
+    pub const ALL: [Relation; 20] = [
         Relation::NamedRel,
         Relation::Optional,
         Relation::Exists,
@@ -712,6 +1011,10 @@ impl Relation {
         Relation::LocyQueryWhere,
         Relation::LocyCommands,
         Relation::LocyBinding,
+        Relation::LocyPermuteConjuncts,
+        Relation::LocyAlphaRename,
+        Relation::LocyRenameIntoCollision,
+        Relation::LocyExplainAgrees,
     ];
 
     /// Short name for reports and failures.
@@ -733,6 +1036,48 @@ impl Relation {
             Relation::LocyQueryWhere => "locy_query_where",
             Relation::LocyCommands => "locy_commands",
             Relation::LocyBinding => "locy_binding",
+            Relation::LocyPermuteConjuncts => "locy_permute_conjuncts",
+            Relation::LocyAlphaRename => "locy_alpha_rename",
+            Relation::LocyRenameIntoCollision => "locy_rename_into_collision",
+            Relation::LocyExplainAgrees => "locy_explain_agrees",
+        }
+    }
+
+    /// Programs this relation expects to fail to compile for `case`, each
+    /// with a word its error message must contain.
+    pub fn expected_errors(self, case: &TopoCase) -> Vec<(String, &'static str)> {
+        match self {
+            // `m` is exposed by `p2` and by `f`: reading it is ambiguous
+            // whatever the order of the references.
+            Relation::LocyPermuteConjuncts => vec![(
+                three_ref_reader(case)
+                    .with_tail(
+                        "YIELD KEY {a}, KEY {b}, {v}, {m} \
+                         QUERY {q} RETURN {a}.id AS c0, {b}.id AS c1, {m} AS c2",
+                    )
+                    .render(&case.perm, &Names::new()),
+                "ambiguous",
+            )],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Whether [`Self::transforms`] reports anything for this relation.
+    fn transforms_reported(self) -> bool {
+        matches!(self, Relation::LocyPermuteConjuncts)
+    }
+
+    /// Whether this relation's rewrite of `case` changes the program's text
+    /// in the way the relation is about, or `None` when every rewrite does.
+    ///
+    /// A conjunct permutation can draw the identity, which compares a program
+    /// with itself; the driver holds the share of non-identity draws to
+    /// [`MIN_TRANSFORMED_RATE`].
+    pub fn transforms(self, case: &TopoCase) -> Option<bool> {
+        match self {
+            // The three-reference reader takes the whole permutation.
+            Relation::LocyPermuteConjuncts => Some(case.perm != IDENTITY),
+            _ => None,
         }
     }
 
@@ -1035,16 +1380,22 @@ impl Relation {
                 // through the in-memory evaluator, which is the path that once
                 // wrote its rows into the store the QUERY reads.
                 let program = |command: &str| {
-                    format!(
-                        "{} CREATE RULE f AS MATCH {}{} \
-                         FOLD n = COUNT(*), s = SUM(b.age) YIELD KEY a, n, s \
-                         CREATE RULE out AS MATCH (a:Person), (b:Person) \
-                         WHERE a IS reach TO b, a IS f YIELD KEY a, KEY b, n \
-                         {command} QUERY out RETURN a.id AS c0, b.id AS c1, n AS c2",
-                        reach_rules(case.hops[0]),
-                        case.locy_pattern(),
-                        case.body_where()
-                    )
+                    LocyText {
+                        rules: format!(
+                            "{} CREATE RULE f AS MATCH {}{} \
+                             FOLD n = COUNT(*), s = SUM(b.age) YIELD KEY a, n, s ",
+                            reach_rules(case.hops[0]),
+                            case.locy_pattern(),
+                            case.body_where()
+                        ),
+                        matches: "(a:Person), (b:Person)".to_string(),
+                        conjuncts: vec!["a IS reach TO b".to_string(), "a IS f".to_string()],
+                        tail: format!(
+                            "YIELD KEY a, KEY b, n \
+                             {command} QUERY out RETURN a.id AS c0, b.id AS c1, n AS c2"
+                        ),
+                    }
+                    .render(&IDENTITY, &names(&[("q", "out")]))
                 };
                 // One command: an EXPLAIN of `out` that matches nothing
                 // re-derives `out`, and through it `f` and `reach`, so it
@@ -1072,22 +1423,97 @@ impl Relation {
                     )
                 };
                 let p = rule("p", "KEY a, KEY b, n");
-                let reader = |rules: &str, body: &str| {
-                    format!(
-                        "{rules}CREATE RULE q AS MATCH (a), (b) WHERE {body} \
-                         QUERY q RETURN a.id AS c0, b.id AS c1, v AS c2"
-                    )
+                let reader = |rules: &str, conjunct: &str, yield_items: &str| {
+                    LocyText {
+                        rules: rules.to_string(),
+                        matches: "(a), (b)".to_string(),
+                        conjuncts: vec![conjunct.to_string()],
+                        tail: format!(
+                            "YIELD {yield_items} QUERY q RETURN a.id AS c0, b.id AS c1, v AS c2"
+                        ),
+                    }
+                    .render(&IDENTITY, &Names::new())
                 };
                 Some(Rewrite {
-                    reference: reader(&p, "(a, b, v) IS p YIELD KEY a, KEY b, v"),
+                    reference: reader(&p, "(a, b, v) IS p", "KEY a, KEY b, v"),
                     equivalents: vec![
-                        vec![reader(&p, "(a, b) IS p TO v YIELD KEY a, KEY b, v")],
-                        vec![reader(&p, "(a, b) IS p YIELD KEY a, KEY b, n AS v")],
+                        vec![reader(&p, "(a, b) IS p TO v", "KEY a, KEY b, v")],
+                        vec![reader(&p, "(a, b) IS p", "KEY a, KEY b, n AS v")],
                         vec![reader(
                             &rule("p", "n, KEY b, KEY a"),
-                            "(b, a, v) IS p YIELD KEY a, KEY b, v",
+                            "(b, a, v) IS p",
+                            "KEY a, KEY b, v",
                         )],
                     ],
+                })
+            }
+            Relation::LocyPermuteConjuncts => {
+                let p1 = p1_reader(case);
+                let three = three_ref_reader(case);
+                let none = Names::new();
+                Some(Rewrite {
+                    reference: p1.render(&IDENTITY, &none),
+                    equivalents: vec![
+                        vec![p1.render(&case.perm, &none)],
+                        vec![three.render(&case.perm, &none)],
+                        vec![three.render_joined(&case.perm, &none, " AND ")],
+                    ],
+                })
+            }
+            Relation::LocyAlphaRename => {
+                let p1 = p1_reader(case);
+                Some(Rewrite {
+                    reference: p1.render(&IDENTITY, &Names::new()),
+                    equivalents: vec![vec![p1.render(
+                        &IDENTITY,
+                        &names(LOCY_RENAMINGS[case.renaming % LOCY_RENAMINGS.len()]),
+                    )]],
+                })
+            }
+            Relation::LocyRenameIntoCollision => {
+                let p1 = p1_reader(case);
+                Some(Rewrite {
+                    reference: p1.render(&IDENTITY, &Names::new()),
+                    equivalents: vec![
+                        vec![p1.render(
+                            &IDENTITY,
+                            &names(P1_COLLISIONS[case.renaming % P1_COLLISIONS.len()]),
+                        )],
+                        vec![three_ref_reader(case).render(
+                            &IDENTITY,
+                            &names(
+                                THREE_REF_COLLISIONS[case.renaming % THREE_REF_COLLISIONS.len()],
+                            ),
+                        )],
+                    ],
+                })
+            }
+            Relation::LocyExplainAgrees => {
+                // EXPLAIN re-resolves each fact's clause, so the facts are
+                // restricted to a few anchors: the case's UNWIND ids plus two
+                // even ids with edges, which the seed rule keeps.
+                let mut ids: Vec<i64> = case.unwind.iter().copied().chain([0, 18]).collect();
+                ids.sort_unstable();
+                ids.dedup();
+                let ids: Vec<String> = ids.iter().map(i64::to_string).collect();
+                let anchors = format!("{{a}}.id IN [{}]", ids.join(", "));
+                let p1 = p1_reader(case);
+                let none = Names::new();
+                Some(Rewrite {
+                    reference: p1
+                        .with_tail(format!(
+                            "YIELD KEY {{a}}, KEY {{b}}, {{v}} QUERY {{q}} WHERE {anchors} \
+                             RETURN DISTINCT {{a}}.id AS c0, {{b}}.id AS c1"
+                        ))
+                        .render(&case.perm, &none),
+                    equivalents: vec![vec![explain_part(
+                        &["a", "b"],
+                        &["s", "p"],
+                        &p1.with_tail(format!(
+                            "YIELD KEY {{a}}, KEY {{b}}, {{v}} EXPLAIN RULE {{q}} WHERE {anchors}"
+                        ))
+                        .render(&case.perm, &none),
+                    )]],
                 })
             }
         }
@@ -1121,13 +1547,33 @@ fn cases_from_env(default: u32) -> u32 {
         .unwrap_or(default)
 }
 
+/// Minimum fraction of applicable cases whose rewrite actually transforms
+/// the program, for relations whose draw can be the identity
+/// ([`Relation::transforms`]). A conjunct permutation of three draws the
+/// identity one time in six.
+pub const MIN_TRANSFORMED_RATE: f64 = 0.50;
+
 #[derive(Default, Clone, Copy)]
 struct Tally {
     applied: u64,
     non_empty: u64,
+    /// Applicable cases whose rewrite moved something, for relations that
+    /// report it.
+    transformed: u64,
 }
 
 async fn run_bag(db: &Uni, query: &str) -> anyhow::Result<RowBag> {
+    if let Some(marked) = query.strip_prefix(EXPLAIN_MARK) {
+        let (header, program) = marked
+            .split_once('\n')
+            .ok_or_else(|| anyhow::anyhow!("malformed explain part: {query}"))?;
+        let (keys, refs) = header
+            .split_once(';')
+            .ok_or_else(|| anyhow::anyhow!("malformed explain header: {header}"))?;
+        let keys: Vec<&str> = keys.split(',').collect();
+        let refs: Vec<&str> = refs.split(',').collect();
+        return run_explain_bag(db, &keys, &refs, program).await;
+    }
     if query.starts_with("CREATE RULE") {
         return run_locy_bag(db, query).await;
     }
@@ -1166,31 +1612,116 @@ async fn run_locy_bag(db: &Uni, program: &str) -> anyhow::Result<RowBag> {
     Ok(out)
 }
 
+/// The facts an `EXPLAIN RULE` program derives, as a set of `c0, c1, …` rows
+/// holding the `id` of each KEY node in `keys`.
+///
+/// A root child is a fact. EXPLAIN answers in one of two modes
+/// (`uni-query`'s `locy_explain.rs`):
+///
+/// - from the provenance the fixpoint recorded, whenever it has entries
+///   matching the `WHERE`: each child is a recorded derivation, carries no
+///   children of its own, and its `graph_fact` starts with `[iter=`;
+/// - otherwise by re-resolving each published fact's clause: a fact counts
+///   as derived when its derivation has a child for every rule in `refs`,
+///   and one no clause re-derives comes back as a leaf with no children.
+async fn run_explain_bag(
+    db: &Uni,
+    keys: &[&str],
+    refs: &[&str],
+    program: &str,
+) -> anyhow::Result<RowBag> {
+    let result = db
+        .session()
+        .locy(program)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}\n  program: {program}"))?;
+    let root = result
+        .command_results()
+        .iter()
+        .find_map(|c| c.as_explain())
+        .ok_or_else(|| anyhow::anyhow!("program has no EXPLAIN RULE: {program}"))?;
+    let mut out = RowBag {
+        columns: (0..keys.len()).map(|i| format!("c{i}")).collect(),
+        ..RowBag::default()
+    };
+    for fact in &root.children {
+        let recorded = fact.children.is_empty()
+            && fact
+                .graph_fact
+                .as_deref()
+                .is_some_and(|g| g.starts_with("[iter="));
+        let derived = recorded
+            || refs
+                .iter()
+                .all(|r| fact.children.iter().any(|child| child.rule == *r));
+        if !derived {
+            continue;
+        }
+        let row = keys
+            .iter()
+            .map(|k| match fact.bindings.get(*k) {
+                Some(uni_db::Value::Node(node)) => node
+                    .properties
+                    .get("id")
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("KEY {k} node has no id: {node:?}")),
+                other => Err(anyhow::anyhow!(
+                    "KEY {k} is not a node in EXPLAIN: {other:?}"
+                )),
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        out.counts.entry(crate::diff::CanonRow(row)).or_insert(1);
+    }
+    out.total = out.counts.len();
+    Ok(out)
+}
+
+/// Runs `query` once, or returns its bag from `memo` when this case already
+/// ran it.
+async fn run_memo(
+    db: &Uni,
+    query: &str,
+    memo: &mut HashMap<String, RowBag>,
+) -> anyhow::Result<RowBag> {
+    if let Some(b) = memo.get(query) {
+        return Ok(b.clone());
+    }
+    let b = run_bag(db, query).await?;
+    memo.insert(query.to_string(), b.clone());
+    Ok(b)
+}
+
 async fn check_case(
     db: &Uni,
     case: &TopoCase,
     tallies: &RefCell<Vec<Tally>>,
 ) -> Result<(), String> {
     let mut rows = 0usize;
+    // Several Locy relations share a reference program; each runs (twice)
+    // once per case.
+    let mut memo: HashMap<String, RowBag> = HashMap::new();
     for (slot, relation) in Relation::ALL.iter().enumerate() {
         let Some(rewrite) = relation.rewrite(case) else {
             continue;
         };
-        let reference = run_bag(db, &rewrite.reference)
+        let seen = memo.contains_key(&rewrite.reference);
+        let reference = run_memo(db, &rewrite.reference, &mut memo)
             .await
             .map_err(|e| format!("[{}] {e}", relation.name()))?;
         rows += reference.total;
         // The same query twice must agree: an order-dependent operator shows up
         // here as itself, instead of as a flaky disagreement between rewrites.
-        let again = run_bag(db, &rewrite.reference)
-            .await
-            .map_err(|e| format!("[{}] {e}", relation.name()))?;
-        if let Err(diff) = bag_eq(&reference, &again) {
-            return Err(format!(
-                "[{}] the same query returned different rows on a second run.\n  query: {}\n{diff}",
-                relation.name(),
-                rewrite.reference
-            ));
+        if !seen {
+            let again = run_bag(db, &rewrite.reference)
+                .await
+                .map_err(|e| format!("[{}] {e}", relation.name()))?;
+            if let Err(diff) = bag_eq(&reference, &again) {
+                return Err(format!(
+                    "[{}] the same query returned different rows on a second run.\n  query: {}\n{diff}",
+                    relation.name(),
+                    rewrite.reference
+                ));
+            }
         }
         {
             let mut t = tallies.borrow_mut();
@@ -1198,11 +1729,32 @@ async fn check_case(
             if reference.total > 0 {
                 t[slot].non_empty += 1;
             }
+            if relation.transforms(case) == Some(true) {
+                t[slot].transformed += 1;
+            }
+        }
+        for (program, needle) in relation.expected_errors(case) {
+            match db.session().locy(&program).await {
+                Ok(_) => {
+                    return Err(format!(
+                        "[{}] expected a compile error containing `{needle}`, \
+                         but the program ran.\n  program: {program}",
+                        relation.name()
+                    ));
+                }
+                Err(e) if format!("{e:#}").to_lowercase().contains(needle) => {}
+                Err(e) => {
+                    return Err(format!(
+                        "[{}] expected an error containing `{needle}`, got: {e:#}\n  program: {program}",
+                        relation.name()
+                    ));
+                }
+            }
         }
         for parts in &rewrite.equivalents {
             let mut bags = Vec::with_capacity(parts.len());
             for part in parts {
-                let b = run_bag(db, part)
+                let b = run_memo(db, part, &mut memo)
                     .await
                     .map_err(|e| format!("[{}] {e}", relation.name()))?;
                 rows += b.total;
@@ -1282,6 +1834,9 @@ pub fn drive_topo(
     let mut report = format!("[dqp:topo:{label}]");
     for (relation, t) in Relation::ALL.iter().zip(&tallies) {
         let _ = write!(report, " {}={}/{}", relation.name(), t.non_empty, t.applied);
+        if relation.transforms_reported() {
+            let _ = write!(report, "(moved {})", t.transformed);
+        }
     }
     eprintln!("{report}");
 
@@ -1298,8 +1853,28 @@ pub fn drive_topo(
             relation.name(),
             t.applied
         );
+        if relation.transforms_reported() {
+            assert!(
+                t.transformed > 0,
+                "[{label}] relation {}: none of {} applicable cases transformed the program",
+                relation.name(),
+                t.applied
+            );
+        }
         if t.applied < MIN_CASES_FOR_RATE {
             continue;
+        }
+        if relation.transforms_reported() {
+            let moved = t.transformed as f64 / t.applied as f64;
+            assert!(
+                moved >= MIN_TRANSFORMED_RATE,
+                "[{label}] relation {}: only {:.1}% of {} applicable cases transformed the \
+                 program (floor {:.0}%); comparing a program with itself proves nothing",
+                relation.name(),
+                moved * 100.0,
+                t.applied,
+                MIN_TRANSFORMED_RATE * 100.0
+            );
         }
         let rate = t.non_empty as f64 / t.applied as f64;
         assert!(
@@ -1421,6 +1996,20 @@ mod tests {
         assert_eq!(
             count("MATCH ()-[r:KNOWS]->() RETURN count(r)").await?,
             Value::Int(edges().len() as i64)
+        );
+        // Every Person's integer `id` is its own VID, and `age` values 10,
+        // 20, 30 are VIDs of other Persons: a VID-vs-integer confusion (an
+        // integer column joined against `_vid`) binds a real node and returns
+        // rows instead of hiding behind an empty result. The seed rule's `k`
+        // (`a.id`) relies on it.
+        assert_eq!(
+            count("MATCH (n:Person) WHERE id(n) = n.id RETURN count(n)").await?,
+            Value::Int(PERSONS.end - PERSONS.start)
+        );
+        assert_eq!(
+            count("MATCH (p:Person), (n:Person) WHERE id(n) = p.age RETURN count(DISTINCT p.age)")
+                .await?,
+            Value::Int(3)
         );
         Ok(())
     }

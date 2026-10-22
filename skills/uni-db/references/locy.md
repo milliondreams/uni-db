@@ -519,26 +519,30 @@ CREATE RULE safe AS
 - If `a` has risk 0.8 in `risky`: `confidence = 1 - 0.8 = 0.2`
 - If `a` is not in `risky` at all: `confidence = 1.0`
 
-Multiple IS/IS NOT references with PROB in a clause multiply their probability terms.
+A positive `IS` reference to a PROB rule multiplies the referenced probability `p` into the calling rule's PROB value (the mirror of `IS NOT`'s `1 - p`), unless the clause's PROB expression already reads `p` as one product factor (`FOLD p = MNOR(p)`, `MNOR(e.w * p)`): count once. Any other read (`1 - p`) is not multiplied and raises `ProbabilityReadNotFactor`. Over `s -0.7-> t`, `s -0.3-> m -0.5-> t`, a reachability `MNOR(e.p)` gives `reach(s,t) = 1 - 0.3 * (1 - 0.15) = 0.745`.
 
 ### Shared Proof Detection
 
-When recursive rules have diamond-shaped derivation graphs, multiple proof paths may share base facts, violating the independence assumption. Uni detects this via a DerivationTracker and emits `SharedProbabilisticDependency` warning.
+When two proofs of one fact rest on the same evidence (the same edge, the same referenced fact, or the fact itself through a cycle), or a row's positive part and an `IS NOT` rest on the same edge, the independence assumption fails and Uni emits `SharedProbabilisticDependency`. Shared nodes alone are not shared evidence: the diamond above warns about nothing. Without a warning, default and exact mode agree.
 
 ### Exact Probability (BDD-Based)
 
-When `exact_probability = true`, shared-proof groups use BDD-based weighted model counting:
-1. Collect unique base facts across derivation rows
-2. Build BDD variable set (one per base fact)
-3. Per derivation row: AND its base-fact variables
-4. Combine rows: OR for MNOR, AND for MPROD
-5. Evaluate via Shannon expansion
+When `exact_probability = true`, each shared fact is recomputed under possible-worlds semantics:
+1. Each derivation row = its own event AND the formula of every positively referenced fact AND NOT the formula of every fact its `IS NOT` matched (rows over the same expression and the same nodes/relationships share one event); default mode keeps `1 - p` for `IS NOT`
+2. A fact = OR (MNOR) or AND (MPROD) of its rows, as a least fixpoint
+3. Build a BDD over the events and evaluate via Shannon expansion
 
-Fallback: when unique base facts exceed `max_bdd_variables` (default 1000), falls back to independence mode with `BddLimitExceeded` warning.
+Example: `A -0.5-> B -0.4-> C -0.6-> D` plus `A -0.3-> C`: both proofs of `reach(A,D)` need `C -> D`; exact 0.264, independence 0.2784. With negation, over `s -0.7-> t`, `s -0.3-> m -0.5-> t`: `reach(s,t) AND NOT link(m,t)` is exact 0.35 (`s->t` without `m->t`), default 0.3725 with the warning.
 
-### Top-K Proof Filtering
+Fallback: when a fact's formula needs more than `max_bdd_variables` (default 1000) events, falls back to independence mode with `BddLimitExceeded` warning.
 
-`top_k_proofs` bounds proofs retained per derived fact (0 = unlimited). Keeps only the k highest-probability proofs. `top_k_proofs_training` optionally overrides during training.
+### Top-K Proofs
+
+`semiring = TopKProofs(k)`: each MNOR fact is evaluated exactly over its `k` most probable rows (proofs), each row its own event AND the facts it references; with `k` at least a fact's row count it equals exact mode. A fact with at most `k` rows and no shared event keeps its default value.
+
+`top_k_proofs` bounds the provenance annotations retained per derivation for EXPLAIN (0 = unlimited). `top_k_proofs_training` optionally overrides during training.
+
+EXPLAIN RULE (recorded provenance) lists under each derivation the facts it references through a probabilistic `IS`, the same references exact mode and `TopKProofs` evaluate.
 
 ---
 
@@ -592,7 +596,9 @@ THEN {
 }
 ```
 
-Execution: fork L0 buffer -> apply mutations -> re-evaluate strata -> execute body -> rollback. Database is never permanently modified. Can be nested. Returns `CommandResult::Assume(Vec<FactRow>)`.
+Execution: fork L0 buffer -> apply mutations -> re-evaluate strata -> execute body -> rollback. Database is never permanently modified. Can be nested. Returns `CommandResult::Assume { results, derived }`: one result per body command in order (`Query`, `Derive { affected }`, `Cypher`, nested `Assume`), plus every rule's facts in the hypothetical state the first body command reads.
+
+`CommandResult::rows()` / `LocyResult::rows()` take the first row-producing body result, depth first; Python's `AssumeCommandResult` has `.results`, `.derived` and `.rows`. `ABDUCE`, `EXPLAIN RULE`, `DERIVE` and nested `ASSUME` run inside an ASSUME body, at any nesting depth, against the hypothetical state; `ABDUCE` validates its candidates against the body's own rules too. `CALIBRATE` and `VALIDATE` are refused there.
 
 ### ABDUCE (Abductive Reasoning)
 
@@ -737,7 +743,7 @@ Convenience: `result.warnings()`, `result.has_warning(code)`.
 | Variant | Payload |
 |---------|---------|
 | `Query` | `Vec<FactRow>` |
-| `Assume` | `Vec<FactRow>` |
+| `Assume` | `{ results: Vec<CommandResult>, derived: HashMap<String, Vec<FactRow>> }`: one result per body command; `rows()` returns the first row-producing body result, depth first |
 | `Explain` | `DerivationNode` |
 | `Abduce` | `AbductionResult` (contains `Vec<ValidatedModification>`) |
 | `Derive` | `{ affected: usize }` |

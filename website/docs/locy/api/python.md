@@ -57,10 +57,21 @@ out = (
         "exact_probability": True,
         "max_bdd_variables": 1000,
         "top_k_proofs": 100,
+        # Goal-directed QUERY evaluation: "off" (default), "on" or "shadow"
+        "goal_directed": "on",
     })
     .run()
 )
 ```
+
+`goal_directed` takes `"off"`, `"on"` or `"shadow"` (case-insensitive; any
+other string raises `ValueError`). The same option is the `goal_directed=`
+keyword of `uni_db.LocyConfig(...)`, which reports it back as a lowercase
+string. With `"on"`, a `QUERY` whose `WHERE` pins a node KEY column derives
+only what that goal reaches; its answers are unchanged, but a rule only such
+goals needed is left out of `result.derived` rather than returned partial.
+`"shadow"` answers from the rewrite while keeping `derived` complete. See
+[Goal-directed QUERY](../advanced/modules-priority-query.md#goal-directed-query).
 
 Builder methods:
 
@@ -91,10 +102,10 @@ print(compiled.num_strata, compiled.num_rules, compiled.rule_names)
 |-----------|------|-------------|
 | `derived` | `dict[str, list[dict]]` | Facts derived by each rule (keyed by rule name) |
 | `stats` | `LocyStats` | Iteration counts, timing, stratum info |
-| `command_results` | `list[dict]` | Output rows from `QUERY`, `ABDUCE`, `EXPLAIN RULE` |
+| `command_results` | `list` | One result object per command: `QueryCommandResult`, `AssumeCommandResult`, `DeriveCommandResult`, `CypherCommandResult`, `ExplainCommandResult`, `AbduceCommandResult` |
 | `warnings` | `list[dict]` | Runtime warnings (e.g., `SharedProbabilisticDependency`) |
 | `approximate_groups` | `dict[str, list[str]]` | Rule/key groups that fell back to approximate probability mode |
-| `derived_fact_set` | `DerivedFactSet` | Opaque fact set for `tx.apply()` materialization |
+| `derived_fact_set` | `DerivedFactSet` | Opaque fact set for `tx.apply()` materialization: every write of a session-level program (DERIVE output and Cypher writes), in program order |
 
 Helper methods:
 
@@ -103,9 +114,37 @@ Helper methods:
 | `.has_warning(code)` | Check if a specific warning code is present |
 | `.warnings_list()` | Get all warnings |
 | `.derived_facts(rule)` | Get derived facts for a specific rule |
-| `.rows()` | Get query result rows (from first `QUERY` command) |
+| `.rows()` | Get result rows from the first `QUERY` or Cypher command, searching an `ASSUME`'s body results depth first |
 | `.columns()` | Get query result column names |
 | `.iterations` | Number of fixpoint iterations performed |
+
+### ASSUME results
+
+An `ASSUME ... THEN { ... }` returns an `AssumeCommandResult` with one result per
+body command:
+
+```python
+result = session.locy("""
+CREATE RULE link AS MATCH (a:Person)-[:KNOWS]->(b:Person) DERIVE (a)-[:LINK]->(b)
+CREATE RULE linked AS MATCH (a:Person)-[:LINK]->(b:Person) YIELD KEY a, KEY b
+ASSUME { CREATE (:Marker) } THEN {
+  QUERY linked RETURN a.name AS a, b.name AS b
+  DERIVE link
+  QUERY linked RETURN a.name AS a, b.name AS b
+}
+""")
+assume = result.command_results[0]
+before, derive, after = assume.results   # QueryCommandResult, DeriveCommandResult, QueryCommandResult
+derive.affected                          # edges the body's DERIVE wrote
+assume.derived["linked"]                 # facts after the mutations, before the body's first command
+assume.rows                              # the first row-producing result's rows: `before.rows`
+```
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `results` | `list` | One result per body command, in order; a nested ASSUME is an `AssumeCommandResult` |
+| `derived` | `dict[str, list[dict]]` | Every rule's facts in the hypothetical state the body's first command reads |
+| `rows` | `list[dict]` | The first row-producing body result's rows (depth first), or `[]` |
 
 ### Warnings
 

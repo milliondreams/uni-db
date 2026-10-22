@@ -146,6 +146,33 @@ pub struct QueryMetrics {
     /// [`Self::scans_reported`] because they count different things: that one
     /// counts `ScanRequest` scans, this one counts searches.
     pub searches_reported: u64,
+    /// Physical plans built while answering this query.
+    ///
+    /// One for the query's own plan, plus one for every sub-plan built at
+    /// execution time: a correlated subquery's body is planned once per outer
+    /// row, and a Locy clause body once per fixpoint iteration. A count that
+    /// grows with the data is a re-plan per row or per iteration.
+    pub physical_plans: u64,
+    /// Wall time spent building those physical plans.
+    ///
+    /// Distinct from [`Self::plan_time`], which is the logical planning the API
+    /// layer does before execution. This one is measured inside execution, so
+    /// it is also contained in [`Self::exec_time`].
+    pub physical_plan_time: Duration,
+    /// Breadth-first searches started by `shortestPath` / `allShortestPaths`.
+    ///
+    /// One per distinct source an operator searched from: rows that share a
+    /// source share one search, however many targets it answers. A count that
+    /// grows with the number of targets is a search per row (A8).
+    pub shortest_path_searches: u64,
+    /// Per-vertex adjacency lookups made by `shortestPath` /
+    /// `allShortestPaths`: one per vertex expanded, per edge type and per
+    /// direction.
+    ///
+    /// Bounded by the vertices the searches expand, not by the paths emitted:
+    /// the search records each hop's edge, so building the output reads no
+    /// adjacency. Reported by the shortest-path operator only.
+    pub shortest_path_adjacency_reads: u64,
 }
 
 /// Single result row from a query.
@@ -454,10 +481,28 @@ impl QueryMetrics {
         self.vector_index_scans = c.vector_index_scans;
         self.fts_index_scans = c.fts_index_scans;
         self.searches_reported = c.searches_reported;
+        self.physical_plans = c.physical_plans;
+        self.physical_plan_time = Duration::from_nanos(c.planning_nanos);
+        self.shortest_path_searches = c.shortest_path_searches;
+        self.shortest_path_adjacency_reads = c.shortest_path_adjacency_reads;
     }
 }
 
 /// Result of a write operation (CREATE, SET, DELETE, etc.).
+///
+/// The counters are the statement's side effects in the openCypher TCK's
+/// vocabulary (`+nodes`, `-nodes`, `+relationships`, `-relationships`,
+/// `+properties`, `-properties`, `+labels`, `-labels`). A property is the
+/// triple (entity, key, value): adding one counts in
+/// [`properties_set`](Self::properties_set), removing one in
+/// [`properties_removed`](Self::properties_removed), overwriting one with a
+/// different value in both, and assigning the value it already has in
+/// neither. An entity created and changed by the same statement reports
+/// only its final state. The properties of a deleted node or relationship
+/// are not counted as removed, as in Neo4j's query statistics. Labels count
+/// per node they are added to or removed from, and only when the node's
+/// label set changes (Neo4j's `labelsAdded` / `labelsRemoved`). The TCK's
+/// side effects are a graph diff taken by its harness, not these counters.
 #[derive(Debug)]
 pub struct ExecuteResult {
     /// Number of entities affected.
@@ -472,6 +517,8 @@ pub struct ExecuteResult {
     pub(crate) relationships_deleted: usize,
     /// Number of properties set.
     pub(crate) properties_set: usize,
+    /// Number of properties removed.
+    pub(crate) properties_removed: usize,
     /// Number of labels added.
     pub(crate) labels_added: usize,
     /// Number of labels removed.
@@ -494,6 +541,7 @@ impl ExecuteResult {
             relationships_created: 0,
             relationships_deleted: 0,
             properties_set: 0,
+            properties_removed: 0,
             labels_added: 0,
             labels_removed: 0,
             metrics: QueryMetrics::default(),
@@ -514,6 +562,7 @@ impl ExecuteResult {
             relationships_created: stats.relationships_created,
             relationships_deleted: stats.relationships_deleted,
             properties_set: stats.properties_set,
+            properties_removed: stats.properties_removed,
             labels_added: stats.labels_added,
             labels_removed: stats.labels_removed,
             metrics,
@@ -545,17 +594,25 @@ impl ExecuteResult {
         self.relationships_deleted
     }
 
-    /// Returns the number of properties set.
+    /// Returns the number of properties set (`+properties`): added, or
+    /// overwritten with a different value.
     pub fn properties_set(&self) -> usize {
         self.properties_set
     }
 
-    /// Returns the number of labels added.
+    /// Returns the number of properties removed (`-properties`): removed,
+    /// set to null, or overwritten with a different value. A deleted
+    /// entity's properties are not counted.
+    pub fn properties_removed(&self) -> usize {
+        self.properties_removed
+    }
+
+    /// Returns the number of labels added, counted per node.
     pub fn labels_added(&self) -> usize {
         self.labels_added
     }
 
-    /// Returns the number of labels removed.
+    /// Returns the number of labels removed, counted per node.
     pub fn labels_removed(&self) -> usize {
         self.labels_removed
     }

@@ -13,7 +13,10 @@ use crate::runtime::WorkingGraph;
 use crate::runtime::context::QueryContext;
 use crate::runtime::l0::L0Buffer;
 use crate::storage::adjacency::AdjacencyDataset;
-use crate::storage::compaction::{Compactor, SemanticCompactionReport};
+use crate::storage::compaction::{
+    CompactionCancelled, CompactionDirLock, Compactor, SemanticCompactionReport,
+    is_compaction_cancelled,
+};
 use crate::storage::delta::{DeltaDataset, ENTRY_SIZE_ESTIMATE, Op};
 use crate::storage::direction::Direction;
 #[cfg(feature = "lance-backend")]
@@ -87,6 +90,52 @@ struct EdgeState {
     deleted: bool,
 }
 
+/// One semantic compaction merge in flight; see
+/// [`StorageManager::begin_compaction_merge`]. Dropping it ends the merge.
+#[derive(Debug)]
+pub struct CompactionMerge {
+    pins: Arc<crate::storage::adjacency_manager::PinnedVersions>,
+    token: Option<crate::storage::adjacency_manager::MergeToken>,
+    floor: Option<u64>,
+    merged_through: u64,
+}
+
+impl CompactionMerge {
+    /// The oldest pinned version when the merge began; the merge keeps every
+    /// row and delta above it. `None` when nothing was pinned.
+    #[must_use]
+    pub fn floor(&self) -> Option<u64> {
+        self.floor
+    }
+
+    /// Records, before the merge writes, that it loses the history below
+    /// `merged_through`: persisted with `snapshots`, so a later process
+    /// refuses a pin below it too, and applied in memory when the merge ends.
+    ///
+    /// # Errors
+    ///
+    /// When the record cannot be persisted; the merge must not write then.
+    pub async fn record(&mut self, snapshots: &SnapshotManager, merged_through: u64) -> Result<()> {
+        if merged_through == 0 {
+            return Ok(());
+        }
+        let recorded = snapshots.load_compaction_horizon().await?;
+        if merged_through > recorded {
+            snapshots.save_compaction_horizon(merged_through).await?;
+        }
+        self.merged_through = self.merged_through.max(merged_through);
+        Ok(())
+    }
+}
+
+impl Drop for CompactionMerge {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            self.pins.end_merge(token, self.merged_through);
+        }
+    }
+}
+
 pub struct StorageManager {
     base_uri: String,
     store: Arc<dyn ObjectStore>,
@@ -98,6 +147,13 @@ pub struct StorageManager {
     requires_adjacency_revalidation: bool,
     pub config: UniConfig,
     pub compaction_status: Arc<Mutex<CompactionStatus>>,
+    /// Held shared by every background index build and exclusively by a
+    /// snapshot restore or capture; see [`Self::pause_index_builds`]. Shared
+    /// with pinned views of the same store.
+    index_build_gate: Arc<tokio::sync::RwLock<()>>,
+    /// Cancels compaction on this manager at its next safe point. Cancelled
+    /// once, at shutdown; it is never reset. See [`Self::cancel_compaction`].
+    compaction_cancel: tokio_util::sync::CancellationToken,
     /// Counter of in-flight `flush_to_l1` operations. Compaction skips
     /// delta-clear when this is non-zero to avoid wiping rows a flush is
     /// about to append. Counter (not bool) so multiple async flushes can
@@ -124,15 +180,14 @@ pub struct StorageManager {
     pinned_version_hwm: Option<u64>,
     /// Keeps this view's version registered in the shared
     /// [`PinnedVersions`](crate::storage::adjacency_manager::PinnedVersions)
-    /// registry so shadow-CSR GC cannot reclaim entries it still resolves.
+    /// registry so shadow-CSR GC cannot reclaim entries it still resolves and
+    /// semantic compaction keeps the rows it reads
+    /// ([`Self::begin_compaction_merge`]).
     ///
-    /// Only `pinned_at_version` sets it: `pinned()` and `at_fork` each build a
-    /// *fresh* `AdjacencyManager`, so they read their own empty shadow and have
-    /// nothing to protect. Released when the view drops.
-    #[expect(
-        dead_code,
-        reason = "RAII guard: held solely so its Drop deregisters this view's pinned version. Never read."
-    )]
+    /// Set by `pinned_at_version` and by `pinned()`, which registers with the
+    /// live manager's registry (its own `AdjacencyManager` is fresh). A view
+    /// at a restore point clears it: its tables are tagged versions. Released
+    /// when the view drops; only ever written, never read.
     pin_guard: Option<crate::storage::adjacency_manager::PinGuard>,
     /// Optional fork scope for branch-aware reads (Phase 1 read-only).
     ///
@@ -173,6 +228,21 @@ pub struct StorageManager {
     /// the [`crate::storage::compaction::Compactor`] via
     /// [`Self::plugin_registry`].
     plugin_registry: Option<Arc<uni_plugin::PluginRegistry>>,
+    /// Hides the rows of bulk loads whose publish is in flight (see
+    /// [`crate::storage::bulk_gate`]).
+    ///
+    /// Shared with the pinned and transaction views of this manager, which read
+    /// the same version space. A fork has its own version space, and its own
+    /// gate.
+    bulk_gate: Arc<crate::storage::bulk_gate::BulkVisibilityGate>,
+    /// Bulk-load versions this view excludes for good: loads that were staged
+    /// or publishing when its version ceiling was captured, and became
+    /// visible only later. Empty for a live manager.
+    excluded_versions: Arc<[u64]>,
+    /// Whether this view's version ceiling is above everything semantic
+    /// compaction merged when the view was made; see
+    /// [`Self::history_is_whole`]. Always `true` for a live manager.
+    history_whole: bool,
 }
 
 /// RAII counter increment for `StorageManager.flush_in_progress`.
@@ -329,22 +399,6 @@ pub(crate) async fn write_dataset_with_lance_conflict_retry(
     .await
 }
 
-/// Combine a version high-water-mark predicate with an optional caller filter.
-///
-/// `hwm` is passed in rather than read off `StorageManager` because the vertex
-/// and edge scan paths deliberately source it differently — see the call sites.
-fn combine_hwm_filter(hwm: Option<u64>, extra: Option<&FilterExpr>) -> Option<FilterExpr> {
-    match (hwm, extra) {
-        (Some(hwm), Some(f)) => Some(FilterExpr::all([
-            FilterExpr::version_at_most(hwm),
-            f.clone(),
-        ])),
-        (Some(hwm), None) => Some(FilterExpr::version_at_most(hwm)),
-        (None, Some(f)) => Some(f.clone()),
-        (None, None) => None,
-    }
-}
-
 /// Narrow `columns` to those that physically exist in the table's schema.
 ///
 /// Returns `None` when the table has no readable schema — callers treat that
@@ -408,6 +462,62 @@ pub enum MissingTable {
     /// is the degenerate case of "no rows matched", and an unmatched tombstone
     /// is already defined as a no-op.
     SkipAsNoOp,
+}
+
+/// A vertex's newest row version and, unless that row is a tombstone, its
+/// labels.
+type NewestLabels = (u64, Option<Vec<String>>);
+
+/// Each vid's newest row in `batches` of the main vertex table (`_vid`,
+/// `labels`, `_version`, `_deleted`). A tombstone wins a version tie.
+fn newest_vertex_labels(
+    batches: &[arrow_array::RecordBatch],
+) -> Result<HashMap<Vid, NewestLabels>> {
+    let mut newest: HashMap<Vid, NewestLabels> = HashMap::new();
+    for batch in batches {
+        let vid_col = batch
+            .column_by_name("_vid")
+            .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| anyhow!("Missing _vid column"))?;
+        let labels_col = batch
+            .column_by_name("labels")
+            .and_then(|c| c.as_any().downcast_ref::<arrow_array::ListArray>())
+            .ok_or_else(|| anyhow!("Missing labels column"))?;
+        let ver_col = batch
+            .column_by_name("_version")
+            .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| anyhow!("Missing _version column"))?;
+        let deleted_col = batch
+            .column_by_name("_deleted")
+            .and_then(|c| c.as_any().downcast_ref::<arrow_array::BooleanArray>())
+            .ok_or_else(|| anyhow!("Missing _deleted column"))?;
+        for row in 0..batch.num_rows() {
+            let vid = Vid::from(vid_col.value(row));
+            let version = ver_col.value(row);
+            let deleted = deleted_col.value(row);
+            if let Some((best, best_labels)) = newest.get(&vid)
+                && (version < *best || (version == *best && (best_labels.is_none() || !deleted)))
+            {
+                continue;
+            }
+            let labels = if deleted {
+                None
+            } else {
+                let list = labels_col.value(row);
+                let strings = list
+                    .as_any()
+                    .downcast_ref::<arrow_array::StringArray>()
+                    .ok_or_else(|| anyhow!("Invalid labels array element type"))?;
+                Some(
+                    (0..strings.len())
+                        .map(|i| strings.value(i).to_string())
+                        .collect(),
+                )
+            };
+            newest.insert(vid, (version, labels));
+        }
+    }
+    Ok(newest)
 }
 
 /// MergeInsert sibling of `write_batch_with_lance_conflict_retry`.
@@ -545,6 +655,81 @@ pub async fn write_batch_with_lance_conflict_retry(
     .await
 }
 
+/// Stage `batch` for `table_name` without making any of it readable.
+///
+/// The staging counterpart of [`write_batch_with_lance_conflict_retry`]: the
+/// stored schema is widened the same way (issue #249), and a table that does
+/// not exist yet is created *empty* from the batch's schema so the staged
+/// files carry the field ids every later append will use. An empty table is
+/// the only thing a reader can observe before [`StorageBackend::publish_staged`].
+///
+/// [`StorageBackend::publish_staged`]: crate::backend::StorageBackend::publish_staged
+///
+/// # Errors
+///
+/// Returns an error if widening, creating, or staging fails.
+pub async fn stage_batch(
+    backend: &dyn crate::backend::StorageBackend,
+    table_name: &str,
+    batch: arrow_array::RecordBatch,
+) -> anyhow::Result<crate::backend::traits::StagedAppend> {
+    crate::storage::schema_evolution::ensure_table_accepts(
+        backend,
+        table_name,
+        batch.schema_ref(),
+        crate::storage::schema_evolution::BatchCoverage::Full,
+    )
+    .await?;
+    if !backend.table_exists(table_name).await? {
+        // A concurrent writer may create it first; that is the state wanted.
+        if let Err(e) = backend.create_empty_table(table_name, batch.schema()).await
+            && !backend.table_exists(table_name).await?
+        {
+            return Err(e);
+        }
+    }
+    backend.stage_append(table_name, vec![batch]).await
+}
+
+/// Holds compaction off while it lives; see [`StorageManager::pause_compaction`].
+#[must_use = "compaction resumes as soon as this is dropped"]
+pub struct CompactionPause {
+    _guard: CompactionGuard,
+    _dir_lock: Option<CompactionDirLock>,
+}
+
+impl std::fmt::Debug for CompactionPause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompactionPause").finish_non_exhaustive()
+    }
+}
+
+/// Holds background index builds off while it lives; see
+/// [`StorageManager::pause_index_builds`].
+#[must_use = "index builds resume as soon as this is dropped"]
+pub struct IndexBuildPause {
+    _guard: tokio::sync::OwnedRwLockWriteGuard<()>,
+}
+
+impl std::fmt::Debug for IndexBuildPause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IndexBuildPause").finish_non_exhaustive()
+    }
+}
+
+/// Lets one background index build run; see
+/// [`StorageManager::index_build_permit`].
+#[must_use = "the build is no longer covered once this is dropped"]
+pub struct IndexBuildPermit {
+    _guard: tokio::sync::OwnedRwLockReadGuard<()>,
+}
+
+impl std::fmt::Debug for IndexBuildPermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IndexBuildPermit").finish_non_exhaustive()
+    }
+}
+
 /// Helper to manage compaction_in_progress flag
 struct CompactionGuard {
     status: Arc<Mutex<CompactionStatus>>,
@@ -646,6 +831,8 @@ impl StorageManager {
             config,
             cardinality: Arc::new(crate::storage::cardinality::CardinalityCache::new()),
             compaction_status: Arc::new(Mutex::new(CompactionStatus::default())),
+            index_build_gate: Arc::new(tokio::sync::RwLock::new(())),
+            compaction_cancel: tokio_util::sync::CancellationToken::new(),
             flush_in_progress: std::sync::atomic::AtomicUsize::new(0),
             pinned_snapshot: None,
             pinned_version_hwm: None,
@@ -657,7 +844,17 @@ impl StorageManager {
                 crate::storage::vid_labels::VidLabelsIndex::new(),
             )),
             plugin_registry: None,
+            bulk_gate: Arc::new(crate::storage::bulk_gate::BulkVisibilityGate::new()),
+            history_whole: true,
+            excluded_versions: Arc::from(Vec::new()),
         };
+
+        // How far earlier processes' semantic compaction merged history, so a
+        // session pinned below it is refused rather than served merged rows.
+        let horizon = sm.snapshot_manager.load_compaction_horizon().await?;
+        sm.adjacency_manager
+            .pinned_versions()
+            .raise_horizon(horizon);
 
         // Rebuild VidLabelsIndex from persisted vertices. A failure leaves the
         // empty index in place; flush-time updates then repopulate it
@@ -724,7 +921,18 @@ impl StorageManager {
         config: UniConfig,
         lancedb_storage_options: Option<HashMap<String, String>>,
     ) -> Result<Self> {
-        let backend = Arc::new(LanceDbBackend::connect(base_uri, lancedb_storage_options).await?);
+        let cache_sizes = crate::backend::lance_directory::LanceCacheSizes {
+            index_bytes: config.lance_index_cache_bytes,
+            metadata_bytes: config.lance_metadata_cache_bytes,
+        };
+        let backend = Arc::new(
+            LanceDbBackend::connect_with_cache_sizes(
+                base_uri,
+                lancedb_storage_options,
+                cache_sizes,
+            )
+            .await?,
+        );
         Self::new_with_backend(base_uri, store, backend, schema_manager, config).await
     }
 
@@ -798,6 +1006,11 @@ impl StorageManager {
     }
 
     pub fn pinned(&self, snapshot: SnapshotManifest) -> Self {
+        let snapshot_excluded = snapshot.unpublished_bulk_versions.clone();
+        let (pin_guard, history_whole) = self
+            .adjacency_manager
+            .pinned_versions()
+            .pin_checked(snapshot.version_high_water_mark);
         // Phase 4a: pinning a forked session is now supported. The
         // resulting StorageManager keeps `fork_scope` so reads continue
         // to route through the fork's Lance branches via `base_paths`,
@@ -818,10 +1031,14 @@ impl StorageManager {
             config: self.config.clone(),
             cardinality: self.cardinality.clone(),
             compaction_status: Arc::new(Mutex::new(CompactionStatus::default())),
+            index_build_gate: Arc::clone(&self.index_build_gate),
+            compaction_cancel: tokio_util::sync::CancellationToken::new(),
             flush_in_progress: std::sync::atomic::AtomicUsize::new(0),
+            // Registered with the live manager's pins, so semantic compaction
+            // keeps the rows this view reads (`Self::begin_compaction_merge`).
+            pin_guard: Some(pin_guard),
             pinned_snapshot: Some(snapshot),
             pinned_version_hwm: None,
-            pin_guard: None,
             fork_scope: self.fork_scope.clone(),
             fork_registry: self.fork_registry.clone(),
             backend: self.backend.clone(),
@@ -834,7 +1051,35 @@ impl StorageManager {
                 self.vid_labels_index.read().clone(),
             )),
             plugin_registry: self.plugin_registry.clone(),
+            bulk_gate: Arc::clone(&self.bulk_gate),
+            history_whole,
+            excluded_versions: Arc::from(snapshot_excluded),
         }
+    }
+
+    /// [`Self::pinned`] for an explicit snapshot: reads each table at the
+    /// version its restore point recorded (`tables`), when the backend can
+    /// ([`StorageBackend::at_table_versions`]).
+    ///
+    /// Those versions are tagged against cleanup and hold exactly the
+    /// snapshot's rows, so the view is unaffected by what happened to the
+    /// live tables since: semantic compaction folding superseded rows and
+    /// edge deltas away, or a table dropped and recreated. The version
+    /// ceiling still applies on top.
+    #[must_use]
+    pub fn pinned_at_restore_point(
+        &self,
+        snapshot: SnapshotManifest,
+        tables: &std::collections::BTreeMap<String, u64>,
+    ) -> Self {
+        let mut view = self.pinned(snapshot);
+        if let Some(backend) = self.backend.at_table_versions(tables) {
+            view.backend = backend;
+            // Its tables are tagged versions compaction cannot change.
+            view.pin_guard = None;
+            view.history_whole = true;
+        }
+        view
     }
 
     /// Construct a clone of this `StorageManager` pinned to a row-version
@@ -856,6 +1101,18 @@ impl StorageManager {
     /// C2); edge reads are recorded in the OCC read-set, so a conflicting
     /// read-modify-write still aborts at commit.
     pub fn pinned_at_version(&self, hwm: u64) -> Self {
+        self.pinned_at_version_excluding(hwm, &[])
+    }
+
+    /// [`Self::pinned_at_version`], also excluding the bulk-load versions
+    /// `excluded` for good: loads reserved at or below `hwm` that were not
+    /// visible when the ceiling was captured
+    /// ([`crate::runtime::l0_manager::SnapshotView::unpublished_bulk`]).
+    /// Without it such a load, published while the transaction runs, would
+    /// appear part way through it.
+    #[must_use]
+    pub fn pinned_at_version_excluding(&self, hwm: u64, excluded: &[u64]) -> Self {
+        let excluded: Vec<u64> = excluded.to_vec();
         // Register the pin for as long as this view lives, so shadow GC cannot
         // reclaim entries this reader still resolves. Dropped with the view.
         let pin_guard = Some(self.adjacency_manager.pinned_versions().pin(hwm));
@@ -869,6 +1126,8 @@ impl StorageManager {
             config: self.config.clone(),
             cardinality: self.cardinality.clone(),
             compaction_status: Arc::new(Mutex::new(CompactionStatus::default())),
+            index_build_gate: Arc::clone(&self.index_build_gate),
+            compaction_cancel: tokio_util::sync::CancellationToken::new(),
             flush_in_progress: std::sync::atomic::AtomicUsize::new(0),
             pinned_snapshot: None,
             pinned_version_hwm: Some(hwm),
@@ -885,6 +1144,9 @@ impl StorageManager {
                 self.vid_labels_index.read().clone(),
             )),
             plugin_registry: self.plugin_registry.clone(),
+            bulk_gate: Arc::clone(&self.bulk_gate),
+            history_whole: true,
+            excluded_versions: Arc::from(excluded),
         }
     }
 
@@ -943,6 +1205,8 @@ impl StorageManager {
             config: self.config.clone(),
             cardinality: self.cardinality.clone(),
             compaction_status: Arc::new(Mutex::new(CompactionStatus::default())),
+            index_build_gate: Arc::new(tokio::sync::RwLock::new(())),
+            compaction_cancel: tokio_util::sync::CancellationToken::new(),
             flush_in_progress: std::sync::atomic::AtomicUsize::new(0),
             pinned_snapshot: None,
             pinned_version_hwm: None,
@@ -959,6 +1223,12 @@ impl StorageManager {
                 self.vid_labels_index.read().clone(),
             )),
             plugin_registry: self.plugin_registry.clone(),
+            // A fork stamps versions from its own counter, so the primary's
+            // hidden versions mean nothing here, and the fork's loads must not
+            // hide primary rows.
+            bulk_gate: Arc::new(crate::storage::bulk_gate::BulkVisibilityGate::new()),
+            history_whole: true,
+            excluded_versions: Arc::from(Vec::new()),
         }
     }
 
@@ -1207,6 +1477,39 @@ impl StorageManager {
             .or(self.pinned_version_hwm)
     }
 
+    /// Starts one semantic compaction merge (a label's vertices, or with
+    /// `edge_tier` an edge type's deltas in one direction).
+    ///
+    /// The guard's [`CompactionMerge::floor`] is the oldest version an
+    /// in-flight pinned reader reads at (a transaction's L1 pin, or a session
+    /// pinned to a snapshot read from the live tables; only the latter for
+    /// edge deltas, since a transaction reads the live adjacency): the merge
+    /// must merge no row and fold no delta above it, so each such reader
+    /// still finds its rows. Before the merge writes, [`CompactionMerge::record`] persists the
+    /// version below which it loses history; a session pinned below that
+    /// afterwards is refused ([`Self::history_is_whole`]).
+    pub fn begin_compaction_merge(&self, edge_tier: bool) -> CompactionMerge {
+        let pins = Arc::clone(self.adjacency_manager.pinned_versions());
+        let (floor, token) = pins.begin_merge(edge_tier);
+        CompactionMerge {
+            pins,
+            token: Some(token),
+            floor,
+            merged_through: 0,
+        }
+    }
+
+    /// Whether this view's version ceiling was at or above every version
+    /// semantic compaction had merged history through when the view was
+    /// made. `false` means the live tables no longer hold the rows the view
+    /// should read: a session pinned to an old flush manifest after a
+    /// compaction pass. Always `true` for a live manager, a transaction view
+    /// and a view at a restore point.
+    #[must_use]
+    pub fn history_is_whole(&self) -> bool {
+        self.history_whole
+    }
+
     /// Version high-water mark from a manifest-pinned (time-travel) snapshot
     /// ONLY — never from a transaction-level version pin.
     ///
@@ -1228,11 +1531,58 @@ impl StorageManager {
     ///
     /// If a snapshot is pinned, conjoins `_version <= hwm` onto `base_filter`.
     /// Otherwise returns `base_filter` unchanged.
+    ///
+    /// Also excludes the rows of bulk loads whose publish is in flight; see
+    /// [`Self::row_visibility`].
     pub fn apply_version_filter(&self, base_filter: FilterExpr) -> FilterExpr {
-        match self.version_high_water_mark() {
-            Some(hwm) => FilterExpr::all([base_filter, FilterExpr::version_at_most(hwm)]),
-            None => base_filter,
+        self.row_visibility().bound(base_filter)
+    }
+
+    /// The gate that hides in-flight bulk publishes from this manager's reads.
+    #[must_use]
+    pub fn bulk_gate(&self) -> &Arc<crate::storage::bulk_gate::BulkVisibilityGate> {
+        &self.bulk_gate
+    }
+
+    /// The rows an L1 read at ceiling `hwm` may return: at most `hwm`, and none
+    /// of a bulk load whose publish is in flight.
+    #[must_use]
+    pub fn visibility_at(&self, hwm: Option<u64>) -> crate::storage::bulk_gate::RowVisibility {
+        crate::storage::bulk_gate::RowVisibility::new(
+            hwm,
+            self.with_excluded_versions(self.bulk_gate.hidden()),
+        )
+    }
+
+    /// `hidden` (the bulk gate's hidden versions) together with the versions
+    /// this view excludes for good.
+    #[must_use]
+    pub fn with_excluded_versions(&self, hidden: Arc<[u64]>) -> Arc<[u64]> {
+        if self.excluded_versions.is_empty() {
+            return hidden;
         }
+        let mut all: Vec<u64> = hidden
+            .iter()
+            .chain(self.excluded_versions.iter())
+            .copied()
+            .collect();
+        all.sort_unstable();
+        all.dedup();
+        Arc::from(all)
+    }
+
+    /// Row visibility for the scan tier: [`Self::version_high_water_mark`]
+    /// plus the bulk visibility gate.
+    #[must_use]
+    pub fn row_visibility(&self) -> crate::storage::bulk_gate::RowVisibility {
+        self.visibility_at(self.version_high_water_mark())
+    }
+
+    /// Row visibility for the edge tier: [`Self::snapshot_version_hwm`] plus
+    /// the bulk visibility gate.
+    #[must_use]
+    pub fn edge_row_visibility(&self) -> crate::storage::bulk_gate::RowVisibility {
+        self.visibility_at(self.snapshot_version_hwm())
     }
 
     /// Build a filter expression that excludes soft-deleted rows and optionally
@@ -1306,18 +1656,87 @@ impl StorageManager {
         tables
     }
 
-    pub async fn compact(&self) -> Result<CompactionStats> {
-        let start = std::time::Instant::now();
-        let schema = self.schema_manager.schema();
-        let mut stats = CompactionStats::default();
+    /// Runs a full compaction pass now: semantic compaction (Tier 2) and a
+    /// backend optimize of every table (Tier 3), exactly what a background
+    /// pass does.
+    ///
+    /// Waits for a pass already running in this handle or in another handle on
+    /// the same directory, so a manual and a background pass never overlap,
+    /// then runs under the same guard and directory lock. Like a background
+    /// pass it lowers the flush-generation count (`l1_runs`) that drives write
+    /// throttling, by the runs that existed when it started.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompactionCancelled`] if the database shuts down while it
+    /// waits or runs, a lock-file I/O error, or a Tier 3 failure.
+    pub async fn compact(self: &Arc<Self>) -> Result<CompactionStats> {
+        let _guard = loop {
+            if let Some(guard) = CompactionGuard::new(self.compaction_status.clone()) {
+                break guard;
+            }
+            if self.compaction_cancel.is_cancelled() {
+                return Err(anyhow::Error::new(CompactionCancelled {
+                    at: "compaction::waiting-for-guard",
+                }));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let _dir_lock = self.lock_compaction_dir().await?;
+        Self::run_full_pass(Arc::clone(self)).await
+    }
 
-        for table in Self::all_tables(&schema) {
-            self.optimize_into(&table, &mut stats).await?;
+    /// Wait until no compaction runs in this handle or another handle on the
+    /// same directory, and keep any from starting until the returned value is
+    /// dropped.
+    ///
+    /// A snapshot restore rewinds tables a compaction would otherwise rewrite
+    /// concurrently.
+    ///
+    /// # Errors
+    ///
+    /// [`CompactionCancelled`] if the database shuts down while waiting, or a
+    /// lock-file I/O error.
+    pub async fn pause_compaction(&self) -> Result<CompactionPause> {
+        let guard = loop {
+            if let Some(guard) = CompactionGuard::new(self.compaction_status.clone()) {
+                break guard;
+            }
+            if self.compaction_cancel.is_cancelled() {
+                return Err(anyhow::Error::new(CompactionCancelled {
+                    at: "pause-compaction::waiting-for-guard",
+                }));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let dir_lock = self.lock_compaction_dir().await?;
+        Ok(CompactionPause {
+            _guard: guard,
+            _dir_lock: dir_lock,
+        })
+    }
+
+    /// Keep background index builds from starting, and wait for those under
+    /// way to finish, until the returned value is dropped.
+    ///
+    /// A snapshot restore holds it while it rewinds storage and the catalog,
+    /// and a snapshot capture while it records them. Without it, a build that
+    /// read the store before the rewind could commit its artifact, or record
+    /// its index `Online`, after it: an index over rows the restore removed,
+    /// or an `Online` index whose artifact the rewind took away.
+    pub async fn pause_index_builds(&self) -> IndexBuildPause {
+        IndexBuildPause {
+            _guard: Arc::clone(&self.index_build_gate).write_owned().await,
         }
+    }
 
-        stats.duration = start.elapsed();
-        self.record_run(&stats)?;
-        Ok(stats)
+    /// Permission for one background index build, held from the moment it
+    /// claims its work until it has recorded the outcome in the catalog.
+    /// Waits while [`Self::pause_index_builds`] is held.
+    pub async fn index_build_permit(&self) -> IndexBuildPermit {
+        IndexBuildPermit {
+            _guard: Arc::clone(&self.index_build_gate).read_owned().await,
+        }
     }
 
     pub async fn compact_label(&self, label: &str) -> Result<CompactionStats> {
@@ -1368,6 +1787,80 @@ impl StorageManager {
         Ok(())
     }
 
+    /// Cancels compaction on this manager: a running pass stops at its next
+    /// safe point and no new pass starts.
+    ///
+    /// Irreversible. Called when the owning database shuts down, so a pass
+    /// does not keep rewriting tables after its owner is gone. A stopped pass
+    /// leaves the store consistent; the next open redoes its work.
+    pub fn cancel_compaction(&self) {
+        self.compaction_cancel.cancel();
+    }
+
+    /// The token that [`Self::cancel_compaction`] cancels.
+    #[must_use]
+    pub fn compaction_cancel_token(&self) -> &tokio_util::sync::CancellationToken {
+        &self.compaction_cancel
+    }
+
+    /// Waits for this directory's compaction lock, then takes it.
+    ///
+    /// Returns `Ok(None)` for a remote store, which has no lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompactionCancelled`] if cancelled while waiting, or the
+    /// lock file's I/O error.
+    pub(crate) async fn lock_compaction_dir(&self) -> Result<Option<CompactionDirLock>> {
+        let Some(root) = self.local_fs_root() else {
+            return Ok(None);
+        };
+        loop {
+            if self.compaction_cancel.is_cancelled() {
+                return Err(anyhow::Error::new(CompactionCancelled {
+                    at: "compaction::waiting-for-dir-lock",
+                }));
+            }
+            if let Some(lock) = CompactionDirLock::try_acquire(&root)? {
+                return Ok(Some(lock));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Waits until no other handle is compacting this directory.
+    ///
+    /// A writable open calls this before it writes anything: a pass still
+    /// running from a dropped handle on the same path would otherwise
+    /// overwrite a table this handle appends to and lose the append. Takes
+    /// the lock and releases it at once; a no-op for remote stores.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the lock is still held after `timeout`, or on the lock
+    /// file's I/O error.
+    pub async fn wait_for_foreign_compaction(&self, timeout: Duration) -> Result<()> {
+        let Some(root) = self.local_fs_root() else {
+            return Ok(());
+        };
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if CompactionDirLock::try_acquire(&root)?.is_some() {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "another handle is still compacting {} after {:?}; refusing to \
+                     open it for writing while a foreign compaction can overwrite \
+                     this handle's writes",
+                    root.display(),
+                    timeout
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     pub async fn wait_for_compaction(&self) -> Result<()> {
         loop {
             let in_progress = {
@@ -1397,9 +1890,25 @@ impl StorageManager {
             let start = tokio::time::Instant::now() + self.config.compaction.check_interval;
             let mut interval =
                 tokio::time::interval_at(start, self.config.compaction.check_interval);
+            // A pass can outlast many ticks; replaying them as a burst would
+            // only re-check status back to back.
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
+                // `biased`, shutdown first: unbiased, a tick that became ready
+                // during a long pass won half the races against a pending
+                // shutdown and started another full pass after it.
                 tokio::select! {
+                    biased;
+                    _ = shutdown_rx.recv() => {
+                        log::info!("Background compaction shutting down");
+                        let _ = self.wait_for_compaction().await;
+                        break;
+                    }
+                    () = self.compaction_cancel.cancelled() => {
+                        log::info!("Background compaction cancelled");
+                        break;
+                    }
                     _ = interval.tick() => {
                         if let Err(e) = self.update_compaction_status().await {
                             log::error!("Failed to update compaction status: {}", e);
@@ -1408,15 +1917,14 @@ impl StorageManager {
 
                         if let Some(task) = self.pick_compaction_task() {
                             log::info!("Triggering background compaction: {:?}", task);
-                            if let Err(e) = Self::execute_compaction(Arc::clone(&self), task).await {
-                                log::error!("Compaction failed: {}", e);
+                            match Self::execute_compaction(Arc::clone(&self), task).await {
+                                Ok(_) => {}
+                                Err(e) if is_compaction_cancelled(&e) => {
+                                    log::info!("{e}");
+                                }
+                                Err(e) => log::error!("Compaction failed: {}", e),
                             }
                         }
-                    }
-                    _ = shutdown_rx.recv() => {
-                        log::info!("Background compaction shutting down");
-                        let _ = self.wait_for_compaction().await;
-                        break;
                     }
                 }
             }
@@ -1472,8 +1980,9 @@ impl StorageManager {
             .unwrap_or(Duration::ZERO);
 
         let mut status = acquire_mutex(&self.compaction_status, "compaction_status")?;
-        // Note: l1_runs is managed by flush_to_l1 (increment) and execute_compaction
-        // (reset). It counts flush generations, not delta table count.
+        // Note: l1_runs is managed by flush_to_l1 (increment) and a full
+        // compaction pass (`run_full_pass`, which subtracts the runs it saw at
+        // its start). It counts flush generations, not delta table count.
         status.l1_rows = total_rows as u64;
         status.l1_estimated_bytes = status.l1_rows.saturating_mul(ENTRY_SIZE_ESTIMATE as u64);
         status.status_refreshes += 1;
@@ -1520,25 +2029,44 @@ impl StorageManager {
         }
     }
 
-    /// Trigger L1 compaction asynchronously without blocking the caller.
-    /// Safe to call frequently — CompactionGuard prevents concurrent runs.
-    pub fn trigger_async_compaction(self: &Arc<Self>) {
-        let this = Arc::clone(self);
-        tokio::spawn(async move {
-            if let Err(e) = Self::execute_compaction(this, CompactionTask::ByRunCount).await {
-                // "Compaction already in progress" is expected when called frequently
-                log::debug!("Post-flush compaction skipped: {}", e);
-            }
-        });
-    }
-
     pub(crate) async fn execute_compaction(
         this: Arc<Self>,
         _task: CompactionTask,
     ) -> Result<CompactionStats> {
-        let start = std::time::Instant::now();
         let _guard = CompactionGuard::new(this.compaction_status.clone())
             .ok_or_else(|| anyhow!("Compaction already in progress"))?;
+        if this.compaction_cancel.is_cancelled() {
+            return Err(anyhow::Error::new(CompactionCancelled {
+                at: "compaction::before-start",
+            }));
+        }
+        // Skip, rather than wait, when a bulk load is being published: its
+        // rows are hidden from readers, and semantic compaction would expose
+        // them through L2 adjacency. The next tick retries.
+        if this.bulk_gate.is_closed() {
+            log::debug!("Background compaction deferred: a bulk load is being published");
+            return Ok(CompactionStats::default());
+        }
+        // Skip, rather than wait, when another handle on this directory is
+        // compacting: the next tick retries. See `CompactionDirLock`.
+        let _dir_lock = match this.local_fs_root() {
+            Some(root) => Some(CompactionDirLock::try_acquire(&root)?.ok_or_else(|| {
+                anyhow!("Compaction already in progress in another handle on this directory")
+            })?),
+            None => None,
+        };
+        Self::run_full_pass(this).await
+    }
+
+    /// One full pass (Tier 2 then Tier 3), for a caller holding the
+    /// compaction guard and the directory lock.
+    ///
+    /// Lowers `l1_runs` by the runs counted when the pass started, not to
+    /// zero: a flush that lands while the pass runs adds a run the pass did
+    /// not fold, and resetting to zero erased it from the write throttle.
+    async fn run_full_pass(this: Arc<Self>) -> Result<CompactionStats> {
+        let start = std::time::Instant::now();
+        let runs_at_start = acquire_mutex(&this.compaction_status, "compaction_status")?.l1_runs;
 
         let schema = this.schema_manager.schema();
         let mut stats = CompactionStats::default();
@@ -1558,8 +2086,14 @@ impl StorageManager {
         // before -- a persistent semantic failure must not block fragment
         // compaction -- but drop every cached CSR, because what changed is
         // exactly what is not known.
-        let semantic = match compactor.compact_all().await {
+        let semantic = match compactor.compact_all_locked().await {
             Ok(report) => report,
+            Err(e) if is_compaction_cancelled(&e) => {
+                // Stopped at a safe point. Some adjacency tables may already
+                // be rewritten, and the report naming them was not returned.
+                this.adjacency_manager().invalidate_all_csr();
+                return Err(e);
+            }
             Err(e) => {
                 log::error!(
                     "Semantic compaction failed (continuing with backend optimize; \
@@ -1598,6 +2132,13 @@ impl StorageManager {
         // drift apart again.
         let backend = this.backend.as_ref();
         for table in Self::all_tables(&schema) {
+            // Each optimize is one atomic Lance commit, so stopping between
+            // tables is safe.
+            if this.compaction_cancel.is_cancelled() {
+                return Err(anyhow::Error::new(CompactionCancelled {
+                    at: "compaction::before-optimize",
+                }));
+            }
             if let Some(report) =
                 Self::try_optimize_table(backend, &table, this.config.compaction.version_retention)
                     .await
@@ -1611,7 +2152,7 @@ impl StorageManager {
         this.record_run(&stats)?;
         {
             let mut status = acquire_mutex(&this.compaction_status, "compaction_status")?;
-            status.l1_runs = 0; // Reset flush generation counter
+            status.l1_runs = status.l1_runs.saturating_sub(runs_at_start);
         }
 
         Ok(stats)
@@ -1763,6 +2304,105 @@ impl StorageManager {
     /// Always called on startup. On a fresh database (no vertex table yet) the
     /// index is left empty and filled incrementally by flush-time updates.
     async fn rebuild_vid_labels_index(&mut self) -> Result<()> {
+        let index = self.load_vid_labels_index().await?;
+        self.vid_labels_index = Arc::new(parking_lot::RwLock::new(index));
+        Ok(())
+    }
+
+    /// Replace the VID-to-labels index, in place, with one read from the main
+    /// vertex table.
+    ///
+    /// For a snapshot restore, which rewinds that table under a live handle:
+    /// in place, so every holder of the index sees the restored labels.
+    ///
+    /// # Errors
+    ///
+    /// When the main vertex table cannot be read; the index is then unchanged.
+    pub async fn reload_vid_labels_index(&self) -> Result<()> {
+        let index = self.load_vid_labels_index().await?;
+        *self.vid_labels_index.write() = index;
+        Ok(())
+    }
+
+    /// Bring this pinned view's VID-to-labels index back to its version.
+    ///
+    /// A pinned view starts from a copy of the live index, which holds the
+    /// labels of the newest flushed rows. Only the vertices with a row above
+    /// the pin can differ; `live` (the manager the view was derived from)
+    /// names them, and they are read again through this view: a vertex
+    /// relabelled since gets its old labels back, one deleted since is put
+    /// back, and one created since is removed. When most of the table
+    /// changed, the index is rebuilt through this view instead. A no-op on a
+    /// view without a ceiling.
+    ///
+    /// # Errors
+    ///
+    /// When the main vertex table cannot be read; the index is then unchanged.
+    pub async fn rewind_vid_labels_index_to_pin(&self, live: &StorageManager) -> Result<()> {
+        /// Above this many changed vertices a rebuild is cheaper than the
+        /// per-vertex re-read.
+        const REREAD_LIMIT: usize = 100_000;
+        let Some(hwm) = self.version_high_water_mark() else {
+            return Ok(());
+        };
+        let backend = self.backend.as_ref();
+        let vtable = table_names::main_vertex_table_name();
+        if !backend.table_exists(vtable).await? {
+            *self.vid_labels_index.write() = crate::storage::vid_labels::VidLabelsIndex::new();
+            return Ok(());
+        }
+        if !live.backend.table_exists(vtable).await? {
+            return Ok(());
+        }
+        // Read from the live table: a view at a restore point reads the
+        // table as it was, which has no row above the pin.
+        let changed_batches = live
+            .backend
+            .scan(
+                ScanRequest::all(vtable)
+                    .with_columns(vec!["_vid".to_string()])
+                    .with_filter(FilterExpr::compare(
+                        "_version",
+                        crate::backend::types::CmpOp::Gt,
+                        crate::backend::types::Scalar::UInt(hwm),
+                    )),
+            )
+            .await
+            .map_err(|e| anyhow!("Failed to query main vertex table: {}", e))?;
+        let mut changed: HashSet<Vid> = HashSet::new();
+        for batch in &changed_batches {
+            let vids = batch
+                .column_by_name("_vid")
+                .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+                .ok_or_else(|| anyhow!("Missing _vid column"))?;
+            changed.extend(vids.iter().flatten().map(Vid::from));
+        }
+        if changed.is_empty() {
+            return Ok(());
+        }
+        if changed.len() > REREAD_LIMIT {
+            return self.reload_vid_labels_index().await;
+        }
+        let changed: Vec<Vid> = changed.into_iter().collect();
+        let mut at_pin: HashMap<Vid, Vec<String>> = HashMap::new();
+        for chunk in changed.chunks(10_000) {
+            at_pin.extend(
+                MainVertexDataset::find_batch_labels_by_vids(backend, chunk, self.row_visibility())
+                    .await?,
+            );
+        }
+        let mut index = self.vid_labels_index.write();
+        for vid in changed {
+            match at_pin.remove(&vid) {
+                Some(labels) => index.insert(vid, labels),
+                None => index.remove_vid(vid),
+            }
+        }
+        Ok(())
+    }
+
+    /// The VID-to-labels index as the main vertex table holds it.
+    async fn load_vid_labels_index(&self) -> Result<crate::storage::vid_labels::VidLabelsIndex> {
         use crate::storage::vid_labels::VidLabelsIndex;
 
         let backend = self.backend.as_ref();
@@ -1770,11 +2410,15 @@ impl StorageManager {
 
         // Check if the table exists (fresh database)
         if !backend.table_exists(vtable).await? {
-            self.vid_labels_index = Arc::new(parking_lot::RwLock::new(VidLabelsIndex::new()));
-            return Ok(());
+            return Ok(VidLabelsIndex::new());
         }
 
-        // Scan all non-deleted vertices and collect (VID, labels).
+        // Scan every row and keep each vid's newest one, tombstones included:
+        // a vertex's rows are appended per write (a relabel adds a row with
+        // the new label set, a delete adds a `_deleted` row), so neither a
+        // `_deleted = false` filter nor the physical row order says which
+        // label set is current. Bounded by this manager's row visibility, so
+        // a pinned view gets the labels as of its version.
         //
         // No limit, deliberately. This index is not a cache that may miss — a
         // traversal's target-label filter consults it and *keeps* the row when a
@@ -1788,55 +2432,69 @@ impl StorageManager {
         // — Comments included — against the 1 003 605 the scan-anchored form
         // returns. No test caught it because every fixture in the repo is
         // smaller than the cap, so the truncation never fired. See issue #211.
-        // Projected to the two columns actually read below. `ScanRequest::all`
+        // Projected to the columns actually read below: `ScanRequest::all`
         // means `ColumnProjection::All`, and the backend materialises every
-        // batch before returning, so without this the rebuild pulls each
-        // vertex's whole row — `content`, `imageFile` and every other wide
-        // column — to extract `_vid` and `labels`. Under the old row cap that
-        // was bounded waste; unbounded it would be the entire vertex table in
-        // memory at once.
-        let request = ScanRequest::all(vtable)
-            .with_columns(vec!["_vid".to_string(), "labels".to_string()])
-            .with_filter(FilterExpr::not_deleted());
+        // batch before returning, so without it the rebuild pulls each
+        // vertex's whole row.
+        let mut request = ScanRequest::all(vtable).with_columns(vec![
+            "_vid".to_string(),
+            "labels".to_string(),
+            "_version".to_string(),
+            "_deleted".to_string(),
+        ]);
+        if let Some(filter) = self.row_visibility().filter() {
+            request = request.with_filter(filter);
+        }
         let batches = backend
             .scan(request)
             .await
             .map_err(|e| anyhow!("Failed to query main vertex table: {}", e))?;
 
-        let mut index = VidLabelsIndex::new();
-        for batch in batches {
-            let vid_col = batch
-                .column_by_name("_vid")
-                .ok_or_else(|| anyhow!("Missing _vid column"))?
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .ok_or_else(|| anyhow!("Invalid _vid column type"))?;
-
-            let labels_col = batch
-                .column_by_name("labels")
-                .ok_or_else(|| anyhow!("Missing labels column"))?
-                .as_any()
-                .downcast_ref::<arrow_array::ListArray>()
-                .ok_or_else(|| anyhow!("Invalid labels column type"))?;
-
-            for row_idx in 0..batch.num_rows() {
-                let vid = Vid::from(vid_col.value(row_idx));
-                let labels_array = labels_col.value(row_idx);
-                let labels_str_array = labels_array
-                    .as_any()
-                    .downcast_ref::<arrow_array::StringArray>()
-                    .ok_or_else(|| anyhow!("Invalid labels array element type"))?;
-
-                let labels: Vec<String> = (0..labels_str_array.len())
-                    .map(|i| labels_str_array.value(i).to_string())
-                    .collect();
-
+        let newest = newest_vertex_labels(&batches)?;
+        let mut index = VidLabelsIndex::with_capacity(newest.len(), 0);
+        for (vid, (_, labels)) in newest {
+            if let Some(labels) = labels {
                 index.insert(vid, labels);
             }
         }
 
-        self.vid_labels_index = Arc::new(parking_lot::RwLock::new(index));
-        Ok(())
+        Ok(index)
+    }
+
+    /// Whether each VID carries at least one of `labels`, per the in-memory
+    /// VID-to-labels index; `None` for a VID the index does not hold.
+    ///
+    /// One lock acquisition for the whole slice and no label copies, for a
+    /// pass over millions of edge endpoints.
+    pub fn vids_carry_any_label(&self, vids: &[Vid], labels: &[String]) -> Vec<Option<bool>> {
+        let index = self.vid_labels_index.read();
+        vids.iter()
+            .map(|vid| {
+                index
+                    .get_labels(*vid)
+                    .map(|have| have.iter().any(|l| labels.contains(l)))
+            })
+            .collect()
+    }
+
+    /// The `(src, dst)` of every edge of `type_name` live in storage (not L0)
+    /// as of version `hwm`, bulk-hidden rows included, read without
+    /// properties.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the main edges table cannot be read.
+    pub async fn find_edge_endpoints_by_type_at(
+        &self,
+        type_name: &str,
+        hwm: u64,
+    ) -> Result<Vec<(Vid, Vid)>> {
+        MainEdgeDataset::find_visible_endpoints_by_type_name(
+            self.backend(),
+            type_name,
+            &crate::storage::bulk_gate::RowVisibility::at_most(Some(hwm)),
+        )
+        .await
     }
 
     /// Get labels for a VID from the in-memory index.
@@ -2201,7 +2859,9 @@ impl StorageManager {
             return Ok(false);
         }
         let at_or_above = FilterExpr::compare("_vid", CmpOp::GtEq, Scalar::UInt(lo));
-        let filter = combine_hwm_filter(self.version_high_water_mark(), Some(&at_or_above));
+        let filter = self
+            .visibility_at(self.version_high_water_mark())
+            .combine(Some(&at_or_above));
         Ok(backend.count_rows(table_name, filter.as_ref()).await? > 0)
     }
 
@@ -2260,7 +2920,7 @@ impl StorageManager {
         // Does anything remain at all? Also establishes the invariant the
         // search below relies on: `hi` always has a row at or above `lo`.
         let at_or_above = FilterExpr::compare("_vid", CmpOp::GtEq, Scalar::UInt(lo));
-        let filter = combine_hwm_filter(hwm, Some(&at_or_above));
+        let filter = self.visibility_at(hwm).combine(Some(&at_or_above));
         if backend.count_rows(&table_name, filter.as_ref()).await? == 0 {
             return Ok(None);
         }
@@ -2325,7 +2985,7 @@ impl StorageManager {
             FilterExpr::compare("_vid", CmpOp::GtEq, Scalar::UInt(lo)),
             FilterExpr::compare("_vid", CmpOp::Lt, Scalar::UInt(hi)),
         ]);
-        let filter = combine_hwm_filter(hwm, Some(&in_range));
+        let filter = self.visibility_at(hwm).combine(Some(&in_range));
         Ok(backend.count_rows(table_name, filter.as_ref()).await? > 0)
     }
 
@@ -2371,7 +3031,7 @@ impl StorageManager {
         {
             c.add_snapshot_read();
         }
-        let filter = combine_hwm_filter(hwm, additional_filter);
+        let filter = self.visibility_at(hwm).combine(additional_filter);
 
         let mut request = ScanRequest::all(&table_name)
             .with_columns(actual_columns)
@@ -2438,7 +3098,7 @@ impl StorageManager {
         {
             c.add_snapshot_read();
         }
-        let filter = combine_hwm_filter(edge_hwm, additional_filter);
+        let filter = self.visibility_at(edge_hwm).combine(additional_filter);
 
         let mut request = ScanRequest::all(&table_name)
             .with_columns(actual_columns)
@@ -2487,7 +3147,9 @@ impl StorageManager {
         {
             c.add_snapshot_read();
         }
-        let full_filter = combine_hwm_filter(self.version_high_water_mark(), filter);
+        let full_filter = self
+            .visibility_at(self.version_high_water_mark())
+            .combine(filter);
 
         let request = ScanRequest::all(table_name)
             .with_columns(columns.iter().map(|s| s.to_string()).collect())
@@ -2517,8 +3179,8 @@ impl StorageManager {
         }
 
         let mut request = ScanRequest::all(table_name);
-        if let Some(f) = filter {
-            request = request.with_filter(f.clone());
+        if let Some(f) = self.visibility_at(None).combine(filter) {
+            request = request.with_filter(f);
         }
 
         let stream = backend.scan_stream(request).await?;
@@ -2541,14 +3203,17 @@ impl StorageManager {
             return Ok(None);
         }
 
-        let stream = backend.scan_stream(ScanRequest::all(&table_name)).await?;
+        let mut request = ScanRequest::all(&table_name);
+        if let Some(f) = self.visibility_at(None).filter() {
+            request = request.with_filter(f);
+        }
+        let stream = backend.scan_stream(request).await?;
         Ok(Some(stream))
     }
 
     /// Find a vertex VID by external ID. Uses pinned snapshot HWM if present.
     pub async fn find_vertex_by_ext_id(&self, ext_id: &str) -> Result<Option<Vid>> {
-        MainVertexDataset::find_by_ext_id(self.backend(), ext_id, self.version_high_water_mark())
-            .await
+        MainVertexDataset::find_by_ext_id(self.backend(), ext_id, self.row_visibility()).await
     }
 
     /// Map every live vertex that has an external id to its `ext_id`
@@ -2571,7 +3236,7 @@ impl StorageManager {
             return Ok(out);
         }
         let request = ScanRequest::all(vtable)
-            .with_filter(FilterExpr::not_deleted())
+            .with_filter(self.visibility_at(None).bound(FilterExpr::not_deleted()))
             .with_columns(vec!["_vid".to_string(), "ext_id".to_string()]);
         let batches = backend
             .scan(request)
@@ -2613,7 +3278,7 @@ impl StorageManager {
         MainVertexDataset::find_labels_by_vid_counted(
             self.backend(),
             vid,
-            self.version_high_water_mark(),
+            self.row_visibility(),
             counters,
         )
         .await
@@ -2646,10 +3311,11 @@ impl StorageManager {
         if let Some((side, vids)) = endpoint_filter
             && self.endpoint_scan_beats_lookup(type_names, vids).await?
         {
-            let all = MainEdgeDataset::find_edges_by_type_names_counted(
+            let all = MainEdgeDataset::find_visible_edges_by_type_names_counted(
                 self.backend(),
                 type_names,
                 None,
+                &self.edge_row_visibility(),
                 counters,
             )
             .await?;
@@ -2666,13 +3332,93 @@ impl StorageManager {
                 .collect());
         }
 
-        MainEdgeDataset::find_edges_by_type_names_counted(
+        // The edge tier's visibility: a pinned snapshot's ceiling and the bulk
+        // gate. Without the ceiling a snapshot read of a schemaless type lost
+        // every edge deleted after the snapshot (the tombstone outranked the
+        // live row) and gained every edge created after it. A transaction pin
+        // is not applied, as for the CSR path (see `pinned_at_version`).
+        MainEdgeDataset::find_visible_edges_by_type_names_counted(
             self.backend(),
             type_names,
             endpoint_filter,
+            &self.edge_row_visibility(),
             counters,
         )
         .await
+    }
+
+    /// Resolves edges by EID: stored endpoints and type, as `ctx` sees them.
+    ///
+    /// The L0 chain answers first (transaction, current, pending flush), via
+    /// [`crate::runtime::l0_visibility::lookup_edges`]: a tombstone in any
+    /// layer makes the edge absent, and a resident edge is taken from the
+    /// newest layer holding it. Whatever L0 does not mention is read from the
+    /// main edges table by `_eid`
+    /// ([`MainEdgeDataset::find_edges_by_eids_counted`]) through this
+    /// manager's backend — a fork's branch when this storage is forked — and
+    /// bounded by [`Self::version_high_water_mark`] when it is pinned.
+    ///
+    /// An EID that resolves nowhere is absent from the result. Properties are
+    /// not read; see `PropertyManager::get_batch_edge_props`. Each L0-resident
+    /// edge counts as one L0 row scanned and each main-table row as a storage
+    /// row, on `ctx`'s counters. Under a read-write transaction every
+    /// requested EID joins the SSI read set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the main edges table cannot be read.
+    pub async fn lookup_edges_by_eids(
+        &self,
+        eids: &[Eid],
+        ctx: Option<&QueryContext>,
+    ) -> Result<HashMap<Eid, crate::storage::main_edge::EdgeRecord>> {
+        let l0 = ctx
+            .map(|c| crate::runtime::l0_visibility::lookup_edges(eids, c))
+            .unwrap_or_default();
+        let counters = ctx.and_then(|c| c.counters.as_ref());
+        if let Some(c) = counters {
+            c.add_l0_rows(l0.found.len());
+            c.add_rows_scanned(l0.found.len());
+        }
+
+        let schema = self.schema_manager.schema();
+        let mut resolved = HashMap::with_capacity(eids.len());
+        let mut unresolved = Vec::new();
+        for &eid in eids {
+            if l0.deleted.contains(&eid) {
+                continue;
+            }
+            // A buffer that recorded no type name still carries the type id;
+            // only an id the schema cannot name falls through to storage.
+            let from_l0 = l0.found.get(&eid).and_then(|edge| {
+                edge.type_name
+                    .clone()
+                    .or_else(|| schema.edge_type_name_by_id_unified(edge.type_id))
+                    .map(|edge_type| crate::storage::main_edge::EdgeRecord {
+                        src_vid: edge.src_vid,
+                        dst_vid: edge.dst_vid,
+                        edge_type,
+                    })
+            });
+            match from_l0 {
+                Some(record) => {
+                    resolved.insert(eid, record);
+                }
+                None => unresolved.push(eid),
+            }
+        }
+        if !unresolved.is_empty() {
+            resolved.extend(
+                MainEdgeDataset::find_edges_by_eids_counted(
+                    self.backend(),
+                    &unresolved,
+                    self.row_visibility(),
+                    counters,
+                )
+                .await?,
+            );
+        }
+        Ok(resolved)
     }
 
     /// Whether one pass over the edge type beats chunked endpoint lookups.
@@ -2748,7 +3494,7 @@ impl StorageManager {
         };
 
         let request = ScanRequest::all(&table_name)
-            .with_filter(full_filter)
+            .with_filter(self.visibility_at(None).bound(full_filter))
             .with_columns(vec!["_vid".to_string()]);
 
         let batches = backend.scan(request).await?;
@@ -2997,8 +3743,8 @@ impl StorageManager {
             // Build combined filter: _deleted = false + optional user filter + HWM
             let mut filter_parts = vec![Self::build_active_filter(filter)];
             let hwm = ctx.and(self.version_high_water_mark());
-            if let Some(hwm) = hwm {
-                filter_parts.push(FilterExpr::version_at_most(hwm));
+            if let Some(visible) = self.visibility_at(hwm).filter() {
+                filter_parts.push(visible);
             }
             let combined_filter = FilterExpr::all(filter_parts);
 
@@ -3120,10 +3866,11 @@ impl StorageManager {
         }
 
         let mut filter_parts = vec![Self::build_active_filter(filter)];
-        if ctx.is_some()
-            && let Some(hwm) = self.version_high_water_mark()
+        if let Some(visible) = self
+            .visibility_at(ctx.and(self.version_high_water_mark()))
+            .filter()
         {
-            filter_parts.push(FilterExpr::version_at_most(hwm));
+            filter_parts.push(visible);
         }
         let combined_filter = FilterExpr::all(filter_parts);
 
@@ -3205,10 +3952,11 @@ impl StorageManager {
                 return Ok(Vec::new());
             }
             let mut filter_parts = vec![Self::build_active_filter(filter)];
-            if ctx.is_some()
-                && let Some(hwm) = self.version_high_water_mark()
+            if let Some(visible) = self
+                .visibility_at(ctx.and(self.version_high_water_mark()))
+                .filter()
             {
-                filter_parts.push(FilterExpr::version_at_most(hwm));
+                filter_parts.push(visible);
             }
             let request = ScanRequest::all(&name)
                 .with_filter(FilterExpr::all(filter_parts))
@@ -3240,10 +3988,11 @@ impl StorageManager {
             };
 
             let mut filter_parts = vec![Self::build_active_filter(filter)];
-            if ctx.is_some()
-                && let Some(hwm) = self.version_high_water_mark()
+            if let Some(visible) = self
+                .visibility_at(ctx.and(self.version_high_water_mark()))
+                .filter()
             {
-                filter_parts.push(FilterExpr::version_at_most(hwm));
+                filter_parts.push(visible);
             }
             let combined_filter = FilterExpr::all(filter_parts);
 
@@ -3519,8 +4268,8 @@ impl StorageManager {
             // Build combined filter: _deleted = false + optional user filter + HWM
             let mut filter_parts = vec![Self::build_active_filter(filter)];
             let hwm = ctx.and(self.version_high_water_mark());
-            if let Some(hwm) = hwm {
-                filter_parts.push(FilterExpr::version_at_most(hwm));
+            if let Some(visible) = self.visibility_at(hwm).filter() {
+                filter_parts.push(visible);
             }
             let combined_filter = FilterExpr::all(filter_parts);
 
@@ -3694,7 +4443,7 @@ impl StorageManager {
         MainVertexDataset::find_label_props_counted(
             self.backend.as_ref(),
             label,
-            ctx.and(self.version_high_water_mark()),
+            self.visibility_at(ctx.and(self.version_high_water_mark())),
             ctx.and_then(|c| c.counters.as_ref()),
         )
         .await
@@ -3743,8 +4492,8 @@ impl StorageManager {
             "_vid",
             hit_vids.iter().map(|v| Scalar::UInt(*v)),
         )];
-        if let Some(hwm) = hwm {
-            parts.push(FilterExpr::version_at_most(hwm));
+        if let Some(visible) = self.visibility_at(hwm).filter() {
+            parts.push(visible);
         }
         let rows = self
             .backend
@@ -3939,7 +4688,7 @@ impl StorageManager {
                     HashMap::new();
                 for chunk in hop_vids.chunks(MAX_SUBGRAPH_VIDS_PER_SCAN) {
                     let part = delta_ds
-                        .read_deltas_batch(backend, chunk, &schema, self.snapshot_version_hwm())
+                        .read_deltas_batch(backend, chunk, &schema, self.edge_row_visibility())
                         .await?;
                     for (vid, entries) in part {
                         delta_by_vid.entry(vid).or_default().extend(entries);

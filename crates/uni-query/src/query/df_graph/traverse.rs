@@ -64,6 +64,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use uni_common::Value as UniValue;
 use uni_common::core::id::{Eid, Vid};
+use uni_query_functions::expr_eval::cypher_eq;
 use uni_store::storage::direction::Direction;
 
 /// BFS result: (target_vid, hop_count, node_path, edge_path)
@@ -3227,12 +3228,16 @@ async fn build_edge_adjacency_map(
         uni_common::Properties,
     )> = edges_with_type.into_iter().collect();
 
-    // Step 2: Overlay L0 buffers for all type names
+    // Step 2: Overlay L0 buffers for all type names. Every L0 edge of the type
+    // is examined, so each counts as an L0 row scanned (the persisted rows are
+    // counted by the storage scan above).
+    let mut l0_examined = 0usize;
     for l0 in l0_ctx.iter_l0_buffers() {
         let l0_guard = l0.read();
 
         for type_name in type_names {
             let l0_eids = l0_guard.eids_for_type(type_name);
+            l0_examined += l0_eids.len();
 
             // For each L0 edge, extract its information
             for &eid in &l0_eids {
@@ -3255,6 +3260,9 @@ async fn build_edge_adjacency_map(
             }
         }
     }
+
+    graph_ctx.count_l0_rows(l0_examined);
+    graph_ctx.count_rows_scanned(l0_examined);
 
     // Step 3: Deduplicate by EID (L0 takes precedence)
     let mut seen_eids = HashSet::new();
@@ -3428,6 +3436,10 @@ pub(super) struct WarmedFilters {
     /// map. `AllAllowed` whenever the pattern has no such map, or whenever the
     /// narrowing could not be established conservatively.
     pub accepting: VidFilter,
+    /// Set instead of the three above for a simple pattern with a map: the
+    /// maps are evaluated per input batch over the region the walk can reach,
+    /// not over the whole edge type up front (P7).
+    pub reachable: Option<ReachableMapFilter>,
 }
 
 /// One quantified-path-pattern hop's filter inputs.
@@ -3532,15 +3544,78 @@ pub(super) async fn build_vertex_property_filter(
     for vid in &candidates {
         let raw = vid.as_u64();
         max_vid = max_vid.max(raw);
-        if let Some(props) = props_by_vid.get(vid)
-            && conditions
-                .iter()
-                .all(|(name, expected)| props.get(name).is_some_and(|actual| actual == expected))
+        if props_by_vid
+            .get(vid)
+            .is_some_and(|props| map_matches(props, conditions))
         {
             passing.push(raw);
         }
     }
     Ok(VidFilter::from_vids(passing, max_vid as usize + 1))
+}
+
+/// Whether `props` satisfies every condition of an inline property map.
+///
+/// `{w: 1}` means `w = 1` under Cypher equality, so an integer property
+/// matches a float literal of the same value, and a `null` literal or a
+/// missing property matches nothing. Plain `Value` equality is structural and
+/// had `{w: 1.0}` reject every edge with `w = 1` — an empty answer where
+/// `WHERE r.w = 1.0` finds rows.
+fn map_matches(props: &uni_common::Properties, conditions: &[(String, UniValue)]) -> bool {
+    conditions.iter().all(|(name, expected)| {
+        props
+            .get(name)
+            .is_some_and(|actual| cypher_eq(actual, expected) == Some(true))
+    })
+}
+
+/// Whether a target vertex may satisfy its inline property map, for a filter
+/// that only narrows.
+///
+/// Admits anything not known to fail: unread properties, a missing property
+/// and a comparison that comes out `null` all leave the decision to the
+/// `FilterExec` above the traversal.
+fn map_admits(props: Option<&uni_common::Properties>, conditions: &[(String, UniValue)]) -> bool {
+    props.is_none_or(|props| {
+        conditions.iter().all(|(name, expected)| {
+            props
+                .get(name)
+                .is_none_or(|actual| cypher_eq(actual, expected) != Some(false))
+        })
+    })
+}
+
+/// Read the target map's properties for `candidates`, projected to the map's
+/// own names.
+///
+/// A label lets the read target that label's table (#134). Without one the
+/// label-free batch read resolves per label and then the schemaless table.
+async fn read_target_map_props(
+    graph_ctx: &GraphExecutionContext,
+    candidates: &[Vid],
+    target_label: Option<&str>,
+    conditions: &[(String, UniValue)],
+) -> DFResult<HashMap<Vid, uni_common::Properties>> {
+    let query_ctx = graph_ctx.query_context();
+    let wanted: Vec<String> = conditions.iter().map(|(name, _)| name.clone()).collect();
+    if let Some(label) = target_label {
+        graph_ctx
+            .property_manager()
+            .get_batch_vertex_props_for_label_projected(
+                candidates,
+                label,
+                Some(&query_ctx),
+                Some(&wanted),
+            )
+            .await
+    } else {
+        let wanted_refs: Vec<&str> = wanted.iter().map(String::as_str).collect();
+        graph_ctx
+            .property_manager()
+            .get_batch_vertex_props(candidates, &wanted_refs, Some(&query_ctx))
+            .await
+    }
+    .map_err(exec_err)
 }
 
 /// Build a filter over the *accepting* vertices of a variable-length pattern
@@ -3594,43 +3669,15 @@ pub(super) async fn build_accepting_vid_filter(
         return Ok(VidFilter::AllAllowed);
     }
 
-    let query_ctx = graph_ctx.query_context();
-    let wanted: Vec<String> = conditions.iter().map(|(name, _)| name.clone()).collect();
-    let props_by_vid = if let Some(label) = target_label {
-        graph_ctx
-            .property_manager()
-            .get_batch_vertex_props_for_label_projected(
-                &candidates,
-                label,
-                Some(&query_ctx),
-                Some(&wanted),
-            )
-            .await
-    } else {
-        let wanted_refs: Vec<&str> = wanted.iter().map(String::as_str).collect();
-        graph_ctx
-            .property_manager()
-            .get_batch_vertex_props(&candidates, &wanted_refs, Some(&query_ctx))
-            .await
-    }
-    .map_err(exec_err)?;
+    let props_by_vid =
+        read_target_map_props(graph_ctx, &candidates, target_label, conditions).await?;
 
     let mut passing: Vec<u64> = Vec::new();
     let mut max_vid: u64 = 0;
     for vid in &candidates {
         let raw = vid.as_u64();
         max_vid = max_vid.max(raw);
-        let admit = match props_by_vid.get(vid) {
-            // Every condition has to be present *and* equal. A property the
-            // read did not return is unknown, not absent, so it admits.
-            Some(props) => conditions
-                .iter()
-                .all(|(name, expected)| props.get(name).is_none_or(|actual| actual == expected)),
-            // Nothing known about this vertex at all: admit and let the
-            // FilterExec above decide.
-            None => true,
-        };
-        if admit {
+        if map_admits(props_by_vid.get(vid), conditions) {
             passing.push(raw);
         }
     }
@@ -3642,6 +3689,12 @@ pub(super) async fn build_accepting_vid_filter(
     Ok(VidFilter::from_vids(passing, max_vid as usize + 1))
 }
 
+/// Build the [`EidFilter`] for a variable-length pattern's inline edge
+/// property map by pre-scanning every edge of the pattern's types.
+///
+/// The pre-scan goes through [`build_edge_adjacency_map`], so it counts toward
+/// the query's `rows_scanned` (storage and L0 rows alike): a profile shows a
+/// whole-type scan here instead of the anchor lookup alone.
 pub(super) async fn build_edge_property_filter(
     graph_ctx: &Arc<GraphExecutionContext>,
     edge_type_ids: &[u32],
@@ -3678,16 +3731,551 @@ pub(super) async fn build_edge_property_filter(
                 continue;
             }
             max_eid = max_eid.max(raw);
-            let passes = conditions
-                .iter()
-                .all(|(name, expected)| props.get(name).is_some_and(|actual| actual == expected));
-            if passes {
+            if map_matches(props, conditions) {
                 passing.push(raw);
             }
         }
     }
 
     Ok(EidFilter::from_eids(passing, max_eid as usize + 1))
+}
+
+/// Property-read rounds the reachable filter may always spend before it
+/// considers falling back to the whole-type pre-scan.
+const REACHABLE_MIN_ROUNDS: usize = 16;
+
+/// Edges of the type the whole-type pre-scan reads in the time one round of
+/// the region read costs.
+///
+/// Each round is one batched property read, issued after the previous one
+/// because the next frontier depends on its verdicts, so a deep walk pays a
+/// fixed per-read cost once per hop. Measured (debug build, flushed chain
+/// where every edge passes): about 0.8 ms per round, against about 5 us per
+/// edge for the whole-type scan (100 ms at 20k edges, 390 ms at 80k). The
+/// round budget is therefore the type's edge count over this, so falling back
+/// happens only once the rounds already spent cost about what the whole-type
+/// scan would. See the P7 entry of
+/// `docs/proposals/open_issues_plan_2026_10_17.md`.
+const EDGES_PER_ROUND: usize = 160;
+
+/// Below this many edges of the pattern's types, a region covering most of
+/// the type is no reason to fall back: either read costs a few milliseconds.
+const REGION_FALLBACK_MIN_EDGES: usize = 4096;
+
+/// One hop of a pattern whose maps [`ReachableMapFilter`] evaluates: the
+/// edges it may take, and the maps on the edge and on the vertex it reaches.
+struct RegionStep {
+    edge_type_ids: Vec<u32>,
+    type_names: Vec<String>,
+    direction: Direction,
+    edge_conditions: Vec<(String, UniValue)>,
+    target_label: Option<String>,
+    target_conditions: Vec<(String, UniValue)>,
+}
+
+/// The inline property maps of a variable-length, shortest-path or
+/// quantified pattern, evaluated only over the part of the graph a walk from
+/// the sources seen so far can reach.
+///
+/// The whole-type form ([`build_edge_property_filter`],
+/// [`build_vertex_property_filter`], [`build_accepting_vid_filter`]) reads
+/// every edge of the pattern's types before the first row, so an anchored
+/// walk that visits a dozen edges paid for the whole type (P7). This one is
+/// grown per input batch, before the batch is walked: a breadth-first pass
+/// from the batch's sources, bounded by the hop limit, that expands only
+/// through edges (and, for a quantified pattern's hop, vertices) whose maps
+/// pass. Each layer's not-yet-evaluated edges are read in one batched
+/// property read per hop slot, the vertices they reach likewise, and the
+/// target map is read once per batch for the vertices first reached.
+///
+/// A simple pattern has one hop slot. A quantified pattern's iteration of
+/// `k` hops has `k`, and hop `d` of a walk uses slot `d mod k` — the slots
+/// [`PathNfa::from_qpp`] stamps on its transitions — so the pass tracks
+/// `(vertex, slot)` pairs.
+///
+/// # Why the filters it builds are complete for the walk
+///
+/// The walk tests a slot-`s` edge only when it leaves a vertex it reached at
+/// depth `d < max_hops` in slot `s` through passing edges and vertices, and
+/// tests a slot's vertex map and the accepting filter only at a vertex
+/// reached that way. The pass reaches every such `(vertex, slot)` at a depth
+/// no greater than `d` (it keeps the shallowest depth, from every source of
+/// every batch so far, and ignores the label constraints the walk adds, so
+/// it reaches a superset), so it expanded that pair too and evaluated the
+/// same edges and vertices. An edge or vertex it never evaluated is one the
+/// walk never asks about, so the allow-sets may leave them out.
+pub(super) struct ReachableMapFilter {
+    graph_ctx: Arc<GraphExecutionContext>,
+    steps: Vec<RegionStep>,
+    max_hops: usize,
+    /// The label and map of the pattern's final vertex.
+    target_label: Option<String>,
+    target_conditions: Vec<(String, UniValue)>,
+    /// Shallowest depth each `(vertex, slot)` has been reached at.
+    depth: rustc_hash::FxHashMap<(Vid, usize), u32>,
+    /// Per slot, the edges whose map has been evaluated.
+    evaluated_edges: Vec<FxHashSet<u64>>,
+    /// Per slot, the vertices whose hop map has been evaluated.
+    evaluated_step_vertices: Vec<FxHashSet<u64>>,
+    /// Vertices whose target map has been evaluated.
+    evaluated_vertices: FxHashSet<u64>,
+    /// Allow-set of edges, one per slot, as the NFA expects.
+    edges: Vec<EidFilter>,
+    /// Allow-set of each slot's reached vertices, as the NFA expects.
+    vertices: Vec<VidFilter>,
+    /// Admitted endpoints.
+    accepting: VidFilter,
+    /// Property-read rounds spent so far.
+    rounds: usize,
+    /// Rounds allowed before falling back to the whole-type filters.
+    max_rounds: usize,
+    /// Approximate edges of the pattern's types: past half of them read one
+    /// at a time, the whole-type scan is the cheaper way to finish.
+    type_edges: usize,
+    /// Fell back to the whole-type filters, which already cover everything.
+    whole_type: bool,
+}
+
+impl ReachableMapFilter {
+    /// A filter for the maps of a simple pattern, or `None` when there is
+    /// nothing to filter or no edge type resolves to a name to read
+    /// properties under.
+    pub(super) fn new(
+        graph_ctx: &Arc<GraphExecutionContext>,
+        edge_type_ids: &[u32],
+        direction: Direction,
+        max_hops: usize,
+        edge_conditions: &[(String, UniValue)],
+        target_label: Option<&str>,
+        target_conditions: &[(String, UniValue)],
+    ) -> Option<Self> {
+        let step = QppStepFilterSpec {
+            edge_type_ids: edge_type_ids.to_vec(),
+            direction,
+            target_label: None,
+            edge_conditions: edge_conditions.to_vec(),
+            target_conditions: Vec::new(),
+        };
+        Self::for_steps(
+            graph_ctx,
+            &[step],
+            max_hops,
+            target_label,
+            target_conditions,
+        )
+    }
+
+    /// A filter for the per-hop maps of a quantified pattern, one slot per
+    /// hop of its iteration, plus its final vertex's map. `None` when no map
+    /// constrains anything, or when a hop with a map has no edge type that
+    /// resolves to a name (the whole-type form then decides, as before).
+    pub(super) fn for_steps(
+        graph_ctx: &Arc<GraphExecutionContext>,
+        steps: &[QppStepFilterSpec],
+        max_hops: usize,
+        target_label: Option<&str>,
+        target_conditions: &[(String, UniValue)],
+    ) -> Option<Self> {
+        let any_map = steps
+            .iter()
+            .any(|s| !s.edge_conditions.is_empty() || !s.target_conditions.is_empty());
+        if !any_map && target_conditions.is_empty() {
+            return None;
+        }
+        let uni_schema = graph_ctx.storage().schema_manager().schema();
+        let mut region_steps = Vec::with_capacity(steps.len());
+        for s in steps {
+            let type_names: Vec<String> = s
+                .edge_type_ids
+                .iter()
+                .filter_map(|id| uni_schema.edge_type_name_by_id_unified(*id))
+                .collect();
+            if type_names.is_empty() {
+                return None;
+            }
+            region_steps.push(RegionStep {
+                edge_type_ids: s.edge_type_ids.clone(),
+                type_names,
+                direction: s.direction,
+                edge_conditions: s.edge_conditions.clone(),
+                target_label: s.target_label.clone(),
+                target_conditions: s.target_conditions.clone(),
+            });
+        }
+        let edges = region_steps
+            .iter()
+            .map(|s| {
+                if s.edge_conditions.is_empty() {
+                    EidFilter::AllAllowed
+                } else {
+                    EidFilter::Sparse(FxHashSet::default())
+                }
+            })
+            .collect();
+        let vertices = region_steps
+            .iter()
+            .map(|s| {
+                if s.target_conditions.is_empty() {
+                    VidFilter::AllAllowed
+                } else {
+                    VidFilter::Sparse(FxHashSet::default())
+                }
+            })
+            .collect();
+        let accepting = if target_conditions.is_empty() {
+            VidFilter::AllAllowed
+        } else {
+            VidFilter::Sparse(FxHashSet::default())
+        };
+        let distinct_types: FxHashSet<u32> = region_steps
+            .iter()
+            .flat_map(|s| s.edge_type_ids.iter().copied())
+            .collect();
+        let type_edges: usize = distinct_types
+            .iter()
+            .map(|&t| graph_ctx.adjacency_manager().approx_edge_count(t))
+            .sum();
+        let k = region_steps.len();
+        Some(Self {
+            graph_ctx: Arc::clone(graph_ctx),
+            steps: region_steps,
+            max_hops,
+            target_label: target_label.map(str::to_string),
+            target_conditions: target_conditions.to_vec(),
+            depth: rustc_hash::FxHashMap::default(),
+            evaluated_edges: vec![FxHashSet::default(); k],
+            evaluated_step_vertices: vec![FxHashSet::default(); k],
+            evaluated_vertices: FxHashSet::default(),
+            edges,
+            vertices,
+            accepting,
+            rounds: 0,
+            max_rounds: REACHABLE_MIN_ROUNDS.max(type_edges / EDGES_PER_ROUND),
+            type_edges,
+            whole_type: false,
+        })
+    }
+
+    /// Approximate heap bytes the filter holds, for memory accounting.
+    pub(super) fn approx_bytes(&self) -> usize {
+        let slot = std::mem::size_of::<u64>() + 1;
+        self.depth.capacity() * (std::mem::size_of::<((Vid, usize), u32)>() + 1)
+            + self
+                .evaluated_edges
+                .iter()
+                .chain(&self.evaluated_step_vertices)
+                .map(FxHashSet::capacity)
+                .sum::<usize>()
+                * slot
+            + self.evaluated_vertices.capacity() * slot
+            + self
+                .edges
+                .iter()
+                .map(EidFilter::approx_bytes)
+                .sum::<usize>()
+            + self
+                .vertices
+                .iter()
+                .map(VidFilter::approx_bytes)
+                .sum::<usize>()
+            + self.accepting.approx_bytes()
+    }
+
+    /// The edge allow-sets, one per NFA slot.
+    pub(super) fn edges(&self) -> &[EidFilter] {
+        &self.edges
+    }
+
+    /// The vertex allow-sets of each slot's reached vertex, one per NFA slot.
+    pub(super) fn vertices(&self) -> &[VidFilter] {
+        &self.vertices
+    }
+
+    /// The admitted endpoints.
+    pub(super) fn accepting(&self) -> &VidFilter {
+        &self.accepting
+    }
+
+    /// The source vids of `column`, for [`Self::cover`].
+    pub(super) fn sources_of(column: &UInt64Array) -> Vec<Vid> {
+        let mut seen = FxHashSet::default();
+        column
+            .iter()
+            .flatten()
+            .filter(|raw| seen.insert(*raw))
+            .map(Vid::from)
+            .collect()
+    }
+
+    /// Whether the next read would cost more than finishing with the
+    /// whole-type filters.
+    fn over_budget(&self, fresh: usize) -> bool {
+        let evaluated: usize = self.evaluated_edges.iter().map(FxHashSet::len).sum();
+        self.rounds >= self.max_rounds
+            || (self.type_edges >= REGION_FALLBACK_MIN_EDGES
+                && evaluated + fresh > self.type_edges / 2)
+    }
+
+    /// Grow the filters to cover every walk from `sources`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error from a property read.
+    pub(super) async fn cover(&mut self, sources: &[Vid]) -> DFResult<()> {
+        if self.whole_type {
+            return Ok(());
+        }
+        let k = self.steps.len();
+        let mut frontier: Vec<(Vid, usize)> = Vec::new();
+        for &v in sources {
+            if self.depth.get(&(v, 0)).is_none_or(|&d| d > 0) {
+                self.depth.insert((v, 0), 0);
+                frontier.push((v, 0));
+            }
+        }
+        let mut reached: Vec<Vid> = Vec::new();
+        let mut depth = 0usize;
+        while !frontier.is_empty() && depth < self.max_hops {
+            self.graph_ctx.check_timeout().map_err(exec_err)?;
+            // Every edge out of the frontier, as (slot, neighbor, eid).
+            let mut out: Vec<(usize, Vid, Eid)> = Vec::new();
+            for slot in 0..k {
+                let from: Vec<Vid> = frontier
+                    .iter()
+                    .filter(|(_, s)| *s == slot)
+                    .map(|(v, _)| *v)
+                    .collect();
+                if from.is_empty() {
+                    continue;
+                }
+                let step = &self.steps[slot];
+                for &type_id in &step.edge_type_ids {
+                    out.extend(
+                        self.graph_ctx
+                            .get_neighbors_batch(&from, type_id, step.direction)
+                            .into_iter()
+                            .map(|(_, neighbor, eid)| (slot, neighbor, eid)),
+                    );
+                }
+            }
+            for slot in 0..k {
+                if self.steps[slot].edge_conditions.is_empty() {
+                    continue;
+                }
+                let fresh: Vec<Eid> = {
+                    let mut seen = FxHashSet::default();
+                    out.iter()
+                        .filter(|(s, _, _)| *s == slot)
+                        .map(|&(_, _, eid)| eid)
+                        .filter(|eid| {
+                            !self.evaluated_edges[slot].contains(&eid.as_u64())
+                                && seen.insert(eid.as_u64())
+                        })
+                        .collect()
+                };
+                if !fresh.is_empty() {
+                    if self.over_budget(fresh.len()) {
+                        return self.fall_back_to_whole_type().await;
+                    }
+                    self.rounds += 1;
+                    self.evaluate_edges(slot, &fresh).await?;
+                }
+            }
+            out.retain(|&(slot, _, eid)| self.edges[slot].contains(eid));
+            for slot in 0..k {
+                if self.steps[slot].target_conditions.is_empty() {
+                    continue;
+                }
+                let fresh: Vec<Vid> = {
+                    let mut seen = FxHashSet::default();
+                    out.iter()
+                        .filter(|(s, _, _)| *s == slot)
+                        .map(|&(_, v, _)| v)
+                        .filter(|v| {
+                            !self.evaluated_step_vertices[slot].contains(&v.as_u64())
+                                && seen.insert(v.as_u64())
+                        })
+                        .collect()
+                };
+                if !fresh.is_empty() {
+                    if self.over_budget(0) {
+                        return self.fall_back_to_whole_type().await;
+                    }
+                    self.rounds += 1;
+                    self.evaluate_step_vertices(slot, &fresh).await?;
+                }
+            }
+            let next_depth = depth as u32 + 1;
+            let mut next: Vec<(Vid, usize)> = Vec::new();
+            for (slot, neighbor, _) in out {
+                if !self.vertices[slot].contains(neighbor) {
+                    continue;
+                }
+                if self.evaluated_vertices.insert(neighbor.as_u64())
+                    && !self.target_conditions.is_empty()
+                {
+                    reached.push(neighbor);
+                }
+                let state = (neighbor, (slot + 1) % k);
+                if self.depth.get(&state).is_none_or(|&d| d > next_depth) {
+                    self.depth.insert(state, next_depth);
+                    next.push(state);
+                }
+            }
+            frontier = next;
+            depth += 1;
+        }
+        if !reached.is_empty() {
+            self.evaluate_targets(&reached).await?;
+        }
+        Ok(())
+    }
+
+    /// Read slot `slot`'s map properties for `eids` in one batched read and
+    /// record verdicts.
+    async fn evaluate_edges(&mut self, slot: usize, eids: &[Eid]) -> DFResult<()> {
+        let step = &self.steps[slot];
+        let names: Vec<&str> = step
+            .edge_conditions
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect();
+        let query_ctx = self.graph_ctx.query_context();
+        let props = self
+            .graph_ctx
+            .property_manager()
+            .get_batch_edge_props(eids, &names, Some(&step.type_names), Some(&query_ctx))
+            .await
+            .map_err(exec_err)?;
+        // Point reads, one row per edge asked for.
+        self.graph_ctx.count_rows_scanned(eids.len());
+        let EidFilter::Sparse(passing) = &mut self.edges[slot] else {
+            unreachable!("an edge map's allow-set is built sparse");
+        };
+        for &eid in eids {
+            self.evaluated_edges[slot].insert(eid.as_u64());
+            // The edge accessor keys its result by the eid reinterpreted as a vid.
+            if props
+                .get(&Vid::from(eid.as_u64()))
+                .is_some_and(|p| map_matches(p, &step.edge_conditions))
+            {
+                passing.insert(eid.as_u64());
+            }
+        }
+        Ok(())
+    }
+
+    /// Read slot `slot`'s vertex map properties for `vids` and record the
+    /// vertices that satisfy it.
+    ///
+    /// Fail-closed, as [`build_vertex_property_filter`] is: this allow-set is
+    /// the authoritative check for the hop's vertex map, so a vertex whose
+    /// properties could not be read does not pass.
+    async fn evaluate_step_vertices(&mut self, slot: usize, vids: &[Vid]) -> DFResult<()> {
+        let step = &self.steps[slot];
+        let props = read_target_map_props(
+            &self.graph_ctx,
+            vids,
+            step.target_label.as_deref(),
+            &step.target_conditions,
+        )
+        .await?;
+        self.graph_ctx.count_rows_scanned(vids.len());
+        let VidFilter::Sparse(passing) = &mut self.vertices[slot] else {
+            unreachable!("a hop's vertex map allow-set is built sparse");
+        };
+        for vid in vids {
+            self.evaluated_step_vertices[slot].insert(vid.as_u64());
+            if props
+                .get(vid)
+                .is_some_and(|p| map_matches(p, &step.target_conditions))
+            {
+                passing.insert(vid.as_u64());
+            }
+        }
+        Ok(())
+    }
+
+    /// Read the target map's properties for `vids` and record the admitted.
+    async fn evaluate_targets(&mut self, vids: &[Vid]) -> DFResult<()> {
+        let props = read_target_map_props(
+            &self.graph_ctx,
+            vids,
+            self.target_label.as_deref(),
+            &self.target_conditions,
+        )
+        .await?;
+        self.graph_ctx.count_rows_scanned(vids.len());
+        let VidFilter::Sparse(admitted) = &mut self.accepting else {
+            unreachable!("a target map's admitted set is built sparse");
+        };
+        for vid in vids {
+            if map_admits(props.get(vid), &self.target_conditions) {
+                admitted.insert(vid.as_u64());
+            }
+        }
+        Ok(())
+    }
+
+    /// Replace the region-bounded filters with the whole-type ones, which
+    /// cover every walk from every source.
+    async fn fall_back_to_whole_type(&mut self) -> DFResult<()> {
+        let mut edges = Vec::with_capacity(self.steps.len());
+        let mut vertices = Vec::with_capacity(self.steps.len());
+        for step in &self.steps {
+            edges.push(
+                build_edge_property_filter(
+                    &self.graph_ctx,
+                    &step.edge_type_ids,
+                    step.direction,
+                    &step.edge_conditions,
+                )
+                .await?,
+            );
+            vertices.push(
+                build_vertex_property_filter(
+                    &self.graph_ctx,
+                    &step.edge_type_ids,
+                    step.direction,
+                    step.target_label.as_deref(),
+                    &step.target_conditions,
+                )
+                .await?,
+            );
+        }
+        let all_types: Vec<u32> = {
+            let mut seen = FxHashSet::default();
+            self.steps
+                .iter()
+                .flat_map(|s| s.edge_type_ids.iter().copied())
+                .filter(|t| seen.insert(*t))
+                .collect()
+        };
+        // A quantified pattern's hops may differ in direction; its final
+        // vertex is a candidate whichever way the last hop went.
+        let accepting_direction = if self.steps.len() == 1 {
+            self.steps[0].direction
+        } else {
+            Direction::Both
+        };
+        self.accepting = build_accepting_vid_filter(
+            &self.graph_ctx,
+            &all_types,
+            accepting_direction,
+            self.target_label.as_deref(),
+            &self.target_conditions,
+        )
+        .await?;
+        self.edges = edges;
+        self.vertices = vertices;
+        self.whole_type = true;
+        // The region state is dead weight from here on.
+        self.depth = rustc_hash::FxHashMap::default();
+        self.evaluated_edges = vec![FxHashSet::default(); self.steps.len()];
+        self.evaluated_step_vertices = vec![FxHashSet::default(); self.steps.len()];
+        self.evaluated_vertices = FxHashSet::default();
+        Ok(())
+    }
 }
 
 impl Stream for GraphTraverseMainStream {
@@ -3919,9 +4507,6 @@ pub struct GraphVariableLengthTraverseExec {
     /// Column name of an already-bound target VID (for patterns where target is in scope).
     bound_target_column: Option<String>,
 
-    /// Lance SQL filter for edge property predicates (VLP bitmap preselection).
-    edge_lance_filter: Option<String>,
-
     /// Simple property equality conditions for per-edge L0 checking during BFS.
     /// Each entry is (property_name, expected_value).
     edge_property_conditions: Vec<(String, UniValue)>,
@@ -4006,7 +4591,6 @@ impl GraphVariableLengthTraverseExec {
         graph_ctx: Arc<GraphExecutionContext>,
         is_optional: bool,
         bound_target_column: Option<String>,
-        edge_lance_filter: Option<String>,
         edge_property_conditions: Vec<(String, UniValue)>,
         target_property_conditions: Vec<(String, UniValue)>,
         used_edge_columns: Vec<String>,
@@ -4056,7 +4640,6 @@ impl GraphVariableLengthTraverseExec {
             target_label_name,
             is_optional,
             bound_target_column,
-            edge_lance_filter,
             edge_property_conditions,
             target_property_conditions,
             used_edge_columns,
@@ -4220,7 +4803,6 @@ impl ExecutionPlan for GraphVariableLengthTraverseExec {
             self.graph_ctx.clone(),
             self.is_optional,
             self.bound_target_column.clone(),
-            self.edge_lance_filter.clone(),
             self.edge_property_conditions.clone(),
             self.target_property_conditions.clone(),
             self.used_edge_columns.clone(),
@@ -4258,12 +4840,45 @@ impl ExecutionPlan for GraphVariableLengthTraverseExec {
         let target_property_conditions = self.target_property_conditions.clone();
         let target_label_for_accepting = self.target_label_name.clone();
         let qpp_step_filters = self.qpp_step_filters.clone();
+        let max_hops = self.max_hops;
         let warm_fut: Pin<Box<dyn std::future::Future<Output = DFResult<WarmedFilters>> + Send>> =
             Box::pin(async move {
                 graph_ctx
                     .ensure_adjacency_warmed(&edge_type_ids, direction)
                     .await
                     .map_err(exec_err)?;
+
+                // The maps are evaluated over the reachable region, batch by
+                // batch: one hop slot for a simple pattern, one per hop of the
+                // iteration for a quantified one, each with its own types,
+                // direction and maps.
+                let reachable = if qpp_step_filters.is_empty() {
+                    ReachableMapFilter::new(
+                        &graph_ctx,
+                        &edge_type_ids,
+                        direction,
+                        max_hops,
+                        &edge_property_conditions,
+                        target_label_for_accepting.as_deref(),
+                        &target_property_conditions,
+                    )
+                } else {
+                    ReachableMapFilter::for_steps(
+                        &graph_ctx,
+                        &qpp_step_filters,
+                        max_hops,
+                        target_label_for_accepting.as_deref(),
+                        &target_property_conditions,
+                    )
+                };
+                if let Some(reachable) = reachable {
+                    return Ok(WarmedFilters {
+                        edges: vec![EidFilter::AllAllowed],
+                        vertices: vec![VidFilter::AllAllowed],
+                        accepting: VidFilter::AllAllowed,
+                        reachable: Some(reachable),
+                    });
+                }
 
                 let accepting = build_accepting_vid_filter(
                     &graph_ctx,
@@ -4287,6 +4902,7 @@ impl ExecutionPlan for GraphVariableLengthTraverseExec {
                         edges: vec![edges],
                         vertices: vec![VidFilter::AllAllowed],
                         accepting,
+                        reachable: None,
                     });
                 }
 
@@ -4320,6 +4936,7 @@ impl ExecutionPlan for GraphVariableLengthTraverseExec {
                     edges,
                     vertices,
                     accepting,
+                    reachable: None,
                 })
             });
 
@@ -4334,6 +4951,7 @@ impl ExecutionPlan for GraphVariableLengthTraverseExec {
             edge_property_filters: vec![EidFilter::AllAllowed],
             vertex_property_filters: vec![VidFilter::AllAllowed],
             accepting_vid_filter: VidFilter::AllAllowed,
+            reachable: None,
             metrics,
             slice_size,
             // Starts at one row, not at `slice_size`, and the difference is the
@@ -4376,7 +4994,6 @@ impl GraphVariableLengthTraverseExec {
             target_label_name: self.target_label_name.clone(),
             is_optional: self.is_optional,
             bound_target_column: self.bound_target_column.clone(),
-            edge_lance_filter: self.edge_lance_filter.clone(),
             edge_property_conditions: self.edge_property_conditions.clone(),
             used_edge_columns: self.used_edge_columns.clone(),
             path_mode: self.path_mode.clone(),
@@ -4407,8 +5024,6 @@ struct GraphVariableLengthTraverseExecData {
     target_label_name: Option<String>,
     is_optional: bool,
     bound_target_column: Option<String>,
-    #[expect(dead_code, reason = "Used in Phase 3 warming")]
-    edge_lance_filter: Option<String>,
     /// Simple property equality conditions for per-edge L0 checking during BFS.
     edge_property_conditions: Vec<(String, UniValue)>,
     used_edge_columns: Vec<String>,
@@ -4611,6 +5226,13 @@ impl GraphVariableLengthTraverseExecData {
         let mut results = Vec::new();
 
         for transition in self.nfa.transitions_from(state) {
+            // A quantified pattern's inner source label, on the vertex this
+            // hop starts a new iteration from.
+            if let Some(constraint) = &transition.source_constraint
+                && !self.check_state_constraint(vid, constraint)
+            {
+                continue;
+            }
             let mut seen_edges: FxHashSet<u64> = FxHashSet::default();
 
             for &etype in &transition.edge_type_ids {
@@ -4840,6 +5462,40 @@ impl GraphVariableLengthTraverseExecData {
         vid_filter: &VidFilter,
     ) -> Vec<(Vid, u32)> {
         let nfa = &self.nfa;
+
+        // A plain `[:T*min..max]` trail decides from shortest distances (see
+        // `trail_reach`); the hop-by-hop search below stays for every other
+        // pattern and for a source that shortest distances cannot decide.
+        // For the latter, no trail is longer than the relationships it can
+        // reach, which bounds the search: on a cyclic graph a walk never runs
+        // out of frontier, so it went on to the hop ceiling and then reported
+        // a truncation that could not have hidden a trail.
+        let mut trail_cap = usize::MAX;
+        if self.path_mode == super::nfa::PathMode::Trail
+            && let Some((min, max)) = nfa.simple_chain_range()
+        {
+            let hop = |v: Vid| -> Vec<(Vid, Eid)> {
+                self.expand_neighbors(v, nfa.start_state(), eid_filters, vertex_filters, used_eids)
+                    .into_iter()
+                    .map(|(w, eid, _)| (w, eid))
+                    .collect()
+            };
+            if let Some(found) = super::trail_reach::trail_endpoints(source, min, max, hop, |v| {
+                self.check_target_label(v) && vid_filter.contains(v)
+            }) {
+                let mut results = Vec::with_capacity(found.endpoints.len() + 1);
+                if min == 0 && self.check_target_label(source) {
+                    results.push((source, 0));
+                }
+                results.extend(found.endpoints);
+                if found.beyond_max > 0 && self.max_hops == DEFAULT_MAX_HOPS {
+                    self.warn_default_hop_bound(found.beyond_max);
+                }
+                return results;
+            }
+            trail_cap = super::trail_reach::reachable_relationships(source, hop);
+        }
+
         let selector = PathSelector::Any; // Only need existence, not all paths
         let mut dag = PredecessorDag::new(selector);
         let mut results: Vec<(Vid, u32)> = Vec::new();
@@ -4855,7 +5511,8 @@ impl GraphVariableLengthTraverseExecData {
         let mut frontier: Vec<(Vid, NfaStateId)> = vec![(source, nfa.start_state())];
         let mut depth: u32 = 0;
 
-        while !frontier.is_empty() && depth < self.max_hops as u32 {
+        let depth_limit = self.max_hops.min(trail_cap) as u32;
+        while !frontier.is_empty() && depth < depth_limit {
             depth += 1;
             let mut next_frontier: Vec<(Vid, NfaStateId)> = Vec::new();
             let mut seen_at_depth: FxHashSet<(Vid, NfaStateId)> = FxHashSet::default();
@@ -4907,10 +5564,11 @@ impl GraphVariableLengthTraverseExecData {
         // complete), a safety cap tripped (already reported), or the hop
         // ceiling was reached with work left. Only the third is silent, and
         // only when the ceiling is the one the planner supplied rather than one
-        // the user wrote.
+        // the user wrote, and only when a trail could be longer than it.
         if !frontier.is_empty()
             && depth >= self.max_hops as u32
             && self.max_hops == DEFAULT_MAX_HOPS
+            && trail_cap > self.max_hops
         {
             self.warn_default_hop_bound(frontier.len());
         }
@@ -4953,6 +5611,12 @@ enum VarLengthStreamState {
     Warming(Pin<Box<dyn std::future::Future<Output = DFResult<WarmedFilters>> + Send>>),
     /// Processing input batches.
     Reading,
+    /// Growing the pattern's map filters over the region this batch's sources
+    /// can reach, before the batch is walked. See [`ReachableMapFilter`].
+    Covering {
+        fut: Pin<Box<dyn std::future::Future<Output = DFResult<ReachableMapFilter>> + Send>>,
+        batch: RecordBatch,
+    },
     /// Fetching storage-backed properties for the entities on this batch's
     /// paths, before the (synchronous) column builders run. Only entered when
     /// the plan materializes entity structs.
@@ -5013,6 +5677,10 @@ struct GraphVariableLengthTraverseStream {
     vertex_property_filters: Vec<VidFilter>,
     /// Narrows the accepting endpoints; `AllAllowed` until warming completes.
     accepting_vid_filter: VidFilter,
+    /// The pattern's maps over the region reached so far, when they are
+    /// evaluated that way; supersedes the edge and accepting filters above.
+    /// Taken out while a batch's sources are being covered.
+    reachable: Option<ReachableMapFilter>,
     metrics: BaselineMetrics,
 
     /// Target rows per output batch, and the expansion budget per pass.
@@ -5074,6 +5742,7 @@ impl Stream for GraphVariableLengthTraverseStream {
                         self.edge_property_filters = warmed.edges;
                         self.vertex_property_filters = warmed.vertices;
                         self.accepting_vid_filter = warmed.accepting;
+                        self.reachable = warmed.reachable;
                         self.state = VarLengthStreamState::Reading;
                         // Continue loop to start reading
                     }
@@ -5094,6 +5763,29 @@ impl Stream for GraphVariableLengthTraverseStream {
 
                     match self.input.poll_next_unpin(cx) {
                         Poll::Ready(Some(Ok(batch))) => {
+                            if let Some(mut reachable) = self.reachable.take() {
+                                // Grow the maps' region to this batch's sources
+                                // before any of its rows is walked.
+                                let sources = match batch
+                                    .column_by_name(&self.exec.source_column)
+                                    .map(|c| column_as_vid_array(c.as_ref()))
+                                    .transpose()
+                                {
+                                    Ok(col) => col
+                                        .map(|c| ReachableMapFilter::sources_of(&c))
+                                        .unwrap_or_default(),
+                                    Err(e) => {
+                                        self.state = VarLengthStreamState::Done;
+                                        return Poll::Ready(Some(Err(e)));
+                                    }
+                                };
+                                let fut = Box::pin(async move {
+                                    reachable.cover(&sources).await?;
+                                    Ok(reachable)
+                                });
+                                self.state = VarLengthStreamState::Covering { fut, batch };
+                                continue;
+                            }
                             // Expansion happens a row-chunk at a time (#241),
                             // so the batch is parked and `RowChunking` drives.
                             self.pending_rows = Some((batch, 0));
@@ -5114,6 +5806,21 @@ impl Stream for GraphVariableLengthTraverseStream {
                         }
                     }
                 }
+                VarLengthStreamState::Covering { mut fut, batch } => match fut.as_mut().poll(cx) {
+                    Poll::Ready(Ok(reachable)) => {
+                        self.reachable = Some(reachable);
+                        self.pending_rows = Some((batch, 0));
+                        self.state = VarLengthStreamState::RowChunking;
+                    }
+                    Poll::Ready(Err(e)) => {
+                        self.state = VarLengthStreamState::Done;
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                    Poll::Pending => {
+                        self.state = VarLengthStreamState::Covering { fut, batch };
+                        return Poll::Pending;
+                    }
+                },
                 VarLengthStreamState::RowChunking => {
                     if let Err(e) = self.exec.graph_ctx.check_timeout() {
                         return Poll::Ready(Some(Err(exec_err(e))));
@@ -5160,12 +5867,16 @@ impl Stream for GraphVariableLengthTraverseStream {
                             // `accepting_vid_filter` is a different thing — it
                             // constrains the *final* vertex, and is built during
                             // warming from the target's inline property map.
-                            let expanded = self.expand_batch(
-                                chunk,
-                                &self.edge_property_filters,
-                                &self.vertex_property_filters,
-                                &self.accepting_vid_filter,
-                            );
+                            let (edge_filters, vertex_filters, accepting) = match &self.reachable {
+                                Some(r) => (r.edges(), r.vertices(), r.accepting()),
+                                None => (
+                                    self.edge_property_filters.as_slice(),
+                                    self.vertex_property_filters.as_slice(),
+                                    &self.accepting_vid_filter,
+                                ),
+                            };
+                            let expanded =
+                                self.expand_batch(chunk, edge_filters, vertex_filters, accepting);
                             match expanded {
                                 Ok((input, expansions, parked)) => {
                                     self.paused_row = parked;
@@ -6071,9 +6782,6 @@ pub struct GraphVariableLengthTraverseMainExec {
     /// Column name of an already-bound target VID (for patterns where target is in scope).
     bound_target_column: Option<String>,
 
-    /// Lance SQL filter for edge property predicates (VLP bitmap preselection).
-    edge_lance_filter: Option<String>,
-
     /// Edge property conditions to check during BFS (e.g., `{year: 1988}`).
     /// Each entry is (property_name, expected_value). All must match for an edge to be traversed.
     edge_property_conditions: Vec<(String, UniValue)>,
@@ -6130,7 +6838,6 @@ impl GraphVariableLengthTraverseMainExec {
         graph_ctx: Arc<GraphExecutionContext>,
         is_optional: bool,
         bound_target_column: Option<String>,
-        edge_lance_filter: Option<String>,
         edge_property_conditions: Vec<(String, UniValue)>,
         used_edge_columns: Vec<String>,
         path_mode: super::nfa::PathMode,
@@ -6162,7 +6869,6 @@ impl GraphVariableLengthTraverseMainExec {
             target_properties,
             is_optional,
             bound_target_column,
-            edge_lance_filter,
             edge_property_conditions,
             used_edge_columns,
             path_mode,
@@ -6285,7 +6991,6 @@ impl ExecutionPlan for GraphVariableLengthTraverseMainExec {
             self.graph_ctx.clone(),
             self.is_optional,
             self.bound_target_column.clone(),
-            self.edge_lance_filter.clone(),
             self.edge_property_conditions.clone(),
             self.used_edge_columns.clone(),
             self.path_mode.clone(),
@@ -6336,7 +7041,6 @@ impl ExecutionPlan for GraphVariableLengthTraverseMainExec {
             graph_ctx: self.graph_ctx.clone(),
             is_optional: self.is_optional,
             bound_target_column: self.bound_target_column.clone(),
-            edge_lance_filter: self.edge_lance_filter.clone(),
             edge_property_conditions: self.edge_property_conditions.clone(),
             used_edge_columns: self.used_edge_columns.clone(),
             path_mode: self.path_mode.clone(),
@@ -6385,7 +7089,6 @@ enum VarLengthMainStreamState {
 }
 
 /// Stream for variable-length traversal on schemaless edges.
-#[expect(dead_code, reason = "VLP fields used in Phase 3")]
 struct GraphVariableLengthTraverseMainStream {
     /// Target rows per output batch, and the expansion budget per pass.
     slice_size: usize,
@@ -6409,7 +7112,6 @@ struct GraphVariableLengthTraverseMainStream {
     graph_ctx: Arc<GraphExecutionContext>,
     is_optional: bool,
     bound_target_column: Option<String>,
-    edge_lance_filter: Option<String>,
     /// Edge property conditions to check during BFS.
     edge_property_conditions: Vec<(String, UniValue)>,
     used_edge_columns: Vec<String>,
@@ -6482,17 +7184,12 @@ impl GraphVariableLengthTraverseMainStream {
                         continue;
                     }
 
-                    // Check edge property conditions (e.g., {year: 1988}).
-                    if !self.edge_property_conditions.is_empty() {
-                        let passes =
-                            self.edge_property_conditions
-                                .iter()
-                                .all(|(name, expected)| {
-                                    props.get(name).is_some_and(|actual| actual == expected)
-                                });
-                        if !passes {
-                            continue;
-                        }
+                    // Check edge property conditions (e.g., {year: 1988}) under
+                    // Cypher equality, as every other walk does: structural
+                    // `Value` equality rejected `{w: 0}` on `w = 0.0` and
+                    // matched NaN with NaN. Nothing re-checks this.
+                    if !map_matches(props, &self.edge_property_conditions) {
+                        continue;
                     }
 
                     let mut new_node_path = node_path.clone();
@@ -6505,6 +7202,63 @@ impl GraphVariableLengthTraverseMainStream {
         }
 
         results
+    }
+
+    /// Each endpoint a trail reaches, once, for a reachability consumer;
+    /// `None` when the output mode needs paths or shortest distances cannot
+    /// decide (see `trail_reach`), and [`Self::bfs`] must list the trails.
+    ///
+    /// `bfs` enumerates every trail whatever the output mode, which on a
+    /// cyclic graph is exponential in the edge count; an undirected pattern
+    /// is cyclic as soon as it has one edge.
+    fn reachable_endpoints(
+        &self,
+        source: Vid,
+        adjacency: &EdgeAdjacencyMap,
+        used_eids: &FxHashSet<u64>,
+    ) -> Option<Vec<MainBfsResult>> {
+        if !matches!(self.output_mode, super::nfa::VlpOutputMode::Reachability)
+            || self.path_mode != super::nfa::PathMode::Trail
+        {
+            return None;
+        }
+        let is_undirected = matches!(self.direction, Direction::Both);
+        // The same hop `bfs` takes: each relationship once, none bound
+        // elsewhere in the pattern, and only those the property map admits.
+        let neighbors = |v: Vid| -> Vec<(Vid, Eid)> {
+            let mut seen: FxHashSet<u64> = FxHashSet::default();
+            adjacency
+                .get(&v)
+                .into_iter()
+                .flatten()
+                .filter(|(_, eid, _, props, _)| {
+                    (!is_undirected || seen.insert(eid.as_u64()))
+                        && !used_eids.contains(&eid.as_u64())
+                        && map_matches(props, &self.edge_property_conditions)
+                })
+                .map(|(w, eid, _, _, _)| (*w, *eid))
+                .collect()
+        };
+        let found = super::trail_reach::trail_endpoints(
+            source,
+            self.min_hops,
+            self.max_hops,
+            neighbors,
+            |_| true,
+        )?;
+        let mut results = Vec::with_capacity(found.endpoints.len() + 1);
+        // A non-empty node path marks a match; an empty one marks the NULL
+        // row of an optional pattern (see `build_output_batch`).
+        if self.min_hops == 0 {
+            results.push((source, 0, vec![source], vec![]));
+        }
+        results.extend(
+            found
+                .endpoints
+                .into_iter()
+                .map(|(v, d)| (v, d as usize, vec![source, v], vec![])),
+        );
+        Some(results)
     }
 
     /// Run the BFS for one input batch and return it alongside the expansions.
@@ -6551,7 +7305,9 @@ impl GraphVariableLengthTraverseMainStream {
                 // Collect used edge IDs from previous hops for this row
                 let used_eids: FxHashSet<u64> = used_edge_arrays.for_row(row_idx).collect();
 
-                let bfs_results = self.bfs(source, adjacency, &used_eids);
+                let bfs_results = self
+                    .reachable_endpoints(source, adjacency, &used_eids)
+                    .unwrap_or_else(|| self.bfs(source, adjacency, &used_eids));
 
                 for (target, hops, node_path, edge_path) in bfs_results {
                     // Filter by bound target VID if set (for patterns where target is in scope).

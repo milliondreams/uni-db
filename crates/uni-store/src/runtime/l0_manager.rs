@@ -48,6 +48,10 @@ pub struct SnapshotView {
     pin: Arc<PinToken>,
     /// Main-L0 version at capture (the C2 hwm fed into `pinned_storage`).
     pub started_at_version: u64,
+    /// Bulk-load versions at or below `started_at_version` not visible at
+    /// capture; the transaction's L1 reads exclude them for good
+    /// ([`L0Manager::reserve_bulk_version`]).
+    pub unpublished_bulk: Vec<u64>,
     /// C2: a `StorageManager` clone pinned to `started_at_version`
     /// (`StorageManager::pinned_at_version`), so L1 scans filter to
     /// `_version <= started_at_version` and an L0→L1 flush completing
@@ -56,6 +60,31 @@ pub struct SnapshotView {
     /// carries a fresh `AdjacencyManager`); `None` for snapshots taken
     /// without a storage pin.
     pub pinned_storage: Option<Arc<crate::storage::manager::StorageManager>>,
+    /// The reading transaction's private, uncommitted L0 buffer, newest of all
+    /// layers.
+    ///
+    /// Set only on a view pinned from a manager built by
+    /// [`L0Manager::from_view`] for a read made inside a transaction (an
+    /// algorithm projection, say); a transaction's own snapshot leaves it
+    /// `None`, since the executor threads its buffer separately. Unlike `main`
+    /// and `extra` it is live: the transaction keeps writing into it, and its
+    /// reads must see those writes.
+    pub transaction: Option<Arc<RwLock<L0Buffer>>>,
+}
+
+impl SnapshotView {
+    /// A [`QueryContext`] reading exactly this view's layers, newest first:
+    /// [`Self::transaction`], then `main`, then `extra`.
+    ///
+    /// [`QueryContext`]: crate::runtime::QueryContext
+    #[must_use]
+    pub fn query_context(&self) -> crate::runtime::QueryContext {
+        crate::runtime::QueryContext::new_with_pending(
+            self.main.clone(),
+            self.transaction.clone(),
+            self.extra.clone(),
+        )
+    }
 }
 
 impl std::fmt::Debug for SnapshotView {
@@ -87,6 +116,41 @@ pub struct L0Manager {
     // buffer this manager mints (initial buffer via `set_plugin_registry`,
     // rotated buffers via `rotate`). `None` preserves native `try_merge`.
     plugin_registry: RwLock<Option<Arc<uni_plugin::PluginRegistry>>>,
+    // The reading transaction's private L0, for a read-only view built by
+    // `from_view`; `None` for every manager that owns an L0 lifecycle.
+    transaction: Option<Arc<RwLock<L0Buffer>>>,
+    // Versions reserved by bulk loads that are not visible yet; see
+    // `reserve_bulk_version`. Locked only inside a buffer's lock, as a leaf.
+    bulk_reserved: parking_lot::Mutex<std::collections::BTreeSet<u64>>,
+}
+
+/// A bulk load's version, reserved by [`L0Manager::reserve_bulk_version`]
+/// and held until the load is visible or discarded. Dropping it releases the
+/// version.
+#[derive(Debug)]
+pub struct BulkVersionReservation {
+    manager: Arc<L0Manager>,
+    version: u64,
+}
+
+impl BulkVersionReservation {
+    /// The reserved version.
+    #[must_use]
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+}
+
+impl Drop for BulkVersionReservation {
+    fn drop(&mut self) {
+        self.manager.bulk_reserved.lock().remove(&self.version);
+    }
+}
+
+impl std::fmt::Debug for L0Manager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("L0Manager").finish_non_exhaustive()
+    }
 }
 
 impl L0Manager {
@@ -97,6 +161,8 @@ impl L0Manager {
             pending_flush: RwLock::new(Vec::new()),
             current_pin: RwLock::new(Arc::new(PinToken(()))),
             plugin_registry: RwLock::new(None),
+            transaction: None,
+            bulk_reserved: parking_lot::Mutex::new(std::collections::BTreeSet::new()),
         }
     }
 
@@ -129,7 +195,84 @@ impl L0Manager {
             // Read-only snapshot manager: buffers already carry their registry
             // and this manager never rotates, so no stamping is needed.
             plugin_registry: RwLock::new(None),
+            transaction: None,
+            bulk_reserved: parking_lot::Mutex::new(std::collections::BTreeSet::new()),
         }
+    }
+
+    /// A read-only manager over a query's L0 visibility, including the
+    /// reading transaction's private buffer.
+    ///
+    /// [`Self::from_snapshot`] has no place for a transaction buffer, and
+    /// listing it among the pending-flush generations makes it the *oldest*
+    /// layer, so the transaction's own updates lose to committed values.
+    /// Snapshots pinned from this manager carry the buffer as
+    /// [`SnapshotView::transaction`], the newest layer.
+    #[must_use]
+    pub fn from_view(
+        current: Arc<RwLock<L0Buffer>>,
+        pending_flush: Vec<Arc<RwLock<L0Buffer>>>,
+        transaction: Option<Arc<RwLock<L0Buffer>>>,
+    ) -> Self {
+        Self {
+            transaction,
+            ..Self::from_snapshot(current, pending_flush)
+        }
+    }
+
+    /// The transaction buffer of a manager built by [`Self::from_view`].
+    #[must_use]
+    pub fn transaction_l0(&self) -> Option<&Arc<RwLock<L0Buffer>>> {
+        self.transaction.as_ref()
+    }
+
+    /// Reserves a version for a bulk load: the next version of the counter,
+    /// recorded as not visible until the returned reservation drops.
+    ///
+    /// The counter is advanced and the version recorded under the current
+    /// buffer's lock, which is the lock every version-ceiling capture reads
+    /// the counter under ([`Self::pin_snapshot`], [`Self::version_and_unpublished_bulk`]).
+    /// So a ceiling that covers the version always sees it recorded, and a
+    /// reader captured before the load is visible keeps excluding it. Held
+    /// under `current`'s read lock, so a rotation cannot leave the version
+    /// on a superseded buffer.
+    pub fn reserve_bulk_version(self: &Arc<Self>) -> BulkVersionReservation {
+        let current = self.current.read();
+        let mut buffer = current.write();
+        buffer.current_version += 1;
+        let version = buffer.current_version;
+        self.bulk_reserved.lock().insert(version);
+        drop(buffer);
+        drop(current);
+        BulkVersionReservation {
+            manager: Arc::clone(self),
+            version,
+        }
+    }
+
+    /// The current version and the bulk-load versions at or below it that
+    /// are not visible yet, read together.
+    ///
+    /// For a reader's version ceiling: rows of those versions must stay
+    /// hidden from it for good, since the loads become visible only later.
+    #[must_use]
+    pub fn version_and_unpublished_bulk(&self) -> (u64, Vec<u64>) {
+        let current = self.current.read();
+        let buffer = current.read();
+        let version = buffer.current_version;
+        let unpublished = self.unpublished_bulk_at_most(version);
+        (version, unpublished)
+    }
+
+    /// The bulk-load versions at or below `version` that are not visible
+    /// yet. Call it under the lock of the buffer `version` was read from.
+    #[must_use]
+    pub fn unpublished_bulk_at_most(&self, version: u64) -> Vec<u64> {
+        self.bulk_reserved
+            .lock()
+            .range(..=version)
+            .copied()
+            .collect()
     }
 
     /// Get the current L0 buffer.
@@ -162,6 +305,10 @@ impl L0Manager {
         let mut guard = self.current.write();
         let old_l0 = guard.clone();
 
+        // Never below the old buffer's counter: a version reserved from the
+        // new buffer before the caller copies the counter over would
+        // otherwise repeat one already used.
+        let next_version = next_version.max(old_l0.read().current_version);
         let mut new_l0 = L0Buffer::new(next_version, new_wal);
         // Carry the registry onto the fresh generation so its commit-time
         // merges route through any registered CRDT provider.
@@ -251,7 +398,11 @@ impl L0Manager {
         let current_guard = self.current.read();
         let main = current_guard.clone();
         let pin = self.current_pin.read().clone();
-        let started_at_version = main.read().current_version;
+        let (started_at_version, unpublished_bulk) = {
+            let buffer = main.read();
+            let version = buffer.current_version;
+            (version, self.unpublished_bulk_at_most(version))
+        };
         let extra = self.pending_flush.read().clone();
         drop(current_guard);
         SnapshotView {
@@ -259,7 +410,9 @@ impl L0Manager {
             extra,
             pin,
             started_at_version,
+            unpublished_bulk,
             pinned_storage: None,
+            transaction: self.transaction.clone(),
         }
     }
 

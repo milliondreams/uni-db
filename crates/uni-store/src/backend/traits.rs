@@ -52,6 +52,129 @@ impl TableWriteGuard {
     }
 }
 
+/// Rows written to a table's storage but not yet part of any version of it.
+///
+/// Returned by [`StorageBackend::stage_append`]. A reader of the table cannot
+/// see these rows until [`StorageBackend::publish_staged`] commits them, and
+/// [`StorageBackend::discard_staged`] drops them without them ever having been
+/// visible. This is what lets the bulk loader keep an in-progress load out of
+/// every reader, every compaction pass and every in-memory cache: there is
+/// nothing to read, so there is nothing to undo.
+///
+/// A backend that cannot stage returns a value whose rows are *already*
+/// visible (see [`Self::is_pending`]); callers that need isolation check
+/// [`StorageBackend::stages_invisibly`] before relying on it.
+#[must_use = "staged rows stay invisible until `publish_staged` commits them"]
+pub struct StagedAppend {
+    rows: usize,
+    // Backend-private description of the written files; `None` when the
+    // backend wrote the rows visibly instead of staging them.
+    payload: Option<Box<dyn std::any::Any + Send + Sync>>,
+}
+
+impl StagedAppend {
+    /// Rows that a backend wrote visibly because it cannot stage.
+    pub fn visible(rows: usize) -> Self {
+        Self {
+            rows,
+            payload: None,
+        }
+    }
+
+    /// Rows staged invisibly, described by a backend-private `payload`.
+    pub fn pending(rows: usize, payload: Box<dyn std::any::Any + Send + Sync>) -> Self {
+        Self {
+            rows,
+            payload: Some(payload),
+        }
+    }
+
+    /// Number of rows in this append.
+    #[must_use]
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// Whether the rows still await [`StorageBackend::publish_staged`].
+    #[must_use]
+    pub fn is_pending(&self) -> bool {
+        self.payload.is_some()
+    }
+
+    /// The backend-private payload, `None` for a visible append.
+    pub fn into_payload(self) -> Option<Box<dyn std::any::Any + Send + Sync>> {
+        self.payload
+    }
+
+    /// The backend-private payload by reference, `None` for a visible append.
+    #[must_use]
+    pub fn payload(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        self.payload.as_deref()
+    }
+}
+
+/// Keeps a table's staged files from being reclaimed while it is held.
+///
+/// Returned by [`StorageBackend::hold_staged_files`]. Staged files are
+/// referenced by no table version until published, and a backend's version
+/// cleanup may treat an unreferenced file past some age as abandoned and delete
+/// it (Lance: 7 days). A bulk load holds the tables it stages into until every
+/// staged file is published -- or, if the load is committed but its publish
+/// could not be finished, until the process exits (see
+/// [`Self::keep_until_exit`]), since the next open completes it from those
+/// files. Dropping the hold releases it.
+#[must_use = "dropping the hold releases it immediately"]
+pub struct StagedFilesHold(Option<Box<dyn std::any::Any + Send + Sync>>);
+
+impl StagedFilesHold {
+    /// A hold that protects nothing, for a backend whose cleanup never deletes
+    /// unreferenced files.
+    pub fn none() -> Self {
+        Self(None)
+    }
+
+    /// A hold released when `guard` is dropped.
+    pub fn new(guard: Box<dyn std::any::Any + Send + Sync>) -> Self {
+        Self(Some(guard))
+    }
+
+    /// Keep holding for the rest of the process.
+    ///
+    /// For staged files a committed load still needs at the next open: the
+    /// files must survive any cleanup this process runs before then. The hold
+    /// is leaked deliberately; it is a few bytes, once per incomplete load.
+    pub fn keep_until_exit(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl std::fmt::Debug for StagedFilesHold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("StagedFilesHold")
+            .field(&self.0.is_some())
+            .finish()
+    }
+}
+
+/// What [`StorageBackend::publish_staged_record`] found and did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordedPublish {
+    /// The recorded rows were not yet in the table; they are now.
+    Published,
+    /// The recorded rows were already published by an earlier attempt, so
+    /// nothing was committed.
+    AlreadyPublished,
+}
+
+impl std::fmt::Debug for StagedAppend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StagedAppend")
+            .field("rows", &self.rows)
+            .field("pending", &self.is_pending())
+            .finish()
+    }
+}
+
 /// Core storage backend trait.
 ///
 /// All persistent storage operations go through this trait. Backends must be
@@ -220,6 +343,130 @@ pub trait StorageBackend: Send + Sync + 'static {
         anyhow::bail!("schema evolution is not supported by this backend")
     }
 
+    /// Whether [`Self::stage_append`] keeps rows invisible until published.
+    ///
+    /// `false` (the default) means `stage_append` writes visibly, so a caller
+    /// that must not expose rows early has to fall back to a protocol that can
+    /// undo a visible write.
+    fn stages_invisibly(&self) -> bool {
+        false
+    }
+
+    /// Write `batches` into `table_name`'s storage without publishing them.
+    ///
+    /// The table must already exist. Readers, compaction and every other
+    /// writer go on seeing the table exactly as before until
+    /// [`Self::publish_staged`] commits the result. The default writes the
+    /// rows visibly and says so through [`StagedAppend::is_pending`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table does not exist or the write fails.
+    async fn stage_append(
+        &self,
+        table_name: &str,
+        batches: Vec<RecordBatch>,
+    ) -> Result<StagedAppend> {
+        let rows = batches.iter().map(RecordBatch::num_rows).sum();
+        self.write(table_name, batches, WriteMode::Append).await?;
+        Ok(StagedAppend::visible(rows))
+    }
+
+    /// Make every append in `staged` visible in `table_name`, as one commit.
+    ///
+    /// Publishing appends onto the table's *current* version, so writes that
+    /// other writers committed after the rows were staged are kept.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the commit fails, in which case none of `staged`
+    /// is visible, or if `staged` holds rows another backend staged.
+    async fn publish_staged(&self, table_name: &str, staged: Vec<StagedAppend>) -> Result<()> {
+        if staged.iter().any(StagedAppend::is_pending) {
+            anyhow::bail!(
+                "publish_staged('{table_name}'): this backend never stages rows, so it \
+                 cannot publish rows staged by another backend"
+            );
+        }
+        Ok(())
+    }
+
+    /// Drop the rows in `staged` without ever making them visible.
+    ///
+    /// Best effort: storage that cannot be reclaimed now is unreferenced, so
+    /// no reader can reach it and the backend's own garbage collection may
+    /// remove it later.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reclaiming the storage failed.
+    async fn discard_staged(&self, table_name: &str, staged: Vec<StagedAppend>) -> Result<()> {
+        let _ = (table_name, staged);
+        Ok(())
+    }
+
+    /// Hold `table_name`'s staged files against version cleanup until the
+    /// returned [`StagedFilesHold`] is dropped.
+    ///
+    /// The default protects nothing, which is right for a backend whose
+    /// cleanup never deletes files no version references.
+    fn hold_staged_files(&self, table_name: &str) -> StagedFilesHold {
+        let _ = table_name;
+        StagedFilesHold::none()
+    }
+
+    /// A durable, backend-private description of the rows in `staged`.
+    ///
+    /// Written into a crash-recovery record before `staged` is published, so a
+    /// process that dies part way through a multi-table publish can complete it
+    /// at the next open with [`Self::publish_staged_record`]. Returns `None`
+    /// when nothing in `staged` awaits publishing (a backend that cannot stage
+    /// wrote it visibly).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `staged` holds rows this backend cannot describe.
+    fn staged_record(
+        &self,
+        table_name: &str,
+        staged: &[StagedAppend],
+    ) -> Result<Option<serde_json::Value>> {
+        if staged.iter().any(StagedAppend::is_pending) {
+            anyhow::bail!(
+                "staged_record('{table_name}'): this backend never stages rows, so it \
+                 cannot describe rows staged by another backend"
+            );
+        }
+        Ok(None)
+    }
+
+    /// Publish the rows described by `record` (from [`Self::staged_record`])
+    /// unless an earlier attempt already did.
+    ///
+    /// Exactly once: the backend recognizes its own earlier publish of the same
+    /// rows at any version after `published_after` (the table's version before
+    /// the first attempt), including one a later commit has since rewritten,
+    /// and then commits nothing. Like [`Self::publish_staged`] it appends onto
+    /// the current version, so other writers' commits are kept.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the commit fails, if `record` was not written by
+    /// this backend, or if only part of the recorded storage is still present,
+    /// so that neither publishing nor skipping it would be exact.
+    async fn publish_staged_record(
+        &self,
+        table_name: &str,
+        record: &serde_json::Value,
+        published_after: Option<u64>,
+    ) -> Result<RecordedPublish> {
+        let _ = (record, published_after);
+        anyhow::bail!(
+            "publish_staged_record('{table_name}'): this backend never stages rows, so \
+             it cannot publish a recorded staged append"
+        )
+    }
+
     /// Acquire the per-table write lock, returning a guard held until dropped.
     ///
     /// A caller performing a read-modify-write that spans multiple backend calls —
@@ -244,6 +491,37 @@ pub trait StorageBackend: Send + Sync + 'static {
 
     /// Roll back a table to a specific version.
     async fn rollback_table(&self, table_name: &str, target_version: u64) -> Result<()>;
+
+    /// Pin `version` of `table_name` under `tag`, so version cleanup keeps it.
+    ///
+    /// A snapshot restore rolls tables back to versions recorded when the
+    /// snapshot was taken; an unpinned version older than the compaction
+    /// retention window is deleted, after which the restore cannot run.
+    ///
+    /// # Errors
+    ///
+    /// The default refuses: a backend without versioned tables cannot keep a
+    /// snapshot restorable.
+    async fn tag_table_version(&self, table_name: &str, tag: &str, version: u64) -> Result<()> {
+        let _ = (tag, version);
+        anyhow::bail!("backend cannot pin versions of '{table_name}' for a snapshot restore")
+    }
+
+    /// Remove the pin `tag` from `table_name`, so version cleanup may delete
+    /// the version it held.
+    ///
+    /// Idempotent: a tag or table that does not exist is not an error, so a
+    /// snapshot deletion cut short converges when run again.
+    ///
+    /// # Errors
+    ///
+    /// When the tag exists and cannot be removed. The default succeeds: a
+    /// backend that keeps the default [`Self::tag_table_version`] never pins
+    /// anything.
+    async fn delete_table_tag(&self, table_name: &str, tag: &str) -> Result<()> {
+        let _ = (table_name, tag);
+        Ok(())
+    }
 
     // ========================
     // Maintenance
@@ -278,6 +556,14 @@ pub trait StorageBackend: Send + Sync + 'static {
     /// Clear all cached state.
     fn clear_cache(&self) {}
 
+    /// Occupancy of the backend's own in-process caches, if it has any.
+    ///
+    /// A cheap, synchronous read. `None` (the default) means the backend
+    /// keeps no such cache, not that it is empty.
+    fn cache_usage(&self) -> Option<BackendCacheUsage> {
+        None
+    }
+
     // ========================
     // Metadata
     // ========================
@@ -292,6 +578,23 @@ pub trait StorageBackend: Send + Sync + 'static {
     /// default so that a new backend cannot accidentally claim fork support it
     /// has not implemented.
     fn branching(&self) -> Option<Arc<dyn ForkBranching>> {
+        None
+    }
+
+    /// A read-only view of this backend that reads every table in `versions`
+    /// at the version given and treats every other table as absent.
+    ///
+    /// What an explicit snapshot's reads go through: its restore point
+    /// records each table's version and tags it against cleanup, so reading
+    /// those versions returns the snapshot's rows whatever compaction or later
+    /// writes did to the live tables. `None` (the default) when the backend
+    /// cannot read an older version; such a snapshot reads the live tables
+    /// under its version ceiling instead.
+    fn at_table_versions(
+        &self,
+        versions: &std::collections::BTreeMap<String, u64>,
+    ) -> Option<Arc<dyn StorageBackend>> {
+        let _ = versions;
         None
     }
 

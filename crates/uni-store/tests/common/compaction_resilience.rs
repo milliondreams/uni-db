@@ -271,6 +271,59 @@ async fn direction_skew_leaves_both_directions_agreeing() -> Result<()> {
     Ok(())
 }
 
+/// A failure to read `main_edges` during the pre-clear invariant check is an
+/// error of the pass, not evidence that an EID is missing.
+///
+/// The check used `exists_by_eid(..).unwrap_or(false)`, so any read failure
+/// tripped the `debug_assert!` with "EID … not found in main_edges", a panic
+/// that blamed the data for an I/O fault, and in release builds the failure
+/// went unreported. The read is failed here by injection; the pass must return
+/// the error with its context, and the deltas must survive for the next pass.
+///
+/// The check exists only with debug assertions, so the test does too.
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn main_edges_read_failure_in_the_invariant_check_is_an_error() -> Result<()> {
+    const SEAM: &str = "main_edge::exists-by-eid";
+    let g = graph().await?;
+    let a = person(&g).await?;
+    let b = person(&g).await?;
+    knows(&g, a, b).await?;
+    g.writer.flush_to_l1(None).await?;
+
+    fail::cfg(SEAM, "return").unwrap();
+    let storage = g.storage.clone();
+    let joined = tokio::spawn(async move {
+        Compactor::new(storage)
+            .compact_adjacency("KNOWS", "Person", "fwd")
+            .await
+    })
+    .await;
+    fail::remove(SEAM);
+    let res = joined.unwrap_or_else(|e| {
+        panic!("the pass panicked on a main_edges read failure instead of returning it: {e}")
+    });
+    let err = match res {
+        Ok(_) => panic!("the pass succeeded although main_edges could not be read"),
+        Err(e) => e,
+    };
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("could not check main_edges") && rendered.contains("injected"),
+        "the error lost its context: {rendered}"
+    );
+
+    // Nothing was cleared, and the next pass converges.
+    Compactor::new(g.storage.clone())
+        .compact_adjacency("KNOWS", "Person", "fwd")
+        .await?;
+    assert_eq!(
+        neighbors_after_reopen(&g, a, Direction::Outgoing).await?,
+        vec![b]
+    );
+    Ok(())
+}
+
 /// Probe, not a repro. `adjacency_table_name` ignores its `label` argument, so
 /// an edge type with N `src_labels` calls `compact_adjacency` N times against
 /// the *same* L2 and delta tables. Passes 2..N early-return on empty deltas, so
@@ -325,5 +378,117 @@ async fn compact_all_with_multi_src_label_edge_type() -> Result<()> {
         "an edge type with two src_labels compacts the same tables twice; the second \
          pass must not clear what the first merged"
     );
+    Ok(())
+}
+
+/// Every point at which compaction honours cancellation.
+const SAFE_POINTS: [&str; 5] = [
+    "compaction::safe-point::before-label",
+    "compaction::safe-point::before-vertex-replace",
+    "compaction::safe-point::before-adjacency",
+    "compaction::safe-point::before-adj-replace",
+    "compaction::safe-point::before-delta-clear",
+];
+
+/// A pass cancelled at any safe point must leave a store that reads the same
+/// edge set in both directions (from the deltas over the old L2, or from a
+/// half-merged pass), and a later pass on a fresh handle must converge.
+///
+/// The cancel is issued from the safe point's own fail point, so it lands
+/// exactly there; the test then requires the pass to report that very point,
+/// which is what rules out a pass that never reached it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_compaction_leaves_store_consistent_at_every_safe_point() -> Result<()> {
+    use uni_store::storage::compaction::CompactionCancelled;
+
+    for seam in SAFE_POINTS {
+        let g = graph().await?;
+        // A declared, populated property, so the vertex pass reaches its
+        // replace: a label with no declared properties is skipped outright.
+        g.schema_manager.add_property(
+            "Person",
+            "name",
+            uni_common::core::schema::DataType::String,
+            true,
+        )?;
+        g.schema_manager.save().await?;
+        let named = |name: &str| {
+            HashMap::from([(
+                "name".to_string(),
+                uni_common::Value::String(name.to_string()),
+            )])
+        };
+        let mut vids = Vec::new();
+        for name in ["a", "b", "c"] {
+            let vid = g.writer.next_vid().await?;
+            g.writer
+                .insert_vertex_with_labels(vid, named(name), &["Person".to_string()], None)
+                .await?;
+            vids.push(vid);
+        }
+        let (a, b, c) = (vids[0], vids[1], vids[2]);
+        knows(&g, a, b).await?;
+        let e_ac = knows(&g, a, c).await?;
+        g.writer.flush_to_l1(None).await?;
+        g.writer
+            .delete_edge(e_ac, a, c, g.edge_type_id, None)
+            .await?;
+        g.writer.flush_to_l1(None).await?;
+
+        let token = g.storage.compaction_cancel_token().clone();
+        fail::cfg_callback(seam, move || token.cancel()).unwrap();
+        let res = Compactor::new(g.storage.clone()).compact_all().await;
+        fail::remove(seam);
+        let err = match res {
+            Ok(r) => panic!("{seam}: the pass completed although it was cancelled: {r:?}"),
+            Err(e) => e,
+        };
+        let cancelled = err
+            .downcast_ref::<CompactionCancelled>()
+            .unwrap_or_else(|| panic!("{seam}: expected CompactionCancelled, got {err:#}"));
+        assert_eq!(cancelled.at, seam, "the pass stopped somewhere else");
+
+        let check = |label: &str| format!("{seam} ({label})");
+        assert_eq!(
+            neighbors_after_reopen(&g, a, Direction::Outgoing).await?,
+            vec![b],
+            "{}",
+            check("fwd after cancel")
+        );
+        assert_eq!(
+            neighbors_after_reopen(&g, b, Direction::Incoming).await?,
+            vec![a],
+            "{}",
+            check("bwd after cancel")
+        );
+        assert_eq!(
+            neighbors_after_reopen(&g, c, Direction::Incoming).await?,
+            Vec::<Vid>::new(),
+            "{}",
+            check("deleted edge resurrected after cancel")
+        );
+
+        // The cancelled token is permanent; a fresh handle finishes the work.
+        let fresh = Arc::new(StorageManager::new(&g.path, g.schema_manager.clone()).await?);
+        Compactor::new(fresh).compact_all().await?;
+        assert_eq!(
+            neighbors_after_reopen(&g, a, Direction::Outgoing).await?,
+            vec![b],
+            "{}",
+            check("fwd after converging pass")
+        );
+        assert_eq!(
+            neighbors_after_reopen(&g, b, Direction::Incoming).await?,
+            vec![a],
+            "{}",
+            check("bwd after converging pass")
+        );
+        assert_eq!(
+            neighbors_after_reopen(&g, c, Direction::Incoming).await?,
+            Vec::<Vid>::new(),
+            "{}",
+            check("deleted edge resurrected after converging pass")
+        );
+    }
     Ok(())
 }

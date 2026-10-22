@@ -35,24 +35,25 @@ pub(crate) enum Accumulator {
         count: u64,
     },
     Collect(Vec<Value>),
-    CountDistinct(HashSet<Value>),
+    /// `AGG(DISTINCT x)`: `inner` folds the first value of each class of
+    /// equal values ([`distinct_key`]). Only `count` honored DISTINCT before;
+    /// `sum`, `avg`, `min`, `max`, `collect` and the percentiles folded
+    /// every row.
+    Distinct {
+        seen: HashSet<Value>,
+        inner: Box<Accumulator>,
+    },
+    /// `percentileDisc` / `percentileCont`: the inputs as exact numbers,
+    /// and the percentile read from the first row that has one
+    /// ([`Accumulator::set_percentile`]).
     PercentileDisc {
-        values: Vec<f64>,
-        percentile: f64,
+        values: Vec<Value>,
+        percentile: Option<f64>,
     },
     PercentileCont {
-        values: Vec<f64>,
-        percentile: f64,
+        values: Vec<Value>,
+        percentile: Option<f64>,
     },
-}
-
-/// Convert f64 to Value, preserving integer representation when possible.
-fn numeric_to_value(val: f64) -> Value {
-    if val.fract() == 0.0 && val >= i64::MIN as f64 && val <= i64::MAX as f64 {
-        Value::Int(val as i64)
-    } else {
-        Value::Float(val)
-    }
 }
 
 /// Collapse an integral finite `Float` to the equivalent `Int`; leave every
@@ -63,25 +64,21 @@ fn numeric_to_value(val: f64) -> Value {
 /// rules (openCypher aggregation vs. the MERGE match-key coercion) and are
 /// deliberately kept as separate, individually-documented entry points.
 pub(crate) fn canonical_numeric_key(val: &Value) -> Value {
+    // Exact: `2^63` (float) is not `i64::MAX`, which an
+    // `f <= i64::MAX as f64` bound folded it into.
     match val {
-        Value::Float(f)
-            if f.is_finite()
-                && f.fract() == 0.0
-                && *f >= i64::MIN as f64
-                && *f <= i64::MAX as f64 =>
-        {
-            Value::Int(*f as i64)
-        }
+        Value::Float(f) => uni_common::f64_to_exact_i64(*f).map_or(Value::Float(*f), Value::Int),
         other => other.clone(),
     }
 }
 
-/// Canonical key for `COUNT(DISTINCT …)`: integral finite floats collapse to
-/// `Int` so `1` and `1.0` count once (matching `cypher_eq`'s numeric
-/// coercion); every other value keeps its type. The accumulator previously
-/// stringified values, which also collapsed `1` with `'1'` — a wrong answer.
+/// Canonical key for `AGG(DISTINCT …)`: equal values share it, at any depth
+/// of lists and maps, so `1` and `1.0` count once (matching `cypher_eq`'s
+/// numeric equality); every other value keeps its type. The accumulator
+/// previously stringified values, which also collapsed `1` with `'1'` — a
+/// wrong answer.
 fn distinct_key(val: &Value) -> Value {
-    canonical_numeric_key(val)
+    uni_query_functions::df_udfs::canonical_cypher_value(val.clone())
 }
 
 /// Cross-type ordering rank for Cypher min/max (lower rank = smaller).
@@ -111,11 +108,12 @@ fn cypher_cross_type_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
     if ra != rb {
         return ra.cmp(&rb);
     }
+    // Numbers by exact value: widening the integer to `f64` tied `2^53 + 1`
+    // with `2^53.0`, and `i64::MAX` with `2^63`.
+    if let Some(ord) = uni_query_functions::expr_eval::cypher_numeric_cmp(a, b) {
+        return ord.unwrap_or(Ordering::Equal);
+    }
     match (a, b) {
-        (Value::Int(l), Value::Int(r)) => l.cmp(r),
-        (Value::Float(l), Value::Float(r)) => l.partial_cmp(r).unwrap_or(Ordering::Equal),
-        (Value::Int(l), Value::Float(r)) => (*l as f64).partial_cmp(r).unwrap_or(Ordering::Equal),
-        (Value::Float(l), Value::Int(r)) => l.partial_cmp(&(*r as f64)).unwrap_or(Ordering::Equal),
         (Value::String(l), Value::String(r)) => l.cmp(r),
         (Value::Bool(l), Value::Bool(r)) => l.cmp(r),
         // Temporal and Bytes share `cypher_type_rank` 5, so a same-rank pair
@@ -156,13 +154,21 @@ pub(crate) fn collect_tombstoned_eids(
 
 impl Accumulator {
     pub(crate) fn new(op: &str, distinct: bool) -> Self {
-        Self::new_with_percentile(op, distinct, 0.0)
+        Self::with_percentile(op, distinct, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_percentile(op: &str, distinct: bool, percentile: f64) -> Self {
+        Self::with_percentile(op, distinct, Some(percentile))
+    }
+
+    fn with_percentile(op: &str, distinct: bool, percentile: Option<f64>) -> Self {
         let op_upper = op.to_uppercase();
         match op_upper.as_str() {
-            "COUNT" if distinct => Accumulator::CountDistinct(HashSet::new()),
+            _ if distinct => Accumulator::Distinct {
+                seen: HashSet::new(),
+                inner: Box::new(Self::with_percentile(op, false, percentile)),
+            },
             "COUNT" => Accumulator::Count(0),
             "SUM" => Accumulator::Sum(Default::default()),
             "MIN" => Accumulator::Min(None),
@@ -191,6 +197,7 @@ impl Accumulator {
     /// When `sum` or `avg` receives a value that is neither a number nor a
     /// duration, or mixes the two, or a percentile receives a non-number.
     pub(crate) fn update(&mut self, val: &Value, is_wildcard: bool) -> anyhow::Result<()> {
+        let name = self.name();
         match self {
             Accumulator::Count(c) => {
                 if is_wildcard || !val.is_null() {
@@ -227,26 +234,65 @@ impl Accumulator {
                     v.push(val.clone());
                 }
             }
-            Accumulator::CountDistinct(s) => {
-                if !val.is_null() {
-                    s.insert(distinct_key(val));
+            // Every aggregate skips NULL, so DISTINCT does not admit it.
+            Accumulator::Distinct { seen, inner } => {
+                if !val.is_null() && seen.insert(distinct_key(val)) {
+                    inner.update(val, is_wildcard)?;
                 }
             }
             Accumulator::PercentileDisc { values, .. }
-            | Accumulator::PercentileCont { values, .. } => match val {
-                Value::Null => {}
-                Value::Int(i) => values.push(*i as f64),
-                Value::Float(f) => values.push(*f),
-                // It skipped a value that is not a number, as `sum` did.
-                other => {
-                    return Err(anyhow::anyhow!(
-                        "percentileDisc() and percentileCont() take numbers, got a {}",
-                        other.type_name()
-                    ));
+            | Accumulator::PercentileCont { values, .. } => {
+                if let Some(n) = uni_query_functions::percentile::read_input(val, name)
+                    .map_err(|e| anyhow::anyhow!(e))?
+                {
+                    values.push(n);
                 }
-            },
+            }
         }
         Ok(())
+    }
+
+    /// The Cypher name of a percentile aggregate, for its messages.
+    fn name(&self) -> &'static str {
+        match self {
+            Accumulator::PercentileCont { .. } => "percentileCont",
+            Accumulator::Distinct { inner, .. } => inner.name(),
+            _ => "percentileDisc",
+        }
+    }
+
+    /// Whether this aggregate takes a percentile argument it has not read
+    /// yet, so the caller evaluates the second argument only while needed.
+    pub(crate) fn wants_percentile(&self) -> bool {
+        match self {
+            Accumulator::PercentileDisc { percentile, .. }
+            | Accumulator::PercentileCont { percentile, .. } => percentile.is_none(),
+            Accumulator::Distinct { inner, .. } => inner.wants_percentile(),
+            _ => false,
+        }
+    }
+
+    /// Reads one row's percentile argument. The first non-NULL one is the
+    /// percentile; nothing else reads it. The fallback executor never read
+    /// it, so every percentile here answered the 0th.
+    ///
+    /// # Errors
+    ///
+    /// When the percentile is not a number or is outside `[0, 1]`.
+    pub(crate) fn set_percentile(&mut self, p: &Value) -> anyhow::Result<()> {
+        let name = self.name();
+        match self {
+            Accumulator::PercentileDisc { percentile, .. }
+            | Accumulator::PercentileCont { percentile, .. } => {
+                if percentile.is_none() {
+                    *percentile = uni_query_functions::percentile::read_percentile(p, name)
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                }
+                Ok(())
+            }
+            Accumulator::Distinct { inner, .. } => inner.set_percentile(p),
+            _ => Ok(()),
+        }
     }
 
     /// The aggregate's value.
@@ -258,36 +304,18 @@ impl Accumulator {
             Accumulator::Max(opt) => opt.as_ref().cloned().unwrap_or(Value::Null),
             Accumulator::Avg { sum, count } => sum.avg(*count),
             Accumulator::Collect(v) => Value::List(v.clone()),
-            Accumulator::CountDistinct(s) => Value::Int(s.len() as i64),
+            Accumulator::Distinct { inner, .. } => inner.finish(),
             Accumulator::PercentileDisc { values, percentile } => {
-                if values.is_empty() {
-                    return Value::Null;
-                }
-                let mut sorted = values.clone();
-                sorted.sort_by(|a, b| a.total_cmp(b));
-                let n = sorted.len();
-                let idx = (percentile * (n as f64 - 1.0)).round() as usize;
-                numeric_to_value(sorted[idx.min(n - 1)])
+                uni_query_functions::percentile::percentile_disc(
+                    &mut values.clone(),
+                    percentile.unwrap_or(0.0),
+                )
             }
             Accumulator::PercentileCont { values, percentile } => {
-                if values.is_empty() {
-                    return Value::Null;
-                }
-                let mut sorted = values.clone();
-                sorted.sort_by(|a, b| a.total_cmp(b));
-                let n = sorted.len();
-                if n == 1 {
-                    return Value::Float(sorted[0]);
-                }
-                let pos = percentile * (n as f64 - 1.0);
-                let lower = (pos.floor() as usize).min(n - 1);
-                let upper = (pos.ceil() as usize).min(n - 1);
-                if lower == upper {
-                    Value::Float(sorted[lower])
-                } else {
-                    let frac = pos - lower as f64;
-                    Value::Float(sorted[lower] + frac * (sorted[upper] - sorted[lower]))
-                }
+                uni_query_functions::percentile::percentile_cont(
+                    &mut values.clone(),
+                    percentile.unwrap_or(0.0),
+                )
             }
         }
     }
@@ -320,8 +348,6 @@ pub struct Executor {
     pub(crate) l0_manager: Option<Arc<L0Manager>>,
     pub(crate) algo_registry: Arc<AlgorithmRegistry>,
     pub(crate) use_transaction: bool,
-    /// File sandbox configuration for BACKUP/COPY/EXPORT commands
-    pub(crate) file_sandbox: uni_common::config::FileSandboxConfig,
     pub(crate) config: uni_common::config::UniConfig,
     /// Cache for parsed generation expressions to avoid re-parsing on every row
     pub(crate) gen_expr_cache: Arc<RwLock<HashMap<GenExprCacheKey, Expr>>>,
@@ -398,7 +424,6 @@ impl Clone for Executor {
             l0_manager: self.l0_manager.clone(),
             algo_registry: self.algo_registry.clone(),
             use_transaction: self.use_transaction,
-            file_sandbox: self.file_sandbox.clone(),
             config: self.config.clone(),
             gen_expr_cache: self.gen_expr_cache.clone(),
             procedure_registry: self.procedure_registry.clone(),
@@ -434,7 +459,6 @@ impl Executor {
             l0_manager: None,
             algo_registry: Arc::new(AlgorithmRegistry::new()),
             use_transaction: false,
-            file_sandbox: uni_common::config::FileSandboxConfig::default(),
             config: uni_common::config::UniConfig::default(),
             gen_expr_cache: Arc::new(RwLock::new(HashMap::new())),
             procedure_registry: Some(proc_registry),
@@ -491,10 +515,13 @@ impl Executor {
         self.xervo_runtime = runtime;
     }
 
-    /// Set the file sandbox configuration for BACKUP/COPY/EXPORT commands.
-    /// MUST be called with sandboxed config in server mode.
+    /// Set the file sandbox configuration for BACKUP and COPY commands.
+    ///
+    /// Overrides `file_sandbox` of the configuration [`Self::set_config`]
+    /// applied; the sandbox is part of that configuration, so a `Uni`
+    /// database's executor already carries its `UniConfig::file_sandbox`.
     pub fn set_file_sandbox(&mut self, sandbox: uni_common::config::FileSandboxConfig) {
-        self.file_sandbox = sandbox;
+        self.config.file_sandbox = sandbox;
     }
 
     /// Apply a runtime configuration to this executor.
@@ -502,9 +529,15 @@ impl Executor {
         self.config = config;
     }
 
-    /// Validate a file path against the sandbox configuration.
+    /// Validate a file path against the configured file sandbox.
+    ///
+    /// The sandbox is read from `config` — the `UniConfig` a database applies
+    /// with [`Self::set_config`]. It used to be a separate field that only
+    /// `set_file_sandbox` wrote and nothing in the database called, so
+    /// `UniConfig::file_sandbox` was never enforced.
     pub(crate) fn validate_path(&self, path: &str) -> Result<std::path::PathBuf> {
-        self.file_sandbox
+        self.config
+            .file_sandbox
             .validate_path(path)
             .map_err(|e| anyhow!("Path validation failed: {}", e))
     }
@@ -605,6 +638,23 @@ impl Executor {
             .as_ref()
             .and_then(|s| s.pinned_storage.clone())
             .unwrap_or_else(|| self.storage.clone())
+    }
+
+    /// The property manager reads on this executor's behalf should use: the
+    /// shared one when installed, else a fresh one over **live** storage.
+    ///
+    /// Never one over [`Self::effective_storage`]: a property manager over
+    /// version-pinned storage treats the pin as a time-travel snapshot and
+    /// skips the transaction's own buffer, so a transaction would stop
+    /// reading its own property writes.
+    pub(crate) fn live_property_manager(&self) -> Arc<PropertyManager> {
+        self.prop_manager_arc.clone().unwrap_or_else(|| {
+            Arc::new(PropertyManager::new(
+                self.storage.clone(),
+                self.storage.schema_manager_arc(),
+                1000,
+            ))
+        })
     }
 
     /// Attach a per-transaction VID/EID reservoir. When set, CREATE/MERGE
@@ -1048,6 +1098,22 @@ pub struct ProfileOutput {
     pub total_time_ms: u64,
     /// Peak memory used during execution in bytes.
     pub peak_memory_bytes: usize,
+    /// Logical planning time in milliseconds (Cypher AST to logical plan).
+    ///
+    /// Measured by the API layer before execution starts, so it is not part of
+    /// [`Self::total_time_ms`].
+    #[serde(default)]
+    pub logical_planning_ms: f64,
+    /// Physical planning time in milliseconds, summed over every plan built.
+    ///
+    /// Includes the sub-plans built during execution (a correlated subquery's
+    /// body once per outer row), so it is part of [`Self::total_time_ms`].
+    #[serde(default)]
+    pub physical_planning_ms: f64,
+    /// Physical plans built: one for the query plus one per execution-time
+    /// sub-plan.
+    #[serde(default)]
+    pub physical_plans: u64,
 }
 
 /// Runtime statistics for a single logical plan operator.
@@ -1136,6 +1202,8 @@ impl Executor {
         let explain_output = planner.explain_logical_plan(&plan)?;
 
         let start = Instant::now();
+        let plans_before = self.counters.physical_plans();
+        let planning_before = self.counters.planning_nanos();
 
         let prop_manager = self.create_prop_manager();
 
@@ -1173,6 +1241,14 @@ impl Executor {
                 runtime_stats: stats,
                 total_time_ms: total_time.as_millis() as u64,
                 peak_memory_bytes: 0,
+                // Filled in by the API layer, which owns logical planning.
+                logical_planning_ms: 0.0,
+                physical_planning_ms: self
+                    .counters
+                    .planning_nanos()
+                    .saturating_sub(planning_before) as f64
+                    / 1_000_000.0,
+                physical_plans: self.counters.physical_plans().saturating_sub(plans_before),
             },
         ))
     }
@@ -1191,6 +1267,70 @@ mod tests {
     use super::*;
 
     // ── Accumulator tests ────────────────────────────────────────────
+
+    const TWO_53: i64 = 1 << 53;
+    const TWO_63: f64 = 9_223_372_036_854_775_808.0;
+
+    #[test]
+    fn canonical_numeric_key_does_not_fold_two_to_the_63() {
+        assert_eq!(
+            canonical_numeric_key(&Value::Float(TWO_63)),
+            Value::Float(TWO_63)
+        );
+        assert_eq!(
+            canonical_numeric_key(&Value::Float(-TWO_63)),
+            Value::Int(i64::MIN)
+        );
+        assert_eq!(canonical_numeric_key(&Value::Float(1.0)), Value::Int(1));
+    }
+
+    #[test]
+    fn min_max_compare_integers_and_floats_exactly() {
+        for values in [
+            [Value::Int(TWO_53 + 1), Value::Float(TWO_53 as f64)],
+            [Value::Float(TWO_53 as f64), Value::Int(TWO_53 + 1)],
+        ] {
+            let mut min_acc = Accumulator::new("MIN", false);
+            let mut max_acc = Accumulator::new("MAX", false);
+            for v in &values {
+                min_acc.update(v, false).unwrap();
+                max_acc.update(v, false).unwrap();
+            }
+            assert_eq!(min_acc.finish(), Value::Float(TWO_53 as f64));
+            assert_eq!(max_acc.finish(), Value::Int(TWO_53 + 1));
+        }
+        let mut max_acc = Accumulator::new("MAX", false);
+        max_acc.update(&Value::Float(TWO_63), false).unwrap();
+        max_acc.update(&Value::Int(i64::MAX), false).unwrap();
+        assert_eq!(max_acc.finish(), Value::Float(TWO_63));
+    }
+
+    #[test]
+    fn distinct_aggregates_fold_the_first_value_of_each_class() {
+        let values = [
+            Value::Float(1.0),
+            Value::Int(1),
+            Value::Null,
+            Value::Float(1.0),
+        ];
+        for (op, want) in [
+            ("SUM", Value::Float(1.0)),
+            ("COUNT", Value::Int(1)),
+            ("MIN", Value::Float(1.0)),
+            ("COLLECT", Value::List(vec![Value::Float(1.0)])),
+        ] {
+            let mut acc = Accumulator::new(op, true);
+            for v in &values {
+                acc.update(v, false).unwrap();
+            }
+            assert_eq!(acc.finish(), want, "{op}(DISTINCT)");
+        }
+        let mut acc = Accumulator::new("COUNT", true);
+        for v in [Value::Int(i64::MAX), Value::Float(TWO_63)] {
+            acc.update(&v, false).unwrap();
+        }
+        assert_eq!(acc.finish(), Value::Int(2));
+    }
 
     #[test]
     fn test_accumulator_percentile_rejects_a_non_number() {

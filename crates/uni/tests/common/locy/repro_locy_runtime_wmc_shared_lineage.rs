@@ -22,24 +22,22 @@
 //!
 //! # Reproducibility through the public API
 //!
-//! The canonical shared-proof shape is the reachability diamond
+//! The canonical shape is the reachability diamond
 //!   s -0.3-> m -0.5-> t ,  s -0.7-> t
-//! evaluated by a recursive `reach` rule. With `exact_probability` this fires
-//! `detect_shared_lineage` (a `SharedProbabilisticDependency` warning is
-//! emitted) and runs `apply_exact_wmc`. The passing test below asserts BOTH
-//! facts, proving the exact-WMC path executes end-to-end. Its computed
-//! probability for `reach(s,t)` is `0.79` — the value the Locy TCK
-//! (`monotonic/ExactProbability.feature`, scenario "BDD mode produces numeric
-//! probability for MNOR diamond") codifies as correct for exact mode
-//! (`MNOR(0.7, 0.3)` over the two fold-input edges).
+//! evaluated by a recursive `reach` rule with `exact_probability`. A positive
+//! `IS` reference to a PROB rule is a probabilistic condition, so `reach(s,t)`
+//! is the possible-worlds probability of `X ∨ (Y ∧ Z)`:
+//! 1 − (1 − 0.7)(1 − 0.3 · 0.5) = 0.745. (It was 0.79 = P(X ∨ Y) while the
+//! reference was a Boolean semi-join, which dropped the conjunct Z.) The two
+//! proofs share no edge, so no `SharedProbabilisticDependency` warning is
+//! raised; `locy_prob_is_ref_semantics` covers a genuinely shared case.
 //!
-//! In every shape reachable from surface Locy, the pre-fold batch column order
-//! coincides with the yield schema, so the positional read at `:2537` is
-//! *coincidentally* correct and the output matches the codified expectation. The
-//! ignored test documents the divergence the defect would produce (full
-//! inclusion-exclusion `X ∨ (Y∧Z) = 0.745`) but is marked latent: forcing a
-//! pre-fold column-order divergence is not achievable through the public API,
-//! and asserting `0.745` today would contradict the TCK-codified `0.79`.
+//! # Fixed
+//!
+//! Exact inference resolves the KEY, PROB and lineage columns by name and
+//! fails closed on a missing one (`locy_lineage::tests`), since the public
+//! surface cannot produce a pre-fold batch whose column order differs from
+//! the yield schema.
 
 use anyhow::Result;
 use uni_db::locy::LocyConfig;
@@ -106,10 +104,9 @@ fn has_warning(result: &uni_locy::LocyResult, code_substr: &str) -> bool {
         .any(|w| format!("{:?}", w.code).contains(code_substr))
 }
 
-/// Proves the exact-WMC path (`detect_shared_lineage` + `apply_exact_wmc`, which
-/// contain the [13] positional-index code) runs end-to-end: the shared-proof
-/// diamond emits a `SharedProbabilisticDependency` warning and produces the
-/// TCK-codified exact-mode probability `0.79` for `reach(s,t)`.
+/// The exact path runs end-to-end on the diamond and gives the
+/// possible-worlds probability `0.745` for `reach(s,t)`, with no
+/// shared-lineage warning: the two proofs share no edge.
 #[tokio::test]
 async fn wmc_shared_lineage_exact_path_engages() -> Result<()> {
     let db = Uni::in_memory().build().await?;
@@ -124,45 +121,53 @@ async fn wmc_shared_lineage_exact_path_engages() -> Result<()> {
 
     let p_st = prob_of(&result, "s", "t");
     let shared = has_warning(&result, "SharedProbabilisticDependency");
-    println!("[13] exact-WMC reach(s,t) prob -> {p_st:?}, shared-dependency warning = {shared}");
     assert!(
-        shared,
-        "the shared-proof diamond must emit SharedProbabilisticDependency, proving detect_shared_lineage/apply_exact_wmc ran"
+        !shared,
+        "the diamond's two proofs share no edge, so no shared-lineage warning"
     );
     let p_st = p_st.expect("reach(s,t) should exist");
     assert!(
-        (p_st - 0.79).abs() < 1e-9,
-        "exact-mode MNOR diamond is codified as 0.79 by the TCK; the pre-fold column order coincides with the yield schema so the positional read at :2537 is coincidentally correct; got {p_st}"
+        (p_st - 0.745).abs() < 1e-9,
+        "exact-mode MNOR diamond: 1 - (1 - 0.7)(1 - 0.3 * 0.5) = 0.745; got {p_st}"
     );
     Ok(())
 }
 
-/// The [13] defect's SHAPE — a mis-grouped/mis-read shared lineage. Ignored and
-/// latent: forcing the pre-fold batch column order to diverge from the yield
-/// schema (the precondition that makes the raw positional indices at
-/// `locy_fixpoint.rs:2537` read the wrong columns) is not achievable through the
-/// public Locy surface. The full inclusion-exclusion value `X ∨ (Y∧Z) = 0.745`
-/// is what correct exact WMC over the shared base facts would yield, but the
-/// codebase (and its TCK) treat `0.79` as the exact-mode answer, so this is
-/// documented, not asserted as a live failure.
+/// The diamond with the FOLD output renamed in YIELD (`prob AS pr`).
+///
+/// The pre-fold facts carry the PROB column under the fold variable (`prob`),
+/// not the YIELD alias (`pr`). Exact inference once looked it up under the
+/// alias, matched no column, and the shared group kept its first row's own
+/// weight.
 #[tokio::test]
-#[ignore = "e2e repro for uni-query [13]: apply_exact_wmc reads PROB/KEY by raw yield-schema positions against pre-fold batches; only manifests when the batch column order diverges from the yield schema, which is unreachable via the public surface (positional read is coincidentally correct in all reachable shapes)"]
-async fn wmc_shared_lineage_positional_misgroup_would_diverge() -> Result<()> {
+async fn wmc_shared_lineage_exact_path_with_renamed_fold_output() -> Result<()> {
     let db = Uni::in_memory().build().await?;
     seed_diamond(&db).await?;
 
+    let program = "CREATE RULE reach AS \
+         MATCH (a:N)-[e:E]->(b:N) \
+         FOLD prob = MNOR(e.p) YIELD KEY a, KEY b, prob AS pr \n\
+         CREATE RULE reach AS \
+         MATCH (a:N)-[e:E]->(mid:N) WHERE mid IS reach TO b \
+         FOLD prob = MNOR(e.p) YIELD KEY a, KEY b, prob AS pr \n\
+         QUERY reach RETURN a.name AS src, b.name AS dst, pr AS prob";
     let result = db
         .session()
-        .locy_with(REACH_MNOR)
+        .locy_with(program)
         .with_config(exact_config())
         .run()
         .await?;
 
     let p_st = prob_of(&result, "s", "t").expect("reach(s,t) should exist");
-    println!("[13] exact-WMC reach(s,t) prob -> {p_st} (full inclusion-exclusion X∨(Y∧Z) = 0.745)");
     assert!(
-        (p_st - 0.745).abs() < 1e-6,
-        "would hold only if apply_exact_wmc combined the shared base facts by exact inclusion-exclusion; got {p_st}"
+        (p_st - 0.745).abs() < 1e-9,
+        "renaming the FOLD output must not change the exact-mode answer 0.745; got {p_st}"
     );
     Ok(())
 }
+
+// The ignored `wmc_shared_lineage_positional_misgroup_would_diverge` that
+// stood here asserted `0.745` for this diamond. That is the possible-worlds
+// value, which `wmc_shared_lineage_exact_path_engages` now asserts; the
+// positional-read defect it was named for is covered by the unit tests named
+// in the module docs.

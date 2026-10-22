@@ -40,6 +40,22 @@ ORDER BY p.year DESC
 LIMIT 10
 ```
 
+### Quoted Identifiers
+
+Any name (variable, label, relationship type, property key, map key, alias,
+parameter, procedure, index or constraint name) can be written in backticks,
+which allows spaces, punctuation and keywords. A backtick inside the name is
+written doubled:
+
+```cypher
+MATCH (`the paper`:Paper)
+WHERE `the paper`.`order` = $`min order`
+RETURN `the paper`.`has``tick` AS `a``b`   // property has`tick, column a`b
+```
+
+The quoted and the bare spelling of a name are the same name: `` `p` `` and
+`p` are one variable.
+
 ---
 
 ## MATCH Clause
@@ -265,6 +281,21 @@ Writing `p.title` is an error, because `p` holds many nodes. The message names
 the replacement: `[n IN p | n.title]` for all of them, or `last(p).title` for
 the final one.
 
+#### Inner node labels
+
+A label on an inner node holds on every iteration. A label on the sub-pattern's
+first node holds for the node that starts each iteration: the outer start node,
+and each node where one iteration ends and the next begins. A label on a later
+inner node holds for that node on every iteration. Each inner node may carry at
+most one label; filter extra labels in `WHERE`.
+
+<!-- doctest: skip -->
+```cypher
+// Every node a hop starts from is a Person; the final node may be anything.
+MATCH (a {name: 'Alice'})((x:Person)-[:KNOWS]->(y)){1,3}(b)
+RETURN b.name
+```
+
 **Restrictions.** A quantified pattern is compiled against declared
 relationship types, so an undeclared type is refused — either declare it, or
 write the sub-pattern without inner variable names so it is planned as an
@@ -293,6 +324,24 @@ WHERE p.year >= 2020
 WHERE p.year < 2025
 WHERE p.year <= 2025
 ```
+
+Floats compare numerically, as openCypher specifies: `-0.0 = 0.0` is true and
+neither is less than the other; `NaN = x` is false and `NaN <> x` is true for
+every number `x` (including `NaN`), and `<`, `<=`, `>`, `>=` with a `NaN`
+operand are false. `DISTINCT` and grouping treat `-0.0` and `0.0` as one value
+and every `NaN` as one value; `ORDER BY` puts `NaN` after positive infinity.
+
+An integer and a float compare by exact value; the integer is never rounded to
+a float. `9007199254740993 = 9007199254740992.0` is false and
+`9007199254740993 > 9007199254740992.0` is true, in `WHERE`, `IN`, joins,
+`ORDER BY`, `min` and `max`, on literals, parameters and stored properties
+alike. An integer equal to a float is the same value: `1` and `1.0` are one row
+under `DISTINCT` and `UNION`, one group, and one element of
+`collect(DISTINCT ...)`. The value kept is the first one seen, so
+`UNWIND [1.0, 1] AS x RETURN DISTINCT x` returns `1.0`. An aggregate over
+`DISTINCT` sees those same first values: `sum(DISTINCT x)` over `[1.0, 1]` is
+`1.0`, and `collect(DISTINCT x)` is `[1.0]`. `UNION` of an integer column with
+a float column keeps each row's own type.
 
 ### Boolean Logic
 
@@ -323,6 +372,21 @@ WHERE p.doi IS NOT NULL
 RETURN COALESCE(p.nickname, p.name) AS display_name
 ```
 
+Operators follow openCypher's NULL rules, whether an operand is a literal, a
+declared property or a schemaless one:
+
+- Arithmetic, comparison, string and regex operators over NULL return NULL,
+  whatever the other operand is: `'ab' + null`, `p.missing ^ 2` and
+  `p.title =~ null` are all NULL.
+- `AND`, `OR` and `XOR` use three-valued (Kleene) logic. An operand that decides
+  the answer wins whatever the other operand is, in either position:
+  `false AND x` is false and `true OR x` is true. Otherwise a non-boolean
+  operand is a type error, beside NULL too: `null AND p.count` is an error, not
+  NULL. A number, string, list or map *literal* under `AND`/`OR`/`XOR`/`NOT` is
+  rejected when the query is compiled.
+- `STARTS WITH`, `ENDS WITH` and `CONTAINS` with a non-string operand return
+  NULL.
+
 ### String Operations
 
 <!-- doctest: skip -->
@@ -342,20 +406,105 @@ WHERE a._doc CONTAINS 'graph database'
 // Path-specific JSON FTS search
 WHERE a._doc.title CONTAINS 'graph'
 
-// Regular expression matching
+// Regular expression matching: the pattern must match the WHOLE title
 WHERE p.title =~ '.*Transform.*'
 
 // Case-insensitive regex
 WHERE p.email =~ '(?i)john@.*'
 
-// Email pattern matching
-WHERE p.email =~ '^[\\w.-]+@[\\w.-]+\\.\\w+$'
+// Email pattern matching (anchors are implied)
+WHERE p.email =~ '[\\w.-]+@[\\w.-]+\\.\\w+'
 ```
 
 **Note:** The `CONTAINS` operator is automatically routed to JSON FTS indexes when the column has an FTS index, enabling BM25-based full-text search with relevance ranking.
 
 **Regex Notes:**
-- The `=~` operator uses Rust's regex engine (similar to PCRE)
+- `=~` matches the **whole** string, as in Neo4j (Java's `Pattern.matches`):
+  `'abc' =~ 'b'` is `false` and `'abc' =~ '.*b.*'` is `true`. Write `.*` on
+  either side to search inside a string.
+- The end of the pattern is the absolute end of the string: `'abc\n' =~ 'abc'`
+  and `'abc\n' =~ 'abc$'` are `false`, also under `(?m)`. Alternation is
+  decided over the whole string, so `'ab' =~ 'a|ab'` is `true`.
+- Patterns use Java's `java.util.regex` syntax and defaults, as Neo4j does
+  (`Pattern.compile(p)` with no flags):
+  - `\w`, `\d`, `\s`, `\b` and the POSIX classes (`\p{Lower}`, `\p{Alpha}`, …)
+    are ASCII: `'é' =~ '\\w'` is `false`. `(?U)` makes them Unicode.
+  - `(?i)` folds ASCII letters only: `'É' =~ '(?i)é'` is `false`. Add `(?u)`
+    (or `(?U)`) for Unicode case folding: `'É' =~ '(?iu)é'` is `true`.
+  - `.` matches any character except a line terminator (`\n`, `\r`, U+0085,
+    U+2028, U+2029); `(?s)` lets it match those too.
+  - `$` also matches before a final line terminator (`'a\n' =~ 'a$\\n'` is
+    `true`); `(?m)` makes `^`/`$` match at every line break.
+  - `\v` is vertical whitespace, `\<`/`\>` are the literal characters, and
+    `\p{..}` names follow Java (`\p{IsGreek}`, `\p{sc=Greek}`, `\p{Lu}`).
+- Java syntax is accepted exactly as Java accepts it, and a pattern Java
+  rejects is an invalid-pattern error. That includes `\Q…\E`, `\h`/`\H`,
+  `\v`/`\V`, `\R`, `\Z`, `\z`, `\G` (the start, under `matches()`), `\e`,
+  `\cX`, octal (`\0101`), `\k<name>`, `(?d)` (UNIX_LINES: only `\n` ends a
+  line), flag groups such as `(?)` and `(?i-i)`, `(?x)` comments, class
+  intersections (`[a-z&&[^k]]`), and stacked quantifiers with Java's meaning
+  (`x{1}{2}` is `x` followed by an empty string repeated twice).
+- Every pattern Java accepts is accepted, with Java's meaning; no valid
+  pattern is refused. That includes look-ahead and look-behind (also with
+  `\b`, look-arounds or backreferences in the body, and over emoji and other
+  supplementary characters), backreferences (case-insensitive ones under
+  `(?i)` and `(?iu)` too, and backreferences inside the group they name),
+  atomic groups (`(?>…)`), possessive quantifiers (`a*+`), Unicode blocks
+  (`\p{InGreek}`, `\p{block=Greek}`), the `Character` predicates
+  (`\p{javaLowerCase}`, `\p{javaJavaIdentifierStart}`, …), named characters
+  (`\N{LATIN SMALL LETTER A}`), grapheme clusters (`\X`) and boundaries
+  (`\b{g}`), and `(?c)` (canonical equivalence for classes and properties:
+  `'e\u0301' =~ '(?c)[é]'` is `true`).
+  - Patterns with those constructs (and with `\b`, a multi-line or inner
+    `^`/`$`, or a quantified `\R`) run on a backtracking matcher over the
+    string's UTF-16 units, which follows Java's corner cases too: a capture
+    made in a look-ahead survives backtracking past it, a loop ends at its
+    first empty iteration (`'a' =~ '(?:a|\G){2}'` is `false`), a
+    look-behind can start inside a surrogate pair, and `(?i)` backreferences
+    fold case as Java does (`'kK' =~ '(?i)(k)\1'` is `true`, `'k\u212A' =~
+    '(?i)(k)\1'` is `false`, `true` under `(?iu)`). Every other pattern runs
+    on a linear-time automaton. The choice is made once per pattern.
+  - Where Java's matcher itself throws on an input (it can read past the end
+    of the string, as `\b{g}` does after a look-ahead that reached the end:
+    `'ab' =~ '(?=ab)a\b{g}b'`), the query fails with an error naming the
+    exception, as it does in Neo4j.
+- **Backtrack limit.** The backtracking matcher stops after
+  `regex_backtrack_limit` backtracking steps per match (default 10,000,000,
+  about 0.1–0.3 s for a refused match) and the query fails with `UniError::RegexBacktrackLimit`
+  (`UniRegexBacktrackLimitError` in Python, with `pattern` and `limit`).
+  Patterns like `(a+)+b` that backtrack exponentially in Java reach it on
+  long inputs; Java has no limit and would keep searching. Raise it with
+  `UniConfig { regex_backtrack_limit, .. }` or `config({"regex_backtrack_limit":
+  …})` in Python. A long scan of `=~` rows also honours the query timeout:
+  the deadline is checked between rows.
+- **Recursion limit.** Java's matcher runs out of stack on a backtracking
+  loop over a long string (`(?:a|b)*` past about 1,500 characters on a
+  default thread stack) and throws `StackOverflowError`. uni-db keeps its
+  backtracking state on an explicit stack and answers such inputs: a match
+  fails with a "Regex recursion limit exceeded" error only when its
+  backtrack stack outgrows a 64 MB budget (a 200,000-character
+  `(?:a|b)*(?=)` match is answered, a 2,400,000-character one is not). Loops Java runs without
+  recursion (`a*`, `(?:ab)*`) and patterns the automaton answers have no
+  such limit. A pattern nested more than 2,000 groups deep is rejected with
+  Java's "Stack overflow during pattern compilation".
+- **Reference JVM and Unicode version.** The semantics are pinned to Java 21,
+  the minimum JVM the current Neo4j release (2026.09) supports ("Java SE 21
+  and Java SE 25 Platform Specification", [Neo4j Operations Manual, system
+  requirements](https://neo4j.com/docs/operations-manual/current/installation/requirements/)).
+  Character classes, properties, scripts, blocks, character names, case
+  folding, grapheme clusters and canonical equivalence use Java 21's
+  Unicode 15.0 data, generated from that JDK, whatever the Rust toolchain:
+  a character assigned in Unicode 16.0 or later is unassigned (`\p{Cn}`),
+  and scripts added since (`\p{IsGaray}`, …) are unknown names, as on
+  Java 21.
+- Agreement with Java 21 is checked against answers recorded from the JDK
+  for generated and hand-written cases (constructs, anchors, Unicode
+  properties, blocks and `\p{java…}`, character names, grapheme clusters,
+  `(?c)`, case-insensitive backreferences, empty loop iterations,
+  look-arounds). Where Java 25 answers differently (Unicode 16.0 data and
+  Java 25's newer grapheme rules), uni-db answers as Java 21. Look-behinds
+  whose length arithmetic nears 2^31 (`{2147483647,}`, zero-width loops of
+  about 10^9 iterations) can still differ from Java.
 - NULL operands return NULL (Cypher semantics)
 - Invalid regex patterns return an error
 
@@ -422,6 +571,18 @@ RETURN p.citations * 2 AS double_citations
 
 // String concatenation
 RETURN p.title + ' (' + p.venue + ')' AS formatted
+
+// A number, boolean or temporal concatenates its toString()
+RETURN 'v' + 1.0, 'due ' + duration('P1D')   // 'v1.0', 'due P1D'
+
+// `^` is always a float
+RETURN 2 ^ 3   // 8.0
+
+// Temporal arithmetic takes durations; subtracting two values of one
+// temporal type gives a duration, and a number is not a duration
+RETURN date('2020-01-02') - date('2020-01-01')   // P1D
+RETURN duration('P1D') * 2                        // P2D
+// date('2020-01-02') + 1 is a type error
 
 // Conditional (CASE)
 RETURN CASE
@@ -568,6 +729,8 @@ Uni provides a comprehensive set of scalar functions for data transformation.
 
 Math functions take numbers: `NULL` gives `NULL`, and any other value (a string, a duration) is a type error. So are `stDev`, `variance` and the percentiles over a value that is not a number.
 
+`percentileDisc(x, p)` returns one of its inputs, unchanged: over integers it returns an integer, exactly. `percentileCont(x, p)` returns a float interpolated between the inputs around the percentile. The percentile `p` must be a number between `0.0` and `1.0`.
+
 | Function | Description | Example |
 |----------|-------------|---------|
 | `abs(n)` | Absolute value | `RETURN abs(-5)` → `5` |
@@ -591,7 +754,7 @@ Math functions take numbers: `NULL` gives `NULL`, and any other value (a string,
 | `tail(list)` | All but first element | `RETURN tail([1,2,3])` → `[2,3]` |
 | `last(list)` | Last element | `RETURN last([1,2,3])` → `3` |
 | `keys(map)` | Keys of a map | `RETURN keys({a:1, b:2})` → `['a','b']` |
-| `range(start, end, [step])` | Generate number sequence | `RETURN range(1, 5)` → `[1,2,3,4,5]` |
+| `range(start, end, [step])` | Integer sequence from `start` to `end` inclusive; `null` if any argument is `null`. A non-integer argument raises `InvalidArgumentType`, a zero step `NumberOutOfRange` | `RETURN range(1, 5)` → `[1,2,3,4,5]`; `RETURN range(0, null)` → `null` |
 
 ### Path Functions
 
@@ -634,7 +797,7 @@ The bulk loader can supply explicit per-row values; otherwise the engine assigns
 | Function | Description | Example |
 |----------|-------------|---------|
 | `similar_to(sources, queries [, options])` | Unified similarity scoring (vector similarity, BM25, or hybrid fusion). Metric-aware: uses the index's configured distance metric (Cosine, L2, or Dot). | `RETURN similar_to(n.embedding, $vec)` |
-| `vector_similarity(v1, v2)` | Cosine similarity between two vectors. Alias for `similar_to` with a single vector source. | `WHERE vector_similarity(a.embed, b.embed) > 0.8` |
+| `vector_similarity(v1, v2)` | Cosine similarity between two vectors (NULL if either is NULL); MaxSim with `v2` as the query for two multi-vectors. Evaluated per row: a `WHERE` threshold returns every matching node and never uses a vector index (use `~=` for top-K). | `WHERE vector_similarity(a.embed, b.embed) > 0.8` |
 | `vector_distance(v1, v2 [, metric])` | Distance between two vectors. | `RETURN vector_distance(a.embed, b.embed, 'cosine')` |
 
 `similar_to` is an expression function — it works in `WHERE`, `RETURN`, `WITH`, `ORDER BY`, and Locy rule bodies. Unlike `CALL uni.search(...)`, it scores one already-bound node (point computation), not a top-K scan.
@@ -770,6 +933,62 @@ CREATE (p:Paper {title: 'My Paper', year: 2024})
 RETURN p.title, p.year
 ```
 
+### Write Counters
+
+`tx.execute(...)` returns an `ExecuteResult` whose counters describe what the
+statement changed. openCypher does not specify execution counters; these
+follow Neo4j's query statistics, with the TCK's (entity, key, value) rule for
+properties:
+
+| Counter | Counts |
+|---|---|
+| `nodes_created` / `nodes_deleted` | Nodes created or deleted. A `SET`, `REMOVE` or `MERGE ... ON MATCH` on an existing node creates nothing. |
+| `relationships_created` / `relationships_deleted` | The same for relationships, including those `DETACH DELETE` removes. |
+| `properties_set` | Properties added, or overwritten with a different value. Assigning the value a property already has counts nothing. |
+| `properties_removed` | Properties removed by an explicit `REMOVE` or `SET ... = null`, or overwritten with a different value. The properties of a deleted node or relationship are not counted, as in Neo4j. |
+| `labels_added` / `labels_removed` | Per node whose label set changes, like Neo4j's `labelsAdded` / `labelsRemoved`. Deleting a node does not count its labels. |
+
+An entity created and changed in one statement reports only its final state,
+and an entity named twice in one `DELETE` is counted once.
+
+The openCypher TCK's "side effects" (`+labels`, `-properties`, ...) are not
+these counters: the TCK harness diffs the graph before and after the
+statement. By that diff `CREATE (:Label), (:Label)` is `+labels 1` (one label
+newly in use) and deleting a node with two properties is `-properties 2`;
+here they report `labels_added = 2` and `properties_removed = 0`.
+
+```cypher
+CREATE (:Person {name: 'Alice', age: 30})-[:KNOWS {since: 2020}]->(:Person {name: 'Bob'})
+
+// nodes_deleted = 1, relationships_deleted = 1, properties_removed = 0
+MATCH (n:Person {name: 'Alice'}) DETACH DELETE n
+```
+
+---|---|---|
+| `nodes_created` / `nodes_deleted` | `+nodes` / `-nodes` | Nodes created or deleted. A `SET`, `REMOVE` or `MERGE ... ON MATCH` on an existing node creates nothing. |
+| `relationships_created` / `relationships_deleted` | `+relationships` / `-relationships` | The same for relationships, including those `DETACH DELETE` removes. |
+| `properties_set` | `+properties` | Properties added, or overwritten with a different value. Assigning the value a property already has counts nothing. |
+| `properties_removed` | `-properties` | Properties removed, set to `null`, or overwritten with a different value, and every property of a deleted node or relationship. |
+| `labels_added` / `labels_removed` | `+labels` / `-labels` | Per node whose label set changes. |
+
+An entity created and changed in one statement reports only its final state;
+one created and deleted in the same statement reports no property changes.
+
+The label counters follow Neo4j's `labelsAdded` / `labelsRemoved`, not the
+TCK. The TCK compares the set of labels in use across the whole graph before
+and after the statement: `CREATE (:Label), (:Label)` is `+labels 1`, and
+`CREATE (:Label)` when other `:Label` nodes already exist is no label change.
+Here the first reports `labels_added = 2` and the second `labels_added = 1`,
+and deleting a node does not count its labels as removed.
+
+```cypher
+CREATE (:Person {name: 'Alice', age: 30})-[:KNOWS {since: 2020}]->(:Person {name: 'Bob'})
+
+// nodes_deleted = 1, relationships_deleted = 1,
+// properties_removed = 3 (two on Alice, one on the relationship)
+MATCH (n:Person {name: 'Alice'}) DETACH DELETE n
+```
+
 ---
 
 ## WITH Clause
@@ -784,6 +1003,18 @@ MATCH (p:Paper)-[:AUTHORED_BY]->(a:Author)
 WITH a, COUNT(p) AS paper_count
 WHERE paper_count > 5
 RETURN a.name, paper_count
+```
+
+### WHERE After ORDER BY / SKIP / LIMIT
+
+A `WHERE` that follows `WITH … ORDER BY … SKIP … LIMIT` filters the rows the
+page kept; it does not run before the page:
+
+```cypher
+UNWIND range(1, 10) AS x
+WITH x ORDER BY x LIMIT 3
+WHERE x > 2
+RETURN collect(x)   // [3]
 ```
 
 ### Subquery-like Behavior
@@ -826,6 +1057,19 @@ CREATE (a:Author {name: name})
 ## CALL Clause (Procedures)
 
 Invoke built-in procedures.
+
+A `CALL` can stand alone or follow other clauses. Standalone, `YIELD` is
+optional and every result column is returned. Inside a query, the procedure
+runs once per input row, and a procedure that returns results must name the
+ones it uses with `YIELD`; only a procedure with no results may be called
+without it. Each yielded column has the type the procedure declares.
+
+<!-- doctest: skip -->
+```cypher
+UNWIND ['1', '2'] AS s
+CALL uni.number.parseInt(s) YIELD result
+RETURN s, result + 1 AS next
+```
 
 ### Vector Search
 
@@ -1397,17 +1641,22 @@ PROFILE executes the query and returns runtime statistics alongside results.
 
     ```rust
     // Execute with profiling
-    let (results, profile) = db.profile(
-        "MATCH (p:Person) WHERE p.age > 25 RETURN p.name"
-    ).await?;
+    let (result, profile) = db
+        .session()
+        .query_with("MATCH (p:Person) WHERE p.age > 25 RETURN p.name")
+        .profile()
+        .await?;
 
     println!("Total time: {}ms", profile.total_time_ms);
-    println!("Rows scanned: {}", profile.rows_scanned);
-    println!("Peak memory: {} bytes", profile.peak_memory_bytes);
+    println!("Rows scanned: {}", result.metrics().rows_scanned);
+    println!(
+        "Planning: logical {:.3}ms, physical {:.3}ms over {} plan(s)",
+        profile.logical_planning_ms, profile.physical_planning_ms, profile.physical_plans
+    );
 
     // Per-operator statistics
-    for op in &profile.operators {
-        println!("{}: {}ms, {} rows", op.name, op.time_ms, op.rows_produced);
+    for op in &profile.runtime_stats {
+        println!("{}: {:.3}ms, {} rows", op.operator, op.time_ms, op.actual_rows);
     }
     ```
 
@@ -1427,9 +1676,17 @@ PROFILE executes the query and returns runtime statistics alongside results.
 
 The profile includes:
 - **total_time_ms**: Total query execution time
-- **rows_scanned**: Number of rows read from storage
+- **runtime_stats** (Python: `operators`): Per-operator breakdown with timing and row counts
+- **logical_planning_ms** / **physical_planning_ms** / **physical_plans** (Rust): planning cost.
+  `physical_plans` is one for the query plus one per sub-plan built while it runs, so a
+  correlated `CALL { ... }` body planned once per outer row shows up as a count that grows
+  with the rows
 - **peak_memory_bytes**: Maximum memory used during execution
-- **operators**: Per-operator breakdown with timing and row counts
+
+The result's `metrics()` carries the query-level counters, including **rows_scanned**
+(rows examined by scans, before filtering). A variable-length pattern with an inline
+property map, such as `-[:R*1..3 {w: 1}]->` or `->(b:N {x: 2})`, scans every edge of the
+type before walking from the anchor, and that scan is included in `rows_scanned`.
 
 ---
 
@@ -1461,14 +1718,10 @@ The `shortestPath` function finds the shortest path between two nodes.
 MATCH path = shortestPath((a:Author {name: 'Alice'})-[:COAUTHOR*]-(b:Author {name: 'Bob'}))
 RETURN path
 
-// With hop constraints (minimum and maximum hops)
-MATCH path = shortestPath((a:Person)-[:KNOWS*2..6]-(b:Person))
+// With an upper hop bound
+MATCH path = shortestPath((a:Person)-[:KNOWS*1..6]-(b:Person))
 WHERE a.name = 'Alice' AND b.name = 'Bob'
 RETURN path, length(path) AS hops
-
-// Minimum hops only (at least 2 hops)
-MATCH path = shortestPath((a)-[:FOLLOWS*2..]-(b))
-RETURN path
 
 // Maximum hops only (at most 5 hops)
 MATCH path = shortestPath((a)-[:KNOWS*..5]-(b))
@@ -1481,10 +1734,62 @@ RETURN path
 
 **Hop Constraint Semantics:**
 - `*` or `*1..` — No *written* upper bound. The planner supplies a default of **100 hops**
-- `*2..6` — Between 2 and 6 hops
+- `*1..6` — Between 1 and 6 hops
 - `*..5` — At most 5 hops (1 to 5)
-- `*3..` — At least 3 hops, up to the 100-hop default
 - `*0..` — Zero or more hops (allows source == target)
+- A lower bound above 1 (`*2..6`, `*3..`) is rejected with an error: the search
+  returns the first, shortest match, so honouring a higher minimum would need a
+  different search.
+
+**When there is no path.** A mandatory `MATCH` drops a pair that has no path
+between its endpoints, as in openCypher and Neo4j; `OPTIONAL MATCH` keeps the
+row with the path `NULL`. This applies to `shortestPath`, `allShortestPaths`
+and the unnamed form `MATCH shortestPath(...)`. A node is its own target only
+through the zero-length path, so `(a)-[*]->(a)` finds nothing and `*0..` finds
+the path of length 0.
+
+```cypher
+// Only the people Alice can reach
+MATCH (a:Person {name: 'Alice'}), (b:Person)
+MATCH p = shortestPath((a)-[:KNOWS*]->(b))
+RETURN b.name, length(p)
+
+// Everyone, with hops NULL for those she cannot reach
+MATCH (a:Person {name: 'Alice'}), (b:Person)
+OPTIONAL MATCH p = shortestPath((a)-[:KNOWS*]->(b))
+RETURN b.name, length(p)
+
+// With an unbound target, each person gets the people they reach,
+// or one row with NULLs if they reach nobody
+MATCH (a:Person)
+OPTIONAL MATCH p = shortestPath((a)-[:KNOWS*]->(b:Person))
+RETURN a.name, b.name, length(p)
+```
+
+A `WHERE` on the path (`WHERE length(p) > 2`) filters the shortest path that was
+found; it does not search for a longer path that would pass.
+
+**A property map on the relationship restricts the search.** The result is the
+shortest path whose every relationship matches the map, not the shortest path
+filtered afterwards. A map value may be computed from the row — the endpoints
+or variables from earlier clauses — and each row is searched under its own
+values; a `NULL` value matches no relationship.
+
+```cypher
+// Shortest route over roads of the traveller's own class
+MATCH (a:City {name: 'Oslo'}), (b:City {name: 'Rome'}), (t:Traveller {id: $id})
+MATCH p = shortestPath((a)-[:ROAD* {class: t.class}]-(b))
+RETURN length(p)
+```
+
+A value that names the path or its relationship variable is refused.
+
+!!! warning "Changed in the next release"
+    Up to 4.2.0 a mandatory `MATCH` kept every no-path pair as a row with a
+    `NULL` path, and an `OPTIONAL MATCH` with an unbound target returned a
+    `NULL`-path row for every unreachable target. Queries that relied on that —
+    for example counting rows to count candidate pairs — should use `OPTIONAL
+    MATCH`.
 
 !!! warning "An omitted upper bound means 100, not infinity"
     A pattern with no upper bound is planned with a maximum of 100 hops. If
@@ -1825,6 +2130,18 @@ Flush and compact all L1 runs into L2 for storage hygiene.
 VACUUM
 ```
 
+### Running administrative procedures
+
+`uni.admin.compact`, `uni.admin.snapshot.create`, `uni.admin.snapshot.restore`,
+`uni.admin.snapshot.delete` and `uni.admin.verifyEdgeEndpoints` change the database as a whole, so they are
+not reads: `session.query()`, a session prepared query, a pinned session, a
+read-only handle and a `VERSION AS OF` statement refuse them with the read-only
+error. Run them with `session.run()` (Rust `Session::run`, Python
+`session.run()`, the `uni query` CLI), which executes them outside any
+transaction — `snapshot.restore`, `snapshot.delete` and `verifyEdgeEndpoints`
+refuse to run inside one. An `AuthzPolicy` sees the action `dbms` for them. `compactionStatus()` and
+`snapshot.list()` are reads and run anywhere.
+
 ### Compaction
 
 ```cypher
@@ -1837,6 +2154,45 @@ CALL uni.admin.compactionStatus()
 YIELD l1_runs, l1_size_bytes, in_progress, pending
 ```
 
+### Edge endpoint verification
+
+A store written by an earlier release may hold edges whose endpoints violate
+their type's declared labels, so the planner does not narrow an unlabelled
+endpoint of those types until they are verified:
+
+```cypher
+// Every unverified declared edge type, or one by name
+CALL uni.admin.verifyEdgeEndpoints('WORK_AT')
+YIELD edge_type, edges_checked, source_violations, target_violations, conformance
+```
+
+A type with no violation is recorded `verified` and saved at once; one with
+violations stays `unverified` and its edges stay readable (delete them, then
+verify again). The whole LDBC SF1 store (15 types, 13M edges) verifies in about
+12 s. Run it outside a transaction: it waits up to 10 s for transactions opened
+before it to finish, then fails. A fork created, or a snapshot taken, before
+the verification does not use it, and restoring such a snapshot withdraws it.
+
+Verification is no longer what keeps `MATCH ()-[r:R]->()` fast. When the
+source cannot be narrowed to a label (an unverified type, a type with several
+declared source labels, `[:R|S]`, or no type), the query reads its sources
+from the relationship type's adjacency rather than scanning every vertex, with
+the same results. At LDBC SF1, `MATCH ()-[w:WORK_AT]->() RETURN count(w)` on an
+unverified store went from about 6 s to about 0.12 s. Inside a read-write
+transaction every vertex is still read, so that concurrent changes to them
+conflict as before.
+
+Opening a store that an earlier release wrote to after a type was `enforced`
+or `verified` (an unflushed WAL segment or a flush from that release) sets
+every such type back to `unverified`, logs a warning naming them, and saves
+that: the earlier release did not check endpoints. Verify again to restore
+narrowing.
+
+A `SET` or `REMOVE` cannot change a relationship's endpoints or type: a map
+carrying `_eid`, `_src`, `_dst` and `_type` that names other ones than the
+stored edge is refused with `EdgeIdentityChange` (Python
+`UniEdgeIdentityError`).
+
 ### Snapshots
 
 ```cypher
@@ -1848,8 +2204,12 @@ YIELD snapshot_id
 CALL uni.admin.snapshot.list()
 YIELD snapshot_id, name, created_at, version_hwm
 
-// Restore to a snapshot
-CALL uni.admin.snapshot.restore('before_migration')
+// Restore to a snapshot (data and schema), by id
+CALL uni.admin.snapshot.restore($snapshot_id)
+YIELD status
+
+// Delete a snapshot, releasing the storage versions it pins
+CALL uni.admin.snapshot.delete($snapshot_id)
 YIELD status
 ```
 
@@ -1889,7 +2249,10 @@ RETURN property, dataType
 
 ### Schema DDL Procedures
 
-Create and modify schema at runtime via procedures:
+Create and modify schema at runtime via procedures. They are schema writes,
+not reads: run them with `session.run()` (an auto-commit transaction) or in a
+transaction; `session.query()` refuses them. An `AuthzPolicy` sees the action
+`schema`.
 
 ```cypher
 // Create a new label

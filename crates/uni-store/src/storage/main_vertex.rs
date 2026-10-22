@@ -20,6 +20,7 @@ use crate::backend::table_names;
 use crate::backend::types::{FilterExpr, Scalar, ScalarIndexType, ScanRequest};
 use crate::runtime::counters::QueryCounters;
 use crate::storage::arrow_convert::build_timestamp_column_from_vid_map;
+use crate::storage::bulk_gate::IntoRowVisibility;
 use anyhow::{Result, anyhow};
 use arrow_array::builder::{
     FixedSizeBinaryBuilder, LargeBinaryBuilder, ListBuilder, StringBuilder,
@@ -264,62 +265,6 @@ impl MainVertexDataset {
             .await
     }
 
-    /// Build a partial-column RecordBatch marking VIDs as deleted. Used
-    /// by the DELETE flush path to skip the wide-row tombstone Append.
-    /// Schema: `_vid`, `_deleted=true`, `_version`, `_updated_at`. Lance
-    /// MergeInsert leaves all other target columns untouched.
-    pub fn build_tombstone_partial_batch(
-        tombstones: &[(Vid, u64)],
-        updated_at: Option<&HashMap<Vid, i64>>,
-    ) -> Result<RecordBatch> {
-        let fields = vec![
-            Field::new("_vid", DataType::UInt64, false),
-            Field::new("_deleted", DataType::Boolean, false),
-            Field::new("_version", DataType::UInt64, false),
-            Field::new(
-                "_updated_at",
-                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
-                true,
-            ),
-        ];
-        let arrow_schema = Arc::new(ArrowSchema::new(fields));
-
-        let vids: Vec<u64> = tombstones.iter().map(|(v, _)| v.as_u64()).collect();
-        let deleted: Vec<bool> = vec![true; tombstones.len()];
-        let versions: Vec<u64> = tombstones.iter().map(|(_, v)| *v).collect();
-        let vids_iter = tombstones.iter().map(|(v, _)| *v);
-
-        let columns: Vec<ArrayRef> = vec![
-            Arc::new(UInt64Array::from(vids)),
-            Arc::new(BooleanArray::from(deleted)),
-            Arc::new(UInt64Array::from(versions)),
-            build_timestamp_column_from_vid_map(vids_iter, updated_at),
-        ];
-
-        RecordBatch::try_new(arrow_schema, columns).map_err(|e| anyhow!(e))
-    }
-
-    /// MergeInsert a tombstone-partial batch into the main vertices
-    /// table. Join key is `_vid`. Matched rows have `_deleted` flipped
-    /// to true; unmatched source rows are dropped (deleting a non-
-    /// existent VID is a logical no-op).
-    pub async fn merge_insert_tombstone_batch(
-        backend: &dyn StorageBackend,
-        batch: RecordBatch,
-    ) -> Result<()> {
-        let table_name = table_names::main_vertex_table_name();
-        // Tolerant of a missing table (#182): "no such table" is the degenerate
-        // case of the unmatched-row rule this method already documents — if the
-        // table was never created there is nothing to tombstone.
-        crate::storage::manager::merge_insert_batch_tolerating_missing_table(
-            backend,
-            table_name,
-            batch,
-            &["_vid"],
-        )
-        .await
-    }
-
     /// Ensure default indexes exist on the main vertices table.
     ///
     /// Checks for existing indexes before creating to avoid expensive
@@ -373,9 +318,10 @@ impl MainVertexDataset {
     pub async fn find_by_ext_id(
         backend: &dyn StorageBackend,
         ext_id: &str,
-        version: Option<u64>,
+        version: impl IntoRowVisibility,
     ) -> Result<Option<Vid>> {
-        Self::find_by_ext_id_counted(backend, ext_id, version, None).await
+        let version = version.into_row_visibility();
+        Self::find_by_ext_id_counted(backend, ext_id, &version, None).await
     }
 
     /// [`Self::find_by_ext_id`], carrying a query's counters into the backend.
@@ -388,9 +334,10 @@ impl MainVertexDataset {
     pub async fn find_by_ext_id_counted(
         backend: &dyn StorageBackend,
         ext_id: &str,
-        version: Option<u64>,
+        version: impl IntoRowVisibility,
         counters: Option<&Arc<QueryCounters>>,
     ) -> Result<Option<Vid>> {
+        let version = version.into_row_visibility();
         let table_name = table_names::main_vertex_table_name();
 
         if !backend.table_exists(table_name).await? {
@@ -404,7 +351,7 @@ impl MainVertexDataset {
         // is the true winner.
         let filter = with_version_bound(
             FilterExpr::equals("ext_id", Scalar::Str(ext_id.to_string())),
-            version,
+            &version,
         );
 
         let results = backend
@@ -454,7 +401,99 @@ impl MainVertexDataset {
         if best_deleted {
             return Ok(None);
         }
-        Ok(best_vid)
+        let Some(vid) = best_vid else {
+            return Ok(None);
+        };
+        let holders =
+            Self::current_ext_id_holders(backend, &[(ext_id.to_string(), vid)], &version, counters)
+                .await?;
+        Ok(holders.into_values().next())
+    }
+
+    /// Keep each `(ext_id, vid)` whose vid still holds that `ext_id`.
+    ///
+    /// The `ext_id` lookups pick the highest-version row *carrying* the
+    /// `ext_id`, but a vertex that later took another `ext_id`, removed it, or
+    /// was rewritten without it has newer rows that do not carry it, so the
+    /// lookup alone kept reporting the freed `ext_id` as taken: reassigning it
+    /// was refused permanently, flushed or not. This reads each candidate's
+    /// newest row overall (tombstones included) and keeps the pair only when
+    /// that row is live and still carries the `ext_id`.
+    ///
+    /// Under the uniqueness invariant the highest-version row carrying an
+    /// `ext_id` belongs to its latest assignee, so checking that one vid is
+    /// enough: anyone who took the `ext_id` after it was freed wrote a newer
+    /// row carrying it.
+    async fn current_ext_id_holders(
+        backend: &dyn StorageBackend,
+        candidates: &[(String, Vid)],
+        version: impl IntoRowVisibility,
+        counters: Option<&Arc<QueryCounters>>,
+    ) -> Result<HashMap<String, Vid>> {
+        let version = version.into_row_visibility();
+        let table_name = table_names::main_vertex_table_name();
+        // Newest row per vid: (version, deleted, ext_id).
+        let mut latest: HashMap<Vid, (u64, bool, Option<String>)> = HashMap::new();
+        for chunk in candidates.chunks(MAX_EXT_IDS_PER_CHUNK) {
+            let filter = with_version_bound(
+                FilterExpr::one_of("_vid", chunk.iter().map(|(_, v)| Scalar::UInt(v.as_u64()))),
+                &version,
+            );
+            let results = backend
+                .scan(
+                    ScanRequest::all(table_name)
+                        .with_filter(filter)
+                        .with_columns(vec![
+                            "_vid".to_string(),
+                            "ext_id".to_string(),
+                            "_version".to_string(),
+                            "_deleted".to_string(),
+                        ])
+                        .with_counters(counters.cloned()),
+                )
+                .await?;
+            for batch in results {
+                let vid_col = batch
+                    .column_by_name("_vid")
+                    .and_then(|c| c.as_any().downcast_ref::<UInt64Array>());
+                let ext_col = batch
+                    .column_by_name("ext_id")
+                    .and_then(|c| c.as_any().downcast_ref::<arrow_array::StringArray>());
+                let ver_col = batch
+                    .column_by_name("_version")
+                    .and_then(|c| c.as_any().downcast_ref::<UInt64Array>());
+                let deleted_col = batch
+                    .column_by_name("_deleted")
+                    .and_then(|c| c.as_any().downcast_ref::<arrow_array::BooleanArray>());
+                let (Some(vid_arr), Some(ver_arr)) = (vid_col, ver_col) else {
+                    continue;
+                };
+                for i in 0..batch.num_rows() {
+                    let vid = Vid::from(vid_arr.value(i));
+                    let v = if ver_arr.is_null(i) {
+                        0
+                    } else {
+                        ver_arr.value(i)
+                    };
+                    // `>=`: the later row wins a tie, as in the lookups.
+                    if latest.get(&vid).is_none_or(|(best, ..)| v >= *best) {
+                        let ext = ext_col
+                            .filter(|c| !c.is_null(i))
+                            .map(|c| c.value(i).to_string());
+                        latest.insert(vid, (v, deleted_col.is_some_and(|d| d.value(i)), ext));
+                    }
+                }
+            }
+        }
+        Ok(candidates
+            .iter()
+            .filter(|(ext_id, vid)| {
+                latest
+                    .get(vid)
+                    .is_some_and(|(_, deleted, ext)| !deleted && ext.as_deref() == Some(ext_id))
+            })
+            .cloned()
+            .collect())
     }
 
     /// The batched counterpart of [`Self::find_by_ext_id`].
@@ -480,9 +519,10 @@ impl MainVertexDataset {
     pub async fn find_by_ext_ids_counted(
         backend: &dyn StorageBackend,
         ext_ids: &[String],
-        version: Option<u64>,
+        version: impl IntoRowVisibility,
         counters: Option<&Arc<QueryCounters>>,
     ) -> Result<HashMap<String, Vid>> {
+        let version = version.into_row_visibility();
         let mut found: HashMap<String, Vid> = HashMap::new();
         if ext_ids.is_empty() {
             return Ok(found);
@@ -499,7 +539,7 @@ impl MainVertexDataset {
         for chunk in ext_ids.chunks(MAX_EXT_IDS_PER_CHUNK) {
             let filter = with_version_bound(
                 FilterExpr::one_of("ext_id", chunk.iter().map(|e| Scalar::Str(e.clone()))),
-                version,
+                &version,
             );
             let results = backend
                 .scan(
@@ -560,11 +600,15 @@ impl MainVertexDataset {
             }
         }
 
-        for (ext_id, (_, deleted, vid)) in best {
-            if !deleted {
-                found.insert(ext_id, vid);
-            }
+        let candidates: Vec<(String, Vid)> = best
+            .into_iter()
+            .filter(|(_, (_, deleted, _))| !deleted)
+            .map(|(ext_id, (_, _, vid))| (ext_id, vid))
+            .collect();
+        if candidates.is_empty() {
+            return Ok(found);
         }
+        found = Self::current_ext_id_holders(backend, &candidates, &version, counters).await?;
         Ok(found)
     }
 
@@ -575,9 +619,10 @@ impl MainVertexDataset {
     pub async fn ext_id_exists(
         backend: &dyn StorageBackend,
         ext_id: &str,
-        version: Option<u64>,
+        version: impl IntoRowVisibility,
     ) -> Result<bool> {
-        Ok(Self::find_by_ext_id(backend, ext_id, version)
+        let version = version.into_row_visibility();
+        Ok(Self::find_by_ext_id(backend, ext_id, &version)
             .await?
             .is_some())
     }
@@ -591,9 +636,10 @@ impl MainVertexDataset {
     pub async fn find_labels_by_vid(
         backend: &dyn StorageBackend,
         vid: Vid,
-        version: Option<u64>,
+        version: impl IntoRowVisibility,
     ) -> Result<Option<Vec<String>>> {
-        Self::find_labels_by_vid_counted(backend, vid, version, None).await
+        let version = version.into_row_visibility();
+        Self::find_labels_by_vid_counted(backend, vid, &version, None).await
     }
 
     /// [`Self::find_labels_by_vid`], carrying a query's counters into the backend.
@@ -606,9 +652,10 @@ impl MainVertexDataset {
     pub async fn find_labels_by_vid_counted(
         backend: &dyn StorageBackend,
         vid: Vid,
-        version: Option<u64>,
+        version: impl IntoRowVisibility,
         counters: Option<&Arc<QueryCounters>>,
     ) -> Result<Option<Vec<String>>> {
+        let version = version.into_row_visibility();
         let table_name = table_names::main_vertex_table_name();
 
         if !backend.table_exists(table_name).await? {
@@ -621,7 +668,7 @@ impl MainVertexDataset {
         // would let an OLDER live version resurrect a deleted vertex.
         let filter = with_version_bound(
             FilterExpr::equals("_vid", Scalar::UInt(vid.as_u64())),
-            version,
+            &version,
         );
 
         let results = backend
@@ -693,9 +740,10 @@ impl MainVertexDataset {
     pub async fn find_batch_props_by_vids(
         backend: &dyn StorageBackend,
         vids: &[Vid],
-        version: Option<u64>,
+        version: impl IntoRowVisibility,
     ) -> Result<HashMap<Vid, Properties>> {
-        Self::find_batch_props_by_vids_counted(backend, vids, version, None).await
+        let version = version.into_row_visibility();
+        Self::find_batch_props_by_vids_counted(backend, vids, &version, None).await
     }
 
     /// [`Self::find_batch_props_by_vids`], carrying a query's counters into the backend.
@@ -708,9 +756,10 @@ impl MainVertexDataset {
     pub async fn find_batch_props_by_vids_counted(
         backend: &dyn StorageBackend,
         vids: &[Vid],
-        version: Option<u64>,
+        version: impl IntoRowVisibility,
         counters: Option<&Arc<QueryCounters>>,
     ) -> Result<HashMap<Vid, Properties>> {
+        let version = version.into_row_visibility();
         let table_name = table_names::main_vertex_table_name();
 
         if vids.is_empty() || !backend.table_exists(table_name).await? {
@@ -727,7 +776,7 @@ impl MainVertexDataset {
         // returned stale props depending on physical scan order.
         let filter = with_version_bound(
             FilterExpr::one_of("_vid", vids.iter().map(|v| Scalar::UInt(v.as_u64()))),
-            version,
+            &version,
         );
 
         let results = backend
@@ -818,9 +867,10 @@ impl MainVertexDataset {
     pub async fn find_props_by_vid(
         backend: &dyn StorageBackend,
         vid: Vid,
-        version: Option<u64>,
+        version: impl IntoRowVisibility,
     ) -> Result<Option<Properties>> {
-        Self::find_props_by_vid_counted(backend, vid, version, None).await
+        let version = version.into_row_visibility();
+        Self::find_props_by_vid_counted(backend, vid, &version, None).await
     }
 
     /// [`Self::find_props_by_vid`], carrying a query's counters into the backend.
@@ -833,9 +883,10 @@ impl MainVertexDataset {
     pub async fn find_props_by_vid_counted(
         backend: &dyn StorageBackend,
         vid: Vid,
-        version: Option<u64>,
+        version: impl IntoRowVisibility,
         counters: Option<&Arc<QueryCounters>>,
     ) -> Result<Option<Properties>> {
+        let version = version.into_row_visibility();
         let table_name = table_names::main_vertex_table_name();
 
         if !backend.table_exists(table_name).await? {
@@ -844,7 +895,7 @@ impl MainVertexDataset {
 
         let filter = with_version_bound(
             FilterExpr::equals("_vid", Scalar::UInt(vid.as_u64())),
-            version,
+            &version,
         );
 
         let results = backend
@@ -909,9 +960,10 @@ impl MainVertexDataset {
     pub async fn find_batch_labels_by_vids(
         backend: &dyn StorageBackend,
         vids: &[Vid],
-        version: Option<u64>,
+        version: impl IntoRowVisibility,
     ) -> Result<HashMap<Vid, Vec<String>>> {
-        Self::find_batch_labels_by_vids_counted(backend, vids, version, None).await
+        let version = version.into_row_visibility();
+        Self::find_batch_labels_by_vids_counted(backend, vids, &version, None).await
     }
 
     /// [`Self::find_batch_labels_by_vids`], carrying a query's counters into the backend.
@@ -924,9 +976,10 @@ impl MainVertexDataset {
     pub async fn find_batch_labels_by_vids_counted(
         backend: &dyn StorageBackend,
         vids: &[Vid],
-        version: Option<u64>,
+        version: impl IntoRowVisibility,
         counters: Option<&Arc<QueryCounters>>,
     ) -> Result<HashMap<Vid, Vec<String>>> {
+        let version = version.into_row_visibility();
         let table_name = table_names::main_vertex_table_name();
 
         if vids.is_empty() || !backend.table_exists(table_name).await? {
@@ -939,7 +992,7 @@ impl MainVertexDataset {
         // + last-row-wins previously resurrected deleted vertices' labels.
         let filter = with_version_bound(
             FilterExpr::one_of("_vid", vids.iter().map(|v| Scalar::UInt(v.as_u64()))),
-            version,
+            &version,
         );
 
         let results = backend
@@ -1022,9 +1075,10 @@ impl MainVertexDataset {
     pub async fn find_label_props_counted(
         backend: &dyn StorageBackend,
         label: &str,
-        version: Option<u64>,
+        version: impl IntoRowVisibility,
         counters: Option<&Arc<QueryCounters>>,
     ) -> Result<HashMap<Vid, Properties>> {
+        let version = version.into_row_visibility();
         let table_name = table_names::main_vertex_table_name();
 
         if !backend.table_exists(table_name).await? {
@@ -1036,7 +1090,7 @@ impl MainVertexDataset {
                 ScanRequest::all(table_name)
                     .with_filter(with_version_bound(
                         FilterExpr::array_contains("labels", Scalar::Str(label.to_string())),
-                        version,
+                        &version,
                     ))
                     .with_columns(vec!["_vid".to_string()])
                     .with_counters(counters.cloned()),
@@ -1062,7 +1116,7 @@ impl MainVertexDataset {
                 ScanRequest::all(table_name)
                     .with_filter(with_version_bound(
                         FilterExpr::one_of("_vid", vids.into_iter().map(Scalar::UInt)),
-                        version,
+                        &version,
                     ))
                     .with_columns(vec![
                         "_vid".to_string(),

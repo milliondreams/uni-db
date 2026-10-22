@@ -15,8 +15,10 @@
 //!    lock is taken. `Synchronous` reject aborts the transaction.
 //! 2. WAL flush + L1 merge run.
 //! 3. `AfterMutation` then `AfterCommit` — fired after publish. `Async`
-//!    fire-mode triggers are spawned onto the tokio runtime so the
-//!    writer's hot path stays untouched.
+//!    fire-mode triggers run on the tokio blocking pool (never on an
+//!    executor thread) as tasks tracked by the database's shutdown
+//!    handle, so the writer's hot path stays untouched and shutdown
+//!    waits for them.
 //!
 //! Behavior contract:
 //! - `predicate_source` is compiled at router build (per-commit) via
@@ -52,12 +54,15 @@
 //!   and edges visible there, and from the L1 probe (which now
 //!   projects every property column on the candidate label) for
 //!   vertices that were drained out of L0 by a previous flush. Edge
-//!   pre-images are captured in the L0 chain via `edge_properties`.
+//!   pre-images are each edge's committed state (L0 chain over L1), read
+//!   in one batched lookup by
+//!   [`PreExistingProbe::extend_edges_with_committed_state`].
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant as StdInstant};
 
+use crate::shutdown::ShutdownHandle;
 use arrow_array::{BooleanArray, Int64Array, LargeBinaryArray, RecordBatch, UInt8Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::physical_plan::PhysicalExpr;
@@ -424,6 +429,10 @@ pub struct TriggerRouter {
     /// router rebuilds). `EventualConsistency` after-phase fires buffer
     /// here instead of spawning per-commit like `Async`.
     ec_queue: Arc<EcQueue>,
+    /// Tracks the per-commit `Async` fire tasks so shutdown waits for them
+    /// and `Uni::background_task_count` counts them. `None` in test setups
+    /// that build a router without a database.
+    task_tracker: Option<ShutdownHandle>,
 }
 
 impl TriggerRouter {
@@ -530,13 +539,73 @@ impl TriggerRouter {
             by_phase,
             defer_queue,
             ec_queue,
+            task_tracker: None,
         })
+    }
+
+    /// Tracks every `Async` fire task through `tracker`.
+    ///
+    /// Without a tracker an `Async` fire is detached: it keeps running after
+    /// the database is dropped and shutdown cannot wait for it.
+    #[must_use]
+    pub fn with_task_tracker(mut self, tracker: ShutdownHandle) -> Self {
+        self.task_tracker = Some(tracker);
+        self
     }
 
     /// True if no triggers are registered at any phase.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.by_phase.iter().all(|v| v.is_empty())
+    }
+
+    /// True if some registered trigger can receive an edge event row
+    /// (`EDGE_CREATE`, `EDGE_UPDATE`, `EDGE_DELETE`, or the kind-agnostic
+    /// `PROPERTY_CHANGE`).
+    ///
+    /// Gates the commit-time edge pre-image read: a store whose only
+    /// triggers watch nodes (the built-in `:_AuditMe` audit trigger is
+    /// registered by default) has no use for it, and the read costs one
+    /// batched storage lookup over every edge the commit writes.
+    #[must_use]
+    pub fn wants_edge_events(&self) -> bool {
+        let edge = TriggerEventMask::EDGE_CREATE
+            .union(TriggerEventMask::EDGE_UPDATE)
+            .union(TriggerEventMask::EDGE_DELETE)
+            .union(TriggerEventMask::PROPERTY_CHANGE);
+        self.by_phase
+            .iter()
+            .flatten()
+            .any(|route| route.event_mask & edge.0 != 0)
+    }
+
+    /// True if some registered trigger can receive a node event row
+    /// (`NODE_CREATE`, `NODE_UPDATE` or `NODE_DELETE`) for a vertex carrying
+    /// `labels`, the labels such a row is emitted under (one row per label;
+    /// one row with an empty label when there are none).
+    ///
+    /// Gates the commit-time vertex pre-image read per vertex: only those
+    /// rows use it, to tell a create from an update and to carry the old
+    /// value. The built-in `:_AuditMe` trigger watches one label, so a store
+    /// whose only trigger is that one reads no pre-image for other vertices.
+    #[must_use]
+    pub fn wants_node_events_for(&self, labels: &[String]) -> bool {
+        let kinds = [
+            TriggerEventMask::NODE_CREATE,
+            TriggerEventMask::NODE_UPDATE,
+            TriggerEventMask::NODE_DELETE,
+        ];
+        let unlabelled = [String::new()];
+        let labels = if labels.is_empty() {
+            &unlabelled[..]
+        } else {
+            labels
+        };
+        self.by_phase.iter().flatten().any(|route| {
+            kinds
+                .iter()
+                .any(|kind| labels.iter().any(|label| route.matches(*kind, label)))
+        })
     }
 
     /// Union of node/edge property names that any compiled trigger
@@ -736,8 +805,12 @@ impl TriggerRouter {
                         );
                     }
                     // `FireMode::Async` and any future variant land on the
-                    // spawn path: one `spawn_blocking`-style task per matching
-                    // commit, fired after the transaction lands.
+                    // spawn path: one blocking-pool task per matching commit,
+                    // fired after the transaction lands. `fire` is a
+                    // synchronous plugin call of unbounded duration, so it must
+                    // not run on an executor thread: on a `current_thread`
+                    // runtime that stalled every other task for the length of
+                    // the fire.
                     _ => {
                         let plugin = Arc::clone(&entry.plugin);
                         let name = entry.name.clone();
@@ -746,7 +819,7 @@ impl TriggerRouter {
                         let tx_id = ctx.tx_id;
                         let queue = self.defer_queue.clone();
                         let host = host.clone();
-                        runtime.spawn(async move {
+                        let handle = runtime.spawn_blocking(move || {
                             let mb_inner = mb;
                             let result =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -769,6 +842,9 @@ impl TriggerRouter {
                                 );
                             });
                         });
+                        if let Some(tracker) = &self.task_tracker {
+                            tracker.track_task(handle);
+                        }
                     }
                 }
             }
@@ -925,8 +1001,9 @@ struct MutationRow {
 /// `NODE_CREATE` on its next mutation. The L1 probe also projects
 /// every property column on the target label so the resulting
 /// `old_value` carries the same pre-image fidelity as the L0-chain
-/// path. Edge pre-images are captured via the L0 chain's
-/// `edge_properties` snapshot.
+/// path. [`Self::extend_edges_with_committed_state`] does the same for
+/// edges, reading each edge's committed state (L0 overlay over L1) in one
+/// batched lookup.
 #[derive(Default)]
 pub struct PreExistingProbe {
     /// VIDs known to exist in committed state (with their pre-image
@@ -938,6 +1015,11 @@ pub struct PreExistingProbe {
     /// uses `Properties::default()` for entries added through an
     /// existence-only path.
     edges: HashMap<uni_common::Eid, Properties>,
+    /// VIDs the committed L0 chain shows as deleted. A stale L1 row for
+    /// one of these must not be read back as a pre-image.
+    dead_vertices: HashSet<uni_common::Vid>,
+    /// EIDs the committed L0 chain shows as deleted; see `dead_vertices`.
+    dead_edges: HashSet<uni_common::Eid>,
 }
 
 impl PreExistingProbe {
@@ -1019,7 +1101,12 @@ impl PreExistingProbe {
             probe_buffer(&g);
         }
 
-        Self { vertices, edges }
+        Self {
+            vertices,
+            edges,
+            dead_vertices: dead_vids,
+            dead_edges: dead_eids,
+        }
     }
 
     /// Snapshot the (vid, label) pairs that should be probed against
@@ -1035,7 +1122,12 @@ impl PreExistingProbe {
             .keys()
             .chain(tx_l0.vertex_tombstones.iter())
         {
-            if self.vertices.contains_key(vid) {
+            if self.vertices.contains_key(vid) || self.dead_vertices.contains(vid) {
+                continue;
+            }
+            // Created by this transaction with a fresh id: nothing committed
+            // to read, as for `created_edges` in `pending_edge_candidates`.
+            if tx_l0.created_vertices.contains(vid) {
                 continue;
             }
             let label = tx_l0
@@ -1097,6 +1189,7 @@ impl PreExistingProbe {
         use std::collections::HashMap as StdHashMap;
         use uni_store::storage::arrow_convert::arrow_to_value;
         const CHUNK_SIZE: usize = 1024;
+        const OVERFLOW_COLUMN: &str = "overflow_json";
 
         let mut by_label: StdHashMap<String, Vec<uni_common::Vid>> = StdHashMap::new();
         for (vid, label) in candidates {
@@ -1152,9 +1245,14 @@ impl PreExistingProbe {
                     continue;
                 };
                 // Cache (column_index, column_name) pairs for the
-                // per-row property assembly. Skip storage-internal
-                // columns (`_vid`, `_version`, `_label`) — user
-                // properties are everything else.
+                // per-row property assembly. The pre-image is the vertex's
+                // user property set, the same map the L0-chain probe
+                // captures: declared columns plus `ext_id`, with the
+                // undeclared properties unpacked from `overflow_json`.
+                // Every other storage column (`_vid`, `_uid`, `_deleted`,
+                // `_version`, `_labels`, `_created_at`, `_updated_at`) is a
+                // reserved name and skipped, and the blob is never surfaced
+                // as a property of its own.
                 let schema = batch.schema();
                 let property_cols: Vec<(usize, String)> = schema
                     .fields()
@@ -1162,10 +1260,8 @@ impl PreExistingProbe {
                     .enumerate()
                     .filter_map(|(idx, f)| {
                         let name = f.name();
-                        if name == "_vid"
-                            || name == "_version"
-                            || name == "_label"
-                            || name == "_labels"
+                        if uni_common::core::schema::is_reserved_property_name(name)
+                            || name == OVERFLOW_COLUMN
                         {
                             None
                         } else {
@@ -1173,6 +1269,9 @@ impl PreExistingProbe {
                         }
                     })
                     .collect();
+                let overflow_col = batch
+                    .column_by_name(OVERFLOW_COLUMN)
+                    .and_then(|c| c.as_any().downcast_ref::<arrow_array::LargeBinaryArray>());
 
                 for row in 0..vid_col.len() {
                     if vid_col.is_null(row) {
@@ -1209,11 +1308,171 @@ impl PreExistingProbe {
                             props.insert(col_name.clone(), value);
                         }
                     }
+                    if let Some(blob) = overflow_col.filter(|c| !c.is_null(row)) {
+                        // Same degrade-not-fail contract as a column decode
+                        // failure above. A declared column wins a shared key,
+                        // as on the read path.
+                        match uni_common::cypher_value_codec::decode(blob.value(row)) {
+                            Ok(uni_common::Value::Map(overflow)) => {
+                                for (k, v) in overflow {
+                                    if !v.is_null() {
+                                        props.entry(k).or_insert(v);
+                                    }
+                                }
+                            }
+                            Ok(uni_common::Value::Null) => {}
+                            Ok(other) => tracing::error!(
+                                value = ?other,
+                                "trigger pre-image: overflow_json decoded to a non-map value"
+                            ),
+                            Err(e) => tracing::error!(
+                                error = %e,
+                                "trigger pre-image: overflow_json failed to decode"
+                            ),
+                        }
+                    }
                     // First insert wins: L0-chain entries always come
                     // first and may already hold richer pre-image data.
                     self.vertices.entry(vid).or_insert(props);
                 }
             }
+        }
+    }
+
+    /// Snapshot the edges of `tx_l0` whose committed state has to be read:
+    /// every EID the transaction writes or deletes, minus those the
+    /// committed L0 chain shows as deleted. Sync — must run under the
+    /// `tx_l0` read lock; hand the result to
+    /// [`Self::extend_edges_with_committed_state`] outside it.
+    ///
+    /// Edges the transaction created (`L0Buffer::created_edges`) are left
+    /// out: their ids are fresh, so no committed state exists for them.
+    ///
+    /// Each EID carries its edge type name when one is known, from the
+    /// transaction's own `edge_types` or else from the type id it records
+    /// (`edge_endpoints` for a write, the tombstone for a delete) through
+    /// `resolve_edge_type`. The type is only a scan hint; an EID without one
+    /// is still probed.
+    #[must_use]
+    pub fn pending_edge_candidates(
+        &self,
+        tx_l0: &L0Buffer,
+        resolve_edge_type: &dyn Fn(u32) -> Option<String>,
+    ) -> Vec<(uni_common::Eid, Option<String>)> {
+        let mut seen: HashSet<uni_common::Eid> = HashSet::new();
+        let written = tx_l0
+            .edge_endpoints
+            .iter()
+            .map(|(eid, (_, _, type_id))| (*eid, *type_id));
+        let deleted = tx_l0
+            .tombstones
+            .iter()
+            .map(|(eid, ts)| (*eid, ts.edge_type));
+        written
+            .chain(deleted)
+            // An edge this transaction created got a fresh id: it has no
+            // committed state to read, so probing it is pure cost (one L1
+            // lookup per new edge).
+            .filter(|(eid, _)| {
+                !self.dead_edges.contains(eid)
+                    && !tx_l0.created_edges.contains(eid)
+                    && seen.insert(*eid)
+            })
+            .map(|(eid, type_id)| {
+                let name = tx_l0
+                    .edge_types
+                    .get(&eid)
+                    .cloned()
+                    .or_else(|| resolve_edge_type(type_id));
+                (eid, name)
+            })
+            .collect()
+    }
+
+    /// Replace the edge pre-images with each edge's committed state, read
+    /// through [`PropertyManager::get_batch_edge_props`] over the committed
+    /// L0 chain (pending-flush buffers, then the current one) layered on L1.
+    ///
+    /// [`Self::from_l0_chain`] alone sees only edges still in L0, and only
+    /// the newest buffer's row for them. An edge flushed to L1 was therefore
+    /// reported as `EDGE_CREATE` with no pre-image on its next update, and
+    /// as an `EDGE_DELETE` with no pre-image when deleted; an edge updated
+    /// after a flush reported only the keys of that later write. The
+    /// committed state is what a read of the edge returns before this
+    /// transaction, so it is the pre-image by definition.
+    ///
+    /// The lookup is one batched read for all `candidates` (chunked `IN`
+    /// scans inside the reader), never one scan per edge. Every property is
+    /// requested — declared columns of the hinted types plus the
+    /// `_all_props` wildcard for undeclared and schemaless properties.
+    /// `Null` values are dropped: a removed property is absent from the
+    /// pre-image, as it is from the L1 vertex pre-image.
+    ///
+    /// # Errors
+    ///
+    /// A failed read is logged and the L0-chain pre-images are kept — the
+    /// same degrade-not-fail contract as [`Self::extend_with_l1`].
+    ///
+    /// [`PropertyManager::get_batch_edge_props`]: uni_store::runtime::property_manager::PropertyManager::get_batch_edge_props
+    pub async fn extend_edges_with_committed_state(
+        &mut self,
+        candidates: Vec<(uni_common::Eid, Option<String>)>,
+        l0_manager: &L0Manager,
+        properties: &uni_store::runtime::property_manager::PropertyManager,
+        schema: &uni_common::core::schema::Schema,
+    ) {
+        const ALL_PROPS: &str = "_all_props";
+        if candidates.is_empty() {
+            return;
+        }
+        // A partial type hint would scan too few delta tables and miss the
+        // unhinted edges, so the hint is used only when every EID has one.
+        let hint: Option<Vec<String>> = candidates
+            .iter()
+            .map(|(_, t)| t.clone())
+            .collect::<Option<HashSet<String>>>()
+            .map(|set| set.into_iter().collect());
+        let declared: HashSet<&str> = match &hint {
+            Some(types) => types
+                .iter()
+                .filter_map(|t| schema.properties.get(t))
+                .flat_map(|props| props.keys().map(String::as_str))
+                .collect(),
+            None => schema
+                .edge_types
+                .keys()
+                .filter_map(|t| schema.properties.get(t))
+                .flat_map(|props| props.keys().map(String::as_str))
+                .collect(),
+        };
+        let mut wanted: Vec<&str> = declared.into_iter().collect();
+        wanted.push(ALL_PROPS);
+        let eids: Vec<uni_common::Eid> = candidates.iter().map(|(eid, _)| *eid).collect();
+
+        // Committed L0 only: the transaction's own buffer is the post-image.
+        let ctx = uni_store::runtime::context::QueryContext::new_with_pending(
+            l0_manager.get_current(),
+            None,
+            l0_manager.get_pending_flush(),
+        );
+        match properties
+            .get_batch_edge_props(&eids, &wanted, hint.as_deref(), Some(&ctx))
+            .await
+        {
+            Ok(found) => {
+                for (key, mut props) in found {
+                    // The reader keys edges by `Vid::from(eid)`.
+                    let eid = uni_common::Eid::from(key.as_u64());
+                    props.retain(|_, v| !v.is_null());
+                    self.edges.insert(eid, props);
+                }
+            }
+            Err(e) => warn!(
+                error = %e,
+                edges = eids.len(),
+                "edge pre-image read failed; edges not in L0 are reported as \
+                 EDGE_CREATE with no pre-image"
+            ),
         }
     }
 
@@ -1460,11 +1719,23 @@ impl MutationEvents {
         // Edge deletes. `old_value` is the pre-tx property image when
         // the probe captured it.
         for (eid, ts) in &l0.tombstones {
+            // Same recovery as the write loop above: a delete records the type
+            // id but often not the name, and a `type:<id>` placeholder never
+            // matches a trigger's declared edge type, so `ON -[:R]` delete
+            // triggers silently never fired.
             let etype = l0
                 .edge_types
                 .get(eid)
                 .cloned()
-                .unwrap_or_else(|| format!("type:{}", ts.edge_type));
+                .or_else(|| resolve_edge_type(ts.edge_type))
+                .unwrap_or_else(|| {
+                    warn!(
+                        eid = ?eid,
+                        type_id = ts.edge_type,
+                        "deleted edge's type name unresolvable; trigger routing will not match it",
+                    );
+                    format!("type:{}", ts.edge_type)
+                });
             let old = probe.and_then(|p| p.edge_old_bytes(*eid));
             let old_props_map = probe
                 .and_then(|p| p.edge_properties(*eid))
@@ -1699,6 +1970,7 @@ fn eid_to_i64(eid: uni_common::Eid) -> i64 {
 /// `Defer` from cascading.
 const DEFER_MAX_ATTEMPTS: u32 = 10;
 
+#[derive(Clone)]
 struct DeferredItem {
     plugin: Arc<dyn TriggerPlugin>,
     name: String,
@@ -1955,6 +2227,9 @@ impl EcQueue {
 ///   Built via [`DeferralQueue::with_persistence`] it mirrors every
 ///   `push`/`drain_due` to a JSON sidecar (FU-5) and reloads on restart
 ///   via [`DeferralQueue::load_from_sidecar`].
+/// - With persistence, a push returns once the sidecar holds the item. The
+///   write runs outside the queue lock, and concurrent pushes share one write
+///   when a later snapshot already covers them.
 /// - Even with persistence there is no transactional guarantee tying a
 ///   deferred fire to the originating commit; a crash between commit and
 ///   the next sidecar write can still lose an item.
@@ -1980,6 +2255,29 @@ pub struct DeferralQueue {
     /// `scheduler.rs`'s equivalent path has for free (it never rewrites its
     /// sidecar); the deferral queue has to assert it.
     load_failed: std::sync::atomic::AtomicBool,
+    /// Set when the last sidecar write failed, so the file may not match the
+    /// in-memory queue. `drain_due` rewrites the sidecar only when it removed
+    /// items or this is set: the tick task calls it every 50 ms, and an
+    /// unconditional rewrite of an unchanged (usually empty) queue cost two
+    /// blocking `fsync`s per tick on the caller's runtime for every database
+    /// with a local data path.
+    persist_dirty: std::sync::atomic::AtomicBool,
+    /// Bumped, under the `inner` lock, by every change to the queue, so a
+    /// snapshot taken under that lock is labelled with the change it reflects.
+    generation: std::sync::atomic::AtomicU64,
+    /// Serializes sidecar writes and holds the generation of the last
+    /// snapshot written.
+    ///
+    /// The write (and its `fsync`s) runs under this lock and never under
+    /// `inner`: `push` is on the commit path, and holding `inner` across the
+    /// write made every concurrent deferring commit, the deferral tick, and
+    /// `pending` wait for each other's disk I/O. A writer that finds a later
+    /// generation already written skips its own write, since that snapshot
+    /// contains its change, so concurrent pushes share one write.
+    persisted: parking_lot::Mutex<u64>,
+    /// Test seam: runs inside the sidecar write, before the file is written.
+    #[cfg(test)]
+    before_write: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl std::fmt::Debug for DeferralQueue {
@@ -2109,87 +2407,142 @@ impl DeferralQueue {
         restored
     }
 
-    /// Persist the current queue state to the sidecar (no-op when
-    /// persistence is disabled). I/O errors degrade to debug log.
-    fn persist_locked(
-        &self,
-        guard: &parking_lot::MutexGuard<'_, BTreeMap<StdInstant, Vec<DeferredItem>>>,
-    ) {
+    /// Bumps the change counter. Call with the `inner` lock held.
+    fn bump_generation(&self) -> u64 {
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1
+    }
+
+    /// Makes the sidecar reflect at least change `generation` of the queue
+    /// (no-op when persistence is disabled). I/O errors degrade to a warn and
+    /// mark the queue dirty, so the next drain retries.
+    ///
+    /// Must be called without the `inner` lock held: the snapshot is taken
+    /// under it, briefly, and the encode and write run outside it.
+    fn persist(&self, generation: u64) {
         let Some(sidecar) = self.sidecar.lock().clone() else {
             return;
         };
-        let now_wall = std::time::SystemTime::now();
-        let now_mono = StdInstant::now();
-        let mut rows: Vec<PersistedDeferral> = Vec::new();
-        for (fire_at_mono, items) in guard.iter() {
-            for item in items {
-                // Convert the monotonic Instant back to wall-clock by
-                // measuring the delta against `now` and offsetting
-                // `now_wall`. Past-due items get a fire_at slightly
-                // before `now_wall` so they fire immediately on
-                // restart.
-                let fire_at_wall = if *fire_at_mono <= now_mono {
-                    now_wall
-                } else {
-                    now_wall + fire_at_mono.duration_since(now_mono)
-                };
-                let fire_at_epoch_ms = fire_at_wall
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                let batch_ipc = match arrow_ipc_encode(&item.batch.events) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        tracing::debug!(error = %e, "DeferralQueue: IPC encode failed; skipping row");
-                        continue;
-                    }
-                };
-                rows.push(PersistedDeferral {
-                    name: item.name.clone(),
-                    name_ordinal: item.name_ordinal,
-                    session_id: item.session_id.clone(),
-                    tx_id: item.tx_id,
-                    attempts: item.attempts,
-                    payload: item.payload.clone(),
-                    batch_ipc,
-                    fire_at_epoch_ms,
-                });
-            }
-        }
         if self.load_failed.load(std::sync::atomic::Ordering::SeqCst) {
             // The in-memory map does not contain whatever the failed read held,
             // so writing it back would destroy those rows (#233).
             return;
         }
-        if let Err(e) = sidecar.write_all(&rows) {
-            tracing::warn!(
+        let mut persisted = self.persisted.lock();
+        if *persisted >= generation && !self.persist_dirty.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            // A write that started after this change already covered it.
+            return;
+        }
+        // Snapshot the latest state, not the state as of `generation`: writes
+        // are serialized here, so the file only moves forward.
+        let (snapshot, snapshot_generation) = {
+            let guard = self.inner.lock();
+            let snapshot: Vec<(StdInstant, DeferredItem)> = guard
+                .iter()
+                .flat_map(|(at, items)| items.iter().map(|item| (*at, item.clone())))
+                .collect();
+            (
+                snapshot,
+                self.generation.load(std::sync::atomic::Ordering::SeqCst),
+            )
+        };
+        let rows = Self::encode_rows(&snapshot);
+        #[cfg(test)]
+        if let Some(hook) = self.before_write.lock().clone() {
+            hook();
+        }
+        let result = sidecar.write_all(&rows);
+        self.persist_dirty
+            .store(result.is_err(), std::sync::atomic::Ordering::SeqCst);
+        match result {
+            Ok(()) => *persisted = snapshot_generation,
+            Err(e) => tracing::warn!(
                 error = %e,
                 "DeferralQueue: sidecar write failed; drained items may fire again after a \
                  restart (at-least-once)",
-            );
+            ),
         }
     }
 
+    /// Encodes a queue snapshot as sidecar rows.
+    fn encode_rows(snapshot: &[(StdInstant, DeferredItem)]) -> Vec<PersistedDeferral> {
+        let now_wall = std::time::SystemTime::now();
+        let now_mono = StdInstant::now();
+        let mut rows: Vec<PersistedDeferral> = Vec::with_capacity(snapshot.len());
+        for (fire_at_mono, item) in snapshot {
+            // Convert the monotonic Instant back to wall-clock by
+            // measuring the delta against `now` and offsetting
+            // `now_wall`. Past-due items get a fire_at slightly
+            // before `now_wall` so they fire immediately on
+            // restart.
+            let fire_at_wall = if *fire_at_mono <= now_mono {
+                now_wall
+            } else {
+                now_wall + fire_at_mono.duration_since(now_mono)
+            };
+            let fire_at_epoch_ms = fire_at_wall
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let batch_ipc = match arrow_ipc_encode(&item.batch.events) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::debug!(error = %e, "DeferralQueue: IPC encode failed; skipping row");
+                    continue;
+                }
+            };
+            rows.push(PersistedDeferral {
+                name: item.name.clone(),
+                name_ordinal: item.name_ordinal,
+                session_id: item.session_id.clone(),
+                tx_id: item.tx_id,
+                attempts: item.attempts,
+                payload: item.payload.clone(),
+                batch_ipc,
+                fire_at_epoch_ms,
+            });
+        }
+        rows
+    }
+
+    /// Enqueues `item`; with persistence on, returns once the sidecar holds it.
     fn push(&self, item: DeferredItem, fire_at: StdInstant) {
-        let mut guard = self.inner.lock();
-        guard.entry(fire_at).or_default().push(item);
-        self.persist_locked(&guard);
+        let generation = {
+            let mut guard = self.inner.lock();
+            guard.entry(fire_at).or_default().push(item);
+            self.bump_generation()
+        };
+        self.persist(generation);
     }
 
     /// Pop every item whose scheduled fire instant is `<= now`.
     fn drain_due(&self, now: StdInstant) -> Vec<DeferredItem> {
-        let mut guard = self.inner.lock();
-        let mut due = Vec::new();
-        // BTreeMap::split_off gives us [now+ε..) so we keep that half
-        // and the front half is everything ≤ now.
-        let mut to_keep = guard.split_off(&(now + Duration::from_nanos(1)));
-        std::mem::swap(&mut *guard, &mut to_keep);
-        for (_, mut items) in to_keep {
-            due.append(&mut items);
-        }
+        let (due, generation) = {
+            let mut guard = self.inner.lock();
+            let mut due = Vec::new();
+            // BTreeMap::split_off gives us [now+ε..) so we keep that half
+            // and the front half is everything ≤ now.
+            let mut to_keep = guard.split_off(&(now + Duration::from_nanos(1)));
+            std::mem::swap(&mut *guard, &mut to_keep);
+            for (_, mut items) in to_keep {
+                due.append(&mut items);
+            }
+            let generation = if due.is_empty() {
+                self.generation.load(std::sync::atomic::Ordering::SeqCst)
+            } else {
+                self.bump_generation()
+            };
+            (due, generation)
+        };
         // FU-5: persist the remaining queue state after each drain so
-        // a restart sees only the still-pending items.
-        self.persist_locked(&guard);
+        // a restart sees only the still-pending items. A drain that removed
+        // nothing left the queue as last persisted, so skip the rewrite
+        // unless the previous write failed and the file may be stale.
+        if !due.is_empty() || self.persist_dirty.load(std::sync::atomic::Ordering::SeqCst) {
+            self.persist(generation);
+        }
         due
     }
 
@@ -2394,6 +2747,48 @@ mod tests {
         );
     }
 
+    /// An idle tick must not rewrite the deferral sidecar.
+    ///
+    /// The tick task calls `drain_due` every 50 ms. It used to rewrite the
+    /// sidecar unconditionally — two blocking `fsync`s per tick on the
+    /// caller's runtime for every database with a local data path, with the
+    /// queue mutex held across them.
+    #[test]
+    fn an_idle_drain_does_not_rewrite_the_sidecar() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue = DeferralQueue::with_persistence(dir.path().to_path_buf());
+        let path = queue.sidecar_path().expect("persistence is enabled");
+
+        for _ in 0..3 {
+            assert!(queue.drain_due(StdInstant::now()).is_empty());
+        }
+        assert!(
+            !path.exists(),
+            "draining an empty queue changed nothing and must not write {path:?}"
+        );
+    }
+
+    /// After a failed write, an idle drain still retries, so the file catches
+    /// up with the in-memory queue.
+    #[test]
+    fn an_idle_drain_retries_a_failed_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue = DeferralQueue::with_persistence(dir.path().to_path_buf());
+        let path = queue.sidecar_path().expect("persistence is enabled");
+
+        queue
+            .persist_dirty
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(queue.drain_due(StdInstant::now()).is_empty());
+        assert!(path.exists(), "a dirty queue must be rewritten on drain");
+        assert!(
+            !queue
+                .persist_dirty
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "a successful write clears the dirty flag"
+        );
+    }
+
     #[test]
     fn empty_router_is_empty() {
         let by_phase = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
@@ -2401,6 +2796,7 @@ mod tests {
             by_phase,
             defer_queue: None,
             ec_queue: EcQueue::new(None, Duration::from_secs(1), 10_000),
+            task_tracker: None,
         };
         assert!(router.is_empty());
     }
@@ -2462,6 +2858,59 @@ mod tests {
             compiled_predicate: None,
             properties_referenced: HashSet::new(),
         }
+    }
+
+    /// A router with one route of `mask` on `labels` (`None`: any label).
+    fn router_with(mask: TriggerEventMask, labels: Option<&[&str]>) -> TriggerRouter {
+        let mut route = ec_route("probe-gate", 0);
+        route.event_mask = mask.0;
+        route.label_filter = labels.map(|ls| ls.iter().map(|l| (*l).to_owned()).collect());
+        TriggerRouter {
+            by_phase: [vec![route], Vec::new(), Vec::new(), Vec::new()],
+            defer_queue: None,
+            ec_queue: EcQueue::new(None, Duration::from_secs(1), 10_000),
+            task_tracker: None,
+        }
+    }
+
+    /// The vertex pre-image gate asks the routes exactly what a node event
+    /// row of the vertex's labels would be delivered to.
+    #[test]
+    fn node_event_gate_follows_the_routes() {
+        let labels = |ls: &[&str]| ls.iter().map(|l| (*l).to_owned()).collect::<Vec<_>>();
+        let audit = router_with(TriggerEventMask::NODE_UPDATE, Some(&[":_AuditMe"]));
+        assert!(!audit.wants_node_events_for(&labels(&["V"])));
+        assert!(!audit.wants_node_events_for(&[]));
+        let on_v = router_with(TriggerEventMask::NODE_DELETE, Some(&["V"]));
+        assert!(on_v.wants_node_events_for(&labels(&["W", "V"])));
+        assert!(!on_v.wants_node_events_for(&labels(&["W"])));
+        let any = router_with(TriggerEventMask::NODE_CREATE, None);
+        assert!(any.wants_node_events_for(&labels(&["W"])));
+        assert!(any.wants_node_events_for(&[]), "an unlabelled vertex's row");
+        let edges = router_with(TriggerEventMask::EDGE_UPDATE, None);
+        assert!(!edges.wants_node_events_for(&labels(&["V"])));
+        let property = router_with(TriggerEventMask::PROPERTY_CHANGE, None);
+        assert!(
+            !property.wants_node_events_for(&labels(&["V"])),
+            "no node row is a PROPERTY_CHANGE row"
+        );
+    }
+
+    /// A vertex the transaction created has no committed state to read.
+    #[test]
+    fn created_vertices_are_not_probed_in_l1() {
+        let mut tx = L0Buffer::new(0, None);
+        let created = uni_common::Vid::new(7);
+        let updated = uni_common::Vid::new(8);
+        tx.insert_vertex_with_labels(created, Properties::new(), &["V".to_owned()]);
+        tx.update_vertex_with_labels(updated, Properties::new(), &["V".to_owned()]);
+        let probe = PreExistingProbe::default();
+        let candidates: Vec<_> = probe
+            .pending_l1_candidates(&tx)
+            .into_iter()
+            .map(|(vid, _)| vid)
+            .collect();
+        assert_eq!(candidates, vec![updated]);
     }
 
     /// One-column Int64 `RecordBatch` carrying `vals` — a stand-in for the
@@ -2634,5 +3083,99 @@ mod tests {
 
         // Silence unused-import warnings for the deferral helper type.
         let _ = TriggerDeferral::from_payload("");
+    }
+
+    /// A deferred item for `entry`, carrying `int_batch(&[n])`.
+    fn deferred(entry: &RouteEntry, n: i64) -> DeferredItem {
+        DeferredItem {
+            plugin: Arc::clone(&entry.plugin),
+            name: entry.name.clone(),
+            name_ordinal: entry.name_ordinal,
+            batch: MutationBatch {
+                events: int_batch(&[n]),
+            },
+            session_id: "s".to_owned(),
+            tx_id: n as u64,
+            attempts: 0,
+            payload: String::new(),
+        }
+    }
+
+    /// The sidecar write runs outside the queue lock.
+    ///
+    /// `push` is on the commit path and used to write and `fsync` the sidecar
+    /// while holding the queue mutex, so a slow disk stalled every concurrent
+    /// deferring commit, the deferral tick, and `pending` for the length of
+    /// the write. The write is held open here by the test seam; a `pending`
+    /// call from another thread must still return.
+    #[test]
+    fn the_sidecar_write_does_not_hold_the_queue_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue = DeferralQueue::with_persistence(dir.path().to_path_buf());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(parking_lot::Mutex::new(release_rx));
+        *queue.before_write.lock() = Some(Arc::new(move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.lock().recv_timeout(Duration::from_secs(10));
+        }));
+
+        let entry = ec_route("t", 0);
+        let pusher = {
+            let queue = Arc::clone(&queue);
+            let item = deferred(&entry, 1);
+            std::thread::spawn(move || queue.push(item, StdInstant::now()))
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the push never reached the sidecar write");
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || {
+                let _ = done_tx.send(queue.pending());
+            });
+        }
+        let seen = done_rx.recv_timeout(Duration::from_secs(2));
+        release_tx.send(()).expect("release the write");
+        pusher.join().expect("pusher");
+        assert_eq!(
+            seen,
+            Ok(1),
+            "`pending` waited for an in-flight sidecar write: the write holds the queue lock"
+        );
+    }
+
+    /// Concurrent pushes all reach the sidecar, whichever of them writes it.
+    #[test]
+    fn concurrent_pushes_are_all_persisted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue = DeferralQueue::with_persistence(dir.path().to_path_buf());
+        let entry = Arc::new(ec_route("t", 0));
+        let far = StdInstant::now() + Duration::from_secs(3600);
+        let threads: Vec<_> = (0..8i64)
+            .map(|t| {
+                let (queue, entry) = (Arc::clone(&queue), Arc::clone(&entry));
+                std::thread::spawn(move || {
+                    for i in 0..10 {
+                        queue.push(deferred(&entry, t * 10 + i), far);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().expect("pusher");
+        }
+        let rows = DeferralSidecar::new(dir.path().to_path_buf())
+            .read_all()
+            .expect("read the sidecar");
+        let mut ids: Vec<u64> = rows.iter().map(|r| r.tx_id).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            (0..80).collect::<Vec<u64>>(),
+            "a pushed item is missing"
+        );
     }
 }

@@ -194,6 +194,27 @@ impl ProcedurePlugin for ProjectProcedure {
         let projection_input = parse_graph_ref(&graph_ref)
             .map_err(|e| FnError::new(0x820, format!("graphRef parse: {e}")))?;
 
+        // The projection catalog is shared by every session and is not undone
+        // by a rollback (as in GDS), so a projection built over a
+        // transaction's uncommitted writes would publish them -- before commit,
+        // and for good after a rollback. Refuse; a transaction without writes
+        // builds from its own snapshot.
+        if host
+            .l0_context()
+            .transaction_l0
+            .as_ref()
+            .is_some_and(|tx_l0| tx_l0.read().mutation_count > 0)
+        {
+            return Err(FnError::new(
+                0x824,
+                uni_common::UniError::uncommitted_writes_message(
+                    "uni.graph.project",
+                    "the projection catalog is not transactional, so the projection would \
+                     publish the transaction's uncommitted writes",
+                ),
+            ));
+        }
+
         // Pre-check duplicates eagerly so the caller sees the error
         // synchronously (matches `uni.graph.exists` ordering); the
         // actual materialisation work is async and runs inside the
@@ -230,6 +251,7 @@ impl ProcedurePlugin for ProjectProcedure {
                     let l0 = build_l0_manager(&host);
                     let mut builder = uni_algo::ProjectionBuilder::new(storage)
                         .l0_manager(l0)
+                        .property_manager(host.property_manager().cloned())
                         .node_labels(&node_labels.iter().map(String::as_str).collect::<Vec<_>>())
                         .edge_types(&edge_types.iter().map(String::as_str).collect::<Vec<_>>())
                         .include_reverse(include_reverse);
@@ -514,13 +536,5 @@ impl ProcedurePlugin for ExistsProcedure {
 /// `uni.graph.project` (Native) sees the same recently-written rows
 /// the outer query would.
 fn build_l0_manager(host: &QueryProcedureHost) -> Option<Arc<uni_store::runtime::L0Manager>> {
-    use uni_store::runtime::L0Manager;
-    let l0_ctx = host.l0_context();
-    l0_ctx.current_l0.as_ref().map(|current| {
-        let mut pending = l0_ctx.pending_flush_l0s.clone();
-        if let Some(tx_l0) = &l0_ctx.transaction_l0 {
-            pending.push(tx_l0.clone());
-        }
-        Arc::new(L0Manager::from_snapshot(current.clone(), pending))
-    })
+    host.l0_context().read_view()
 }

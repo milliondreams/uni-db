@@ -1,12 +1,15 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use uni_common::{Properties, Value};
+use uni_common::{Eid, Properties, Value, Vid};
 
 use crate::types::{RuntimeWarning, RuntimeWarningCode};
 
 /// A single row of bindings from a Locy evaluation result.
 pub type FactRow = HashMap<String, Value>;
+
+/// Every rule's facts, keyed by rule name.
+pub type RuleFacts = HashMap<String, Vec<FactRow>>;
 
 /// The result of evaluating a compiled Locy program.
 #[derive(Debug, Clone)]
@@ -44,7 +47,19 @@ pub struct LocyResult {
 #[derive(Debug, Clone)]
 pub enum CommandResult {
     Query(Vec<FactRow>),
-    Assume(Vec<FactRow>),
+    /// Result of an `ASSUME { ... } THEN { ... }` block.
+    Assume {
+        /// One result per body command, in program order: a `QUERY`'s rows,
+        /// a `DERIVE`'s affected count, a Cypher command's rows, a nested
+        /// `ASSUME`'s own result. Empty when the body defines rules only.
+        results: Vec<CommandResult>,
+        /// Every rule's facts in the hypothetical state the body's first
+        /// command reads: after the block's mutations, before any body
+        /// command, the parent program's rules and the body's own. The same
+        /// point the program's [`LocyResult::derived`] is taken at, before
+        /// its first command.
+        derived: RuleFacts,
+    },
     Explain(DerivationNode),
     Abduce(AbductionResult),
     Derive {
@@ -234,25 +249,55 @@ pub struct ValidatedModification {
 /// A proposed graph modification from ABDUCE.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub enum Modification {
+    /// Remove one relationship the derivation read.
+    ///
+    /// The `*_var` fields name the rule body's variables, for display. The
+    /// edge itself is identified by `eid` when the body binds it, otherwise by
+    /// its endpoints `source_vid` / `target_vid` (`source_vid` is the edge's
+    /// actual source, whatever the direction the body wrote it in).
     RemoveEdge {
         source_var: String,
         target_var: String,
         edge_var: String,
         edge_type: String,
-        /// Property constraints used to identify the specific edge to remove.
+        /// Property constraints on the edge, applied in addition to its
+        /// identity.
         match_properties: HashMap<String, Value>,
+        /// Identity of the edge to remove, when the rule body binds it.
+        eid: Option<Eid>,
+        /// Identity of the edge's source node.
+        source_vid: Option<Vid>,
+        /// Identity of the edge's target node.
+        target_vid: Option<Vid>,
     },
+    /// Change one property of one node or edge the derivation read.
+    ///
+    /// `element_var` is the rule body's variable; the entity changed is the
+    /// one `vid` (a node) or `eid` (an edge) identifies.
     ChangeProperty {
         element_var: String,
         property: String,
         old_value: Box<Value>,
         new_value: Box<Value>,
+        /// Identity of the node to change, when the element is a node.
+        vid: Option<Vid>,
+        /// Identity of the edge to change, when the element is an edge.
+        eid: Option<Eid>,
     },
+    /// Add one relationship between two existing nodes.
+    ///
+    /// The `*_var` fields name the rule body's variables, for display, in the
+    /// edge's own direction. The nodes the edge joins are `source_vid` and
+    /// `target_vid`.
     AddEdge {
         source_var: String,
         target_var: String,
         edge_type: String,
         properties: HashMap<String, Value>,
+        /// Identity of the new edge's source node.
+        source_vid: Option<Vid>,
+        /// Identity of the new edge's target node.
+        target_vid: Option<Vid>,
     },
 }
 
@@ -283,6 +328,11 @@ pub struct DerivedFactSet {
     /// Internal: Cypher ASTs for faithful replay during `tx.apply()`.
     #[doc(hidden)]
     pub mutation_queries: Vec<uni_cypher::ast::Query>,
+    /// Internal: the program's parameters, which `tx.apply()` replays
+    /// `mutation_queries` with, so a write command reading `$param` stores
+    /// the value it was evaluated with.
+    #[doc(hidden)]
+    pub mutation_params: HashMap<String, Value>,
 }
 
 impl DerivedFactSet {
@@ -291,9 +341,11 @@ impl DerivedFactSet {
         self.vertices.values().map(|v| v.len()).sum::<usize>() + self.edges.len()
     }
 
-    /// True when no facts were derived.
+    /// True when there is nothing to apply: no facts were derived and the
+    /// program issued no other write (a Cypher write command's statement is
+    /// replayed too).
     pub fn is_empty(&self) -> bool {
-        self.vertices.is_empty() && self.edges.is_empty()
+        self.vertices.is_empty() && self.edges.is_empty() && self.mutation_queries.is_empty()
     }
 }
 
@@ -309,6 +361,24 @@ pub struct LocyStats {
     pub mutations_executed: usize,
     /// Peak memory used by derived relations (in bytes).
     pub peak_memory_bytes: usize,
+    /// Strata derived by hypothetical re-evaluations (`ASSUME` bodies and
+    /// `ABDUCE` candidate checks), summed over every re-evaluation.
+    pub hypothetical_strata_evaluated: usize,
+    /// Strata a hypothetical re-evaluation copied from the state before its
+    /// mutation instead of deriving, because the mutation could not affect
+    /// them (see [`crate::incremental`]). Summed over every re-evaluation.
+    pub hypothetical_strata_reused: usize,
+    /// Facts the derived (not reused) strata of hypothetical re-evaluations
+    /// produced, summed over every re-evaluation.
+    pub hypothetical_facts_derived: usize,
+    /// Strata derived again because an earlier top-level command wrote (a
+    /// `DERIVE`, a Cypher write) and a later command read the facts, summed
+    /// over every such re-derivation.
+    pub sequenced_strata_evaluated: usize,
+    /// Strata such a re-derivation copied from the state before the write
+    /// instead of deriving, because the write could not affect them. Summed
+    /// over every re-derivation.
+    pub sequenced_strata_reused: usize,
 }
 
 impl LocyResult {
@@ -317,12 +387,18 @@ impl LocyResult {
         self.derived.get(rule)
     }
 
-    /// Get rows from the first Query command result.
+    /// Get rows from the first row-producing command result.
+    ///
+    /// Row-producing results are `QUERY` and Cypher statements, taken in
+    /// program order; an `ASSUME … THEN { … }` is searched depth first, so its
+    /// body's first row-producing result counts in the ASSUME's place (see
+    /// [`CommandResult::rows`]). The Python binding's `rows` follows the same
+    /// rule. Use [`Self::command_results`] to reach a specific command.
     pub fn rows(&self) -> Option<&Vec<FactRow>> {
-        self.command_results.iter().find_map(|cr| cr.as_query())
+        self.command_results.iter().find_map(CommandResult::rows)
     }
 
-    /// Get column names from the first Query command result's first row.
+    /// Get column names from the first row-producing command result's first row.
     ///
     /// Column names are returned in deterministic (sorted) order. The
     /// underlying [`FactRow`] is a `HashMap`, whose iteration order is
@@ -407,6 +483,29 @@ impl CommandResult {
             _ => None,
         }
     }
+
+    /// If this is an Assume result, return its per-command results and its
+    /// derived facts.
+    pub fn as_assume(&self) -> Option<(&[CommandResult], &RuleFacts)> {
+        match self {
+            CommandResult::Assume { results, derived } => Some((results, derived)),
+            _ => None,
+        }
+    }
+
+    /// The rows this result produced, searching an Assume depth first.
+    ///
+    /// A `Query` or `Cypher` result is its own rows; an `Assume` result is the
+    /// rows of the first row-producing result among its body's results,
+    /// descending into nested ASSUMEs in order; any other result (and an
+    /// Assume whose body produced no rows) has none.
+    pub fn rows(&self) -> Option<&Vec<FactRow>> {
+        match self {
+            CommandResult::Query(rows) | CommandResult::Cypher(rows) => Some(rows),
+            CommandResult::Assume { results, .. } => results.iter().find_map(CommandResult::rows),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -446,6 +545,60 @@ mod tests {
         );
     }
 
+    fn row(col: &str, v: i64) -> FactRow {
+        [(col.to_string(), Value::Int(v))].into()
+    }
+
+    fn result_of(command_results: Vec<CommandResult>) -> LocyResult {
+        LocyResult {
+            derived: HashMap::new(),
+            stats: LocyStats::default(),
+            command_results,
+            warnings: Vec::new(),
+            compile_warnings: Vec::new(),
+            approximate_groups: HashMap::new(),
+            derived_fact_set: None,
+            incomplete: None,
+        }
+    }
+
+    /// `rows()` descends depth first into ASSUME results: a DERIVE is not
+    /// row-producing, a nested ASSUME's first row-producing result comes
+    /// before a later sibling's, and an ASSUME with none is skipped.
+    #[test]
+    fn rows_descends_depth_first_into_assume() {
+        let empty_assume = CommandResult::Assume {
+            results: vec![CommandResult::Derive { affected: 2 }],
+            derived: HashMap::new(),
+        };
+        let nested = CommandResult::Assume {
+            results: vec![
+                CommandResult::Derive { affected: 1 },
+                CommandResult::Assume {
+                    results: vec![CommandResult::Query(vec![row("inner", 1)])],
+                    derived: HashMap::new(),
+                },
+                CommandResult::Query(vec![row("outer", 2)]),
+            ],
+            derived: HashMap::from([("r".to_string(), vec![row("d", 3)])]),
+        };
+        let result = result_of(vec![
+            empty_assume,
+            nested,
+            CommandResult::Query(vec![row("top", 4)]),
+        ]);
+        assert_eq!(result.rows(), Some(&vec![row("inner", 1)]));
+        assert_eq!(result.columns(), Some(vec!["inner".to_string()]));
+
+        let (results, derived) = result.command_results[1]
+            .as_assume()
+            .expect("an Assume result");
+        assert_eq!(results.len(), 3);
+        assert_eq!(derived.get("r"), Some(&vec![row("d", 3)]));
+        assert!(result.command_results[2].as_assume().is_none());
+        assert_eq!(result.command_results[0].rows(), None);
+    }
+
     #[test]
     fn abduce_result_serializes_to_json() {
         let result = AbductionResult {
@@ -456,6 +609,8 @@ mod tests {
                         property: "flagged".into(),
                         old_value: Box::new(Value::String("false".into())),
                         new_value: Box::new(Value::String("true".into())),
+                        vid: Some(Vid::new(1)),
+                        eid: None,
                     },
                     validated: true,
                     cost: 0.5,
@@ -467,6 +622,9 @@ mod tests {
                         edge_var: "e".into(),
                         edge_type: "TRANSFERS_TO".into(),
                         match_properties: HashMap::from([("amount".into(), Value::Float(1000.0))]),
+                        eid: Some(Eid::new(7)),
+                        source_vid: Some(Vid::new(1)),
+                        target_vid: Some(Vid::new(2)),
                     },
                     validated: false,
                     cost: 1.0,
@@ -477,6 +635,8 @@ mod tests {
                         target_var: "b".into(),
                         edge_type: "FLAGGED_BY".into(),
                         properties: HashMap::new(),
+                        source_vid: Some(Vid::new(1)),
+                        target_vid: Some(Vid::new(3)),
                     },
                     validated: true,
                     cost: 1.5,

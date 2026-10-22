@@ -566,14 +566,15 @@ impl GraphUnwindStream {
                                 _ => {
                                     return Err(datafusion::error::DataFusionError::Execution(
                                         format!(
-                                            "range() requires integer arguments, got start={start:?}, end={end:?}, step={step:?}"
+                                            "ArgumentError: InvalidArgumentType - range() requires integer arguments, got start={start:?}, end={end:?}, step={step:?}"
                                         ),
                                     ));
                                 }
                             };
                             if st == 0 {
                                 return Err(datafusion::error::DataFusionError::Execution(
-                                    "range() step argument cannot be 0".to_string(),
+                                    "ArgumentError: NumberOutOfRange - range() step cannot be zero"
+                                        .to_string(),
                                 ));
                             }
                             let mut result = Vec::new();
@@ -707,7 +708,7 @@ impl GraphUnwindStream {
             ))
         })?;
 
-        Ok(arrow_to_json_value(col.as_ref(), row_idx))
+        arrow_to_json_value(col.as_ref(), row_idx)
     }
 
     /// Build output batch from expansions.
@@ -924,7 +925,16 @@ impl RecordBatchStream for GraphUnwindStream {
 }
 
 /// Convert an Arrow array value at a specific row to `uni_common::Value`.
-pub(crate) fn arrow_to_json_value(array: &dyn Array, row: usize) -> Value {
+///
+/// # Errors
+///
+/// Returns an error when the column's type has no decoder, or a typed payload
+/// (a CRDT blob, a BTIC interval) fails to decode. Answering `NULL` instead
+/// would be a wrong answer with no diagnostic: `NULL` is a legal value, so an
+/// unreadable cell became indistinguishable from an absent one, and every
+/// caller — `UNWIND`, correlated-subquery parameters, `COLLECT { }`, recursive
+/// CTEs — passed it on as data.
+pub(crate) fn arrow_to_json_value(array: &dyn Array, row: usize) -> DFResult<Value> {
     use arrow_array::{
         BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
         LargeStringArray, ListArray, StringArray, UInt8Array, UInt16Array, UInt32Array,
@@ -932,29 +942,29 @@ pub(crate) fn arrow_to_json_value(array: &dyn Array, row: usize) -> Value {
     };
 
     if array.is_null(row) {
-        return Value::Null;
+        return Ok(Value::Null);
     }
 
     let any = array.as_any();
 
     // String types
     if let Some(arr) = any.downcast_ref::<StringArray>() {
-        return Value::String(arr.value(row).to_string());
+        return Ok(Value::String(arr.value(row).to_string()));
     }
     if let Some(arr) = any.downcast_ref::<LargeStringArray>() {
-        return Value::String(arr.value(row).to_string());
+        return Ok(Value::String(arr.value(row).to_string()));
     }
     // `Utf8View`. Without this arm the fall-through below reads the column as
     // `Value::Null` with no diagnostic -- silently, unlike `arrow_to_value`.
     if let Some(arr) = any.downcast_ref::<arrow_array::StringViewArray>() {
-        return Value::String(arr.value(row).to_string());
+        return Ok(Value::String(arr.value(row).to_string()));
     }
 
     // Integer types - use a macro to reduce repetition
     macro_rules! try_int {
         ($arr_type:ty) => {
             if let Some(arr) = any.downcast_ref::<$arr_type>() {
-                return Value::Int(arr.value(row) as i64);
+                return Ok(Value::Int(arr.value(row) as i64));
             }
         };
     }
@@ -969,37 +979,44 @@ pub(crate) fn arrow_to_json_value(array: &dyn Array, row: usize) -> Value {
 
     // Float types
     if let Some(arr) = any.downcast_ref::<Float64Array>() {
-        return Value::Float(arr.value(row));
+        return Ok(Value::Float(arr.value(row)));
     }
     if let Some(arr) = any.downcast_ref::<Float32Array>() {
-        return Value::Float(arr.value(row) as f64);
+        return Ok(Value::Float(arr.value(row) as f64));
     }
 
     // Boolean
     if let Some(arr) = any.downcast_ref::<BooleanArray>() {
-        return Value::Bool(arr.value(row));
+        return Ok(Value::Bool(arr.value(row)));
     }
 
     // List (recursive)
     if let Some(arr) = any.downcast_ref::<ListArray>() {
         let values = arr.value(row);
-        let result: Vec<Value> = (0..values.len())
+        let result = (0..values.len())
             .map(|i| arrow_to_json_value(values.as_ref(), i))
-            .collect();
-        return Value::List(result);
+            .collect::<DFResult<Vec<Value>>>()?;
+        return Ok(Value::List(result));
     }
 
     // LargeBinary (CypherValue) — decode to Value
     if let Some(arr) = any.downcast_ref::<arrow_array::LargeBinaryArray>() {
         let bytes = arr.value(row);
+        if bytes.is_empty() {
+            return Ok(Value::Null);
+        }
         if let Ok(uni_val) = uni_common::cypher_value_codec::decode(bytes) {
-            return uni_val;
+            return Ok(uni_val);
         }
         // Fallback: try plain JSON text
         if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(bytes) {
-            return Value::from(parsed);
+            return Ok(Value::from(parsed));
         }
-        return Value::Null;
+        // Neither encoding: without a field marker nothing says this column
+        // holds a CypherValue rather than opaque bytes, so the payload is
+        // returned as bytes — the canonical decoder's documented contract
+        // (`arrow_to_value`) — not as `NULL`, which lost it.
+        return Ok(Value::Bytes(bytes.to_vec()));
     }
 
     // Struct — convert fields to a Map so keys()/properties() UDFs work
@@ -1008,14 +1025,23 @@ pub(crate) fn arrow_to_json_value(array: &dyn Array, row: usize) -> Value {
         for (field, child) in s.fields().iter().zip(s.columns()) {
             map.insert(
                 field.name().clone(),
-                arrow_to_json_value(child.as_ref(), row),
+                arrow_to_json_value(child.as_ref(), row)?,
             );
         }
-        return Value::Map(map).canonical_entity();
+        return Ok(Value::Map(map).canonical_entity());
     }
 
-    // Fallback
-    Value::Null
+    // Every other type — a fixed-size list (a stored dense vector), a large
+    // list, a temporal or binary column — goes through the storage layer's
+    // canonical decoder. Answering NULL here erased a vector property handed
+    // to an `EXISTS { }` body as an outer value, so `vector_similarity(a.emb,
+    // q)` on an outer `a` was always NULL there.
+    uni_store::storage::arrow_convert::arrow_to_value(array, row, None).map_err(|e| {
+        datafusion::error::DataFusionError::Execution(format!(
+            "cannot decode a {} value at row {row}: {e}",
+            array.data_type()
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -1386,7 +1412,7 @@ mod tests {
     #[test]
     fn test_arrow_to_json_value_uint64_is_coerced_to_int() {
         let arr = UInt64Array::from(vec![Some(42u64)]);
-        let value = arrow_to_json_value(&arr, 0);
+        let value = arrow_to_json_value(&arr, 0).unwrap();
         assert_eq!(value, Value::Int(42));
     }
 
@@ -1394,8 +1420,39 @@ mod tests {
     fn test_arrow_to_json_value_largebinary_decodes_cypher_map() {
         let encoded = uni_common::cypher_value_codec::encode(&Value::Map(HashMap::new()));
         let arr = LargeBinaryArray::from(vec![Some(encoded.as_slice())]);
-        let value = arrow_to_json_value(&arr, 0);
+        let value = arrow_to_json_value(&arr, 0).unwrap();
         assert_eq!(value, Value::Map(HashMap::new()));
+    }
+
+    /// A column with no decoder is an error, not `NULL`: `NULL` is a legal
+    /// value, so answering it made an unreadable cell look absent.
+    #[test]
+    fn test_arrow_to_json_value_undecodable_type_is_an_error() {
+        let arr = arrow_array::Decimal128Array::from(vec![Some(12_345_i128)])
+            .with_precision_and_scale(10, 2)
+            .unwrap();
+        let err = arrow_to_json_value(&arr, 0).expect_err("Decimal128 has no decoder");
+        assert!(err.to_string().contains("Decimal128"), "{err}");
+        // Nested: a struct field with no decoder fails the whole value.
+        let fields = vec![Arc::new(Field::new("d", arr.data_type().clone(), true))];
+        let s = arrow_array::StructArray::new(fields.into(), vec![Arc::new(arr)], None);
+        assert!(arrow_to_json_value(&s, 0).is_err());
+        // A null cell of such a column is still just null.
+        let nulls = arrow_array::Decimal128Array::from(vec![None::<i128>]);
+        assert_eq!(arrow_to_json_value(&nulls, 0).unwrap(), Value::Null);
+    }
+
+    /// Bytes that are neither a CypherValue nor JSON are returned as bytes,
+    /// the canonical decoder's contract, not dropped to `NULL`.
+    #[test]
+    fn test_arrow_to_json_value_opaque_largebinary_is_bytes() {
+        let raw: &[u8] = &[0xC1, 0xFF, 0x00, 0x7F];
+        let arr = LargeBinaryArray::from(vec![Some(raw), Some(&[][..])]);
+        assert_eq!(
+            arrow_to_json_value(&arr, 0).unwrap(),
+            Value::Bytes(raw.to_vec())
+        );
+        assert_eq!(arrow_to_json_value(&arr, 1).unwrap(), Value::Null);
     }
 
     /// Evaluate a scalar function-call expression (e.g. `range(...)`, `size(...)`)
@@ -1465,6 +1522,34 @@ mod tests {
     fn test_range_zero_step_errors() {
         let err = eval_scalar_fn("range", vec![int_lit(1), int_lit(5), int_lit(0)]);
         assert!(err.is_err(), "range(1, 5, 0) must error, got {err:?}");
+    }
+
+    /// `range` is null-in/null-out here as in the UDF: a null argument
+    /// answers null (so `UNWIND` produces no rows), even beside a zero step,
+    /// and the errors that remain carry their openCypher codes.
+    #[test]
+    fn test_range_null_argument_returns_null() {
+        let null = || Expr::Literal(CypherLiteral::Null);
+        for args in [
+            vec![int_lit(0), null()],
+            vec![null(), int_lit(3)],
+            vec![int_lit(0), int_lit(3), null()],
+            vec![null(), int_lit(3), int_lit(0)],
+        ] {
+            let result = eval_scalar_fn("range", args.clone()).unwrap();
+            assert_eq!(result, Value::Null, "range({args:?})");
+        }
+        let err = eval_scalar_fn("range", vec![int_lit(1), int_lit(5), int_lit(0)])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("NumberOutOfRange"), "{err}");
+        let err = eval_scalar_fn(
+            "range",
+            vec![int_lit(0), Expr::Literal(CypherLiteral::Float(1.5))],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("InvalidArgumentType"), "{err}");
     }
 
     /// H5: float bounds are a type error (openCypher), NOT a silent empty list.
@@ -1544,7 +1629,10 @@ mod tests {
                 .downcast_ref::<UInt64Array>()
                 .expect("vid column");
             for i in 0..b.num_rows() {
-                rows.push((vids.value(i), arrow_to_json_value(b.column(1).as_ref(), i)));
+                rows.push((
+                    vids.value(i),
+                    arrow_to_json_value(b.column(1).as_ref(), i).unwrap(),
+                ));
             }
         }
         (sizes, rows)

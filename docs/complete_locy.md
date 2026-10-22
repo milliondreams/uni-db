@@ -88,7 +88,7 @@ Locy compiles rules into execution plans that run inside Uni's DataFusion-based 
 - **FOLD** aggregates across rows per KEY group: `FOLD total = SUM(amount)`. Monotonic variants (MSUM, MNOR, MPROD) are safe in recursion.
 - **ALONG** accumulates values along recursive paths: `ALONG cost = prev.cost + e.weight`.
 - **BEST BY** selects the optimal derivation per KEY group: `BEST BY cost ASC`.
-- **Commands** operate on rules after strata converge: QUERY (goal lookup), DERIVE (materialize to graph), ASSUME (what-if), ABDUCE (why/why-not), EXPLAIN RULE (proof trace).
+- **Commands** run after strata converge, in sequence: QUERY (goal lookup), DERIVE (materialize to graph), ASSUME (what-if), ABDUCE (why/why-not), EXPLAIN RULE (proof trace). A command reads the state every earlier command of the program left, so a QUERY after a DERIVE sees the derived edges (§13.1).
 
 ```mermaid
 graph LR
@@ -307,7 +307,7 @@ MATCH (n:Person) RETURN n.name   -- This is a plain Cypher query
 QUERY r RETURN *
 ```
 
-Cypher statements are executed as commands after strata converge. They return `CommandResult::Cypher(Vec<FactRow>)`.
+Cypher statements are executed as commands after strata converge, in program order with the other commands. They return `CommandResult::Cypher(Vec<FactRow>)`. A Cypher write (`CREATE`, `MERGE`, `SET`, `DELETE`, ...) is a command like `DERIVE`: every later command reads the graph it left (§13.1). At the transaction level it lands in the transaction; at the session level it is returned in the `DerivedFactSet` (§10.5).
 
 ## 3.4 Union Queries
 
@@ -426,9 +426,19 @@ take columns from the front of the sequence, and a `TO` target takes the next on
 KEY columns are yielded first, the binding sequence is simply YIELD order. The same order is used
 by `IS`, `IS NOT`, EXPLAIN and every evaluation path (`uni_locy::is_binding`).
 
-A variable that is not yet bound is bound to the column; one that is already bound is tested
-against it. A KEY column of a node binds a node; a value column (a FOLD result, an ALONG
-accumulation, a projected property) binds a value.
+**Binding is order-independent.** Each variable of a clause body has exactly one binder — the
+MATCH pattern, a position of a positive IS reference, or a generator output — and every other
+occurrence is a test (an equality against the binder), whatever the order of the WHERE conditions.
+`WHERE o IS seed AND (o, e, pct) IS stake` and the reverse are the same clause. The compiler decides
+this once per clause in its **binding plan** (`uni_locy::binding_plan`), which the compiler's
+checks, the planner and EXPLAIN all read; before it, each decided on its own and conjunct order
+changed answers (issue #300).
+
+Each position has a **kind** — node, relationship or scalar — inferred from the referenced rule's
+YIELD expression, not from whether the column is a KEY. A scalar KEY (`YIELD KEY n, KEY t.code AS
+code`) binds a value: `n IS tag TO c` binds `c` to the code string. A variable of one kind on a
+column of another is a compile error (`IsRefKindMismatch`), for positive and negated references
+alike.
 
 ### Unary Form
 
@@ -461,8 +471,8 @@ cost` binds the same columns.
 
 ### Reading a Value Column by Name
 
-A positive IS reference also makes each of the referenced rule's value columns available under its
-own name, without binding it:
+A positive IS reference also makes each of the referenced rule's value columns that none of its
+positions binds available under its own name. KEY columns are never exposed by name; bind them.
 
 ```
 CREATE RULE stake AS
@@ -477,8 +487,11 @@ CREATE RULE exposure AS
     YIELD KEY e, total
 ```
 
-When two references in one clause expose the same name, the first one wins; bind the value
-explicitly (tuple form or `TO`) to choose.
+When two references in one clause expose the same name, exposing it is legal but *reading* it by
+its bare name — in WHERE, a generator argument, ALONG, FOLD, YIELD or BEST BY — is a compile error,
+`AmbiguousRuleColumn`. Bind each value positionally instead: `(a, s1) IS r1, (a, s2) IS r2`. (This
+replaces an earlier "first reference wins" rule, under which swapping two conjuncts changed the
+answer.)
 
 ### Semantics
 
@@ -486,6 +499,11 @@ A positive IS reference is a **semi-join**: for each row from the MATCH clause, 
 subject(s) exist in the target rule's derived relation. If found, the row passes through, once per
 matching fact; if not, it's filtered out. `prev.<column>` inside ALONG reads a column of the
 referenced fact in a recursive clause (§6).
+
+When both the target rule and the calling rule have a PROB column, the reference is also a
+**probabilistic condition**: the row holds only when the referenced fact does, so the fact's
+probability is multiplied into the row's PROB value — the mirror of `IS NOT`'s `1 − p` (§5.2), so
+`P(r) + P(¬r) = 1`. A clause that already reads that probability is not charged twice; see §12.3.
 
 ## 5.2 IS NOT References (Negation)
 
@@ -503,6 +521,12 @@ KEY, and negation asks whether a fact exists, so `IS NOT` cannot compare a value
 already bound and lands on a value column is a compile error (`IsNotBindsValueColumn`); test the
 value in WHERE after a positive reference instead. An unbound variable on a value column is
 existentially quantified and ignored, so `b IS NOT stake TO agg` means `b IS NOT stake`.
+
+Negations run after every positive condition, wherever they are written, so `NOT b IS blocked` may
+precede the reference that binds `b`. **Safety:** every variable on a KEY position of a negated
+reference must be bound somewhere in the body by MATCH, a positive IS reference or a generator
+(`IsNotKeyUnbound`; for a node KEY, `IsNotSubjectNotANode`, whose message starts `IS NOT subject
+'x'`). A YIELD alias of a bound node (`YIELD KEY a AS subj`) counts as that node.
 
 ### Boolean Semantics (Default)
 
@@ -559,6 +583,12 @@ KEY marks a column as a **grouping key**:
 **Deduplication is on the whole row, not on KEY alone.** Two derived rows are
 the same fact only when *every* column matches, so a rule may legitimately
 produce several rows per KEY group — which is what ALONG and BEST BY rely on.
+A rule with **ALONG** is the exception: its facts are one row per derivation
+path, so two paths that reach the same KEY with equal values give two rows,
+identical on every visible column (issue #159; merging them halved downstream
+`SUM`s). On a DAG with many equal paths this grows with the number of paths —
+exponential in the depth of a diamond lattice. Add `BEST BY` when you want one
+row per KEY.
 Declaring no KEY columns does not disable deduplication; it only removes the
 grouping, and is usually an anti-pattern in recursive rules (see
 [Section 19](#19-best-practices--anti-patterns)).
@@ -872,7 +902,7 @@ A top-level command that triggers bottom-up evaluation of the named rule and app
 
 ## 10.5 DerivedFactSet and tx.apply()
 
-When Locy runs at **session level** (read-only), DERIVE mutations are collected into a `DerivedFactSet` rather than applied immediately:
+When Locy runs at **session level**, nothing is written to the database. The program's writes — DERIVE mutations and Cypher write commands, in program order — land in an ephemeral overlay that later commands of the same program read (§13.1) and that is discarded on return. They are collected into one `DerivedFactSet` rather than applied:
 
 ```rust
 // Session level: collect derived facts
@@ -885,7 +915,11 @@ tx.apply(derived).await?;
 tx.commit().await?;
 ```
 
-When Locy runs at **transaction level**, DERIVE mutations are applied immediately to the transaction's private L0 buffer:
+Applying it replays every write of the program in one transaction, so a session-level program's writes take effect together or not at all.
+
+One program shape cannot be replayed: a DERIVE that connects a node an earlier command of the same session-level program created (a `DERIVE (NEW ...)`, a Cypher `CREATE`). The replay finds a DERIVE's endpoints by node id, and the created node gets a new id when the replay creates it again, so such a DERIVE fails with an evaluation error naming the node instead of losing its edge. Run the program with `tx.locy()` instead.
+
+When Locy runs at **transaction level**, DERIVE mutations and Cypher writes are applied immediately to the transaction's private L0 buffer, and commit or roll back with the transaction:
 
 ```rust
 let tx = session.tx().await?;
@@ -983,36 +1017,82 @@ CREATE RULE safe AS
 
 - If `a` has a risk of 0.8 in `risky`, then `safe` yields `confidence = 1 − 0.8 = 0.2`.
 - If `a` is not in `risky` at all, then `safe` yields `confidence = 1.0`.
+- If the negation key matches several facts (a KEY column of `risky` that no literal binds is
+  existential), `p` is their noisy-OR.
 
-Multiple IS / IS NOT references with PROB in a single clause multiply their probability terms into the calling rule's PROB column.
+That `1 − p` is the default-mode value: it treats the negated fact as independent of the rest of
+the row. In exact mode (§12.5) the row instead conjoins the negation of the negated facts'
+formulas, which differs when they share an event with the rest of the row.
+
+A positive `IS` reference to a PROB rule multiplies the referenced fact's probability `p` into the
+calling rule's PROB column, as `IS NOT` multiplies `1 − p`; several references in one clause each
+contribute their term. **Count-once rule:** a clause's PROB expression (the FOLD input, or the
+PROB YIELD item) that already reads `p` is not charged a second time:
+
+| The PROB expression reads `p` | Multiplied in | Exact mode |
+|---|---|---|
+| not at all: `FOLD prob = MNOR(e.p)` | yes: `e.p · p` | row event `e.p` ∧ the referenced fact |
+| as exactly one product factor: `MNOR(p)`, `MNOR(e.p * p)` | no (already counted) | the same decomposition |
+| any other way: `MNOR(1.0 - p)`, `MNOR(p * p)`, `max(p, e.p)` | no (never counted twice) | the row is one independent event; `ProbabilityReadNotFactor` warning |
+
+```
+CREATE RULE reach AS
+    MATCH (a)-[e:LINK]->(b)
+    FOLD prob = MNOR(e.p) YIELD KEY a, KEY b, prob
+CREATE RULE reach AS
+    MATCH (a)-[e:LINK]->(mid) WHERE mid IS reach TO b
+    FOLD prob = MNOR(e.p) YIELD KEY a, KEY b, prob
+```
+
+Over `s -0.7-> t`, `s -0.3-> m -0.5-> t`, the recursive row is `0.3 · reach(m, t) = 0.15` and
+`reach(s, t) = 1 − (1 − 0.7)(1 − 0.15) = 0.745`: the probability that `t` is reachable when each
+edge is present independently with its `p`. A PROB column computed after the fold
+(`YIELD 1 - total AS x PROB`) has no per-row value, and its positive references stay Boolean.
 
 ## 12.4 Shared Proof Detection
 
-When recursive rules have diamond-shaped derivation graphs, multiple proof paths may share the same base facts. The **independence assumption** (which MNOR/MPROD rely on) may not hold.
+MNOR and MPROD combine a group's rows as independent events. That holds unless two proofs of a fact rest on the same event: the same edge (or, generally, the same expression over the same nodes and relationships), or the same referenced fact, or the fact itself through a cycle. The same goes for one row whose positive part and an `IS NOT` rest on one event: `reach(a, b) AND NOT link(m, b)` both read the edge `m → b` when it lies on a path from `a`. Nodes in common are not evidence in common: the two proofs of `reach(s, t)` in §12.3 share the node `s` but no edge, so independence is exact there.
 
-Uni detects this at runtime via a **DerivationTracker** that records the base-fact inputs for each derived fact. When overlap is detected, it emits a `SharedProbabilisticDependency` warning.
+Uni records each MNOR/MPROD rule's derivation rows as lineage and emits a `SharedProbabilisticDependency` warning for a rule when some fact's formula reads one event twice. When no rule warns, every default-mode value is already the possible-worlds probability.
 
 ## 12.5 Exact Probability (BDD-Based)
 
-When `exact_probability = true`, shared-proof groups use **BDD-based weighted model counting** instead of the independence assumption:
+When `exact_probability = true`, each fact whose formula reads an event twice is recomputed by **BDD-based weighted model counting** under possible-worlds semantics:
 
-1. Collect all unique base facts across the group's derivation rows
-2. Build a BDD variable set (one variable per base fact)
-3. For each derivation row: AND its base-fact variables
-4. Combine rows: OR for MNOR, AND for MPROD
-5. Evaluate exact probability via Shannon expansion
+1. Each derivation row is `(its own event) AND (the formula of every fact it references positively) AND NOT (the formula of any fact its IS NOT references matched)`. The row's own event has the row's PROB value divided by the referenced probabilities and complements it carries; rows over the same expression and the same nodes and relationships share one event, and a referenced or negated fact of a rule without lineage (a non-fold PROB rule) is one event
+2. A fact is the OR (MNOR) or the AND (MPROD) of its rows, as a least fixpoint, so a derivation through itself adds nothing. A negated fact sits in a lower stratum, so it is complete before any formula negates it
+3. Build a BDD over the events (one variable each) and evaluate its probability via Shannon expansion
+
+On the graph `A -0.5-> B -0.4-> C -0.6-> D`, `A -0.3-> C`, both proofs of `reach(A, D)` need `C → D`: exact mode gives `0.6 · (1 − 0.7 · 0.8) = 0.264`, independence `1 − (1 − 0.12)(1 − 0.18) = 0.2784`.
+
+With negation, on `s -0.7-> t`, `s -0.3-> m -0.5-> t`:
+
+```
+CREATE RULE link AS
+    MATCH (a)-[e:LINK]->(b)
+    FOLD p = MNOR(e.p) YIELD KEY a, KEY b, p
+CREATE RULE odd AS
+    MATCH (a), (m) WHERE a IS reach TO b, m IS NOT link TO b
+    FOLD prob = MNOR(1.0) YIELD KEY a, KEY m, KEY b, prob
+```
+
+`odd(s, m, t)` is `(X ∨ (Y ∧ Z)) ∧ ¬Z = X ∧ ¬Z` with `X = s→t`, `Y = s→m`, `Z = m→t`: exact mode gives
+`0.7 · 0.5 = 0.35`. Default mode gives `reach(s, t) · (1 − link(m, t)) = 0.745 · 0.5 = 0.3725` and
+raises `SharedProbabilisticDependency` for `odd`.
 
 ### Fallback
 
-When unique base facts exceed `max_bdd_variables` (default 1000), the group falls back to independence mode and emits `BddLimitExceeded`. The affected rows are annotated with `approximate = true`.
+When a fact's formula needs more than `max_bdd_variables` (default 1000) events, the group falls back to independence mode and emits `BddLimitExceeded`. The affected rows are annotated with `approximate = true`.
 
 ### Cross-Group Correlation
 
-When base facts are shared across **different KEY groups**, per-group BDD is exact internally but cross-group correlation remains approximate. This emits `CrossGroupCorrelationNotExact`.
+When a referenced fact is consumed by **different KEY groups** of one rule, per-group BDD is exact internally but cross-group correlation remains approximate. This emits `CrossGroupCorrelationNotExact`.
 
-## 12.6 Top-K Proof Filtering
+## 12.6 Top-K Proofs
 
-`top_k_proofs` bounds the number of proof annotations retained per derived fact. When `top_k_proofs > 0`, only the k highest-probability proofs are kept (Scallop, Huang et al. 2021). `top_k_proofs_training` optionally overrides this during training mode.
+**`TopKProofs { k }` semiring.** Each fact of an MNOR/MPROD rule is evaluated over its proofs as in §12.5, with each MNOR fact restricted to its `k` most probable rows (by row PROB value; ties by row order). The facts a kept row references keep all their rows. With `k` at least a fact's row count the value is the possible-worlds probability, shared events counted once; with fewer, it is the probability of the kept proofs, a lower bound. A fact with at most `k` rows and no shared event keeps its default value, which is already exact. On the `A … D` graph of §12.5, `TopKProofs(8)` gives `reach(A, D) = 0.264`, and `TopKProofs(1)` keeps `A → C, reach(C, D)` (0.18 against 0.12): `0.3 · 0.6 = 0.18`. A referenced fact of a rule without a PROB column is certain and contributes no event. The shared-proof warning is not raised under `TopKProofs`, which corrects the facts it names.
+
+**`top_k_proofs` (annotation retention).** `top_k_proofs` bounds the number of provenance annotations retained per derivation for EXPLAIN. When `top_k_proofs > 0`, only the k highest-probability annotations are kept (Scallop, Huang et al. 2021). `top_k_proofs_training` optionally overrides this during training mode.
 
 ```mermaid
 graph TD
@@ -1032,7 +1112,7 @@ graph TD
 
 # 13. Commands
 
-Commands execute in **Phase 2** (row-level dispatch) after all strata have converged in Phase 1. They operate on the converged derived relations.
+Commands execute in **Phase 2** (row-level dispatch) after all strata have converged in Phase 1, one after another in program order. The first command reads the converged derived relations; each later one reads the state the commands before it left (§13.1.1).
 
 ## 13.1 Two-Phase Execution
 
@@ -1059,6 +1139,18 @@ graph TB
 
 **Phase 2** operates on converged facts. Commands are not queries — they perform mutations (DERIVE), hypothetical reasoning (ASSUME/ABDUCE), or introspection (EXPLAIN/QUERY).
 
+### 13.1.1 Commands run in sequence
+
+A program's commands behave exactly like the same commands run one after another, each as its own `tx.locy` call, in one transaction. A command that writes — a `DERIVE` that derived something, or a Cypher write — changes the graph, and every later command reads the changed graph and the facts derived from it: a `QUERY`, a second `DERIVE`, `EXPLAIN RULE`, `ABDUCE`, an `ASSUME` (its hypothetical state starts from the written one), `VALIDATE`, and a Cypher read.
+
+After a write, the facts are derived again when the next command that reads them runs, incrementally: a stratum the writes cannot affect keeps its facts, the rest are derived from scratch (the criterion is the one ASSUME uses, §13.4). Consecutive writes are folded into one re-derivation, and nothing is derived after the last write, so a program ending in `DERIVE` pays nothing extra. A program without a write command derives nothing again. `LocyStats::sequenced_strata_evaluated` / `sequenced_strata_reused` show the split. A program that records provenance (an `EXPLAIN RULE`, or shared-proof probability tracking) derives every stratum again after a write, recording provenance for the new state, so EXPLAIN explains the facts it reads.
+
+`ASSUME` and `ABDUCE` write only to a hypothetical state they discard, so they change nothing a later command reads. The same machinery runs an ASSUME body's commands (§13.4).
+
+`LocyResult::derived` holds the facts the program derived before its first command (hydrated in the state the program leaves), not the facts of a later state; read a later state with a `QUERY` after the write.
+
+Before this, every command read the facts derived before the first command ran: a `QUERY` after a `DERIVE` in the same program answered without the derived edges, while a Cypher read after it saw them, and a Cypher write ahead of the program's first `DERIVE` failed with "Mutation context not set".
+
 > **Expression limitation:** WHERE filters in commands use `eval_expr()` (a lightweight row-level evaluator), not DataFusion. Expression functions like `similar_to()` are limited to pure vector cosine — no auto-embed, FTS, or multi-source fusion. Rule WHERE clauses (Phase 1) have full DataFusion expression support.
 
 ## 13.2 QUERY (Goal-Directed Evaluation)
@@ -1070,6 +1162,17 @@ QUERY rule_name [WHERE expr] [RETURN items [ORDER BY ...] [SKIP n] [LIMIT n]]
 Answered from the **derived store** — the same semi-naive fixpoint result that `.derived` exposes — then filtered by WHERE and shaped by RETURN. Because both read the same rows, `QUERY` and `.derived` agree by construction.
 
 Every rule has a published relation, empty when it derived nothing, including a rule with a **generator**: the fixpoint runs generators as a row-explosion operator (`LocyGenerateExec`), so a generator rule's FOLD, BEST BY and post-FOLD WHERE apply and other rules can reference it. There is no second, goal-directed evaluator; a missing relation is an error.
+
+### Goal-directed QUERY (magic sets, opt-in)
+
+By default a `QUERY ... WHERE` filters the converged relation: `QUERY reach WHERE a.uid = 'c0_0'` derives the whole transitive closure first (76k facts for a 19-row answer in the A1 measurement). With `LocyConfig::goal_directed = GoalDirected::On` the compiled program is rewritten before planning (`uni_locy::magic`, the magic-sets transformation) so the fixpoint derives only what the goal can reach. Answers are unchanged.
+
+- **What binds.** A top-level WHERE conjunct `c.p = v`, `v = c.p` or `c.p IN [...]` where `c` is a node KEY column of the queried rule and `v` a string, integer or boolean literal, or a `$param` holding one (or a list of them). Floats, OR, comparisons between columns and conjuncts on value (non-KEY) columns do not bind; they stay filters. The whole WHERE is still applied to the answer.
+- **The rewrite.** Each adorned rule `r` (adornment = which KEY columns are bound) gets a copy `__locy_gd{g}_r_{bf}` whose clauses are guarded by `(bound vars) IS __locy_gdm{g}_r_{bf}`, a magic rule seeded by `MATCH (c:L) WHERE <conjuncts> YIELD KEY c`. A call inside a copy is adorned on the KEY positions bound by the head or by MATCH nodes connected to a bound head variable; it then contributes a magic propagation clause (the connected MATCH paths, the guard, the filters over them). Magic rules read only the graph and other magic rules, so the rewritten program stratifies whenever the original does.
+- **Fallback to full evaluation** (never a partial answer): ALONG; FOLD, BEST BY, REQUIRE or post-FOLD WHERE in a *recursive* stratum; PROB columns, MNOR/MPROD, `IS NOT` of a PROB rule; PRIORITY; generators; neural models; DERIVE rules. `IS NOT` targets are always read in full (never adorned). FOLD / BEST BY in a non-recursive stratum are adorned: the guard is on KEY columns, so whole KEY groups are kept or dropped. Only top-level `QUERY` is rewritten: `EXPLAIN RULE`, `DERIVE`, `ABDUCE` and commands inside `ASSUME` use full evaluation.
+- **Effect on `.derived`.** The copies and magic rules never appear in `.derived`. In `On` mode a rule that only rewritten goals needed is not evaluated, so it is *absent* from `.derived` (never present with a partial relation); every other rule is evaluated and published as before. `GoalDirected::Shadow` evaluates every original rule too, so `.derived` is unchanged while QUERY reads the rewritten copies — a verification mode (the Locy TCK runs in it with `UNI_LOCY_TCK_GOAL_DIRECTED=shadow`). `profile()` shows the generated rules.
+- **Default: `Off`.** `.derived` is documented as every rule's full relation; turning the rewrite on by default would empty that contract for every queried rule. Opt in per evaluation.
+- **Not passed sideways:** bindings produced by one IS reference for another (the inner call of non-linear recursion reads its callee in full).
 
 ```
 QUERY reachable WHERE a.name = 'Alice' RETURN b.name AS destination
@@ -1096,7 +1199,7 @@ ASSUME {
     CREATE (x:Account {name: 'Suspicious'})-[:TRANSFER]->(existing:Account)
 }
 THEN {
-    -- Locy body (rules, queries, other commands)
+    -- Locy body (rules, QUERY, Cypher, DERIVE, nested ASSUME)
     QUERY risk_propagation RETURN affected_nodes
 }
 ```
@@ -1104,13 +1207,23 @@ THEN {
 **Execution:**
 1. **Fork** the L0 buffer (save current state)
 2. **Apply** mutations from the ASSUME block
-3. **Re-evaluate** all strata in the mutated state
+3. **Re-evaluate** the strata the mutations can affect; every other stratum keeps the facts it had before the block
 4. **Execute** body commands
 5. **Rollback** — restore L0 to pre-ASSUME state
 
 The database is never permanently modified. ASSUME blocks can be nested (stacked savepoints).
 
-Returns `CommandResult::Assume(Vec<FactRow>)`.
+**Incremental re-evaluation.** A stratum is recomputed when one of its rules matches a label whose membership the mutations change (a created node's labels, an added or removed label, every label when a node is deleted), matches a relationship type that gains or loses a relationship, reads a property the mutations `SET` or `REMOVE`, references (`IS` / `IS NOT`) a recomputed rule, or uses a construct whose inputs cannot be read from the syntax (subqueries, `EXISTS`, generators, neural models, plugin or retrieval functions, `rand()`, `timestamp()`). Every other stratum is reused. Recomputed strata are evaluated from scratch. Answers are the same as evaluating the program on the mutated graph; `LocyStats::hypothetical_strata_evaluated` / `hypothetical_strata_reused` show the split. A hypothetical evaluation cut short by the timeout or iteration limit is an error unless `allow_partial` is set.
+
+**Body commands run in sequence**, with the same machinery as a program's top-level commands (§13.1.1). The body behaves exactly like its commands run one after another in a transaction that is rolled back: a `DERIVE` or a Cypher write changes the hypothetical graph, and every later command in the body (`QUERY`, another `DERIVE`, Cypher, a nested ASSUME) reads the changed graph and the facts derived from it. After a command that writes, the parent's strata are re-derived incrementally against the write's footprint when a later body command reads facts (the same criterion as above; a `DERIVE`'s footprint is that of the edge or node writes it ran, and a `DERIVE` that derived nothing writes nothing), and the body's own rules are derived again on top. Before, the body's facts were derived once, before its first command, so a `QUERY` after a `DERIVE` in the same body answered from the graph without the derived edges while a Cypher read saw them.
+
+The ASSUME's result holds one result per body command, in order, each the result the same command gives at the top level: `Query(rows)` for a `QUERY`, `Derive { affected }` for a `DERIVE`, `Cypher(rows)` for a Cypher command, and a nested ASSUME's own `Assume { .. }`. With them it carries `derived`: every rule's facts, the program's and the body's own, in the hypothetical state the body's first command reads (after the ASSUME's mutations, before any body command). That is the point a program's own `LocyResult::derived` is taken at, before its first command; the state after the last body command is not reported, because re-derivation is lazy and a body ending in a write never derives it. A body that only defines rules has no results; its facts are in `derived`. (Until 4.2 the result was the body commands' rows concatenated into one list, with a `DERIVE` contributing an `{affected: n}` row and a rules-only body returning every derived fact as rows.)
+
+`CommandResult::rows()` and `LocyResult::rows()` search depth first: an ASSUME's rows are those of the first body result that produces rows (a `QUERY` or Cypher command, descending into a nested ASSUME), and an ASSUME whose body produced none is skipped. The Python `AssumeCommandResult` has `.results`, `.derived`, and `.rows` (the same depth-first rows, or `[]`). The Locy TCK addresses a nested result by path: `the result at path 0.2 should be a Query with 3 rows` is body command 2 of top-level command 0 (`assume/AssumeBodyResults.feature`).
+
+`ABDUCE` and `EXPLAIN RULE` run inside an ASSUME body, at any nesting depth, against the hypothetical state, and their results are body results (`CommandResult::Abduce`, `CommandResult::Explain`). `EXPLAIN RULE` explains the hypothetical facts from the provenance recorded while deriving them; `ABDUCE` applies each candidate on top of the hypothetical state and validates it against the parent's rules and the body's own. Each gives the answer the same command gives at the top level of a program run in a transaction that applied the mutations and is rolled back. A program that records provenance (an `EXPLAIN RULE` or an `MNOR` / `MPROD` fold anywhere, ASSUME bodies included) records it in every hypothetical evaluation too, so under `exact_probability` a body `QUERY` reads the exact probability, as a top-level one does. (Until 4.2 both were compile errors, `LocyCompileError::AssumeBodyCommandNotAllowed`, and before that the ASSUME computed them and dropped their results.) A `DERIVE` in the body is allowed: its edges land in the hypothetical graph, where every later command in the same body reads them, and are rolled back with it.
+
+Returns `CommandResult::Assume { results: Vec<CommandResult>, derived: HashMap<String, Vec<FactRow>> }`.
 
 ```
 -- "What if Alice knew Carol?"
@@ -1133,7 +1246,7 @@ Asks: "What graph modifications would make this rule hold (or stop holding)?"
 
 **Three-phase pipeline:**
 1. **Generate candidates**: Build derivation tree via EXPLAIN, extract candidate modifications (RemoveEdge, AddEdge, ChangeProperty)
-2. **Validate**: For each candidate, use ASSUME-style fork → mutate → re-evaluate → check if goal holds → rollback
+2. **Validate**: For each candidate, use ASSUME-style fork → mutate → re-evaluate (only the strata the candidate can affect, as for ASSUME) → check if goal holds → rollback
 3. **Return**: Validated modifications sorted by cost, up to `max_abduce_results`
 
 ```
@@ -1148,9 +1261,9 @@ ABDUCE flagged WHERE account.id = 'ACC-999' RETURN assumptions
 Returns `CommandResult::Abduce(AbductionResult)` containing `Vec<ValidatedModification>`.
 
 **Modification types:**
-- `RemoveEdge { source_var, target_var, edge_var, edge_type, match_properties }`
+- `RemoveEdge { source_var, target_var, edge_var, edge_type, match_properties, eid, source_vid, target_vid }` — the edge is identified by `eid` when the rule body binds it, else by its endpoints (`source_vid` is the edge's actual source)
 - `AddEdge { source_var, target_var, edge_type, properties }`
-- `ChangeProperty { element_var, property, old_value, new_value }`
+- `ChangeProperty { element_var, property, old_value, new_value, vid, eid }` — `element_var` is the rule body's variable; the entity is the node `vid` or the edge `eid`
 
 ## 13.6 EXPLAIN RULE (Proof Traces)
 
@@ -1159,6 +1272,18 @@ EXPLAIN RULE rule_name [WHERE expr] [RETURN items [ORDER BY ...] [LIMIT n]]
 ```
 
 Returns the **derivation tree** showing which clauses and base facts produced a result.
+
+With recorded provenance (Mode A: the program has an EXPLAIN or an MNOR/MPROD fold), each
+derivation of a matching fact is a child of the root, and below each derivation are the facts it
+references positively through a probabilistic `IS` (to a PROB rule, from an MNOR/MPROD rule) —
+the same references exact mode and `TopKProofs` evaluate, read from the same hidden columns, so a
+subject the rule does not yield (`mid IS reach TO b`) is still shown. A referenced fact is expanded
+into its own derivations where it first appears in the tree, to `max_explain_depth` levels;
+elsewhere it is a leaf carrying its bindings, marked `(cycle)` (on the path from the root),
+`(derived above)` or `(depth limit)`. A reference to a rule without a PROB column is a certain
+condition and is not listed. Without recorded provenance (Mode B, also what ABDUCE uses), the
+tree is rebuilt from the published facts by re-running each clause's MATCH, one derivation per
+fact.
 
 ```
 EXPLAIN RULE reachable WHERE a.name = 'A' AND b.name = 'C'
@@ -1326,7 +1451,7 @@ Non-rule statements are extracted as `CompiledCommand`:
 
 **Phase 1 (DataFusion):** Bottom-up stratum evaluation via `LocyProgramExec`. Rules compile to DataFusion `LogicalPlan` nodes. Physical planning uses `CypherPhysicalExprCompiler` for expressions. Fixpoint iteration runs via `FixpointExec`.
 
-**Phase 2 (Row-Level):** Command dispatch via `NativeExecutionAdapter`. Commands receive converged facts as `Vec<FactRow>` and perform mutations (DERIVE), hypothetical reasoning (ASSUME/ABDUCE), or introspection (EXPLAIN/QUERY).
+**Phase 2 (Row-Level):** Command dispatch via `NativeExecutionAdapter`, in program order. Commands receive the facts of the current state as `Vec<FactRow>` — the converged facts, derived again after a command writes (§13.1.1) — and perform mutations (DERIVE, Cypher writes), hypothetical reasoning (ASSUME/ABDUCE), or introspection (EXPLAIN/QUERY).
 
 ## 15.2 Stratum Evaluation Order
 
@@ -1413,7 +1538,7 @@ Accumulates converged facts from each stratum. Later strata see results from all
 
 ## 15.7 One Evaluator
 
-Every command reads the facts the fixpoint published (Appendix B2 of the Black Book, C-NONINTERFERENCE):
+Every command reads the facts the fixpoint published for the state it runs in — the program's own, or the facts derived again after an earlier command wrote (§13.1.1). A command that does not write never changes what a later command reads (Appendix B2 of the Black Book, C-NONINTERFERENCE):
 
 - **QUERY** filters and projects the rule's relation.
 - **EXPLAIN** reads the provenance the fixpoint recorded (Mode A) or, without it, rebuilds the tree from the published facts by re-running each clause's MATCH (Mode B). It does not re-derive the rule.
@@ -1433,6 +1558,19 @@ Locy used to keep an in-memory top-down resolver (SLG) for generator rules and E
 | `DERIVE ... WHERE` | In-memory eval_expr | Limited (vector cosine only for similar_to) |
 | `ABDUCE ... WHERE` | In-memory eval_expr | Limited |
 | `ASSUME ... THEN` body WHERE | In-memory eval_expr | Limited |
+
+Every in-memory context (`QUERY ... WHERE / RETURN / ORDER BY`, `DERIVE`,
+`ABDUCE`, `ASSUME`, `EXPLAIN RULE ... WHERE`) evaluates binary operators
+through the same value-level evaluator the Cypher executors share
+(`uni_query_functions::expr_eval::eval_binary_op`), so an operator answers
+as a Cypher `RETURN` does: `+` over strings, lists and temporal + duration;
+checked integer arithmetic; `=` over lists/maps holding NULL is NULL; durations
+do not order; `=~` is supported. Four operators are adjusted to match what a
+Cypher `RETURN` answers: `AND`/`OR` with a non-boolean, non-NULL operand is a
+type error; `STARTS WITH`/`ENDS WITH`/`CONTAINS` over a non-string is NULL;
+`^` is always a float; and `string + number/boolean/temporal` concatenates the
+operand's `toString`. The matrix test `locy::locy_operator_parity` holds every
+operator × operand-type pairing to Cypher.
 
 ---
 
@@ -1596,14 +1734,14 @@ LocyResult {
 - `result.stats` — execution statistics
 - `result.command_results` — ordered command outputs
 - `result.warnings` / `result.has_warning(code)` — runtime warning inspection
-- `result.derived_fact_set` — collected DERIVE mutations (session-level only)
+- `result.derived_fact_set` — the program's collected writes, DERIVE mutations and Cypher writes in program order (session-level only)
 
 ### CommandResult
 
 ```rust
 enum CommandResult {
     Query(Vec<FactRow>),
-    Assume(Vec<FactRow>),
+    Assume { results: Vec<CommandResult>, derived: HashMap<String, Vec<FactRow>> },
     Explain(DerivationNode),
     Abduce(AbductionResult),
     Derive { affected: usize },
@@ -1671,6 +1809,7 @@ LocyExplainOutput {
 | `timeout` | `Duration` | `300s` | Overall evaluation timeout |
 | `max_explain_depth` | `usize` | `100` | Maximum recursion depth for EXPLAIN derivation trees |
 | `max_slg_depth` | `usize` | `1000` | Deprecated, no effect; will be removed. Setting or reading it warns (a Rust deprecation warning, a Python `DeprecationWarning`) |
+| `goal_directed` | `GoalDirected` | `Off` | Answer qualifying `QUERY ... WHERE` commands by the magic-sets rewrite (`On`), or rewrite while still evaluating every rule (`Shadow`); see §13.2 |
 | `max_abduce_candidates` | `usize` | `20` | Maximum candidate modifications generated during ABDUCE |
 | `max_abduce_results` | `usize` | `10` | Maximum validated results returned from ABDUCE |
 | `max_derived_bytes` | `usize` | `256 MiB` | Maximum bytes of derived facts per relation |
@@ -1782,6 +1921,7 @@ session.locy_with(program) \
 | Shared proof | `SharedProbabilisticDependency` | MNOR/MPROD proof paths share base facts — independence assumption may not hold |
 | BDD limit | `BddLimitExceeded` | Group exceeded `max_bdd_variables` — fell back to independence mode |
 | Cross-group | `CrossGroupCorrelationNotExact` | Base facts shared across different KEY groups — per-group BDD is exact, cross-group is approximate |
+| Non-factor probability read | `ProbabilityReadNotFactor` | A clause's PROB expression reads a positively referenced probability other than as one product factor (`1 - p`) — it is not multiplied in again, and exact mode treats the row as one independent event (§12.3) |
 
 ---
 
@@ -2299,7 +2439,7 @@ struct ExplainRule { rule_name: QualifiedName, where_expr: Option<Expr>, return_
 
 ## Appendix D: TCK Coverage Map
 
-**72 feature files, 528 scenarios** covering all Locy features.
+**74 feature files, 553 scenarios** covering all Locy features.
 
 ### Core Evaluation
 
@@ -2308,9 +2448,9 @@ struct ExplainRule { rule_name: QualifiedName, where_expr: Option<Expr>, return_
 | `evaluate/NonRecursive.feature` | 4 | Basic YIELD rules, WHERE filters, multiple rules |
 | `evaluate/TransitiveClosure.feature` | 2 | Recursive IS-ref chains |
 | `evaluate/MultiStratum.feature` | 3 | Cross-stratum fact injection |
-| `evaluate/YieldValueColumns.feature` | 5 | YIELD schema, value columns |
+| `evaluate/YieldValueColumns.feature` | 7 | YIELD schema, value columns |
 | `evaluate/ParameterBinding.feature` | 5 | `$param` references in rules |
-| `evaluate/ErrorConditions.feature` | 5 | Compilation/runtime error cases |
+| `evaluate/ErrorConditions.feature` | 8 | Compilation/runtime error cases |
 | `evaluate/AlongWithIsRef.feature` | 3 | ALONG + IS-ref combinations |
 | `evaluate/CypherFunctions.feature` | 9 | Built-in function evaluation |
 | `rules/BasicRules.feature` | 6 | Base + recursive rules |
@@ -2320,21 +2460,21 @@ struct ExplainRule { rule_name: QualifiedName, where_expr: Option<Expr>, return_
 
 | Feature File | Scenarios | Coverage |
 |-------------|-----------|----------|
-| `fold/Aggregation.feature` | 11 | FOLD (SUM, MAX, MIN, COUNT, AVG) |
+| `fold/Aggregation.feature` | 12 | FOLD (SUM, MAX, MIN, COUNT, AVG) |
 | `bestby/OptimizedSelection.feature` | 6 | BEST BY (group-by + selection) |
 | `priority/PrioritizedRules.feature` | 5 | PRIORITY clause semantics |
-| `along/PathCarriedValues.feature` | 9 | ALONG for path-carried aggregation |
+| `along/PathCarriedValues.feature` | 10 | ALONG for path-carried aggregation |
 
 ### Probabilistic
 
 | Feature File | Scenarios | Coverage |
 |-------------|-----------|----------|
-| `monotonic/MonotonicAggregation.feature` | 30 | MSUM, MMAX, MMIN, MCOUNT, MNOR, MPROD |
-| `monotonic/ProbabilisticComplement.feature` | 13 | PROB + IS NOT complement |
-| `monotonic/SharedProofDetection.feature` | 4 | Shared-proof dependency warnings |
-| `monotonic/ExactProbability.feature` | 25 | BDD-based exact probability |
+| `monotonic/MonotonicAggregation.feature` | 36 | MSUM, MMAX, MMIN, MCOUNT, MNOR, MPROD |
+| `monotonic/ProbabilisticComplement.feature` | 19 | PROB + IS NOT complement |
+| `monotonic/SharedProofDetection.feature` | 6 | Shared-proof dependency warnings |
+| `monotonic/ExactProbability.feature` | 17 | BDD-based exact probability |
 | `monotonic/ProbabilisticStress.feature` | 10 | Large-scale probabilistic correctness |
-| `monotonic/TopKProofs.feature` | 4 | Top-K proof filtering |
+| `monotonic/TopKProofs.feature` | 6 | Top-K proof filtering |
 
 ### Commands
 
@@ -2343,6 +2483,7 @@ struct ExplainRule { rule_name: QualifiedName, where_expr: Option<Expr>, return_
 | `query/GoalDirected.feature` | 9 | QUERY command execution |
 | `explain/ProofTraces.feature` | 3 | EXPLAIN with proof tree derivations |
 | `assume/Hypothetical.feature` | 6 | ASSUME fork/restore semantics |
+| `assume/AssumeBodyResults.feature` | 3 | One result per body command, nested ASSUME results, `derived` |
 | `abduce/AbductiveReasoning.feature` | 4 | ABDUCE with explanations |
 
 ### Mutation & Visibility
@@ -2351,12 +2492,13 @@ struct ExplainRule { rule_name: QualifiedName, where_expr: Option<Expr>, return_
 |-------------|-----------|----------|
 | `derive/DeriveEdges.feature` | 9 | DERIVE edge creation |
 | `derive/DeriveVisibility.feature` | 7 | DERIVE visibility to trailing Cypher |
+| `derive/CommandSequencing.feature` | 5 | Top-level commands read the state earlier commands left |
 
 ### Negation & Stratification
 
 | Feature File | Scenarios | Coverage |
 |-------------|-----------|----------|
-| `negation/StratifiedNegation.feature` | 5 | IS NOT negation, stratification |
+| `negation/StratifiedNegation.feature` | 9 | IS NOT negation, stratification |
 | `compile/Stratification.feature` | 6 | Compile-level stratification |
 
 ### Module System & Lexical

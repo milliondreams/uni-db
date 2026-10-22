@@ -159,6 +159,14 @@ pub(crate) fn build_cypher_comparison(
 ) -> DfExpr {
     use TypeCompat::*;
 
+    // Numbers with a float among them compare numerically, not by the total
+    // order Arrow's kernels use (`-0.0 = 0.0`, NaN compares false).
+    if let Some(cmp) =
+        super::df_expr::float_comparison(left.clone(), left_type, op, right.clone(), right_type)
+    {
+        return cmp;
+    }
+
     match type_compat(left_type, right_type) {
         Same | StringCompat | BooleanCompat => binary_expr(left, op, right),
         NumericWidening(common) => {
@@ -249,7 +257,33 @@ pub(crate) fn build_cypher_plus(
         ]));
     }
 
-    // 5. String + anything: toString(right) and concat
+    // 5. String + a value Arrow's string cast does not render as `toString`
+    //    does (a float: `toString(1.0)` is `'1.0'`): the Cypher UDF.
+    let cast_renders = |t: &DataType| {
+        is_string_type(t)
+            || matches!(
+                t,
+                DataType::Int8
+                    | DataType::Int16
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::UInt8
+                    | DataType::UInt16
+                    | DataType::UInt32
+                    | DataType::UInt64
+                    | DataType::Boolean
+            )
+    };
+    if (is_string_type(left_type) || is_string_type(right_type))
+        && !(cast_renders(left_type) && cast_renders(right_type))
+    {
+        return Ok(super::df_expr::dummy_udf_expr(
+            "_cypher_add",
+            vec![left, right],
+        ));
+    }
+
+    // 6. String + anything: toString(right) and concat
     if is_string_type(left_type) {
         let right_str = to_string_expr(right, right_type)?;
         return Ok(datafusion::functions::string::expr_fn::concat(vec![
@@ -257,7 +291,7 @@ pub(crate) fn build_cypher_plus(
         ]));
     }
 
-    // 6. Anything + String: toString(left) and concat
+    // 7. Anything + String: toString(left) and concat
     if is_string_type(right_type) {
         let left_str = to_string_expr(left, left_type)?;
         return Ok(datafusion::functions::string::expr_fn::concat(vec![
@@ -265,7 +299,7 @@ pub(crate) fn build_cypher_plus(
         ]));
     }
 
-    // 7. List operations
+    // 8. List operations
     if matches!(left_type, DataType::List(_)) && matches!(right_type, DataType::List(_)) {
         // Both lists → concatenate
         return Ok(super::df_expr::dummy_udf_expr(
@@ -290,7 +324,7 @@ pub(crate) fn build_cypher_plus(
         ));
     }
 
-    // 8. Temporal + Duration arithmetic (Date/DateTime + Interval)
+    // 9. Temporal + Duration arithmetic (Date/DateTime + Interval)
     if is_temporal_or_interval(left_type) || is_temporal_or_interval(right_type) {
         return Ok(super::df_expr::dummy_udf_expr(
             "_cypher_add",
@@ -298,7 +332,7 @@ pub(crate) fn build_cypher_plus(
         ));
     }
 
-    // 9. Otherwise: Error
+    // 10. Otherwise: Error
     Err(anyhow!(
         "Incompatible types for Plus operator: {:?} + {:?}",
         left_type,

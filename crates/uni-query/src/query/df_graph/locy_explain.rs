@@ -29,14 +29,20 @@ use super::locy_traits::DerivedFactSource;
 /// A single term in a derivation proof: identifies one IS-ref dependency.
 ///
 /// Each `ProofTerm` records a dependency edge in the proof DAG — the source
-/// rule that was referenced and the opaque hash of the specific base fact
-/// consumed (Cui & Widom 2000, lineage).
+/// rule that was referenced and the specific fact consumed (Cui & Widom 2000,
+/// lineage). Terms are read through the one reference resolution
+/// (`locy_lineage::RefResolver`), so they are exactly the references exact
+/// inference and `TopKProofs` evaluate.
 #[derive(Clone, Debug)]
 pub struct ProofTerm {
     /// Name of the IS-ref rule that produced this dependency.
     pub source_rule: String,
-    /// Opaque hash identifying the base fact consumed from `source_rule`.
+    /// The hash of the consumed fact's KEY columns: the
+    /// [`ProvenanceAnnotation::fact_key`] of that fact's derivations.
     pub base_fact_id: Vec<u8>,
+    /// The probability the derivation read for the consumed fact: the factor
+    /// it contributes to the derivation's [`ProvenanceAnnotation::proof_probability`].
+    pub prob: f64,
 }
 
 /// Provenance annotation for a derived fact (Green et al. 2007, Definition 3.1).
@@ -49,7 +55,18 @@ pub struct ProvenanceAnnotation {
     pub rule_name: String,
     /// Index of the clause within the rule that produced this fact.
     pub clause_index: usize,
-    /// Proof terms: IS-ref input facts (populated when IS-ref tracking is available).
+    /// The hash of the fact's KEY columns, which a [`ProofTerm`] of a fact
+    /// derived from this one names it by.
+    pub fact_key: Vec<u8>,
+    /// The hash identifying this derivation among the fact's derivations:
+    /// the key it is recorded under when proofs are not filtered. A
+    /// recursive rule re-records a derivation as the facts it references are
+    /// refined, under the same hash.
+    pub derivation: Vec<u8>,
+    /// Proof terms: the facts this derivation positively references through a
+    /// probabilistic `IS` (to a PROB rule, from an `MNOR`/`MPROD` rule). A
+    /// reference to a rule without a PROB column is a certain condition and
+    /// is not listed.
     pub support: Vec<ProofTerm>,
     /// ALONG column values captured at derivation time.
     pub along_values: HashMap<String, Value>,
@@ -57,7 +74,11 @@ pub struct ProvenanceAnnotation {
     pub iteration: usize,
     /// Full fact row stored for Mode A filtering/display.
     pub fact_row: FactRow,
-    /// Probability of this specific proof path (populated by top-k filtering).
+    /// The weight of this derivation: the row's own PROB value, which is its
+    /// local weight times every probability it referenced (each carried on
+    /// its [`ProofTerm`]). A leaf, referencing nothing, weighs its own PROB
+    /// value. `None` for a rule without a PROB column. Top-k filtering keeps
+    /// each fact's heaviest derivations by this weight.
     pub proof_probability: Option<f64>,
     /// Phase C B1–B3: per neural-model invocation that contributed
     /// to this fact's derivation. Populated by
@@ -76,13 +97,22 @@ pub struct ProvenanceAnnotation {
 #[derive(Debug)]
 pub struct ProvenanceStore {
     entries: RwLock<HashMap<Vec<u8>, Vec<ProvenanceAnnotation>>>,
+    /// The lineage of every `MNOR`/`MPROD` rule evaluated in this run, which
+    /// exact inference and shared-proof detection read.
+    lineage: super::locy_lineage::LineageStore,
 }
 
 impl ProvenanceStore {
     pub fn new() -> Self {
         Self {
             entries: RwLock::new(HashMap::new()),
+            lineage: super::locy_lineage::LineageStore::new(),
         }
+    }
+
+    /// The lineage of the run's `MNOR`/`MPROD` rules.
+    pub(crate) fn lineage(&self) -> &super::locy_lineage::LineageStore {
+        &self.lineage
     }
 
     /// Record a provenance annotation. First-derivation-wins: if the hash is already
@@ -93,21 +123,51 @@ impl ProvenanceStore {
         }
     }
 
-    /// Record a provenance annotation with top-k filtering.
+    /// Record a derivation's provenance, keeping its first iteration and
+    /// clause but its latest value.
     ///
-    /// Retains at most `k` annotations per fact, ordered by `proof_probability`
-    /// (highest first). Annotations without a proof probability are treated as
-    /// having probability 0.0 for ordering purposes.
+    /// A recursive rule's derivation is re-recorded each iteration its value
+    /// changes, as the facts it references are refined; first-derivation-wins
+    /// would show the value of the iteration that first derived it.
+    pub fn record_derivation(&self, fact_hash: Vec<u8>, entry: ProvenanceAnnotation) {
+        if let Ok(mut guard) = self.entries.write() {
+            match guard.entry(fact_hash) {
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    if let Some(first) = slot.get_mut().first_mut() {
+                        first.fact_row = entry.fact_row;
+                        first.support = entry.support;
+                        first.along_values = entry.along_values;
+                        first.proof_probability = entry.proof_probability;
+                        first.neural_calls = entry.neural_calls;
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(vec![entry]);
+                }
+            }
+        }
+    }
+
+    /// Record a derivation of the fact `fact_hash` with top-k filtering.
+    ///
+    /// `fact_hash` names the fact, not the derivation ([`top_k_fact_hash`]),
+    /// so the fact's derivations compete: at most `k` are retained, heaviest
+    /// [`ProvenanceAnnotation::proof_probability`] first, a derivation without
+    /// a weight counting as 0.0, and earlier derivations winning ties. A
+    /// derivation recorded again (a recursive rule refining it) replaces its
+    /// earlier record rather than competing with it.
     pub fn record_top_k(&self, fact_hash: Vec<u8>, entry: ProvenanceAnnotation, k: usize) {
         if let Ok(mut guard) = self.entries.write() {
             let vec = guard.entry(fact_hash).or_default();
-            vec.push(entry);
-            // Sort descending by proof_probability.
+            match vec.iter_mut().find(|e| e.derivation == entry.derivation) {
+                Some(existing) => *existing = entry,
+                None => vec.push(entry),
+            }
+            // Stable, so equal weights keep their recording order.
             vec.sort_by(|a, b| {
                 b.proof_probability
                     .unwrap_or(0.0)
-                    .partial_cmp(&a.proof_probability.unwrap_or(0.0))
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .total_cmp(&a.proof_probability.unwrap_or(0.0))
             });
             vec.truncate(k);
         }
@@ -124,24 +184,13 @@ impl ProvenanceStore {
         guard.get(fact_hash).cloned()
     }
 
-    /// Collect base fact probabilities from stored annotations.
-    ///
-    /// Scans all annotations for base facts (those with empty support, i.e. leaf
-    /// nodes in the proof tree) and extracts the PROB column value from their
-    /// `fact_row`. Used by top-k proof filtering to compute `proof_probability`.
-    pub fn base_fact_probs(&self) -> HashMap<Vec<u8>, f64> {
-        let mut probs = HashMap::new();
-        if let Ok(guard) = self.entries.read() {
-            for (fact_hash, annotations) in guard.iter() {
-                if let Some(ann) = annotations.first()
-                    && ann.support.is_empty()
-                    && let Some(uni_common::Value::Float(p)) = ann.fact_row.get("PROB")
-                {
-                    probs.insert(fact_hash.clone(), *p);
-                }
-            }
+    /// Every recorded derivation, of every rule: one per key, or under
+    /// top-k filtering each fact's retained derivations.
+    pub fn all_entries(&self) -> Vec<ProvenanceAnnotation> {
+        match self.entries.read() {
+            Ok(guard) => guard.values().flatten().cloned().collect(),
+            Err(_) => vec![],
         }
-        probs
     }
 
     /// Get all entries for a specific rule name (returns first annotation per fact).
@@ -161,22 +210,36 @@ impl ProvenanceStore {
     }
 }
 
-/// Compute the probability of a single proof path from its support terms.
+/// The key top-k filtering records a derivation of `rule`'s fact with KEY
+/// hash `fact_key` under: the fact, so that its derivations compete.
+pub fn top_k_fact_hash(rule: &str, fact_key: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(rule.len() + 1 + fact_key.len());
+    key.extend_from_slice(rule.as_bytes());
+    key.push(0);
+    key.extend_from_slice(fact_key);
+    key
+}
+
+/// The weight of one derivation: `own`, the row's PROB value, when the rule
+/// has a PROB column (`has_prob`); otherwise the product of the
+/// probabilities it referenced.
 ///
-/// Returns `None` if any base fact's probability is unknown.
+/// The row's PROB value is its local weight times every probability it
+/// referenced, so for a PROB rule it already is the product along the
+/// derivation; a leaf, referencing nothing, weighs exactly its own value,
+/// and `None` when that value is NULL. A rule without a PROB column derives
+/// certain facts: a derivation referencing nothing weighs 1, as does a
+/// reference to such a fact (its [`ProofTerm::prob`] is 1).
 pub fn compute_proof_probability(
+    has_prob: bool,
+    own: Option<f64>,
     support: &[ProofTerm],
-    base_probs: &HashMap<Vec<u8>, f64>,
 ) -> Option<f64> {
-    if support.is_empty() {
-        return None;
+    match own {
+        Some(p) => Some(p.clamp(0.0, 1.0)),
+        None if has_prob => None,
+        None => Some(support.iter().map(|t| t.prob.clamp(0.0, 1.0)).product()),
     }
-    let mut product = 1.0;
-    for term in support {
-        let p = base_probs.get(&term.base_fact_id)?;
-        product *= p;
-    }
-    Some(product)
 }
 
 impl Default for ProvenanceStore {
@@ -217,6 +280,7 @@ pub async fn explain_rule(
             fact_source,
             derived_store,
             approximate_groups,
+            config.max_explain_depth,
         )
         .await
     {
@@ -238,6 +302,11 @@ pub async fn explain_rule(
 
 /// Mode A: build derivation tree using recorded provenance from the fixpoint loop.
 ///
+/// Each recorded derivation of a matching fact is a child of the root, and
+/// each derivation's children are the facts it references
+/// ([`ProvenanceAnnotation::support`]), expanded into their own derivations
+/// (see [`ModeATree::node`]).
+///
 /// Returns `Err` when no tracker entries exist for the rule (signals Mode B fallback).
 async fn explain_rule_mode_a(
     query: &ExplainRule,
@@ -246,6 +315,7 @@ async fn explain_rule_mode_a(
     fact_source: &dyn DerivedFactSource,
     derived_store: &RowStore,
     approximate_groups: Option<&HashMap<String, Vec<String>>>,
+    max_depth: usize,
 ) -> Result<DerivationNode, LocyError> {
     let rule_name = query.rule_name.to_string();
     let rule = program
@@ -255,64 +325,147 @@ async fn explain_rule_mode_a(
             message: format!("rule '{}' not found for EXPLAIN RULE (Mode A)", rule_name),
         })?;
 
-    let tracker_entries = tracker.entries_for_rule(&rule_name);
-    if tracker_entries.is_empty() {
+    if tracker.entries_for_rule(&rule_name).is_empty() {
         return Err(LocyError::EvaluationError {
             message: format!("no tracker entries for rule '{rule_name}' (falling back to Mode B)"),
         });
     }
 
-    // Enrich each tracker entry's fact_row so WHERE predicates like
-    // `n.prop = X` or `e.prop = X` resolve against full Node / Edge
-    // values. Two encodings to handle:
-    //   - Node bindings: tracker stores `Value::Int(vid)` (Arrow UInt64).
-    //     Resolved via the side-channel `lookup_nodes_by_vids` Cypher.
-    //   - Edge bindings: tracker stores `Value::Map({_eid,_type,...})`
-    //     (Arrow struct). Resolved by `normalize_graph_row`, the same
-    //     helper Mode B uses, which converts Map → Value::Edge.
-    //
-    // Enrichment is scoped to KEY columns from the rule's yield_schema
-    // (`is_key && !is_prob`) so non-KEY scalar Ints (e.g. count columns)
-    // never get coerced into Nodes.
-    let key_cols: HashSet<String> = rule
-        .yield_schema
-        .iter()
-        .filter(|c| c.is_key && !c.is_prob)
-        .map(|c| c.name.clone())
-        .collect();
+    // Every recorded derivation: the root's and those of the facts they
+    // reference, hydrated alike.
+    let mut entries = tracker.all_entries();
+    hydrate_annotations(&mut entries, program, fact_source, derived_store).await;
+    // Stable order: the store is a hash map.
+    entries.sort_by_cached_key(|e| {
+        (
+            e.rule_name.clone(),
+            e.iteration,
+            format_graph_fact(&visible_row(&e.fact_row)),
+        )
+    });
+    let mut by_fact: HashMap<(String, Vec<u8>), Vec<usize>> = HashMap::new();
+    for (i, entry) in entries.iter().enumerate() {
+        by_fact
+            .entry((entry.rule_name.clone(), entry.fact_key.clone()))
+            .or_default()
+            .push(i);
+    }
 
-    let mut tracker_entries: Vec<(Vec<u8>, ProvenanceAnnotation)> = tracker_entries
-        .into_iter()
-        .map(|(h, mut ann)| {
-            // Map → Edge / Node conversion for bare graph-entity vars.
-            normalize_graph_row(&mut ann.fact_row);
-            (h, ann)
-        })
-        .collect();
-
-    // Resolve the integer IDs left in KEY columns. Which columns hold
-    // entities, and of which kind, is read from the published facts, which
-    // hydration already turned into nodes and edges: tracker rows carry a VID,
-    // an EID and a plain integer KEY alike as an integer, and the two ID spaces
-    // overlap, so guessing would bind an unrelated entity.
-    let mut entity_cols: HashMap<String, bool> = HashMap::new();
-    if let Some(relation) = derived_store.get(&rule_name) {
-        for column in &key_cols {
-            let kind = relation.rows.iter().find_map(|row| match row.get(column) {
-                Some(Value::Node(_)) => Some(false),
-                Some(Value::Edge(_)) => Some(true),
-                _ => None,
-            });
-            if let Some(is_edge) = kind {
-                entity_cols.insert(column.clone(), is_edge);
-            }
+    // Filter the rule's entries by the WHERE expression.
+    let mut matching: Vec<usize> = Vec::new();
+    for (i, entry) in entries.iter().enumerate() {
+        if entry.rule_name != rule_name {
+            continue;
+        }
+        let keep = match &query.where_expr {
+            Some(where_expr) => eval_condition(where_expr, &entry.fact_row, "EXPLAIN RULE WHERE")?,
+            None => true,
+        };
+        if keep {
+            matching.push(i);
         }
     }
+
+    if matching.is_empty() {
+        return Err(LocyError::EvaluationError {
+            message: format!("no tracker entries match WHERE clause for rule '{rule_name}'"),
+        });
+    }
+
+    let tree = ModeATree {
+        program,
+        entries: &entries,
+        by_fact: &by_fact,
+        approximate_groups,
+    };
+    let mut root = DerivationNode {
+        rule: rule_name.clone(),
+        clause_index: 0,
+        priority: rule.priority,
+        bindings: HashMap::new(),
+        along_values: HashMap::new(),
+        children: Vec::new(),
+        graph_fact: None,
+        approximate: tree.approximate(&rule_name),
+        proof_probability: None,
+        neural_calls: Vec::new(),
+    };
+    let mut expanded = HashSet::new();
+    for i in matching {
+        let mut path = HashSet::new();
+        root.children
+            .push(tree.node(i, &mut path, &mut expanded, max_depth));
+    }
+    Ok(root)
+}
+
+/// A fact row without the engine's hidden columns (`__deriv_*`), which are
+/// derivation identity, not bindings.
+fn visible_row(row: &FactRow) -> FactRow {
+    row.iter()
+        .filter(|(k, _)| {
+            !k.starts_with(crate::query::planner_locy_types::FOLD_DISCRIMINATOR_COL_PREFIX)
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// Turns the integer IDs left in each annotation's KEY columns into nodes and
+/// edges, and its edge maps into edges, so EXPLAIN WHERE predicates like
+/// `n.prop = X` resolve and every level of the tree reads alike.
+///
+/// Which KEY columns hold entities, and of which kind, is read from each
+/// rule's published facts, which hydration already turned into nodes and
+/// edges: tracker rows carry a VID, an EID and a plain integer KEY alike as an
+/// integer, and the two ID spaces overlap, so guessing would bind an
+/// unrelated entity. Non-KEY scalar integers (e.g. counts) are never coerced.
+async fn hydrate_annotations(
+    entries: &mut [ProvenanceAnnotation],
+    program: &CompiledProgram,
+    fact_source: &dyn DerivedFactSource,
+    derived_store: &RowStore,
+) {
+    // Per rule: KEY column -> whether it holds an edge (else a node).
+    let mut entity_cols: HashMap<String, HashMap<String, bool>> = HashMap::new();
+    for entry in entries.iter_mut() {
+        // Map → Edge / Node conversion for bare graph-entity vars.
+        normalize_graph_row(&mut entry.fact_row);
+        if entity_cols.contains_key(&entry.rule_name) {
+            continue;
+        }
+        let mut kinds = HashMap::new();
+        if let (Some(rule), Some(relation)) = (
+            program.rule_catalog.get(&entry.rule_name),
+            derived_store.get(&entry.rule_name),
+        ) {
+            for column in rule
+                .yield_schema
+                .iter()
+                .filter(|c| c.is_key && !c.is_prob)
+                .map(|c| &c.name)
+            {
+                let kind = relation.rows.iter().find_map(|row| match row.get(column) {
+                    Some(Value::Node(_)) => Some(false),
+                    Some(Value::Edge(_)) => Some(true),
+                    _ => None,
+                });
+                if let Some(is_edge) = kind {
+                    kinds.insert(column.clone(), is_edge);
+                }
+            }
+        }
+        entity_cols.insert(entry.rule_name.clone(), kinds);
+    }
     let ids_in = |edges: bool| -> Vec<u64> {
-        let mut ids: Vec<u64> = tracker_entries
+        let mut ids: Vec<u64> = entries
             .iter()
-            .flat_map(|(_, entry)| &entry.fact_row)
-            .filter(|(k, _)| entity_cols.get(*k) == Some(&edges))
+            .flat_map(|entry| {
+                let kinds = &entity_cols[&entry.rule_name];
+                entry
+                    .fact_row
+                    .iter()
+                    .filter(move |(k, _)| kinds.get(*k) == Some(&edges))
+            })
             .filter_map(|(_, v)| match v {
                 Value::Int(i) if *i >= 0 => Some(*i as u64),
                 _ => None,
@@ -339,9 +492,10 @@ async fn explain_rule_mode_a(
             .await
             .unwrap_or_default()
     };
-    for (_, ann) in &mut tracker_entries {
-        for (k, v) in ann.fact_row.iter_mut() {
-            let resolved = match entity_cols.get(k) {
+    for entry in entries.iter_mut() {
+        let kinds = &entity_cols[&entry.rule_name];
+        for (k, v) in entry.fact_row.iter_mut() {
+            let resolved = match kinds.get(k) {
                 Some(true) => &eid_to_edge,
                 Some(false) => &vid_to_node,
                 None => continue,
@@ -354,80 +508,115 @@ async fn explain_rule_mode_a(
             }
         }
     }
+}
 
-    // Filter tracker entries by WHERE expression
-    let matching_entries: Vec<_> = if let Some(where_expr) = &query.where_expr {
-        tracker_entries
-            .into_iter()
-            .map(|e| {
-                let keep = eval_condition(where_expr, &e.1.fact_row, "EXPLAIN RULE WHERE")?;
-                Ok(keep.then_some(e))
-            })
-            .filter_map(Result::transpose)
-            .collect::<Result<_, LocyError>>()?
-    } else {
-        tracker_entries
-    };
+/// The recorded derivations Mode A builds its tree from.
+struct ModeATree<'a> {
+    program: &'a CompiledProgram,
+    entries: &'a [ProvenanceAnnotation],
+    /// Each fact's derivations, by `(rule, KEY hash)`.
+    by_fact: &'a HashMap<(String, Vec<u8>), Vec<usize>>,
+    approximate_groups: Option<&'a HashMap<String, Vec<String>>>,
+}
 
-    if matching_entries.is_empty() {
-        return Err(LocyError::EvaluationError {
-            message: format!("no tracker entries match WHERE clause for rule '{rule_name}'"),
-        });
+impl ModeATree<'_> {
+    /// Whether `rule` has a group that fell back to independence.
+    fn approximate(&self, rule: &str) -> bool {
+        self.approximate_groups
+            .is_some_and(|ag| ag.contains_key(rule))
     }
 
-    let is_approximate = approximate_groups
-        .map(|ag| ag.contains_key(&rule_name))
-        .unwrap_or(false);
-
-    let mut root = DerivationNode {
-        rule: rule_name.clone(),
-        clause_index: 0,
-        priority: rule.priority,
-        bindings: HashMap::new(),
-        along_values: HashMap::new(),
-        children: Vec::new(),
-        graph_fact: None,
-        approximate: is_approximate,
-        proof_probability: None,
-        neural_calls: Vec::new(),
-    };
-
-    for (_, entry) in matching_entries {
-        let along_values = extract_along_values(&entry.fact_row, rule);
-        let clause_priority = rule
-            .clauses
-            .get(entry.clause_index)
-            .and_then(|c| c.priority);
-        let base_fact = format!(
-            "[iter={}] {}",
-            entry.iteration,
-            format_graph_fact(&entry.fact_row)
-        );
-        let graph_fact = if is_approximate {
-            format!("[APPROXIMATE] {}", base_fact)
-        } else {
-            base_fact
-        };
-        let node = DerivationNode {
-            rule: rule_name.clone(),
+    /// The node of derivation `index`, with the facts it references below
+    /// it.
+    ///
+    /// A referenced fact's derivations are expanded where the fact first
+    /// appears in the tree, `depth` levels deep; anywhere else it is a leaf
+    /// carrying its bindings: `(cycle)` when it is on the path from the root
+    /// (a fact deriving itself), `(derived above)` when expanded elsewhere,
+    /// `(depth limit)` past `max_explain_depth`. Expanding every occurrence
+    /// would repeat subtrees exponentially in the depth.
+    fn node(
+        &self,
+        index: usize,
+        path: &mut HashSet<(String, Vec<u8>)>,
+        expanded: &mut HashSet<(String, Vec<u8>)>,
+        depth: usize,
+    ) -> DerivationNode {
+        let entry = &self.entries[index];
+        let rule = self.program.rule_catalog.get(&entry.rule_name);
+        let approximate = self.approximate(&entry.rule_name);
+        let row = visible_row(&entry.fact_row);
+        let fact = format!("[iter={}] {}", entry.iteration, format_graph_fact(&row));
+        let own = (entry.rule_name.clone(), entry.fact_key.clone());
+        let pushed = path.insert(own.clone());
+        let mut children = Vec::new();
+        for term in &entry.support {
+            let key = (term.source_rule.clone(), term.base_fact_id.clone());
+            let derivations = self.by_fact.get(&key);
+            let leaf = |what: &str| self.leaf(&term.source_rule, derivations, what);
+            if derivations.is_none() {
+                // Every rule of the run records provenance, so this is a fact
+                // no derivation was recorded for: shown, not hidden.
+                children.push(leaf("(not recorded)"));
+            } else if path.contains(&key) {
+                children.push(leaf("(cycle)"));
+            } else if depth == 0 {
+                children.push(leaf("(depth limit)"));
+            } else if !expanded.insert(key) {
+                children.push(leaf("(derived above)"));
+            } else {
+                for &d in derivations.into_iter().flatten() {
+                    children.push(self.node(d, path, expanded, depth - 1));
+                }
+            }
+        }
+        if pushed {
+            path.remove(&own);
+        }
+        DerivationNode {
+            rule: entry.rule_name.clone(),
             clause_index: entry.clause_index,
-            priority: clause_priority.or(rule.priority),
-            bindings: entry.fact_row.clone(),
-            along_values,
-            // Mode A: children not tracked (inputs list is reserved for future recursion)
-            children: vec![],
-            graph_fact: Some(graph_fact),
-            approximate: is_approximate,
+            priority: rule
+                .and_then(|r| r.clauses.get(entry.clause_index))
+                .and_then(|c| c.priority)
+                .or_else(|| rule.and_then(|r| r.priority)),
+            along_values: rule.map_or_else(HashMap::new, |r| extract_along_values(&row, r)),
+            bindings: row,
+            children,
+            graph_fact: Some(if approximate {
+                format!("[APPROXIMATE] {fact}")
+            } else {
+                fact
+            }),
+            approximate,
             proof_probability: entry.proof_probability,
             // Phase C B1–B3: surface the per-call neural metadata
             // captured by `collect_neural_calls_for_row` during
             // fixpoint into the EXPLAIN derivation tree.
             neural_calls: entry.neural_calls.clone(),
-        };
-        root.children.push(node);
+        }
     }
 
-    Ok(root)
+    /// A leaf for a referenced fact of `rule` that is not expanded here,
+    /// carrying the bindings of its first derivation, if any.
+    fn leaf(&self, rule: &str, derivations: Option<&Vec<usize>>, what: &str) -> DerivationNode {
+        let bindings = derivations
+            .and_then(|d| d.first())
+            .map(|&d| visible_row(&self.entries[d].fact_row))
+            .unwrap_or_default();
+        DerivationNode {
+            rule: rule.to_string(),
+            clause_index: 0,
+            priority: self.program.rule_catalog.get(rule).and_then(|r| r.priority),
+            bindings,
+            along_values: HashMap::new(),
+            children: Vec::new(),
+            graph_fact: Some(what.to_string()),
+            approximate: false,
+            proof_probability: None,
+            neural_calls: Vec::new(),
+        }
+    }
 }
 
 /// Mode B: re-execution fallback — re-executes clause queries to find which
@@ -578,8 +767,16 @@ fn build_derivation_node<'a>(
         // (FOLD-aggregated, similar_to, etc.) are absent from those rows.
         // KEY columns uniquely identify a derived fact, so this is sufficient.
 
-        // Try each clause to find the one that produced this fact
-        for (clause_idx, clause) in rule.clauses.iter().enumerate() {
+        // Try each clause to find the one that produced this fact, highest
+        // PRIORITY first: PRIORITY keeps, per KEY, the rows of the
+        // highest-priority clause that derived it, so a lower one that also
+        // derives the KEY did not produce the fact. In text order, the first
+        // clause deriving the KEY was taken, whichever PRIORITY kept.
+        let mut clause_order: Vec<usize> = (0..rule.clauses.len()).collect();
+        clause_order
+            .sort_by_key(|&i| std::cmp::Reverse(rule.clauses[i].priority.unwrap_or(i64::MIN)));
+        for clause_idx in clause_order {
+            let clause = &rule.clauses[clause_idx];
             let has_is_refs = clause
                 .where_conditions
                 .iter()
@@ -614,7 +811,7 @@ fn build_derivation_node<'a>(
                     (Some(v1), Some(v2)) => values_equal_for_join(v1, v2),
                     (None, None) => true,
                     _ => false,
-                })
+                }) && yields_match(clause, row, fact)
             });
 
             if let Some(evidence_row) = matching_row {
@@ -731,6 +928,48 @@ fn build_derivation_node<'a>(
     })
 }
 
+/// Whether `row`, a body row of `clause`, yields `fact`'s values beyond its
+/// KEY: every non-KEY column the clause yields straight from its body
+/// (`e.w AS w`) must equal the fact's.
+///
+/// Matched on the KEY alone, the first body row sharing the fact's KEY
+/// explained it, even when BEST BY kept another row of that KEY (or the
+/// rule's facts differ in a non-KEY column): the tree then showed a
+/// derivation of another fact. A FOLD output and a PROB value are not
+/// compared (a body row carries neither: a fold aggregates rows, and a PROB
+/// value has referenced probabilities multiplied in), nor is a column whose
+/// expression the body row cannot evaluate (one reading an ALONG value or a
+/// referenced fact's column).
+fn yields_match(clause: &uni_locy::types::CompiledClause, row: &FactRow, fact: &FactRow) -> bool {
+    let uni_cypher::locy_ast::RuleOutput::Yield(yield_clause) = &clause.output else {
+        return true;
+    };
+    let fold_outputs: HashSet<&str> = clause.fold.iter().map(|f| f.name.as_str()).collect();
+    yield_clause.items.iter().all(|item| {
+        if item.is_key || item.is_prob {
+            return true;
+        }
+        let name = match (&item.alias, &item.expr) {
+            (Some(alias), _) => alias.as_str(),
+            (None, uni_cypher::ast::Expr::Variable(v)) => v.as_str(),
+            _ => return true,
+        };
+        if fold_outputs.contains(name) {
+            return true;
+        }
+        let Some(expected) = fact.get(name) else {
+            return true;
+        };
+        match super::locy_eval::eval_expr(&item.expr, row) {
+            Ok(value) => {
+                matches!((&value, expected), (Value::Null, Value::Null))
+                    || values_equal_for_join(&value, expected)
+            }
+            Err(_) => true,
+        }
+    })
+}
+
 /// Check if a binding variable matches a ref-fact key column via VID-based join.
 ///
 /// Looks up `var_name` in `primary` (falling back to `fallback`), then compares
@@ -811,6 +1050,8 @@ mod tests {
         ProvenanceAnnotation {
             rule_name: rule.to_string(),
             clause_index: 0,
+            fact_key: Vec::new(),
+            derivation: rule.as_bytes().to_vec(),
             support: vec![],
             along_values: HashMap::new(),
             iteration: 0,
@@ -865,37 +1106,55 @@ mod tests {
         assert_eq!(all[1].rule_name, "high");
     }
 
+    /// A derivation recorded again replaces its earlier record: it does not
+    /// take a second slot, and its new weight decides its rank.
     #[test]
-    fn compute_proof_probability_basic() {
-        let support = vec![
-            ProofTerm {
-                source_rule: "r1".to_string(),
-                base_fact_id: b"f1".to_vec(),
-            },
-            ProofTerm {
-                source_rule: "r2".to_string(),
-                base_fact_id: b"f2".to_vec(),
-            },
-        ];
-        let base_probs = HashMap::from([(b"f1".to_vec(), 0.3), (b"f2".to_vec(), 0.5)]);
-        let prob = compute_proof_probability(&support, &base_probs);
-        assert!((prob.unwrap() - 0.15).abs() < 1e-10);
+    fn record_top_k_replaces_a_rerecorded_derivation() {
+        let store = ProvenanceStore::new();
+        let hash = b"fact1".to_vec();
+        store.record_top_k(hash.clone(), make_annotation("a", Some(0.2)), 2);
+        store.record_top_k(hash.clone(), make_annotation("b", Some(0.5)), 2);
+        store.record_top_k(hash.clone(), make_annotation("a", Some(0.9)), 2);
+        let all = store.lookup_all(&hash).unwrap();
+        let ranked: Vec<(&str, Option<f64>)> = all
+            .iter()
+            .map(|e| (e.rule_name.as_str(), e.proof_probability))
+            .collect();
+        assert_eq!(ranked, vec![("a", Some(0.9)), ("b", Some(0.5))]);
+    }
+
+    fn term(prob: f64) -> ProofTerm {
+        ProofTerm {
+            source_rule: "r".to_string(),
+            base_fact_id: b"f".to_vec(),
+            prob,
+        }
     }
 
     #[test]
-    fn compute_proof_probability_empty_support() {
-        let prob = compute_proof_probability(&[], &HashMap::new());
-        assert!(prob.is_none());
+    fn compute_proof_probability_is_the_rows_own_weight() {
+        // 0.5 local x 0.8 referenced: the row's PROB value already holds it.
+        let prob = compute_proof_probability(true, Some(0.4), &[term(0.8)]);
+        assert_eq!(prob, Some(0.4));
     }
 
     #[test]
-    fn compute_proof_probability_missing_fact() {
-        let support = vec![ProofTerm {
-            source_rule: "r1".to_string(),
-            base_fact_id: b"unknown".to_vec(),
-        }];
-        let prob = compute_proof_probability(&support, &HashMap::new());
-        assert!(prob.is_none());
+    fn compute_proof_probability_of_a_leaf_is_its_own_value() {
+        assert_eq!(compute_proof_probability(true, Some(0.9), &[]), Some(0.9));
+        // A NULL PROB value is no weight.
+        assert_eq!(compute_proof_probability(true, None, &[]), None);
+    }
+
+    #[test]
+    fn compute_proof_probability_without_a_prob_column_multiplies_the_references() {
+        let prob = compute_proof_probability(false, None, &[term(0.3), term(0.5)]);
+        assert!((prob.unwrap() - 0.15).abs() < 1e-12);
+        // A certain fact: referencing nothing, or only certain facts.
+        assert_eq!(compute_proof_probability(false, None, &[]), Some(1.0));
+        assert_eq!(
+            compute_proof_probability(false, None, &[term(1.0), term(1.0)]),
+            Some(1.0)
+        );
     }
 
     #[test]

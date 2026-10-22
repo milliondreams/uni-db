@@ -725,8 +725,14 @@ fn modification_to_py(py: Python, m: uni_locy::Modification) -> PyResult<Py<PyAn
             edge_var,
             edge_type,
             match_properties,
+            eid,
+            source_vid,
+            target_vid,
         } => {
             dict.set_item("type", "remove_edge")?;
+            dict.set_item("eid", eid.map(|e| e.as_u64()))?;
+            dict.set_item("source_vid", source_vid.map(|v| v.as_u64()))?;
+            dict.set_item("target_vid", target_vid.map(|v| v.as_u64()))?;
             dict.set_item("source_var", source_var)?;
             dict.set_item("target_var", target_var)?;
             dict.set_item("edge_var", edge_var)?;
@@ -742,8 +748,12 @@ fn modification_to_py(py: Python, m: uni_locy::Modification) -> PyResult<Py<PyAn
             property,
             old_value,
             new_value,
+            vid,
+            eid,
         } => {
             dict.set_item("type", "change_property")?;
+            dict.set_item("vid", vid.map(|v| v.as_u64()))?;
+            dict.set_item("eid", eid.map(|e| e.as_u64()))?;
             dict.set_item("element_var", element_var)?;
             dict.set_item("property", property)?;
             dict.set_item("old_value", value_to_py(py, &old_value)?)?;
@@ -754,8 +764,12 @@ fn modification_to_py(py: Python, m: uni_locy::Modification) -> PyResult<Py<PyAn
             target_var,
             edge_type,
             properties,
+            source_vid,
+            target_vid,
         } => {
             dict.set_item("type", "add_edge")?;
+            dict.set_item("source_vid", source_vid.map(|v| v.as_u64()))?;
+            dict.set_item("target_vid", target_vid.map(|v| v.as_u64()))?;
             dict.set_item("source_var", source_var)?;
             dict.set_item("target_var", target_var)?;
             dict.set_item("edge_type", edge_type)?;
@@ -778,10 +792,35 @@ fn command_result_to_py(py: Python, cmd: uni_locy::CommandResult) -> PyResult<Py
             let list = PyList::new(py, &rows_py)?;
             Ok(Py::new(py, PyQueryCommandResult { rows: list.into() })?.into_any())
         }
-        uni_locy::CommandResult::Assume(rows) => {
-            let rows_py = locy_rows_to_py(py, rows)?;
-            let list = PyList::new(py, &rows_py)?;
-            Ok(Py::new(py, PyAssumeCommandResult { rows: list.into() })?.into_any())
+        uni_locy::CommandResult::Assume { results, derived } => {
+            // `rows` is the first row-producing body result's rows, depth
+            // first (`CommandResult::rows`), kept for callers of the
+            // flat-rows shape; an empty list when no body command produced
+            // rows, which `has_rows` records for `LocyResult.rows`.
+            let rows = results
+                .iter()
+                .find_map(uni_locy::CommandResult::rows)
+                .cloned();
+            let has_rows = rows.is_some();
+            let rows_list = PyList::new(py, &locy_rows_to_py(py, rows.unwrap_or_default())?)?;
+            let results_list = PyList::empty(py);
+            for r in results {
+                results_list.append(command_result_to_py(py, r)?)?;
+            }
+            let derived_dict = PyDict::new(py);
+            for (rule_name, rule_rows) in derived {
+                derived_dict.set_item(&rule_name, locy_rows_to_py(py, rule_rows)?)?;
+            }
+            Ok(Py::new(
+                py,
+                PyAssumeCommandResult {
+                    results: results_list.into(),
+                    derived: derived_dict.into(),
+                    rows: rows_list.into(),
+                    has_rows,
+                },
+            )?
+            .into_any())
         }
         uni_locy::CommandResult::Explain(node) => {
             let tree = derivation_node_to_py(py, node)?;
@@ -855,6 +894,32 @@ fn command_result_to_py(py: Python, cmd: uni_locy::CommandResult) -> PyResult<Py
     }
 }
 
+/// Parse the Python spelling of [`uni_locy::GoalDirected`].
+///
+/// Accepts `"off"`, `"on"` or `"shadow"`, case-insensitively. Anything else is
+/// a `ValueError` (a non-string a `TypeError`) rather than a fallback to the
+/// default, so a misspelt mode cannot silently run the full evaluation.
+pub(crate) fn parse_goal_directed(v: &Bound<'_, PyAny>) -> PyResult<::uni_locy::GoalDirected> {
+    let raw: String = v.extract()?;
+    match raw.to_ascii_lowercase().as_str() {
+        "off" => Ok(::uni_locy::GoalDirected::Off),
+        "on" => Ok(::uni_locy::GoalDirected::On),
+        "shadow" => Ok(::uni_locy::GoalDirected::Shadow),
+        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "invalid goal_directed '{raw}'; expected one of 'off', 'on', 'shadow'"
+        ))),
+    }
+}
+
+/// The Python spelling of a [`uni_locy::GoalDirected`] mode.
+pub(crate) fn goal_directed_name(mode: ::uni_locy::GoalDirected) -> &'static str {
+    match mode {
+        ::uni_locy::GoalDirected::Off => "off",
+        ::uni_locy::GoalDirected::On => "on",
+        ::uni_locy::GoalDirected::Shadow => "shadow",
+    }
+}
+
 /// Extract a LocyConfig from a Python config dict.
 pub fn extract_locy_config(
     py: Python,
@@ -909,6 +974,9 @@ pub fn extract_locy_config(
     }
     if let Some(v) = config.get("top_k_proofs_training") {
         locy_config.top_k_proofs_training = Some(v.extract::<usize>(py)?);
+    }
+    if let Some(v) = config.get("goal_directed") {
+        locy_config.goal_directed = parse_goal_directed(v.bind(py))?;
     }
     if let Some(v) = config.get("params") {
         let params_map = v.extract::<HashMap<String, Py<PyAny>>>(py)?;
@@ -1011,6 +1079,11 @@ pub fn locy_result_to_py(py: Python, result: uni_db::locy::LocyResult) -> PyResu
         queries_executed: result.stats.queries_executed,
         mutations_executed: result.stats.mutations_executed,
         peak_memory_bytes: result.stats.peak_memory_bytes,
+        hypothetical_strata_evaluated: result.stats.hypothetical_strata_evaluated,
+        hypothetical_strata_reused: result.stats.hypothetical_strata_reused,
+        hypothetical_facts_derived: result.stats.hypothetical_facts_derived,
+        sequenced_strata_evaluated: result.stats.sequenced_strata_evaluated,
+        sequenced_strata_reused: result.stats.sequenced_strata_reused,
     };
     dict.set_item("stats", stats.into_py_any(py)?)?;
 
@@ -1088,6 +1161,18 @@ pub fn query_metrics_to_py(py: Python, m: &::uni_db::QueryMetrics) -> PyResult<P
     dict.set_item("searches_reported", m.searches_reported)?;
     dict.set_item("storage_reads", m.storage_reads)?;
     dict.set_item("cache_hits", m.cache_hits)?;
+    dict.set_item("lance_iops", m.lance_iops)?;
+    dict.set_item("subquery_executions", m.subquery_executions)?;
+    dict.set_item("physical_plans", m.physical_plans)?;
+    dict.set_item(
+        "physical_plan_time_ms",
+        m.physical_plan_time.as_secs_f64() * 1000.0,
+    )?;
+    dict.set_item("shortest_path_searches", m.shortest_path_searches)?;
+    dict.set_item(
+        "shortest_path_adjacency_reads",
+        m.shortest_path_adjacency_reads,
+    )?;
     Ok(dict.into())
 }
 
@@ -1103,6 +1188,7 @@ pub fn execute_result_to_py(
         relationships_created: r.relationships_created(),
         relationships_deleted: r.relationships_deleted(),
         properties_set: r.properties_set(),
+        properties_removed: r.properties_removed(),
         labels_added: r.labels_added(),
         labels_removed: r.labels_removed(),
         metrics: query_metrics_to_py(py, r.metrics())?,
@@ -1137,6 +1223,11 @@ pub fn locy_result_to_py_class(
         queries_executed: result.stats.queries_executed,
         mutations_executed: result.stats.mutations_executed,
         peak_memory_bytes: result.stats.peak_memory_bytes,
+        hypothetical_strata_evaluated: result.stats.hypothetical_strata_evaluated,
+        hypothetical_strata_reused: result.stats.hypothetical_strata_reused,
+        hypothetical_facts_derived: result.stats.hypothetical_facts_derived,
+        sequenced_strata_evaluated: result.stats.sequenced_strata_evaluated,
+        sequenced_strata_reused: result.stats.sequenced_strata_reused,
     };
 
     let cmd_list = pyo3::types::PyList::empty(py);
@@ -1271,6 +1362,9 @@ pub fn profile_output_to_py(
     profile_dict.set_item("total_time_ms", profile.total_time_ms)?;
     profile_dict.set_item("peak_memory_bytes", profile.peak_memory_bytes)?;
     profile_dict.set_item("plan_text", &profile.explain.plan_text)?;
+    profile_dict.set_item("logical_planning_ms", profile.logical_planning_ms)?;
+    profile_dict.set_item("physical_planning_ms", profile.physical_planning_ms)?;
+    profile_dict.set_item("physical_plans", profile.physical_plans)?;
 
     let ops = PyList::empty(py);
     for op in &profile.runtime_stats {
@@ -1321,6 +1415,12 @@ pub fn query_metrics_to_py_class(
         vector_index_scans: m.vector_index_scans,
         fts_index_scans: m.fts_index_scans,
         searches_reported: m.searches_reported,
+        lance_iops: m.lance_iops,
+        subquery_executions: m.subquery_executions,
+        physical_plans: m.physical_plans,
+        physical_plan_time_ms: m.physical_plan_time.as_secs_f64() * 1000.0,
+        shortest_path_searches: m.shortest_path_searches,
+        shortest_path_adjacency_reads: m.shortest_path_adjacency_reads,
     };
     Py::new(py, metrics)
 }
@@ -1442,6 +1542,9 @@ pub fn profile_output_to_py_class(
         peak_memory_bytes: profile.peak_memory_bytes,
         plan_text: profile.explain.plan_text,
         operators: ops.into(),
+        logical_planning_ms: profile.logical_planning_ms,
+        physical_planning_ms: profile.physical_planning_ms,
+        physical_plans: profile.physical_plans,
     })
 }
 
@@ -1608,7 +1711,68 @@ pub const UNI_CONFIG_KEYS: &[&str] = &[
     "fork_default_ttl",
     "fork_sweeper_interval",
     "disable_fork_sweeper",
+    "vector_knn_default_k",
+    "regex_backtrack_limit",
+    "lance_metadata_cache_bytes",
+    "lance_index_cache_bytes",
+    "compaction",
+    "throttle",
 ];
+
+/// Every key the nested `"compaction"` dict of `config({...})` understands,
+/// one per [`uni_common::config::CompactionConfig`] field.
+///
+/// Read by `scripts/ci/check_rust_python_parity.py` like
+/// [`UNI_CONFIG_KEYS`], so a field added to the struct and not here fails it.
+pub const COMPACTION_CONFIG_KEYS: &[&str] = &[
+    "enabled",
+    "max_l1_runs",
+    "max_l1_size_bytes",
+    "max_l1_age",
+    "check_interval",
+    "worker_threads",
+    "frozen_segments_compact_threshold",
+    "version_retention",
+];
+
+/// Every key the nested `"throttle"` dict of `config({...})` understands, one
+/// per [`uni_common::config::WriteThrottleConfig`] field.
+pub const THROTTLE_CONFIG_KEYS: &[&str] = &["soft_limit", "hard_limit", "base_delay"];
+
+/// A duration given as seconds (a number) or a `datetime.timedelta`.
+fn py_duration(v: &Bound<'_, PyAny>) -> PyResult<std::time::Duration> {
+    if v.hasattr("total_seconds")? {
+        return py_timedelta_to_duration(v);
+    }
+    let secs: f64 = v.extract()?;
+    if !secs.is_finite() || secs < 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "a duration must be a non-negative number of seconds, got {secs}"
+        )));
+    }
+    Ok(std::time::Duration::from_secs_f64(secs))
+}
+
+/// The nested dict under `key`, refusing a key outside `accepted`.
+fn nested_config<'py>(
+    py: Python<'py>,
+    key: &str,
+    value: &Py<PyAny>,
+    accepted: &[&str],
+) -> PyResult<HashMap<String, Bound<'py, PyAny>>> {
+    let map: HashMap<String, Bound<'py, PyAny>> = value.bind(py).extract().map_err(|_| {
+        pyo3::exceptions::PyTypeError::new_err(format!("config key '{key}' takes a dict"))
+    })?;
+    if let Some(unknown) = map.keys().find(|k| !accepted.contains(&k.as_str())) {
+        let mut sorted: Vec<&str> = accepted.to_vec();
+        sorted.sort_unstable();
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "unknown {key} config key '{unknown}'; accepted keys are: {}",
+            sorted.join(", ")
+        )));
+    }
+    Ok(map)
+}
 
 /// Build a fresh [`uni_common::UniConfig`] from a Python dict.
 ///
@@ -1683,6 +1847,19 @@ pub fn apply_uni_config(
     if let Some(v) = config.get("strict_schema") {
         uni_config.strict_schema = v.extract::<bool>(py)?;
     }
+    if let Some(v) = config.get("vector_knn_default_k") {
+        uni_config.vector_knn_default_k = v.extract::<usize>(py)?;
+    }
+    if let Some(v) = config.get("regex_backtrack_limit") {
+        uni_config.regex_backtrack_limit = v.extract::<usize>(py)?;
+    }
+    // `None` keeps Lance's default capacity for that cache.
+    if let Some(v) = config.get("lance_metadata_cache_bytes") {
+        uni_config.lance_metadata_cache_bytes = v.extract::<Option<usize>>(py)?;
+    }
+    if let Some(v) = config.get("lance_index_cache_bytes") {
+        uni_config.lance_index_cache_bytes = v.extract::<Option<usize>>(py)?;
+    }
     // Phase 4b — fork lifecycle config
     if let Some(v) = config.get("max_forks") {
         // Allow None to mean unbounded; otherwise extract as usize.
@@ -1704,6 +1881,36 @@ pub fn apply_uni_config(
     }
     if let Some(v) = config.get("disable_fork_sweeper") {
         uni_config.disable_fork_sweeper = v.extract::<bool>(py)?;
+    }
+    // Nested structs merge the same way: only the keys given change.
+    if let Some(v) = config.get("compaction") {
+        let c = &mut uni_config.compaction;
+        for (k, v) in nested_config(py, "compaction", v, COMPACTION_CONFIG_KEYS)? {
+            match k.as_str() {
+                "enabled" => c.enabled = v.extract()?,
+                "max_l1_runs" => c.max_l1_runs = v.extract()?,
+                "max_l1_size_bytes" => c.max_l1_size_bytes = v.extract()?,
+                "max_l1_age" => c.max_l1_age = py_duration(&v)?,
+                "check_interval" => c.check_interval = py_duration(&v)?,
+                "worker_threads" => c.worker_threads = v.extract()?,
+                "frozen_segments_compact_threshold" => {
+                    c.frozen_segments_compact_threshold = v.extract()?;
+                }
+                "version_retention" => c.version_retention = py_duration(&v)?,
+                _ => unreachable!("nested_config admits only COMPACTION_CONFIG_KEYS"),
+            }
+        }
+    }
+    if let Some(v) = config.get("throttle") {
+        let t = &mut uni_config.throttle;
+        for (k, v) in nested_config(py, "throttle", v, THROTTLE_CONFIG_KEYS)? {
+            match k.as_str() {
+                "soft_limit" => t.soft_limit = v.extract()?,
+                "hard_limit" => t.hard_limit = v.extract()?,
+                "base_delay" => t.base_delay = py_duration(&v)?,
+                _ => unreachable!("nested_config admits only THROTTLE_CONFIG_KEYS"),
+            }
+        }
     }
     Ok(())
 }
@@ -1884,11 +2091,16 @@ pub fn database_metrics_to_py(
         active_sessions: m.active_sessions,
         l1_run_count: m.l1_run_count,
         write_throttle_pressure: m.write_throttle_pressure.value(),
+        write_throttle_waits: m.write_throttle_waits,
+        write_throttle_wait_time_secs: m.write_throttle_wait_time.as_secs_f64(),
+        writes_stalled: m.writes_stalled,
         compaction_in_progress: m.compaction_status.compaction_in_progress,
         wal_size_bytes: m.wal_size_bytes,
         wal_lsn: m.wal_lsn,
         total_queries: m.total_queries,
         total_commits: m.total_commits,
+        storage_metadata_cache_bytes: m.storage_metadata_cache_bytes,
+        storage_index_cache_bytes: m.storage_index_cache_bytes,
     })
 }
 
@@ -1923,6 +2135,33 @@ pub fn uni_config_to_py(py: Python, config: &uni_common::UniConfig) -> PyResult<
         config.fork_sweeper_interval.as_secs_f64(),
     )?;
     dict.set_item("disable_fork_sweeper", config.disable_fork_sweeper)?;
+    dict.set_item("vector_knn_default_k", config.vector_knn_default_k)?;
+    dict.set_item("regex_backtrack_limit", config.regex_backtrack_limit)?;
+    dict.set_item(
+        "lance_metadata_cache_bytes",
+        config.lance_metadata_cache_bytes,
+    )?;
+    dict.set_item("lance_index_cache_bytes", config.lance_index_cache_bytes)?;
+    let c = &config.compaction;
+    let compaction = PyDict::new(py);
+    compaction.set_item("enabled", c.enabled)?;
+    compaction.set_item("max_l1_runs", c.max_l1_runs)?;
+    compaction.set_item("max_l1_size_bytes", c.max_l1_size_bytes)?;
+    compaction.set_item("max_l1_age", c.max_l1_age.as_secs_f64())?;
+    compaction.set_item("check_interval", c.check_interval.as_secs_f64())?;
+    compaction.set_item("worker_threads", c.worker_threads)?;
+    compaction.set_item(
+        "frozen_segments_compact_threshold",
+        c.frozen_segments_compact_threshold,
+    )?;
+    compaction.set_item("version_retention", c.version_retention.as_secs_f64())?;
+    dict.set_item("compaction", compaction)?;
+    let t = &config.throttle;
+    let throttle = PyDict::new(py);
+    throttle.set_item("soft_limit", t.soft_limit)?;
+    throttle.set_item("hard_limit", t.hard_limit)?;
+    throttle.set_item("base_delay", t.base_delay.as_secs_f64())?;
+    dict.set_item("throttle", throttle)?;
     Ok(dict.into())
 }
 

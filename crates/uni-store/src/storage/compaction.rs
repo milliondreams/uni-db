@@ -7,7 +7,7 @@ use anyhow::{Result, anyhow};
 use arrow_array::Array;
 use arrow_array::builder::{ListBuilder, UInt64Builder};
 use arrow_array::{
-    LargeBinaryArray, ListArray, RecordBatch, StringArray, TimestampNanosecondArray, UInt64Array,
+    LargeBinaryArray, ListArray, RecordBatch, TimestampNanosecondArray, UInt64Array,
 };
 use metrics;
 use std::collections::{HashMap, HashSet};
@@ -27,8 +27,40 @@ impl Compactor {
         Self { storage }
     }
 
+    /// Runs a full semantic pass: vertex dedup, CRDT merge, delta folding.
+    ///
+    /// Waits for the directory's compaction lock first, so a pass started here
+    /// (for example by `VACUUM`) never overlaps another instance's pass over
+    /// the same directory. See [`CompactionDirLock`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompactionCancelled`] when the manager's compaction token is
+    /// cancelled, before or during the pass; every safe point leaves the store
+    /// consistent. Also fails when the lock file cannot be opened. Per-label
+    /// and per-direction failures are logged and skipped, as before.
     #[instrument(skip(self), level = "info")]
     pub async fn compact_all(&self) -> Result<SemanticCompactionReport> {
+        let _dir_lock = self.storage.lock_compaction_dir().await?;
+        self.compact_all_locked().await
+    }
+
+    /// [`Self::compact_all`] for a caller that already holds the directory's
+    /// compaction lock.
+    pub(crate) async fn compact_all_locked(&self) -> Result<SemanticCompactionReport> {
+        // Never while a bulk load is being published: its rows are hidden
+        // from readers by `_version`, and folding its deltas into L2 adjacency
+        // (whose rows carry this pass's version) would expose them part way.
+        // Bulk publishes wait for this pass in turn. Polled rather than
+        // queued: a queued writer on the lock would hold up every new bulk
+        // publish behind a load whose background re-drive keeps failing.
+        let _bulk_exclusion = loop {
+            if let Some(guard) = self.storage.bulk_gate().try_exclusive() {
+                break guard;
+            }
+            self.safe_point("compaction::safe-point::waiting-for-bulk-publish")?;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
         let start = std::time::Instant::now();
         let schema = self.storage.schema_manager().schema();
         let mut report = SemanticCompactionReport::default();
@@ -43,6 +75,7 @@ impl Compactor {
 
         // Compact Vertices
         for label in schema.labels.keys() {
+            self.safe_point("compaction::safe-point::before-label")?;
             info!("Compacting vertices for label {}", label);
             match self.compact_vertices(label).await {
                 Ok(v) if v.ran => {
@@ -50,6 +83,7 @@ impl Compactor {
                     report.crdt_merges += v.crdt_merges;
                 }
                 Ok(_) => {}
+                Err(e) if is_compaction_cancelled(&e) => return Err(e),
                 Err(e) => error!("Failed to compact vertices for {}: {}", label, e),
             }
 
@@ -75,9 +109,11 @@ impl Compactor {
         for (edge_type, meta) in &schema.edge_types {
             // Outgoing: src_labels
             for label in &meta.src_labels {
+                self.safe_point("compaction::safe-point::before-adjacency")?;
                 info!("Compacting adjacency {} -> {} (fwd)", label, edge_type);
                 match self.compact_adjacency(edge_type, label, "fwd").await {
                     Ok(info) => report.adjacency.push(info),
+                    Err(e) if is_compaction_cancelled(&e) => return Err(e),
                     Err(e) => {
                         error!(
                             "Failed to compact adjacency {} -> {}: {}",
@@ -101,9 +137,11 @@ impl Compactor {
 
             // Incoming: dst_labels
             for label in &meta.dst_labels {
+                self.safe_point("compaction::safe-point::before-adjacency")?;
                 info!("Compacting adjacency {} <- {} (bwd)", label, edge_type);
                 match self.compact_adjacency(edge_type, label, "bwd").await {
                     Ok(info) => report.adjacency.push(info),
+                    Err(e) if is_compaction_cancelled(&e) => return Err(e),
                     Err(e) => {
                         error!(
                             "Failed to compact adjacency {} <- {}: {}",
@@ -182,7 +220,17 @@ impl Compactor {
         let _write_guard = backend.lock_table_for_write(&table_name).await;
 
         use crate::backend::types::ScanRequest;
-        let batches: Vec<RecordBatch> = backend.scan(ScanRequest::all(&table_name)).await?;
+        let scanned: Vec<RecordBatch> = backend.scan(ScanRequest::all(&table_name)).await?;
+        // Rows above the oldest version an in-flight reader is pinned at are
+        // kept as they are; only the rows at or below it are merged. A reader
+        // pinned at `p` needs each vertex's newest row at or below `p`, which
+        // the merge would otherwise have replaced by the newest row overall,
+        // stamped above `p` (or dropped, for a vertex deleted since).
+        let mut merge = self.storage.begin_compaction_merge(false);
+        let (batches, kept) = split_at_floor(scanned, merge.floor())?;
+        // Rows merged per vertex: a vertex with one merged row loses no
+        // history, so only those with more set the merge's horizon.
+        let mut merged_rows: HashMap<Vid, usize> = HashMap::new();
 
         // Vid -> (Properties, Deleted)
         let mut vertex_state: HashMap<Vid, (Properties, bool)> = HashMap::new();
@@ -225,9 +273,6 @@ impl Compactor {
             // their physical columns and put them back into the property map, so
             // `build_record_batch_with_timestamps` re-derives `ext_id`, `_uid`
             // and `overflow_json` from the same inputs the flush path used.
-            let ext_id_col = batch
-                .column_by_name("ext_id")
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
             let overflow_col = batch
                 .column_by_name("overflow_json")
                 .and_then(|c| c.as_any().downcast_ref::<LargeBinaryArray>());
@@ -244,6 +289,7 @@ impl Compactor {
                 let vid = Vid::from(vid_col.value(i));
                 let version = ver_col.value(i);
                 let deleted = del_col.value(i);
+                *merged_rows.entry(vid).or_insert(0) += 1;
 
                 // Extract labels from the _labels column (keep latest version's labels)
                 if let Some(list_arr) = labels_col
@@ -297,14 +343,7 @@ impl Compactor {
                 }
 
                 // Restore the reserved columns the loop above cannot reach.
-                if let Some(col) = ext_id_col
-                    && !col.is_null(i)
-                {
-                    row_props.insert(
-                        "ext_id".to_string(),
-                        Value::String(col.value(i).to_string()),
-                    );
-                }
+                crate::storage::property_builder::restore_ext_id_column(&batch, i, &mut row_props);
                 if let Some(col) = overflow_col
                     && !col.is_null(i)
                     && let Value::Map(overflow) =
@@ -363,8 +402,9 @@ impl Compactor {
             }
         }
 
-        if !valid_vertices.is_empty() {
-            let batch = dataset.build_record_batch_with_timestamps(
+        let kept_rows: usize = kept.iter().map(RecordBatch::num_rows).sum();
+        if !valid_vertices.is_empty() || kept_rows > 0 {
+            let merged = dataset.build_record_batch_with_timestamps(
                 &valid_vertices,
                 &valid_deleted,
                 &valid_versions,
@@ -372,6 +412,19 @@ impl Compactor {
                 Some(&created_at),
                 Some(&updated_at),
             )?;
+            let batch = append_kept_rows(merged, &kept)?;
+            let merged_through = merged_rows
+                .iter()
+                .filter(|(_, rows)| **rows > 1)
+                .filter_map(|(vid, _)| vertex_versions.get(vid).copied())
+                .max()
+                .unwrap_or(0);
+            merge
+                .record(self.storage.snapshot_manager(), merged_through)
+                .await?;
+            // Safe point: nothing has been written yet, so a cancelled pass
+            // leaves the table exactly as it was.
+            self.safe_point("compaction::safe-point::before-vertex-replace")?;
             dataset
                 .replace(self.storage.backend(), batch, &schema)
                 .await?;
@@ -553,9 +606,17 @@ impl Compactor {
 
         // 1. Load all L1 Deltas sorted by key
         let delta_ds = self.storage.delta_dataset(edge_type, direction)?;
-        let deltas = delta_ds
+        let mut deltas = delta_ds
             .scan_all_backend(self.storage.backend(), &schema)
             .await?;
+        // Fold only the deltas at or below the oldest version an in-flight
+        // reader with a versioned edge tier is pinned at. L2 rows carry no version, so everything folded
+        // into L2 is visible at every pin; a delta above the floor stays a
+        // delta, read by each pin under its own ceiling.
+        let mut merge = self.storage.begin_compaction_merge(true);
+        if let Some(floor) = merge.floor() {
+            deltas.retain(|entry| entry.version <= floor);
+        }
 
         let delta_count = deltas.len();
         tracing::Span::current().record("delta_count", delta_count);
@@ -717,6 +778,14 @@ impl Compactor {
             let batch = RecordBatch::try_new(schema, vec![src_arr, neighbors_arr, edge_ids_arr])?;
 
             // Replace the table with compacted data
+            // Safe point: L2 and the deltas are both untouched, so a cancelled
+            // pass leaves the deltas authoritative over the old L2.
+            self.safe_point("compaction::safe-point::before-adj-replace")?;
+            // Every folded delta is visible at every version from here on.
+            let folded_through = deltas.iter().map(|e| e.version).max().unwrap_or(0);
+            merge
+                .record(self.storage.snapshot_manager(), folded_through)
+                .await?;
             adj_ds.replace(self.storage.backend(), batch).await?;
         }
 
@@ -756,10 +825,23 @@ impl Compactor {
                     deltas.iter().map(|e| e.eid).collect();
 
                 for eid in delta_eids {
+                    // A per-EID scan is slow; do not hold a cancelled pass
+                    // here. The safe point below then stops it.
+                    if self.storage.compaction_cancel_token().is_cancelled() {
+                        break;
+                    }
+                    // An I/O failure is not evidence that the EID is missing:
+                    // report it as what it is instead of tripping the assertion.
                     let main_edge_exists =
                         MainEdgeDataset::exists_by_eid(self.storage.backend(), eid)
                             .await
-                            .unwrap_or(false);
+                            .map_err(|e| {
+                                e.context(format!(
+                                    "could not check main_edges for EID {} before \
+                                     clearing Delta L1",
+                                    eid.as_u64()
+                                ))
+                            })?;
 
                     debug_assert!(
                         main_edge_exists,
@@ -769,6 +851,11 @@ impl Compactor {
                     );
                 }
             }
+
+            // Safe point: the window above. L2 already holds merge(L2, deltas)
+            // and the deltas are still present; re-applying them is a no-op,
+            // so stopping here costs only the redo on the next pass.
+            self.safe_point("compaction::safe-point::before-delta-clear")?;
 
             // Clear ONLY the deltas we actually merged into L2 — those at or
             // below the high-water-mark captured from the rows read at the top
@@ -804,7 +891,158 @@ impl Compactor {
     }
 }
 
+impl Compactor {
+    /// Stops the pass if the manager's compaction token was cancelled.
+    ///
+    /// Every call site is a point where the store is consistent on disk, so
+    /// returning here is equivalent to a crash at that point, which the
+    /// recovery suite covers. The fail point lets tests cancel at exactly
+    /// this call.
+    fn safe_point(&self, at: &'static str) -> Result<()> {
+        fail::fail_point!(at);
+        if self.storage.compaction_cancel_token().is_cancelled() {
+            info!(at, "compaction cancelled at a safe point");
+            return Err(anyhow::Error::new(CompactionCancelled { at }));
+        }
+        Ok(())
+    }
+}
+
+/// A compaction pass stopped at a safe point because it was cancelled.
+///
+/// Returned when the owning database shuts down mid-pass. The store is
+/// consistent; the remaining work is redone by the next pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactionCancelled {
+    /// Name of the safe point the pass stopped at.
+    pub at: &'static str,
+}
+
+impl std::fmt::Display for CompactionCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "compaction cancelled at {}", self.at)
+    }
+}
+
+impl std::error::Error for CompactionCancelled {}
+
+/// Whether `e` is, or wraps, a [`CompactionCancelled`].
+#[must_use]
+pub fn is_compaction_cancelled(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<CompactionCancelled>().is_some()
+}
+
+/// Exclusive, cross-instance claim on compacting one database directory.
+///
+/// `CompactionGuard` is per `StorageManager`, so it cannot see a second
+/// instance over the same directory. Dropping a database and reopening the
+/// path at once (or two handles opened on one path) let two semantic passes
+/// overwrite each other's tables: measured as an overlap in every drop-and-
+/// reopen with an in-flight pass, with the live instance then answering a
+/// reverse traversal with no rows. This claim is an OS file lock (`flock` on
+/// Unix) on `compaction.lock` in the storage root, so it excludes other
+/// handles in this process and other processes alike, and the OS releases it
+/// if the holder dies. Remote stores have no such lock and are not covered.
+#[derive(Debug)]
+pub struct CompactionDirLock {
+    _file: std::fs::File,
+}
+
+impl CompactionDirLock {
+    /// Name of the lock file inside the storage root.
+    pub const FILE_NAME: &'static str = "compaction.lock";
+
+    /// Takes the lock on `root` without waiting.
+    ///
+    /// Returns `Ok(None)` when another handle holds it.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the lock file cannot be created or the lock call fails for
+    /// a reason other than contention.
+    pub fn try_acquire(root: &std::path::Path) -> Result<Option<Self>> {
+        let path = root.join(Self::FILE_NAME);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|e| anyhow!("cannot open compaction lock {}: {e}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { _file: file })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => Err(anyhow!(
+                "cannot lock compaction lock {}: {e}",
+                path.display()
+            )),
+        }
+    }
+}
+
 /// Apply delta operations to an edge map, returning the resolved neighbor for the direction.
+/// Splits scanned vertex rows into those at or below `floor` (merged by
+/// compaction) and those above it (kept as they are). No floor merges every
+/// row.
+fn split_at_floor(
+    batches: Vec<RecordBatch>,
+    floor: Option<u64>,
+) -> Result<(Vec<RecordBatch>, Vec<RecordBatch>)> {
+    let Some(floor) = floor else {
+        return Ok((batches, Vec::new()));
+    };
+    let mut merged = Vec::with_capacity(batches.len());
+    let mut kept = Vec::new();
+    for batch in batches {
+        let versions = batch
+            .column_by_name("_version")
+            .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| anyhow!("vertex compaction: missing _version column"))?;
+        let at_or_below: arrow_array::BooleanArray = versions
+            .iter()
+            .map(|v| Some(v.unwrap_or(0) <= floor))
+            .collect();
+        let above = arrow::compute::not(&at_or_below)?;
+        merged.push(arrow::compute::filter_record_batch(&batch, &at_or_below)?);
+        let above = arrow::compute::filter_record_batch(&batch, &above)?;
+        if above.num_rows() > 0 {
+            kept.push(above);
+        }
+    }
+    Ok((merged, kept))
+}
+
+/// `merged` followed by the `kept` rows, each projected by column name onto
+/// `merged`'s schema (the table's schema as the catalog declares it).
+fn append_kept_rows(merged: RecordBatch, kept: &[RecordBatch]) -> Result<RecordBatch> {
+    if kept.is_empty() {
+        return Ok(merged);
+    }
+    let schema = merged.schema();
+    let mut parts = vec![merged];
+    for batch in kept {
+        let columns = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                let column = batch.column_by_name(field.name()).ok_or_else(|| {
+                    anyhow!(
+                        "vertex compaction: kept row lacks column '{}'",
+                        field.name()
+                    )
+                })?;
+                if column.data_type() == field.data_type() {
+                    Ok(Arc::clone(column))
+                } else {
+                    Ok(arrow::compute::cast(column, field.data_type())?)
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        parts.push(RecordBatch::try_new(Arc::clone(&schema), columns)?);
+    }
+    Ok(arrow::compute::concat_batches(&schema, &parts)?)
+}
+
 fn apply_deltas_to_edges(current_edges: &mut HashMap<Eid, Vid>, ops: &[L1Entry], direction: &str) {
     for op in ops {
         match op.op {

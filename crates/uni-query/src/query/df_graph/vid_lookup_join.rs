@@ -66,8 +66,49 @@ use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSe
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::{Stream, StreamExt};
 
+use super::ReadSetRecordingExec;
 use super::common::compute_plan_properties;
 use super::scan::{DynamicVidFilter, GraphScanExec};
+
+/// The `GraphScanExec` a probe child reads: the child itself, or the scan an
+/// SSI [`ReadSetRecordingExec`] wraps directly.
+///
+/// The wrapper is looked *through*, never discarded: the probe child stays the
+/// wrapper, so the rows the probe returns are still recorded into the
+/// transaction's read set (see [`wire_probe`]). One level, exact match — a
+/// wrapper over anything but a bare scan is not a probe.
+pub(crate) fn probe_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<&GraphScanExec> {
+    if let Some(scan) = plan.downcast_ref::<GraphScanExec>() {
+        return Some(scan);
+    }
+    plan.downcast_ref::<ReadSetRecordingExec>()?
+        .input()
+        .downcast_ref::<GraphScanExec>()
+}
+
+/// `probe` with its scan wired to publish into `filter`, keeping any
+/// read-set wrapper above it.
+///
+/// Recording what the probe returns is exactly the read set of a vid-filtered
+/// scan: the rows looked up are the rows the join depends on. A vertex the
+/// lookup skips cannot change the join's output, and every looked-up vertex is
+/// recorded, so a concurrent change to one still conflicts.
+fn wire_probe(
+    probe: &Arc<dyn ExecutionPlan>,
+    filter: &Arc<DynamicVidFilter>,
+) -> DFResult<Arc<dyn ExecutionPlan>> {
+    let scan = probe_scan(probe).ok_or_else(|| {
+        datafusion::error::DataFusionError::Plan(
+            "VidLookupJoinExec: probe-side child must be a GraphScanExec".into(),
+        )
+    })?;
+    let wired: Arc<dyn ExecutionPlan> = Arc::new(scan.with_dynamic_vid_filter(Arc::clone(filter)));
+    if probe.downcast_ref::<GraphScanExec>().is_some() {
+        Ok(wired)
+    } else {
+        Arc::clone(probe).with_new_children(vec![wired])
+    }
+}
 
 /// Maximum VIDs per `_vid IN (...)` chunk. Larger build sets are split into
 /// multiple sequential probe scans whose results are concatenated. Mirrors
@@ -92,7 +133,7 @@ pub struct EquiPair {
 
 impl EquiPair {
     /// Column index on the build side, given which side is the probe.
-    fn build_col(&self, probe_side: ProbeSide) -> usize {
+    pub(crate) fn build_col(&self, probe_side: ProbeSide) -> usize {
         match probe_side {
             ProbeSide::Left => self.right_col_idx,
             ProbeSide::Right => self.left_col_idx,
@@ -100,7 +141,7 @@ impl EquiPair {
     }
 
     /// Column index on the probe side, given which side is the probe.
-    fn probe_col(&self, probe_side: ProbeSide) -> usize {
+    pub(crate) fn probe_col(&self, probe_side: ProbeSide) -> usize {
         match probe_side {
             ProbeSide::Left => self.left_col_idx,
             ProbeSide::Right => self.right_col_idx,
@@ -154,7 +195,8 @@ impl VidLookupJoinExec {
     /// `right.schema()`. The caller (the planner pre-check) must ensure:
     /// - `pairs[0]`'s probe side is the `_vid` column (UInt64).
     /// - `pairs[0]`'s build side is a UInt64 column.
-    /// - The `probe_side`'s child is a `GraphScanExec`.
+    /// - The `probe_side`'s child is a `GraphScanExec`, or a
+    ///   `ReadSetRecordingExec` directly over one (see `probe_scan`).
     /// - `pairs` is non-empty.
     pub fn try_new(
         left: Arc<dyn ExecutionPlan>,
@@ -172,22 +214,13 @@ impl VidLookupJoinExec {
             ProbeSide::Left => &left,
             ProbeSide::Right => &right,
         };
-        if probe_plan.downcast_ref::<GraphScanExec>().is_none() {
-            return Err(datafusion::error::DataFusionError::Plan(
-                "VidLookupJoinExec: probe-side child must be a GraphScanExec".into(),
-            ));
-        }
         // Give the probe a slot this operator fills in before executing it
         // (#179). That is what lets the probe run through the ordinary
         // `execute()` API and therefore be a real child: the vid set is not
         // known until the build side is materialised, which is the whole reason
         // it used to be driven through a bespoke helper.
         let probe_filter = Arc::new(DynamicVidFilter::default());
-        let probe_scan = probe_plan
-            .downcast_ref::<GraphScanExec>()
-            .expect("probe was checked to be a GraphScanExec above")
-            .with_dynamic_vid_filter(probe_filter.clone());
-        let probe_wired: Arc<dyn ExecutionPlan> = Arc::new(probe_scan);
+        let probe_wired = wire_probe(probe_plan, &probe_filter)?;
         let (left, right) = match probe_side {
             ProbeSide::Left => (probe_wired, right),
             ProbeSide::Right => (left, probe_wired),
@@ -473,9 +506,7 @@ async fn run_join(
     // whole vid list to one scan call, so a cap-busting build set must be split
     // before it is published or the `_vid` IN-list would exceed the bound that
     // keeps the scalar index earning its keep.
-    let probe_scan = probe
-        .downcast_ref::<GraphScanExec>()
-        .expect("planner ensured probe is GraphScanExec");
+    let probe_scan = probe_scan(&probe).expect("try_new ensured the probe reads a GraphScanExec");
     let probe_batch = if vid_set.is_empty() {
         // No build VIDs → no probe rows to fetch. Still need an empty
         // batch with the correct schema for downstream NULL-padding logic.
@@ -666,10 +697,10 @@ async fn run_join(
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
-struct JoinMatch {
-    build_batch_idx: usize,
-    build_row_idx: usize,
-    probe_row_idx: usize,
+pub(crate) struct JoinMatch {
+    pub(crate) build_batch_idx: usize,
+    pub(crate) build_row_idx: usize,
+    pub(crate) probe_row_idx: usize,
 }
 
 fn build_probe_vid_index(
@@ -698,7 +729,12 @@ fn build_probe_vid_index(
 /// Uses `ScalarValue` for type-erased comparison so the operator works for
 /// any column type Arrow can lift into a `ScalarValue` (which covers all
 /// types we currently materialize from Lance).
-fn values_equal(a_col: &ArrayRef, a_row: usize, b_col: &ArrayRef, b_row: usize) -> DFResult<bool> {
+pub(crate) fn values_equal(
+    a_col: &ArrayRef,
+    a_row: usize,
+    b_col: &ArrayRef,
+    b_row: usize,
+) -> DFResult<bool> {
     // Cypher comparison against NULL yields null (unknown), which for a join
     // equi-pair means "not a match" — a null on either side must never join.
     // `ScalarValue`'s `PartialEq` instead treats NULL == NULL as true, so guard
@@ -742,7 +778,11 @@ fn locate_vid_column(schema: &SchemaRef) -> DFResult<usize> {
 /// `{var}._vid` as `Field::new(.., UInt64, false)`, so a LEFT-outer NULL pad
 /// wrote nulls into a non-nullable column and `RecordBatch::try_new` rejected
 /// the whole batch. Every unmatched OPTIONAL row would have failed the query.
-fn concat_schemas(left: &SchemaRef, right: &SchemaRef, widen: Option<ProbeSide>) -> SchemaRef {
+pub(crate) fn concat_schemas(
+    left: &SchemaRef,
+    right: &SchemaRef,
+    widen: Option<ProbeSide>,
+) -> SchemaRef {
     let mut fields: Vec<Field> = Vec::with_capacity(left.fields().len() + right.fields().len());
     let widen_left = widen == Some(ProbeSide::Left);
     let widen_right = widen == Some(ProbeSide::Right);
@@ -825,7 +865,7 @@ impl<'a> AnchorKeys<'a> {
 /// outer) NULL-padded unmatched build rows. Output column order is
 /// `left_schema ++ right_schema` regardless of which side is the probe.
 #[allow(clippy::too_many_arguments)]
-fn emit_joined_batch(
+pub(crate) fn emit_joined_batch(
     build_batches: &[RecordBatch],
     probe_batch: &RecordBatch,
     matches: &[JoinMatch],

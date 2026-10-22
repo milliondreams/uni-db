@@ -36,6 +36,7 @@ use crate::query::df_expr::{TranslationContext, VariableKind, cypher_expr_to_df}
 use crate::query::df_graph::ReadSetRecordingExec;
 use crate::query::df_graph::bind_fixed_path::BindFixedPathExec;
 use crate::query::df_graph::bind_zero_length_path::BindZeroLengthPathExec;
+use crate::query::df_graph::edge_source_scan::EdgeSourceScanExec;
 use crate::query::df_graph::mutation_common::{
     MutationKind, extended_schema_for_new_vars, new_create_exec, new_merge_exec,
 };
@@ -43,6 +44,7 @@ use crate::query::df_graph::mutation_delete::new_delete_exec;
 use crate::query::df_graph::mutation_remove::new_remove_exec;
 use crate::query::df_graph::mutation_set::new_set_exec;
 use crate::query::df_graph::recursive_cte::RecursiveCTEExec;
+use crate::query::df_graph::scan::schemaless_l0_prefilter;
 use crate::query::df_graph::traverse::QppStepFilterSpec;
 use crate::query::df_graph::traverse::{
     GraphVariableLengthTraverseExec, GraphVariableLengthTraverseMainExec,
@@ -54,8 +56,9 @@ use crate::query::df_graph::{
     OptionalFilterExec,
 };
 use crate::query::planner::{
-    COL_FWD, LogicalPlan, STRUCT_ONLY_SENTINEL, WITH_PASSTHROUGH_SENTINEL, aggregate_column_name,
-    collect_properties_from_plan, projection_columns, reconcile_passthrough_properties,
+    COL_FWD, ImportKind, LogicalPlan, STRUCT_ONLY_SENTINEL, WITH_PASSTHROUGH_SENTINEL,
+    aggregate_column_name, collect_properties_from_plan, projection_columns,
+    reconcile_passthrough_properties,
 };
 use anyhow::{Result, anyhow};
 use arrow_schema::{DataType, Schema, SchemaRef};
@@ -147,6 +150,11 @@ pub struct HybridPhysicalPlanner {
     /// correlated references.
     outer_entity_vars: HashSet<String>,
 
+    /// The enclosing row a correlated subquery body runs against, as one
+    /// row. A [`LogicalPlan::OuterRow`] import bound to a node or a
+    /// relationship is planned from its columns (see [`Self::with_outer_row`]).
+    outer_row: Option<datafusion::arrow::array::RecordBatch>,
+
     /// Plugin registry used to resolve Locy aggregates (and other plugin
     /// surfaces) at plan time. Defaults to a process-wide registry pre-loaded
     /// with the built-ins from `uni-plugin-builtin`; replace with
@@ -161,6 +169,59 @@ pub struct HybridPhysicalPlanner {
     /// [`Self::plan_internal`]). A variable-length traversal with no bound
     /// variable reads it to choose reachability over per-path enumeration.
     multiplicity_insensitive: AtomicBool,
+}
+
+/// Whether the constant operand of an indexed point lookup can be handed to
+/// Lance against a column of `column_type` without changing its meaning.
+///
+/// `resolved` is a property-first predicate with parameters already
+/// substituted (`n.p = lit` or `n.p IN [lit, …]`). Lance coerces the literal to
+/// the column's Arrow type and errors when it cannot, so `n.x = 41.5` on an INT
+/// column failed the query instead of returning no rows. Only operands whose
+/// coercion is exact are accepted: an integer for an integer column, an
+/// integer of magnitude at most 2^53 or a float for a float column, a string
+/// for a string column, a boolean for a boolean column. A float operand must
+/// also be finite and non-zero (see the float arm). A NULL operand matches
+/// nothing under either semantics and is left to the outer filter. Columns of
+/// any other type keep the previous behavior.
+fn index_operand_fits_column(
+    resolved: &Expr,
+    column_type: Option<&uni_common::core::schema::DataType>,
+) -> bool {
+    use uni_common::core::schema::DataType as T;
+    let fits = |operand: &Expr| -> bool {
+        let Expr::Literal(lit) = operand else {
+            return false;
+        };
+        match (column_type, lit) {
+            (_, CypherLiteral::Null) => false,
+            (Some(T::Int32 | T::Int64), lit) => matches!(lit, CypherLiteral::Integer(_)),
+            // A zero operand is never pushed: Cypher's `-0.0 = 0.0` holds, but
+            // the storage filter compares by IEEE total order, so `f = 0`
+            // would drop the stored `-0.0` row before the residual sees it.
+            (Some(T::Float32 | T::Float64), CypherLiteral::Integer(i)) => {
+                *i != 0 && i.unsigned_abs() <= 1_u64 << 53
+            }
+            // A non-finite float has no SQL literal (`NaN` and `inf` parse as
+            // column names), and a zero cannot be spelled with its sign
+            // (`-0.0` renders as `-0`, an integer, i.e. `+0.0`) — nor would
+            // either sign select both zeros under the storage filter's total
+            // order (see the integer arm).
+            (Some(T::Float32 | T::Float64), CypherLiteral::Float(f)) => f.is_finite() && *f != 0.0,
+            (Some(T::Float32 | T::Float64), _) => false,
+            (Some(T::String), lit) => matches!(lit, CypherLiteral::String(_)),
+            (Some(T::Bool), lit) => matches!(lit, CypherLiteral::Bool(_)),
+            _ => true,
+        }
+    };
+    match resolved {
+        Expr::BinaryOp { right, .. } => fits(right),
+        Expr::In { list, .. } => match list.as_ref() {
+            Expr::List(items) => items.iter().all(fits),
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 /// The string `variable.ext_id` is required to equal, if some conjunct of
@@ -353,6 +414,7 @@ impl HybridPhysicalPlanner {
             outer_values: HashMap::new(),
             mutation_ctx: None,
             outer_entity_vars: HashSet::new(),
+            outer_row: None,
             plugin_registry: super::df_graph::locy_fold::default_locy_plugin_registry(),
             multiplicity_insensitive: AtomicBool::new(false),
         }
@@ -441,7 +503,7 @@ impl HybridPhysicalPlanner {
                             *p != "*"
                                 && *p != STRUCT_ONLY_SENTINEL
                                 && *p != WITH_PASSTHROUGH_SENTINEL
-                                && (!p.starts_with('_')
+                                && (!uni_common::core::schema::is_reserved_property_name(p)
                                     || matches!(p.as_str(), "_created_at" | "_updated_at"))
                         })
                         .cloned()
@@ -511,6 +573,7 @@ impl HybridPhysicalPlanner {
             outer_values,
             mutation_ctx: None,
             outer_entity_vars: HashSet::new(),
+            outer_row: None,
             plugin_registry: super::df_graph::locy_fold::default_locy_plugin_registry(),
             multiplicity_insensitive: AtomicBool::new(false),
         }
@@ -579,6 +642,25 @@ impl HybridPhysicalPlanner {
         self
     }
 
+    /// Set `K` for a `~=` vector search that no `LIMIT` sized
+    /// (`UniConfig::vector_knn_default_k`).
+    #[must_use]
+    pub fn with_vector_knn_default_k(mut self, k: usize) -> Self {
+        let ctx = self.take_graph_ctx().with_vector_knn_default_k(k);
+        self.graph_ctx = Arc::new(ctx);
+        self
+    }
+
+    /// Share an enclosing query's warning collector with this sub-plan.
+    #[must_use]
+    pub(crate) fn with_inherited_warnings(mut self, parent: &GraphExecutionContext) -> Self {
+        let ctx = self
+            .take_graph_ctx()
+            .with_warnings_sink(parent.warnings_sink());
+        self.graph_ctx = Arc::new(ctx);
+        self
+    }
+
     /// Attach the per-query counter set, threading it into the graph context
     /// every physical operator receives.
     #[must_use]
@@ -605,6 +687,16 @@ impl HybridPhysicalPlanner {
     /// Set outer entity variable names for nested EXISTS correlated reference detection.
     pub fn set_outer_entity_vars(&mut self, vars: HashSet<String>) {
         self.outer_entity_vars = vars;
+    }
+
+    /// Supplies the enclosing row of a correlated subquery body.
+    ///
+    /// `row` must hold exactly one row. The imports of a plan bound against
+    /// its schema (`bind_outer_row`) are planned from its columns.
+    #[must_use]
+    pub fn with_outer_row(mut self, row: datafusion::arrow::array::RecordBatch) -> Self {
+        self.outer_row = Some(row);
+        self
     }
 
     pub fn with_algo_registry(mut self, registry: Arc<AlgorithmRegistry>) -> Self {
@@ -860,6 +952,7 @@ impl HybridPhysicalPlanner {
             | LogicalPlan::LocyModelInvoke { .. }
             | LogicalPlan::LocyGenerate { .. }
             | LogicalPlan::Empty
+            | LogicalPlan::OuterRow { .. }
             | LogicalPlan::CreateVectorIndex { .. }
             | LogicalPlan::CreateSparseIndex { .. }
             | LogicalPlan::CreateFullTextIndex { .. }
@@ -867,7 +960,6 @@ impl HybridPhysicalPlanner {
             | LogicalPlan::CreateJsonFtsIndex { .. }
             | LogicalPlan::DropIndex { .. }
             | LogicalPlan::ShowIndexes { .. }
-            | LogicalPlan::Copy { .. }
             | LogicalPlan::Backup { .. }
             | LogicalPlan::ShowDatabase
             | LogicalPlan::ShowConfig
@@ -906,6 +998,7 @@ impl HybridPhysicalPlanner {
     ///
     /// Returns an error if planning fails (unsupported operation, schema mismatch, etc.)
     pub fn plan(&self, logical: &LogicalPlan) -> Result<Arc<dyn ExecutionPlan>> {
+        let started = std::time::Instant::now();
         // A root `MultiplicityInsensitive` marker becomes the planner flag and
         // is stripped before the logical pre-passes below, which would
         // otherwise stop at a node they do not recognise.
@@ -936,7 +1029,19 @@ impl HybridPhysicalPlanner {
 
         // Delegate to internal planning with properties context
         let plan = self.plan_internal(&logical_rewritten, &all_properties)?;
-        self.guard_deadlines(plan)
+        let guarded = self.guard_deadlines(plan);
+        self.count_physical_plan(started);
+        guarded
+    }
+
+    /// Records one physical plan, and the time since `started`, in the query's
+    /// counters. Every public planning entry calls this once on success, so the
+    /// count covers the query's plan and each execution-time sub-plan (a
+    /// correlated body per outer row, a Locy clause body per iteration).
+    fn count_physical_plan(&self, started: std::time::Instant) {
+        if let Some(counters) = self.graph_ctx.counters() {
+            counters.add_physical_plan(started.elapsed());
+        }
     }
 
     /// Insert deadline checkpoints beneath pipeline-breaking operators.
@@ -965,6 +1070,7 @@ impl HybridPhysicalPlanner {
         logical: &LogicalPlan,
         extra_properties: HashMap<String, HashSet<String>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let started = std::time::Instant::now();
         // Same pre-pass as `plan()` — see commentary there.
         let logical_rewritten = merge_unwind_in_filters(logical, &self.params);
         let mut all_properties = collect_properties_from_plan(&logical_rewritten);
@@ -976,7 +1082,9 @@ impl HybridPhysicalPlanner {
         // `count(n)` needs to know a row exists, not what is in it (#184 family).
         crate::query::planner::relax_count_only_entities(&logical_rewritten, &mut all_properties);
         let plan = self.plan_internal(&logical_rewritten, &all_properties)?;
-        self.guard_deadlines(plan)
+        let guarded = self.guard_deadlines(plan);
+        self.count_physical_plan(started);
+        guarded
     }
 
     /// Wrap a plan with optional semantics.
@@ -1288,6 +1396,9 @@ impl HybridPhysicalPlanner {
                 min_hops,
                 max_hops,
                 edge_filter_expr,
+                edge_row_conditions,
+                optional,
+                optional_pattern_vars,
             } => self.plan_shortest_path(
                 input,
                 edge_type_ids,
@@ -1300,6 +1411,9 @@ impl HybridPhysicalPlanner {
                 *min_hops,
                 *max_hops,
                 edge_filter_expr.as_ref(),
+                edge_row_conditions,
+                *optional,
+                optional_pattern_vars,
                 all_properties,
             ),
 
@@ -1330,33 +1444,8 @@ impl HybridPhysicalPlanner {
 
             LogicalPlan::Distinct { input } => {
                 let input_plan = self.plan_internal(input, all_properties)?;
-                let schema = input_plan.schema();
                 // Group by all columns with no aggregates = deduplication
-                let group_exprs: Vec<(Arc<dyn datafusion::physical_expr::PhysicalExpr>, String)> =
-                    schema
-                        .fields()
-                        .iter()
-                        .enumerate()
-                        .map(|(i, f)| {
-                            (
-                                Arc::new(datafusion::physical_expr::expressions::Column::new(
-                                    f.name(),
-                                    i,
-                                ))
-                                    as Arc<dyn datafusion::physical_expr::PhysicalExpr>,
-                                f.name().clone(),
-                            )
-                        })
-                        .collect();
-                let group_by = PhysicalGroupBy::new_single(group_exprs);
-                Ok(Arc::new(AggregateExec::try_new(
-                    AggregateMode::Single,
-                    group_by,
-                    vec![],
-                    vec![],
-                    input_plan.clone(),
-                    input_plan.schema(),
-                )?))
+                plan_equivalence_distinct(input_plan)
             }
 
             LogicalPlan::Sort { input, order_by } => {
@@ -1372,6 +1461,8 @@ impl HybridPhysicalPlanner {
             }
 
             LogicalPlan::Empty => self.plan_empty(),
+
+            LogicalPlan::OuterRow { variables } => self.plan_outer_row(variables, all_properties),
 
             LogicalPlan::BindZeroLengthPath {
                 input,
@@ -1541,14 +1632,14 @@ impl HybridPhysicalPlanner {
                 property,
                 query,
                 k,
-                threshold,
+                optional,
             } => self.plan_vector_knn(
                 *label_id,
                 variable,
                 property,
                 query.clone(),
                 *k,
-                *threshold,
+                *optional,
                 all_properties,
             ),
 
@@ -1568,6 +1659,9 @@ impl HybridPhysicalPlanner {
                 min_hops,
                 max_hops,
                 edge_filter_expr,
+                edge_row_conditions,
+                optional,
+                optional_pattern_vars,
             } => self.plan_shortest_path(
                 input,
                 edge_type_ids,
@@ -1580,6 +1674,9 @@ impl HybridPhysicalPlanner {
                 *min_hops,
                 *max_hops,
                 edge_filter_expr.as_ref(),
+                edge_row_conditions,
+                *optional,
+                optional_pattern_vars,
                 all_properties,
             ),
 
@@ -1726,17 +1823,7 @@ impl HybridPhysicalPlanner {
                 // storage + L0 snapshot from graph_ctx. Construction
                 // mirrors `execute_algo_procedure` in procedure_call.rs.
                 let graph_algo = {
-                    let l0_ctx = self.graph_ctx.l0_context();
-                    let l0_mgr = l0_ctx.current_l0.as_ref().map(|current| {
-                        let mut pending = l0_ctx.pending_flush_l0s.clone();
-                        if let Some(tx_l0) = &l0_ctx.transaction_l0 {
-                            pending.push(tx_l0.clone());
-                        }
-                        Arc::new(uni_store::runtime::l0_manager::L0Manager::from_snapshot(
-                            current.clone(),
-                            pending,
-                        ))
-                    });
+                    let l0_mgr = self.graph_ctx.l0_context().read_view();
                     let l0_buffers = self.graph_ctx.l0_context().current_l0.as_ref().map(
                         |current| super::df_graph::locy_model_invoke::L0Buffers {
                             current: current.clone(),
@@ -1823,7 +1910,6 @@ impl HybridPhysicalPlanner {
             | LogicalPlan::CreateJsonFtsIndex { .. }
             | LogicalPlan::DropIndex { .. }
             | LogicalPlan::ShowIndexes { .. }
-            | LogicalPlan::Copy { .. }
             | LogicalPlan::Backup { .. }
             | LogicalPlan::ShowDatabase
             | LogicalPlan::ShowConfig
@@ -2006,13 +2092,22 @@ impl HybridPhysicalPlanner {
     /// filter string AND an Arrow-side `PhysicalExpr`, both derived from the
     /// same set of indexed-property conjuncts.
     ///
-    /// - The Lance string drives an O(1) hash-index lookup against on-disk data.
+    /// - The Lance string lets a scalar index serve the lookup against on-disk
+    ///   data: equality / `IN` (issue #57) and, since perf audit F1, ranges,
+    ///   `STARTS WITH` prefixes and null tests.
     /// - The Arrow filter applies to the merged (Lance + L0) batch in-process,
     ///   so L0 rows that haven't been flushed yet are still index-bounded.
     ///
-    /// Returns `None` when no indexed predicate exists or any parameter
-    /// resolution fails — in that case the planner falls back to the regular
-    /// post-scan `FilterExec`. See issue #57.
+    /// The two halves are deliberately not the same predicate. The Arrow
+    /// filter is the original conjunct (parameters resolved), translated with
+    /// Cypher semantics; the Lance half is a type-exact rendering that may
+    /// accept *more* rows — `n.x < 9.5` on an INT column goes to Lance as
+    /// `x < 10`, a prefix as a half-open string range. Both sit below the
+    /// outer `FilterExec`, which re-applies the whole WHERE.
+    ///
+    /// Returns `None` when no indexed predicate exists or any parameter of an
+    /// indexed equality fails to resolve — in that case the planner falls back
+    /// to the regular post-scan `FilterExec`. See issue #57.
     fn build_indexed_property_pushdown(
         &self,
         filter: Option<&Expr>,
@@ -2023,7 +2118,8 @@ impl HybridPhysicalPlanner {
         let filter = filter?;
         let analyzer = crate::query::pushdown::IndexAwareAnalyzer::new(&self.schema);
         let strategy = analyzer.analyze(filter, variable, label_id);
-        if strategy.indexed_equality_columns.is_empty() {
+        if strategy.indexed_equality_columns.is_empty() && strategy.indexed_range_columns.is_empty()
+        {
             return None;
         }
 
@@ -2036,28 +2132,87 @@ impl HybridPhysicalPlanner {
         // simple keeps the merge behaviour obvious.
         let label_name = self.schema.label_name_by_id(label_id)?;
         let label_props = self.schema.properties.get(label_name);
+        let column_type_of = |col: &str| label_props.and_then(|p| p.get(col)).map(|m| &m.r#type);
         let mut indexed_preds: Vec<Expr> = Vec::new();
         for pred in &strategy.lance_predicates {
             if let Some(col) = crate::query::pushdown::predicate_target_column(pred, variable)
+                && matches!(
+                    pred,
+                    Expr::In { .. }
+                        | Expr::BinaryOp {
+                            op: uni_cypher::ast::BinaryOp::Eq,
+                            ..
+                        }
+                )
                 && strategy
                     .indexed_equality_columns
                     .iter()
                     .any(|(c, _)| c == &col)
             {
                 let resolved = crate::query::pushdown::substitute_params(pred, &self.params)?;
+                // Lance coerces the literal to the column type, and refuses
+                // when it cannot (`n.x = 41.5` on an INT column failed the
+                // whole query). Such a predicate stays with the outer
+                // `FilterExec`, which applies Cypher's comparison semantics.
+                if !index_operand_fits_column(&resolved, column_type_of(&col)) {
+                    continue;
+                }
                 indexed_preds.push(resolved);
             }
+        }
+        let mut lance_expr = crate::query::pushdown::LanceFilterGenerator::generate_expr(
+            &indexed_preds,
+            variable,
+            label_props,
+        );
+
+        // Ranges, prefixes and null tests (F1). Each conjunct goes to Lance in
+        // its type-exact rendering and to the Arrow filter as written; one
+        // that has no exact rendering is skipped and left to the outer
+        // `FilterExec` alone.
+        if !strategy.indexed_range_columns.is_empty() {
+            let mut range_parts = Vec::new();
+            for conj in crate::query::pushdown::conjuncts(filter) {
+                let Some(col) = crate::query::pushdown::predicate_target_column(conj, variable)
+                else {
+                    continue;
+                };
+                if !strategy
+                    .indexed_range_columns
+                    .iter()
+                    .any(|(c, _)| c == &col)
+                {
+                    continue;
+                }
+                let Some(resolved) = crate::query::pushdown::substitute_params(conj, &self.params)
+                else {
+                    continue;
+                };
+                if let Some(part) = crate::query::pushdown::indexed_range_filter(
+                    &resolved,
+                    variable,
+                    column_type_of(&col),
+                ) {
+                    range_parts.push(part);
+                    indexed_preds.push(resolved);
+                }
+            }
+            lance_expr = uni_store::backend::types::FilterExpr::all(
+                std::iter::once(lance_expr).chain(range_parts),
+            );
         }
         if indexed_preds.is_empty() {
             return None;
         }
 
-        // Render the Lance SQL filter string for storage-side pushdown.
-        let lance_str = crate::query::pushdown::LanceFilterGenerator::generate(
-            &indexed_preds,
-            variable,
-            label_props,
-        )?;
+        // Render the Lance SQL filter string for storage-side pushdown. A
+        // conjunct the dialect cannot spell is dropped (a superset, which the
+        // filters above re-apply); nothing left means nothing to push.
+        let lance_expr = lance_expr.sql_pushable();
+        if lance_expr.is_trivially_true() {
+            return None;
+        }
+        let lance_str = lance_expr.to_sql().ok()?;
 
         // Build the Arrow-side PhysicalExpr from the same predicates. The
         // GraphScanExec applies it to the merged (Lance+L0) batch so the
@@ -2320,7 +2475,11 @@ impl HybridPhysicalPlanner {
         // 2. Infer subquery output schema from logical plan + UniSchema metadata.
         // Use the ORIGINAL (still-wrapped) subquery so a unit subquery resolves
         // to an empty schema, which `GraphApplyExec` reads as the unit signal.
-        let sub_schema = infer_logical_plan_schema(subquery, &self.schema);
+        let sub_schema = infer_logical_plan_schema(
+            subquery,
+            &self.schema,
+            self.graph_ctx.procedure_registry().map(Arc::as_ref),
+        );
 
         // 3. Merge schemas: subquery fields override input fields with the
         //    same name. The subquery's RETURN list is authoritative for the
@@ -2390,17 +2549,28 @@ impl HybridPhysicalPlanner {
     }
 
     /// Plan a vector KNN search.
-    #[expect(clippy::too_many_arguments)]
+    ///
+    /// `k` is `None` when no `LIMIT` sized the search; the configured default
+    /// (`UniConfig::vector_knn_default_k`) applies, and the exec warns when
+    /// it returns exactly that many rows.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one argument per `LogicalPlan::VectorKnn` field plus the property map"
+    )]
     fn plan_vector_knn(
         &self,
         label_id: u16,
         variable: &str,
         property: &str,
         query_expr: Expr,
-        k: usize,
-        threshold: Option<f32>,
+        k: Option<usize>,
+        optional: bool,
         all_properties: &HashMap<String, HashSet<String>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let (k, k_defaulted) = match k {
+            Some(k) => (k, false),
+            None => (self.graph_ctx.vector_knn_default_k(), true),
+        };
         let label_name = self
             .schema
             .label_name_by_id(label_id)
@@ -2440,7 +2610,6 @@ impl HybridPhysicalPlanner {
                 property.to_string(),
                 query_expr,
                 k,
-                threshold,
                 self.params.clone(),
                 target_properties,
                 entry.kind,
@@ -2455,11 +2624,11 @@ impl HybridPhysicalPlanner {
                 property.to_string(),
                 query_expr,
                 k,
-                threshold,
                 self.params.clone(),
                 target_properties,
             )
         };
+        let knn = knn.with_k_defaulted(k_defaulted).with_optional(optional);
 
         // SSI read-set: a vector-KNN result is a set of *real* graph vertices
         // (the exec emits `{variable}._vid` from the native/plugin index over the
@@ -2481,6 +2650,10 @@ impl HybridPhysicalPlanner {
 
         // Build target_properties map for node-like yields in search procedures
         let mut target_properties: HashMap<String, Vec<String>> = HashMap::new();
+        // Node yields used as whole entities (`RETURN node`, `labels(node)`,
+        // `properties(node)`, `node {.*}`): they need the node struct column a
+        // scan builds, not the VID-string placeholder the procedure emits.
+        let mut structural_yields: Vec<String> = Vec::new();
 
         if crate::query::df_graph::procedure_call::is_node_yield_procedure_static(procedure_name) {
             for (name, alias) in yield_items {
@@ -2489,11 +2662,23 @@ impl HybridPhysicalPlanner {
                 if canonical == "node" {
                     // Collect properties requested for this node variable
                     if let Some(props) = all_properties.get(output_name.as_str()) {
-                        let prop_list: Vec<String> = props
+                        let mut prop_list: Vec<String> = props
                             .iter()
-                            .filter(|p| *p != "*" && !p.starts_with('_'))
+                            .filter(|p| {
+                                *p != "*" && !uni_common::core::schema::is_reserved_property_name(p)
+                            })
                             .cloned()
                             .collect();
+                        // A whole-entity read needs every property, declared or
+                        // not: `_all_props` carries them, the same column a
+                        // scan adds for `"*"`. Dropping the marker emitted a
+                        // node with no properties at all.
+                        if props.contains("*") {
+                            prop_list.push("_all_props".to_string());
+                        }
+                        if props.contains("*") || props.contains(STRUCT_ONLY_SENTINEL) {
+                            structural_yields.push(output_name.clone());
+                        }
                         target_properties.insert(output_name.clone(), prop_list);
                     }
                 }
@@ -2507,10 +2692,58 @@ impl HybridPhysicalPlanner {
             yield_items.to_vec(),
             self.params.clone(),
             self.outer_values.clone(),
-            target_properties,
+            target_properties.clone(),
         );
 
-        Ok(Arc::new(exec))
+        let mut plan: Arc<dyn ExecutionPlan> = Arc::new(exec);
+        for output_name in structural_yields {
+            plan = self.replace_vid_placeholder_with_node_struct(
+                plan,
+                &output_name,
+                target_properties
+                    .get(&output_name)
+                    .map_or(&[][..], Vec::as_slice),
+            )?;
+        }
+        Ok(plan)
+    }
+
+    /// Replace a procedure's VID-string placeholder column for a node yield
+    /// with the node struct a scan builds (`_vid`, `_labels`, properties).
+    ///
+    /// Inside the query the placeholder is only a string, so entity functions
+    /// (`labels`, `properties`, `keys`) and map projection saw no node at all;
+    /// only the final result conversion rebuilt one, from the narrowed property
+    /// columns.
+    fn replace_vid_placeholder_with_node_struct(
+        &self,
+        input: Arc<dyn ExecutionPlan>,
+        variable: &str,
+        properties: &[String],
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        use datafusion::physical_plan::projection::ProjectionExec;
+
+        let input_schema = input.schema();
+        let proj_exprs: Vec<(Arc<dyn datafusion::physical_expr::PhysicalExpr>, String)> =
+            input_schema
+                .fields()
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.name() != variable)
+                .map(|(i, f)| {
+                    (
+                        Arc::new(datafusion::physical_expr::expressions::Column::new(
+                            f.name(),
+                            i,
+                        ))
+                            as Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+                        f.name().clone(),
+                    )
+                })
+                .collect();
+        let without_placeholder: Arc<dyn ExecutionPlan> =
+            Arc::new(ProjectionExec::try_new(proj_exprs, input)?);
+        self.add_structural_projection(without_placeholder, variable, properties)
     }
 
     /// Plan a vertex scan.
@@ -2588,7 +2821,7 @@ impl HybridPhysicalPlanner {
         let label_props = self.schema.properties.get(label_name);
         let has_projection_overflow = properties.iter().any(|p| {
             p != "overflow_json"
-                && !p.starts_with('_')
+                && !uni_common::core::schema::is_reserved_property_name(p)
                 && !label_props.is_some_and(|lp| lp.contains_key(p.as_str()))
         });
         if has_projection_overflow && !properties.iter().any(|p| p == "overflow_json") {
@@ -2601,7 +2834,7 @@ impl HybridPhysicalPlanner {
             let filter_props = crate::query::df_expr::collect_properties(filter_expr);
             let has_overflow = filter_props.iter().any(|(var, prop)| {
                 var == variable
-                    && !prop.starts_with('_')
+                    && !uni_common::core::schema::is_reserved_property_name(prop)
                     && label_props.is_none_or(|props| !props.contains_key(prop.as_str()))
             });
             if has_overflow && !properties.iter().any(|p| p == "overflow_json") {
@@ -2663,12 +2896,50 @@ impl HybridPhysicalPlanner {
         // `apply_scan_filter` below) is harmless and keeps residual conjuncts
         // (e.g. non-indexed multi-property AND) correct.
         let scan_schema_for_idx = scan_exec.schema();
-        if let Some((lance_str, runtime_filter)) =
-            self.build_indexed_property_pushdown(filter, variable, label_id, &scan_schema_for_idx)
-        {
-            scan_exec = scan_exec
-                .with_extra_lance_filter(lance_str)
-                .with_extra_runtime_filter(runtime_filter);
+        let indexed =
+            self.build_indexed_property_pushdown(filter, variable, label_id, &scan_schema_for_idx);
+        // `(n:L {ext_id: 'x'})` / `WHERE n.ext_id = 'x'`: `ext_id` is never a
+        // declared property, so the analyzer above cannot see it, but every
+        // per-label table carries it as a BTree-indexed column (A10). Pushed
+        // as Lance SQL only, like the unlabelled scan's: the outer
+        // `FilterExec` re-applies it to every row, unflushed ones included.
+        //
+        // The same equality narrows the scan's L0 read: without a runtime
+        // filter there is nothing for the scan to recover an L0 prefilter
+        // from, so it is handed one, and an unflushed lookup builds the
+        // matching L0 rows instead of the label's whole L0 set.
+        let ext_id_value = ext_id_equality(filter, variable, &self.params);
+        if let Some(ext_id) = &ext_id_value {
+            scan_exec = scan_exec.with_planner_l0_prefilter(Some(
+                uni_store::runtime::columnar_scan::L0PropertyPrefilter {
+                    property: uni_store::storage::property_builder::EXT_ID_COLUMN.to_string(),
+                    one_of: Some(vec![uni_common::Value::String(ext_id.clone())]),
+                    bounds: Vec::new(),
+                },
+            ));
+        }
+        let ext_id_lance = ext_id_value
+            .map(|ext_id| {
+                uni_store::backend::types::FilterExpr::equals(
+                    uni_store::storage::property_builder::EXT_ID_COLUMN,
+                    uni_store::backend::types::Scalar::Str(ext_id),
+                )
+                .to_sql()
+                .map_err(|e| anyhow!("ext_id pushdown: {e}"))
+            })
+            .transpose()?;
+        match (indexed, ext_id_lance) {
+            (Some((lance_str, runtime_filter)), ext) => {
+                let lance_str = match ext {
+                    Some(e) => format!("({lance_str}) AND ({e})"),
+                    None => lance_str,
+                };
+                scan_exec = scan_exec
+                    .with_extra_lance_filter(lance_str)
+                    .with_extra_runtime_filter(runtime_filter);
+            }
+            (None, Some(e)) => scan_exec = scan_exec.with_extra_lance_filter(e),
+            (None, None) => {}
         }
         let mut scan_plan: Arc<dyn ExecutionPlan> = Arc::new(scan_exec);
 
@@ -2724,7 +2995,10 @@ impl HybridPhysicalPlanner {
             .filter_map(|f| {
                 f.name()
                     .strip_prefix(&prefix)
-                    .filter(|prop| !prop.starts_with('_') || *prop == "_all_props")
+                    .filter(|prop| {
+                        !uni_common::core::schema::is_reserved_property_name(prop)
+                            || *prop == "_all_props"
+                    })
                     .map(|prop| prop.to_string())
             })
             .collect();
@@ -2907,7 +3181,10 @@ impl HybridPhysicalPlanner {
             .filter_map(|f| {
                 f.name()
                     .strip_prefix(&prefix)
-                    .filter(|prop| !prop.starts_with('_') && *prop != "overflow_json")
+                    .filter(|prop| {
+                        !uni_common::core::schema::is_reserved_property_name(prop)
+                            && *prop != "overflow_json"
+                    })
                     .map(|prop| prop.to_string())
             })
             .collect();
@@ -2966,14 +3243,20 @@ impl HybridPhysicalPlanner {
         all_properties: &HashMap<String, HashSet<String>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let (properties, need_full) = Self::resolve_schemaless_properties(variable, all_properties);
-        let scan_plan: Arc<dyn ExecutionPlan> =
-            Arc::new(GraphScanExec::new_schemaless_vertex_scan(
+        let scan_plan: Arc<dyn ExecutionPlan> = Arc::new(
+            GraphScanExec::new_schemaless_vertex_scan(
                 self.graph_ctx.clone(),
                 label_name.to_string(),
                 variable.to_string(),
                 properties.clone(),
                 None,
-            ));
+            )
+            .with_planner_l0_prefilter(schemaless_l0_prefilter(
+                filter,
+                variable,
+                &self.params,
+            )),
+        );
         self.finalize_schemaless_scan(
             scan_plan,
             variable,
@@ -3035,14 +3318,20 @@ impl HybridPhysicalPlanner {
         if virtual_labels.is_empty() {
             let (properties, need_full) =
                 Self::resolve_schemaless_properties(variable, all_properties);
-            let scan_plan: Arc<dyn ExecutionPlan> =
-                Arc::new(GraphScanExec::new_multi_label_vertex_scan(
+            let scan_plan: Arc<dyn ExecutionPlan> = Arc::new(
+                GraphScanExec::new_multi_label_vertex_scan(
                     self.graph_ctx.clone(),
                     labels.to_vec(),
                     variable.to_string(),
                     properties.clone(),
                     None,
-                ));
+                )
+                .with_planner_l0_prefilter(schemaless_l0_prefilter(
+                    filter,
+                    variable,
+                    &self.params,
+                )),
+            );
             return self.finalize_schemaless_scan(
                 scan_plan,
                 variable,
@@ -3371,7 +3660,9 @@ impl HybridPhysicalPlanner {
             .map(|props| {
                 props
                     .iter()
-                    .filter(|p| !p.starts_with('_') && *p != "*")
+                    .filter(|p| {
+                        !uni_common::core::schema::is_reserved_property_name(p) && *p != "*"
+                    })
                     .cloned()
                     .collect()
             })
@@ -3512,6 +3803,24 @@ impl HybridPhysicalPlanner {
         optional: bool,
         all_properties: &HashMap<String, HashSet<String>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.plan_scan_all_restricted(variable, filter, optional, all_properties, None)
+    }
+
+    /// [`Self::plan_scan_all`], optionally restricted to the sources of
+    /// `edge_sources` — the edge types and direction of the traversal the scan
+    /// feeds — by an [`EdgeSourceScanExec`] directly over the scan.
+    ///
+    /// The restriction sits below the filter, read-set recording and
+    /// structural projection, so everything above the scan is planned exactly
+    /// as for the unrestricted scan.
+    fn plan_scan_all_restricted(
+        &self,
+        variable: &str,
+        filter: Option<&Expr>,
+        optional: bool,
+        all_properties: &HashMap<String, HashSet<String>>,
+        edge_sources: Option<(&[u32], Direction)>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         let (properties, need_full) = Self::resolve_schemaless_properties(variable, all_properties);
         // Extract VID(s) from filter for scan-level optimization. See the
         // detailed comment at the per-label scan site (issue #55 PR #4).
@@ -3525,7 +3834,8 @@ impl HybridPhysicalPlanner {
             variable.to_string(),
             properties.clone(),
             scan_filter,
-        );
+        )
+        .with_planner_l0_prefilter(schemaless_l0_prefilter(filter, variable, &self.params));
         if let Some(vids) = extracted_vids
             && vids.len() > 1
         {
@@ -3544,7 +3854,15 @@ impl HybridPhysicalPlanner {
             .map_err(|e| anyhow!("ext_id pushdown: {e}"))?;
             scan_exec = scan_exec.with_extra_lance_filter(lance);
         }
-        let scan_plan: Arc<dyn ExecutionPlan> = Arc::new(scan_exec);
+        let mut scan_plan: Arc<dyn ExecutionPlan> = Arc::new(scan_exec);
+        if let Some((edge_type_ids, direction)) = edge_sources {
+            scan_plan = Arc::new(EdgeSourceScanExec::try_new(
+                scan_plan,
+                self.graph_ctx.clone(),
+                edge_type_ids.to_vec(),
+                direction,
+            )?);
+        }
         self.finalize_schemaless_scan(
             scan_plan,
             variable,
@@ -3553,6 +3871,58 @@ impl HybridPhysicalPlanner {
             &properties,
             need_full,
         )
+    }
+
+    /// The traversal's source planned as an all-vertex scan restricted to the
+    /// vertices with an edge of `edge_type_ids` along `direction`, when that
+    /// cannot change the traversal's rows; `None` when it can.
+    ///
+    /// Restricting is sound exactly when the source is an unfiltered,
+    /// non-optional `ScanAll` of `source_variable` and the traversal drops a
+    /// source with no neighbor: a fixed-length hop, not optional (an optional
+    /// one null-extends such a source), over native edge types only (a
+    /// virtual type has no adjacency to enumerate). See
+    /// [`EdgeSourceScanExec`] for why the rows are then unchanged.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors the traversal parameters the soundness test reads"
+    )]
+    fn plan_edge_driven_source(
+        &self,
+        input: &LogicalPlan,
+        source_variable: &str,
+        edge_type_ids: &[u32],
+        direction: Direction,
+        is_variable_length: bool,
+        optional: bool,
+        all_properties: &HashMap<String, HashSet<String>>,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        let LogicalPlan::ScanAll {
+            variable,
+            filter: None,
+            optional: false,
+        } = input
+        else {
+            return Ok(None);
+        };
+        if variable != source_variable
+            || is_variable_length
+            || optional
+            || edge_type_ids.is_empty()
+            || edge_type_ids
+                .iter()
+                .any(|&t| uni_common::core::edge_type::is_virtual_edge_type(t))
+        {
+            return Ok(None);
+        }
+        self.plan_scan_all_restricted(
+            variable,
+            None,
+            false,
+            all_properties,
+            Some((edge_type_ids, direction)),
+        )
+        .map(Some)
     }
 
     /// Plan a graph traversal.
@@ -3583,10 +3953,20 @@ impl HybridPhysicalPlanner {
         qpp_steps: Option<&[crate::query::planner::QppStepInfo]>,
         qpp_inner_source: Option<&str>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let input_plan = self.plan_internal(input, all_properties)?;
-        let input_plan = tag_optional_source(input_plan, optional, optional_pattern_vars);
-
         let adj_direction = convert_direction(direction.clone());
+        let input_plan = match self.plan_edge_driven_source(
+            input,
+            source_variable,
+            edge_type_ids,
+            adj_direction,
+            is_variable_length,
+            optional,
+            all_properties,
+        )? {
+            Some(plan) => plan,
+            None => self.plan_internal(input, all_properties)?,
+        };
+        let input_plan = tag_optional_source(input_plan, optional, optional_pattern_vars);
         let (input_plan, source_col) = Self::resolve_source_vid_col(input_plan, source_variable)?;
 
         // M5b.3 — virtual edge-type dispatch. When the relationship type
@@ -3627,18 +4007,27 @@ impl HybridPhysicalPlanner {
                     .get(edge_var)
                     .is_some_and(|props| props.contains("*"));
                 if has_wildcard {
-                    // Expand to all schema-defined properties across all matching edge types
-                    let mut schema_props: Vec<String> = edge_type_ids
+                    // Expand to all schema-defined properties across all matching
+                    // edge types, each name once: two types that both declare `w`
+                    // would otherwise make two `r.w` columns, and a reference
+                    // DataFusion resolves by name (`r['w']`) is then ambiguous.
+                    let mut schema_props: Vec<String> = Vec::new();
+                    for name in edge_type_ids
                         .iter()
                         .filter_map(|eid| self.schema.edge_type_name_by_id(*eid))
-                        .flat_map(|name| {
-                            self.schema
-                                .properties
-                                .get(name)
-                                .map(|p| p.keys().cloned().collect::<Vec<_>>())
-                                .unwrap_or_default()
-                        })
-                        .collect();
+                    {
+                        for prop in self
+                            .schema
+                            .properties
+                            .get(name)
+                            .into_iter()
+                            .flat_map(|p| p.keys())
+                        {
+                            if !schema_props.contains(prop) {
+                                schema_props.push(prop.clone());
+                            }
+                        }
+                    }
 
                     // Also include explicitly referenced properties (non-wildcard, non-internal)
                     // that may be overflow properties not in the schema. System-managed
@@ -3646,8 +4035,9 @@ impl HybridPhysicalPlanner {
                     // `created_at(r)` / `updated_at(r)` are kept too.
                     if let Some(props) = all_properties.get(edge_var) {
                         for p in props {
-                            let passthrough = !p.starts_with('_')
-                                || matches!(p.as_str(), "_created_at" | "_updated_at");
+                            let passthrough =
+                                !uni_common::core::schema::is_reserved_property_name(p)
+                                    || matches!(p.as_str(), "_created_at" | "_updated_at");
                             if p != "*" && passthrough && !schema_props.contains(p) {
                                 schema_props.push(p.clone());
                             }
@@ -3672,7 +4062,7 @@ impl HybridPhysicalPlanner {
                 let edge_type_props = self.merged_edge_type_properties(edge_type_ids);
                 let has_overflow_edge_props = edge_properties.iter().any(|p| {
                     p != "overflow_json"
-                        && !p.starts_with('_')
+                        && !uni_common::core::schema::is_reserved_property_name(p)
                         && !edge_type_props.contains_key(p.as_str())
                 });
                 // Add overflow_json if:
@@ -3778,7 +4168,7 @@ impl HybridPhysicalPlanner {
             let has_non_schema_props = target_properties.iter().any(|p| {
                 p != "overflow_json"
                     && p != "_all_props"
-                    && !p.starts_with('_')
+                    && !uni_common::core::schema::is_reserved_property_name(p)
                     && !is_schema_prop(p.as_str())
             });
             if has_non_schema_props && !target_properties.iter().any(|p| p == "_all_props") {
@@ -3791,7 +4181,7 @@ impl HybridPhysicalPlanner {
                 // filtered property schemaless.
                 let has_overflow_filter = filter_props.iter().any(|(var, prop)| {
                     var == target_variable
-                        && !prop.starts_with('_')
+                        && !uni_common::core::schema::is_reserved_property_name(prop)
                         && !is_schema_prop(prop.as_str())
                 });
                 if has_overflow_filter && !target_properties.iter().any(|p| p == "_all_props") {
@@ -3947,19 +4337,9 @@ impl HybridPhysicalPlanner {
                     vlp_target_properties.clear();
                 }
 
-                // VLP: compile edge predicates to Lance SQL for bitmap preselection
-                let edge_lance_filter: Option<String> = edge_filter_expr.and_then(|expr| {
-                    let edge_var_name = step_variable.unwrap_or("__anon_edge");
-                    crate::query::pushdown::LanceFilterGenerator::generate(
-                        std::slice::from_ref(expr),
-                        edge_var_name,
-                        None,
-                    )
-                });
-
                 // VLP: extract simple property equality conditions for L0 checking
                 let edge_property_conditions = edge_filter_expr
-                    .map(Self::extract_edge_property_conditions)
+                    .map(|e| self.extract_edge_property_conditions(e))
                     .unwrap_or_default();
 
                 // The same extraction applied to the *target* node's predicate,
@@ -3969,7 +4349,7 @@ impl HybridPhysicalPlanner {
                 // applies `target_filter` and remains the authoritative check,
                 // which is what lets the narrowing be conservative.
                 let target_property_conditions = target_filter
-                    .map(Self::extract_edge_property_conditions)
+                    .map(|e| self.extract_edge_property_conditions(e))
                     .unwrap_or_default();
 
                 // VLP: collect used edge columns for cross-pattern relationship uniqueness
@@ -4033,12 +4413,12 @@ impl HybridPhysicalPlanner {
                                 edge_conditions: s
                                     .edge_filter_expr
                                     .as_ref()
-                                    .map(Self::extract_edge_property_conditions)
+                                    .map(|e| self.extract_edge_property_conditions(e))
                                     .unwrap_or_default(),
                                 target_conditions: s
                                     .target_property_expr
                                     .as_ref()
-                                    .map(Self::extract_edge_property_conditions)
+                                    .map(|e| self.extract_edge_property_conditions(e))
                                     .unwrap_or_default(),
                             })
                             .collect()
@@ -4061,7 +4441,16 @@ impl HybridPhysicalPlanner {
                                 .map(|l| VertexConstraint::Label(l.clone())),
                         })
                         .collect();
-                    crate::query::df_graph::nfa::PathNfa::from_qpp(nfa_steps, min_iter, max_iter)
+                    let nfa = crate::query::df_graph::nfa::PathNfa::from_qpp(
+                        nfa_steps, min_iter, max_iter,
+                    );
+                    match steps.first().and_then(|s| s.source_label.clone()) {
+                        Some(label) => nfa.with_iteration_source_constraint(
+                            hops_per_iter,
+                            VertexConstraint::Label(label),
+                        ),
+                        None => nfa,
+                    }
                 });
 
                 Arc::new(GraphVariableLengthTraverseExec::new(
@@ -4079,7 +4468,6 @@ impl HybridPhysicalPlanner {
                     self.graph_ctx.clone(),
                     optional,
                     bound_target_column,
-                    edge_lance_filter,
                     edge_property_conditions,
                     target_property_conditions,
                     used_edge_columns,
@@ -4393,19 +4781,9 @@ impl HybridPhysicalPlanner {
             target_properties.clear();
         }
 
-        // VLP: compile edge predicates to Lance SQL for bitmap preselection
-        let edge_lance_filter: Option<String> = edge_filter_expr.and_then(|expr| {
-            let edge_var_name = step_variable.unwrap_or("__anon_edge");
-            crate::query::pushdown::LanceFilterGenerator::generate(
-                std::slice::from_ref(expr),
-                edge_var_name,
-                None,
-            )
-        });
-
         // VLP: extract edge property conditions for BFS-level filtering
         let edge_property_conditions = edge_filter_expr
-            .map(Self::extract_edge_property_conditions)
+            .map(|e| self.extract_edge_property_conditions(e))
             .unwrap_or_default();
 
         // VLP: collect used edge columns for cross-pattern relationship uniqueness
@@ -4437,7 +4815,6 @@ impl HybridPhysicalPlanner {
             self.graph_ctx.clone(),
             optional,
             bound_target_column,
-            edge_lance_filter,
             edge_property_conditions,
             used_edge_columns,
             path_mode.clone(),
@@ -4462,9 +4839,16 @@ impl HybridPhysicalPlanner {
         min_hops: u32,
         max_hops: u32,
         edge_filter_expr: Option<&Expr>,
+        edge_row_conditions: &[(String, Expr)],
+        optional: bool,
+        optional_pattern_vars: &HashSet<String>,
         all_properties: &HashMap<String, HashSet<String>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let input_plan = self.plan_internal(input, all_properties)?;
+        let input_plan = if optional {
+            self.plan_tagging_optional_entry(input, optional_pattern_vars, all_properties)?
+        } else {
+            self.plan_internal(input, all_properties)?
+        };
 
         let adj_direction = convert_direction(direction);
         let source_col = format!("{}._vid", source_variable);
@@ -4474,8 +4858,26 @@ impl HybridPhysicalPlanner {
         // is exactly what this extractor supports — the same conversion the
         // variable-length path performs before building its `EidFilter`.
         let edge_property_conditions = edge_filter_expr
-            .map(Self::extract_edge_property_conditions)
+            .map(|e| self.extract_edge_property_conditions(e))
             .unwrap_or_default();
+
+        // Map values computed per row, compiled against the rows entering the
+        // search; the operator evaluates them per batch.
+        let row_conditions = if edge_row_conditions.is_empty() {
+            Vec::new()
+        } else {
+            let schema = input_plan.schema();
+            let mut ctx = self.translation_context_for_plan(input);
+            ctx.available_columns =
+                Some(schema.fields().iter().map(|f| f.name().clone()).collect());
+            let session = self.session_ctx.read();
+            let state = session.state();
+            let compiler = self.expr_compiler(&state, Some(&ctx));
+            edge_row_conditions
+                .iter()
+                .map(|(name, value)| Ok((name.clone(), compiler.compile(value, &schema)?)))
+                .collect::<Result<Vec<_>>>()?
+        };
 
         Ok(Arc::new(GraphShortestPathExec::new(
             input_plan,
@@ -4490,7 +4892,44 @@ impl HybridPhysicalPlanner {
             min_hops,
             max_hops,
             edge_property_conditions,
+            row_conditions,
+            optional,
         )))
+    }
+
+    /// Plan the input of an OPTIONAL `shortestPath`, tagging the rows that
+    /// enter the clause.
+    ///
+    /// An endpoint the clause scans for itself is cross-joined onto the
+    /// entering rows, so one entering row reaches the operator as one row per
+    /// candidate. The closing `OptionalFilterExec` must decide per *entering*
+    /// row, which only a tag applied before those cross joins identifies:
+    /// grouping by the bound node ids instead merges entering rows that bind
+    /// the same node (`UNWIND [1, 1] AS x MATCH (a) OPTIONAL MATCH …` would keep
+    /// one NULL row of two). Walks the left spine of cross joins past each
+    /// right side that binds one of `clause_vars`, tags what is left, and
+    /// rebuilds the joins as `plan_internal` would. `tag_optional_source`
+    /// declines to tag a subtree that still binds a clause variable, so an
+    /// unexpected shape is left untagged rather than tagged wrongly.
+    fn plan_tagging_optional_entry(
+        &self,
+        plan: &LogicalPlan,
+        clause_vars: &HashSet<String>,
+        all_properties: &HashMap<String, HashSet<String>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if let LogicalPlan::CrossJoin { left, right } = plan
+            && collect_plan_variables(right)
+                .iter()
+                .any(|v| clause_vars.contains(v))
+        {
+            let left_plan = self.plan_tagging_optional_entry(left, clause_vars, all_properties)?;
+            let right_plan = self.plan_internal(right, all_properties)?;
+            return Ok(Arc::new(
+                datafusion::physical_plan::joins::CrossJoinExec::new(left_plan, right_plan),
+            ));
+        }
+        let planned = self.plan_internal(plan, all_properties)?;
+        Ok(tag_optional_source(planned, true, clause_vars))
     }
 
     /// Plan a filter operation.
@@ -4523,12 +4962,25 @@ impl HybridPhysicalPlanner {
         }
 
         let input_plan = self.plan_internal(input, all_properties)?;
+        let input_width = input_plan.schema().fields().len();
+        // An unresolved `startNode(r)` in the predicate reads `r`'s endpoint
+        // from a hydrated column, as it does in a projection
+        // (`plan_project_from_input`); the columns are dropped again below.
+        let input_plan = self.hydrate_endpoints_for(input_plan, &[(predicate.clone(), None)])?;
         let schema = input_plan.schema();
 
         // Use CypherPhysicalExprCompiler for all filters (handles both schema-typed
         // and schemaless LargeBinary/CypherValue columns without coercion failures).
         let mut ctx = self.translation_context_for_plan(input);
         ctx.available_columns = Some(schema.fields().iter().map(|f| f.name().clone()).collect());
+        ctx.node_variable_hints.extend(
+            schema
+                .fields()
+                .iter()
+                .map(|f| f.name())
+                .filter(|name| name.starts_with(ENDPOINT_COLUMN_PREFIX))
+                .cloned(),
+        );
         let ctx = ctx;
         let session = self.session_ctx.read();
         let state = session.state();
@@ -4536,18 +4988,34 @@ impl HybridPhysicalPlanner {
         let physical_predicate = compiler.compile_predicate(predicate, &schema)?;
 
         // For OPTIONAL MATCH: use OptionalFilterExec for proper NULL row preservation.
-        if !optional_variables.is_empty() {
-            return Ok(Arc::new(OptionalFilterExec::new(
+        let filtered: Arc<dyn ExecutionPlan> = if optional_variables.is_empty() {
+            Arc::new(FilterExec::try_new(physical_predicate, input_plan)?)
+        } else {
+            Arc::new(OptionalFilterExec::new(
                 input_plan,
                 physical_predicate,
                 optional_variables.clone(),
-            )));
+            ))
+        };
+        if schema.fields().len() == input_width {
+            return Ok(filtered);
         }
-
-        Ok(Arc::new(FilterExec::try_new(
-            physical_predicate,
-            input_plan,
-        )?))
+        let kept = schema
+            .fields()
+            .iter()
+            .take(input_width)
+            .enumerate()
+            .map(|(idx, field)| {
+                (
+                    Arc::new(datafusion::physical_expr::expressions::Column::new(
+                        field.name(),
+                        idx,
+                    )) as Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+                    field.name().clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        Ok(Arc::new(ProjectionExec::try_new(kept, filtered)?))
     }
 
     /// Issue #53 optimization: try to convert Filter(CrossJoin(L, R), pred) into
@@ -4616,7 +5084,7 @@ impl HybridPhysicalPlanner {
         // by the standalone `merge_unwind_in_filters` pre-pass at
         // `HybridPhysicalPlanner::plan`. That pass walks the LogicalPlan
         // tree BEFORE any physical-plan optimization can bail (e.g.,
-        // `unify_join_key_types` failing on Utf8 ↔ LargeBinary), so the
+        // `unify_join_key_types` refusing a dtype pairing), so the
         // scan-side filters always survive — regardless of whether this
         // function emits HashJoinExec or falls back to FilterExec(CrossJoin).
         //
@@ -4661,17 +5129,18 @@ impl HybridPhysicalPlanner {
             left_plan
         };
 
-        // Compile each (l_expr, r_expr) pair, wrapping both sides in tointeger
-        // for type unification (handles UInt64 _vid vs LargeBinary CV property).
-        // If any pair can't be unified, fall through to FilterExec.
+        // Compile each (l_expr, r_expr) pair into hash keys of one dtype (see
+        // `unify_join_key_types`). If any pair can't be unified, fall through
+        // to FilterExec.
         let left_schema = left_plan.schema();
         let right_schema = right_plan.schema();
         let left_ctx = self.translation_context_for_plan(&left_with_filter);
         let right_ctx = self.translation_context_for_plan(&right_with_filter);
 
-        // Build join keys: compile each side's expression and wrap in tointeger
-        // for type unification (handles UInt64 _vid vs LargeBinary CV property).
+        // Build join keys. A pair keyed through a coarse bucket key also
+        // yields its original equality, re-checked as a join filter below.
         // Drop the session lock between this scope and HashJoinExec construction.
+        let mut rechecks: Vec<Expr> = Vec::new();
         let on: Vec<(
             Arc<dyn datafusion::physical_plan::PhysicalExpr>,
             Arc<dyn datafusion::physical_plan::PhysicalExpr>,
@@ -4705,12 +5174,18 @@ impl HybridPhysicalPlanner {
                 };
                 let l_phys = left_compiler.compile(l_expr, &left_schema)?;
                 let r_phys = right_compiler.compile(r_expr, &right_schema)?;
-                let Some((l_key, r_key)) =
-                    unify_join_key_types(l_phys, r_phys, &left_schema, &right_schema, &state)
+                let Some(key) = unify_join_key_types(l_phys, r_phys, &left_schema, &right_schema)
                 else {
                     return Ok(None);
                 };
-                pairs.push((l_key, r_key));
+                if key.needs_recheck {
+                    rechecks.push(Expr::BinaryOp {
+                        left: Box::new(l_expr.clone()),
+                        op: uni_cypher::ast::BinaryOp::Eq,
+                        right: Box::new(r_expr.clone()),
+                    });
+                }
+                pairs.push((key.left, key.right));
             }
             pairs
         };
@@ -4722,8 +5197,12 @@ impl HybridPhysicalPlanner {
         // with `VidLookupJoinExec`. Supports INNER and LEFT outer; falls
         // through to HashJoinExec for RIGHT outer, non-Scan probes, or
         // computed (non-Column) join keys.
+        // `VidLookupJoinExec` compares non-anchor pairs by exact `ScalarValue`
+        // equality, which is only Cypher equality on a same-dtype exact key —
+        // a pair that needs re-checking needs `HashJoinExec`'s join filter.
         if matches!(join_type, JoinType::Inner | JoinType::Left)
             && cls.residual.is_none()
+            && rechecks.is_empty()
             && let Some(plan) = self.try_emit_vid_lookup_join(
                 &cls.equi_pairs,
                 join_type,
@@ -4736,17 +5215,53 @@ impl HybridPhysicalPlanner {
             return Ok(Some(plan));
         }
 
-        let join: Arc<dyn ExecutionPlan> = Arc::new(HashJoinExec::try_new(
-            left_plan,
-            right_plan,
-            on,
-            None,
-            &join_type,
-            None,
-            PartitionMode::CollectLeft,
-            NullEquality::NullEqualsNothing,
-            false,
-        )?);
+        // A7: sideways information passing. When one side is a scan joined on
+        // an indexed property, look it up by the other side's key values
+        // instead of scanning it whole (`PropertyLookupJoinExec`). Same
+        // exactness conditions as the vid lookup above; a cross-side residual
+        // is applied above it exactly as above the hash join, and only an
+        // INNER join can carry one (outer joins bailed earlier).
+        let lookup = if matches!(join_type, JoinType::Inner | JoinType::Left) && rechecks.is_empty()
+        {
+            self.try_emit_property_lookup_join(
+                &cls.equi_pairs,
+                join_type,
+                &left_plan,
+                &right_plan,
+                &left_with_filter,
+                &right_with_filter,
+            )?
+        } else {
+            None
+        };
+
+        let join: Arc<dyn ExecutionPlan> = match lookup {
+            Some(lookup) => lookup,
+            None => {
+                let filter = if rechecks.is_empty() {
+                    None
+                } else {
+                    Some(self.build_recheck_join_filter(
+                        &rechecks,
+                        &left_plan,
+                        &right_plan,
+                        &left_with_filter,
+                        &right_with_filter,
+                    )?)
+                };
+                Arc::new(HashJoinExec::try_new(
+                    left_plan,
+                    right_plan,
+                    on,
+                    filter,
+                    &join_type,
+                    None,
+                    PartitionMode::CollectLeft,
+                    NullEquality::NullEqualsNothing,
+                    false,
+                )?)
+            }
+        };
 
         // Apply mixed-non-equi residual (predicates referencing both sides
         // that aren't equi-joins) as a post-join FilterExec.
@@ -4768,6 +5283,65 @@ impl HybridPhysicalPlanner {
         }
 
         Ok(Some(join))
+    }
+
+    /// Build the join filter that re-checks equi-pairs keyed by a bucket key.
+    ///
+    /// `_cypher_join_key` puts every pair of equal values in one bucket but may
+    /// put unequal ones there too (see `unify_join_key_types`), so each
+    /// candidate pair is re-tested with the original equality, compiled exactly
+    /// as the cross-join fallback compiles it. A join filter rather than a
+    /// post-join `FilterExec` keeps outer joins right: a candidate that fails
+    /// the re-check leaves the outer row unmatched and NULL-padded instead of
+    /// dropping it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the re-check predicate fails to compile.
+    fn build_recheck_join_filter(
+        &self,
+        rechecks: &[Expr],
+        left_plan: &Arc<dyn ExecutionPlan>,
+        right_plan: &Arc<dyn ExecutionPlan>,
+        left_logical: &LogicalPlan,
+        right_logical: &LogicalPlan,
+    ) -> Result<datafusion::physical_plan::joins::utils::JoinFilter> {
+        use datafusion::common::JoinSide;
+        use datafusion::physical_plan::joins::utils::{ColumnIndex, JoinFilter};
+
+        let left_schema = left_plan.schema();
+        let right_schema = right_plan.schema();
+        let fields: Vec<arrow_schema::FieldRef> = left_schema
+            .fields()
+            .iter()
+            .chain(right_schema.fields().iter())
+            .cloned()
+            .collect();
+        let column_indices: Vec<ColumnIndex> = (0..left_schema.fields().len())
+            .map(|index| ColumnIndex {
+                index,
+                side: JoinSide::Left,
+            })
+            .chain((0..right_schema.fields().len()).map(|index| ColumnIndex {
+                index,
+                side: JoinSide::Right,
+            }))
+            .collect();
+        let intermediate = Arc::new(Schema::new(fields));
+
+        let predicate = and_combine(rechecks.to_vec()).ok_or_else(|| {
+            anyhow::anyhow!("build_recheck_join_filter called without a re-check")
+        })?;
+        let crossjoin_for_ctx = LogicalPlan::CrossJoin {
+            left: Box::new(left_logical.clone()),
+            right: Box::new(right_logical.clone()),
+        };
+        let merged_ctx = self.translation_context_for_plan(&crossjoin_for_ctx);
+        let session = self.session_ctx.read();
+        let state = session.state();
+        let compiler = self.expr_compiler(&state, Some(&merged_ctx));
+        let expression = compiler.compile_predicate(&predicate, &intermediate)?;
+        Ok(JoinFilter::new(expression, column_indices, intermediate))
     }
 
     /// Issue #55 PR #5+#6: detect the cross-MATCH dynamic VID-filter pushdown
@@ -4794,7 +5368,6 @@ impl HybridPhysicalPlanner {
         left_logical: &LogicalPlan,
         right_logical: &LogicalPlan,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        use crate::query::df_graph::scan::GraphScanExec;
         use crate::query::df_graph::vid_lookup_join::{
             EquiPair, ProbeSide, VidJoinKind, VidLookupJoinExec,
         };
@@ -4837,23 +5410,24 @@ impl HybridPhysicalPlanner {
             ProbeSide::Right => left_logical,
         };
 
-        // 2. Probe-side plan must be a top-level GraphScanExec.
+        // 2. Probe-side plan must be a top-level GraphScanExec, optionally
+        // under an SSI `ReadSetRecordingExec`.
         //
-        // We deliberately do NOT peek through an SSI `ReadSetRecordingExec`
-        // here. That wrapper is only inserted for read-write transactions with
-        // an active read-set, and `VidLookupJoinExec::try_new` requires the
-        // probe child to be a bare `GraphScanExec` — so peeking through would
-        // hand it the inner scan and drop the wrapper from the plan, silently
-        // skipping read-set capture for the probe rows. Letting the wrapper mask
-        // the scan makes this rewrite bail to `HashJoinExec`, which executes the
-        // wrapper normally and records the reads. Non-SSI / read-only contexts
-        // have no wrapper, so the optimization still fires there.
+        // That wrapper is inserted for read-write transactions with an active
+        // read-set — which includes every Locy evaluation, so a recursive
+        // clause walked from its derived delta (issue #301) could never use
+        // this operator while the wrapper masked the scan. The rewrite now
+        // looks *through* it (`vid_lookup_join::probe_scan`) but keeps it as
+        // the probe child: `VidLookupJoinExec::try_new` wires the vid slot into
+        // the inner scan and re-parents it under the same wrapper, so the probe
+        // rows are still recorded. Discarding the wrapper is what used to make
+        // peeking unsafe, and is still never done.
         //
-        // (The probe now runs through `execute()` like any other child (#179),
-        // but that does not rescue the wrapper: it is the *discarding* of it at
-        // plan time that would lose the reads, not how the scan is driven.)
+        // (The probe runs through `execute()` like any other child (#179), so
+        // the wrapper records exactly the rows the lookup returned — the read
+        // set of a vid-filtered scan.)
         //
-        // We DO peek through the `wrap_optional` wrapper, and only that one.
+        // We also peek through the `wrap_optional` wrapper, and only that one.
         // An OPTIONAL MATCH scan is wrapped in
         // `NestedLoopJoinExec(PlaceholderRowExec, GraphScanExec, Left)` whose
         // sole purpose is to emit one all-NULL row when the scan is empty
@@ -4868,7 +5442,7 @@ impl HybridPhysicalPlanner {
         // side is always wrapped. It had been dead since the commit that
         // introduced it.
         let probe_plan = Self::unwrap_optional_scan(probe_plan);
-        if probe_plan.downcast_ref::<GraphScanExec>().is_none() {
+        if crate::query::df_graph::vid_lookup_join::probe_scan(&probe_plan).is_none() {
             return Ok(None);
         }
 
@@ -4962,6 +5536,197 @@ impl HybridPhysicalPlanner {
         )?)))
     }
 
+    /// A7: emit `PropertyLookupJoinExec` for an equi-join whose probe side is
+    /// a scan keyed on an indexed property. Returns `Ok(None)` for any shape it
+    /// does not take; the caller then emits the hash join.
+    ///
+    /// Conditions, each of which keeps the rewrite exact (see the module docs
+    /// of `property_lookup_join`):
+    ///
+    /// - some equi-pair has, on one side, `v.prop` where that side plans to a
+    ///   row-wise chain over a per-label `GraphScanExec` of `v`, and `prop` has
+    ///   an online Hash or BTree scalar index on the scan's label;
+    /// - every equi-pair compiles to a bare column on both sides of one data
+    ///   type (with no re-check, the caller's guard, that is an exact native
+    ///   key), and the anchor's type is a string or `Int64`;
+    /// - the join is INNER, or LEFT with the probe on the right (only build
+    ///   rows can be null-padded).
+    ///
+    /// When both sides qualify, the side whose scan carries no pushed filter
+    /// is probed: a filtered scan is the anchored, smaller side.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if compiling a join key fails.
+    fn try_emit_property_lookup_join(
+        &self,
+        equi_pairs: &[(Expr, Expr)],
+        join_type: JoinType,
+        left_plan: &Arc<dyn ExecutionPlan>,
+        right_plan: &Arc<dyn ExecutionPlan>,
+        left_logical: &LogicalPlan,
+        right_logical: &LogicalPlan,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        use crate::query::df_graph::property_lookup_join::{
+            LookupKeyType, ProbeKey, PropertyLookupJoinExec, probe_scan,
+        };
+        use crate::query::df_graph::vid_lookup_join::{EquiPair, ProbeSide, VidJoinKind};
+        use datafusion::physical_expr::expressions::Column;
+
+        // Nothing to look up unless some side is a plain user property.
+        let is_property_key = |e: &Expr| {
+            matches!(e, Expr::Property(base, prop)
+                if !uni_common::core::schema::is_reserved_property_name(prop) && matches!(base.as_ref(), Expr::Variable(_)))
+        };
+        if !equi_pairs
+            .iter()
+            .any(|(l, r)| is_property_key(l) || is_property_key(r))
+        {
+            return Ok(None);
+        }
+
+        // Compile every pair to (left column, right column); any computed key
+        // keeps the hash join. Entity equality is keyed on identity, exactly as
+        // the caller keys the hash join (`identity_join_key`).
+        let left_schema = left_plan.schema();
+        let right_schema = right_plan.schema();
+        let left_ctx = self.translation_context_for_plan(left_logical);
+        let right_ctx = self.translation_context_for_plan(right_logical);
+        let equi_pairs: Vec<(Expr, Expr)> = equi_pairs
+            .iter()
+            .map(|(l, r)| {
+                identity_join_key(l, r, &left_ctx, &right_ctx)
+                    .unwrap_or_else(|| (l.clone(), r.clone()))
+            })
+            .collect();
+        let compiled: Vec<EquiPair> = {
+            let session = self.session_ctx.read();
+            let state = session.state();
+            let left_compiler = self.expr_compiler(&state, Some(&left_ctx));
+            let right_compiler = self.expr_compiler(&state, Some(&right_ctx));
+            let mut compiled = Vec::with_capacity(equi_pairs.len());
+            for (l_expr, r_expr) in &equi_pairs {
+                let l_phys = left_compiler.compile(l_expr, &left_schema)?;
+                let r_phys = right_compiler.compile(r_expr, &right_schema)?;
+                let (Some(l_col), Some(r_col)) = (
+                    l_phys.downcast_ref::<Column>(),
+                    r_phys.downcast_ref::<Column>(),
+                ) else {
+                    return Ok(None);
+                };
+                if left_schema.field(l_col.index()).data_type()
+                    != right_schema.field(r_col.index()).data_type()
+                {
+                    return Ok(None);
+                }
+                compiled.push(EquiPair {
+                    left_col_idx: l_col.index(),
+                    right_col_idx: r_col.index(),
+                });
+            }
+            compiled
+        };
+
+        // Candidate anchors: (pair index, probe side, probe plan, key, filtered).
+        let mut candidates = Vec::new();
+        for (i, (l_expr, r_expr)) in equi_pairs.iter().enumerate() {
+            for (side, expr, plan) in [
+                (ProbeSide::Left, l_expr, left_plan),
+                (ProbeSide::Right, r_expr, right_plan),
+            ] {
+                let Expr::Property(base, prop) = expr else {
+                    continue;
+                };
+                let Expr::Variable(var) = base.as_ref() else {
+                    continue;
+                };
+                if uni_common::core::schema::is_reserved_property_name(prop) {
+                    continue;
+                }
+                let join_kind = match (join_type, side) {
+                    (JoinType::Inner, _) => VidJoinKind::Inner,
+                    (JoinType::Left, ProbeSide::Right) => VidJoinKind::Left,
+                    _ => continue,
+                };
+                // A LEFT probe is the optional side, wrapped by `wrap_optional`;
+                // the operator null-pads unmatched build rows itself.
+                let plan = if join_kind == VidJoinKind::Left {
+                    Self::unwrap_optional_scan(plan)
+                } else {
+                    plan.clone()
+                };
+                let key_column = format!("{var}.{prop}");
+                let Some(scan) = probe_scan(&plan, &key_column) else {
+                    continue;
+                };
+                let (label, scan_var, schemaless) = scan.scan_target();
+                if schemaless || scan_var != var {
+                    continue;
+                }
+                let indexed = self
+                    .schema
+                    .scalar_index_for_property(label, prop)
+                    .is_some_and(|cfg| {
+                        matches!(
+                            cfg.index_type,
+                            uni_common::core::schema::ScalarIndexType::Hash
+                                | uni_common::core::schema::ScalarIndexType::BTree
+                        )
+                    });
+                if !indexed {
+                    continue;
+                }
+                let probe_idx = compiled[i].probe_col(side);
+                let probe_schema = plan.schema();
+                let field = probe_schema.field(probe_idx);
+                if field.name() != &key_column {
+                    continue;
+                }
+                let Some(key_type) = LookupKeyType::of(field.data_type()) else {
+                    continue;
+                };
+                // A pushed index filter or a residual `FilterExec` in the
+                // chain marks the anchored side; a read-set wrapper does not.
+                let mut filtered = scan.has_extra_lance_filter();
+                let mut node = plan.clone();
+                while !filtered && node.downcast_ref::<GraphScanExec>().is_none() {
+                    filtered = node.downcast_ref::<FilterExec>().is_some();
+                    let Some(child) = node.children().first().map(|c| Arc::clone(c)) else {
+                        break;
+                    };
+                    node = child;
+                }
+                candidates.push((
+                    i,
+                    side,
+                    plan,
+                    join_kind,
+                    ProbeKey::new(var, prop, key_type),
+                    filtered,
+                ));
+            }
+        }
+        // Unfiltered probe first; among equals the right side, the hash join's
+        // probe side.
+        candidates
+            .sort_by_key(|(_, side, _, _, _, filtered)| (*filtered, *side == ProbeSide::Left));
+        let Some((anchor_idx, probe_side, probe_plan, join_kind, probe_key, _)) =
+            candidates.into_iter().next()
+        else {
+            return Ok(None);
+        };
+
+        let mut pairs = compiled;
+        pairs.swap(0, anchor_idx);
+        let (left, right) = match probe_side {
+            ProbeSide::Left => (probe_plan, right_plan.clone()),
+            ProbeSide::Right => (left_plan.clone(), probe_plan),
+        };
+        Ok(Some(Arc::new(PropertyLookupJoinExec::try_new(
+            left, right, probe_side, pairs, join_kind, probe_key,
+        )?)))
+    }
+
     /// Peels the `wrap_optional` wrapper off a probe plan, if that is exactly what
     /// it is.
     ///
@@ -4971,11 +5736,11 @@ impl HybridPhysicalPlanner {
     /// itself, so for that operator the wrapper is redundant — and because the
     /// placeholder's schema is empty, removing it is schema-neutral.
     ///
-    /// Deliberately **one level, exact match, no recursion.** The SSI
-    /// `ReadSetRecordingExec` wrapper must keep masking the scan so the rewrite
-    /// bails to `HashJoinExec` and read-set capture still happens; a recursive or
-    /// loose unwrap would defeat that. Anything that is not precisely
-    /// `NLJ(PlaceholderRowExec, _, Left)` with no filter is returned untouched.
+    /// Deliberately **one level, exact match, no recursion.** It never strips
+    /// the SSI `ReadSetRecordingExec` wrapper — the vid-lookup rewrite looks
+    /// through that one while keeping it, so read-set capture still happens.
+    /// Anything that is not precisely `NLJ(PlaceholderRowExec, _, Left)` with no
+    /// filter is returned untouched.
     fn unwrap_optional_scan(plan: &Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
         let Some(nlj) = plan.downcast_ref::<NestedLoopJoinExec>() else {
             return plan.clone();
@@ -5233,7 +5998,8 @@ impl HybridPhysicalPlanner {
     /// Plan a compact Locy YIELD projection — emits ONLY the listed expressions,
     /// without carrying through helper/property columns.
     ///
-    /// Node variables are projected as their `._vid` column (UInt64).
+    /// A bare name is an exact column of the input (the Locy planner reads a
+    /// node through its `._vid` column, a relationship through its `._eid`).
     /// Other expressions are compiled normally, then CAST to target type if needed.
     fn plan_locy_project(
         &self,
@@ -5257,55 +6023,30 @@ impl HybridPhysicalPlanner {
         for (i, (expr, alias)) in projections.iter().enumerate() {
             let target_type = target_types.get(i);
 
-            // Handle node/relationship variables: extract the identity column
-            if let Expr::Variable(var_name) = expr {
-                // A relationship variable → its EID (UInt64), hydrated into the
-                // edge after the fixpoint as a node's VID is. Checked before
-                // `._vid`, which a relationship's columns can also include.
-                let eid_col_name = format!("{var_name}._eid");
-                if let Some((eid_idx, _)) = schema.column_with_name(&eid_col_name) {
-                    let col_expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
-                        Arc::new(Column::new(&eid_col_name, eid_idx));
-                    let name = alias.clone().unwrap_or_else(|| var_name.clone());
-                    exprs.push((col_expr, name));
-                    continue;
-                }
-                // Check if this is a graph-expanded node variable ({var}._vid exists)
-                let vid_col_name = format!("{}._vid", var_name);
-                let vid_col_match = schema
-                    .fields()
-                    .iter()
-                    .enumerate()
-                    .find(|(_, f)| f.name() == &vid_col_name);
-
-                if let Some((vid_idx, _)) = vid_col_match {
-                    // Node variable → extract VID (UInt64)
-                    let col_expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
-                        Arc::new(Column::new(&vid_col_name, vid_idx));
-                    let name = alias.clone().unwrap_or_else(|| var_name.clone());
-                    exprs.push((col_expr, name));
-                    continue;
-                }
-
-                // Direct column (e.g. from derived scan)
-                if let Some((col_idx, field)) = schema.column_with_name(var_name) {
-                    let col_expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
-                        Arc::new(Column::new(var_name, col_idx));
-                    // A column declared as a Cypher value (a generator output,
-                    // say) is encoded, so the rule's facts carry the declared
-                    // type.
-                    let col_expr = if target_type == Some(&DataType::LargeBinary)
-                        && field.data_type() != &DataType::LargeBinary
-                    {
-                        crate::query::df_graph::expr_compiler::to_cypher_value_expr(col_expr)
-                    } else {
-                        col_expr
-                    };
-                    let name = alias.clone().unwrap_or_else(|| var_name.clone());
-                    exprs.push((col_expr, name));
-                    continue;
-                }
-                // Fall through to generic expression compilation
+            // A bare name is a column of the input, looked up exactly. The Locy
+            // planner resolves every name through the clause's binding plan
+            // before it gets here — a node to its `._vid`, a relationship to
+            // its `._eid`, a referenced column to its prefixed name — so a
+            // fallback that guessed (`_eid`, then `_vid`, then the bare name)
+            // could only capture an unrelated column (issue #300).
+            if let Expr::Variable(var_name) = expr
+                && let Some((col_idx, field)) = schema.column_with_name(var_name)
+            {
+                let col_expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
+                    Arc::new(Column::new(var_name, col_idx));
+                // A column declared as a Cypher value (a generator output,
+                // say) is encoded, so the rule's facts carry the declared
+                // type.
+                let col_expr = if target_type == Some(&DataType::LargeBinary)
+                    && field.data_type() != &DataType::LargeBinary
+                {
+                    crate::query::df_graph::expr_compiler::to_cypher_value_expr(col_expr)
+                } else {
+                    col_expr
+                };
+                let name = alias.clone().unwrap_or_else(|| var_name.clone());
+                exprs.push((col_expr, name));
+                continue;
             }
 
             // A recursive rule's referenced-fact discriminator (#159): a hash of
@@ -5316,6 +6057,16 @@ impl HybridPhysicalPlanner {
                 let children = args
                     .iter()
                     .map(|arg| {
+                        // A string literal tags the identity (the shape of a
+                        // Locy row event's expression).
+                        if let Expr::Literal(uni_cypher::ast::CypherLiteral::String(tag)) = arg {
+                            return Ok(Arc::new(
+                                datafusion::physical_expr::expressions::Literal::new(
+                                    datafusion::common::ScalarValue::Utf8(Some(tag.clone())),
+                                ),
+                            )
+                                as Arc<dyn datafusion::physical_expr::PhysicalExpr>);
+                        }
                         let Expr::Variable(col) = arg else {
                             return Err(anyhow!("{name} takes column names"));
                         };
@@ -5482,6 +6233,9 @@ impl HybridPhysicalPlanner {
         use crate::query::df_graph::expr_compiler::CypherPhysicalExprCompiler;
         let mut group_exprs: Vec<(Arc<dyn datafusion::physical_expr::PhysicalExpr>, String)> =
             Vec::new();
+        // `(group position, aggregate)` for each key emitted through
+        // `_cypher_first_seen` rather than as its canonical key.
+        let mut first_seen_keys: Vec<(usize, Arc<AggregateFunctionExpr>)> = Vec::new();
         for expr in group_by {
             let name = expr.to_string_repr();
 
@@ -5530,7 +6284,15 @@ impl HybridPhysicalPlanner {
                 // Convert logical expression to physical
                 create_physical_expr(&df_expr, &df_schema_ref, state.execution_props())?
             };
-            group_exprs.push((physical_expr, name));
+            let (key, first_seen) = equivalence_group_key(
+                physical_expr,
+                &format!("__cypher_first_seen_{}", group_exprs.len()),
+                &schema,
+            )?;
+            if let Some(first_seen) = first_seen {
+                first_seen_keys.push((group_exprs.len(), first_seen));
+            }
+            group_exprs.push((key, name));
         }
 
         // For entity variables (Node/Edge) in group_by, also include their
@@ -5565,11 +6327,20 @@ impl HybridPhysicalPlanner {
 
         // Translate aggregates and their associated filter expressions
         // (e.g. collect() uses a filter to exclude null values per Cypher spec)
-        let (aggr_exprs, filter_exprs): (Vec<_>, Vec<_>) = self
+        let (mut aggr_exprs, mut filter_exprs): (Vec<_>, Vec<_>) = self
             .translate_aggregates(&rewritten_aggregates, &schema, &state, &ctx)?
             .into_iter()
             .unzip();
         let num_aggregates = aggr_exprs.len();
+        // First-seen values of CypherValue keys go after the user's
+        // aggregates; the projection below puts each in its key's place.
+        let num_first_seen = first_seen_keys.len();
+        let mut first_seen_slot: HashMap<usize, usize> = HashMap::new();
+        for (j, (group_pos, agg)) in first_seen_keys.into_iter().enumerate() {
+            first_seen_slot.insert(group_pos, num_aggregates + j);
+            aggr_exprs.push(agg);
+            filter_exprs.push(None);
+        }
 
         let agg_exec = Arc::new(AggregateExec::try_new(
             AggregateMode::Single,
@@ -5586,14 +6357,25 @@ impl HybridPhysicalPlanner {
         let agg_schema = agg_exec.schema();
         // Use actual expanded group-by count (includes entity property columns)
         // rather than logical group_by.len() which doesn't account for expansion.
-        let num_group_by = agg_schema.fields().len() - num_aggregates;
+        let num_group_by = agg_schema.fields().len() - num_aggregates - num_first_seen;
         let mut proj_exprs: Vec<(Arc<dyn datafusion::physical_expr::PhysicalExpr>, String)> =
             Vec::new();
 
-        for (i, field) in agg_schema.fields().iter().enumerate() {
-            let mut col_expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> = Arc::new(
-                datafusion::physical_expr::expressions::Column::new(field.name(), i),
-            );
+        for (i, field) in agg_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .take(num_group_by + num_aggregates)
+        {
+            // A CypherValue key reads its group's first-seen value.
+            let src = first_seen_slot
+                .get(&i)
+                .map_or(i, |&slot| num_group_by + slot);
+            let mut col_expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> =
+                Arc::new(datafusion::physical_expr::expressions::Column::new(
+                    agg_schema.field(src).name(),
+                    src,
+                ));
             if i >= num_group_by && is_sum_aggregate(&aggregates[i - num_group_by]) {
                 col_expr = sum_of_nothing_is_zero(col_expr, field.data_type())?;
             }
@@ -5786,10 +6568,11 @@ impl HybridPhysicalPlanner {
                     }
                     let expr_arg = cypher_expr_to_df(&args[0], Some(ctx))?;
                     let pct_arg = cypher_expr_to_df(&args[1], Some(ctx))?;
-                    let coerced = Self::coerce_numeric_for_stat(expr_arg, schema);
+                    // The input goes in uncast: the aggregate reads exact
+                    // numbers and rejects anything else itself.
                     let udaf =
                         Arc::new(crate::query::df_udfs::create_cypher_percentile_disc_udaf());
-                    udaf.call(vec![coerced, pct_arg])
+                    udaf.call(vec![expr_arg, pct_arg])
                 }
                 "percentilecont" => {
                     if args.len() != 2 {
@@ -5797,10 +6580,11 @@ impl HybridPhysicalPlanner {
                     }
                     let expr_arg = cypher_expr_to_df(&args[0], Some(ctx))?;
                     let pct_arg = cypher_expr_to_df(&args[1], Some(ctx))?;
-                    let coerced = Self::coerce_numeric_for_stat(expr_arg, schema);
+                    // The input goes in uncast: the aggregate reads exact
+                    // numbers and rejects anything else itself.
                     let udaf =
                         Arc::new(crate::query::df_udfs::create_cypher_percentile_cont_udaf());
-                    udaf.call(vec![coerced, pct_arg])
+                    udaf.call(vec![expr_arg, pct_arg])
                 }
                 "collect" => {
                     // Use custom Cypher collect UDAF that filters nulls and returns
@@ -6359,9 +7143,12 @@ impl HybridPhysicalPlanner {
     /// agree on what a mixed pair becomes rather than one working and the
     /// other reporting a planner bug.
     ///
-    /// Only entity columns are touched. A genuine conflict between, say, an
-    /// `Int64` and a `Utf8` is left for the caller's schema check to reject —
-    /// coercing that pair would invent a conversion the user did not ask for.
+    /// The same holds for any other pair of differing types. Cypher columns
+    /// are dynamically typed, so `RETURN 1 AS x UNION RETURN 'a' AS x` is
+    /// valid; and a property column is typed only by its own label's
+    /// declaration, so `s.v` on a schemaless label (the stored value,
+    /// `LargeBinary`) meets `f.v` declared `FLOAT` on another. An integer
+    /// against a float is included: no Arrow type holds both exactly.
     fn coerce_union_entity_columns(
         left: Arc<dyn ExecutionPlan>,
         right: Arc<dyn ExecutionPlan>,
@@ -6370,13 +7157,9 @@ impl HybridPhysicalPlanner {
         if ls.fields().len() != rs.fields().len() {
             return Ok((left, right));
         }
-        let coercible = |l: &DataType, r: &DataType| {
-            l != r
-                && [l, r].iter().all(|t| {
-                    uni_query_functions::cypher_type_coerce::is_entity_struct(t)
-                        || matches!(t, DataType::LargeBinary)
-                })
-        };
+        // Every differing pair becomes CypherValue, which represents any
+        // Cypher value exactly; `Float64` would round integers above 2^53.
+        let coercible = |l: &DataType, r: &DataType| l != r;
         let positions: Vec<usize> = (0..ls.fields().len())
             .filter(|&i| coercible(ls.field(i).data_type(), rs.field(i).data_type()))
             .collect();
@@ -6494,39 +7277,13 @@ impl HybridPhysicalPlanner {
 
         // UNION (without ALL) requires deduplication
         if !all {
-            use datafusion::physical_plan::aggregates::{
-                AggregateExec, AggregateMode, PhysicalGroupBy,
-            };
             use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 
             // First, coalesce all partitions into one to ensure global deduplication
             let coalesced = Arc::new(CoalescePartitionsExec::new(union_plan));
 
-            // Create group by all columns to deduplicate
-            let schema = coalesced.schema();
-            let group_by_exprs: Vec<_> = (0..schema.fields().len())
-                .map(|i| {
-                    (
-                        Arc::new(datafusion::physical_plan::expressions::Column::new(
-                            schema.field(i).name(),
-                            i,
-                        ))
-                            as Arc<dyn datafusion::physical_expr::PhysicalExpr>,
-                        schema.field(i).name().clone(),
-                    )
-                })
-                .collect();
-
-            let group_by = PhysicalGroupBy::new_single(group_by_exprs);
-
-            Ok(Arc::new(AggregateExec::try_new(
-                AggregateMode::Single,
-                group_by,
-                vec![], // No aggregate functions, just grouping for distinct
-                vec![], // No filters
-                coalesced,
-                schema,
-            )?))
+            // Group by all columns to deduplicate
+            plan_equivalence_distinct(coalesced)
         } else {
             // UNION ALL - just return the union
             Ok(union_plan)
@@ -6924,6 +7681,87 @@ impl HybridPhysicalPlanner {
         Ok(Arc::new(PlaceholderRowExec::new(schema)))
     }
 
+    /// Plan the imports of a correlated subquery body ([`LogicalPlan::OuterRow`]).
+    ///
+    /// A node or relationship import carries every column the outer row holds
+    /// for it — `{name}`, and `{name}.<anything>` (`_vid`, `_labels`, `_eid`,
+    /// `_type`, properties, `_all_props`) — so the body sees the entity in
+    /// the same columns the enclosing query does. A parameter import is the
+    /// same-named parameter, as a one-row projection over an empty input.
+    fn plan_outer_row(
+        &self,
+        variables: &[crate::query::planner::ImportedVariable],
+        all_properties: &HashMap<String, HashSet<String>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        // With the outer row supplied, an import that row carries no value
+        // for is one an earlier projection pruned because nothing reads it —
+        // `CALL { … }` imports every variable in scope. Planning its parameter
+        // anyway failed with `Unresolved parameter`; a body that does read it
+        // still fails, naming the column.
+        let parameters: Vec<(Expr, Option<String>)> = variables
+            .iter()
+            .filter(|v| v.kind == ImportKind::Parameter)
+            .filter(|v| self.outer_row.is_none() || self.params.contains_key(&v.name))
+            .map(|v| (Expr::Parameter(v.name.clone()), Some(v.name.clone())))
+            .collect();
+        let entities: Vec<&str> = variables
+            .iter()
+            .filter(|v| v.kind != ImportKind::Parameter)
+            .map(|v| v.name.as_str())
+            .collect();
+        let parameter_plan = || {
+            self.plan_project_with_aliases(
+                &LogicalPlan::Empty,
+                &parameters,
+                all_properties,
+                &HashMap::new(),
+            )
+        };
+        if entities.is_empty() {
+            return if parameters.is_empty() {
+                self.plan_empty()
+            } else {
+                parameter_plan()
+            };
+        }
+        // `bind_outer_row` sets an entity kind only for a caller that supplies
+        // the row, so its absence is a planner bug, not a user error.
+        let row = self.outer_row.as_ref().ok_or_else(|| {
+            anyhow!(
+                "internal error: subquery imports {entities:?} were bound to the outer row, \
+                 but no outer row was supplied"
+            )
+        })?;
+        let schema = row.schema();
+        let indices: Vec<usize> = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| {
+                let name = f.name();
+                entities.iter().any(|e| {
+                    name == e
+                        || name
+                            .strip_prefix(e)
+                            .is_some_and(|rest| rest.starts_with('.'))
+                })
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let columns = row.project(&indices)?;
+        let entity_plan = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
+            &[vec![columns.clone()]],
+            columns.schema(),
+            None,
+        )?;
+        if parameters.is_empty() {
+            return Ok(entity_plan);
+        }
+        Ok(Arc::new(
+            datafusion::physical_plan::joins::CrossJoinExec::new(entity_plan, parameter_plan()?),
+        ))
+    }
+
     /// Plan a zero-length path binding.
     /// Converts a single node pattern `p = (a)` into a Path with one node and zero edges.
     fn plan_bind_zero_length_path(
@@ -6972,26 +7810,58 @@ impl HybridPhysicalPlanner {
     ///
     /// Returns `Vec<(property_name, expected_value)>` for use in L0 edge property
     /// checking during VLP BFS.
-    fn extract_edge_property_conditions(expr: &Expr) -> Vec<(String, uni_common::Value)> {
+    ///
+    /// Only a value [`is_walk_constant_map_value`] accepts — a literal or a
+    /// parameter — becomes a condition; any other conjunct is skipped. For a
+    /// relationship map that is not a pruning hint but the whole filter, so the
+    /// logical planner hands this extractor walk-constant entries only and
+    /// applies the rest as a residual `all(...)` over the step list. A
+    /// `{w: a.x}` that reached here used to be skipped with nothing after it,
+    /// and the walk admitted every edge.
+    ///
+    /// [`is_walk_constant_map_value`]: crate::query::planner::is_walk_constant_map_value
+    fn extract_edge_property_conditions(&self, expr: &Expr) -> Vec<(String, uni_common::Value)> {
+        // A map value is a literal or a query parameter. A parameter used to be
+        // skipped, which emptied the conditions and made `{w: $p}` match every
+        // edge, as if the map were not there.
+        let constant = |e: &Expr| match e {
+            Expr::Literal(lit) => Some(lit.to_value()),
+            Expr::Parameter(name) => Some(
+                self.params
+                    .get(name)
+                    .cloned()
+                    .unwrap_or(uni_common::Value::Null),
+            ),
+            _ => {
+                // The logical planner leaves a walk-constant value to this
+                // extractor and nothing else; one it cannot convert would be
+                // dropped silently.
+                debug_assert!(
+                    !crate::query::planner::is_walk_constant_map_value(e),
+                    "walk-constant map value the extractor cannot convert: {e:?}"
+                );
+                None
+            }
+        };
         match expr {
             Expr::BinaryOp {
                 left,
                 op: uni_cypher::ast::BinaryOp::Eq,
                 right,
             } => {
-                // Pattern: variable.prop = literal
+                // Pattern: variable.prop = constant
                 if let Expr::Property(inner, prop_name) = left.as_ref()
                     && matches!(inner.as_ref(), Expr::Variable(_))
-                    && let Expr::Literal(lit) = right.as_ref()
+                    && let Some(value) = constant(right)
                 {
-                    return vec![(prop_name.clone(), lit.to_value())];
+                    return vec![(prop_name.clone(), value)];
                 }
-                // Reverse: literal = variable.prop
-                if let Expr::Literal(lit) = left.as_ref()
+                // Reverse: constant = variable.prop
+                if let Some(value) = constant(left)
                     && let Expr::Property(inner, prop_name) = right.as_ref()
                     && matches!(inner.as_ref(), Expr::Variable(_))
                 {
-                    return vec![(prop_name.clone(), lit.to_value())];
+                    return vec![(prop_name.clone(), value)];
                 }
                 vec![]
             }
@@ -7000,8 +7870,8 @@ impl HybridPhysicalPlanner {
                 op: uni_cypher::ast::BinaryOp::And,
                 right,
             } => {
-                let mut result = Self::extract_edge_property_conditions(left);
-                result.extend(Self::extract_edge_property_conditions(right));
+                let mut result = self.extract_edge_property_conditions(left);
+                result.extend(self.extract_edge_property_conditions(right));
                 result
             }
             _ => vec![],
@@ -7544,7 +8414,7 @@ impl HybridPhysicalPlanner {
     }
 
     /// Coerce an aggregate argument to `Float64` for numeric statistical
-    /// aggregates (stDev, variance, percentiles). A numeric column is cast
+    /// aggregates (stDev, variance). A numeric column is cast
     /// directly; anything else (a schemaless property's `LargeBinary`
     /// CypherValue, a string or duration column) reads through
     /// `_cypher_number`, so a value that is not a number is an error, as in
@@ -7594,10 +8464,20 @@ fn coerce_physical_expr(
     // FOLD `SUM` over them summed to 0.
     match (actual_dt, target_dt) {
         (DataType::LargeBinary, DataType::Float64) => wrap_cypher_number(expr, schema),
-        // Read the number, then truncate.
+        // Read the integer exactly (a float truncates). Reading a Float64
+        // first rounded every integer above 2^53.
         (DataType::LargeBinary, DataType::Int64) => {
-            let float_expr = wrap_cypher_number(expr, schema);
-            Arc::new(CastExpr::new(float_expr, DataType::Int64, None))
+            let udf = Arc::new(super::df_udfs::cypher_integer_udf());
+            let config = Arc::new(datafusion::common::config::ConfigOptions::default());
+            Arc::new(
+                datafusion::physical_expr::ScalarFunctionExpr::try_new(
+                    udf,
+                    vec![expr],
+                    schema,
+                    config,
+                )
+                .expect("CypherIntegerUdf accepts Any(1) signature"),
+            )
         }
         (actual, DataType::Float64) if !actual.is_numeric() && actual != &DataType::Null => {
             wrap_cypher_number(expr, schema)
@@ -7718,6 +8598,7 @@ fn resolve_best_by_criteria(
                 })?;
             Ok(super::df_graph::locy_best_by::SortCriterion {
                 col_index,
+                column: schema.field(col_index).name().clone(),
                 ascending: *ascending,
                 nulls_first: false, // NULLS LAST is Locy default
             })
@@ -7948,6 +8829,18 @@ pub(crate) fn collect_variable_kinds(
         LogicalPlan::FusedIndexScanWrapped { inner, .. }
         | LogicalPlan::MultiplicityInsensitive { input: inner } => {
             collect_variable_kinds(inner, kinds);
+        }
+        // An unbound import is a single parameter value, as an aliased
+        // projection of anything but a variable is (see `Project` below).
+        LogicalPlan::OuterRow { variables } => {
+            for v in variables {
+                let kind = match v.kind {
+                    ImportKind::Node => VariableKind::Node,
+                    ImportKind::Edge => VariableKind::Edge,
+                    ImportKind::Parameter => VariableKind::Opaque,
+                };
+                kinds.insert(v.name.clone(), kind);
+            }
         }
         LogicalPlan::Scan { variable, .. }
         | LogicalPlan::FusedIndexScan { variable, .. }
@@ -8203,7 +9096,6 @@ pub(crate) fn collect_variable_kinds(
         | LogicalPlan::CreateJsonFtsIndex { .. }
         | LogicalPlan::DropIndex { .. }
         | LogicalPlan::ShowIndexes { .. }
-        | LogicalPlan::Copy { .. }
         | LogicalPlan::Backup { .. }
         | LogicalPlan::ShowDatabase
         | LogicalPlan::ShowConfig
@@ -8308,6 +9200,7 @@ fn collect_mutation_node_hints(plan: &LogicalPlan, hints: &mut Vec<String>) {
         | LogicalPlan::LocyModelInvoke { .. }
         | LogicalPlan::LocyGenerate { .. }
         | LogicalPlan::Empty
+        | LogicalPlan::OuterRow { .. }
         | LogicalPlan::CreateVectorIndex { .. }
         | LogicalPlan::CreateSparseIndex { .. }
         | LogicalPlan::CreateFullTextIndex { .. }
@@ -8315,7 +9208,6 @@ fn collect_mutation_node_hints(plan: &LogicalPlan, hints: &mut Vec<String>) {
         | LogicalPlan::CreateJsonFtsIndex { .. }
         | LogicalPlan::DropIndex { .. }
         | LogicalPlan::ShowIndexes { .. }
-        | LogicalPlan::Copy { .. }
         | LogicalPlan::Backup { .. }
         | LogicalPlan::ShowDatabase
         | LogicalPlan::ShowConfig
@@ -8439,6 +9331,7 @@ fn collect_mutation_edge_hints(plan: &LogicalPlan, hints: &mut Vec<String>) {
         | LogicalPlan::LocyModelInvoke { .. }
         | LogicalPlan::LocyGenerate { .. }
         | LogicalPlan::Empty
+        | LogicalPlan::OuterRow { .. }
         | LogicalPlan::CreateVectorIndex { .. }
         | LogicalPlan::CreateSparseIndex { .. }
         | LogicalPlan::CreateFullTextIndex { .. }
@@ -8446,7 +9339,6 @@ fn collect_mutation_edge_hints(plan: &LogicalPlan, hints: &mut Vec<String>) {
         | LogicalPlan::CreateJsonFtsIndex { .. }
         | LogicalPlan::DropIndex { .. }
         | LogicalPlan::ShowIndexes { .. }
-        | LogicalPlan::Copy { .. }
         | LogicalPlan::Backup { .. }
         | LogicalPlan::ShowDatabase
         | LogicalPlan::ShowConfig
@@ -8528,7 +9420,7 @@ fn sanitize_vlp_target_properties(
     let has_non_schema_props = properties.iter().any(|p| {
         p != "_all_props"
             && p != "overflow_json"
-            && !p.starts_with('_')
+            && !uni_common::core::schema::is_reserved_property_name(p)
             && !target_label_props.is_some_and(|props| props.contains(p))
     });
     if has_non_schema_props && !properties.iter().any(|p| p == "_all_props") {
@@ -8700,6 +9592,16 @@ fn collect_plan_variables_into(plan: &LogicalPlan, out: &mut HashSet<String>) {
             out.insert(variable.clone());
             collect_plan_variables_into(input, out);
         }
+        LogicalPlan::OuterRow { variables } => {
+            for v in variables {
+                match v.kind {
+                    ImportKind::Node => insert_node_var(&v.name, out),
+                    ImportKind::Edge | ImportKind::Parameter => {
+                        out.insert(v.name.clone());
+                    }
+                }
+            }
+        }
         // Wrapper nodes — pass their input's variables through.
         LogicalPlan::Filter { input, .. }
         | LogicalPlan::Project { input, .. }
@@ -8788,7 +9690,6 @@ fn collect_plan_variables_into(plan: &LogicalPlan, out: &mut HashSet<String>) {
         | LogicalPlan::CreateJsonFtsIndex { .. }
         | LogicalPlan::DropIndex { .. }
         | LogicalPlan::ShowIndexes { .. }
-        | LogicalPlan::Copy { .. }
         | LogicalPlan::Backup { .. }
         | LogicalPlan::ShowDatabase
         | LogicalPlan::ShowConfig
@@ -9672,10 +10573,13 @@ fn merge_unwind_in_filters(
     }
 }
 
-/// Returns `true` if `dt` is hashable directly by Arrow's HashJoinExec without
-/// any value transformation. When both join keys share such a dtype, we can
-/// skip the `tointeger` / `_cypher_sort_key` wrap entirely.
-fn is_hashable_native_dtype(dt: &DataType) -> bool {
+/// Returns `true` if Arrow's native equality on `dt` is exactly Cypher equality.
+///
+/// When both join keys share such a dtype the hash join can compare them as
+/// they are. Floats are excluded (Arrow's total order says `NaN = NaN` and
+/// `-0.0 <> 0.0`), and so are binary columns: a `LargeBinary` column holds
+/// `CypherValue` bytes, where `1` and `1.0` encode differently but are equal.
+fn is_exact_native_key_dtype(dt: &DataType) -> bool {
     matches!(
         dt,
         DataType::Boolean
@@ -9687,20 +10591,15 @@ fn is_hashable_native_dtype(dt: &DataType) -> bool {
             | DataType::UInt16
             | DataType::UInt32
             | DataType::UInt64
-            | DataType::Float32
-            | DataType::Float64
             | DataType::Utf8
             | DataType::LargeUtf8
-            | DataType::Binary
-            | DataType::LargeBinary
             | DataType::Date32
             | DataType::Date64
     )
 }
 
-/// Returns `true` if `dt` is one of the types `tointeger` UDF accepts as input
-/// (numeric primitives plus CV-encoded `LargeBinary`).
-fn tointeger_accepts_dtype(dt: &DataType) -> bool {
+/// Returns `true` for the Arrow integer types.
+fn is_integer_dtype(dt: &DataType) -> bool {
     matches!(
         dt,
         DataType::Int8
@@ -9711,10 +10610,37 @@ fn tointeger_accepts_dtype(dt: &DataType) -> bool {
             | DataType::UInt16
             | DataType::UInt32
             | DataType::UInt64
-            | DataType::Float32
-            | DataType::Float64
-            | DataType::LargeBinary
     )
+}
+
+/// The dtype classes a mixed-type equi-join may key through `_cypher_join_key`.
+///
+/// Every pair the key admits is compared, in the residual it re-checks, by
+/// Cypher equality or by Arrow numeric equality — the two semantics the key is
+/// complete for. Mixed pairs outside this set (a temporal column against a
+/// string, say) can be compared by an Arrow coercion the key does not model,
+/// so they keep the cross-join fallback.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JoinKeyDomain {
+    /// `LargeBinary`: a `CypherValue`, any kind at run time.
+    Dynamic,
+    /// Integer or float.
+    Numeric,
+    /// `Utf8` / `LargeUtf8`.
+    String,
+    /// `Boolean`.
+    Bool,
+}
+
+fn join_key_domain(dt: &DataType) -> Option<JoinKeyDomain> {
+    match dt {
+        DataType::LargeBinary => Some(JoinKeyDomain::Dynamic),
+        DataType::Float32 | DataType::Float64 => Some(JoinKeyDomain::Numeric),
+        dt if is_integer_dtype(dt) => Some(JoinKeyDomain::Numeric),
+        DataType::Utf8 | DataType::LargeUtf8 => Some(JoinKeyDomain::String),
+        DataType::Boolean => Some(JoinKeyDomain::Bool),
+        _ => None,
+    }
 }
 
 /// Wrap `expr` with a 1-arg scalar UDF that returns `return_dt`.
@@ -9735,49 +10661,234 @@ fn wrap_with_unary_udf(
     ))
 }
 
+/// Key a float grouping expression on its Cypher equivalence class.
+///
+/// `AggregateExec` hashes and compares a float key bit-exactly (IEEE total
+/// order), so `-0.0` and `0.0` formed two groups and NaNs with different sign
+/// bits two more. openCypher groups by equivalence: equality, under which
+/// `-0.0 = 0.0`, except that every NaN is one value (CIP2016-06-14).
+/// `_cypher_float_key` maps each class to one bit pattern and keeps the type,
+/// so the group's output column is unchanged apart from showing `0.0` for a
+/// group of zeros. A `CypherValue` column has the same defect through its
+/// encoded bytes and is keyed by `_cypher_value_key`. Other expressions are
+/// returned as they are.
+///
+/// # Errors
+///
+/// Returns an error if the expression's type cannot be determined.
+fn float_equivalence_key(
+    expr: Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+    schema: &Schema,
+) -> Result<Arc<dyn datafusion::physical_plan::PhysicalExpr>> {
+    let field = expr.return_field(schema)?;
+    let dt = field.data_type().clone();
+    match dt {
+        DataType::Float32 | DataType::Float64 => {
+            let udf = Arc::new(crate::query::df_udfs::create_cypher_float_key_udf());
+            Ok(wrap_with_unary_udf(expr, udf, dt))
+        }
+        // A CypherValue groups by its bytes; raw `Bytes` columns share the
+        // type and must be left as they are.
+        DataType::LargeBinary if !field.metadata().contains_key("uni_raw_bytes") => {
+            let udf = Arc::new(crate::query::df_udfs::create_cypher_value_key_udf());
+            Ok(wrap_with_unary_udf(expr, udf, dt))
+        }
+        _ => Ok(expr),
+    }
+}
+
+/// A group key and, when the key is not the value, the aggregate that emits
+/// the group's value ([`equivalence_group_key`]).
+type EquivalenceGroupKey = (
+    Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+    Option<Arc<AggregateFunctionExpr>>,
+);
+
+/// The group key for `expr` under Cypher equivalence, and the aggregate that
+/// emits the group's value when the key is not that value.
+///
+/// A float key is its canonical float ([`float_equivalence_key`]), which is
+/// the value up to the sign of a zero. A `CypherValue` key is its canonical
+/// encoding, in which `1.0` is `1`: grouping on it makes `1` and `1.0` one
+/// group, as openCypher equality requires, but emitting it would replace the
+/// value the query produced. Such a key is returned with a
+/// `_cypher_first_seen` aggregate over `expr`, named `name`, which emits the
+/// first value of the group, as Neo4j does.
+///
+/// # Errors
+///
+/// Returns an error if the expression's type cannot be determined or the
+/// aggregate cannot be built.
+fn equivalence_group_key(
+    expr: Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+    name: &str,
+    schema: &Schema,
+) -> Result<EquivalenceGroupKey> {
+    let field = expr.return_field(schema)?;
+    let key = float_equivalence_key(Arc::clone(&expr), schema)?;
+    if field.data_type() != &DataType::LargeBinary || field.metadata().contains_key("uni_raw_bytes")
+    {
+        return Ok((key, None));
+    }
+    let first_seen = datafusion::physical_expr::aggregate::AggregateExprBuilder::new(
+        Arc::new(crate::query::df_udfs::create_cypher_first_seen_udaf()),
+        vec![expr],
+    )
+    .schema(Arc::new(schema.clone()))
+    .alias(name)
+    .build()?;
+    Ok((key, Some(Arc::new(first_seen))))
+}
+
+/// Deduplicate the rows of `input` under Cypher equivalence: one row per
+/// group of equivalent rows, every column kept in place under its name.
+///
+/// Float columns group on their canonical float and are emitted as it.
+/// CypherValue columns group on their canonical encoding and are emitted as
+/// the group's first-seen value ([`equivalence_group_key`]), so
+/// `UNWIND [1.0, 1] AS x RETURN DISTINCT x` is one row, `1.0`.
+///
+/// # Errors
+///
+/// Returns an error if a key or the aggregate cannot be planned.
+fn plan_equivalence_distinct(input: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
+    let schema = input.schema();
+    let mut groups: Vec<(Arc<dyn datafusion::physical_plan::PhysicalExpr>, String)> = Vec::new();
+    let mut aggs: Vec<Arc<AggregateFunctionExpr>> = Vec::new();
+    // Per input column: `Ok(group index)` or `Err(aggregate index)`.
+    let mut slots: Vec<std::result::Result<usize, usize>> = Vec::new();
+    for (i, f) in schema.fields().iter().enumerate() {
+        let column: Arc<dyn datafusion::physical_plan::PhysicalExpr> = Arc::new(
+            datafusion::physical_expr::expressions::Column::new(f.name(), i),
+        );
+        let (key, first_seen) = equivalence_group_key(column, f.name(), &schema)?;
+        match first_seen {
+            Some(agg) => {
+                // The key is internal; the aggregate carries the column name.
+                groups.push((key, format!("__cypher_group_key_{i}")));
+                slots.push(Err(aggs.len()));
+                aggs.push(agg);
+            }
+            None => {
+                slots.push(Ok(groups.len()));
+                groups.push((key, f.name().clone()));
+            }
+        }
+    }
+    let num_groups = groups.len();
+    let has_first_seen = !aggs.is_empty();
+    let filters = vec![None; aggs.len()];
+    let agg: Arc<dyn ExecutionPlan> = Arc::new(AggregateExec::try_new(
+        AggregateMode::Single,
+        PhysicalGroupBy::new_single(groups),
+        aggs,
+        filters,
+        input,
+        Arc::clone(&schema),
+    )?);
+    if !has_first_seen {
+        return Ok(agg);
+    }
+    let out = agg.schema();
+    let exprs = slots
+        .iter()
+        .zip(schema.fields().iter())
+        .map(|(slot, f)| {
+            let idx = match *slot {
+                Ok(g) => g,
+                Err(a) => num_groups + a,
+            };
+            let col: Arc<dyn datafusion::physical_plan::PhysicalExpr> = Arc::new(
+                datafusion::physical_expr::expressions::Column::new(out.field(idx).name(), idx),
+            );
+            (col, f.name().clone())
+        })
+        .collect::<Vec<_>>();
+    Ok(Arc::new(ProjectionExec::try_new(exprs, agg)?))
+}
+
+/// One equi-pair lowered to hash-join keys.
+struct JoinKeyPair {
+    left: Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+    right: Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+    /// The keys only bucket candidates: equal values always share a key, but
+    /// unequal ones may too, so the original equality must be re-checked on
+    /// every candidate pair (as a join filter, so outer joins stay correct).
+    needs_recheck: bool,
+}
+
 /// Bilateral type unification for a HashJoin equi-pair.
 ///
-/// Strategy (in order of preference):
-/// 1. Same dtype + natively hashable → return both unchanged (fast path,
-///    e.g. `Utf8 = Utf8`, `Int64 = Int64`).
-/// 2. Both dtypes accepted by `tointeger` (numeric or CV-encoded
-///    `LargeBinary`) → wrap both in `tointeger` to unify on `Int64`. This is
-///    the original issue #53 behavior.
-/// 3. Otherwise (mixed string/CV/other Cypher types) → wrap both in
-///    `_cypher_sort_key`, which produces an order-preserving `LargeBinary`
-///    encoding that hashes equal iff the underlying Cypher values are equal.
+/// 1. Same dtype, and Arrow equality on it is exactly Cypher equality
+///    (integers, strings, booleans, dates) → keys used as they are.
+/// 2. Two integer dtypes → both cast to `Int64`. Exact: a `UInt64` above
+///    `i64::MAX` becomes a null key, and no `Int64` can equal it.
+/// 3. `Utf8` against `LargeUtf8` → both cast to `LargeUtf8`. Exact.
+/// 4. Any other pairing of `CypherValue`, numeric, string and boolean
+///    dtypes that can compare equal → both wrapped in `_cypher_join_key`, a
+///    bucket key under which equal values always collide, with
+///    `needs_recheck` set so the caller re-applies the original equality.
+///    This covers a `CypherValue` against a string (a correlated
+///    `MATCH (n {uid: row.uid})`), against a number, or against another
+///    `CypherValue`, and a float against a float or an integer.
+/// 5. Anything else → `None`, and the caller falls back to FilterExec over a
+///    CrossJoin, which compares with Cypher-aware UDFs. A pairing whose values
+///    can never compare equal (a string against a number) also lands here.
 ///
-/// Returns `None` only when the required UDFs aren't registered or a side's
-/// dtype can't be inferred — the caller falls back to FilterExec+CrossJoin.
+/// The numeric bucket key is coarse above 2^53 (an integer is keyed through
+/// the float it rounds to), while `cypher_eq` compares an integer with a
+/// float exactly. Bucket-then-recheck is what makes the join answer identical
+/// to the filter answer.
 fn unify_join_key_types(
     left: Arc<dyn datafusion::physical_plan::PhysicalExpr>,
     right: Arc<dyn datafusion::physical_plan::PhysicalExpr>,
     left_schema: &Schema,
     right_schema: &Schema,
-    state: &SessionState,
-) -> Option<(
-    Arc<dyn datafusion::physical_plan::PhysicalExpr>,
-    Arc<dyn datafusion::physical_plan::PhysicalExpr>,
-)> {
+) -> Option<JoinKeyPair> {
+    use datafusion::physical_expr::expressions::CastExpr;
+
     let l_dt = left.data_type(left_schema).ok()?;
     let r_dt = right.data_type(right_schema).ok()?;
+    let exact = |left, right| {
+        Some(JoinKeyPair {
+            left,
+            right,
+            needs_recheck: false,
+        })
+    };
+    let cast = |expr, dt: DataType| -> Arc<dyn datafusion::physical_plan::PhysicalExpr> {
+        Arc::new(CastExpr::new(expr, dt, None))
+    };
 
-    if l_dt == r_dt && is_hashable_native_dtype(&l_dt) {
-        return Some((left, right));
+    if l_dt == r_dt && is_exact_native_key_dtype(&l_dt) {
+        return exact(left, right);
+    }
+    if is_integer_dtype(&l_dt) && is_integer_dtype(&r_dt) {
+        return exact(cast(left, DataType::Int64), cast(right, DataType::Int64));
+    }
+    if matches!(
+        (&l_dt, &r_dt),
+        (DataType::Utf8, DataType::LargeUtf8) | (DataType::LargeUtf8, DataType::Utf8)
+    ) {
+        return exact(
+            cast(left, DataType::LargeUtf8),
+            cast(right, DataType::LargeUtf8),
+        );
     }
 
-    if tointeger_accepts_dtype(&l_dt) && tointeger_accepts_dtype(&r_dt) {
-        let udf = state.scalar_functions().get("tointeger")?.clone();
-        return Some((
-            wrap_with_unary_udf(left, udf.clone(), DataType::Int64),
-            wrap_with_unary_udf(right, udf, DataType::Int64),
-        ));
+    let l_dom = join_key_domain(&l_dt)?;
+    let r_dom = join_key_domain(&r_dt)?;
+    let comparable =
+        l_dom == r_dom || l_dom == JoinKeyDomain::Dynamic || r_dom == JoinKeyDomain::Dynamic;
+    if !comparable {
+        return None;
     }
-
-    // Cross-domain unification (e.g. Utf8 ↔ LargeBinary CV-encoded) is not yet
-    // implemented at the HashJoin layer — fall through to FilterExec, which
-    // handles these via Cypher-aware comparison UDFs.
-    None
+    let udf = Arc::new(crate::query::df_udfs::create_cypher_join_key_udf());
+    Some(JoinKeyPair {
+        left: wrap_with_unary_udf(left, udf.clone(), DataType::LargeBinary),
+        right: wrap_with_unary_udf(right, udf, DataType::LargeBinary),
+        needs_recheck: true,
+    })
 }
 
 #[cfg(test)]

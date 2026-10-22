@@ -21,6 +21,7 @@
 //! property test [`render_roundtrips_generated_queries`] to hold.
 
 pub mod render;
+pub mod transform;
 
 use proptest::collection::vec as prop_vec;
 use proptest::prelude::*;
@@ -430,6 +431,20 @@ impl Case {
         ])
     }
 
+    /// The base query filtered by `base AND p AND (p IS NOT NULL)`: a `WHERE`
+    /// of two or three conjuncts in every case, for the conjunct-permutation
+    /// guard (`metamorphic::binding`). Same rows as the `True` partition.
+    pub fn conjunctive_query(&self) -> Query {
+        let guarded = and_expr(
+            self.predicate.clone(),
+            Expr::IsNotNull(Box::new(self.predicate.clone())),
+        );
+        build_query(vec![
+            match_clause(&self.shape, Some(conj(self.base_where.clone(), guarded))),
+            return_clause(self.projection.clone()),
+        ])
+    }
+
     /// NoREC optimized form: predicate in `WHERE`, reachable by pushdown.
     pub fn norec_optimized(&self) -> Query {
         let where_clause = Some(conj(self.base_where.clone(), self.predicate.clone()));
@@ -470,6 +485,71 @@ impl Case {
             match_clause(&self.shape, self.base_where.clone()),
             Clause::Return(ret),
         ])
+    }
+
+    /// The base query ordered by `<firstVar>.name` and cut to `n` rows.
+    ///
+    /// Deterministic: `name` is non-null and unique per Person and per
+    /// Company, and every Person has at most one `WORKS_AT` edge, so the sort
+    /// key is unique per row and `LIMIT` has no ties to break. A resolver that
+    /// read the sort key from a projection alias named `name` instead (the
+    /// `ORDER BY`-alias shape) would keep different rows.
+    pub fn ordered_limited_query(&self, n: u32) -> Query {
+        let first_var = self.shape.bounds()[0].var;
+        let ret = ReturnClause {
+            distinct: false,
+            items: self.projection.clone(),
+            order_by: Some(vec![SortItem {
+                expr: prop_expr(first_var, "name"),
+                ascending: true,
+            }]),
+            skip: None,
+            limit: Some(Expr::Literal(CypherLiteral::Integer(i64::from(n)))),
+        };
+        build_query(vec![
+            match_clause(&self.shape, self.base_where.clone()),
+            Clause::Return(ret),
+        ])
+    }
+
+    /// The base query ordered by its first projection **alias**, then by
+    /// `<firstVar>.name`, and cut to `n` rows; `None` when the first item is
+    /// not a property (a node value has no stable order).
+    ///
+    /// The `name` tiebreak makes the order total (see
+    /// [`Self::ordered_limited_query`]), so the bag is deterministic. The
+    /// sort reads an alias and a property side by side, which a renaming of
+    /// the alias onto a property key turns into a collision.
+    pub fn alias_ordered_limited_query(&self, n: u32) -> Option<Query> {
+        let ReturnItem::Expr {
+            expr: Expr::Property(..),
+            alias: Some(alias),
+            ..
+        } = self.projection.first()?
+        else {
+            return None;
+        };
+        let first_var = self.shape.bounds()[0].var;
+        let ret = ReturnClause {
+            distinct: false,
+            items: self.projection.clone(),
+            order_by: Some(vec![
+                SortItem {
+                    expr: Expr::Variable(alias.clone()),
+                    ascending: true,
+                },
+                SortItem {
+                    expr: prop_expr(first_var, "name"),
+                    ascending: true,
+                },
+            ]),
+            skip: None,
+            limit: Some(Expr::Literal(CypherLiteral::Integer(i64::from(n)))),
+        };
+        Some(build_query(vec![
+            match_clause(&self.shape, self.base_where.clone()),
+            Clause::Return(ret),
+        ]))
     }
 
     /// The base query with `LIMIT n` appended.
@@ -539,7 +619,7 @@ const INT_LITERALS: &[i64] = &[0, 18, 22, 25, 30, 40, 50, 65, 1999, 2010];
 /// `0`, `1999` and `2010` are in the full set **deliberately**, as literals that
 /// match nothing — an always-false predicate is a partition worth having for
 /// TLP. But they are useless as the *equality* half of a pushdown conjunction:
-/// the `=`/`IN` is what puts the column into `hash_index_columns`, and one that
+/// the `=`/`IN` is what puts the column into `indexed_equality_columns`, and one that
 /// selects no row leaves the case unable to exercise the pushdown path at all.
 /// Such a case is not wrong, merely inert, and a run made mostly of them reports
 /// a depressed activation rate rather than a defect.
@@ -581,7 +661,7 @@ fn arb_comparison(targets: Vec<(&'static str, Prop)>) -> impl Strategy<Value = E
 
 /// `var.prop IN [l1, l2, l3]` over an integer target.
 ///
-/// `IN` is the second route into `PushdownStrategy::hash_index_columns`,
+/// `IN` is the second route into `PushdownStrategy::indexed_equality_columns`,
 /// alongside `=`. The list is drawn from [`INT_LITERALS`] and deduplicated —
 /// a repeated literal is legal Cypher but renders a list the parser
 /// canonicalises differently, which would fail the round-trip property for a
@@ -612,13 +692,16 @@ fn arb_in_list(targets: Vec<(&'static str, Prop)>) -> BoxedStrategy<Expr> {
 
 /// An `=`/`IN` **and** a two-sided inclusive range over the *same* column.
 ///
-/// This is the only predicate shape that reaches the deleted Lance range
-/// fusion, and all three parts are load-bearing
-/// (`bugs/hash_index_range_quoting.rs:15-23`): the `=`/`IN` is what puts the
-/// column into `PushdownStrategy::hash_index_columns`, and the two-sided
-/// *inclusive* range is the only form the fusion fired on. Drop any one and the
-/// predicate never reaches `LanceFilterGenerator` — which is why the plain
-/// `WHERE p >= 2 AND p <= 4` form always looked correct and the bug survived.
+/// The shape the deleted Lance range fusion fired on. Which parts reach Lance
+/// depends on the index kind. The `=`/`IN` puts the column into
+/// `PushdownStrategy::indexed_equality_columns` for a Hash *or* BTree index.
+/// The two-sided *inclusive* range is pushed only for a **BTree** column (perf
+/// audit F1, `indexed_range_filter`); on a Hash column it stays in the residual
+/// filter and never reaches the renderer. (When the fusion shipped, the
+/// `=`/`IN` was also what let the range reach `LanceFilterGenerator` on a Hash
+/// column — `bugs/hash_index_range_quoting.rs:15-23` — which is no longer
+/// true.) So the range half has teeth only against
+/// `dqp::seed::Fixture::TINY_BTREE_INDEXED`.
 ///
 /// Bounds are drawn as an **ordered** triple `lo <= mid <= hi` with the equality
 /// at `mid`, so the range contains the equality and the predicate selects real
@@ -785,20 +868,24 @@ pub fn arb_case() -> impl Strategy<Value = Case> {
 
 /// The property the pushdown strategies target.
 ///
-/// Shared with `dqp::seed::INDEXED_PROPERTY`, which declares the Hash index on
-/// exactly this column — a generated pushdown predicate over any *other*
-/// property would never enter `hash_index_columns`, and the lever would run a
-/// full soak against a path that cannot exhibit the defect. `dqp::seed` aliases
-/// this constant rather than repeating the string, so the two cannot drift.
+/// Shared with `dqp::seed::INDEXED_PROPERTY`, which declares the Hash (or, in
+/// the BTree mode, the BTree) index on exactly this column — a generated
+/// pushdown predicate over any *other* property would consult no index, and
+/// the lever would run a full soak against a path that cannot exhibit the
+/// defect. `dqp::seed` aliases this constant rather than repeating the string,
+/// so the two cannot drift.
 pub const PUSHDOWN_PROPERTY: &str = "age";
 
 /// A case whose base `WHERE` is always a same-column conjunction over
-/// [`PUSHDOWN_PROPERTY`] — the shape that reaches the Lance range fusion.
+/// [`PUSHDOWN_PROPERTY`]: an `=`/`IN` plus a two-sided inclusive range.
 ///
 /// Every case is filtered by construction, so unlike [`arb_case`] this needs no
-/// `arb_base_where` (which emits `None` two draws in three). Pair it with
-/// `dqp::seed::Fixture::TINY_INDEXED`; against a fixture with no index the
-/// predicate is merely a slow filter and the run proves nothing.
+/// `arb_base_where` (which emits `None` two draws in three). Pair it with an
+/// indexed fixture. Against `dqp::seed::Fixture::TINY_INDEXED` (Hash) only the
+/// `=`/`IN` conjunct is pushed to Lance; the range reaches range pushdown and
+/// the filter renderer only against `dqp::seed::Fixture::TINY_BTREE_INDEXED`
+/// (ranges push only for a BTree since perf audit F1). Against a fixture with
+/// no index the predicate is merely a slow filter and the run proves nothing.
 pub fn arb_case_pushdown() -> impl Strategy<Value = Case> {
     arb_shape().prop_flat_map(|shape| {
         let targets = shape.nullable_targets();
@@ -994,12 +1081,14 @@ mod roundtrip {
                 case.norec_unoptimized(),
                 case.ordered_query(),
                 case.limited_query(5),
+                case.ordered_limited_query(3),
+                case.conjunctive_query(),
                 case.count_query(),
                 // The `EXPLAIN` wrapper must survive the same round trip, since
                 // the routing assertions render through it.
                 Query::Explain(Box::new(case.base_query())),
             ];
-            for q in variants {
+            for q in variants.into_iter().chain(case.alias_ordered_limited_query(3)) {
                 let rendered = render(&q);
                 let reparsed = parse(&rendered).map_err(|e| {
                     TestCaseError::fail(format!("parse failed for `{rendered}`: {e:?}"))
@@ -1073,7 +1162,7 @@ mod spike {
     #[test]
     fn fixpoint_pushdown_predicates_and_explain() {
         // `IN` over an integer column — the second route into
-        // `hash_index_columns` alongside `=`.
+        // `indexed_equality_columns` alongside `=`.
         assert_render_fixpoint("MATCH (a:Person) WHERE (a.age IN [18, 25, 30]) RETURN a.name");
         assert_render_fixpoint("MATCH (a:Person) WHERE (a.age IN [30]) RETURN a.name");
 

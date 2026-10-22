@@ -21,7 +21,7 @@
 //! `index_scans == 0`. Without that pairing, deleting the callback would make
 //! all of them pass.
 
-use uni_db::{DataType, IndexType, ScalarType, Uni, Value};
+use uni_db::{DataType, IndexType, ScalarType, Uni, UniConfig, Value};
 
 /// Large enough that Lance does not brute-force past the index.
 const N: i64 = 3000;
@@ -216,7 +216,15 @@ async fn the_index_counter_is_not_a_constant() {
 /// is the distinction `scans_reported` exists to make.
 #[tokio::test]
 async fn an_unflushed_query_reports_no_lance_scan() {
-    let db = Uni::temporary().build().await.unwrap();
+    // No timer flush: the row must still be in L0 when the query runs.
+    let db = Uni::temporary()
+        .config(UniConfig {
+            auto_flush_interval: None,
+            ..Default::default()
+        })
+        .build()
+        .await
+        .unwrap();
     db.schema()
         .label("Item")
         .property("name", DataType::String)
@@ -582,8 +590,8 @@ async fn a_scalar_index_survives_a_later_write() {
 /// `index_scans=0` against indexes present on disk (#247).
 ///
 /// Semantic compaction is reached only from the background scheduler:
-/// `compact_label` runs Lance's `compact_files` alone, and
-/// `trigger_async_compaction` has no callers. So this drives the scheduler with
+/// `compact_label` runs Lance's `compact_files` alone (the uncalled
+/// `trigger_async_compaction` was removed). So this drives the scheduler with
 /// a short interval and a flush to give `pick_compaction_task` something to
 /// pick, which is what the earlier compaction test missed — it called
 /// `compact()` and never reached `replace`.

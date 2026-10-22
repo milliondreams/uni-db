@@ -1,10 +1,13 @@
+pub mod binding_plan;
 pub mod calibration;
 pub mod compiler;
 pub mod config;
 pub mod dependency_dnf;
 pub mod entity_columns;
 pub mod errors;
+pub mod incremental;
 pub mod is_binding;
+pub mod magic;
 pub mod names;
 pub mod neural;
 pub mod prune;
@@ -13,6 +16,10 @@ pub mod semiring;
 pub mod top_k_proofs;
 pub mod types;
 
+#[doc(inline)]
+pub use binding_plan::{
+    ClauseBinding, ClauseBindingPlan, ColumnKind, ColumnKinds, attach_binding_plans,
+};
 pub use calibration::{
     BetaCalibration, BetaFitter, CalibrationError, CalibrationMethodKind, Calibrator,
     CalibratorFitter, CredalCalibrator, DirichletCalibrator, DirichletFitter,
@@ -34,6 +41,8 @@ pub use compiler::{MonotonicityOracle, default_monotonicity_oracle};
 pub use config::{ClassifierRegistry, ConfigError, LocyConfig};
 pub use dependency_dnf::{BaseRv, BaseRvSet, DependencyDnf};
 pub use errors::LocyError;
+#[doc(inline)]
+pub use magic::{GoalDirected, GoalDirectedReport, rewrite_goal_directed};
 pub use neural::{
     CalibratedClassifier, CandleLinearClassifier, ClassifierError, ClassifierResult, ClassifyInput,
     FeatureValue, MockClassifier, ModelInvocationCache, NeuralClassifier, NeuralProvenanceRecord,
@@ -42,7 +51,7 @@ pub use neural::{
 pub use result::{
     AbductionResult, CalibrationResult, CommandResult, ConfidenceBand, ConfidenceSource,
     DerivationNode, DerivedEdge, DerivedFactSet, FactRow, LocyResult, LocyStats, Modification,
-    NeuralProvenance, ValidatedModification, ValidationResult,
+    NeuralProvenance, RuleFacts, ValidatedModification, ValidationResult,
 };
 pub use semiring::merge_top_k_dispatch_owned as merge_top_k_runtime;
 pub use semiring::{

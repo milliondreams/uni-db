@@ -10,15 +10,17 @@
 //! - **execute mode** (`derive_command`): immediately applies mutations via `ctx.execute_mutation()`
 //! - **collect mode** (`collect_derive_facts`): collects Cypher ASTs + vertex/edge data for deferred application
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use uni_common::Properties;
 use uni_cypher::ast::Query;
 use uni_cypher::locy_ast::{DeriveClause, DeriveCommand, DerivePattern, RuleOutput};
+use uni_locy::incremental::{MutationFootprint, query_footprint};
 use uni_locy::result::DerivedEdge;
 use uni_locy::{CompiledProgram, FactRow, LocyError, LocyStats};
 
 use super::locy_ast_builder::build_derive_create;
+use super::locy_delta::RowStore;
 use super::locy_eval::{eval_condition, eval_expr};
 use super::locy_traits::LocyExecutionContext;
 use crate::query::executor::result_normalizer::ResultNormalizer;
@@ -29,25 +31,54 @@ pub struct CollectedDeriveOutput {
     pub vertices: HashMap<String, Vec<Properties>>,
     pub edges: Vec<DerivedEdge>,
     pub affected: usize,
+    /// The ids of the existing nodes the queries name (a DERIVE head's
+    /// bound endpoints). A replay finds each by this id, so each must exist
+    /// where the queries are replayed.
+    pub bound_vids: BTreeSet<u64>,
 }
 
 /// Execute a top-level DERIVE command (auto-apply mode).
 ///
-/// Looks up facts from the native store via `ctx.lookup_derived()`, applies optional
-/// WHERE filtering, and for each matching fact executes the DERIVE mutation via
+/// Looks up the rule's facts via `ctx.lookup_derived_enriched()` against
+/// `derived_store` (the issuing command's store), applies optional WHERE
+/// filtering, and for each matching fact executes the DERIVE mutation via
 /// `ctx.execute_mutation()`.
 pub async fn derive_command(
     dc: &DeriveCommand,
     program: &CompiledProgram,
     ctx: &dyn LocyExecutionContext,
+    derived_store: &RowStore,
     stats: &mut LocyStats,
 ) -> Result<usize, LocyError> {
-    let collected = collect_derive_facts_inner(dc, program, ctx).await?;
+    derive_command_footprint(dc, program, ctx, derived_store, stats)
+        .await
+        .map(|(affected, _)| affected)
+}
+
+/// Executes a DERIVE command as [`derive_command`] does, and also returns
+/// the footprint of the mutations it ran (empty when it derived nothing).
+///
+/// A caller that keeps facts across commands (an `ASSUME` body) needs the
+/// footprint to tell which of them the DERIVE made stale.
+///
+/// # Errors
+///
+/// A rule lookup, `WHERE` evaluation or mutation failure.
+pub async fn derive_command_footprint(
+    dc: &DeriveCommand,
+    program: &CompiledProgram,
+    ctx: &dyn LocyExecutionContext,
+    derived_store: &RowStore,
+    stats: &mut LocyStats,
+) -> Result<(usize, MutationFootprint), LocyError> {
+    let collected = collect_derive_facts_inner(dc, program, ctx, derived_store).await?;
+    let mut footprint = MutationFootprint::default();
     for query in collected.queries {
+        footprint.extend(&query_footprint(&query));
         ctx.execute_mutation(query, HashMap::new()).await?;
         stats.mutations_executed += 1;
     }
-    Ok(collected.affected)
+    Ok((collected.affected, footprint))
 }
 
 /// Collect derived facts without executing mutations (collect mode).
@@ -58,8 +89,9 @@ pub async fn collect_derive_facts(
     dc: &DeriveCommand,
     program: &CompiledProgram,
     ctx: &dyn LocyExecutionContext,
+    derived_store: &RowStore,
 ) -> Result<CollectedDeriveOutput, LocyError> {
-    collect_derive_facts_inner(dc, program, ctx).await
+    collect_derive_facts_inner(dc, program, ctx, derived_store).await
 }
 
 /// Shared implementation for both execute and collect modes.
@@ -67,6 +99,7 @@ async fn collect_derive_facts_inner(
     dc: &DeriveCommand,
     program: &CompiledProgram,
     ctx: &dyn LocyExecutionContext,
+    derived_store: &RowStore,
 ) -> Result<CollectedDeriveOutput, LocyError> {
     let rule_name = dc.rule_name.to_string();
     let rule = program
@@ -76,7 +109,9 @@ async fn collect_derive_facts_inner(
             message: format!("rule '{}' not found for DERIVE command", rule_name),
         })?;
 
-    let facts = ctx.lookup_derived_enriched(&rule_name).await?;
+    let facts = ctx
+        .lookup_derived_enriched(&rule_name, derived_store)
+        .await?;
 
     // Apply optional WHERE filter
     let filtered: Vec<_> = if let Some(where_expr) = &dc.where_expr {
@@ -93,13 +128,21 @@ async fn collect_derive_facts_inner(
     let mut all_vertices: HashMap<String, Vec<Properties>> = HashMap::new();
     let mut all_edges = Vec::new();
     let mut affected = 0;
+    let mut bound_vids = BTreeSet::new();
 
     for clause in &rule.clauses {
         if let RuleOutput::Derive(derive_clause) = &clause.output {
+            let head = derive_head_variables(derive_clause);
             for row in &filtered {
                 for row in expand_group_bindings(derive_clause, row) {
                     let queries = build_derive_create(derive_clause, &row)?;
                     affected += queries.len();
+                    if !queries.is_empty() {
+                        bound_vids.extend(head.iter().filter_map(|var| match row.get(var) {
+                            Some(uni_common::Value::Node(n)) => Some(n.vid.as_u64()),
+                            _ => None,
+                        }));
+                    }
 
                     // Extract vertex/edge data for inspection
                     extract_vertex_edge_data(
@@ -120,6 +163,7 @@ async fn collect_derive_facts_inner(
         vertices: all_vertices,
         edges: all_edges,
         affected,
+        bound_vids,
     })
 }
 

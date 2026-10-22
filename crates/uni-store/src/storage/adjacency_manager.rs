@@ -45,47 +45,132 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use uni_common::core::id::{Eid, Vid};
 
-/// Versions currently pinned by in-flight snapshot readers.
+/// Versions currently pinned by in-flight readers, and how far semantic
+/// compaction has merged history.
 ///
-/// Exists so shadow-CSR entries can be reclaimed without dropping any a live
-/// reader still resolves. The bound is subtle and worth stating once:
+/// Two users:
 ///
-/// * `StorageManager::pinned()` and `at_fork` each build a **fresh**
-///   [`AdjacencyManager`] with its own empty `ShadowCsr`, so those readers
-///   never consult the live instance.
-/// * `StorageManager::pinned_at_version` **shares** the live manager, and is
-///   the path every read-write transaction takes.
+/// * Shadow-CSR GC reclaims no entry a live reader still resolves. The
+///   readers of the live shadow are the `StorageManager::pinned_at_version`
+///   views every read-write transaction takes, and the safe floor is the
+///   minimum version among them.
+/// * Semantic compaction merges no vertex row above the oldest pin, and folds
+///   no edge delta above the oldest pin of a reader whose edge tier is
+///   versioned ([`Self::begin_merge`]), so every registered reader still finds
+///   its rows. A transaction's edge tier reads the live adjacency, so only
+///   `StorageManager::pinned` views (a session pinned to a snapshot that reads
+///   the live tables, registered with [`Self::pin_checked`]) hold edge deltas.
 ///
-/// So the only readers of the live shadow are in-flight `pinned_at_version`
-/// views, and the safe floor is the minimum version among them.
-/// `SnapshotManager` cannot supply this — it is a manifest reader-writer and
-/// tracks no live readers.
+/// A merge also raises the *horizon*: the version below which merged history
+/// is gone. A reader pinned below it, registered afterwards, would read a
+/// merged row in place of the rows it should see, so [`Self::pin_checked`]
+/// says whether a new pin is still readable. Registration and the floor read
+/// share one lock, so a pin either constrains a merge or sees its bound.
 ///
 /// Refcounted rather than a set: several transactions routinely pin the same
 /// version, and the floor must not rise until the last of them is gone.
 #[derive(Debug, Default)]
 pub struct PinnedVersions {
-    counts: parking_lot::Mutex<std::collections::BTreeMap<u64, usize>>,
+    state: parking_lot::Mutex<PinState>,
 }
 
+#[derive(Debug, Default)]
+struct PinState {
+    counts: std::collections::BTreeMap<u64, usize>,
+    /// The subset of `counts` whose edge tier is versioned too.
+    edge_counts: std::collections::BTreeMap<u64, usize>,
+    /// Merged history ends below this version.
+    horizon: u64,
+    /// Bounds of the merges in flight, by token: each merges nothing above its
+    /// bound (`u64::MAX` when nothing was pinned when it started).
+    in_flight: HashMap<u64, u64>,
+    next_token: u64,
+}
+
+/// One merge registered by [`PinnedVersions::begin_merge`].
+#[derive(Debug)]
+#[must_use = "end the merge with `PinnedVersions::end_merge`"]
+pub struct MergeToken(u64);
+
 impl PinnedVersions {
-    /// Register `version` as pinned until the returned guard drops.
+    /// Register `version` as pinned until the returned guard drops, for a
+    /// reader whose edge tier is live (a transaction).
     pub fn pin(self: &Arc<Self>, version: u64) -> PinGuard {
-        *self.counts.lock().entry(version).or_insert(0) += 1;
+        let mut state = self.state.lock();
+        *state.counts.entry(version).or_insert(0) += 1;
         PinGuard {
             versions: Arc::clone(self),
             version,
+            edge_tier: false,
         }
+    }
+
+    /// Register `version` as pinned for a reader whose vertex and edge tiers
+    /// are both read at it, and say whether history at `version` is still
+    /// whole: no finished or running merge reaches above it.
+    pub fn pin_checked(self: &Arc<Self>, version: u64) -> (PinGuard, bool) {
+        let mut state = self.state.lock();
+        *state.counts.entry(version).or_insert(0) += 1;
+        *state.edge_counts.entry(version).or_insert(0) += 1;
+        let readable =
+            version >= state.horizon && state.in_flight.values().all(|bound| version >= *bound);
+        (
+            PinGuard {
+                versions: Arc::clone(self),
+                version,
+                edge_tier: true,
+            },
+            readable,
+        )
     }
 
     /// The lowest version any in-flight reader is pinned at.
     pub fn min_pinned(&self) -> Option<u64> {
-        self.counts.lock().keys().next().copied()
+        self.state.lock().counts.keys().next().copied()
     }
 
     /// Number of distinct pinned versions; for tests and diagnostics.
     pub fn distinct_pinned(&self) -> usize {
-        self.counts.lock().len()
+        self.state.lock().counts.len()
+    }
+
+    /// Starts a merge: returns the oldest pinned version, above which the
+    /// merge must keep every row as it is, and registers the merge so a pin
+    /// registered meanwhile below its bound is reported unreadable. An
+    /// `edge_tier` merge (edge deltas) considers only the pins of readers
+    /// whose edge tier is versioned.
+    pub fn begin_merge(&self, edge_tier: bool) -> (Option<u64>, MergeToken) {
+        let mut state = self.state.lock();
+        let pins = if edge_tier {
+            &state.edge_counts
+        } else {
+            &state.counts
+        };
+        let floor = pins.keys().next().copied();
+        let token = state.next_token;
+        state.next_token += 1;
+        state.in_flight.insert(token, floor.unwrap_or(u64::MAX));
+        (floor, MergeToken(token))
+    }
+
+    /// Ends a merge that lost the history below `merged_through` (0 when it
+    /// lost none), raising the horizon to it.
+    pub fn end_merge(&self, token: MergeToken, merged_through: u64) {
+        let mut state = self.state.lock();
+        state.in_flight.remove(&token.0);
+        state.horizon = state.horizon.max(merged_through);
+    }
+
+    /// Raises the horizon to at least `version` (one recorded by an earlier
+    /// process).
+    pub fn raise_horizon(&self, version: u64) {
+        let mut state = self.state.lock();
+        state.horizon = state.horizon.max(version);
+    }
+
+    /// The version below which merged history is gone.
+    pub fn horizon(&self) -> u64 {
+        self.state.lock().horizon
     }
 }
 
@@ -94,16 +179,23 @@ impl PinnedVersions {
 pub struct PinGuard {
     versions: Arc<PinnedVersions>,
     version: u64,
+    edge_tier: bool,
 }
 
 impl Drop for PinGuard {
     fn drop(&mut self) {
-        let mut counts = self.versions.counts.lock();
-        if let Some(n) = counts.get_mut(&self.version) {
-            *n -= 1;
-            if *n == 0 {
-                counts.remove(&self.version);
+        fn release(counts: &mut std::collections::BTreeMap<u64, usize>, version: u64) {
+            if let Some(n) = counts.get_mut(&version) {
+                *n -= 1;
+                if *n == 0 {
+                    counts.remove(&version);
+                }
             }
+        }
+        let mut state = self.versions.state.lock();
+        release(&mut state.counts, self.version);
+        if self.edge_tier {
+            release(&mut state.edge_counts, self.version);
         }
     }
 }
@@ -187,6 +279,34 @@ pub struct AdjacencyManager {
     compact_lock: parking_lot::Mutex<()>,
 }
 
+/// Puts a neighbor list in the order the read paths promise: ascending by
+/// `(neighbor vid, eid)`, each edge once.
+///
+/// Layers repeat an edge legitimately — the overlay dual-writes an edge the
+/// Main CSR may already hold, a self-loop read in both directions is listed
+/// once per direction, and the shadow CSR resurrects edges a lower layer may
+/// still list. An edge's endpoints never change, so every repeat of an eid
+/// carries the same neighbor, and exact-duplicate removal after the sort is
+/// the whole of the merge the old per-eid map performed.
+fn into_canonical_order(neighbors: &mut Vec<(Vid, Eid)>) {
+    if neighbors.len() > 1 {
+        neighbors.sort_unstable();
+        neighbors.dedup();
+    }
+    #[cfg(debug_assertions)]
+    {
+        let mut eids: Vec<Eid> = neighbors.iter().map(|&(_, eid)| eid).collect();
+        eids.sort_unstable();
+        let before = eids.len();
+        eids.dedup();
+        debug_assert_eq!(
+            before,
+            eids.len(),
+            "one eid reached two different neighbors: {neighbors:?}"
+        );
+    }
+}
+
 impl AdjacencyManager {
     /// Creates a new adjacency manager with the given memory budget.
     pub fn new(max_bytes: usize) -> Self {
@@ -208,15 +328,29 @@ impl AdjacencyManager {
     ///
     /// Reads Main CSR + frozen segments + active overlay, minus tombstones.
     /// Tombstones from any layer remove edges from all lower layers.
+    ///
+    /// The result is ordered by `(neighbor vid, eid)`, with each edge once.
+    /// That order is a contract, not a by-product: a breadth-first search
+    /// picks among equal-length paths by expansion order, so `shortestPath`
+    /// returns the same path every time — and the same path whether an edge is
+    /// flushed or still buffered — only because this order does not depend on
+    /// hash seeds or on which layer holds an edge. It used to come out of a
+    /// fresh `HashMap` per call, and 30 runs of one query returned 2 paths.
     pub fn get_neighbors(&self, vid: Vid, edge_type: u32, direction: Direction) -> Vec<(Vid, Eid)> {
-        let mut result: HashMap<Eid, Vid> = HashMap::new();
+        // Layers are appended in age order and tombstones applied in place, so
+        // the vector goes through exactly the states the old per-eid map did,
+        // minus the hashing; `into_canonical_order` then removes the repeats a
+        // map would have merged.
+        let mut result: Vec<(Vid, Eid)> = Vec::new();
 
         for &dir in direction.expand() {
             // 1. Main CSR
             if let Some(csr) = self.main_csr.get(&(edge_type, dir)) {
-                for entry in csr.get_entries(vid) {
-                    result.insert(entry.eid, entry.neighbor_vid);
-                }
+                result.extend(
+                    csr.get_entries(vid)
+                        .iter()
+                        .map(|entry| (entry.neighbor_vid, entry.eid)),
+                );
             }
 
             // 2. Frozen segments (oldest first) — add inserts, then remove tombstones.
@@ -234,15 +368,13 @@ impl AdjacencyManager {
                     && let Some(adj) = segment.inserts.get(&(edge_type, dir))
                     && let Some(neighbors) = adj.get(&vid)
                 {
-                    for &(neighbor, eid, _version) in neighbors {
-                        result.insert(eid, neighbor);
-                    }
+                    result.extend(neighbors.iter().map(|&(neighbor, eid, _)| (neighbor, eid)));
                 }
                 // Apply tombstones against ALL prior results (Main CSR + older segments).
                 // Skip the retain pass entirely when there are no tombstones — it would
                 // be a no-op but still O(result_size) due to the closure call.
                 if has_tombstones {
-                    result.retain(|eid, _| !segment.tombstones.contains_key(eid));
+                    result.retain(|(_, eid)| !segment.tombstones.contains_key(eid));
                 }
             }
 
@@ -256,16 +388,15 @@ impl AdjacencyManager {
                 && let Some(adj) = active.inserts.get(&(edge_type, dir))
                 && let Some(neighbors) = adj.get(&vid)
             {
-                for &(neighbor, eid, _version) in neighbors {
-                    result.insert(eid, neighbor);
-                }
+                result.extend(neighbors.iter().map(|&(neighbor, eid, _)| (neighbor, eid)));
             }
             if active_has_tombstones {
-                result.retain(|eid, _| !active.tombstones.contains_key(eid));
+                result.retain(|(_, eid)| !active.tombstones.contains_key(eid));
             }
         }
 
-        result.into_iter().map(|(e, n)| (n, e)).collect()
+        into_canonical_order(&mut result);
+        result
     }
 
     /// Returns neighbors visible at a specific snapshot version.
@@ -280,16 +411,18 @@ impl AdjacencyManager {
         direction: Direction,
         version: u64,
     ) -> Vec<(Vid, Eid)> {
-        let mut result: HashMap<Eid, Vid> = HashMap::new();
+        // Same accumulation and ordering contract as `get_neighbors`.
+        let mut result: Vec<(Vid, Eid)> = Vec::new();
 
         for &dir in direction.expand() {
             // 1. Main CSR — filter by created_version
             if let Some(csr) = self.main_csr.get(&(edge_type, dir)) {
-                for entry in csr.get_entries(vid) {
-                    if entry.created_version <= version {
-                        result.insert(entry.eid, entry.neighbor_vid);
-                    }
-                }
+                result.extend(
+                    csr.get_entries(vid)
+                        .iter()
+                        .filter(|entry| entry.created_version <= version)
+                        .map(|entry| (entry.neighbor_vid, entry.eid)),
+                );
             }
 
             // 2. Frozen segments — filter inserts by version, apply tombstones.
@@ -304,14 +437,15 @@ impl AdjacencyManager {
                     && let Some(adj) = segment.inserts.get(&(edge_type, dir))
                     && let Some(neighbors) = adj.get(&vid)
                 {
-                    for &(neighbor, eid, ver) in neighbors {
-                        if ver <= version {
-                            result.insert(eid, neighbor);
-                        }
-                    }
+                    result.extend(
+                        neighbors
+                            .iter()
+                            .filter(|&&(_, _, ver)| ver <= version)
+                            .map(|&(neighbor, eid, _)| (neighbor, eid)),
+                    );
                 }
                 if has_tombstones {
-                    result.retain(|eid, _| {
+                    result.retain(|(_, eid)| {
                         segment
                             .tombstones
                             .get(eid)
@@ -334,12 +468,12 @@ impl AdjacencyManager {
                         .get(&eid)
                         .is_none_or(|ts| ts.version > version);
                     if ver <= version && not_tombstoned {
-                        result.insert(eid, neighbor);
+                        result.push((neighbor, eid));
                     }
                 }
             }
             if active_has_tombstones {
-                result.retain(|eid, _| {
+                result.retain(|(_, eid)| {
                     active
                         .tombstones
                         .get(eid)
@@ -348,15 +482,53 @@ impl AdjacencyManager {
             }
 
             // 4. Shadow CSR — resurrect edges alive at version
-            for (neighbor, eid) in self
-                .shadow
-                .get_entries_at_version(vid, edge_type, dir, version)
-            {
-                result.insert(eid, neighbor);
-            }
+            result.extend(
+                self.shadow
+                    .get_entries_at_version(vid, edge_type, dir, version),
+            );
         }
 
-        result.into_iter().map(|(e, n)| (n, e)).collect()
+        into_canonical_order(&mut result);
+        result
+    }
+
+    /// Adds to `out` every vertex that [`Self::get_neighbors`] (or, with
+    /// `include_shadow`, [`Self::get_neighbors_at_version`]) can return a
+    /// neighbor for, for `edge_type` along `direction`.
+    ///
+    /// A superset, not the exact set: a vertex whose every edge is tombstoned
+    /// is still reported. That is what makes it safe to drive a scan with —
+    /// a caller that keeps only these vertices as traversal sources loses no
+    /// row the traversal could produce, because the traversal itself drops a
+    /// source with no live neighbor. Reads the same layers the two neighbor
+    /// reads do (Main CSR, frozen and active overlays, and the shadow CSR for
+    /// versioned reads), so a layer cannot be read by one and missed here.
+    pub fn collect_source_vids(
+        &self,
+        edge_type: u32,
+        direction: Direction,
+        include_shadow: bool,
+        out: &mut HashSet<Vid>,
+    ) {
+        for &dir in direction.expand() {
+            if let Some(csr) = self.main_csr.get(&(edge_type, dir)) {
+                out.extend(csr.vids_with_entries());
+            }
+            for segment in self.frozen_segments.read().iter() {
+                if let Some(adj) = segment.inserts.get(&(edge_type, dir)) {
+                    out.extend(adj.keys().copied());
+                }
+            }
+            {
+                let active = self.active_overlay.read();
+                if let Some(adj) = active.inserts.get(&(edge_type, dir)) {
+                    out.extend(adj.keys().copied());
+                }
+            }
+            if include_shadow {
+                self.shadow.collect_vids(edge_type, dir, out);
+            }
+        }
     }
 
     /// Records an edge insertion into the L0-csr overlay (both directions).
@@ -425,6 +597,25 @@ impl AdjacencyManager {
     pub fn invalidate_all_csr(&self) {
         self.main_csr.clear();
         self.csr_source_stamp.clear();
+    }
+
+    /// Forgets every edge this manager holds: Main CSRs, the overlay and its
+    /// frozen segments, and the shadow CSR.
+    ///
+    /// For a snapshot restore, which rewinds the tables underneath. Flushed
+    /// edges stay in the overlay until a compaction folds them into a Main CSR,
+    /// so dropping the Main CSRs alone would keep serving edges the restore
+    /// removed. The caller must hold off writers and must have no reader
+    /// pinned to a version, since the shadow CSR is what such a reader needs.
+    pub fn reset(&self) {
+        let _compact_guard = self.compact_lock.lock();
+        *self.active_overlay.write() = L0CsrSegment::new();
+        self.frozen_segments.write().clear();
+        self.main_csr.clear();
+        self.csr_source_stamp.clear();
+        self.warm_guards.clear();
+        self.shadow.clear();
+        self.current_bytes.store(0, Ordering::Relaxed);
     }
 
     /// Drops the cached Main CSR so the next warm re-reads from storage.
@@ -535,6 +726,32 @@ impl AdjacencyManager {
         ids.sort_unstable();
         ids.dedup();
         ids
+    }
+
+    /// Approximate number of edges of `edge_type` the adjacency holds.
+    ///
+    /// The Main CSR's outgoing entries plus the overlay segments' outgoing
+    /// inserts, without subtracting tombstones or merging an edge both layers
+    /// hold, so it may over-count recent churn. Meant for cost decisions — how
+    /// a bounded read compares with reading the whole type — not for answers.
+    #[must_use]
+    pub fn approx_edge_count(&self, edge_type: u32) -> usize {
+        let key = (edge_type, Direction::Outgoing);
+        let main = self.main_csr.get(&key).map_or(0, |csr| csr.num_edges());
+        let frozen: usize = self
+            .frozen_segments
+            .read()
+            .iter()
+            .filter_map(|seg| seg.inserts.get(&key))
+            .map(|adj| adj.values().map(Vec::len).sum::<usize>())
+            .sum();
+        let active = self
+            .active_overlay
+            .read()
+            .inserts
+            .get(&key)
+            .map_or(0, |adj| adj.values().map(Vec::len).sum());
+        main + frozen + active
     }
 
     /// Returns the number of frozen segments awaiting compaction.
@@ -692,6 +909,12 @@ impl AdjacencyManager {
     /// builds a [`MainCsr`] with version metadata, and populates the
     /// [`ShadowCsr`] with L1 tombstones. Called once at startup or
     /// lazily on first access per edge type.
+    ///
+    /// Reads under the storage manager's bulk visibility gate, and installs
+    /// the result only if the gate did not change while it was read: a CSR
+    /// read while a bulk load was hidden must not outlive the load's release,
+    /// and one read while it was half published must not be installed after
+    /// it was hidden. On a change the read is repeated under the new state.
     pub async fn warm(
         &self,
         storage: &StorageManager,
@@ -699,6 +922,31 @@ impl AdjacencyManager {
         direction: Direction,
         version: Option<u64>,
     ) -> anyhow::Result<()> {
+        loop {
+            let (epoch, hidden) = storage.bulk_gate().snapshot();
+            let visibility = crate::storage::bulk_gate::RowVisibility::new(
+                version,
+                storage.with_excluded_versions(hidden),
+            );
+            if self
+                .warm_once(storage, edge_type_id, direction, &visibility, epoch)
+                .await?
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    /// One read of the CSR under `visibility`; returns whether it was
+    /// installed (the gate was still at `epoch`).
+    async fn warm_once(
+        &self,
+        storage: &StorageManager,
+        edge_type_id: u32,
+        direction: Direction,
+        visibility: &crate::storage::bulk_gate::RowVisibility,
+        epoch: u64,
+    ) -> anyhow::Result<bool> {
         // Stamp *before* reading. A write landing mid-warm then leaves the CSR
         // looking stale and it is re-read on the next query; stamping after the
         // read would record the post-write version against a pre-write CSR and
@@ -746,12 +994,13 @@ impl AdjacencyManager {
                     let adj_exists = backend.table_exists(&adj_table_name).await.unwrap_or(false);
 
                     if adj_exists {
-                        let mut request = crate::backend::types::ScanRequest::all(&adj_table_name);
-                        if let Some(hwm) = version {
-                            request = request.with_filter(
-                                crate::backend::types::FilterExpr::version_at_most(hwm),
-                            );
-                        }
+                        // Unfiltered: L2 rows carry no `_version`, and a
+                        // version filter on them is a schema error. Semantic
+                        // compaction folds no delta above the oldest pinned
+                        // version (`StorageManager::begin_compaction_merge`) and
+                        // never runs while a bulk load is hidden, so every
+                        // edge in L2 is visible to every reader of it.
+                        let request = crate::backend::types::ScanRequest::all(&adj_table_name);
 
                         // Fail closed: a transient scan error must abort the warm,
                         // not `unwrap_or_default()` into an empty L2 read that then
@@ -794,10 +1043,10 @@ impl AdjacencyManager {
 
                                 for j in 0..neighbors.len() {
                                     // L2 adjacency rows don't carry per-edge _version.
-                                    // Version 0 means "from base storage" — the `_version <= hwm` filter on
-                                    // the query already ensures we only load rows within the snapshot window.
-                                    // At query time, get_neighbors_at_version() uses created_version to filter,
-                                    // so version=0 edges are always visible (which is correct for compacted L2 data).
+                                    // Version 0 means "from base storage": visible at
+                                    // every version, which holds because compaction
+                                    // folds nothing above the oldest pin (see the scan
+                                    // above).
                                     entries.push((
                                         src_offset,
                                         Vid::from(neighbors.value(j)),
@@ -822,9 +1071,8 @@ impl AdjacencyManager {
                 .unwrap_or(false)
             {
                 let mut request = crate::backend::types::ScanRequest::all(&delta_table_name);
-                if let Some(hwm) = version {
-                    request = request
-                        .with_filter(crate::backend::types::FilterExpr::version_at_most(hwm));
+                if let Some(filter) = visibility.filter() {
+                    request = request.with_filter(filter);
                 }
 
                 // Fail closed: propagate a delta scan error rather than silently
@@ -911,19 +1159,21 @@ impl AdjacencyManager {
         // Build MainCsr
         let max_offset = entries.iter().map(|(o, _, _, _)| *o).max().unwrap_or(0);
         let csr = MainCsr::from_edge_entries(max_offset as usize, entries);
-        self.set_main_csr(edge_type_id, direction, csr);
-        match source_stamp {
-            Some(v) => {
-                self.csr_source_stamp.insert((edge_type_id, direction), v);
+        let installed = storage.bulk_gate().install_if_current(epoch, || {
+            self.set_main_csr(edge_type_id, direction, csr);
+            match source_stamp {
+                Some(v) => {
+                    self.csr_source_stamp.insert((edge_type_id, direction), v);
+                }
+                // No stamp means no freshness claim: leave the entry absent so
+                // `csr_is_fresh` reports stale and the next query re-warms.
+                None => {
+                    self.csr_source_stamp.remove(&(edge_type_id, direction));
+                }
             }
-            // No stamp means no freshness claim: leave the entry absent so
-            // `csr_is_fresh` reports stale and the next query re-warms.
-            None => {
-                self.csr_source_stamp.remove(&(edge_type_id, direction));
-            }
-        }
+        });
 
-        Ok(())
+        Ok(installed.is_some())
     }
 
     /// Coalesced warm() operation to prevent cache stampede (Issue #13).
@@ -1401,7 +1651,7 @@ mod tests {
         // Insert same Eid into overlay at version 3 (update scenario)
         am.insert_edge(src, dst, eid, etype, 3);
 
-        // get_neighbors should return only 1 edge (HashMap<Eid, Vid> deduplicates)
+        // get_neighbors should return only 1 edge (repeats of an eid are merged)
         let neighbors = am.get_neighbors(src, etype, Direction::Outgoing);
         assert_eq!(
             neighbors.len(),
@@ -1615,5 +1865,140 @@ mod tests {
             n.is_empty(),
             "tombstone in frozen segment must still hide Main CSR edge"
         );
+    }
+
+    /// Builds a manager whose vertex 0 has `degree` outgoing edges of type 1
+    /// spread over Main CSR, a frozen segment and the active overlay, inserted
+    /// in an order that is neither VID nor EID order, plus parallel edges.
+    fn layered_fixture(degree: u64) -> (AdjacencyManager, Vec<(Vid, Eid)>) {
+        let am = AdjacencyManager::new(64 * 1024 * 1024);
+        // A fixed permutation: multiply by a unit modulo a prime > degree.
+        let p = 1_000_003u64;
+        let perm = |i: u64| (i * 7919) % p;
+        let mut expected = Vec::new();
+        let mut csr_entries = Vec::new();
+        let third = degree / 3;
+        for i in 0..degree {
+            let k = perm(i);
+            // Neighbors collide modulo `degree / 2 + 1`, giving parallel edges.
+            let nbr = Vid::new(1 + (k % (degree / 2 + 1)));
+            let eid = Eid::new(10_000 + perm(degree - i));
+            expected.push((nbr, eid));
+            if i < third {
+                csr_entries.push((0u64, nbr, eid, 1u64));
+            } else if i < 2 * third {
+                am.insert_edge(Vid::new(0), nbr, eid, 1, 2);
+            } else {
+                // Placed after the freeze below.
+                continue;
+            }
+        }
+        am.set_main_csr(
+            1,
+            Direction::Outgoing,
+            MainCsr::from_edge_entries(0, csr_entries),
+        );
+        let frozen = {
+            let mut active = am.active_overlay.write();
+            Arc::new(std::mem::take(&mut *active).freeze())
+        };
+        am.frozen_segments.write().push(frozen);
+        for &(nbr, eid) in expected.iter().skip(2 * third as usize) {
+            am.insert_edge(Vid::new(0), nbr, eid, 1, 3);
+        }
+        expected.sort_unstable();
+        (am, expected)
+    }
+
+    /// Neighbor order is part of the contract: shortest-path tie-breaking and
+    /// the edge reported for a parallel pair follow it, so it must not depend
+    /// on per-call hash seeds or on which layer holds an edge.
+    #[test]
+    fn get_neighbors_is_sorted_by_vid_then_eid_on_every_call() {
+        let (am, expected) = layered_fixture(60);
+        for _ in 0..30 {
+            assert_eq!(
+                am.get_neighbors(Vid::new(0), 1, Direction::Outgoing),
+                expected
+            );
+            assert_eq!(
+                am.get_neighbors_at_version(Vid::new(0), 1, Direction::Outgoing, u64::MAX),
+                expected
+            );
+        }
+    }
+
+    /// Sorting must not resurrect a tombstoned edge or duplicate an edge that
+    /// two layers both hold, and a self-loop read in both directions is still
+    /// one neighbor.
+    #[test]
+    fn get_neighbors_sorted_output_keeps_dedup_and_tombstones() {
+        let am = AdjacencyManager::new(1024 * 1024);
+        let csr = MainCsr::from_edge_entries(
+            0,
+            vec![
+                (0, Vid::new(9), Eid::new(5), 1),
+                (0, Vid::new(3), Eid::new(7), 1),
+            ],
+        );
+        am.set_main_csr(1, Direction::Outgoing, csr);
+        // Same edge again in the overlay (dual-write), a new one, a deleted one.
+        am.insert_edge(Vid::new(0), Vid::new(9), Eid::new(5), 1, 2);
+        am.insert_edge(Vid::new(0), Vid::new(3), Eid::new(2), 1, 2);
+        am.add_tombstone(Eid::new(7), Vid::new(0), Vid::new(3), 1, 3);
+        // Self-loop, seen once outgoing and once incoming.
+        am.insert_edge(Vid::new(0), Vid::new(0), Eid::new(11), 1, 2);
+
+        let out = am.get_neighbors(Vid::new(0), 1, Direction::Outgoing);
+        assert_eq!(
+            out,
+            vec![
+                (Vid::new(0), Eid::new(11)),
+                (Vid::new(3), Eid::new(2)),
+                (Vid::new(9), Eid::new(5)),
+            ]
+        );
+        let both = am.get_neighbors(Vid::new(0), 1, Direction::Both);
+        assert_eq!(both, out);
+        let at_v2 = am.get_neighbors_at_version(Vid::new(0), 1, Direction::Outgoing, 2);
+        assert_eq!(
+            at_v2,
+            vec![
+                (Vid::new(0), Eid::new(11)),
+                (Vid::new(3), Eid::new(2)),
+                (Vid::new(3), Eid::new(7)),
+                (Vid::new(9), Eid::new(5)),
+            ]
+        );
+    }
+
+    /// Micro-benchmark for the neighbor read path; run in release with
+    /// `--run-ignored only -E 'test(get_neighbors_cost)'`.
+    #[test]
+    #[ignore = "timing benchmark, run manually in release"]
+    fn get_neighbors_cost() {
+        for degree in [4u64, 16, 64, 512] {
+            let (am, expected) = layered_fixture(degree);
+            // Main-CSR-only variant: the common flushed-and-compacted case.
+            let csr_only = AdjacencyManager::new(64 * 1024 * 1024);
+            csr_only.set_main_csr(
+                1,
+                Direction::Outgoing,
+                MainCsr::from_edge_entries(
+                    0,
+                    expected.iter().map(|&(v, e)| (0u64, v, e, 1u64)).collect(),
+                ),
+            );
+            let iters = 2_000_000 / degree as usize;
+            for (name, m) in [("layered", &am), ("csr_only", &csr_only)] {
+                let start = std::time::Instant::now();
+                let mut sink = 0usize;
+                for _ in 0..iters {
+                    sink += m.get_neighbors(Vid::new(0), 1, Direction::Outgoing).len();
+                }
+                let ns = start.elapsed().as_nanos() as f64 / iters as f64;
+                eprintln!("degree={degree:4} {name:9} {ns:9.1} ns/call (sink {sink})");
+            }
+        }
     }
 }

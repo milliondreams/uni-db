@@ -270,6 +270,16 @@ pub struct UniInner {
     /// and parameter binding still run per execution, so cached reuse is
     /// parameter-value independent.
     pub(crate) plan_cache: Arc<std::sync::Mutex<crate::api::session::PlanCache>>,
+    /// The one background index-rebuild manager of this view, with its
+    /// worker task.
+    ///
+    /// Set at build when automatic rebuilds are enabled, otherwise created on
+    /// the first background rebuild. One per view matters twice over: every
+    /// manager's worker loops until shutdown, so a manager per call leaked a
+    /// worker per call, and every manager rewrites the same
+    /// `index_rebuild_state.json` from its own task map, so two of them
+    /// overwrite each other's tasks.
+    pub(crate) index_rebuild: tokio::sync::OnceCell<Arc<uni_store::storage::IndexRebuildManager>>,
 }
 
 /// Capacity of the transaction-write-path plan cache (entries).
@@ -329,10 +339,23 @@ pub struct DatabaseMetrics {
     pub uptime: Duration,
     /// Number of currently active sessions.
     pub active_sessions: usize,
-    /// Number of L1 compaction runs completed (0 until storage instrumentation).
+    /// Uncompacted flush generations: L0 flushes to L1 since the last
+    /// compaction. The count the write throttle compares against
+    /// `UniConfig::throttle`'s soft and hard limits.
     pub l1_run_count: usize,
-    /// Write throttle pressure (0.0–1.0, 0 until instrumentation).
+    /// How hard the write throttle is pushing back, from `l1_run_count`:
+    /// `0.0` below the soft limit, rising through the soft band, `1.0` at the
+    /// hard limit (writes stall, or with compaction disabled are refused).
+    /// `0.0` without a writer.
     pub write_throttle_pressure: ThrottlePressure,
+    /// Writes (statements, batches, or unscoped writer calls) that waited on
+    /// the write throttle since this database was opened.
+    pub write_throttle_waits: u64,
+    /// Total time those writes spent waiting.
+    pub write_throttle_wait_time: Duration,
+    /// Writes refused with [`UniError::WriteStalled`] since this database
+    /// was opened.
+    pub writes_stalled: u64,
     /// Current compaction status.
     pub compaction_status: uni_store::CompactionStatus,
     /// WAL size in bytes (0 until storage instrumentation).
@@ -343,6 +366,13 @@ pub struct DatabaseMetrics {
     pub total_queries: u64,
     /// Total transactions committed across all sessions.
     pub total_commits: u64,
+    /// Bytes held by the storage engine's metadata cache (Lance's shared
+    /// session), bounded by `UniConfig::lance_metadata_cache_bytes`. Shared
+    /// with every fork of this database. `0` for a backend without one.
+    pub storage_metadata_cache_bytes: u64,
+    /// Bytes held by the storage engine's index cache, bounded by
+    /// `UniConfig::lance_index_cache_bytes`. `0` for a backend without one.
+    pub storage_index_cache_bytes: u64,
 }
 
 /// Main entry point for Uni embedded database.
@@ -407,6 +437,39 @@ fn build_executor_template(
 }
 
 impl UniInner {
+    /// This view's background index-rebuild manager, created with its worker
+    /// on first use.
+    ///
+    /// # Errors
+    ///
+    /// Fails if a new manager cannot load the persisted rebuild state.
+    pub(crate) async fn index_rebuild_manager(
+        &self,
+    ) -> Result<Arc<uni_store::storage::IndexRebuildManager>> {
+        self.index_rebuild
+            .get_or_try_init(|| async {
+                let manager = Arc::new(
+                    uni_store::storage::IndexRebuildManager::new(
+                        self.storage.clone(),
+                        self.schema.clone(),
+                        self.config.index_rebuild.clone(),
+                    )
+                    .await
+                    .map_err(UniError::Internal)?,
+                );
+                let handle =
+                    Arc::clone(&manager).start_background_worker(self.shutdown_handle.subscribe());
+                track_task_with_scratch_claim(
+                    &self.shutdown_handle,
+                    self._temp_dir.as_ref(),
+                    handle,
+                );
+                Ok(manager)
+            })
+            .await
+            .cloned()
+    }
+
     /// Build a [`uni_bulk::BulkBackend`] handle bundle from this inner's
     /// fields for the bulk-write driver (`bulk_writer`/`appender`).
     pub(crate) fn bulk_backend(self: &Arc<Self>) -> uni_bulk::BulkBackend {
@@ -416,6 +479,33 @@ impl UniInner {
             schema: self.schema.clone(),
             shutdown: self.shutdown_handle.clone(),
             config: self.config.clone(),
+            // The view's one manager, so a deferred rebuild after a bulk load
+            // does not start a worker of its own. Weak: the backend must not
+            // keep the database alive.
+            rebuild_manager: Some({
+                let inner = Arc::downgrade(self);
+                Arc::new(move || {
+                    let inner = inner.clone();
+                    Box::pin(async move {
+                        let inner = inner
+                            .upgrade()
+                            .ok_or_else(|| anyhow::anyhow!("the database was dropped"))?;
+                        inner
+                            .index_rebuild_manager()
+                            .await
+                            .map_err(anyhow::Error::from)
+                    })
+                })
+            }),
+            // A re-drive publishes into the database directory, so it holds
+            // the scratch-directory claim, as every tracked writer does.
+            track_task: Some({
+                let shutdown = Arc::clone(&self.shutdown_handle);
+                let scratch = self._temp_dir.clone();
+                Arc::new(move |handle| {
+                    track_task_with_scratch_claim(&shutdown, scratch.as_ref(), handle);
+                })
+            }),
         }
     }
 
@@ -461,7 +551,10 @@ impl UniInner {
             defer_queue: self.defer_queue.clone(),
             ec_queue: self.ec_queue.clone(),
             scheduler_host: Arc::clone(&self.scheduler_host),
-            shutdown_handle: Arc::new(ShutdownHandle::new(Duration::from_secs(30))),
+            // Derived from the parent's, so the parent's shutdown (and `Drop for
+            // Uni`) signals, counts, and waits for the tasks this view starts:
+            // they write the same directory. Released when this inner drops.
+            shutdown_handle: Arc::new(self.shutdown_handle.derive()),
             locy_rule_registry,
             // Fork/snapshot inners must not persist rule mutations: keep them
             // ephemeral so a fork's registrations never touch the primary
@@ -489,6 +582,8 @@ impl UniInner {
             plan_cache: Arc::new(std::sync::Mutex::new(crate::api::session::PlanCache::new(
                 TX_PLAN_CACHE_CAPACITY,
             ))),
+            // A different storage view rebuilds into different datasets.
+            index_rebuild: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -504,11 +599,53 @@ impl UniInner {
             .await
             .map_err(UniError::Internal)?;
 
-        let pinned_storage = Arc::new(self.storage.pinned(manifest));
+        // The snapshot's tables may hold edge rows a later endpoint
+        // verification never read (compaction can drop them from the live
+        // tables), so plans over it distrust verifications newer than it. A
+        // private copy of the schema: this view is read-only.
+        let schema = self
+            .schema
+            .with_overlay(&uni_common::core::fork::SchemaDelta::empty());
+        schema
+            .distrust_verifications_after(manifest.created_at)
+            .map_err(UniError::Internal)?;
+        // An explicit snapshot reads its tables at the versions its restore
+        // point tagged; a flush manifest has none and reads the live tables
+        // under its version ceiling.
+        let restore_point = self
+            .storage
+            .snapshot_manager()
+            .load_restore_point(snapshot_id)
+            .await
+            .map_err(UniError::Internal)?;
+        let pinned_storage = Arc::new(match &restore_point {
+            Some(point) => self
+                .storage
+                .pinned_at_restore_point(manifest, &point.tables),
+            None => self.storage.pinned(manifest),
+        });
+        if !pinned_storage.history_is_whole() {
+            // A flush manifest is read from the live tables, and semantic
+            // compaction has since merged the rows it would read.
+            return Err(UniError::InvalidArgument {
+                arg: "snapshot_id".to_string(),
+                message: format!(
+                    "snapshot '{snapshot_id}' was written by a flush, not taken with \
+                     create_snapshot, and compaction has since merged the history it \
+                     needs; only explicit snapshots stay readable after compaction"
+                ),
+            });
+        }
+        // The copied VID-to-labels index holds the live labels; traversals
+        // filter target labels through it.
+        pinned_storage
+            .rewind_vid_labels_index_to_pin(&self.storage)
+            .await
+            .map_err(UniError::Internal)?;
 
         let prop_manager = Arc::new(PropertyManager::with_plugin_registry(
             pinned_storage.clone(),
-            self.schema.clone(),
+            schema.clone(),
             self.properties.cache_size(),
             self.plugin_registry.clone(),
         ));
@@ -530,7 +667,7 @@ impl UniInner {
         );
         Ok(self.derived_clone(
             pinned_storage,
-            self.schema.clone(),
+            schema,
             prop_manager,
             None,
             None,
@@ -568,10 +705,32 @@ impl UniInner {
         // construction, which matches the spec's fork-point snapshot
         // isolation.
         let merged_schema = self.schema.with_overlay(&scope.overlay());
+        // A verification of declared endpoints that started after this fork
+        // was created never read the fork's base data, so it must not narrow
+        // the fork's plans. A nested fork inherits its ancestors' bases too,
+        // which were created earlier still, so it trusts no verification at
+        // all -- only types enforced since creation.
+        let fork_info = scope.fork_info();
+        let trusted_since = if fork_info.parent_fork_id.is_some() {
+            chrono::DateTime::<chrono::Utc>::MIN_UTC
+        } else {
+            fork_info.created_at
+        };
+        merged_schema
+            .distrust_verifications_after(trusted_since)
+            .map_err(UniError::Internal)?;
         let forked_storage = Arc::new(
             self.storage
                 .at_fork_with_schema(scope.clone(), merged_schema.clone()),
         );
+
+        // Complete a bulk load on this fork that passed its commit point but
+        // whose publish was interrupted, before anything reads the fork: its
+        // marker lives in the fork's catalog namespace, which the primary's
+        // open never looks at. A no-op when no marker is present.
+        uni_bulk::recover_interrupted_bulk_load(&forked_storage)
+            .await
+            .map_err(UniError::Internal)?;
 
         let prop_manager = Arc::new(PropertyManager::with_plugin_registry(
             forked_storage.clone(),
@@ -632,6 +791,16 @@ impl UniInner {
             .unwrap_or(0);
         let replayed = forked_writer
             .replay_wal(fork_wal_hwm)
+            .await
+            .map_err(UniError::Internal)?;
+        // The fork's catalog view is never saved, so a downgrade stays in it.
+        forked_writer
+            .distrust_conformance_after_unmarked_writes(false)
+            .await
+            .map_err(UniError::Internal)?;
+        // As on the primary: a fork load completed by recovery above has its
+        // edges' declared endpoints checked once the fork's WAL is replayed.
+        uni_bulk::check_recovered_bulk_endpoints(&forked_storage, &forked_writer, true)
             .await
             .map_err(UniError::Internal)?;
         if replayed > 0 {
@@ -909,6 +1078,18 @@ impl Uni {
     pub fn metrics(&self) -> DatabaseMetrics {
         let schema_version = self.inner.schema.schema().schema_version as u64;
         let compaction_status = self.inner.storage.compaction_status().unwrap_or_default();
+        let throttle = self
+            .inner
+            .writer
+            .as_ref()
+            .map(|w| w.write_throttle_stats())
+            .unwrap_or_default();
+        let cache_usage = self
+            .inner
+            .storage
+            .backend()
+            .cache_usage()
+            .unwrap_or_default();
         DatabaseMetrics {
             l0_mutation_count: self.inner.cached_l0_mutation_count.load(Ordering::Relaxed),
             l0_estimated_size_bytes: self.inner.cached_l0_estimated_size.load(Ordering::Relaxed),
@@ -916,12 +1097,25 @@ impl Uni {
             uptime: self.inner.start_time.elapsed(),
             active_sessions: self.inner.active_session_count.load(Ordering::Relaxed),
             l1_run_count: compaction_status.l1_runs,
-            write_throttle_pressure: ThrottlePressure::default(),
+            write_throttle_pressure: ThrottlePressure::new(if self.inner.writer.is_some() {
+                uni_store::runtime::writer::write_throttle_pressure(
+                    &self.inner.config.throttle,
+                    self.inner.config.compaction.enabled,
+                    compaction_status.l1_runs,
+                )
+            } else {
+                0.0
+            }),
+            write_throttle_waits: throttle.waits,
+            write_throttle_wait_time: throttle.wait_time,
+            writes_stalled: throttle.stalled,
             compaction_status,
             wal_size_bytes: 0u64,
             wal_lsn: self.inner.cached_wal_lsn.load(Ordering::Relaxed),
             total_queries: self.inner.total_queries.load(Ordering::Relaxed),
             total_commits: self.inner.total_commits.load(Ordering::Relaxed),
+            storage_metadata_cache_bytes: cache_usage.metadata_bytes,
+            storage_index_cache_bytes: cache_usage.index_bytes,
         }
     }
 
@@ -986,6 +1180,40 @@ impl Uni {
         self.inner.storage.clone()
     }
 
+    /// Whether the bulk load `load_id` is applied.
+    ///
+    /// `true` once the load passed its commit point: its rows are visible, or
+    /// -- after a crash or a `BulkCommitIncomplete` -- the next open completes
+    /// it. `false` when it never reached the commit point, so nothing of it is
+    /// or will be visible and retrying it is safe. This is how a caller
+    /// settles a `BulkCommitOutcomeUnknown`, or a crash in the middle of
+    /// `BulkWriter::commit`, without risking a double load. `load_id` comes
+    /// from `BulkWriter::load_id`, `BulkStats::load_id`, or the error.
+    ///
+    /// Answered from the load's commit marker while it exists and from a
+    /// small receipt (`catalog/bulk_loads_applied/{load_id}.json`) written
+    /// before the marker is deleted. A load on a fork keeps its marker and
+    /// receipt under the fork's catalog namespace and is answered by
+    /// `Session::bulk_load_applied` on a session of that fork; here it answers
+    /// `false`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UniError::InvalidArgument`] if `load_id` is not a load id (a
+    /// UUID), and [`UniError::Internal`] if the store cannot be read: an
+    /// unreadable answer is never reported as `false`.
+    pub async fn bulk_load_applied(&self, load_id: &str) -> Result<bool> {
+        if uuid::Uuid::parse_str(load_id).is_err() {
+            return Err(UniError::InvalidArgument {
+                arg: "load_id".to_string(),
+                message: format!("'{load_id}' is not a bulk load id"),
+            });
+        }
+        uni_bulk::flush_intent::bulk_load_applied(&self.inner.storage, load_id)
+            .await
+            .map_err(UniError::Internal)
+    }
+
     /// Flush all uncommitted changes to persistent storage (L1).
     ///
     /// This forces a write of the current in-memory buffer (L0) to columnar files.
@@ -1018,7 +1246,7 @@ impl Uni {
 
         let snapshot_id = if let Some(writer) = &self.inner.writer {
             writer
-                .flush_to_l1(Some(name.to_string()))
+                .create_snapshot(Some(name.to_string()))
                 .await
                 .map_err(UniError::Internal)?
         } else {
@@ -1050,17 +1278,78 @@ impl Uni {
         Ok(manifests)
     }
 
-    /// Restore the database to a specific snapshot.
+    /// Restore the database to a snapshot taken with [`Self::create_snapshot`]
+    /// (or `CALL uni.admin.snapshot.create`).
     ///
-    /// **Note**: This currently requires a restart or re-opening of Uni to fully take effect
-    /// as it only updates the latest pointer.
+    /// Takes effect at once, in this handle and on disk: every later read sees
+    /// the snapshot's vertices, edges and property values and nothing written
+    /// after it, whether those writes were flushed or not. Writes after the
+    /// restore build on the restored state. The schema catalog is restored
+    /// too: labels, edge types, properties, indexes and constraints declared,
+    /// dropped, renamed or retyped after the snapshot are back as they were.
+    /// Background index builds wait for the restore and then run against the
+    /// restored store.
+    ///
+    /// # Errors
+    ///
+    /// [`UniError::ReadOnly`] on a read-only handle;
+    /// [`UniError::SnapshotNotFound`] for an unknown id;
+    /// [`UniError::RestoreBlockedByForks`] while the database has forks (a
+    /// restore does not rewind fork branches, so drop them first);
+    /// [`UniError::Internal`] when the snapshot was not taken by
+    /// `create_snapshot` (a manifest written by an ordinary flush has no
+    /// restore point) or was taken before restore points recorded the
+    /// catalog, while a transaction is open or a bulk load is publishing, or
+    /// when a step fails. A failure after the rewind started is completed by
+    /// the next open.
     pub async fn restore_snapshot(&self, snapshot_id: &str) -> Result<()> {
-        self.inner
-            .storage
-            .snapshot_manager()
-            .set_latest_snapshot(snapshot_id)
+        let writer = self
+            .inner
+            .writer
+            .as_ref()
+            .ok_or_else(|| UniError::ReadOnly {
+                operation: "restore_snapshot".to_string(),
+            })?;
+        writer
+            .restore_snapshot(snapshot_id)
             .await
-            .map_err(UniError::Internal)
+            .map_err(|e| match e.downcast::<UniError>() {
+                Ok(typed) => typed,
+                Err(other) => UniError::Internal(other),
+            })
+    }
+
+    /// Delete a snapshot: its restore point, its names, its manifest, and the
+    /// tags pinning the storage versions it recorded.
+    ///
+    /// A restorable snapshot keeps every version it recorded for as long as
+    /// it exists, whatever `compaction.version_retention` says. Once deleted,
+    /// the next compaction's version cleanup reclaims the versions no other
+    /// snapshot pins. Other snapshots are unaffected and stay restorable.
+    /// Also `CALL uni.admin.snapshot.delete(id)`.
+    ///
+    /// # Errors
+    ///
+    /// [`UniError::ReadOnly`] on a read-only handle;
+    /// [`UniError::SnapshotNotFound`] for an unknown id;
+    /// [`UniError::Internal`] while a restore is incomplete (reopen to
+    /// complete it), while a fork was created from the snapshot, or when a
+    /// step fails. A failed deletion can be run again.
+    pub async fn delete_snapshot(&self, snapshot_id: &str) -> Result<()> {
+        let writer = self
+            .inner
+            .writer
+            .as_ref()
+            .ok_or_else(|| UniError::ReadOnly {
+                operation: "delete_snapshot".to_string(),
+            })?;
+        writer
+            .delete_snapshot(snapshot_id)
+            .await
+            .map_err(|e| match e.downcast::<UniError>() {
+                Ok(typed) => typed,
+                Err(other) => UniError::Internal(other),
+            })
     }
 
     // ── Compaction ──────────────────────────────────────────────────────
@@ -1106,6 +1395,10 @@ impl Uni {
     /// Propagates a failure to stop the background tasks. A flush failure is
     /// logged rather than propagated, matching the previous behaviour.
     pub async fn shutdown_in_place(&self) -> Result<()> {
+        // Stop an in-flight compaction at its next safe point rather than
+        // letting it run to completion against a closing database.
+        self.inner.storage.cancel_compaction();
+
         // Flush pending data.
         if let Some(writer) = &self.inner.writer {
             if let Err(e) = writer.flush_to_l1(None).await {
@@ -1172,6 +1465,26 @@ impl Uni {
     pub fn uri(&self) -> &str {
         &self.inner.uri
     }
+
+    /// Number of tracked background tasks still running.
+    ///
+    /// Counts the tasks tracked by the shutdown handle and the async-flush
+    /// stream tasks. Zero after [`Self::shutdown_in_place`] returns unless a
+    /// task overran the shutdown grace period.
+    #[must_use]
+    pub fn background_task_count(&self) -> usize {
+        self.inner.shutdown_handle.live_task_count() + self.live_flush_stream_count()
+    }
+
+    /// Async-flush stream tasks still running (zero without a writer or with
+    /// async flush off).
+    fn live_flush_stream_count(&self) -> usize {
+        self.inner
+            .writer
+            .as_ref()
+            .and_then(|w| w.flush_coordinator())
+            .map_or(0, |coord| coord.live_stream_count())
+    }
 }
 
 /// Removes a temporary database's scratch directory, retrying briefly.
@@ -1196,52 +1509,88 @@ fn reap_dir(path: &std::path::Path) {
     }
 }
 
+/// How long `Drop for Uni` waits for background tasks to finish.
+///
+/// Compaction stops at its next safe point once cancelled, so the wait is
+/// normally milliseconds; the bound covers one in-flight Lance commit or index
+/// rebuild. Past it the tasks are left running and a warning is logged.
+pub const DROP_TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a writable open waits for another handle's compaction on the same
+/// directory to finish before failing.
+const FOREIGN_COMPACTION_WAIT: Duration = Duration::from_secs(30);
+
 impl Drop for Uni {
+    /// Stops background work and waits for it, bounded.
+    ///
+    /// Cancels compaction, waits for in-flight async-flush streams, signals
+    /// every tracked task, and waits for those too — all within
+    /// [`DROP_TASK_JOIN_TIMEOUT`] — so a pass or a stream does not keep
+    /// rewriting a directory its owner has given up (and that the caller may
+    /// delete or reopen next). The wait observes the tasks rather than driving
+    /// them, so it depends on where the drop runs:
+    ///
+    /// * no runtime on this thread, or a `multi_thread` runtime: waits (on a
+    ///   runtime worker, inside `block_in_place`);
+    /// * a `current_thread` runtime: does not wait, since the tasks run on
+    ///   this very thread and blocking it would stall them until the bound.
+    ///   Call [`Uni::shutdown`] there instead.
     fn drop(&mut self) {
-        self.inner.shutdown_handle.shutdown_blocking();
-        self.await_scratch_claims();
-        tracing::debug!("Uni dropped, shutdown signal sent");
+        self.inner.storage.cancel_compaction();
+        let coord = self
+            .inner
+            .writer
+            .as_ref()
+            .and_then(|w| w.flush_coordinator());
+        let handle = &self.inner.shutdown_handle;
+        // Waits, in order and under one deadline: for the async-flush stream
+        // tasks (awaited by the coordinator, not tracked by the shutdown
+        // handle; one left running keeps writing Lance data into the directory
+        // after `drop` returns), then — once their submissions are queued — for
+        // the tracked tasks, the flush finalizer among them.
+        let wait_all = || {
+            let deadline = Instant::now() + DROP_TASK_JOIN_TIMEOUT;
+            let mut streams = self.live_flush_stream_count();
+            while streams > 0 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(2));
+                streams = self.live_flush_stream_count();
+            }
+            close_flush_submit_channel(coord);
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            handle.shutdown_and_wait_blocking(remaining) + streams
+        };
+        let live = match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+            Err(_) => wait_all(),
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(wait_all),
+            Ok(_) => {
+                close_flush_submit_channel(coord);
+                handle.shutdown_blocking();
+                0
+            }
+        };
+        if live > 0 {
+            tracing::warn!(
+                live,
+                timeout = ?DROP_TASK_JOIN_TIMEOUT,
+                "Uni dropped with background tasks still running; call \
+                 `Uni::shutdown` to wait for them"
+            );
+        }
+        tracing::debug!("Uni dropped, background tasks signalled");
     }
 }
 
-impl Uni {
-    /// Give the background tasks a bounded chance to release their scratch-dir
-    /// claims before this handle goes away.
-    ///
-    /// Ordering removal by ownership (see `ScratchDir`) is correct only while
-    /// something still runs the tasks that release the claims. At process exit
-    /// it may not: the embedder's runtime is abandoned, the tasks never wake,
-    /// the `Arc` is never released, and the directory is then removed by
-    /// *nothing at all* — strictly worse than the racy removal it replaced.
-    /// Measured at ~15% of exits with a disk-backed `TMPDIR`; a tmpfs `/tmp`
-    /// drains fast enough to hide it, which is why the first Python probe of
-    /// this read 0/200.
-    ///
-    /// Only runs off a runtime thread — the embedder-teardown case. Inside a
-    /// runtime the tasks are being driven already, and on a `current_thread`
-    /// runtime blocking here would deadlock the very tasks being waited on.
-    fn await_scratch_claims(&self) {
-        let Some(scratch) = self.inner._temp_dir.as_ref() else {
-            return;
-        };
-        if tokio::runtime::Handle::try_current().is_ok() {
-            return;
-        }
-        // The flush-coordinator finalizer blocks on its submit channel and
-        // never sees the shutdown broadcast, so it would hold its claim until
-        // the deadline every single time — turning this bounded wait into an
-        // unconditional one. `shutdown_in_place` closes the channel for the
-        // same reason; this is the synchronous half of that.
-        if let Some(writer) = self.inner.writer.as_ref()
-            && let Some(coord) = writer.flush_coordinator()
-        {
-            coord.close_submit_channel();
-        }
-        // One claim is `UniInner`'s own; any excess belongs to a live task.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while Arc::strong_count(scratch) > 1 && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+/// Closes the async-flush coordinator's submit channel, if there is one.
+///
+/// The finalizer blocks on that channel and never sees the shutdown broadcast;
+/// without closing it, a wait for the tracked tasks would run to its bound
+/// every time. Buffered submissions are still finalized before it exits.
+/// `shutdown_in_place` closes it for the same reason.
+fn close_flush_submit_channel(
+    coord: Option<&Arc<uni_store::runtime::flush_coordinator::FlushCoordinator>>,
+) {
+    if let Some(coord) = coord {
+        coord.close_submit_channel();
     }
 }
 
@@ -1275,7 +1624,8 @@ fn track_task_with_scratch_claim(
 /// Held as an `Arc` by `UniInner` **and** by every background task that can
 /// write into the directory. That is the whole point: on the bare-drop path
 /// (`db = Uni.temporary()` with no `with` block, from Python) `Drop for Uni`
-/// only calls `shutdown_blocking`, which sends a broadcast and awaits nothing.
+/// used to only send a broadcast and await nothing; it now waits, bounded, but
+/// not on a `current_thread` runtime, so the ordering is still needed.
 /// With the guard owned solely by `UniInner`, teardown removed the directory
 /// *successfully* and the auto-flush task — waking on that very same broadcast
 /// to perform its final flush — then wrote a catalog manifest and recreated the
@@ -1303,11 +1653,12 @@ impl Drop for ScratchDir {
 }
 
 impl Drop for UniInner {
-    /// Reap the scratch directory on the implicit teardown path.
+    /// Signal this view's own background tasks, and reap the scratch directory
+    /// on the implicit teardown path.
     ///
     /// A caller who never calls [`Uni::shutdown`] — `db = Uni.temporary()` with
-    /// no `with` block, from Python — reached only `Drop for Uni`, whose
-    /// `shutdown_blocking` sends a broadcast and awaits nothing. Cleanup then
+    /// no `with` block, from Python — reached only `Drop for Uni`, which then
+    /// sent a broadcast and awaited nothing. Cleanup then
     /// fell through to `TempDir`'s own `Drop`: one un-retried `remove_dir_all`
     /// whose error is discarded. That call walks and then unlinks, so a
     /// background flush landing mid-walk yields `ENOTEMPTY` and the directory
@@ -1317,6 +1668,11 @@ impl Drop for UniInner {
     /// when the *last* `Arc` dies, not when one handle goes out of scope while
     /// a `Session` still holds a reference to the data underneath it.
     fn drop(&mut self) {
+        // Stop the tasks this view started; nothing can reach them any more. A
+        // fork's last session going away is the common case. Tasks of views
+        // derived from this one (a nested fork) are left alone, and the tasks
+        // stay tracked by the root handle, whose shutdown still waits for them.
+        self.shutdown_handle.release();
         // Releasing the `Arc` is the whole teardown: `ScratchDir::drop` removes
         // the directory once no background task still holds a claim.
         drop(self._temp_dir.take());
@@ -1471,6 +1827,7 @@ impl UniBuilder {
 
     /// Open the database (async).
     pub async fn build(mut self) -> Result<Uni> {
+        self.config.warn_deprecated_options();
         let uri = self.uri.clone();
         // Share one guard between `UniInner` and every background task that can
         // write into the scratch directory, so removal is ordered after the
@@ -1625,6 +1982,11 @@ impl UniBuilder {
                 .await
                 .map_err(UniError::Internal)?,
         );
+        // A local-only store keeps the catalog under the database directory;
+        // a restore syncs it there before clearing its intent.
+        if !is_hybrid && !is_remote_uri {
+            schema_manager.set_local_file(PathBuf::from(&uri).join(schema_obj_path.as_ref()));
+        }
 
         // Hoisted above the persisted-Locy-rule load below, which needs the
         // registry to compile rules against a registry-backed monotonicity
@@ -1717,6 +2079,17 @@ impl UniBuilder {
 
         let storage = Arc::new(storage);
 
+        // A handle dropped on this path a moment ago may still be inside a
+        // compaction pass (a `current_thread` runtime cannot join it on drop).
+        // Its table overwrites would discard this handle's first writes, so a
+        // writable open waits it out. A no-op when nothing holds the lock.
+        if !self.read_only {
+            storage
+                .wait_for_foreign_compaction(FOREIGN_COMPACTION_WAIT)
+                .await
+                .map_err(UniError::Internal)?;
+        }
+
         // Create shutdown handle
         let shutdown_handle = Arc::new(ShutdownHandle::new(Duration::from_secs(30)));
 
@@ -1750,6 +2123,12 @@ impl UniBuilder {
         // a committed-but-unfinalized one forward (it may flip the latest pointer,
         // so it must run first). A no-op when no marker is present (H9).
         uni_bulk::recover_interrupted_bulk_load(&storage)
+            .await
+            .map_err(UniError::Internal)?;
+        // A snapshot restore cut short rewinds the rest of the store and
+        // publishes its manifest, so it too runs before the latest snapshot is
+        // read.
+        uni_store::snapshot::restore::recover_interrupted_restore(&storage)
             .await
             .map_err(UniError::Internal)?;
 
@@ -1990,8 +2369,22 @@ impl UniBuilder {
                 info!("WAL recovery: replayed {} mutations", replayed);
             }
         }
+        // A WAL segment or latest manifest written by a binary that does not
+        // enforce declared edge endpoints voids the catalog's conformance
+        // records; a read-only open downgrades its in-memory view only.
+        writer
+            .distrust_conformance_after_unmarked_writes(!self.read_only)
+            .await
+            .map_err(UniError::Internal)?;
+        // A bulk load completed by recovery above, before the WAL was
+        // replayed, has its edges' declared endpoints checked now, when a
+        // label removal still in the WAL is visible.
+        uni_bulk::check_recovered_bulk_endpoints(&storage, &writer, !self.read_only)
+            .await
+            .map_err(UniError::Internal)?;
 
         // Wire up IndexRebuildManager for post-flush automatic rebuild scheduling
+        let mut auto_rebuild_manager = None;
         if !self.read_only && self.config.index_rebuild.auto_rebuild_enabled {
             let rebuild_manager = Arc::new(
                 uni_store::storage::IndexRebuildManager::new(
@@ -2009,8 +2402,9 @@ impl UniBuilder {
             track_task_with_scratch_claim(&shutdown_handle, scratch_dir.as_ref(), handle);
 
             writer
-                .set_index_rebuild_manager(rebuild_manager)
+                .set_index_rebuild_manager(Arc::clone(&rebuild_manager))
                 .map_err(UniError::Internal)?;
+            auto_rebuild_manager = Some(rebuild_manager);
         }
 
         // Start background flush checker for time-based auto-flush
@@ -2038,7 +2432,7 @@ impl UniBuilder {
                 loop {
                     tokio::select! {
                         _ = ticker.tick() => {
-                            if let Err(e) = writer_clone.check_flush().await {
+                            if let Err(e) = writer_clone.check_flush_in_background().await {
                                 tracing::warn!("Background flush check failed: {}", e);
                             }
                         }
@@ -2248,11 +2642,23 @@ impl UniBuilder {
             let mut shutdown_rx = shutdown_handle.subscribe();
             let handle = tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(std::time::Duration::from_millis(50));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     tokio::select! {
                         _ = ticker.tick() => {
-                            ec.flush_due(std::time::Instant::now());
-                            queue.tick();
+                            // A tick fires deferred triggers (synchronous plugin
+                            // calls) and rewrites the fsynced deferral sidecar,
+                            // so it runs on the blocking pool: inline, a slow
+                            // plugin or disk stalled the executor thread, which
+                            // on a `current_thread` runtime is every task.
+                            let (ec, queue) = (Arc::clone(&ec), Arc::clone(&queue));
+                            let tick = tokio::task::spawn_blocking(move || {
+                                ec.flush_due(std::time::Instant::now());
+                                queue.tick();
+                            });
+                            if let Err(e) = tick.await {
+                                tracing::error!(error = %e, "deferral tick did not complete");
+                            }
                         }
                         _ = shutdown_rx.recv() => { break; }
                     }
@@ -2390,6 +2796,7 @@ impl UniBuilder {
                 plan_cache: Arc::new(std::sync::Mutex::new(crate::api::session::PlanCache::new(
                     TX_PLAN_CACHE_CAPACITY,
                 ))),
+                index_rebuild: tokio::sync::OnceCell::new_with(auto_rebuild_manager),
             }),
         };
 

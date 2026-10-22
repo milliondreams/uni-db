@@ -199,6 +199,9 @@ async fn a_failed_mutation_batch_halts_instead_of_checkpointing_past_it() {
         vec![100],
         "commit 101 must NOT be delivered as an empty batch carrying its real LSN range"
     );
+    // Checkpoints are persisted off the commit path; wait for every one
+    // handed to the writer so far before reading the sidecar.
+    runtime.flush_checkpoints().await;
     assert_eq!(
         sidecar
             .lookup("healthy")

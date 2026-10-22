@@ -211,6 +211,32 @@ Be intentional about nullable properties:
 | Descriptive | `citation_count` not `cc` | Self-documenting |
 | No prefixes | `title` not `paper_title` | Label provides context |
 
+**Reserved names.** A few names belong to the engine. A write that sets a
+property named `overflow_json`, `_vid`, `_uid`, `_eid`, `_labels`,
+`_label`, `_type`, `_type_name`, `_src`, `_dst`, `_src_vid`, `_dst_vid`,
+`_all_props`, `_score`, `_fwd`, `_deleted`, `_version`, `_created_at`,
+`_updated_at`, Lance's row columns (`_rowid`, `_rowaddr`, `_rowoffset`,
+`_row_created_at_version`, `_row_last_updated_at_version`), `__set_struct__`
+or `__with_passthrough__`, or one starting with `_gen_`, `__fde_` or
+`__alias_of__` — through `CREATE`, `SET`, `MERGE`, bulk insert, the bulk
+writer or the Python API — fails with
+`UniError::InvalidIdentifier` (Python: `UniInvalidIdentifierError`), declared
+label or not. Any other name is yours, including one that starts with `_`: an
+undeclared `_source` or `__tag` property reads back like any other, through
+`n._source`, `keys(n)`, `properties(n)`, `n {.*}`, the returned node and Locy.
+Declaring a property cannot use a leading `_` at all, nor `ext_id`, `eid`,
+`src_vid`, `dst_vid` or `op`. `ext_id` is the vertex's external id; `eid`,
+`src_vid`, `dst_vid`, `op`, `type`, `labels` and `props_json` work as
+undeclared properties.
+
+**Characters a declared property cannot use.** A declared property is a storage
+column, and a column name cannot contain `.` or a backtick: declaring one fails
+with a schema error (through `CREATE LABEL`, `CREATE EDGE TYPE`,
+`ALTER … ADD PROPERTY`, rename, and the schema builder). Such a name still works
+as an undeclared property, written with backticks in Cypher (`` n.`a.b` ``,
+`` n.`has``tick` ``). Spaces, keywords and other punctuation are fine in a
+declared name.
+
 ### Avoid Property Bloat
 
 ```
@@ -454,6 +480,18 @@ RETURN json_get_string(p.overflow_json, 'github')
 - `json_get_int(overflow_json, 'key')` - Extract integer
 - `json_get_float(overflow_json, 'key')` - Extract float
 - `json_get_bool(overflow_json, 'key')` - Extract boolean
+
+### A Declaration Applies Only to Its Own Label
+
+Declaring `price: FLOAT` on `Product` types `price` on `Product` vertices only.
+The same name on another label, or on a relationship type that does not
+declare it, keeps whatever value was written: `MATCH (o:Offer) RETURN o.price`
+returns the integer or string stored there, in a `CALL { ... }` subquery and a
+Locy rule as much as in a plain `MATCH`. A relationship matched over several
+types (`[e]`, `[e:A|B]`) takes a declared type only when every one of those
+types declares it the same way. A `UNION` whose branches return different
+types for one column (a typed property and an untyped one, or `1` and `'a'`)
+returns each row's own value.
 
 ### Enforcing Strict Schema
 

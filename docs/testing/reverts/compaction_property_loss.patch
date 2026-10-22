@@ -1,19 +1,18 @@
-diff --git b/crates/uni-store/src/storage/compaction.rs a/crates/uni-store/src/storage/compaction.rs
-index 032307e69..b0bffab3a 100644
---- b/crates/uni-store/src/storage/compaction.rs
-+++ a/crates/uni-store/src/storage/compaction.rs
-@@ -6,9 +6,7 @@ use crate::storage::manager::StorageManager;
+diff --git a/crates/uni-store/src/storage/compaction.rs b/crates/uni-store/src/storage/compaction.rs
+--- a/crates/uni-store/src/storage/compaction.rs
++++ b/crates/uni-store/src/storage/compaction.rs
+@@ -6,9 +6,7 @@
  use anyhow::{Result, anyhow};
  use arrow_array::Array;
  use arrow_array::builder::{ListBuilder, UInt64Builder};
 -use arrow_array::{
--    LargeBinaryArray, ListArray, RecordBatch, StringArray, TimestampNanosecondArray, UInt64Array,
+-    LargeBinaryArray, ListArray, RecordBatch, TimestampNanosecondArray, UInt64Array,
 -};
 +use arrow_array::{ListArray, RecordBatch, UInt64Array};
  use metrics;
  use std::collections::{HashMap, HashSet};
  use std::sync::Arc;
-@@ -151,8 +149,6 @@ impl Compactor {
+@@ -236,8 +234,6 @@
          let mut vertex_state: HashMap<Vid, (Properties, bool)> = HashMap::new();
          let mut vertex_versions: HashMap<Vid, u64> = HashMap::new();
          let mut vertex_labels: HashMap<Vid, Vec<String>> = HashMap::new();
@@ -22,7 +21,7 @@ index 032307e69..b0bffab3a 100644
  
          let mut rows_processed = 0;
  
-@@ -182,27 +178,6 @@ impl Compactor {
+@@ -267,23 +263,6 @@
                  .column_by_name("_labels")
                  .and_then(|c| c.as_any().downcast_ref::<arrow_array::ListArray>());
  
@@ -32,9 +31,6 @@ index 032307e69..b0bffab3a 100644
 -            // their physical columns and put them back into the property map, so
 -            // `build_record_batch_with_timestamps` re-derives `ext_id`, `_uid`
 -            // and `overflow_json` from the same inputs the flush path used.
--            let ext_id_col = batch
--                .column_by_name("ext_id")
--                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
 -            let overflow_col = batch
 -                .column_by_name("overflow_json")
 -                .and_then(|c| c.as_any().downcast_ref::<LargeBinaryArray>());
@@ -46,23 +42,15 @@ index 032307e69..b0bffab3a 100644
 -            let updated_col = batch
 -                .column_by_name("_updated_at")
 -                .and_then(|c| c.as_any().downcast_ref::<TimestampNanosecondArray>());
--
+ 
              for i in 0..batch.num_rows() {
                  let vid = Vid::from(vid_col.value(i));
-                 let version = ver_col.value(i);
-@@ -259,45 +234,6 @@ impl Compactor {
+@@ -342,38 +321,6 @@
                      }
                  }
  
 -                // Restore the reserved columns the loop above cannot reach.
--                if let Some(col) = ext_id_col
--                    && !col.is_null(i)
--                {
--                    row_props.insert(
--                        "ext_id".to_string(),
--                        Value::String(col.value(i).to_string()),
--                    );
--                }
+-                crate::storage::property_builder::restore_ext_id_column(&batch, i, &mut row_props);
 -                if let Some(col) = overflow_col
 -                    && !col.is_null(i)
 -                    && let Value::Map(overflow) =
@@ -96,12 +84,12 @@ index 032307e69..b0bffab3a 100644
                  crdt_merges += Self::merge_row_into_state(
                      row_props,
                      null_props,
-@@ -329,13 +263,11 @@ impl Compactor {
-         }
+@@ -404,13 +351,11 @@
  
-         if !valid_vertices.is_empty() {
--            let batch = dataset.build_record_batch_with_timestamps(
-+            let batch = dataset.build_record_batch(
+         let kept_rows: usize = kept.iter().map(RecordBatch::num_rows).sum();
+         if !valid_vertices.is_empty() || kept_rows > 0 {
+-            let merged = dataset.build_record_batch_with_timestamps(
++            let merged = dataset.build_record_batch(
                  &valid_vertices,
                  &valid_deleted,
                  &valid_versions,
@@ -109,5 +97,5 @@ index 032307e69..b0bffab3a 100644
 -                Some(&created_at),
 -                Some(&updated_at),
              )?;
-             dataset
-                 .replace(self.storage.backend(), batch, &schema)
+             let batch = append_kept_rows(merged, &kept)?;
+             let merged_through = merged_rows

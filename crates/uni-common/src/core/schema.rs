@@ -863,6 +863,83 @@ pub struct EdgeTypeMeta {
     pub state: SchemaElementState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Whether every stored edge of this type is known to carry endpoints its
+    /// declaration accepts. Absent in a catalog written before declared
+    /// endpoints were enforced, which reads as [`EndpointConformance::Unverified`].
+    #[serde(default)]
+    pub endpoint_conformance: EndpointConformance,
+}
+
+/// What is known about stored edges conforming to their type's declared endpoints.
+///
+/// The planner narrows an unlabelled endpoint of a typed pattern to the
+/// declared labels only when this says no stored edge can violate the
+/// declaration; narrowing over a violating edge would silently drop it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum EndpointConformance {
+    /// Nothing is known: a legacy catalog, an edge type whose name may already
+    /// label stored edges, or a verification that found violations.
+    #[default]
+    Unverified,
+    /// The edge type was created while writes enforced its declaration, so no
+    /// edge of it could ever be written with a violating endpoint.
+    Enforced,
+    /// A verification pass read every stored edge of the type as of `at` and
+    /// found none violating; every write since is enforced.
+    Verified {
+        /// Start of the verified read; a fork created earlier may hold edges
+        /// the pass never saw.
+        at: DateTime<Utc>,
+    },
+}
+
+/// Writer feature: every edge write is checked against its type's declared
+/// endpoints, and every label removal that would orphan an edge is refused.
+///
+/// A binary that enforces endpoints records this in each catalog save
+/// ([`Schema::writer_features`]), each snapshot manifest and each WAL segment
+/// it writes. A manifest or segment without it may come from an older binary
+/// that wrote edges unchecked, so on open the
+/// [`EndpointConformance::Enforced`] / [`EndpointConformance::Verified`]
+/// records no longer hold (see [`SchemaManager::distrust_all_conformance`]).
+pub const WRITER_FEATURE_ENDPOINT_ENFORCEMENT: &str = "endpoint_enforcement";
+
+/// The writer features this binary records on what it writes.
+pub const WRITER_FEATURES: &[&str] = &[WRITER_FEATURE_ENDPOINT_ENFORCEMENT];
+
+/// The writer features this binary records, as owned strings.
+#[must_use]
+pub fn current_writer_features() -> Vec<String> {
+    WRITER_FEATURES.iter().map(|f| (*f).to_string()).collect()
+}
+
+/// `true` when `features` (read from a catalog, manifest or WAL segment)
+/// says its writer enforced declared edge endpoints.
+#[must_use]
+pub fn writer_enforces_endpoints(features: &[String]) -> bool {
+    features
+        .iter()
+        .any(|f| f == WRITER_FEATURE_ENDPOINT_ENFORCEMENT)
+}
+
+impl EndpointConformance {
+    /// `true` when no stored edge of the type can violate its declaration.
+    #[must_use]
+    pub fn is_conforming(&self) -> bool {
+        !matches!(self, Self::Unverified)
+    }
+
+    /// Short name for display: `unverified`, `enforced` or `verified`.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Unverified => "unverified",
+            Self::Enforced => "enforced",
+            Self::Verified { .. } => "verified",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -1015,6 +1092,18 @@ pub fn is_virtual_label_id(id: u16) -> bool {
     (VIRTUAL_LABEL_ID_START..VIRTUAL_LABEL_ID_SENTINEL).contains(&id)
 }
 
+/// The labels or edge types an entity is known to carry, for resolving a
+/// property's declared type with [`Schema::scoped_property_meta`].
+#[derive(Clone, Copy, Debug)]
+pub enum EntityScope<'a, S> {
+    /// The entity carries every one of these: a vertex matched as `(n:A:B)`,
+    /// or a relationship of a single named type.
+    AllOf(&'a [S]),
+    /// The entity carries exactly one of these: `[e:R|Q]`, `(n:A|B)`, or a
+    /// traversal target whose declared endpoint labels are these.
+    OneOf(&'a [S]),
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Schema {
     pub schema_version: u32,
@@ -1028,6 +1117,18 @@ pub struct Schema {
     /// Registry for schemaless edge types (dynamically assigned IDs)
     #[serde(default)]
     pub schemaless_registry: SchemalessEdgeTypeRegistry,
+    /// Writer features of the binary that saved this catalog (see
+    /// [`WRITER_FEATURES`]). Empty in a catalog saved by an older binary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub writer_features: Vec<String>,
+    /// Id of a snapshot manifest without writer features that an enforcing
+    /// binary found as the latest one on open and accepted as predating it.
+    ///
+    /// Manifests this binary writes carry [`WRITER_FEATURES`]; one without
+    /// them is either this accepted pre-existing state, or an older binary
+    /// flushed after it (see [`SchemaManager::distrust_all_conformance`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_unmarked_manifest: Option<String>,
 }
 
 impl Default for Schema {
@@ -1040,6 +1141,8 @@ impl Default for Schema {
             indexes: Vec::new(),
             constraints: Vec::new(),
             schemaless_registry: SchemalessEdgeTypeRegistry::new(),
+            writer_features: current_writer_features(),
+            trusted_unmarked_manifest: None,
         }
     }
 }
@@ -1066,6 +1169,49 @@ impl Schema {
             .iter()
             .find(|(_, meta)| meta.id == label_id)
             .map(|(name, _)| name.as_str())
+    }
+
+    /// The declaration that types `prop` on an entity in `scope`, if the
+    /// schema pins one.
+    ///
+    /// A property's declared type belongs to the label or edge type that
+    /// declares it, not to the property name: `F.v FLOAT` says nothing about
+    /// `v` on a vertex of the undeclared label `S`, which stores whatever was
+    /// written. Every place that types a property column ahead of reading it
+    /// resolves the type here, from the labels the entity is known to carry,
+    /// so none of them can borrow a declaration from an unrelated label.
+    ///
+    /// - [`EntityScope::AllOf`]: the entity carries every listed label. The
+    ///   labels among them that declare `prop` decide; a write coerces under
+    ///   each of them, so their declarations must agree to give a type.
+    /// - [`EntityScope::OneOf`]: the entity carries exactly one of them. Every
+    ///   alternative must declare `prop` at the same type, since a single
+    ///   alternative that does not leaves its values untyped.
+    ///
+    /// `None` when the scope is empty, no label in it declares `prop`, or the
+    /// declarations disagree. The caller then types the column as the
+    /// dynamically typed stored value (`DataType::CypherValue`), which holds
+    /// anything a schemaless write can store.
+    pub fn scoped_property_meta<S: AsRef<str>>(
+        &self,
+        scope: EntityScope<'_, S>,
+        prop: &str,
+    ) -> Option<&PropertyMeta> {
+        let declared = |label: &S| self.properties.get(label.as_ref())?.get(prop);
+        match scope {
+            EntityScope::AllOf(labels) => {
+                let mut metas = labels.iter().filter_map(declared);
+                let first = metas.next()?;
+                metas.all(|m| m.r#type == first.r#type).then_some(first)
+            }
+            EntityScope::OneOf(labels) => {
+                let mut metas = labels.iter().map(declared);
+                let first = metas.next()??;
+                metas
+                    .all(|m| m.is_some_and(|m| m.r#type == first.r#type))
+                    .then_some(first)
+            }
+        }
     }
 
     /// Returns the label ID for a given label name.
@@ -1302,6 +1448,13 @@ pub struct SchemaManager {
     /// [`SchemaManager::save_if_dirty`] tests, so a mint that happens on a
     /// synchronous path can still be persisted later by an asynchronous one.
     persisted_version: AtomicU32,
+    /// [`Schema::writer_features`] as the catalog on disk held it when this
+    /// manager loaded it; the in-memory schema carries this binary's own
+    /// features so every save records them.
+    loaded_writer_features: Vec<String>,
+    /// The catalog file on the local filesystem, when the store is local;
+    /// see [`SchemaManager::set_local_file`].
+    local_file: std::sync::OnceLock<std::path::PathBuf>,
 }
 
 impl SchemaManager {
@@ -1360,11 +1513,15 @@ impl SchemaManager {
                     }
                 }
                 let loaded_version = schema.schema_version;
+                let loaded_writer_features =
+                    std::mem::replace(&mut schema.writer_features, current_writer_features());
                 Ok(Self {
                     store,
                     path: path.clone(),
                     schema: RwLock::new(Arc::new(schema)),
                     persisted_version: AtomicU32::new(loaded_version),
+                    loaded_writer_features,
+                    local_file: std::sync::OnceLock::new(),
                 })
             }
             Err(object_store::Error::NotFound { .. }) => Ok(Self {
@@ -1374,6 +1531,8 @@ impl SchemaManager {
                 // Nothing on disk yet, so the default schema counts as
                 // unwritten: the first `save_if_dirty` must actually write.
                 persisted_version: AtomicU32::new(0),
+                loaded_writer_features: current_writer_features(),
+                local_file: std::sync::OnceLock::new(),
             }),
             Err(e) => Err(anyhow::Error::from(e)),
         }
@@ -1423,6 +1582,21 @@ impl SchemaManager {
 
     pub fn path(&self) -> &ObjectStorePath {
         &self.path
+    }
+
+    /// Record where the catalog file lives on the local filesystem, so a
+    /// caller that must make a save durable can sync it
+    /// ([`SchemaManager::local_file`]). Set once, by the opener of a local
+    /// store; later calls are ignored.
+    pub fn set_local_file(&self, file: std::path::PathBuf) {
+        let _ = self.local_file.set(file);
+    }
+
+    /// The catalog file on the local filesystem, or `None` for a remote
+    /// store (whose `put` is durable) or a manager no opener described.
+    #[must_use]
+    pub fn local_file(&self) -> Option<&std::path::Path> {
+        self.local_file.get().map(std::path::PathBuf::as_path)
     }
 
     pub fn schema(&self) -> Arc<Schema> {
@@ -1556,6 +1730,9 @@ impl SchemaManager {
             // nothing; the commit path guards the rest by refusing to call it
             // at all for a forked session.
             persisted_version: AtomicU32::new(merged_version),
+            loaded_writer_features: self.loaded_writer_features.clone(),
+            // Never saved, so never synced.
+            local_file: std::sync::OnceLock::new(),
         })
     }
 
@@ -1693,6 +1870,14 @@ impl SchemaManager {
             ));
         }
 
+        // A new type's edges are all written under enforcement -- unless the
+        // name already labels schemaless edges, which were written unchecked
+        // and which the declared type reads by name.
+        let endpoint_conformance = if schema.schemaless_registry.id_by_name(name).is_some() {
+            EndpointConformance::Unverified
+        } else {
+            EndpointConformance::Enforced
+        };
         schema.edge_types.insert(
             name.to_string(),
             EdgeTypeMeta {
@@ -1701,10 +1886,137 @@ impl SchemaManager {
                 dst_labels,
                 state: SchemaElementState::Active,
                 description,
+                endpoint_conformance,
             },
         );
         schema.bump_version();
         Ok(id)
+    }
+
+    /// Record what is known about `name`'s stored edges conforming to its
+    /// declared endpoints.
+    ///
+    /// Bumps the schema version so plans built under the previous state are
+    /// not reused.
+    ///
+    /// # Errors
+    /// When `name` is not a declared edge type, or the schema lock is poisoned.
+    pub fn set_endpoint_conformance(
+        &self,
+        name: &str,
+        conformance: EndpointConformance,
+    ) -> Result<()> {
+        let mut guard = acquire_write(&self.schema, "schema")?;
+        let schema = Arc::make_mut(&mut *guard);
+        let meta = schema
+            .edge_types
+            .get_mut(name)
+            .ok_or_else(|| anyhow!("Edge type '{}' not found", name))?;
+        if meta.endpoint_conformance != conformance {
+            meta.endpoint_conformance = conformance;
+            schema.bump_version();
+        }
+        Ok(())
+    }
+
+    /// Distrust every verification that started after `fork_created_at`.
+    ///
+    /// A fork branches from the parent's data as of its creation. A
+    /// verification that started later read the parent, not the fork's base,
+    /// so it says nothing about edges the fork inherited or wrote before it --
+    /// those fall back to [`EndpointConformance::Unverified`] in the fork's
+    /// view. [`EndpointConformance::Enforced`] holds in every branch, since no
+    /// edge of such a type was ever written unchecked.
+    ///
+    /// Returns whether any record changed. The schema version is not bumped,
+    /// so a fork's merged view stays clean; a caller persisting the change
+    /// saves explicitly.
+    ///
+    /// # Errors
+    /// When the schema lock is poisoned.
+    pub fn distrust_verifications_after(&self, fork_created_at: DateTime<Utc>) -> Result<bool> {
+        let mut guard = acquire_write(&self.schema, "schema")?;
+        let stale = guard.edge_types.values().any(|m| {
+            matches!(m.endpoint_conformance, EndpointConformance::Verified { at } if at > fork_created_at)
+        });
+        if !stale {
+            return Ok(false);
+        }
+        let schema = Arc::make_mut(&mut *guard);
+        for meta in schema.edge_types.values_mut() {
+            if matches!(meta.endpoint_conformance, EndpointConformance::Verified { at } if at > fork_created_at)
+            {
+                meta.endpoint_conformance = EndpointConformance::Unverified;
+            }
+        }
+        Ok(true)
+    }
+
+    /// [`Schema::writer_features`] of the catalog as loaded from storage.
+    #[must_use]
+    pub fn loaded_writer_features(&self) -> &[String] {
+        &self.loaded_writer_features
+    }
+
+    /// The accepted pre-existing unmarked manifest, when the catalog on disk
+    /// was saved by an enforcing binary (an older binary's save drops it).
+    ///
+    /// # Errors
+    /// When the schema lock is poisoned.
+    pub fn trusted_unmarked_manifest(&self) -> Result<Option<String>> {
+        if !writer_enforces_endpoints(&self.loaded_writer_features) {
+            return Ok(None);
+        }
+        Ok(acquire_read(&self.schema, "schema")?
+            .trusted_unmarked_manifest
+            .clone())
+    }
+
+    /// Record `id` as the accepted pre-existing unmarked manifest. Persisted
+    /// by the next save; the schema version is not bumped.
+    ///
+    /// # Errors
+    /// When the schema lock is poisoned.
+    pub fn set_trusted_unmarked_manifest(&self, id: Option<String>) -> Result<()> {
+        let mut guard = acquire_write(&self.schema, "schema")?;
+        if guard.trusted_unmarked_manifest != id {
+            Arc::make_mut(&mut *guard).trusted_unmarked_manifest = id;
+        }
+        Ok(())
+    }
+
+    /// Set every [`EndpointConformance::Enforced`] and
+    /// [`EndpointConformance::Verified`] record to
+    /// [`EndpointConformance::Unverified`].
+    ///
+    /// For storage written by a binary that may not have enforced declared
+    /// endpoints: a snapshot manifest or WAL segment without
+    /// [`WRITER_FEATURE_ENDPOINT_ENFORCEMENT`]. Returns the edge types that
+    /// changed, sorted. The schema version is not bumped (this runs at open,
+    /// before any plan exists); a caller persisting the change saves
+    /// explicitly.
+    ///
+    /// # Errors
+    /// When the schema lock is poisoned.
+    pub fn distrust_all_conformance(&self) -> Result<Vec<String>> {
+        let mut guard = acquire_write(&self.schema, "schema")?;
+        let mut changed: Vec<String> = guard
+            .edge_types
+            .iter()
+            .filter(|(_, m)| m.endpoint_conformance.is_conforming())
+            .map(|(n, _)| n.clone())
+            .collect();
+        if changed.is_empty() {
+            return Ok(changed);
+        }
+        changed.sort();
+        let schema = Arc::make_mut(&mut *guard);
+        for name in &changed {
+            if let Some(meta) = schema.edge_types.get_mut(name) {
+                meta.endpoint_conformance = EndpointConformance::Unverified;
+            }
+        }
+        Ok(changed)
     }
 
     /// Delegates to [`Schema::get_or_assign_edge_type_id`].
@@ -2194,6 +2506,19 @@ pub fn validate_identifier(name: &str) -> Result<()> {
 /// Without this, declaring a property named e.g. `ext_id` produces an Arrow
 /// schema with two `ext_id` fields at flush time, which Lance rejects with
 /// "Duplicate field name" — silently losing all in-session writes on shutdown.
+///
+/// A declared property is a top-level storage column, and two characters
+/// cannot appear in one:
+///
+/// * `.`: Lance refuses the field at table creation (it reads the name as a
+///   struct path). The declaration used to succeed and accept writes, and then
+///   every flush of the label failed.
+/// * a backtick: Lance writes the field but cannot project it (see
+///   `uni-store`'s `lance_backtick_column_probe`), so after the first flush
+///   every read of the label failed with `No field named`.
+///
+/// An undeclared (schemaless) property of either name is unaffected: it lives
+/// in the overflow column, not a field of its own.
 pub fn validate_property_name(name: &str) -> Result<()> {
     if name.starts_with('_') {
         return Err(anyhow!(
@@ -2201,7 +2526,133 @@ pub fn validate_property_name(name: &str) -> Result<()> {
             name
         ));
     }
+    if let Some(c) = name.chars().find(|c| matches!(c, '.' | '`')) {
+        return Err(anyhow!(
+            "Property name '{}' cannot be declared: a declared property is a storage \
+             column, and a column name cannot contain '{}' (leave it undeclared to store it \
+             schemalessly)",
+            name,
+            c
+        ));
+    }
     validate_reserved_property_name(name)
+}
+
+/// Property names the engine reserves for its own bookkeeping.
+///
+/// One definition serves both directions: a write that uses one of these
+/// names (or a [`RESERVED_PROPERTY_PREFIXES`] name) is refused by
+/// [`check_written_property_names`], and every read path that separates an
+/// entity's user properties from its system fields hides exactly these — see
+/// [`is_reserved_property_name`]. Any other name, including one that starts
+/// with `_`, is a user property and reads back like any other.
+///
+/// Each entry is a name the engine itself gives a meaning:
+///
+/// * storage columns of the per-label vertex, per-type edge and main tables:
+///   `overflow_json`, `_vid`, `_uid`, `_eid`, `_deleted`, `_version`,
+///   `_labels`, `_created_at`, `_updated_at`;
+/// * keys of the map encoding of an entity, read by `entity_ref_from_map` to
+///   tell an edge from a vertex: `_type`, `_type_name`, `_src`, `_dst`,
+///   `_src_vid`, `_dst_vid`, and `_all_props`, which holds a schemaless
+///   entity's properties;
+/// * Lance's own row columns, which a scan can project: `_rowid`, `_rowaddr`,
+///   `_rowoffset`, `_row_created_at_version`, `_row_last_updated_at_version`;
+/// * per-variable query columns the planner synthesizes beside an entity:
+///   `_label` (external-id lookup), `_score` (vector and full-text search) and
+///   `_fwd` (an undirected traversal's per-row orientation);
+/// * planner markers recorded in a variable's property set:
+///   `__set_struct__` and `__with_passthrough__`.
+///
+/// A user property of any of these names would be read with the engine's
+/// meaning instead of its own: hidden, shadowed by the system value, or (a
+/// `_type` key, or `_src` with `_dst`) taken as the tell of an edge.
+///
+/// The other storage column names (`ext_id`, `eid`, `src_vid`, `dst_vid`,
+/// `op`, `type`, `labels`, `props_json`) are deliberately absent: a write of
+/// any of them round-trips through every storage state, so rejecting them
+/// would break working data. So is `_id`: a common key in imported JSON, and
+/// never what identifies an entity map on its own (an entity is recognised by
+/// a structural tell), so it is an ordinary user property.
+pub const RESERVED_PROPERTY_NAMES: &[&str] = &[
+    "overflow_json",
+    "_vid",
+    "_uid",
+    "_eid",
+    "_deleted",
+    "_version",
+    "_labels",
+    "_created_at",
+    "_updated_at",
+    "_type",
+    "_type_name",
+    "_src",
+    "_dst",
+    "_src_vid",
+    "_dst_vid",
+    "_all_props",
+    "_label",
+    "_score",
+    "_fwd",
+    "_rowid",
+    "_rowaddr",
+    "_rowoffset",
+    "_row_created_at_version",
+    "_row_last_updated_at_version",
+    "__set_struct__",
+    "__with_passthrough__",
+];
+
+/// Name prefixes of system-generated properties, reserved like
+/// [`RESERVED_PROPERTY_NAMES`].
+///
+/// `_gen_` names the columns of generated (expression-index) properties,
+/// `__fde_` a MUVERA index's derived vector column, and `__alias_of__` the
+/// alias marker the planner records in a variable's property set. Each is a
+/// family of names created by the engine, so a prefix is the exact rule.
+pub const RESERVED_PROPERTY_PREFIXES: &[&str] = &["_gen_", "__fde_", "__alias_of__"];
+
+/// Whether `name` is reserved by the engine rather than a user property.
+///
+/// The single test every read path uses to separate an entity's user
+/// properties from its system fields, and the one the write paths use to
+/// refuse a property name. A leading `_` alone does not make a name reserved.
+#[must_use]
+pub fn is_reserved_property_name(name: &str) -> bool {
+    RESERVED_PROPERTY_NAMES.contains(&name)
+        || RESERVED_PROPERTY_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+}
+
+/// Reject a write whose property map uses a reserved key (see
+/// [`is_reserved_property_name`]).
+///
+/// A [`RESERVED_PROPERTY_PREFIXES`] name the schema declares is the engine's
+/// own column (a generated property's `_gen_*`, a MUVERA index's `__fde_*`)
+/// and is allowed: the engine writes it, and a write that stages an entity's
+/// current properties back carries it. An undeclared name of those families,
+/// and every [`RESERVED_PROPERTY_NAMES`] entry, is refused.
+///
+/// # Errors
+///
+/// Returns [`crate::UniError::InvalidIdentifier`] naming the first reserved key.
+pub fn check_written_property_names<'a>(
+    keys: impl IntoIterator<Item = &'a String>,
+    schema: &Schema,
+) -> std::result::Result<(), crate::UniError> {
+    let refused = |k: &str| {
+        RESERVED_PROPERTY_NAMES.contains(&k)
+            || (is_reserved_property_name(k)
+                && !schema
+                    .properties
+                    .values()
+                    .any(|props| props.contains_key(k)))
+    };
+    match keys.into_iter().find(|k| refused(k)) {
+        Some(name) => Err(crate::UniError::reserved_property_name(name)),
+        None => Ok(()),
+    }
 }
 
 /// Reject names that collide with storage-layer Arrow column names.
@@ -2248,6 +2699,49 @@ fn validate_reserved_property_name(name: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::value::{TemporalValue, Value};
+
+    /// A declaration types a property only on the labels in scope. `F` and
+    /// `G` declare `v` as `Float64`, `H` as `Int64`; `S` declares nothing.
+    #[test]
+    fn scoped_property_meta_reads_only_the_labels_in_scope() {
+        let meta = |t: DataType| PropertyMeta {
+            r#type: t,
+            nullable: true,
+            added_in: 1,
+            state: SchemaElementState::Active,
+            generation_expression: None,
+            description: None,
+        };
+        let mut schema = Schema::default();
+        for (label, t) in [
+            ("F", DataType::Float64),
+            ("G", DataType::Float64),
+            ("H", DataType::Int64),
+        ] {
+            schema
+                .properties
+                .insert(label.into(), HashMap::from([("v".to_string(), meta(t))]));
+        }
+        let ty = |scope: EntityScope<'_, &str>| {
+            schema
+                .scoped_property_meta(scope, "v")
+                .map(|m| m.r#type.clone())
+        };
+        let float = Some(DataType::Float64);
+        // The schemaless label borrows nothing from `F`.
+        assert_eq!(ty(EntityScope::AllOf(&["S"])), None);
+        assert_eq!(ty(EntityScope::AllOf(&[])), None);
+        // A vertex carrying `S` and `F` is written under `F`'s declaration.
+        assert_eq!(ty(EntityScope::AllOf(&["S", "F"])), float);
+        assert_eq!(ty(EntityScope::AllOf(&["F", "G"])), float);
+        assert_eq!(ty(EntityScope::AllOf(&["F", "H"])), None);
+        // One of several: every alternative must declare it alike.
+        assert_eq!(ty(EntityScope::OneOf(&["F", "G"])), float);
+        assert_eq!(ty(EntityScope::OneOf(&["F", "S"])), None);
+        assert_eq!(ty(EntityScope::OneOf(&["S", "F"])), None);
+        assert_eq!(ty(EntityScope::OneOf(&["F", "H"])), None);
+        assert_eq!(ty(EntityScope::OneOf(&[])), None);
+    }
 
     /// The two variants a downstream catch-all was silently swallowing, plus
     /// the nested forms, so a future tidy-up cannot change a Python-visible
@@ -3064,6 +3558,7 @@ mod tests {
             dst_labels: vec!["NewLabel".into()],
             state: SchemaElementState::Active,
             description: None,
+            endpoint_conformance: Default::default(),
         };
         let delta = SchemaDelta {
             added_labels: vec![("NewLabel".to_string(), label_meta)],

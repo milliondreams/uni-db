@@ -160,8 +160,8 @@ impl TriggerPlugin for DelayedAsyncTrigger {
         _ctx: TriggerContext<'_>,
         events: &MutationBatch,
     ) -> Result<TriggerOutcome, FnError> {
-        // Synchronous sleep is fine — `fire` is called from a spawned
-        // task so blocking here doesn't stall the writer.
+        // Synchronous sleep is fine — an `Async` fire runs on the blocking
+        // pool, so blocking here stalls neither the writer nor the executor.
         std::thread::sleep(self.delay);
         let n = events.events.num_rows() as u64;
         self.counter.fetch_add(n, Ordering::SeqCst);
@@ -388,6 +388,92 @@ async fn async_fire_mode_does_not_block_commit() -> Result<()> {
         "async trigger never fired (counter = {})",
         counter.load(Ordering::SeqCst)
     );
+}
+
+/// An in-flight `Async` fire is a background task of the database: counted by
+/// `background_task_count` and waited for by `shutdown_in_place`.
+///
+/// It was a detached `tokio::spawn`, so shutdown returned with the plugin
+/// still running against a database that was gone, and nothing counted it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_fire_is_counted_and_awaited_by_shutdown() -> Result<()> {
+    let db = db_with_audit_schema().await?;
+    let (trigger, counter) = DelayedAsyncTrigger::new(Duration::from_secs(1));
+    register_trigger(&db, "test-async-tracked", Arc::new(trigger))?;
+    let baseline = db.background_task_count();
+
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:_AuditMe {x: 1})").await?;
+    tx.commit().await?;
+    assert_eq!(
+        db.background_task_count(),
+        baseline + 1,
+        "the in-flight async trigger fire is not counted"
+    );
+
+    db.shutdown_in_place().await?;
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "shutdown returned while the async trigger was still firing"
+    );
+    assert_eq!(db.background_task_count(), 0);
+    Ok(())
+}
+
+/// An `Async` fire started by a commit on a fork is a background task of the
+/// database too: counted by the primary and waited for by its shutdown.
+///
+/// A fork's `UniInner` got its own `ShutdownHandle`, which nothing ever
+/// signalled or awaited, so the fire was tracked by a handle no shutdown path
+/// could reach and kept running after `shutdown_in_place` returned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_fire_on_a_fork_is_counted_and_awaited_by_shutdown() -> Result<()> {
+    let db = db_with_audit_schema().await?;
+    let (trigger, counter) = DelayedAsyncTrigger::new(Duration::from_secs(1));
+    register_trigger(&db, "test-async-fork", Arc::new(trigger))?;
+    let baseline = db.background_task_count();
+
+    let fork = db.session().fork("f").await?;
+    let tx = fork.tx().await?;
+    tx.execute("CREATE (:_AuditMe {x: 1})").await?;
+    tx.commit().await?;
+    drop(fork);
+    assert_eq!(
+        db.background_task_count(),
+        baseline + 1,
+        "the in-flight async trigger fire on the fork is not counted"
+    );
+
+    db.shutdown_in_place().await?;
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "shutdown returned while the fork's async trigger was still firing"
+    );
+    assert_eq!(db.background_task_count(), 0);
+    Ok(())
+}
+
+/// The same fire is waited for by a bare `drop` of the database.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_fire_on_a_fork_is_awaited_by_drop() -> Result<()> {
+    let db = db_with_audit_schema().await?;
+    let (trigger, counter) = DelayedAsyncTrigger::new(Duration::from_secs(1));
+    register_trigger(&db, "test-async-fork-drop", Arc::new(trigger))?;
+
+    let fork = db.session().fork("f").await?;
+    let tx = fork.tx().await?;
+    tx.execute("CREATE (:_AuditMe {x: 1})").await?;
+    tx.commit().await?;
+    drop(fork);
+    drop(db);
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "drop returned while the fork's async trigger was still firing"
+    );
+    Ok(())
 }
 
 #[tokio::test]
@@ -648,5 +734,53 @@ async fn update_to_flushed_vertex_emits_node_update() -> Result<()> {
             "pre-image x should be 1 (pre-tx value), got {x:?}"
         );
     }
+    Ok(())
+}
+
+/// The pre-image a trigger sees for a vertex is its user property set,
+/// whether the vertex is still in L0 or was flushed to L1.
+///
+/// The L1 probe built the pre-image from every column of the per-label
+/// table, so a flushed vertex's `old_value` carried the storage columns
+/// (`overflow_json`, `_deleted`, `_uid`, `_created_at`, `_updated_at`)
+/// beside its properties, and its undeclared properties sat nested inside
+/// `overflow_json` instead of at top level. The L0 pre-image of the same
+/// vertex is the reference; the two must decode to the same map.
+#[tokio::test]
+async fn update_pre_image_matches_between_l0_and_flushed_vertex() -> Result<()> {
+    async fn pre_image(flush: bool) -> Result<serde_json::Value> {
+        let db = db_with_audit_schema().await?;
+        let (trigger, records) = RecordingTrigger::new(
+            TriggerPhase::AfterCommit,
+            TriggerEventMask::NODE_UPDATE,
+            Some(vec![SmolStr::new("_AuditMe")]),
+            FireMode::Synchronous,
+            "record-pre-image",
+        );
+        register_trigger(&db, "test-pre-image", Arc::new(trigger))?;
+        let tx = db.session().tx().await?;
+        tx.execute("CREATE (:_AuditMe {x: 1, u: 2, ext_id: 'e1'})")
+            .await?;
+        tx.commit().await?;
+        if flush {
+            db.flush().await?;
+        }
+        let tx = db.session().tx().await?;
+        tx.execute("MATCH (n:_AuditMe {x: 1}) SET n.x = 99").await?;
+        tx.commit().await?;
+        let g = records.lock().expect("records mutex");
+        assert_eq!(g.len(), 1, "one NODE_UPDATE expected, got {}", g.len());
+        let bytes = g[0].1.as_ref().expect("an UPDATE carries a pre-image");
+        Ok(serde_json::from_slice(bytes)?)
+    }
+
+    let unflushed = pre_image(false).await?;
+    let flushed = pre_image(true).await?;
+    assert_eq!(
+        unflushed,
+        serde_json::json!({"x": 1, "u": 2, "ext_id": "e1"}),
+        "L0 pre-image reference"
+    );
+    assert_eq!(flushed, unflushed, "flushed pre-image differs from L0");
     Ok(())
 }

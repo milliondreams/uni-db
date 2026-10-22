@@ -21,10 +21,13 @@ use uni_query::{QueryMetrics, QueryPlanner};
 
 use crate::api::locy_result::LocyResult;
 use uni_query::query::df_graph::locy_ast_builder::build_match_return_query;
-use uni_query::query::df_graph::locy_delta::{RowRelation, RowStore, extract_cypher_conditions};
+use uni_query::query::df_graph::locy_delta::{RowRelation, RowStore};
 use uni_query::query::df_graph::locy_derive::CollectedDeriveOutput;
 use uni_query::query::df_graph::locy_eval::record_batches_to_locy_rows;
 use uni_query::query::df_graph::locy_explain::ProvenanceStore;
+use uni_query::query::df_graph::locy_sequence::{
+    CommandFacts, CommandSequence, SequencePrograms, SequenceScope, reads_facts,
+};
 use uni_query::query::df_graph::{DerivedFactSource, LocyExecutionContext};
 
 /// Copy `parent`'s deadline and cancellation token onto a derived context.
@@ -86,9 +89,19 @@ pub struct LocyRuleRegistry {
 /// Reachability is computed by [`uni_locy::prune`]; a reference to a rule that
 /// does not exist is already rejected at compile time, so pruning cannot turn a
 /// missing rule into a silently empty result.
-pub(crate) fn merge_registered_rules(compiled: &mut CompiledProgram, registry: &LocyRuleRegistry) {
+///
+/// Every clause's binding plan is recomputed against the merged catalog, since
+/// a program clause referencing a registered rule had none until now.
+///
+/// # Errors
+///
+/// A binding error from [`uni_locy::attach_binding_plans`].
+pub(crate) fn merge_registered_rules(
+    compiled: &mut CompiledProgram,
+    registry: &LocyRuleRegistry,
+) -> std::result::Result<(), LocyCompileError> {
     if registry.rules.is_empty() {
-        return;
+        return Ok(());
     }
     for (name, rule) in &registry.rules {
         compiled
@@ -127,6 +140,40 @@ pub(crate) fn merge_registered_rules(compiled: &mut CompiledProgram, registry: &
     }
     merged_strata.append(&mut compiled.strata);
     compiled.strata = merged_strata;
+    uni_locy::attach_binding_plans(compiled)
+}
+
+/// Refuses `compiled` when `params` lacks a parameter it needs, naming every
+/// missing one ([`crate::api::impl_query::check_parameters`]).
+///
+/// `program_parameters` are those the program's own text references, in
+/// order of first appearance. `compiled` has the registered rules merged
+/// ([`merge_registered_rules`]), and a registered rule's parameters are not in
+/// the program's text, so each merged rule's are added after them, in
+/// stratum order. Checked before evaluation: a registered rule's parameter
+/// used to surface only when its clause first evaluated it, naming that one
+/// parameter alone.
+///
+/// # Errors
+///
+/// `UniError::ParameterMissing` with every missing name.
+pub(crate) fn check_program_parameters(
+    program_parameters: &[String],
+    compiled: &CompiledProgram,
+    params: &HashMap<String, Value>,
+) -> Result<()> {
+    let mut names: Vec<String> = program_parameters.to_vec();
+    for name in compiled
+        .strata
+        .iter()
+        .flat_map(|s| &s.rules)
+        .flat_map(|r| &r.parameters)
+    {
+        if !names.contains(name) {
+            names.push(name.clone());
+        }
+    }
+    crate::api::impl_query::check_parameters(&names, params)
 }
 
 /// Rebuilds a fresh registry by recompiling each source in order.
@@ -398,8 +445,8 @@ pub(crate) async fn evaluate_with_db_and_config_capturing(
     max_memory: Option<usize>,
 ) -> Result<LocyResult> {
     // Compile with the given registry
-    let ast = match uni_cypher::parse_locy(program) {
-        Ok(ast) => ast,
+    let (ast, parameters) = match uni_cypher::parse_locy_with_parameters(program) {
+        Ok(parsed) => parsed,
         Err(e) => {
             let mut err = map_parse_error(e);
             if let (UniError::Parse { message, .. }, Some(hint)) =
@@ -430,7 +477,11 @@ pub(crate) async fn evaluate_with_db_and_config_capturing(
     .map_err(map_compile_error)?;
 
     // Merge registered rules
-    merge_registered_rules(&mut compiled, &rule_registry.read().unwrap());
+    merge_registered_rules(&mut compiled, &rule_registry.read().unwrap())
+        .map_err(map_compile_error)?;
+    // After compiling and merging, so a program invalid for another reason
+    // reports that; the merged rules' parameters count too.
+    check_program_parameters(&parameters, &compiled, &config.params)?;
 
     // Create a LocyEngine directly from &UniInner.
     // Session-level: collect DERIVE output for deferred materialization.
@@ -576,19 +627,33 @@ impl<'a> LocyEngine<'a> {
         program: &str,
         config: &LocyConfig,
     ) -> Result<CompiledProgram> {
-        let ast = uni_cypher::parse_locy(program).map_err(map_parse_error)?;
+        self.compile_with_parameters(program, config)
+            .map(|(compiled, _)| compiled)
+    }
+
+    /// [`Self::compile_only_with_config`], also returning every parameter
+    /// the program's text references, in order of first appearance, for
+    /// [`check_program_parameters`] once registered rules are merged.
+    fn compile_with_parameters(
+        &self,
+        program: &str,
+        config: &LocyConfig,
+    ) -> Result<(CompiledProgram, Vec<String>)> {
+        let (ast, parameters) =
+            uni_cypher::parse_locy_with_parameters(program).map_err(map_parse_error)?;
         let registry = self.db.locy_rule_registry.read().unwrap();
         let external_names: Vec<String> = registry.rules.keys().cloned().collect();
         drop(registry);
         let oracle = plugin_monotonicity_oracle(&self.db.plugin_registry);
-        uni_locy::compile_with_oracle_and_config(
+        let compiled = uni_locy::compile_with_oracle_and_config(
             &ast,
             &HashMap::new(),
             &external_names,
             config,
             &oracle,
         )
-        .map_err(map_compile_error)
+        .map_err(map_compile_error)?;
+        Ok((compiled, parameters))
     }
 
     /// Compile and register a Locy program's rules for reuse.
@@ -673,10 +738,14 @@ impl<'a> LocyEngine<'a> {
         config: &LocyConfig,
         profile_capture: Option<&Arc<std::sync::Mutex<Option<uni_query::LocyExecProfile>>>>,
     ) -> Result<LocyResult> {
-        let mut compiled = self.compile_only_with_config(program, config)?;
+        let (mut compiled, parameters) = self.compile_with_parameters(program, config)?;
 
         // Merge registered rules into the compiled program.
-        merge_registered_rules(&mut compiled, &self.db.locy_rule_registry.read().unwrap());
+        merge_registered_rules(&mut compiled, &self.db.locy_rule_registry.read().unwrap())
+            .map_err(map_compile_error)?;
+        // After compiling and merging, so a program invalid for another
+        // reason reports that; the merged rules' parameters count too.
+        check_program_parameters(&parameters, &compiled, &config.params)?;
 
         self.evaluate_compiled_capturing(compiled, config, profile_capture)
             .await
@@ -733,7 +802,48 @@ impl<'a> LocyEngine<'a> {
         config: &LocyConfig,
         profile_capture: Option<&Arc<std::sync::Mutex<Option<uni_query::LocyExecProfile>>>>,
     ) -> Result<LocyResult> {
+        // A session-level evaluation (it collects DERIVE output rather than
+        // writing) runs its commands against an ephemeral overlay, discarded
+        // on return: a write command lands there, so later commands see it
+        // and the shared graph does not. Every collecting entry point gets
+        // one here, not only those that build it themselves: without it a
+        // prepared program's DERIVE was invisible to its later commands, its
+        // ASSUME failed to fork, and its Cypher write went straight to the
+        // shared graph.
+        refuse_undeferrable_procedures(&compiled.commands, self.collect_derive, false, |name| {
+            uni_plugin::QName::parse(name)
+                .ok()
+                .and_then(|q| self.db.plugin_registry.procedure(&q))
+                .map(|e| e.signature.mode)
+        })?;
+        if self.collect_derive
+            && self.locy_l0.is_none()
+            && let Some(writer) = self.db.writer.as_ref()
+        {
+            let overlay = writer.create_transaction_l0();
+            let scoped = LocyEngine {
+                db: self.db,
+                tx_l0_override: Some(Arc::clone(&overlay)),
+                locy_l0: Some(overlay),
+                collect_derive: true,
+                counters: Arc::clone(&self.counters),
+                read_snapshot: self.read_snapshot.clone(),
+                cancel: self.cancel.clone(),
+                max_memory: self.max_memory,
+            };
+            return Box::pin(scoped.evaluate_compiled_capturing_inner(
+                compiled,
+                config,
+                profile_capture,
+            ))
+            .await;
+        }
         let start = Instant::now();
+
+        // Goal-directed (magic-sets) rewrite of qualifying QUERY commands; the
+        // identity unless `config.goal_directed` asks for it (uni_locy::magic).
+        let (compiled, _goal_report) =
+            uni_locy::magic::rewrite_goal_directed(compiled, config.goal_directed, &config.params);
 
         // Capture current version for staleness detection in DerivedFactSet
         let evaluated_at_version = if self.collect_derive {
@@ -746,10 +856,16 @@ impl<'a> LocyEngine<'a> {
             0
         };
 
-        // 1. Build logical plan
+        // 1. Build logical plan. Timed for `QueryMetrics::plan_time`: this
+        // plans every stratum's clause bodies up front, and was the one
+        // planning step a Locy result did not report.
+        let plan_start = Instant::now();
         let schema = self.db.schema.schema();
         let query_planner = uni_query::QueryPlanner::new(schema);
-        let plan_builder = uni_query::query::locy_planner::LocyPlanBuilder::new(&query_planner);
+        // A run with a provenance tracker (step 4) plans the transient
+        // provenance and lineage columns too.
+        let plan_builder = uni_query::query::locy_planner::LocyPlanBuilder::new(&query_planner)
+            .with_provenance(compiled.needs_provenance_tracker());
         let logical = plan_builder
             .build_program_plan_with_full_neural(
                 &compiled,
@@ -781,9 +897,10 @@ impl<'a> LocyEngine<'a> {
                     .or_else(|| Some(std::sync::Arc::new(uni_locy::NeuralProvenanceStore::new()))),
             )
             .map_err(|e| UniError::Query {
-                message: format!("LocyPlanBuildError: {e}"),
+                message: format!("LocyPlanBuildError: {e:#}"),
                 query: None,
             })?;
+        let plan_time = plan_start.elapsed();
 
         // 2. Create executor + physical planner
         let mut df_executor = uni_query::Executor::new(self.db.storage.clone());
@@ -831,24 +948,7 @@ impl<'a> LocyEngine<'a> {
             .map_err(|e| map_native_df_error(e, limits))?;
 
         // 4. Create tracker for EXPLAIN commands or shared-proof detection
-        let has_explain = compiled
-            .commands
-            .iter()
-            .any(|c| matches!(c, CompiledCommand::ExplainRule(_)));
-        let has_prob_fold = compiled.strata.iter().any(|s| {
-            s.rules.iter().any(|r| {
-                r.clauses.iter().any(|c| {
-                    c.fold.iter().any(|f| {
-                        if let uni_cypher::ast::Expr::FunctionCall { name, .. } = &f.aggregate {
-                            matches!(name.to_uppercase().as_str(), "MNOR" | "MPROD")
-                        } else {
-                            false
-                        }
-                    })
-                })
-            })
-        });
-        let needs_tracker = has_explain || has_prob_fold;
+        let needs_tracker = compiled.needs_provenance_tracker();
         let tracker: Option<Arc<uni_query::query::df_graph::ProvenanceStore>> = if needs_tracker {
             Some(Arc::new(uni_query::query::df_graph::ProvenanceStore::new()))
         } else {
@@ -874,6 +974,7 @@ impl<'a> LocyEngine<'a> {
             if profile_capture.is_some() {
                 program_exec.set_profile_enabled(true);
             }
+            program_exec.set_allow_partial(config.allow_partial);
             (
                 program_exec.derived_store_slot(),
                 program_exec.iteration_counts_slot(),
@@ -899,6 +1000,11 @@ impl<'a> LocyEngine<'a> {
             )
         };
 
+        // The base state the facts below are derived from, for incremental
+        // ASSUME / ABDUCE (see `NativeExecutionAdapter::enable_top_level_baseline`).
+        // Taken before the run, so a commit during it is detected afterwards.
+        let base_before_run = base_fingerprint(self.db, &self.read_snapshot);
+
         // 5. Execute strata
         let _stats_batches = uni_query::Executor::collect_batches(&session_ctx, exec_plan)
             .await
@@ -912,6 +1018,36 @@ impl<'a> LocyEngine<'a> {
             *capture.lock().unwrap_or_else(|e| e.into_inner()) = Some(prof);
         }
 
+        // 5c. The program's budget covers what follows the run too: the
+        // conversion and hydration of its facts and every command. Before,
+        // only the operators and the checks between strata and iterations
+        // consulted it, so a run that finished just inside its deadline went
+        // on converting, hydrating and answering commands unbounded (a
+        // 1200-item cross join: 2.6 s against a 614 ms timeout).
+        let deadline = start + limits.timeout;
+        if let Some(detail) = incomplete_slot.read().ok().and_then(|g| g.clone())
+            && !config.allow_partial
+        {
+            // The same error the end of this function would raise, without
+            // first converting and hydrating facts nobody will see.
+            return Err(UniError::LocyIncomplete {
+                detail: Box::new(detail),
+            });
+        }
+        let mut commands_cut = false;
+        if Instant::now() >= deadline
+            && incomplete_slot.read().map(|g| g.is_none()).unwrap_or(false)
+        {
+            if !config.allow_partial {
+                return Err(budget_spent(limits));
+            }
+            // The facts are complete; the commands are not run.
+            if let Ok(mut slot) = incomplete_slot.write() {
+                *slot = Some(commands_cut_short(&compiled, config, start, limits));
+            }
+            commands_cut = true;
+        }
+
         // 6. Extract native DerivedStore
         let native_store = derived_store_slot
             .write()
@@ -920,7 +1056,14 @@ impl<'a> LocyEngine<'a> {
             .unwrap_or_default();
 
         // 7. Convert native DerivedStore → row-based RowStore for the commands
-        let mut orch_store = native_store_to_row_store(&native_store, &compiled);
+        //
+        // A program that may not return partial facts stops converting and
+        // hydrating them once its budget is spent, failing with the `Timeout`
+        // it would raise afterwards anyway. Under `allow_partial` the facts
+        // are returned complete (and hydrated), as documented.
+        let strict_deadline = (!config.allow_partial).then_some(deadline);
+        let mut orch_store = native_store_to_row_store(&native_store, &compiled, strict_deadline)
+            .map_err(|DeadlinePassed| budget_spent(limits))?;
 
         // 7b. Enrich VID / EID integers → Node / Edge objects so commands can access
         //     node properties (d.name etc.) and IS-ref joins work correctly
@@ -931,14 +1074,15 @@ impl<'a> LocyEngine<'a> {
                 .map(|(k, v)| (k.clone(), v.rows.clone()))
                 .collect();
             let (enriched_rows, hydration_warnings) = enrich_vids_with_nodes(
-                self.db,
                 &native_store,
                 &compiled.rule_catalog,
                 orch_rows,
                 planner.graph_ctx(),
                 planner.session_ctx(),
+                strict_deadline,
             )
-            .await;
+            .await
+            .map_err(|DeadlinePassed| budget_spent(limits))?;
             if !hydration_warnings.is_empty()
                 && let Ok(mut w) = warnings_slot.write()
             {
@@ -951,11 +1095,28 @@ impl<'a> LocyEngine<'a> {
             }
         }
 
-        // The published facts are fixed from here on. Commands receive the
-        // store by shared reference, so no command can change what a later
-        // one reads; one that needs to re-derive does so in a store of its
-        // own (see `locy_command_noninterference`).
-        let orch_store = orch_store;
+        // Commands run in sequence: a command that writes (DERIVE, a Cypher
+        // write) changes the state, and a later command that reads facts reads
+        // them derived again in the new state — the strata the write can
+        // affect, the rest reused (`locy_sequence`, shared with ASSUME bodies).
+        // Each state's store is shared by reference, so a command that only
+        // reads cannot change what a later one reads
+        // (`locy_command_noninterference`).
+        let commands_may_write = compiled.commands.iter().any(command_may_write);
+        // ASSUME / ABDUCE may reuse these facts for the strata their mutations
+        // cannot affect. Not when a provenance tracker ran: it can change PROB
+        // values (shared-proof BDD) in ways a hypothetical re-evaluation,
+        // which runs without one, does not reproduce.
+        let hypothetical = compiled
+            .commands
+            .iter()
+            .any(|c| matches!(c, CompiledCommand::Assume(_) | CompiledCommand::Abduce(_)));
+        let offer_baseline = tracker.is_none();
+        let orch_store = Arc::new(orch_store);
+        // The raw facts, kept only when something can reuse them: a later
+        // state after a write, or a hypothetical command.
+        let raw_facts = (commands_may_write || (hypothetical && offer_baseline))
+            .then(|| Arc::new(native_store.clone()));
 
         // 8. Dispatch commands via native trait interfaces
         let native_ctx = NativeExecutionAdapter::new(
@@ -971,6 +1132,41 @@ impl<'a> LocyEngine<'a> {
         );
         // Propagate locy_l0 to the adapter for DERIVE/ASSUME/ABDUCE scoping.
         *native_ctx.locy_l0.lock().unwrap() = self.locy_l0.clone();
+        *native_ctx.sequenced_tracker.lock().unwrap() = tracker.clone();
+        // Every later evaluation of the program records provenance when its
+        // own run did, and shares what remains of its budget.
+        let native_ctx = native_ctx.with_budget(tracker.is_some(), start, limits.timeout);
+        let mut top_level_baseline = false;
+        if hypothetical
+            && offer_baseline
+            && let Some(raw) = &raw_facts
+        {
+            native_ctx.enable_top_level_baseline(
+                base_before_run,
+                Arc::clone(raw),
+                Arc::clone(&orch_store),
+            );
+            top_level_baseline = true;
+        }
+        let mut sequence = CommandSequence::new(
+            SequencePrograms {
+                parent: &compiled,
+                body: None,
+            },
+            SequenceScope::TopLevel,
+            CommandFacts::top_level(raw_facts, orch_store, base_before_run.map(|b| b.token())),
+            offer_baseline,
+            top_level_baseline,
+        );
+        // A session program's writes are replayed later by `tx.apply`, where
+        // a node created by an earlier command of the program gets a new id.
+        // The first id such a node can have, to refuse a DERIVE that names one.
+        let program_start_vid = match self.db.writer.as_ref() {
+            Some(writer) if self.collect_derive && commands_may_write => {
+                Some(writer.allocator.current_vid().await)
+            }
+            _ => None,
+        };
         let mut locy_stats = LocyStats {
             total_iterations: iteration_counts_slot
                 .read()
@@ -989,7 +1185,8 @@ impl<'a> LocyEngine<'a> {
 
         let mut command_results = Vec::new();
         let mut collected_derives: Vec<CollectedDeriveOutput> = Vec::new();
-        let timed_out_early = timeout_flag.load(std::sync::atomic::Ordering::Relaxed) != 0;
+        let timed_out_early =
+            commands_cut || timeout_flag.load(std::sync::atomic::Ordering::Relaxed) != 0;
         // Skip command dispatch when evaluation was cut short — the partial
         // derived store may be incomplete and QUERY would hit the expired
         // budget.
@@ -1000,35 +1197,153 @@ impl<'a> LocyEngine<'a> {
                     command_results.push(result.clone());
                     continue;
                 }
-                let result = dispatch_native_command(
+                // Each command runs only inside the program's budget.
+                if Instant::now() >= deadline {
+                    if !config.allow_partial {
+                        return Err(budget_spent(limits));
+                    }
+                    merge_incomplete(
+                        &mut native_ctx.rederivation_incomplete.lock().unwrap(),
+                        commands_cut_short(&compiled, config, start, limits),
+                    );
+                    break;
+                }
+                let facts = if reads_facts(cmd) {
+                    sequence
+                        .facts(&native_ctx, config, &mut locy_stats)
+                        .await
+                        .map_err(|e| map_runtime_error(e, limits))?
+                } else {
+                    sequence.last_derived()
+                };
+                // A re-derivation cut short under `allow_partial` ends the
+                // commands, as a cut-short run of the program does: the
+                // facts are partial. The cut is reported in `incomplete`.
+                if native_ctx.is_cut_short() {
+                    break;
+                }
+                // The provenance and approximations of the state the command
+                // reads: the program's own until the facts are derived again.
+                let tracker = native_ctx.sequenced_tracker.lock().unwrap().clone();
+                let approximate = native_ctx
+                    .sequenced_approximate
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| approx_for_explain.clone());
+                let outcome = match dispatch_native_command(
                     cmd,
                     &compiled,
                     &native_ctx,
                     config,
-                    &orch_store,
+                    facts,
                     &mut locy_stats,
-                    tracker.clone(),
-                    &approx_for_explain,
+                    tracker,
+                    &approximate,
                     self.collect_derive,
                     &mut collected_derives,
+                    program_start_vid,
                 )
                 .await
-                .map_err(|e| map_runtime_error(e, limits))?;
-                command_results.push(result);
+                {
+                    Ok(outcome) => outcome,
+                    // The budget ran out inside the command (an in-memory
+                    // QUERY checks it between rows, here or in an ASSUME
+                    // body): under `allow_partial` a cut like any other, the
+                    // command not answered.
+                    Err(LocyError::Timeout { .. }) if config.allow_partial => {
+                        merge_incomplete(
+                            &mut native_ctx.rederivation_incomplete.lock().unwrap(),
+                            commands_cut_short(&compiled, config, start, limits),
+                        );
+                        break;
+                    }
+                    Err(e) => return Err(map_runtime_error(e, limits)),
+                };
+                // A command whose own re-evaluations (ASSUME, ABDUCE) were
+                // cut short answered from partial facts: not reported.
+                if native_ctx.is_cut_short() {
+                    break;
+                }
+                command_results.push(outcome.result);
+                if let Some(written) = outcome.written {
+                    sequence.record_write(written);
+                }
+                // Test seam: time passing between a command's completion and
+                // the check below (`sleep(ms)` makes the deadline pass there).
+                fail::fail_point!("locy::after-command");
+                // A command that finished past the deadline answered late:
+                // the program overran its budget. Without `allow_partial`
+                // that is the `Timeout` below; with it, the answer stands
+                // (its work, a write included, is done) but the overrun is
+                // reported and no later command runs. It used to go
+                // unreported, a late result returned as on time.
+                if config.allow_partial && Instant::now() > deadline {
+                    merge_incomplete(
+                        &mut native_ctx.rederivation_incomplete.lock().unwrap(),
+                        commands_cut_short(&compiled, config, start, limits),
+                    );
+                    break;
+                }
             }
         }
+        let orch_store = sequence.finish(&native_ctx);
+        let sequenced_warnings =
+            std::mem::take(&mut *native_ctx.sequenced_warnings.lock().unwrap());
+        if !sequenced_warnings.is_empty()
+            && let Ok(mut w) = warnings_slot.write()
+        {
+            w.extend(sequenced_warnings);
+        }
 
-        let evaluation_time = start.elapsed();
+        // A command that ran past the deadline answered late: the program
+        // overran its budget, which is reported, not returned as on time —
+        // as the `Timeout` without `allow_partial`, in `incomplete` with it.
+        // Judged at the instant `evaluation_time` ends, so a result reported
+        // complete always took at most its budget.
+        let finished = Instant::now();
+        if finished > deadline {
+            if !config.allow_partial {
+                return Err(budget_spent(limits));
+            }
+            merge_incomplete(
+                &mut native_ctx.rederivation_incomplete.lock().unwrap(),
+                commands_cut_short(&compiled, config, start, limits),
+            );
+        }
+        let evaluation_time = finished.duration_since(start);
+        // ASSUME and ABDUCE plan strata again for each hypothetical state;
+        // that planning ran inside `evaluation_time` and is planning too.
+        let plan_time = plan_time + native_ctx.hypothetical_plan_time();
 
-        // 9. Build derived map, enrich VID columns with full nodes
-        let mut base_derived: HashMap<String, Vec<FactRow>> = native_store
-            .rule_names()
-            .filter_map(|name| {
-                native_store
-                    .get(name)
-                    .map(|batches| (name.to_string(), record_batches_to_locy_rows(batches)))
-            })
-            .collect();
+        // 9. Build the returned derived map, every rule hydrated.
+        //
+        // `LocyResult::derived` is public and holds every rule's facts, returned
+        // by a command or not, so every rule is hydrated (the Python binding
+        // converts the whole map too). It holds the facts the program derived
+        // before its first command, the state its first command reads. Without
+        // a write command, the command store is exactly these rows, already
+        // hydrated, and is reused. A write command (DERIVE, a Cypher write)
+        // changes the graph, and the entities the facts name are then read in
+        // their state after the commands, so hydration runs again, as it
+        // always did. (ASSUME and ABDUCE write only to a hypothetical overlay
+        // that is discarded before this point.)
+        let mut base_derived: HashMap<String, Vec<FactRow>> = if commands_may_write {
+            native_store
+                .rule_names()
+                .filter_map(|name| {
+                    native_store
+                        .get(name)
+                        .map(|batches| (name.to_string(), record_batches_to_locy_rows(batches)))
+                })
+                .collect()
+        } else {
+            Arc::try_unwrap(orch_store.into_store())
+                .unwrap_or_else(|shared| (*shared).clone())
+                .into_iter()
+                .map(|(name, relation)| (name, relation.rows))
+                .collect()
+        };
 
         // Stamp _approximate on facts in rules that had BDD fallback groups.
         let approximate_groups = approximate_slot
@@ -1045,20 +1360,26 @@ impl<'a> LocyEngine<'a> {
             }
         }
 
-        let (enriched_derived, hydration_warnings) = enrich_vids_with_nodes(
-            self.db,
-            &native_store,
-            &compiled.rule_catalog,
-            base_derived,
-            planner.graph_ctx(),
-            planner.session_ctx(),
-        )
-        .await;
-        if !hydration_warnings.is_empty()
-            && let Ok(mut w) = warnings_slot.write()
-        {
-            w.extend(hydration_warnings);
-        }
+        let enriched_derived = if commands_may_write {
+            let (enriched, hydration_warnings) = enrich_vids_with_nodes(
+                &native_store,
+                &compiled.rule_catalog,
+                base_derived,
+                planner.graph_ctx(),
+                planner.session_ctx(),
+                strict_deadline,
+            )
+            .await
+            .map_err(|DeadlinePassed| budget_spent(limits))?;
+            if !hydration_warnings.is_empty()
+                && let Ok(mut w) = warnings_slot.write()
+            {
+                w.extend(hydration_warnings);
+            }
+            enriched
+        } else {
+            base_derived
+        };
 
         // 10. Build DerivedFactSet from collected derives (session path only)
         let derived_fact_set = if !collected_derives.is_empty() {
@@ -1081,6 +1402,9 @@ impl<'a> LocyEngine<'a> {
                 stats: locy_stats.clone(),
                 evaluated_at_version,
                 mutation_queries: all_queries,
+                // A Cypher write command's statement may read `$params`;
+                // the replay runs it with the values it ran with here.
+                mutation_params: config.params.clone(),
             })
         } else {
             None
@@ -1088,7 +1412,12 @@ impl<'a> LocyEngine<'a> {
 
         // 11. Build final LocyResult
         let warnings = warnings_slot.read().map(|w| w.clone()).unwrap_or_default();
-        let incomplete = incomplete_slot.read().ok().and_then(|g| g.clone());
+        let mut incomplete = incomplete_slot.read().ok().and_then(|g| g.clone());
+        // A re-derivation cut short under `allow_partial` (without it, it
+        // already failed the program) is reported with the program's own.
+        if let Some(cut) = native_ctx.rederivation_incomplete.lock().unwrap().take() {
+            merge_incomplete(&mut incomplete, cut);
+        }
         // An over-budget evaluation is a hard error by default: partial,
         // possibly-unsound facts must not be returned silently. Callers that
         // want anytime / best-effort semantics opt in via `allow_partial`, which
@@ -1105,6 +1434,7 @@ impl<'a> LocyEngine<'a> {
             command_results,
             &compiled,
             evaluation_time,
+            plan_time,
             locy_stats,
             warnings,
             approximate_groups,
@@ -1119,16 +1449,42 @@ impl<'a> LocyEngine<'a> {
     /// Used by `re_evaluate_strata()` so that savepoint-scoped mutations from
     /// ASSUME/ABDUCE hypothetical states are visible — the `Executor` is configured
     /// with `self.db.writer`, which holds the active transaction handle.
+    ///
+    /// `reused` strata are copied from an earlier evaluation instead of
+    /// derived (incremental ASSUME / ABDUCE).
+    ///
+    /// Returns the derived facts and the time spent building the logical
+    /// plan, the same step the program's own `plan_time` measures.
+    ///
+    /// # Errors
+    ///
+    /// A planning or execution failure, and `UniError::LocyIncomplete` when
+    /// the run stopped early (timeout, iteration limit) and
+    /// `config.allow_partial` is unset: a hypothetical state's facts are then
+    /// partial, and a command answering from them would answer short.
     async fn run_strata_native(
         &self,
         compiled: &CompiledProgram,
         config: &LocyConfig,
-    ) -> Result<uni_query::query::df_graph::DerivedStore> {
+        reused: Option<uni_query::query::df_graph::ReusedStrata>,
+        tracker: Option<Arc<ProvenanceStore>>,
+    ) -> Result<StrataRun> {
+        let plan_start = Instant::now();
         let schema = self.db.schema.schema();
         let query_planner = uni_query::QueryPlanner::new(schema);
-        let plan_builder = uni_query::query::locy_planner::LocyPlanBuilder::new(&query_planner);
+        // Reused strata are copied, not evaluated, so they are not planned.
+        let plan_builder = uni_query::query::locy_planner::LocyPlanBuilder::new(&query_planner)
+            .with_provenance(tracker.is_some())
+            .with_reused_strata(
+                reused
+                    .as_ref()
+                    .map(|r| r.positions.clone())
+                    .unwrap_or_default(),
+            );
+        // Planned as the program's own run is, model invocations included:
+        // a rule calling a classifier derives the same facts here.
         let logical = plan_builder
-            .build_program_plan_with_semiring(
+            .build_program_plan_with_full_neural(
                 compiled,
                 config.max_iterations,
                 config.effective_timeout(),
@@ -1146,11 +1502,22 @@ impl<'a> LocyEngine<'a> {
                         query: None,
                     })?
                     .kind,
+                std::sync::Arc::new(config.classifier_registry.clone()),
+                config.classifier_cache.clone().or_else(|| {
+                    Some(std::sync::Arc::new(uni_locy::ModelInvocationCache::new(
+                        config.classifier_cache_max,
+                    )))
+                }),
+                config
+                    .classifier_provenance_store
+                    .clone()
+                    .or_else(|| Some(std::sync::Arc::new(uni_locy::NeuralProvenanceStore::new()))),
             )
             .map_err(|e| UniError::Query {
-                message: format!("LocyPlanBuildError: {e}"),
+                message: format!("LocyPlanBuildError: {e:#}"),
                 query: None,
             })?;
+        let plan_time = plan_start.elapsed();
 
         let mut df_executor = uni_query::Executor::new(self.db.storage.clone());
         let executor_config = self.executor_config(config);
@@ -1165,8 +1532,19 @@ impl<'a> LocyEngine<'a> {
         if let Some(ref l0) = self.tx_l0_override {
             df_executor.set_transaction_l0(l0.clone());
         }
+        // The same pinned snapshot and functions the program's own run used:
+        // the hypothetical state is that state plus the mutations, and the
+        // strata it reuses were derived under them.
+        if self.read_snapshot.is_some() {
+            df_executor.set_read_snapshot(self.read_snapshot.clone());
+        }
         df_executor.set_xervo_runtime(self.db.xervo_runtime.clone());
         df_executor.set_procedure_registry(self.db.procedure_registry.clone());
+        if let Ok(reg) = self.db.custom_functions.read()
+            && !reg.is_empty()
+        {
+            df_executor.set_custom_functions(std::sync::Arc::new(reg.clone()));
+        }
 
         let (session_ctx, planner, _) = df_executor
             .create_datafusion_planner(&self.db.properties, &config.params)
@@ -1176,23 +1554,208 @@ impl<'a> LocyEngine<'a> {
             .plan(&logical)
             .map_err(|e| map_native_df_error(e, limits))?;
 
-        let derived_store_slot = if let Some(program_exec) =
-            exec_plan.downcast_ref::<uni_query::query::df_graph::LocyProgramExec>()
-        {
-            program_exec.derived_store_slot()
-        } else {
-            Arc::new(std::sync::RwLock::new(None))
-        };
+        let (derived_store_slot, incomplete_slot, warnings_slot, approximate_slot) =
+            if let Some(program_exec) =
+                exec_plan.downcast_ref::<uni_query::query::df_graph::LocyProgramExec>()
+            {
+                if let Some(reused) = reused {
+                    program_exec.set_reused_strata(reused);
+                }
+                if let Some(tracker) = tracker {
+                    program_exec.set_derivation_tracker(tracker);
+                }
+                program_exec.set_allow_partial(config.allow_partial);
+                (
+                    program_exec.derived_store_slot(),
+                    program_exec.incomplete_slot(),
+                    program_exec.warnings_slot(),
+                    program_exec.approximate_slot(),
+                )
+            } else {
+                (
+                    Arc::new(std::sync::RwLock::new(None)),
+                    Arc::new(std::sync::RwLock::new(None)),
+                    Arc::new(std::sync::RwLock::new(Vec::new())),
+                    Arc::new(std::sync::RwLock::new(HashMap::new())),
+                )
+            };
 
         let _ = uni_query::Executor::collect_batches(&session_ctx, exec_plan)
             .await
             .map_err(|e| map_native_df_error(e, limits))?;
-        Ok(derived_store_slot
+        let incomplete = incomplete_slot.read().ok().and_then(|g| g.clone());
+        if let Some(detail) = &incomplete
+            && !config.allow_partial
+        {
+            return Err(UniError::LocyIncomplete {
+                detail: Box::new(detail.clone()),
+            });
+        }
+        let store = derived_store_slot
             .write()
             .unwrap()
             .take()
-            .unwrap_or_default())
+            .unwrap_or_default();
+        Ok(StrataRun {
+            store,
+            plan_time,
+            warnings: warnings_slot.read().map(|w| w.clone()).unwrap_or_default(),
+            approximate: approximate_slot
+                .read()
+                .map(|a| a.clone())
+                .unwrap_or_default(),
+            incomplete,
+        })
     }
+}
+
+/// What one run of a program's strata produced.
+struct StrataRun {
+    store: uni_query::query::df_graph::DerivedStore,
+    /// Time spent building the logical plan.
+    plan_time: Duration,
+    warnings: Vec<RuntimeWarning>,
+    /// Rules whose groups fell back to approximate probabilities.
+    approximate: HashMap<String, Vec<String>>,
+    /// How the run was cut short, when it was: only under `allow_partial`,
+    /// since otherwise the cut is an error.
+    incomplete: Option<uni_common::LocyIncomplete>,
+}
+
+/// The error for a program that spent its budget outside any operator: the
+/// timeout an operator's deadline reports.
+fn budget_spent(limits: LocyLimits) -> UniError {
+    UniError::Timeout {
+        timeout_ms: u64::try_from(limits.timeout.as_millis()).unwrap_or(u64::MAX),
+    }
+}
+
+/// The `incomplete` record of a program whose facts are complete but whose
+/// budget ran out before its commands did: a timeout with no rule
+/// incomplete or skipped, every stratum evaluated.
+fn commands_cut_short(
+    compiled: &CompiledProgram,
+    config: &LocyConfig,
+    start: Instant,
+    limits: LocyLimits,
+) -> uni_common::LocyIncomplete {
+    uni_common::LocyIncomplete {
+        reason: uni_common::LocyIncompleteReason::Timeout,
+        elapsed_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+        limit_ms: u64::try_from(limits.timeout.as_millis()).unwrap_or(u64::MAX),
+        max_iterations: config.max_iterations,
+        completed_strata: compiled.strata.len(),
+        total_strata: compiled.strata.len(),
+        incomplete_rules: Vec::new(),
+        skipped_rules: Vec::new(),
+        complement_rules_affected: Vec::new(),
+    }
+}
+
+/// Folds `cut` into `into`: the first cut's reason, limits and strata
+/// counts, every cut's incomplete, skipped and unsound rules, each once.
+fn merge_incomplete(
+    into: &mut Option<uni_common::LocyIncomplete>,
+    cut: uni_common::LocyIncomplete,
+) {
+    let Some(existing) = into else {
+        *into = Some(cut);
+        return;
+    };
+    existing.elapsed_ms = existing.elapsed_ms.max(cut.elapsed_ms);
+    for (all, more) in [
+        (&mut existing.incomplete_rules, cut.incomplete_rules),
+        (&mut existing.skipped_rules, cut.skipped_rules),
+        (
+            &mut existing.complement_rules_affected,
+            cut.complement_rules_affected,
+        ),
+    ] {
+        for rule in more {
+            if !all.contains(&rule) {
+                all.push(rule);
+            }
+        }
+    }
+}
+
+/// A failed re-evaluation as the error its command fails with, keeping the
+/// typed cases typed: a cut-short run stays `LocyIncomplete` and a deadline
+/// stays `Timeout`, as the program's own run reports them, instead of
+/// becoming a message inside a generic runtime error.
+fn uni_error_to_locy(e: UniError) -> LocyError {
+    match e {
+        UniError::LocyIncomplete { detail } => LocyError::Incomplete { detail },
+        UniError::Timeout { timeout_ms } => {
+            let limit = Duration::from_millis(timeout_ms);
+            LocyError::Timeout {
+                elapsed: limit,
+                limit,
+            }
+        }
+        other => LocyError::ExecutorError {
+            message: other.to_string(),
+        },
+    }
+}
+
+// ── Hypothetical baselines (incremental ASSUME / ABDUCE, A4) ─────────────────
+
+/// Identifies the shared base state a Locy evaluation reads under the session
+/// path: the writer's current L0 buffer (which a flush replaces) and its write
+/// counters (which a commit advances).
+///
+/// `None` when nothing needs checking: under a pinned read snapshot the base
+/// state cannot move, and without a writer nothing can write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct BaseFingerprint {
+    l0: usize,
+    version: u64,
+    mutations: usize,
+    pending_flush: usize,
+}
+
+impl BaseFingerprint {
+    /// The fingerprint as one opaque value, for
+    /// [`LocyExecutionContext::base_state_token`].
+    fn token(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
+fn base_fingerprint(
+    db: &crate::api::UniInner,
+    read_snapshot: &Option<uni_store::runtime::SnapshotView>,
+) -> Option<BaseFingerprint> {
+    if read_snapshot.is_some() {
+        return None;
+    }
+    let writer = db.writer.as_ref()?;
+    let current = writer.l0_manager.get_current();
+    let (version, mutations) = {
+        let l0 = current.read();
+        (l0.current_version, l0.mutation_count)
+    };
+    Some(BaseFingerprint {
+        l0: Arc::as_ptr(&current) as usize,
+        version,
+        mutations,
+        pending_flush: writer.l0_manager.get_pending_flush().len(),
+    })
+}
+
+/// The facts of one earlier state and how to tell that it is still current.
+struct HypotheticalBaseline {
+    facts: Arc<uni_query::query::df_graph::DerivedStore>,
+    /// The same facts hydrated in that state, when held.
+    rows: Option<Arc<RowStore>>,
+    /// The adapter's epoch when the facts were derived.
+    epoch: u64,
+    /// The base state when the facts were derived.
+    base: Option<BaseFingerprint>,
 }
 
 // ── NativeExecutionAdapter — implements DerivedFactSource + LocyExecutionContext ─
@@ -1222,9 +1785,50 @@ struct NativeExecutionAdapter<'a> {
     /// Stack of saved L0 states for nested fork/restore (ASSUME inside ASSUME).
     l0_save_stack:
         std::sync::Mutex<Vec<Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>>,
+    /// Which mutation history the current state is: replaced by a fresh value
+    /// on every write this adapter issues, restored by `restore_l0`. Two
+    /// moments with equal epochs see the same Locy-issued writes, which is
+    /// how a [`HypotheticalBaseline`] knows it still describes the state.
+    epoch: std::sync::atomic::AtomicU64,
+    /// Source of fresh epochs; never reused within the adapter.
+    next_epoch: std::sync::atomic::AtomicU64,
+    /// The epoch at each `fork_l0`, restored by the paired `restore_l0`.
+    epoch_save_stack: std::sync::Mutex<Vec<u64>>,
+    /// Facts of earlier states, innermost last: the program's own (when
+    /// enabled), then one per enclosing ASSUME body.
+    baselines: std::sync::Mutex<Vec<HypotheticalBaseline>>,
     /// Cancellation scope, cloned from the `LocyEngine`, for the Cypher
     /// statements command dispatch runs.
     cancel: crate::api::impl_query::CancelScope,
+    /// Time spent planning the strata of hypothetical re-evaluations
+    /// (`ASSUME` bodies, `ABDUCE` candidates) and of the re-derivations
+    /// after a top-level write, in nanoseconds. Reported in the result's
+    /// `plan_time` next to the program's own planning.
+    hypothetical_plan_nanos: std::sync::atomic::AtomicU64,
+    /// The provenance of the current top-level state, when the program
+    /// records provenance (EXPLAIN, shared-proof detection): the program's
+    /// own tracker, replaced by a fresh one each time the facts are derived
+    /// again after a write.
+    sequenced_tracker: std::sync::Mutex<Option<Arc<ProvenanceStore>>>,
+    /// The approximate-probability groups of the current top-level state,
+    /// once the facts were derived again after a write; `None` before.
+    sequenced_approximate: std::sync::Mutex<Option<HashMap<String, Vec<String>>>>,
+    /// Warnings raised while deriving the facts again after a write.
+    sequenced_warnings: std::sync::Mutex<Vec<RuntimeWarning>>,
+    /// Whether the program records provenance (see
+    /// [`CompiledProgram::needs_provenance_tracker`]): every re-evaluation
+    /// then records it too, a hypothetical one included, since exact
+    /// probabilities and EXPLAIN both depend on it, and reuses no stratum.
+    records_provenance: bool,
+    /// When the program's budget runs out: its start plus its timeout.
+    /// Every re-evaluation runs with what remains, not a fresh timeout.
+    deadline: Option<Instant>,
+    /// The program's start and timeout, for the `Timeout` a check of
+    /// `deadline` reports.
+    budget: Option<(Instant, Duration)>,
+    /// The re-evaluations cut short under `allow_partial`, merged; reported
+    /// with the program's result.
+    rederivation_incomplete: std::sync::Mutex<Option<uni_common::LocyIncomplete>>,
 }
 
 impl<'a> NativeExecutionAdapter<'a> {
@@ -1254,8 +1858,81 @@ impl<'a> NativeExecutionAdapter<'a> {
             read_snapshot,
             locy_l0: std::sync::Mutex::new(None),
             l0_save_stack: std::sync::Mutex::new(Vec::new()),
+            epoch: std::sync::atomic::AtomicU64::new(0),
+            next_epoch: std::sync::atomic::AtomicU64::new(1),
+            epoch_save_stack: std::sync::Mutex::new(Vec::new()),
+            baselines: std::sync::Mutex::new(Vec::new()),
             cancel,
+            hypothetical_plan_nanos: std::sync::atomic::AtomicU64::new(0),
+            sequenced_tracker: std::sync::Mutex::new(None),
+            sequenced_approximate: std::sync::Mutex::new(None),
+            sequenced_warnings: std::sync::Mutex::new(Vec::new()),
+            records_provenance: false,
+            deadline: None,
+            budget: None,
+            rederivation_incomplete: std::sync::Mutex::new(None),
         }
+    }
+
+    /// The adapter for a program that records provenance when
+    /// `records_provenance`, started at `start` with the budget `timeout`.
+    fn with_budget(mut self, records_provenance: bool, start: Instant, timeout: Duration) -> Self {
+        self.records_provenance = records_provenance;
+        self.deadline = Some(start + timeout);
+        self.budget = Some((start, timeout));
+        self
+    }
+
+    /// The `Timeout` of a program whose budget is spent, `None` while it
+    /// is not (or without a budget).
+    fn budget_spent(&self) -> Option<LocyError> {
+        let (start, limit) = self.budget?;
+        (Instant::now() >= start + limit).then(|| self.timeout_error())
+    }
+
+    /// The `Timeout` the program's budget reports: its elapsed time and
+    /// limit (zero without a budget, which has no deadline to pass).
+    fn timeout_error(&self) -> LocyError {
+        let (start, limit) = self.budget.unwrap_or((Instant::now(), Duration::ZERO));
+        LocyError::Timeout {
+            elapsed: start.elapsed(),
+            limit,
+        }
+    }
+
+    /// Total planning time of the hypothetical re-evaluations run so far.
+    fn hypothetical_plan_time(&self) -> Duration {
+        Duration::from_nanos(
+            self.hypothetical_plan_nanos
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Offer the program's own facts to ASSUME / ABDUCE for reuse.
+    ///
+    /// `base` is the base state's fingerprint taken before the program ran.
+    /// Valid until a Locy-issued write or a change of the base state.
+    fn enable_top_level_baseline(
+        &self,
+        base: Option<BaseFingerprint>,
+        facts: Arc<uni_query::query::df_graph::DerivedStore>,
+        rows: Arc<RowStore>,
+    ) {
+        let baseline = HypotheticalBaseline {
+            facts,
+            rows: Some(rows),
+            epoch: self.epoch.load(std::sync::atomic::Ordering::SeqCst),
+            base,
+        };
+        self.baselines.lock().unwrap().insert(0, baseline);
+    }
+
+    /// Record that the state changed: a write is about to run.
+    fn advance_epoch(&self) {
+        let fresh = self
+            .next_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.epoch.store(fresh, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Storage pinned to the transaction's snapshot version (C2) when a read
@@ -1269,34 +1946,68 @@ impl<'a> NativeExecutionAdapter<'a> {
             .unwrap_or_else(|| self.db.storage.clone())
     }
 
-    /// Execute a Query AST via execute_subplan, reusing the fixpoint contexts.
-    async fn execute_query_ast(
-        &self,
-        ast: Query,
-    ) -> std::result::Result<Vec<RecordBatch>, LocyError> {
-        let schema = self.db.schema.schema();
-        let logical_plan =
-            QueryPlanner::new(schema)
-                .plan(ast)
-                .map_err(|e| LocyError::ExecutorError {
-                    message: e.to_string(),
-                })?;
-        uni_query::query::df_graph::common::execute_subplan(
-            &logical_plan,
-            &self.params,
-            &HashMap::new(),
-            &self.graph_ctx,
-            &self.session_ctx,
-            // Honor the pinned snapshot storage (C2) so fact-extraction reads the
-            // same L1 version boundary the fixpoint used (REQ-1b).
-            &self.effective_storage(),
-            &self.db.schema.schema(),
-            None, // Locy fact-extraction path is read-only
-        )
-        .await
-        .map_err(|e| LocyError::ExecutorError {
-            message: e.to_string(),
-        })
+    /// The context an entity lookup scans through: the fixpoint's, on
+    /// [`Self::effective_storage`] (pinned to the transaction's snapshot when
+    /// one is installed), so a lookup and a Cypher read of the same entity see
+    /// the same version.
+    ///
+    /// It reads the current state's L0 too ([`Self::state_ctx`]): inside an
+    /// ASSUME body or an ABDUCE candidate that is the hypothetical overlay,
+    /// so an entity the hypothetical mutation created resolves. Read through
+    /// the program's own overlay instead, such an entity stayed a raw id, and
+    /// a body EXPLAIN whose WHERE named it fell back to re-execution.
+    fn lookup_ctx(&self) -> Arc<uni_query::query::df_graph::GraphExecutionContext> {
+        self.state_ctx()
+    }
+
+    /// The context a read of the current state goes through: the active
+    /// Locy L0 (the hypothetical overlay inside ASSUME / ABDUCE, else the
+    /// program's own overlay or transaction L0) over the pinned snapshot's
+    /// frozen generations and version-pinned storage when one is installed,
+    /// else live L0 and storage; the fixpoint's context when none of these
+    /// apply. It inherits the fixpoint context's budget and counters.
+    ///
+    /// REQ-1b: when a read snapshot is pinned (the `tx.locy()` path), base
+    /// facts come from the frozen snapshot generations and the
+    /// version-pinned storage, exactly as the fixpoint planner read them,
+    /// not live state; otherwise a concurrent commit would leak into command
+    /// dispatch. The active L0 stays live for read-your-writes, and the
+    /// property manager stays on live storage, matching
+    /// `Executor::create_datafusion_planner`.
+    fn state_ctx(&self) -> Arc<uni_query::query::df_graph::GraphExecutionContext> {
+        let active_l0 = self
+            .locy_l0
+            .lock()
+            .unwrap()
+            .clone()
+            .or_else(|| self.tx_l0_override.clone());
+        if (active_l0.is_some() || self.read_snapshot.is_some())
+            && let Some(writer) = self.db.writer.as_ref()
+        {
+            let (current_l0, pending_flush_l0s) = match &self.read_snapshot {
+                Some(snap) => (snap.main.clone(), snap.extra.clone()),
+                None => (
+                    writer.l0_manager.get_current(),
+                    writer.l0_manager.get_pending_flush(),
+                ),
+            };
+            let l0_ctx = uni_query::query::df_graph::L0Context {
+                current_l0: Some(current_l0),
+                transaction_l0: active_l0,
+                pending_flush_l0s,
+            };
+            // Derived from `self.graph_ctx`, so it inherits that context's
+            // budget too: otherwise it silently drops the deadline (#207).
+            return Arc::new(carry_budget(
+                uni_query::query::df_graph::GraphExecutionContext::with_l0_context(
+                    self.effective_storage(),
+                    l0_ctx,
+                    self.graph_ctx.property_manager().clone(),
+                ),
+                &self.graph_ctx,
+            ));
+        }
+        self.graph_ctx.clone()
     }
 }
 
@@ -1339,62 +2050,10 @@ impl DerivedFactSource for NativeExecutionAdapter<'_> {
         // Storage pinned to the transaction's snapshot version (C2) when a read
         // snapshot is installed, else live storage.
         let effective_storage = self.effective_storage();
-
-        // When a locy_l0 or transaction L0 is active, OR a read snapshot is
-        // pinned, the stored graph_ctx may not reflect the right L0/storage view
-        // for this dispatch. Rebuild a temporary context.
-        //
-        // REQ-1b: when a read snapshot is pinned (the `tx.locy()` path), the
-        // rebuilt context MUST read base facts from the FROZEN snapshot
-        // generations (`snap.main` + `snap.extra`) and the version-pinned
-        // storage, exactly like the fixpoint planner did — not live storage and
-        // live L0. Otherwise a concurrent commit (or a flush completing
-        // mid-transaction) would leak into command-dispatch pattern matching,
-        // making a program's result depend on whether it ran via `session.locy()`
-        // (no snapshot ⇒ live) vs `tx.locy()` (snapshot ⇒ frozen). The
-        // transaction L0 stays live for read-your-writes. PropertyManager
-        // intentionally stays on live storage (read-your-writes on properties),
-        // matching `Executor::create_datafusion_planner`.
-        let tx_l0_for_ctx = self
-            .locy_l0
-            .lock()
-            .unwrap()
-            .clone()
-            .or_else(|| self.tx_l0_override.clone());
-        let transaction_ctx: Option<Arc<uni_query::query::df_graph::GraphExecutionContext>> =
-            if tx_l0_for_ctx.is_some() || self.read_snapshot.is_some() {
-                if let Some(writer) = self.db.writer.as_ref() {
-                    let (current_l0, pending_flush_l0s) = match &self.read_snapshot {
-                        Some(snap) => (snap.main.clone(), snap.extra.clone()),
-                        None => (
-                            writer.l0_manager.get_current(),
-                            writer.l0_manager.get_pending_flush(),
-                        ),
-                    };
-                    let l0_ctx = uni_query::query::df_graph::L0Context {
-                        current_l0: Some(current_l0),
-                        transaction_l0: tx_l0_for_ctx,
-                        pending_flush_l0s,
-                    };
-                    // Derived from `self.graph_ctx`, so it inherits that
-                    // context's budget too — otherwise the transaction-scoped
-                    // context silently drops the deadline. See #207.
-                    Some(Arc::new(carry_budget(
-                        uni_query::query::df_graph::GraphExecutionContext::with_l0_context(
-                            effective_storage.clone(),
-                            l0_ctx,
-                            self.graph_ctx.property_manager().clone(),
-                        ),
-                        &self.graph_ctx,
-                    )))
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-        let effective_ctx = transaction_ctx.as_ref().unwrap_or(&self.graph_ctx);
+        // The current state: the active Locy L0 (the hypothetical overlay
+        // inside ASSUME / ABDUCE) over the pinned snapshot (REQ-1b).
+        let state_ctx = self.state_ctx();
+        let effective_ctx = &state_ctx;
 
         // Use the fixpoint planner's execution contexts directly via execute_subplan.
         uni_query::query::df_graph::common::execute_subplan(
@@ -1430,9 +2089,27 @@ impl DerivedFactSource for NativeExecutionAdapter<'_> {
 
 #[async_trait]
 impl LocyExecutionContext for NativeExecutionAdapter<'_> {
+    /// A DERIVE rule's facts are its body re-run now — the fixpoint does not
+    /// evaluate DERIVE rules — through [`resolve_clause_with_is_refs`]: the
+    /// MATCH through [`DerivedFactSource::execute_pattern`] (which reads the
+    /// adapter's current `locy_l0`, the hypothetical overlay inside ASSUME),
+    /// then each IS reference as a semi-join, filter or anti-join over
+    /// `derived_store`, in the clause's binding-plan order.
+    ///
+    /// Re-running only the MATCH and its WHERE expressions, as this did,
+    /// dropped every IS reference: `WHERE a IS flag` derived for every `a`, and
+    /// `WHERE a IS reach TO b` derived nothing, since only the reference binds
+    /// `b`. And the referenced facts must be `derived_store`'s, not the
+    /// program's, so that inside ASSUME they are the hypothetical ones.
+    ///
+    /// Any other rule's facts are `derived_store`'s rows, already hydrated by
+    /// whichever evaluation produced that store, in the state it ran in.
+    ///
+    /// [`resolve_clause_with_is_refs`]: uni_query::query::df_graph::locy_delta::resolve_clause_with_is_refs
     async fn lookup_derived_enriched(
         &self,
         rule_name: &str,
+        derived_store: &RowStore,
     ) -> std::result::Result<Vec<FactRow>, LocyError> {
         if let Some(rule) = self.compiled.rule_catalog.get(rule_name) {
             let is_derive_rule = rule
@@ -1442,75 +2119,50 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
             if is_derive_rule {
                 let mut all_rows = Vec::new();
                 for clause in &rule.clauses {
-                    let cypher_conds = extract_cypher_conditions(&clause.where_conditions);
-                    let raw_batches = self
-                        .execute_pattern(&clause.match_pattern, &cypher_conds)
-                        .await?;
-                    all_rows.extend(record_batches_to_locy_rows(&raw_batches));
+                    all_rows.extend(
+                        uni_query::query::df_graph::locy_delta::resolve_clause_with_is_refs(
+                            clause,
+                            self,
+                            derived_store,
+                            &self.compiled.rule_catalog,
+                            None,
+                        )
+                        .await?,
+                    );
                 }
                 return Ok(all_rows);
             }
         }
-
-        let batches = self
-            .native_store
+        Ok(derived_store
             .get(rule_name)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[]);
-        let rows = record_batches_to_locy_rows(batches);
-        let edge_columns = uni_locy::entity_columns::edge_columns(&self.compiled.rule_catalog);
-        let id_columns = entity_id_columns(batches, edge_columns.get(rule_name));
-        let mut resolved: HashMap<EntityKind, HashMap<i64, Value>> = HashMap::new();
-        for kind in [EntityKind::Node, EntityKind::Edge] {
-            let columns: HashSet<String> = id_columns
-                .iter()
-                .filter(|(_, k)| **k == kind)
-                .map(|(c, _)| c.clone())
-                .collect();
-            let ids = unique_vids_in(&rows, &columns);
-            if ids.is_empty() {
-                continue;
-            }
-            // A fact whose entity did not resolve would reach DERIVE as a bare
-            // integer, so a failed lookup is an error rather than a quiet
-            // fall-back to the raw IDs.
-            let lookup_error = |message: String| LocyError::EvaluationError {
-                message: format!("hydrating rule '{rule_name}': {message}"),
-            };
-            let ast = uni_cypher::parse(&entity_lookup_query(&ids, kind))
-                .map_err(|e| lookup_error(e.to_string()))?;
-            let batches = self.execute_query_ast(ast).await?;
-            let mut map = HashMap::new();
-            for row in record_batches_to_locy_rows(&batches) {
-                if let (Some(Value::Int(id)), Some(entity)) = (row.get("_id"), row.get("entity")) {
-                    map.insert(*id, entity.clone());
-                }
-            }
-            if map.len() < ids.len() {
-                return Err(lookup_error(format!(
-                    "resolved {}/{} entities",
-                    map.len(),
-                    ids.len()
-                )));
-            }
-            resolved.insert(kind, map);
-        }
-        Ok(substitute_entities(rows, &id_columns, &resolved))
+            .map(|relation| relation.rows.clone())
+            .unwrap_or_default())
     }
 
     async fn execute_cypher_read(
         &self,
         ast: Query,
     ) -> std::result::Result<Vec<FactRow>, LocyError> {
+        // A Cypher command that writes changes the state a hypothetical
+        // baseline describes.
+        if uni_locy::incremental::query_may_write(&ast) {
+            self.advance_epoch();
+        }
         // Route through locy_l0 so trailing Cypher sees DERIVE/ASSUME mutations.
         // locy_l0 is the "active" L0 for this evaluation scope.
+        //
+        // Every branch runs with the program's parameters and under its
+        // cancellation scope, as the inline Cypher commands ahead of the
+        // first write do: a command after a write is dispatched here, and
+        // without them a `$param` read failed as unresolved and a `$param`
+        // write stored NULL.
         let active_l0 = self.locy_l0.lock().unwrap().clone();
         let result = if let Some(ref l0) = active_l0 {
             self.db
                 .execute_ast_internal_with_tx_l0(
                     ast,
                     "<locy>",
-                    HashMap::new(),
+                    self.params.clone(),
                     self.db.config.clone(),
                     l0.clone(),
                     self.cancel.clone(),
@@ -1521,7 +2173,7 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
                 .execute_ast_internal_with_tx_l0(
                     ast,
                     "<locy>",
-                    HashMap::new(),
+                    self.params.clone(),
                     self.db.config.clone(),
                     tx_l0.clone(),
                     self.cancel.clone(),
@@ -1532,9 +2184,9 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
                 .execute_ast_internal(
                     ast,
                     "<locy>",
-                    HashMap::new(),
+                    self.params.clone(),
                     self.db.config.clone(),
-                    crate::api::impl_query::CancelScope::default(),
+                    self.cancel.clone(),
                 )
                 .await
         }
@@ -1556,6 +2208,9 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
         ast: Query,
         params: HashMap<String, Value>,
     ) -> std::result::Result<usize, LocyError> {
+        // Advanced before running: a mutation that fails part way may still
+        // have written.
+        self.advance_epoch();
         // Route through locy_l0 for all mutations within this evaluation scope.
         let active_l0 = self.locy_l0.lock().unwrap().clone();
         if let Some(ref l0) = active_l0 {
@@ -1602,7 +2257,7 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
                 "<locy>",
                 params,
                 self.db.config.clone(),
-                crate::api::impl_query::CancelScope::default(),
+                self.cancel.clone(),
             )
             .await
             .map_err(|e| LocyError::ExecutorError {
@@ -1622,6 +2277,10 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
         // Save the original, replace with the clone for hypothetical mutations
         let previous = guard.replace(cloned).unwrap();
         self.l0_save_stack.lock().unwrap().push(previous);
+        self.epoch_save_stack
+            .lock()
+            .unwrap()
+            .push(self.epoch.load(std::sync::atomic::Ordering::SeqCst));
         Ok(())
     }
 
@@ -1636,6 +2295,10 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
                 })?;
         let mut guard = self.locy_l0.lock().unwrap();
         *guard = Some(saved);
+        // The restored buffer is the state at the fork, so is its epoch.
+        if let Some(epoch) = self.epoch_save_stack.lock().unwrap().pop() {
+            self.epoch.store(epoch, std::sync::atomic::Ordering::SeqCst);
+        }
         Ok(())
     }
 
@@ -1644,6 +2307,171 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
         program: &CompiledProgram,
         config: &LocyConfig,
     ) -> std::result::Result<RowStore, LocyError> {
+        Ok(self
+            .re_evaluate_strata_reusing(program, config, None)
+            .await?
+            .rows)
+    }
+
+    fn reuse_baseline(&self) -> Option<uni_query::query::df_graph::StrataBaseline> {
+        let baselines = self.baselines.lock().unwrap();
+        let top = baselines.last()?;
+        let current = self.epoch.load(std::sync::atomic::Ordering::SeqCst);
+        // The innermost baseline is the newest; if it is stale, so is every
+        // older one (a Locy write since, or the base state moved).
+        (top.epoch == current && top.base == base_fingerprint(self.db, &self.read_snapshot)).then(
+            || uni_query::query::df_graph::StrataBaseline {
+                facts: top.facts.clone(),
+                rows: top.rows.clone(),
+            },
+        )
+    }
+
+    fn push_reuse_baseline(&self, baseline: uni_query::query::df_graph::StrataBaseline) {
+        let entry = HypotheticalBaseline {
+            facts: baseline.facts,
+            rows: baseline.rows,
+            epoch: self.epoch.load(std::sync::atomic::Ordering::SeqCst),
+            base: base_fingerprint(self.db, &self.read_snapshot),
+        };
+        self.baselines.lock().unwrap().push(entry);
+    }
+
+    fn pop_reuse_baseline(&self) {
+        self.baselines.lock().unwrap().pop();
+    }
+
+    async fn re_evaluate_strata_reusing(
+        &self,
+        program: &CompiledProgram,
+        config: &LocyConfig,
+        reused: Option<uni_query::query::df_graph::ReusedStrata>,
+    ) -> std::result::Result<uni_query::query::df_graph::ReEvaluation, LocyError> {
+        // A hypothetical state records provenance when the program does:
+        // exact probabilities are corrected only with a tracker, so without
+        // one an ASSUME body read the independence approximation of a value
+        // the same QUERY at the top level read exactly, and a body EXPLAIN
+        // had no derivations to show. A reused stratum carries no
+        // provenance, so nothing is reused then.
+        let tracker = self
+            .records_provenance
+            .then(|| Arc::new(ProvenanceStore::new()));
+        let reused = if tracker.is_some() { None } else { reused };
+        let (evaluation, run_warnings) = self
+            .re_evaluate_with(program, config, reused, tracker)
+            .await?;
+        for w in &run_warnings {
+            tracing::warn!(rule = %w.rule_name, "{}", w.message);
+        }
+        Ok(evaluation)
+    }
+
+    async fn re_evaluate_sequenced(
+        &self,
+        program: &CompiledProgram,
+        config: &LocyConfig,
+        reused: Option<uni_query::query::df_graph::ReusedStrata>,
+    ) -> std::result::Result<uni_query::query::df_graph::ReEvaluation, LocyError> {
+        // A program that records provenance records it for the new state
+        // too, so EXPLAIN after a write reads the derivations of the facts it
+        // explains. A reused stratum would carry no provenance, so nothing is
+        // reused then.
+        let had_tracker = self.sequenced_tracker.lock().unwrap().is_some();
+        let tracker = had_tracker.then(|| Arc::new(ProvenanceStore::new()));
+        let reused = if had_tracker { None } else { reused };
+        let (evaluation, run_warnings) = self
+            .re_evaluate_with(program, config, reused, tracker.clone())
+            .await?;
+        if had_tracker {
+            *self.sequenced_tracker.lock().unwrap() = tracker;
+        }
+        *self.sequenced_approximate.lock().unwrap() = Some(evaluation.approximate.clone());
+        self.sequenced_warnings.lock().unwrap().extend(run_warnings);
+        Ok(evaluation)
+    }
+
+    fn base_state_token(&self) -> Option<u64> {
+        base_fingerprint(self.db, &self.read_snapshot).map(|b| b.token())
+    }
+
+    fn is_cut_short(&self) -> bool {
+        self.rederivation_incomplete.lock().unwrap().is_some()
+    }
+
+    fn check_interrupt(&self) -> std::result::Result<(), LocyError> {
+        if self.cancel.is_cancelled() {
+            // The message `map_runtime_error` maps to `UniError::Cancelled`,
+            // as an operator's cancellation reads.
+            return Err(LocyError::ExecutorError {
+                message: "Query cancelled".to_string(),
+            });
+        }
+        match self.budget_spent() {
+            Some(spent) => Err(spent),
+            None => Ok(()),
+        }
+    }
+}
+
+impl NativeExecutionAdapter<'_> {
+    /// Re-evaluates `program`'s strata in the current state, copying the
+    /// `reused` strata, recording provenance into `tracker` when given.
+    ///
+    /// The run gets what remains of the program's budget, not a fresh
+    /// timeout. When it is cut short (budget, `max_iterations`), it fails
+    /// with [`LocyError::Incomplete`] unless `config.allow_partial`, in
+    /// which case its partial facts are returned and the cut is recorded
+    /// for the program's result.
+    ///
+    /// Returns the facts, with their provenance and approximate-probability
+    /// groups, and the warnings the run and the hydration raised.
+    async fn re_evaluate_with(
+        &self,
+        program: &CompiledProgram,
+        config: &LocyConfig,
+        reused: Option<uni_query::query::df_graph::ReusedStrata>,
+        tracker: Option<Arc<ProvenanceStore>>,
+    ) -> std::result::Result<
+        (
+            uni_query::query::df_graph::ReEvaluation,
+            Vec<RuntimeWarning>,
+        ),
+        LocyError,
+    > {
+        let reused_positions = reused
+            .as_ref()
+            .map(|r| r.positions.clone())
+            .unwrap_or_default();
+        // Rows already hydrated in this state, for rules only reused strata
+        // derive (a name an evaluated stratum also derives — a body rule
+        // shadowing a parent rule — takes the evaluated facts, as the run's
+        // store does).
+        let rehydrate_free: HashMap<String, RowRelation> =
+            match reused.as_ref().and_then(|r| r.hydrated.clone()) {
+                Some(hydrated) => {
+                    let evaluated: HashSet<&str> = program
+                        .strata
+                        .iter()
+                        .enumerate()
+                        .filter(|(pos, _)| !reused_positions.contains(pos))
+                        .flat_map(|(_, s)| s.rules.iter().map(|r| r.name.as_str()))
+                        .collect();
+                    program
+                        .strata
+                        .iter()
+                        .enumerate()
+                        .filter(|(pos, _)| reused_positions.contains(pos))
+                        .flat_map(|(_, s)| &s.rules)
+                        .filter(|r| !evaluated.contains(r.name.as_str()))
+                        .filter_map(|r| {
+                            hydrated
+                                .get(&r.name)
+                                .map(|rel| (r.name.clone(), rel.clone()))
+                        })
+                        .collect()
+                }
+                None => HashMap::new(),
+            };
         let strata_only = CompiledProgram {
             strata: program.strata.clone(),
             rule_catalog: program.rule_catalog.clone(),
@@ -1668,28 +2496,64 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
             tx_l0_override: locy_l0.clone(),
             locy_l0,
             collect_derive: false,
-            read_snapshot: None,
+            // The program's own pinned snapshot: the hypothetical state is
+            // that state plus the fork's mutations, and reused strata were
+            // derived from it.
+            read_snapshot: self.read_snapshot.clone(),
             cancel: self.cancel.clone(),
             // The adapter carries no override of its own; the bound for this
             // re-entry comes from the database config, as it did before.
             max_memory: None,
         };
-        let native_store = engine
-            .run_strata_native(&strata_only, config)
+        // What remains of the program's budget; an exhausted one stops the
+        // run before its first stratum, as an interruption.
+        let remaining_config;
+        let config = match self.deadline {
+            Some(deadline) => {
+                remaining_config = LocyConfig {
+                    timeout: Some(deadline.saturating_duration_since(Instant::now())),
+                    ..config.clone()
+                };
+                &remaining_config
+            }
+            None => config,
+        };
+        let StrataRun {
+            store: native_store,
+            plan_time,
+            warnings: mut run_warnings,
+            approximate,
+            incomplete,
+        } = engine
+            .run_strata_native(&strata_only, config, reused, tracker.clone())
             .await
-            .map_err(|e| LocyError::ExecutorError {
-                message: e.to_string(),
-            })?;
-        let mut store = native_store_to_row_store(&native_store, program);
+            .map_err(uni_error_to_locy)?;
+        if let Some(cut) = incomplete {
+            // `run_strata_native` returns a cut-short run only under
+            // `allow_partial`.
+            merge_incomplete(&mut self.rederivation_incomplete.lock().unwrap(), cut);
+        }
+        self.hypothetical_plan_nanos.fetch_add(
+            u64::try_from(plan_time.as_nanos()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        // Bounded as the program's own conversion and hydration are: only
+        // when partial facts may not be returned.
+        let strict_deadline = self.deadline.filter(|_| !config.allow_partial);
+        let spent = |DeadlinePassed| self.timeout_error();
+        let mut store =
+            native_store_to_row_store(&native_store, program, strict_deadline).map_err(spent)?;
 
         // Enrich VID / EID integers → Node / Edge objects so QUERY inside
         // ASSUME/ABDUCE can access node properties and IS-ref joins work.
+        // Rows reused already hydrated are not looked up again.
         let store_rows: HashMap<String, Vec<FactRow>> = store
             .iter()
+            .filter(|(k, _)| !rehydrate_free.contains_key(*k))
             .map(|(k, v)| (k.clone(), v.rows.clone()))
             .collect();
 
-        // Enrichment resolves each vid by running `MATCH (n) WHERE id(n) IN [...]`.
+        // Enrichment resolves each vid by scanning exactly those vertices (`lookup_vertices`).
         // It MUST read through the same hypothetical `locy_l0` overlay the fixpoint
         // just used — otherwise a node created only inside this ASSUME/ABDUCE block
         // (which lives in the forked overlay, not base storage) is not found, the
@@ -1697,89 +2561,196 @@ impl LocyExecutionContext for NativeExecutionAdapter<'_> {
         // (e.g. `QUERY ... WHERE b.name = 'B'`) evaluates `Int.name` → NULL and
         // silently drops the row. Rebuild an overlay-aware context mirroring the
         // command-dispatch path (`dispatch`/`execute_pattern`).
-        let enrich_storage = self.effective_storage();
-        let enrich_ctx: Arc<uni_query::query::df_graph::GraphExecutionContext> = {
-            let tx_l0_for_ctx = self
-                .locy_l0
-                .lock()
-                .unwrap()
-                .clone()
-                .or_else(|| self.tx_l0_override.clone());
-            if (tx_l0_for_ctx.is_some() || self.read_snapshot.is_some())
-                && let Some(writer) = self.db.writer.as_ref()
-            {
-                let (current_l0, pending_flush_l0s) = match &self.read_snapshot {
-                    Some(snap) => (snap.main.clone(), snap.extra.clone()),
-                    None => (
-                        writer.l0_manager.get_current(),
-                        writer.l0_manager.get_pending_flush(),
-                    ),
-                };
-                let l0_ctx = uni_query::query::df_graph::L0Context {
-                    current_l0: Some(current_l0),
-                    transaction_l0: tx_l0_for_ctx,
-                    pending_flush_l0s,
-                };
-                Arc::new(carry_budget(
-                    uni_query::query::df_graph::GraphExecutionContext::with_l0_context(
-                        enrich_storage.clone(),
-                        l0_ctx,
-                        self.graph_ctx.property_manager().clone(),
-                    ),
-                    &self.graph_ctx,
-                ))
-            } else {
-                self.graph_ctx.clone()
-            }
-        };
+        let enrich_ctx = self.state_ctx();
         let (enriched, hydration_warnings) = enrich_vids_with_nodes(
-            self.db,
             &native_store,
             &program.rule_catalog,
             store_rows,
             &enrich_ctx,
             &self.session_ctx,
+            strict_deadline,
         )
-        .await;
-        for w in &hydration_warnings {
-            tracing::warn!(rule = %w.rule_name, "{}", w.message);
-        }
+        .await
+        .map_err(spent)?;
+        run_warnings.extend(hydration_warnings);
         for (name, rows) in enriched {
             if let Some(rel) = store.get_mut(&name) {
                 rel.rows = rows;
             }
         }
+        store.extend(rehydrate_free);
 
-        Ok(store)
+        Ok((
+            uni_query::query::df_graph::ReEvaluation {
+                rows: store,
+                facts: Some(Arc::new(native_store)),
+                reused: reused_positions,
+                tracker,
+                approximate,
+            },
+            run_warnings,
+        ))
     }
+}
+
+/// Refuses a Cypher command calling a `Schema`- or `Dbms`-mode procedure
+/// (`uni.schema.createLabel`, `uni.admin.snapshot.restore`, …) where its
+/// effect could not be contained: anywhere in a session-level program, whose
+/// writes are only collected for `tx.apply` and whose overlay is discarded,
+/// and anywhere in an `ASSUME` body, which is hypothetical. These procedures
+/// act on the catalog or the storage directly, not on the overlay, so they
+/// would take effect at once — a session program ran
+/// `uni.admin.snapshot.create()` and `uni.schema.dropLabel()` for real.
+fn refuse_undeferrable_procedures(
+    commands: &[CompiledCommand],
+    session_level: bool,
+    in_assume: bool,
+    registered_mode: impl Fn(&str) -> Option<uni_plugin::traits::procedure::ProcedureMode> + Copy,
+) -> Result<()> {
+    use uni_plugin::traits::procedure::ProcedureMode;
+    for command in commands {
+        match command {
+            CompiledCommand::Cypher(q) if session_level || in_assume => {
+                let mode = uni_query::strongest_procedure_mode(q, &registered_mode);
+                if matches!(mode, Some(m) if !matches!(m, ProcedureMode::Read | ProcedureMode::Write))
+                {
+                    let place = if in_assume {
+                        "an ASSUME body"
+                    } else {
+                        "a session-level Locy program"
+                    };
+                    return Err(UniError::Query {
+                        message: format!(
+                            "a schema or administrative procedure cannot run in {place}: its \
+                             effect is immediate and cannot be deferred or discarded. Run it \
+                             with session.run() (administrative) or in a transaction (schema)."
+                        ),
+                        query: None,
+                    });
+                }
+            }
+            CompiledCommand::Assume(a) => {
+                refuse_undeferrable_procedures(
+                    &a.body_commands,
+                    session_level,
+                    true,
+                    registered_mode,
+                )?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 // ── Native command dispatch ───────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
+/// Whether `cmd` can write to the graph its program runs against: a DERIVE,
+/// or a Cypher command that is not read-only. ASSUME and ABDUCE write only
+/// to a hypothetical state they discard.
+fn command_may_write(cmd: &CompiledCommand) -> bool {
+    match cmd {
+        CompiledCommand::DeriveCommand(_) => true,
+        CompiledCommand::Cypher(q) => uni_locy::incremental::query_may_write(q),
+        _ => false,
+    }
+}
+
+/// What a top-level command produced.
+struct DispatchOutcome {
+    result: CommandResult,
+    /// The footprint of what it wrote, when it wrote: the facts later
+    /// commands read must be derived again.
+    written: Option<uni_locy::incremental::MutationFootprint>,
+}
+
+impl DispatchOutcome {
+    fn read(result: CommandResult) -> Self {
+        Self {
+            result,
+            written: None,
+        }
+    }
+}
+
+/// Refuses a session-level DERIVE that names a node an earlier command of
+/// the same program created.
+///
+/// A session program's writes come back as a `DerivedFactSet` that
+/// `tx.apply` replays, and a DERIVE's statements find the nodes they connect
+/// by id. A node an earlier command created exists only in the program's
+/// ephemeral overlay; the replay creates it again under a new id, so the
+/// DERIVE's statement would match nothing and its edge would be silently
+/// lost. Nodes allocated before the program started, or not in the overlay,
+/// exist outside it.
+fn refuse_program_created_endpoints(
+    ctx: &NativeExecutionAdapter<'_>,
+    rule: &str,
+    bound_vids: &std::collections::BTreeSet<u64>,
+    program_start_vid: Option<u64>,
+) -> std::result::Result<(), LocyError> {
+    let Some(start) = program_start_vid else {
+        return Ok(());
+    };
+    let Some(overlay) = ctx.locy_l0.lock().unwrap().clone() else {
+        return Ok(());
+    };
+    let overlay = overlay.read();
+    let created = bound_vids.iter().find(|vid| {
+        **vid >= start
+            && overlay
+                .vertex_labels
+                .contains_key(&uni_common::core::id::Vid::new(**vid))
+    });
+    match created {
+        Some(vid) => Err(LocyError::EvaluationError {
+            message: format!(
+                "DERIVE {rule} connects node {vid}, which an earlier command of this \
+                 session-level program created. The program's writes are returned as a \
+                 DerivedFactSet that tx.apply() replays, and the replay creates that node \
+                 under a new id, so this DERIVE could not find it. Run the program with \
+                 tx.locy(), or apply the creating command's facts before deriving from them."
+            ),
+        }),
+        None => Ok(()),
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Threads the program, adapter, current facts, provenance and the session path's collection state into one command"
+)]
 fn dispatch_native_command<'a>(
     cmd: &'a CompiledCommand,
     program: &'a CompiledProgram,
     ctx: &'a NativeExecutionAdapter<'a>,
     config: &'a LocyConfig,
-    orch_store: &'a RowStore,
+    facts: &'a CommandFacts,
     stats: &'a mut LocyStats,
     tracker: Option<Arc<ProvenanceStore>>,
     approximate_groups: &'a HashMap<String, Vec<String>>,
     collect_derive: bool,
     collected_derives: &'a mut Vec<CollectedDeriveOutput>,
+    program_start_vid: Option<u64>,
 ) -> std::pin::Pin<
     Box<
-        dyn std::future::Future<Output = std::result::Result<CommandResult, LocyError>> + Send + 'a,
+        dyn std::future::Future<Output = std::result::Result<DispatchOutcome, LocyError>>
+            + Send
+            + 'a,
     >,
 > {
     Box::pin(async move {
+        let orch_store = facts.store();
         match cmd {
             CompiledCommand::GoalQuery(gq) => {
                 let rows = uni_query::query::df_graph::locy_query::evaluate_query(
-                    gq, program, config, orch_store,
+                    gq,
+                    program,
+                    config,
+                    orch_store,
+                    &|| ctx.check_interrupt(),
                 )?;
-                Ok(CommandResult::Query(rows))
+                Ok(DispatchOutcome::read(CommandResult::Query(rows)))
             }
             CompiledCommand::ExplainRule(eq) => {
                 let node = uni_query::query::df_graph::locy_explain::explain_rule(
@@ -1793,87 +2764,149 @@ fn dispatch_native_command<'a>(
                     Some(approximate_groups),
                 )
                 .await?;
-                Ok(CommandResult::Explain(node))
+                Ok(DispatchOutcome::read(CommandResult::Explain(node)))
             }
             CompiledCommand::Assume(ca) => {
-                let rows = uni_query::query::df_graph::locy_assume::evaluate_assume(
+                // An ASSUME restores the state it started from, so it writes
+                // nothing the following commands can see.
+                let result = uni_query::query::df_graph::locy_assume::evaluate_assume(
                     ca, program, ctx, config, stats,
                 )
                 .await?;
-                Ok(CommandResult::Assume(rows))
+                Ok(DispatchOutcome::read(result))
             }
             CompiledCommand::Abduce(aq) => {
                 let result = uni_query::query::df_graph::locy_abduce::evaluate_abduce(
                     aq, program, ctx, config, orch_store, stats,
                 )
                 .await?;
-                Ok(CommandResult::Abduce(result))
+                Ok(DispatchOutcome::read(CommandResult::Abduce(result)))
             }
             CompiledCommand::DeriveCommand(dc) => {
                 if collect_derive {
                     // Session path: collect ASTs + data for deferred materialization.
                     let output = uni_query::query::df_graph::locy_derive::collect_derive_facts(
-                        dc, program, ctx,
+                        dc, program, ctx, orch_store,
                     )
                     .await?;
+                    refuse_program_created_endpoints(
+                        ctx,
+                        &dc.rule_name.to_string(),
+                        &output.bound_vids,
+                        program_start_vid,
+                    )?;
                     let affected = output.affected;
 
-                    // Replay mutations to the ephemeral L0 so that subsequent
-                    // trailing Cypher commands can read the derived edges.
-                    // Guard: skip when no L0 exists (read-only DB).
-                    // Replay mutations to the ephemeral L0 so that subsequent
-                    // trailing Cypher commands can read the derived edges.
-                    // Guard: skip when no L0 exists (read-only DB).
+                    // Replay the mutations into the ephemeral overlay so that
+                    // later commands see the derived facts. Skipped when there
+                    // is no overlay (a read-only database).
+                    let mut footprint = uni_locy::incremental::MutationFootprint::default();
                     if ctx.tx_l0_override.is_some() {
                         for query in &output.queries {
+                            footprint.extend(&uni_locy::incremental::query_footprint(query));
                             ctx.execute_mutation(query.clone(), HashMap::new()).await?;
                         }
                     }
 
                     collected_derives.push(output);
-                    Ok(CommandResult::Derive { affected })
+                    Ok(DispatchOutcome {
+                        result: CommandResult::Derive { affected },
+                        written: (affected > 0 && ctx.tx_l0_override.is_some())
+                            .then_some(footprint),
+                    })
                 } else {
                     // Transaction path: auto-apply mutations
-                    let affected = uni_query::query::df_graph::locy_derive::derive_command(
-                        dc, program, ctx, stats,
-                    )
-                    .await?;
-                    Ok(CommandResult::Derive { affected })
+                    let (affected, footprint) =
+                        uni_query::query::df_graph::locy_derive::derive_command_footprint(
+                            dc, program, ctx, orch_store, stats,
+                        )
+                        .await?;
+                    Ok(DispatchOutcome {
+                        result: CommandResult::Derive { affected },
+                        written: (affected > 0).then_some(footprint),
+                    })
                 }
             }
             CompiledCommand::Cypher(q) => {
                 let rows = ctx.execute_cypher_read(q.clone()).await?;
                 stats.queries_executed += 1;
-                Ok(CommandResult::Cypher(rows))
+                let written = uni_locy::incremental::command_write_footprint(q);
+                if collect_derive && written.is_some() {
+                    // A session program's write is returned with its DERIVE
+                    // output, in program order, for `tx.apply` to replay.
+                    collected_derives.push(CollectedDeriveOutput {
+                        queries: vec![q.clone()],
+                        vertices: HashMap::new(),
+                        edges: Vec::new(),
+                        affected: 0,
+                        bound_vids: std::collections::BTreeSet::new(),
+                    });
+                }
+                Ok(DispatchOutcome {
+                    result: CommandResult::Cypher(rows),
+                    written,
+                })
             }
             CompiledCommand::Calibrate(cc) => {
-                // CALIBRATE runs inline inside LocyProgramExec::run_program
-                // and surfaces its result via the command_results_slot;
-                // by the time we get here that lookup has already
-                // succeeded. Reaching this arm is a programming
-                // error (the inline result was missing).
-                Err(LocyError::EvaluationError {
-                    message: format!(
-                        "internal: CALIBRATE '{}' missing inline result; \
-                         dispatch_native_command should not have been invoked \
-                         for a Calibrate command",
-                        cc.model_name
-                    ),
-                })
+                // Before the program's first write, CALIBRATE runs inline in
+                // `run_program`. After it, here, so its collection query sees
+                // the state the earlier commands left.
+                let model = program.model_catalog.get(&cc.model_name).ok_or_else(|| {
+                    LocyError::EvaluationError {
+                        message: format!("CALIBRATE: unknown model '{}'", cc.model_name),
+                    }
+                })?;
+                let query = uni_query::query::df_graph::locy_calibrate::calibrate_collection_query(
+                    cc, model,
+                );
+                let rows = ctx.execute_cypher_read(query).await?;
+                let result = uni_query::query::df_graph::locy_calibrate::run_calibrate(
+                    cc,
+                    &program.model_catalog,
+                    &Arc::new(config.classifier_registry.clone()),
+                    rows,
+                )
+                .await
+                .map_err(|e| LocyError::EvaluationError {
+                    message: format!("CALIBRATE error: {e}"),
+                })?;
+                Ok(DispatchOutcome::read(CommandResult::Calibrate(result)))
             }
             CompiledCommand::Validate(cv) => {
-                // VALIDATE, like CALIBRATE, runs inline inside
-                // LocyProgramExec::run_program and surfaces via
-                // command_results_slot. Reaching this arm is a
-                // programming error.
-                Err(LocyError::EvaluationError {
-                    message: format!(
-                        "internal: VALIDATE '{}' missing inline result; \
-                         dispatch_native_command should not have been invoked \
-                         for a Validate command",
-                        cv.rule_name
-                    ),
-                })
+                // Before the program's first write, VALIDATE runs inline in
+                // `run_program`. After it, here, against the facts and the
+                // graph of the state the earlier commands left.
+                let rule_key_cols: Vec<String> = program
+                    .rule_catalog
+                    .get(&cv.rule_name)
+                    .map(|r| {
+                        r.yield_schema
+                            .iter()
+                            .filter(|c| c.is_key)
+                            .map(|c| c.name.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let query = uni_query::query::df_graph::locy_validate::validate_collection_query(
+                    cv,
+                    &rule_key_cols,
+                );
+                let target_rows = ctx.execute_cypher_read(query).await?;
+                let rule_facts: Vec<FactRow> = facts
+                    .raw()
+                    .and_then(|raw| raw.get(&cv.rule_name))
+                    .map(|batches| record_batches_to_locy_rows(batches))
+                    .unwrap_or_default();
+                let result = uni_query::query::df_graph::locy_validate::run_validate(
+                    cv,
+                    &rule_key_cols,
+                    &rule_facts,
+                    target_rows,
+                )
+                .map_err(|e| LocyError::EvaluationError {
+                    message: format!("VALIDATE error: {e}"),
+                })?;
+                Ok(DispatchOutcome::read(CommandResult::Validate(result)))
             }
         }
     })
@@ -1894,28 +2927,6 @@ fn unique_vids_in(rows: &[FactRow], vid_columns: &HashSet<String>) -> HashSet<i6
             })
         })
         .collect()
-}
-
-/// The Cypher statement resolving each ID in `ids` to its entity: a node for
-/// a VID, a relationship for an EID. Returns the ID as `_id` and the entity as
-/// `entity`.
-fn entity_lookup_query(ids: &HashSet<i64>, kind: EntityKind) -> String {
-    let ids_literal = ids
-        .iter()
-        .map(|v| v.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    match kind {
-        EntityKind::Node => {
-            format!(
-                "MATCH (entity) WHERE id(entity) IN [{ids_literal}] RETURN id(entity) AS _id, entity"
-            )
-        }
-        EntityKind::Edge => format!(
-            "MATCH ()-[entity]->() WHERE id(entity) IN [{ids_literal}] \
-             RETURN id(entity) AS _id, entity"
-        ),
-    }
 }
 
 /// A rule's entity-ID columns (`UInt64`) and which ID space each holds.
@@ -1945,7 +2956,8 @@ fn entity_id_columns(
 }
 
 impl NativeExecutionAdapter<'_> {
-    /// Resolve entity IDs of one kind through a Cypher lookup.
+    /// Resolve entity IDs of one kind: VIDs by [`lookup_vertices`], EIDs by
+    /// [`lookup_edges`].
     ///
     /// IDs that do not resolve are absent from the map; the caller decides
     /// whether that is an error.
@@ -1961,21 +2973,20 @@ impl NativeExecutionAdapter<'_> {
         if ids.is_empty() {
             return Ok(HashMap::new());
         }
-        let ast = uni_cypher::parse(&entity_lookup_query(&ids, kind)).map_err(|e| {
-            LocyError::EvaluationError {
-                message: format!("entity lookup failed to parse: {e}"),
-            }
-        })?;
-        let batches = self.execute_query_ast(ast).await?;
-        Ok(record_batches_to_locy_rows(&batches)
-            .into_iter()
-            .filter_map(|row| match (row.get("_id"), row.get("entity")) {
-                (Some(Value::Int(id)), Some(entity)) if *id >= 0 => {
-                    Some((*id as u64, entity.clone()))
-                }
-                _ => None,
+        let ctx = self.lookup_ctx();
+        let found = match kind {
+            EntityKind::Node => lookup_vertices(&ids, &ctx, &self.session_ctx).await,
+            EntityKind::Edge => lookup_edges(&ids, &ctx).await,
+        };
+        found
+            .map(|map| {
+                map.into_iter()
+                    .filter_map(|(id, entity)| u64::try_from(id).ok().map(|id| (id, entity)))
+                    .collect()
             })
-            .collect())
+            .map_err(|message| LocyError::EvaluationError {
+                message: format!("entity lookup failed: {message}"),
+            })
     }
 }
 
@@ -1991,7 +3002,7 @@ enum EntityKind {
 fn substitute_entities(
     rows: Vec<FactRow>,
     columns: &HashMap<String, EntityKind>,
-    resolved: &HashMap<EntityKind, HashMap<i64, Value>>,
+    resolved: &HashMap<EntityKind, &HashMap<i64, Value>>,
 ) -> Vec<FactRow> {
     rows.into_iter()
         .map(|row| {
@@ -2016,7 +3027,7 @@ fn substitute_entities(
 
 /// Minimum wall-clock budget granted to a VID hydration lookup.
 ///
-/// Hydration is bounded work — one `id(n) IN [...]` lookup over a known VID
+/// Hydration is bounded work — one lookup per entity kind over a known ID
 /// list — but it runs *after* the fixpoint, so it inherits whatever is left of
 /// the evaluation deadline. A fixpoint that consumed the budget used to leave
 /// hydration racing a few microseconds, and the resulting timeout was swallowed:
@@ -2026,57 +3037,182 @@ fn substitute_entities(
 /// A caller whose deadline is already more generous keeps their own.
 const VID_HYDRATION_MIN_BUDGET: Duration = Duration::from_secs(30);
 
-/// Resolve `ids` to entities of `kind` with one Cypher lookup.
+/// Resolve EIDs to `Value::Edge`s by looking up exactly those relationships.
+///
+/// The relationship counterpart of [`lookup_vertices`]. This used to run
+/// `MATCH ()-[entity]->() WHERE id(entity) IN [...]`, which has no EID
+/// pushdown: it walked every vertex and every relationship of the graph and
+/// tested each against the whole literal list, O(E × |eids|) — 1.15 s for 8k
+/// EIDs. Now:
+///
+/// - endpoints and type come from `StorageManager::lookup_edges_by_eids` — the
+///   L0 chain (transaction, hypothetical and pending-flush buffers, with their
+///   tombstones), then the main edges table read by `_eid` through the
+///   context's storage, which is the fork's branch on a fork and is bounded by
+///   the snapshot's version when pinned. Under a read-write transaction every
+///   requested EID joins the SSI read set there;
+/// - properties come from `PropertyManager::get_batch_edge_props` with
+///   `_all_props`, hinted with the types just resolved — the call the Cypher
+///   traversal makes to materialise `RETURN r`, so both read the same tiers
+///   with the same precedence.
+///
+/// The entity is the `_eid` / `_type` / `_src` / `_dst` / `_all_props` map
+/// canonicalised by [`Value::canonical_entity`], with endpoints in stored
+/// orientation, as `MATCH ()-[r]->()` binds them.
 ///
 /// # Errors
 ///
-/// Returns a description of the failure if the lookup cannot be planned or
-/// run, or resolves fewer entities than it was given.
-async fn lookup_entities(
-    db: &crate::api::UniInner,
+/// Returns a description of the failure if either read fails. EIDs that do not
+/// resolve are absent from the map; the caller decides whether that is a
+/// failure.
+async fn lookup_edges(
     ids: &HashSet<i64>,
-    kind: EntityKind,
+    graph_ctx: &Arc<uni_query::query::df_graph::GraphExecutionContext>,
+) -> std::result::Result<HashMap<i64, Value>, String> {
+    use uni_common::core::id::{Eid, Vid};
+
+    let eids: Vec<Eid> = ids
+        .iter()
+        .filter_map(|&id| u64::try_from(id).ok())
+        .map(Eid::from)
+        .collect();
+    if eids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let query_ctx = graph_ctx.query_context();
+    let records = graph_ctx
+        .storage()
+        .lookup_edges_by_eids(&eids, Some(&query_ctx))
+        .await
+        .map_err(|e| format!("EID lookup failed: {e}"))?;
+    if records.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let found: Vec<Eid> = records.keys().copied().collect();
+    let types: Vec<String> = records
+        .values()
+        .map(|r| r.edge_type.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let mut props = graph_ctx
+        .property_manager()
+        .get_batch_edge_props(&found, &["_all_props"], Some(&types), Some(&query_ctx))
+        .await
+        .map_err(|e| format!("EID lookup failed to read properties: {e}"))?;
+
+    let mut resolved = HashMap::with_capacity(records.len());
+    for (eid, record) in records {
+        let id = i64::try_from(eid.as_u64())
+            .map_err(|_| format!("EID lookup: {eid:?} does not fit an Int"))?;
+        let endpoint = |vid: Vid| {
+            i64::try_from(vid.as_u64())
+                .map(Value::Int)
+                .map_err(|_| format!("EID lookup: endpoint {vid:?} does not fit an Int"))
+        };
+        let properties = props.remove(&Vid::from(eid.as_u64())).unwrap_or_default();
+        let entity = HashMap::from([
+            ("_eid".to_string(), Value::Int(id)),
+            ("_type".to_string(), Value::String(record.edge_type)),
+            ("_src".to_string(), endpoint(record.src_vid)?),
+            ("_dst".to_string(), endpoint(record.dst_vid)?),
+            ("_all_props".to_string(), Value::Map(properties)),
+        ]);
+        resolved.insert(id, Value::Map(entity).canonical_entity());
+    }
+    Ok(resolved)
+}
+
+/// Resolve VIDs to `Value::Node`s by scanning exactly those vertices.
+///
+/// This is the same scan `MATCH (entity) WHERE id(entity) IN [...] RETURN
+/// entity` plans — a label-less vertex scan with the VID list pushed down to
+/// Lance and to L0 — without the two costs that statement adds on top. The
+/// statement had to be parsed with every VID as a literal (130 ms for 8k VIDs),
+/// and its residual `FilterExec` re-evaluated the `IN` per row against the
+/// whole list, O(N²): 38.6 ms → 585.8 ms for 2k → 8k VIDs while the scan
+/// beneath it went 5.7 ms → 19.6 ms. The scan already returns only the listed
+/// VIDs, and a filter can only remove rows, so dropping it changes no answer:
+/// anything not asked for is ignored when the result is substituted.
+///
+/// The node is built the way the Cypher read path builds it: the scan's
+/// `_vid`, `_labels` and `_all_props` columns, decoded by `arrow_to_value`, as
+/// an entity map canonicalised by [`Value::canonical_entity`]. Visibility is
+/// the scan's, so `graph_ctx` decides it: its L0 chain (transaction and
+/// hypothetical overlays included), its storage (pinned snapshot, fork branch)
+/// and its tombstones.
+///
+/// # Errors
+///
+/// Returns a description of the failure if the scan cannot run or its output
+/// cannot be decoded. VIDs that do not resolve are absent from the map.
+async fn lookup_vertices(
+    ids: &HashSet<i64>,
     graph_ctx: &Arc<uni_query::query::df_graph::GraphExecutionContext>,
     session_ctx: &Arc<parking_lot::RwLock<datafusion::prelude::SessionContext>>,
 ) -> std::result::Result<HashMap<i64, Value>, String> {
-    let what = match kind {
-        EntityKind::Node => "VID",
-        EntityKind::Edge => "EID",
-    };
-    let query_str = entity_lookup_query(ids, kind);
-    let ast =
-        uni_cypher::parse(&query_str).map_err(|e| format!("{what} lookup failed to parse: {e}"))?;
-    let logical_plan = uni_query::QueryPlanner::new(db.schema.schema())
-        .plan(ast)
-        .map_err(|e| format!("{what} lookup failed to plan: {e}"))?;
-    let batches = uni_query::query::df_graph::common::execute_subplan(
-        &logical_plan,
-        &HashMap::new(),
-        &HashMap::new(),
-        graph_ctx,
-        session_ctx,
-        // Use the (snapshot-pinned, when in a tx) storage carried by graph_ctx
-        // rather than live `db.storage`, so enrichment honors the same L1
-        // version boundary as the fixpoint and does not leak post-snapshot rows
-        // from a mid-tx flush (REQ-1b, C2 storage pin).
-        graph_ctx.storage(),
-        &db.schema.schema(),
-        None, // Locy inline Cypher path is read-only
-    )
-    .await
-    .map_err(|e| format!("{what} lookup failed to execute: {e}"))?;
-    let mut resolved = HashMap::new();
-    for row in record_batches_to_locy_rows(&batches) {
-        if let (Some(Value::Int(id)), Some(entity)) = (row.get("_id"), row.get("entity")) {
-            resolved.insert(*id, entity.clone());
-        }
+    use datafusion::physical_plan::ExecutionPlan;
+    use uni_query::query::df_graph::{GraphScanExec, ReadSetRecordingExec};
+
+    const VARIABLE: &str = "entity";
+    let vids: Vec<u64> = ids
+        .iter()
+        .filter_map(|&id| u64::try_from(id).ok())
+        .collect();
+    if vids.is_empty() {
+        return Ok(HashMap::new());
     }
-    if resolved.len() < ids.len() {
-        return Err(format!(
-            "{what} lookup resolved {}/{} entities",
-            resolved.len(),
-            ids.len()
-        ));
+    let scan: Arc<dyn ExecutionPlan> = Arc::new(
+        GraphScanExec::new_schemaless_all_scan(
+            graph_ctx.clone(),
+            VARIABLE,
+            vec!["_all_props".to_string()],
+            None,
+        )
+        .with_vid_list_filter(vids),
+    );
+    // Inside a transaction the planner wraps every scan so the rows it returns
+    // join the SSI read set; this read is no exception.
+    let records_reads = graph_ctx
+        .l0_context()
+        .transaction_l0
+        .as_ref()
+        .is_some_and(|l0| l0.read().occ_read_set.is_some());
+    let plan: Arc<dyn ExecutionPlan> = if records_reads {
+        Arc::new(ReadSetRecordingExec::new(scan, graph_ctx.clone(), VARIABLE))
+    } else {
+        scan
+    };
+    let task_ctx = session_ctx.read().task_ctx();
+    let batches = datafusion::physical_plan::collect(plan, task_ctx)
+        .await
+        .map_err(|e| format!("VID lookup failed to execute: {e}"))?;
+
+    let mut resolved = HashMap::with_capacity(ids.len());
+    for batch in &batches {
+        let column = |field: &str| {
+            batch
+                .column_by_name(&format!("{VARIABLE}.{field}"))
+                .ok_or_else(|| format!("VID lookup: scan output lacks `{VARIABLE}.{field}`"))
+        };
+        let (vid_col, labels_col, props_col) =
+            (column("_vid")?, column("_labels")?, column("_all_props")?);
+        for row in 0..batch.num_rows() {
+            let decode = |col: &arrow_array::ArrayRef| {
+                uni_store::storage::arrow_convert::arrow_to_value(col.as_ref(), row, None)
+                    .map_err(|e| format!("VID lookup failed to decode: {e}"))
+            };
+            let vid = decode(vid_col)?;
+            let Value::Int(id) = vid else {
+                return Err(format!("VID lookup: `_vid` decoded as {vid:?}"));
+            };
+            let entity = HashMap::from([
+                ("_vid".to_string(), vid),
+                ("_labels".to_string(), decode(labels_col)?),
+                ("_all_props".to_string(), decode(props_col)?),
+            ]);
+            resolved.insert(id, Value::Map(entity).canonical_entity());
+        }
     }
     Ok(resolved)
 }
@@ -2092,17 +3228,27 @@ async fn lookup_entities(
 /// Returns the enriched rows and any warnings describing rules whose hydration
 /// could not complete; those rules keep integer IDs, and the warning is how a
 /// caller learns the shape it got is not the shape it expected.
+///
+/// With a `deadline` (a program that may not return partial facts), the
+/// lookups run under it, and once it passed the hydration stops with
+/// [`DeadlinePassed`]: such a program fails with `Timeout` anyway. Without
+/// one, the lookups get at least [`VID_HYDRATION_MIN_BUDGET`], so the facts
+/// an `allow_partial` program returns are hydrated whatever the timing.
 async fn enrich_vids_with_nodes(
-    db: &crate::api::UniInner,
     native_store: &uni_query::query::df_graph::DerivedStore,
     rule_catalog: &HashMap<String, uni_locy::types::CompiledRule>,
     derived: HashMap<String, Vec<FactRow>>,
     graph_ctx: &Arc<uni_query::query::df_graph::GraphExecutionContext>,
     session_ctx: &Arc<parking_lot::RwLock<datafusion::prelude::SessionContext>>,
-) -> (HashMap<String, Vec<FactRow>>, Vec<RuntimeWarning>) {
+    deadline: Option<Instant>,
+) -> std::result::Result<(HashMap<String, Vec<FactRow>>, Vec<RuntimeWarning>), DeadlinePassed> {
     let mut enriched = HashMap::new();
     let mut warnings: Vec<RuntimeWarning> = Vec::new();
     let edge_columns = uni_locy::entity_columns::edge_columns(rule_catalog);
+    let passed = || deadline.is_some_and(|d| Instant::now() >= d);
+    if passed() {
+        return Err(DeadlinePassed);
+    }
 
     // Give the bounded lookup a usable budget when the inherited one is spent.
     let now = std::time::Instant::now();
@@ -2110,37 +3256,89 @@ async fn enrich_vids_with_nodes(
     // `None` means "no deadline at all" and must stay unbounded — only an
     // inherited deadline too small for the bounded lookup is raised to the floor.
     let enrich_ctx: Arc<uni_query::query::df_graph::GraphExecutionContext> =
-        match graph_ctx.deadline_for_host() {
-            Some(d) if d < floor => Arc::new((**graph_ctx).clone().with_deadline(floor)),
+        match (deadline, graph_ctx.deadline_for_host()) {
+            (Some(d), _) => Arc::new((**graph_ctx).clone().with_deadline(d)),
+            (None, Some(d)) if d < floor => Arc::new((**graph_ctx).clone().with_deadline(floor)),
             _ => graph_ctx.clone(),
         };
 
-    for (name, rows) in derived {
-        let id_columns = entity_id_columns(
-            native_store.get(&name).map_or(&[][..], Vec::as_slice),
-            edge_columns.get(&name),
-        );
+    // Every rule's ID columns, then the union of every rule's IDs per kind: one
+    // lookup per kind for the whole store rather than one per rule, so a vertex
+    // that several rules derive is read once.
+    let id_columns: HashMap<String, HashMap<String, EntityKind>> = derived
+        .keys()
+        .map(|name| {
+            let columns = entity_id_columns(
+                native_store.get(name).map_or(&[][..], Vec::as_slice),
+                edge_columns.get(name),
+            );
+            (name.clone(), columns)
+        })
+        .collect();
+    let ids_of = |rows: &[FactRow], columns: &HashMap<String, EntityKind>, kind: EntityKind| {
+        let of_kind: HashSet<String> = columns
+            .iter()
+            .filter(|(_, k)| **k == kind)
+            .map(|(c, _)| c.clone())
+            .collect();
+        unique_vids_in(rows, &of_kind)
+    };
+    let mut wanted: HashMap<EntityKind, HashSet<i64>> = HashMap::new();
+    for (name, rows) in &derived {
+        for kind in [EntityKind::Node, EntityKind::Edge] {
+            let ids = ids_of(rows, &id_columns[name], kind);
+            if !ids.is_empty() {
+                wanted.entry(kind).or_default().extend(ids);
+            }
+        }
+    }
+    let mut lookups: HashMap<EntityKind, std::result::Result<HashMap<i64, Value>, String>> =
+        HashMap::new();
+    for (kind, ids) in &wanted {
+        let lookup = match kind {
+            EntityKind::Node => lookup_vertices(ids, &enrich_ctx, session_ctx).await,
+            EntityKind::Edge => lookup_edges(ids, &enrich_ctx).await,
+        };
+        // A lookup the deadline stopped is the program's cut, not a rule
+        // left unhydrated.
+        if lookup.is_err() && passed() {
+            return Err(DeadlinePassed);
+        }
+        lookups.insert(*kind, lookup);
+    }
 
-        let mut resolved: HashMap<EntityKind, HashMap<i64, Value>> = HashMap::new();
+    for (name, rows) in derived {
+        let columns = &id_columns[&name];
+        let mut resolved: HashMap<EntityKind, &HashMap<i64, Value>> = HashMap::new();
         // Why every failure is recorded: an unhydrated rule is indistinguishable
         // from an empty one to a caller doing `hasattr(r, "properties")`, so a
         // swallowed error here reads downstream as "no rows matched".
         let mut failures: Vec<String> = Vec::new();
         for kind in [EntityKind::Node, EntityKind::Edge] {
-            let columns: HashSet<String> = id_columns
-                .iter()
-                .filter(|(_, k)| **k == kind)
-                .map(|(c, _)| c.clone())
-                .collect();
-            let ids = unique_vids_in(&rows, &columns);
+            let ids = ids_of(&rows, columns, kind);
             if ids.is_empty() {
                 continue;
             }
-            match lookup_entities(db, &ids, kind, &enrich_ctx, session_ctx).await {
-                Ok(map) => {
-                    resolved.insert(kind, map);
+            let what = match kind {
+                EntityKind::Node => "VID",
+                EntityKind::Edge => "EID",
+            };
+            match lookups.get(&kind) {
+                // All or nothing per rule and kind, as when each rule ran its
+                // own lookup: a rule is never returned half hydrated.
+                Some(Ok(map)) => {
+                    let found = ids.iter().filter(|id| map.contains_key(id)).count();
+                    if found == ids.len() {
+                        resolved.insert(kind, map);
+                    } else {
+                        failures.push(format!(
+                            "{what} lookup resolved {found}/{} entities",
+                            ids.len()
+                        ));
+                    }
                 }
-                Err(message) => failures.push(message),
+                Some(Err(message)) => failures.push(message.clone()),
+                None => failures.push(format!("{what} lookup did not run")),
             }
         }
 
@@ -2155,10 +3353,11 @@ async fn enrich_vids_with_nodes(
             });
         }
 
-        enriched.insert(name, substitute_entities(rows, &id_columns, &resolved));
+        let rows = substitute_entities(rows, columns, &resolved);
+        enriched.insert(name, rows);
     }
 
-    (enriched, warnings)
+    Ok((enriched, warnings))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2167,6 +3366,7 @@ fn build_locy_result(
     command_results: Vec<CommandResult>,
     compiled: &CompiledProgram,
     evaluation_time: Duration,
+    plan_time: Duration,
     mut orchestrator_stats: LocyStats,
     warnings: Vec<RuntimeWarning>,
     approximate_groups: HashMap<String, Vec<String>>,
@@ -2174,6 +3374,10 @@ fn build_locy_result(
     incomplete: Option<uni_common::LocyIncomplete>,
     counters: uni_store::CounterSnapshot,
 ) -> LocyResult {
+    // The goal-directed rewrite's copies and magic rules are evaluation
+    // detail, not rules of the program.
+    let mut derived = derived;
+    derived.retain(|name, _| !uni_locy::magic::is_goal_directed_rule(name));
     let total_facts: usize = derived.values().map(|v| v.len()).sum();
     // Reflect how far evaluation actually got: the full count for a complete
     // run, or the recorded completed-strata count when it was cut short.
@@ -2197,9 +3401,12 @@ fn build_locy_result(
     // this total already spans every fixpoint iteration — there is nothing to
     // sum here. They were ticking all along; only the harvest was missing, so
     // `metrics().rows_scanned` read 0 however much the rules scanned.
+    // `evaluation_time` spans planning too; `exec_time` is what follows it,
+    // so `plan_time + exec_time = total_time` as for a Cypher query.
     let mut metrics = QueryMetrics {
         total_time: evaluation_time,
-        exec_time: evaluation_time,
+        plan_time,
+        exec_time: evaluation_time.saturating_sub(plan_time),
         rows_returned: total_facts,
         ..Default::default()
     };
@@ -2207,14 +3414,33 @@ fn build_locy_result(
     LocyResult::new(inner, metrics)
 }
 
+/// The budget a conversion or hydration ran out of: its deadline passed
+/// before it finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeadlinePassed;
+
+/// `native`'s facts as rows, for the commands and the result.
+///
+/// With a `deadline` (a program that may not return partial facts), the
+/// conversion checks it before each batch and stops once it passed: such a
+/// program then fails with `Timeout` anyway, so finishing the conversion
+/// first only made it fail late. Under `allow_partial` the facts are
+/// returned complete, as documented, so no deadline is given.
 fn native_store_to_row_store(
     native: &uni_query::query::df_graph::DerivedStore,
     compiled: &CompiledProgram,
-) -> RowStore {
+    deadline: Option<Instant>,
+) -> std::result::Result<RowStore, DeadlinePassed> {
     let mut result = RowStore::new();
     for name in native.rule_names() {
         if let Some(batches) = native.get(name) {
-            let rows = record_batches_to_locy_rows(batches);
+            let mut rows = Vec::new();
+            for batch in batches {
+                if deadline.is_some_and(|d| Instant::now() >= d) {
+                    return Err(DeadlinePassed);
+                }
+                rows.extend(record_batches_to_locy_rows(std::slice::from_ref(batch)));
+            }
             let rule = compiled.rule_catalog.get(name);
             let columns: Vec<String> = rule
                 .map(|r| r.yield_schema.iter().map(|yc| yc.name.clone()).collect())
@@ -2226,7 +3452,7 @@ fn native_store_to_row_store(
             result.insert(name.to_string(), RowRelation::new(columns, rows));
         }
     }
-    result
+    Ok(result)
 }
 
 // ── Error mapping ──────────────────────────────────────────────────────────
@@ -2241,7 +3467,7 @@ fn map_parse_error(e: uni_cypher::ParseError) -> UniError {
     }
 }
 
-fn map_compile_error(e: LocyCompileError) -> UniError {
+pub(crate) fn map_compile_error(e: LocyCompileError) -> UniError {
     UniError::Query {
         message: format!("LocyCompileError: {e}"),
         query: None,
@@ -2284,6 +3510,9 @@ fn map_runtime_error(e: LocyError, limits: LocyLimits) -> UniError {
         LocyError::Timeout { limit, .. } => UniError::Timeout {
             timeout_ms: u64::try_from(limit.as_millis()).unwrap_or(u64::MAX),
         },
+        // A re-evaluation cut short: the same report the program's own
+        // cut-short run gives.
+        LocyError::Incomplete { detail } => UniError::LocyIncomplete { detail },
         other => map_native_df_error(other, limits),
     }
 }
@@ -2310,6 +3539,9 @@ fn map_native_df_error(e: impl std::fmt::Display, limits: LocyLimits) -> UniErro
         limits.max_query_memory,
     ) {
         return refusal;
+    }
+    if let Some(missing) = UniError::parameter_missing_from_message(&msg) {
+        return missing;
     }
     UniError::Query {
         message: format!("LocyRuntimeError: {msg}"),

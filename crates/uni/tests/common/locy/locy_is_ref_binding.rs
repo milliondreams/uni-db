@@ -123,16 +123,28 @@ const BLOCKED_BASE: &str = "CREATE RULE blocked AS \
 /// Issue #298: a third subject binds the rule's value column, so the second
 /// stage sums one contribution per owner: `a` = max(25, 25) + 20 = 45, below
 /// the threshold, and nothing beyond the designated entities is blocked.
+///
+/// Both conjunct orders: binding is order-independent (issue #300), and the
+/// first order is #300's own shape, which returned no rows before.
 #[tokio::test]
 async fn is_ref_binding_tuple_reads_a_value_column() -> Result<()> {
     let db = stakes().await?;
-    let program = format!(
-        "{STAKE}{BLOCKED_BASE}CREATE RULE blocked AS MATCH (o:E), (e:E) \
-         WHERE o IS blocked AND (o, e, pct) IS stake \
-         FOLD agg = MSUM(pct) REQUIRE agg >= 50.0 YIELD KEY e, agg\n\
-         QUERY blocked RETURN e.uid AS uid"
-    );
-    assert_eq!(query(&db, &program).await?, ["uid=x", "uid=y"]);
+    for conditions in [
+        "o IS blocked AND (o, e, pct) IS stake",
+        "(o, e, pct) IS stake AND o IS blocked",
+    ] {
+        let program = format!(
+            "{STAKE}{BLOCKED_BASE}CREATE RULE blocked AS MATCH (o:E), (e:E) \
+             WHERE {conditions} \
+             FOLD agg = MSUM(pct) REQUIRE agg >= 50.0 YIELD KEY e, agg\n\
+             QUERY blocked RETURN e.uid AS uid"
+        );
+        assert_eq!(
+            query(&db, &program).await?,
+            ["uid=x", "uid=y"],
+            "{conditions}"
+        );
+    }
     Ok(())
 }
 
@@ -215,24 +227,36 @@ async fn is_ref_binding_negation_with_interleaved_keys() -> Result<()> {
 /// `IS NOT` that compares a bound variable with a value column is refused at
 /// compile time, naming both. (An unbound one is existentially quantified and
 /// legal: `locy_is_not_scalar_to_target`.)
+///
+/// Refused in both conjunct orders: `s` is bound by the positive reference
+/// wherever it appears (issue #300). The compiler used to walk the WHERE left
+/// to right and let the reversed order through, treating `s` as an unbound,
+/// existential value; now the binding plan refuses both at compile time.
 #[tokio::test]
 async fn is_ref_binding_negation_of_a_bound_value_is_refused() -> Result<()> {
     let db = graph(FAN).await?;
-    let program = "CREATE RULE tot AS MATCH (x:N)-[e:E]->(y:N) FOLD s = SUM(e.w) YIELD KEY x, s\n\
-         CREATE RULE r AS MATCH (x:N) WHERE x IS tot TO s, x IS NOT tot TO s YIELD KEY x\n\
-         QUERY r RETURN x.name AS x";
-    let err = db
-        .session()
-        .locy_with(program)
-        .with_config(config())
-        .run()
-        .await
-        .expect_err("IS NOT comparing the bound value `s` must be refused");
-    let message = format!("{err:#}");
-    assert!(
-        message.contains("IS NOT") && message.contains("`s`"),
-        "unexpected error: {message}"
-    );
+    for conditions in [
+        "x IS tot TO s, x IS NOT tot TO s",
+        "x IS NOT tot TO s, x IS tot TO s",
+    ] {
+        let program = format!(
+            "CREATE RULE tot AS MATCH (x:N)-[e:E]->(y:N) FOLD s = SUM(e.w) YIELD KEY x, s\n\
+             CREATE RULE r AS MATCH (x:N) WHERE {conditions} YIELD KEY x\n\
+             QUERY r RETURN x.name AS x"
+        );
+        let err = db
+            .session()
+            .locy_with(&program)
+            .with_config(config())
+            .run()
+            .await
+            .expect_err("IS NOT comparing the bound value `s` must be refused");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("IS NOT") && message.contains("`s`"),
+            "{conditions}: unexpected error: {message}"
+        );
+    }
     Ok(())
 }
 
@@ -263,14 +287,18 @@ async fn is_ref_binding_too_many_subjects_is_refused() -> Result<()> {
 /// ABDUCE builds its derivation tree with the in-memory evaluator, which bound
 /// `TO t` by the stored relation's column order and put the weight `w` in `t`.
 /// No clause reproduced the `via` facts, the tree ended at them, and ABDUCE
-/// reported no valid edit at all, though removing either `E` edge out of `a`
-/// removes one of them.
+/// reported no valid edit at all, though removing the `E` edge from `a` to `b`
+/// removes `via(a, b)`.
+///
+/// The goal names one fact. `x.name = 'a'` alone matches `via(a, b)` and
+/// `via(a, c)`, which no single edge removal ends; this test used to accept
+/// that goal only because a removal deleted every `E` edge.
 #[tokio::test]
 async fn is_ref_binding_abduce_follows_the_binding() -> Result<()> {
     let db = graph(FAN).await?;
     let program = "CREATE RULE link AS MATCH (x:N)-[e:E]->(y:N) YIELD KEY x, e.w AS w, KEY y\n\
          CREATE RULE via AS MATCH (x:N) WHERE x IS link TO t YIELD KEY x, KEY t\n\
-         ABDUCE NOT via WHERE x.name = 'a'";
+         ABDUCE NOT via WHERE x.name = 'a' AND t.name = 'b'";
     let result = db
         .session()
         .locy_with(program)

@@ -424,6 +424,13 @@ impl FileSandboxConfig {
     }
 }
 
+/// Default of [`UniConfig::vector_knn_default_k`].
+///
+/// The `K` an unsized `~=` search used before it was configurable, kept so
+/// existing queries return the same rows. Large enough for interactive
+/// retrieval, small enough that hydrating every hit stays cheap.
+pub const DEFAULT_VECTOR_KNN_K: usize = 100;
+
 #[derive(Clone, Debug)]
 pub struct UniConfig {
     /// Maximum adjacency cache size in bytes (default: 1GB)
@@ -511,6 +518,17 @@ pub struct UniConfig {
     /// Default maximum memory per query (default: 1GB)
     pub max_query_memory: usize,
 
+    /// Backtracking steps one `=~` match may take on the backtracking
+    /// matcher (default: 10,000,000, which a refused match reaches in about
+    /// 0.1–0.3 s in a release build).
+    ///
+    /// Only patterns with look-around, backreferences, atomic groups,
+    /// possessive quantifiers, `\b`, `\X`, `\b{g}`, `(?c)`, a quantified `\R`
+    /// or an anchor away from the pattern's ends or under `(?m)` use that
+    /// matcher; the rest run in linear time. A match that exceeds the limit
+    /// fails with `UniError::RegexBacktrackLimit`.
+    pub regex_backtrack_limit: usize,
+
     /// Maximum transaction buffer memory in bytes (default: 1GB).
     /// Limits memory usage during transactions to prevent OOM.
     pub max_transaction_memory: usize,
@@ -521,6 +539,45 @@ pub struct UniConfig {
 
     /// Maximum iterations for recursive CTE evaluation (default: 1000).
     pub max_recursive_cte_iterations: usize,
+
+    /// Neighbors a `n.prop ~= q` vector search returns when no `LIMIT`
+    /// sizes it (default: 100).
+    ///
+    /// `~=` is a top-K index scan. `K` is the query's `LIMIT` (plus `SKIP`)
+    /// when the scan feeds that `LIMIT` directly: through projections, and
+    /// through an `ORDER BY` whose leading key is the scan's `_score`,
+    /// descending. Everywhere else, including when a residual filter sits
+    /// between the scan and the `LIMIT`, `K` is this value, and a search that
+    /// returns exactly this many rows adds a warning to the result, because
+    /// more rows may have qualified.
+    ///
+    /// Raising it trades search cost for completeness; every hit is hydrated,
+    /// so the cost grows linearly. A value of `0` makes such searches return
+    /// nothing.
+    pub vector_knn_default_k: usize,
+
+    /// Capacity in bytes of Lance's metadata cache for this database
+    /// (default: `None`, Lance's own default of 1 GiB).
+    ///
+    /// Every Lance dataset this database opens through its storage backend
+    /// shares one Lance session, which owns two caches: this one (manifests,
+    /// fragment and file metadata) and the index cache sized by
+    /// [`Self::lance_index_cache_bytes`]. A fork shares its primary's
+    /// session. The caches fill as tables are opened, flushed and indexed and
+    /// are only trimmed when full, so a long-running process that flushes
+    /// often holds up to the full capacity. Set this to bound that memory;
+    /// `Some(0)` disables the cache. Misses are re-read from storage, so a
+    /// smaller cache costs I/O, never correctness.
+    pub lance_metadata_cache_bytes: Option<usize>,
+
+    /// Capacity in bytes of Lance's index cache for this database
+    /// (default: `None`, Lance's own default of 6 GiB).
+    ///
+    /// Holds opened scalar, vector and full-text index structures. A cache
+    /// too small for the working set of a vector index re-reads and
+    /// re-decodes it on every search, so size it above the index if ANN
+    /// latency matters. See [`Self::lance_metadata_cache_bytes`] for scope.
+    pub lance_index_cache_bytes: Option<usize>,
 
     /// Object store resilience configuration
     pub object_store: ObjectStoreConfig,
@@ -533,15 +590,20 @@ pub struct UniConfig {
     /// is accepted and dynamically registered).
     pub strict_schema: bool,
 
-    /// Enable Lance `MergeInsert` for SET-only flushes (default: false).
+    /// Deprecated no-op; accepted so existing configurations still build.
     ///
-    /// When true, `Writer::insert_vertex_partial` records the touched
-    /// property keys into L0 and the flush emits a partial-column source
-    /// to Lance via `MergeInsertBuilder` — skipping the read of (and write
-    /// of) the unchanged columns. Wide-row schemas with vector indexes
-    /// benefit most (~17 ms/row → ~3 ms/row on the issue #72 ingest
-    /// workload). See the Round-11 plan section in
-    /// `plan-and-implement-a-valiant-flame.md`.
+    /// It used to route a `SET` through a Lance `MergeInsert` of the touched
+    /// columns at flush. Vertex and edge tables hold one row per flushed
+    /// version until compaction, which a key-matched merge cannot address:
+    /// removed properties came back after a flush or a compaction, and a row
+    /// created and updated in one flush window was lost. Every vertex and
+    /// edge write is now stored as a full row whatever this says. Setting it
+    /// to `true` logs one warning per process when a database is opened (see
+    /// [`UniConfig::warn_deprecated_options`]).
+    #[deprecated(
+        since = "4.2.0",
+        note = "no-op: every write is stored as a full row; the partial MergeInsert path was removed"
+    )]
     pub partial_lance_writes: bool,
 
     /// When true, auto-embedding for vertex writes is deferred from the
@@ -756,10 +818,18 @@ impl Default for UniConfig {
             max_query_memory: 1024 * 1024 * 1024,       // 1GB
             max_transaction_memory: 1024 * 1024 * 1024, // 1GB
             max_compaction_rows: 5_000_000,             // 5M rows
+            regex_backtrack_limit: 10_000_000,
             max_recursive_cte_iterations: 1000,
+            vector_knn_default_k: DEFAULT_VECTOR_KNN_K,
+            lance_metadata_cache_bytes: None,
+            lance_index_cache_bytes: None,
             object_store: ObjectStoreConfig::default(),
             index_rebuild: IndexRebuildConfig::default(),
             strict_schema: false,
+            #[expect(
+                deprecated,
+                reason = "the default must still name the deprecated field"
+            )]
             partial_lance_writes: false,
             defer_embeddings: false,
             fork_fragment_warn_threshold: 256,
@@ -807,6 +877,28 @@ impl Default for UniConfig {
             // auto-flush knobs so operators reason about them together.
             ec_flush_interval: Duration::from_secs(1),
             ec_flush_threshold: 10_000,
+        }
+    }
+}
+
+impl UniConfig {
+    /// Logs a warning for each deprecated option this configuration sets.
+    ///
+    /// Each option warns at most once per process, however many databases are
+    /// opened with it: the option is a no-op, so repeating the warning on every
+    /// open adds noise without adding information. Called when a database is
+    /// opened.
+    pub fn warn_deprecated_options(&self) {
+        static PARTIAL_LANCE_WRITES: std::sync::Once = std::sync::Once::new();
+        #[expect(deprecated, reason = "reads the deprecated flag only to warn about it")]
+        let partial = self.partial_lance_writes;
+        if partial {
+            PARTIAL_LANCE_WRITES.call_once(|| {
+                tracing::warn!(
+                    "UniConfig::partial_lance_writes is deprecated and has no effect: \
+                     every vertex and edge write is stored as a full row"
+                );
+            });
         }
     }
 }

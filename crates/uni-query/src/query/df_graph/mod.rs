@@ -43,7 +43,9 @@ pub mod catalog_scan;
 pub mod common;
 pub mod comprehension;
 pub mod deadline_guard;
+pub mod edge_source_scan;
 pub mod endpoint_hydrate;
+mod exists_decorrelate;
 pub mod expr_compiler;
 pub mod ext_id_lookup;
 pub mod iteration_driver;
@@ -62,12 +64,14 @@ pub mod locy_explain;
 pub mod locy_fixpoint;
 pub mod locy_fold;
 pub mod locy_generate;
+pub(crate) mod locy_lineage;
 pub mod locy_model_invoke;
 pub mod locy_priority;
 pub mod locy_profile;
 pub mod locy_program;
 pub mod locy_query;
 pub mod locy_row_hash;
+pub mod locy_sequence;
 pub mod locy_traits;
 pub mod locy_validate;
 pub mod mutation_common;
@@ -82,6 +86,7 @@ pub mod pattern_comprehension;
 pub mod pattern_exists;
 pub mod pred_dag;
 pub mod procedure_call;
+pub mod property_lookup_join;
 pub mod quantifier;
 pub mod raw_bytes_marker;
 mod read_set_exec;
@@ -90,6 +95,7 @@ pub mod reduce;
 pub mod scan;
 pub mod shortest_path;
 pub(crate) mod similar_to_expr;
+mod trail_reach;
 pub mod traverse;
 pub mod unwind;
 pub mod vector_knn;
@@ -116,6 +122,7 @@ use crate::types::QueryWarning;
 use uni_common::cypher_value_codec::handle::HandleScope;
 
 pub use apply::GraphApplyExec;
+pub use edge_source_scan::EdgeSourceScanExec;
 pub use ext_id_lookup::GraphExtIdLookupExec;
 // CREATE and MERGE both execute through `MutationExec`; these aliases and
 // the `new_*_exec` builders are re-exported here so the planner can refer to
@@ -145,8 +152,8 @@ pub use locy_fixpoint::{
 };
 pub use locy_fold::FoldExec;
 pub use locy_priority::PriorityExec;
-pub use locy_program::{DerivedStore, LocyProgramExec};
-pub use locy_traits::{DerivedFactSource, LocyExecutionContext};
+pub use locy_program::{DerivedStore, LocyProgramExec, ReusedStrata};
+pub use locy_traits::{DerivedFactSource, LocyExecutionContext, ReEvaluation, StrataBaseline};
 
 /// A query deadline that excuses the time a cursor's consumer spent idle.
 ///
@@ -312,6 +319,10 @@ pub struct GraphExecutionContext {
     /// context, which is what releases the ids — see
     /// `uni_common::cypher_value_codec::handle`.
     handle_scope: Arc<HandleScope>,
+
+    /// `K` for a `~=` vector search no `LIMIT` sized
+    /// (`UniConfig::vector_knn_default_k`).
+    vector_knn_default_k: usize,
 }
 
 impl std::fmt::Debug for GraphExecutionContext {
@@ -371,6 +382,7 @@ impl GraphExecutionContext {
             cancellation_token,
             writer: None,
             handle_scope: Arc::new(HandleScope::new()),
+            vector_knn_default_k: uni_common::config::DEFAULT_VECTOR_KNN_K,
         }
     }
 
@@ -442,6 +454,33 @@ impl GraphExecutionContext {
     /// The per-query counter set, if this context belongs to a counted query.
     pub fn counters(&self) -> Option<&Arc<uni_store::QueryCounters>> {
         self.counters.as_ref()
+    }
+
+    /// Set `K` for a `~=` vector search that no `LIMIT` sized.
+    #[must_use]
+    pub fn with_vector_knn_default_k(mut self, k: usize) -> Self {
+        self.vector_knn_default_k = k;
+        self
+    }
+
+    /// `K` for a `~=` vector search that no `LIMIT` sized.
+    pub fn vector_knn_default_k(&self) -> usize {
+        self.vector_knn_default_k
+    }
+
+    /// Share `sink` as this context's warning collector.
+    ///
+    /// For a sub-plan: its context is built fresh, so without this the
+    /// warnings its operators raise land in a collector nobody harvests.
+    #[must_use]
+    pub(crate) fn with_warnings_sink(mut self, sink: Arc<Mutex<Vec<QueryWarning>>>) -> Self {
+        self.warnings = sink;
+        self
+    }
+
+    /// The warning collector, for a sub-plan to share.
+    pub(crate) fn warnings_sink(&self) -> Arc<Mutex<Vec<QueryWarning>>> {
+        Arc::clone(&self.warnings)
     }
 
     /// Records `n` rows served from an L0 buffer, if counting is active.
@@ -542,8 +581,14 @@ impl GraphExecutionContext {
     }
 
     /// Record a runtime warning.
+    ///
+    /// A warning already recorded is not recorded again: a sub-plan runs
+    /// once per outer row and shares this collector, and the same truncation
+    /// reported a thousand times says nothing the first report did not.
     pub fn push_warning(&self, warning: QueryWarning) {
-        if let Ok(mut w) = self.warnings.lock() {
+        if let Ok(mut w) = self.warnings.lock()
+            && !w.contains(&warning)
+        {
             w.push(warning);
         }
     }
@@ -784,6 +829,65 @@ impl GraphExecutionContext {
         })
     }
 
+    /// Every vertex [`Self::get_neighbors`] can return a neighbor for, for any
+    /// of `edge_type_ids` along `direction` — a superset of it.
+    ///
+    /// Reads the layers `get_neighbors` reads and no others: the adjacency
+    /// manager (with the shadow CSR when this is a versioned read) and, for a
+    /// live read, the transaction L0's edges. A vertex whose edges are all
+    /// tombstoned may be reported; a vertex with a visible edge is never
+    /// missed. Warm the types first ([`Self::ensure_adjacency_warmed`]), as
+    /// a traversal does, or the Main CSR is not there to enumerate.
+    pub fn edge_source_candidates(
+        &self,
+        edge_type_ids: &[u32],
+        direction: Direction,
+    ) -> std::collections::HashSet<Vid> {
+        let version_hwm = self.storage.snapshot_version_hwm();
+        let am = self.adjacency_manager();
+        let mut out = std::collections::HashSet::new();
+        for &edge_type in edge_type_ids {
+            am.collect_source_vids(edge_type, direction, version_hwm.is_some(), &mut out);
+        }
+        // `neighbors_for_vid` overlays the transaction L0 only on a live read.
+        if version_hwm.is_none()
+            && let Some(tx_l0) = &self.l0_context.transaction_l0
+        {
+            let guard = tx_l0.read();
+            for edge in guard.graph.edges() {
+                if !edge_type_ids.contains(&edge.edge_type) {
+                    continue;
+                }
+                match direction {
+                    Direction::Outgoing => {
+                        out.insert(edge.src_vid);
+                    }
+                    Direction::Incoming => {
+                        out.insert(edge.dst_vid);
+                    }
+                    Direction::Both => {
+                        out.insert(edge.src_vid);
+                        out.insert(edge.dst_vid);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether this query records what it reads into a transaction read set.
+    ///
+    /// True only inside a read-write transaction with SSI on. An operator that
+    /// would skip rows the pattern logically depends on — a vertex with no
+    /// edge of a type yet is still a read a concurrent insert must conflict
+    /// with — has to read them all when this holds.
+    pub fn records_read_set(&self) -> bool {
+        self.l0_context
+            .transaction_l0
+            .as_ref()
+            .is_some_and(|l0| l0.read().occ_read_set.is_some())
+    }
+
     /// Get neighbors for a vertex, merging CSR and all L0 buffers.
     ///
     /// This implements the MVCC visibility rules:
@@ -1022,7 +1126,7 @@ impl GraphExecutionContext {
         if version_hwm.is_none()
             && let Some(tx_guard) = tx_guard
         {
-            overlay_l0_neighbors(
+            uni_store::runtime::l0_visibility::overlay_l0_neighbors(
                 vid,
                 edge_type,
                 direction,
@@ -1132,65 +1236,6 @@ impl GraphExecutionContext {
                     }
                 }
             }
-        }
-    }
-}
-
-/// Overlay L0 buffer neighbors onto existing neighbor list.
-///
-/// Adds new edges from L0 and removes tombstoned edges.
-/// Filters by version if a snapshot boundary is provided.
-fn overlay_l0_neighbors(
-    vid: Vid,
-    edge_type: u32,
-    direction: Direction,
-    l0: &L0Buffer,
-    neighbors: &mut Vec<(Vid, Eid)>,
-    version_hwm: Option<u64>,
-) {
-    use std::collections::HashMap;
-
-    // Convert to map for efficient updates
-    let mut neighbor_map: HashMap<Eid, Vid> = neighbors.drain(..).map(|(v, e)| (e, v)).collect();
-
-    // Query L0 for each direction
-    for &simple_dir in direction.to_simple_directions() {
-        for (neighbor, eid, version) in l0.get_neighbors(vid, edge_type, simple_dir) {
-            // Skip edges beyond snapshot boundary
-            if version_hwm.is_some_and(|hwm| version > hwm) {
-                continue;
-            }
-
-            // Apply insert or remove tombstone
-            if l0.is_tombstoned(eid) {
-                neighbor_map.remove(&eid);
-            } else {
-                neighbor_map.insert(eid, neighbor);
-            }
-        }
-    }
-
-    // Remove edges tombstoned in this L0 but originating from other layers
-    for eid in l0.tombstones.keys() {
-        neighbor_map.remove(eid);
-    }
-
-    // Convert back to vec
-    *neighbors = neighbor_map.into_iter().map(|(e, v)| (v, e)).collect();
-}
-
-/// Extension trait to convert storage Direction to SimpleGraph directions.
-trait DirectionExt {
-    fn to_simple_directions(&self) -> &'static [uni_common::graph::simple_graph::Direction];
-}
-
-impl DirectionExt for Direction {
-    fn to_simple_directions(&self) -> &'static [uni_common::graph::simple_graph::Direction] {
-        use uni_common::graph::simple_graph::Direction as SimpleDirection;
-        match self {
-            Direction::Outgoing => &[SimpleDirection::Outgoing],
-            Direction::Incoming => &[SimpleDirection::Incoming],
-            Direction::Both => &[SimpleDirection::Outgoing, SimpleDirection::Incoming],
         }
     }
 }

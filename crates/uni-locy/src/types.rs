@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use crate::binding_plan::ClauseBinding;
+
 use uni_cypher::ast::{Clause, Expr, Pattern, Query};
 use uni_cypher::locy_ast::{
     AbduceQuery, AlongBinding, BestByClause, DeriveCommand, ExplainRule, FoldBinding, GoalQuery,
@@ -17,6 +19,52 @@ pub struct CompiledProgram {
     pub model_catalog: HashMap<String, CompiledModel>,
     pub warnings: Vec<CompilerWarning>,
     pub commands: Vec<CompiledCommand>,
+}
+
+impl CompiledProgram {
+    /// Whether running this program needs a provenance tracker.
+    ///
+    /// True when the program has an `EXPLAIN RULE` command, or a rule folds
+    /// with `MNOR` or `MPROD` (shared-proof detection and exact inference
+    /// for probabilistic folds), anywhere: at the top level or in an
+    /// `ASSUME` body, its own rules and commands included, at any depth.
+    /// The runtime attaches a tracker exactly when this holds, to the
+    /// program's own run and to every re-evaluation of it (after a write, in
+    /// a hypothetical state), and then reuses no stratum across states: the
+    /// tracker can change `PROB` values (shared-proof BDD), and a reused
+    /// stratum would carry no provenance. So `hypothetical_strata_reused` is
+    /// always zero for such a program.
+    #[must_use]
+    pub fn needs_provenance_tracker(&self) -> bool {
+        let has_prob_fold = self.strata.iter().any(|s| {
+            s.rules.iter().any(|r| {
+                r.clauses.iter().any(|c| {
+                    c.fold.iter().any(|f| {
+                        if let Expr::FunctionCall { name, .. } = &f.aggregate {
+                            matches!(name.to_uppercase().as_str(), "MNOR" | "MPROD")
+                        } else {
+                            false
+                        }
+                    })
+                })
+            })
+        });
+        has_prob_fold || commands_need_provenance_tracker(&self.commands)
+    }
+}
+
+/// Whether any of `commands` needs a provenance tracker: an `EXPLAIN RULE`,
+/// or an `ASSUME` whose body needs one (see
+/// [`CompiledProgram::needs_provenance_tracker`]).
+fn commands_need_provenance_tracker(commands: &[CompiledCommand]) -> bool {
+    commands.iter().any(|c| match c {
+        CompiledCommand::ExplainRule(_) => true,
+        CompiledCommand::Assume(ca) => {
+            ca.body_program.needs_provenance_tracker()
+                || commands_need_provenance_tracker(&ca.body_commands)
+        }
+        _ => false,
+    })
 }
 
 /// A compiled `CREATE MODEL` declaration (Phase B preview).
@@ -116,6 +164,14 @@ pub struct CompiledRule {
     pub clauses: Vec<CompiledClause>,
     pub yield_schema: Vec<YieldColumn>,
     pub priority: Option<i64>,
+    /// Every parameter (`$name`) the rule's definitions reference, in order
+    /// of first appearance and without repeats. A rule the goal-directed
+    /// rewrite generates carries those of the rules it was generated from.
+    ///
+    /// Read when a program runs a previously registered rule: the program's
+    /// own text does not name the rule's parameters, so they are checked
+    /// from here, before evaluation, with every missing name reported.
+    pub parameters: Vec<String>,
 }
 
 /// A single clause (one CREATE RULE ... AS ... definition).
@@ -149,6 +205,10 @@ pub struct CompiledClause {
     /// `apply_model_invocations`, then get stripped from the final
     /// `LocyResult` rows by the runtime.
     pub hidden_yield_cols: Vec<String>,
+    /// Which occurrence of each body variable binds it and which ones test
+    /// it; see [`crate::binding_plan`]. [`ClauseBinding::Pending`] until the
+    /// compiler knows every rule the clause references.
+    pub binding: ClauseBinding,
 }
 
 /// A single neural-model invocation site extracted from a clause body.
@@ -442,6 +502,11 @@ pub enum RuntimeWarningCode {
     /// approximation. Emitted from library code; Stage 2 wires it
     /// into the runtime tag flow.
     TopKPruningCrossedDependency,
+    /// A clause's PROB value reads the probability of a positive `IS`
+    /// reference other than as one product factor (`1 - p`, `p * p`). The
+    /// referenced probability is not multiplied in a second time, and exact
+    /// inference treats each such row as an independent event.
+    ProbabilityReadNotFactor,
 }
 
 impl RuntimeWarningCode {
@@ -465,6 +530,7 @@ impl RuntimeWarningCode {
             RuntimeWarningCode::FuzzyNotProbabilistic => "fuzzy_not_probabilistic",
             RuntimeWarningCode::EntityHydrationIncomplete => "entity_hydration_incomplete",
             RuntimeWarningCode::TopKPruningCrossedDependency => "top_k_pruning_crossed_dependency",
+            RuntimeWarningCode::ProbabilityReadNotFactor => "probability_read_not_factor",
         }
     }
 }

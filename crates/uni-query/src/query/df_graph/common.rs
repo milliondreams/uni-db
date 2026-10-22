@@ -27,6 +27,7 @@ use super::GraphExecutionContext;
 use super::procedure_call::map_yield_to_canonical;
 use super::unwind::arrow_to_json_value;
 use crate::query::df_graph::MutationContext;
+use crate::query::executor::procedure::ProcedureRegistry;
 
 /// Replace any interned-value handle in `batches` with its self-contained
 /// encoding.
@@ -1449,16 +1450,18 @@ pub fn typed_large_list_to_cv_array(
         return large_list_of_cv_to_cv_array(list);
     }
 
-    // Build the element-to-JSON converter closure. For Struct arrays, we need
-    // to iterate over fields; for scalar arrays, use arrow_element_to_json directly.
-    let elem_to_json: Box<dyn Fn(usize) -> serde_json::Value> = match values.data_type() {
+    // Build the element converter. For Struct arrays, we need to iterate over
+    // fields; for the common scalar arrays, use arrow_element_to_json directly;
+    // every other element type goes through the canonical decoder.
+    type ElemFn = Box<dyn Fn(usize) -> datafusion::error::Result<uni_common::Value>>;
+    let elem_to_value: ElemFn = match values.data_type() {
         DataType::UInt64
         | DataType::Int64
         | DataType::Float64
         | DataType::Utf8
         | DataType::Boolean => {
             let values = values.clone();
-            Box::new(move |idx| arrow_element_to_json(values.as_ref(), idx))
+            Box::new(move |idx| Ok(arrow_element_to_json(values.as_ref(), idx).into()))
         }
         DataType::Struct(_) => {
             let typed = values
@@ -1476,21 +1479,25 @@ pub fn typed_large_list_to_cv_array(
             let nulls = typed.nulls().cloned();
             Box::new(move |idx| {
                 if nulls.as_ref().is_some_and(|n| n.is_null(idx)) {
-                    return serde_json::Value::Null;
+                    return Ok(uni_common::Value::Null);
                 }
                 let mut map = serde_json::Map::new();
                 for (field_idx, field) in fields.iter().enumerate() {
                     let value = arrow_element_to_json(columns[field_idx].as_ref(), idx);
                     map.insert(field.name().clone(), value);
                 }
-                serde_json::Value::Object(map)
+                Ok(serde_json::Value::Object(map).into())
             })
         }
-        other => {
-            return Err(datafusion::error::DataFusionError::Execution(format!(
-                "Unsupported element type for typed_large_list_to_cv_array: {:?}",
-                other
-            )));
+        // Anything else — the `Null` element type of an empty list literal,
+        // temporals, narrower numerics — used to be rejected outright, so
+        // `c.v = []` with `c.v` a CypherValue failed to run.
+        _ => {
+            let values = values.clone();
+            Box::new(move |idx| {
+                uni_store::storage::arrow_convert::arrow_to_value(values.as_ref(), idx, None)
+                    .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))
+            })
         }
     };
 
@@ -1504,14 +1511,47 @@ pub fn typed_large_list_to_cv_array(
 
         let start = list.offsets()[row_idx] as usize;
         let end = list.offsets()[row_idx + 1] as usize;
-        let json_elements: Vec<serde_json::Value> = (start..end).map(&elem_to_json).collect();
+        let elements = (start..end)
+            .map(&elem_to_value)
+            .collect::<datafusion::error::Result<Vec<_>>>()?;
 
-        let uni_val: uni_common::Value = serde_json::Value::Array(json_elements).into();
+        let uni_val = uni_common::Value::List(elements);
         let bytes = uni_common::cypher_value_codec::encode(&uni_val);
         builder.append_value(&bytes);
     }
 
     Ok(Arc::new(builder.finish()))
+}
+
+/// `list` with its values trimmed to the rows it covers and offsets from 0.
+///
+/// A sliced `LargeListArray` keeps its parent's whole `values()` buffer, and
+/// its offsets index into it — they start at the slice's first element, not
+/// at 0. Code that pairs `values()` element-for-element with indices built
+/// from the offsets (the comprehension and quantifier inner batches) must see
+/// the compacted form: with the full buffer, the loop column was longer than
+/// every other column of the inner batch, and building it failed with "all
+/// columns in a record batch must have the same length" once an operator
+/// split its output into slices (a VLP emitting more than one batch's worth
+/// of rows for one input). Returns the list unchanged when already compact.
+pub fn compact_large_list(
+    list: &datafusion::arrow::array::LargeListArray,
+) -> datafusion::arrow::array::LargeListArray {
+    use datafusion::arrow::array::{Array, LargeListArray};
+    use datafusion::arrow::buffer::OffsetBuffer;
+    let offsets = list.offsets();
+    let first = offsets[0];
+    let last = offsets[offsets.len() - 1];
+    if first == 0 && last as usize == list.values().len() {
+        return list.clone();
+    }
+    let values = list.values().slice(first as usize, (last - first) as usize);
+    let rebased = OffsetBuffer::new(offsets.iter().map(|o| o - first).collect::<Vec<_>>().into());
+    let field = match list.data_type() {
+        datafusion::arrow::datatypes::DataType::LargeList(f) => f.clone(),
+        _ => unreachable!("a LargeListArray has a LargeList type"),
+    };
+    LargeListArray::new(field, rebased, values, list.nulls().cloned())
 }
 
 /// Convert a `LargeBinaryArray` of CypherValue-encoded arrays into a `LargeListArray`.
@@ -1727,6 +1767,42 @@ pub async fn execute_subplan(
         storage,
         schema_info,
         &std::collections::HashSet::new(),
+        None,
+        mutation_ctx,
+    )
+    .await?;
+    Ok(batches)
+}
+
+/// Like [`execute_subplan`], for a correlated subquery body bound to its
+/// enclosing row ([`crate::query::planner::bind_outer_row`]).
+///
+/// `outer_row` is that row, as a one-row batch; the body's node and
+/// relationship imports are planned from its columns.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Mirrors execute_subplan's context parameters plus the outer row"
+)]
+pub async fn execute_subplan_with_outer_row(
+    plan: &LogicalPlan,
+    params: &HashMap<String, Value>,
+    outer_row: RecordBatch,
+    graph_ctx: &Arc<GraphExecutionContext>,
+    session_ctx: &Arc<RwLock<SessionContext>>,
+    storage: &Arc<StorageManager>,
+    schema_info: &Arc<UniSchema>,
+    mutation_ctx: Option<&Arc<MutationContext>>,
+) -> DFResult<Vec<RecordBatch>> {
+    let (batches, _plan) = execute_subplan_with_outer_vars(
+        plan,
+        params,
+        &HashMap::new(),
+        graph_ctx,
+        session_ctx,
+        storage,
+        schema_info,
+        &std::collections::HashSet::new(),
+        Some(outer_row),
         mutation_ctx,
     )
     .await?;
@@ -1819,6 +1895,7 @@ pub async fn execute_subplan_collecting(
         storage,
         schema_info,
         &std::collections::HashSet::new(),
+        None,
         mutation_ctx,
     )
     .await?;
@@ -1844,6 +1921,7 @@ pub async fn execute_subplan_with_outer_vars(
     storage: &Arc<StorageManager>,
     schema_info: &Arc<UniSchema>,
     outer_entity_vars: &std::collections::HashSet<String>,
+    outer_row: Option<RecordBatch>,
     mutation_ctx: Option<&Arc<MutationContext>>,
 ) -> DFResult<(
     Vec<RecordBatch>,
@@ -1859,6 +1937,9 @@ pub async fn execute_subplan_with_outer_vars(
         outer_values.clone(),
     );
     planner.set_outer_entity_vars(outer_entity_vars.clone());
+    if let Some(row) = outer_row {
+        planner = planner.with_outer_row(row);
+    }
 
     // A sub-plan inherits the outer query's budget: the planner builds its own
     // `GraphExecutionContext` from the L0 context alone, so without this the
@@ -1880,6 +1961,14 @@ pub async fn execute_subplan_with_outer_vars(
     // same way.
     planner = planner.with_counters(graph_ctx.counters().cloned());
 
+    // Warnings and the `~=` default `K` cross the boundary for the same
+    // reason: a fresh context would collect a sub-plan's warnings where
+    // nobody harvests them, and size its vector searches by the built-in
+    // default instead of the database's.
+    planner = planner
+        .with_inherited_warnings(graph_ctx)
+        .with_vector_knn_default_k(graph_ctx.vector_knn_default_k());
+
     // Propagate registries from parent context so procedures remain available
     // inside correlated subqueries (Apply operator).
     if let Some(registry) = graph_ctx.algo_registry() {
@@ -1896,6 +1985,12 @@ pub async fn execute_subplan_with_outer_vars(
     }
     if let Some(runtime) = graph_ctx.xervo_runtime() {
         planner = planner.with_xervo_runtime(runtime.clone());
+    }
+    // The transaction's writer, for the same reason: an in-query `CALL` of a
+    // `WRITE` procedure runs as a sub-plan of `Apply`, and without the writer
+    // its host refused the write that the standalone call performs.
+    if let Some(writer) = graph_ctx.writer() {
+        planner = planner.with_writer(Arc::clone(writer));
     }
 
     // Propagate the outer MutationContext so writes inside CALL { ... }
@@ -1924,13 +2019,18 @@ pub async fn execute_subplan_with_outer_vars(
 /// Extract a single row from a RecordBatch as a HashMap of column name → Value.
 ///
 /// Used to build parameters for correlated subqueries (Apply, EXISTS).
-pub fn extract_row_params(batch: &RecordBatch, row_idx: usize) -> HashMap<String, Value> {
+///
+/// # Errors
+///
+/// Fails when a column cannot be decoded (see `arrow_to_json_value`); a
+/// subquery must not run against a parameter silently replaced by `NULL`.
+pub fn extract_row_params(batch: &RecordBatch, row_idx: usize) -> DFResult<HashMap<String, Value>> {
     let schema = batch.schema();
     (0..batch.num_columns())
         .map(|col_idx| {
             let col_name = schema.field(col_idx).name().clone();
-            let val = arrow_to_json_value(batch.column(col_idx).as_ref(), row_idx);
-            (col_name, val)
+            let val = arrow_to_json_value(batch.column(col_idx).as_ref(), row_idx)?;
+            Ok((col_name, val))
         })
         .collect()
 }
@@ -1945,7 +2045,9 @@ fn infer_procedure_call_schema(
     procedure_name: &str,
     yield_items: &[(String, Option<String>)],
     _schema_info: &UniSchema,
+    procedures: Option<&ProcedureRegistry>,
 ) -> SchemaRef {
+    let node_yield = super::procedure_call::is_node_yield_procedure_static(procedure_name);
     let infer_type = |name: &str| -> DataType {
         match procedure_name {
             "uni.schema.labels" => match name {
@@ -1980,7 +2082,16 @@ fn infer_procedure_call_schema(
         .iter()
         .map(|(name, alias)| {
             let col_name = alias.as_ref().unwrap_or(name);
-            Field::new(col_name, infer_type(name), true)
+            // The procedure's own declaration first, as the standalone call
+            // types its columns (`GraphProcedureCallExec::build_schema`):
+            // without it every plugin yield here was Utf8, and the row's
+            // `Int` came back as the string `"1"`, so `result + 1` was `"11"`.
+            procedures
+                .filter(|_| !node_yield)
+                .and_then(|r| {
+                    super::procedure_call::declared_yield_field(r, procedure_name, name, col_name)
+                })
+                .unwrap_or_else(|| Field::new(col_name, infer_type(name), true))
         })
         .collect();
 
@@ -1993,14 +2104,22 @@ fn infer_procedure_call_schema(
 /// don't exist as physical columns at planning time, so we can't dry-run plan
 /// the subquery to get its schema. Instead we walk the logical plan and use
 /// `UniSchema` property metadata to infer types.
-pub fn infer_logical_plan_schema(plan: &LogicalPlan, schema_info: &UniSchema) -> SchemaRef {
+///
+/// `procedures` types the yields of a `ProcedureCall` from the procedures'
+/// declarations; without it they fall back to a built-in table and `Utf8`.
+pub fn infer_logical_plan_schema(
+    plan: &LogicalPlan,
+    schema_info: &UniSchema,
+    procedures: Option<&ProcedureRegistry>,
+) -> SchemaRef {
     // Walk to outermost Project
     if let LogicalPlan::Project { projections, .. } = plan {
+        let scopes = entity_scopes(plan, schema_info);
         let fields: Vec<Field> = projections
             .iter()
             .map(|(expr, alias)| {
                 let name = alias.clone().unwrap_or_else(|| expr.to_string_repr());
-                let dt = infer_expr_type(expr, schema_info);
+                let dt = infer_expr_type(expr, schema_info, &scopes);
                 Field::new(name, dt, true)
             })
             .collect();
@@ -2012,13 +2131,15 @@ pub fn infer_logical_plan_schema(plan: &LogicalPlan, schema_info: &UniSchema) ->
         LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Filter { input, .. }
-        | LogicalPlan::Distinct { input } => infer_logical_plan_schema(input, schema_info),
+        | LogicalPlan::Distinct { input } => {
+            infer_logical_plan_schema(input, schema_info, procedures)
+        }
 
         LogicalPlan::ProcedureCall {
             procedure_name,
             yield_items,
             ..
-        } => infer_procedure_call_schema(procedure_name, yield_items, schema_info),
+        } => infer_procedure_call_schema(procedure_name, yield_items, schema_info, procedures),
 
         _ => {
             // Fallback: empty schema
@@ -2027,27 +2148,159 @@ pub fn infer_logical_plan_schema(plan: &LogicalPlan, schema_info: &UniSchema) ->
     }
 }
 
-/// Infer Arrow DataType for a Cypher expression using schema metadata.
-fn infer_expr_type(expr: &Expr, schema_info: &UniSchema) -> DataType {
-    match expr {
-        Expr::Property(base, key) => {
-            if let Expr::Variable(_) = base.as_ref() {
-                // Look up key across all labels/edge types in schema
-                for props in schema_info.properties.values() {
-                    if let Some(meta) = props.get(key.as_str()) {
-                        return meta.r#type.to_arrow();
+/// The labels or edge types a plan variable is known to carry.
+#[derive(Debug, Clone, PartialEq)]
+enum VarScope {
+    /// A vertex carrying every one of these labels.
+    AllOf(Vec<String>),
+    /// An entity carrying exactly one of these labels or edge types.
+    OneOf(Vec<String>),
+}
+
+/// The scope of every entity variable `plan` binds, for typing its
+/// properties.
+///
+/// `None` marks a name bound in more than one way — two scans with different
+/// labels (a label disjunction plans as a `Union` of per-label scans), or a
+/// projection, unwind or path that rebinds it — whose properties therefore
+/// have no single declared type. A variable absent from the map is unknown
+/// too: an import from the outer query, or an unlabelled scan.
+fn entity_scopes(plan: &LogicalPlan, schema_info: &UniSchema) -> HashMap<String, Option<VarScope>> {
+    fn bind(scopes: &mut HashMap<String, Option<VarScope>>, var: &str, scope: Option<VarScope>) {
+        scopes
+            .entry(var.to_string())
+            .and_modify(|existing| {
+                if *existing != scope {
+                    *existing = None;
+                }
+            })
+            .or_insert(scope);
+    }
+    fn walk(
+        plan: &LogicalPlan,
+        schema_info: &UniSchema,
+        scopes: &mut HashMap<String, Option<VarScope>>,
+    ) {
+        match plan {
+            LogicalPlan::Scan {
+                labels, variable, ..
+            }
+            | LogicalPlan::FusedIndexScan {
+                labels, variable, ..
+            }
+            | LogicalPlan::ScanMainByLabels {
+                labels, variable, ..
+            } => bind(scopes, variable, Some(VarScope::AllOf(labels.clone()))),
+            LogicalPlan::ScanAll { variable, .. } | LogicalPlan::ExtIdLookup { variable, .. } => {
+                bind(scopes, variable, None)
+            }
+            LogicalPlan::Traverse {
+                target_variable,
+                target_label_id,
+                step_variable,
+                edge_type_ids,
+                is_variable_length,
+                path_variable,
+                ..
+            } => {
+                let target = schema_info
+                    .label_name_by_id(*target_label_id)
+                    .map(|l| VarScope::AllOf(vec![l.to_string()]));
+                bind(scopes, target_variable, target);
+                if let Some(step) = step_variable {
+                    let types = (!is_variable_length).then(|| {
+                        edge_type_ids
+                            .iter()
+                            .filter_map(|id| schema_info.edge_type_name_by_id_unified(*id))
+                            .collect::<Vec<_>>()
+                    });
+                    let scope = types
+                        .filter(|t| t.len() == edge_type_ids.len())
+                        .map(VarScope::OneOf);
+                    bind(scopes, step, scope);
+                }
+                if let Some(path) = path_variable {
+                    bind(scopes, path, None);
+                }
+            }
+            LogicalPlan::TraverseMainByType {
+                type_names,
+                target_variable,
+                step_variable,
+                is_variable_length,
+                path_variable,
+                ..
+            } => {
+                bind(scopes, target_variable, None);
+                if let Some(step) = step_variable {
+                    let scope = (!is_variable_length).then(|| VarScope::OneOf(type_names.clone()));
+                    bind(scopes, step, scope);
+                }
+                if let Some(path) = path_variable {
+                    bind(scopes, path, None);
+                }
+            }
+            LogicalPlan::Unwind { variable, .. } => bind(scopes, variable, None),
+            LogicalPlan::Project { projections, .. } => {
+                for (expr, alias) in projections {
+                    if let Some(alias) = alias
+                        && !matches!(expr, Expr::Variable(v) if v == alias)
+                    {
+                        bind(scopes, alias, None);
                     }
                 }
-                DataType::LargeBinary
-            } else {
-                DataType::LargeBinary
             }
+            _ => {}
+        }
+        for child in plan.children() {
+            walk(child, schema_info, scopes);
+        }
+    }
+    let mut scopes = HashMap::new();
+    walk(plan, schema_info, &mut scopes);
+    scopes
+}
+
+/// Infer Arrow DataType for a Cypher expression using schema metadata.
+///
+/// A property is typed only from the labels or edge types its variable is
+/// known to carry (`scopes`); anything else is the dynamically typed stored
+/// value. Typing `s.v` from whichever label happened to declare a `v` read an
+/// integer stored on an undeclared label as a float and a string as NULL.
+fn infer_expr_type(
+    expr: &Expr,
+    schema_info: &UniSchema,
+    scopes: &HashMap<String, Option<VarScope>>,
+) -> DataType {
+    use uni_common::core::schema::EntityScope;
+    match expr {
+        Expr::Property(base, key) => {
+            let Expr::Variable(var) = base.as_ref() else {
+                return DataType::LargeBinary;
+            };
+            let meta = match scopes.get(var.as_str()) {
+                Some(Some(VarScope::AllOf(labels))) => {
+                    schema_info.scoped_property_meta(EntityScope::AllOf(labels), key)
+                }
+                Some(Some(VarScope::OneOf(labels))) => {
+                    schema_info.scoped_property_meta(EntityScope::OneOf(labels), key)
+                }
+                Some(None) | None => None,
+            };
+            meta.map_or(DataType::LargeBinary, |m| m.r#type.to_arrow())
         }
         Expr::BinaryOp { left, op, right } => match op {
             BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
-                let lt = infer_expr_type(left, schema_info);
-                let rt = infer_expr_type(right, schema_info);
-                numeric_promotion(&lt, &rt)
+                let lt = infer_expr_type(left, schema_info, scopes);
+                let rt = infer_expr_type(right, schema_info, scopes);
+                // `+` also concatenates strings and lists, and `-` subtracts
+                // temporals: only two numbers make a number.
+                let numeric = |t: &DataType| t.is_integer() || t.is_floating();
+                if numeric(&lt) && numeric(&rt) {
+                    numeric_promotion(&lt, &rt)
+                } else {
+                    DataType::LargeBinary
+                }
             }
             BinaryOp::Eq
             | BinaryOp::NotEq
@@ -2070,21 +2323,23 @@ fn infer_expr_type(expr: &Expr, schema_info: &UniSchema) -> DataType {
         Expr::Variable(_) => DataType::LargeBinary,
         Expr::FunctionCall { name, args, .. } => match name.to_lowercase().as_str() {
             "count" => DataType::Int64,
+            // `sum` keeps an integer input integral; `avg` of numbers is a
+            // float. Either over a value of unknown type (or durations) is
+            // whatever that value makes it.
             "sum" | "avg" => {
-                if let Some(arg) = args.first() {
-                    let arg_type = infer_expr_type(arg, schema_info);
-                    if matches!(arg_type, DataType::Float32 | DataType::Float64) {
-                        DataType::Float64
-                    } else {
-                        DataType::Int64
-                    }
-                } else {
-                    DataType::Int64
+                let arg_type = args.first().map_or(DataType::LargeBinary, |arg| {
+                    infer_expr_type(arg, schema_info, scopes)
+                });
+                match arg_type {
+                    DataType::Float32 | DataType::Float64 => DataType::Float64,
+                    t if t.is_integer() && name.eq_ignore_ascii_case("sum") => DataType::Int64,
+                    t if t.is_integer() => DataType::Float64,
+                    _ => DataType::LargeBinary,
                 }
             }
             "min" | "max" => {
                 if let Some(arg) = args.first() {
-                    infer_expr_type(arg, schema_info)
+                    infer_expr_type(arg, schema_info, scopes)
                 } else {
                     DataType::LargeBinary
                 }
@@ -2115,6 +2370,35 @@ fn numeric_promotion(left: &DataType, right: &DataType) -> DataType {
     }
 }
 
+/// Whether [`evaluate_simple_expr`] can evaluate `expr` with no row in scope.
+///
+/// True for literals, parameters, lists and maps of such, unary and binary
+/// operators over them, and built-in scalar functions of them — every constant
+/// a query writes as an operator argument, including a negative literal (which
+/// the parser produces as a unary minus over a literal). False for anything
+/// that reads a row: a variable, a property, a subquery.
+pub(crate) fn is_simple_evaluable(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_) | Expr::Parameter(_) => true,
+        Expr::List(items) => items.iter().all(is_simple_evaluable),
+        Expr::Map(entries) => entries.iter().all(|(_, v)| is_simple_evaluable(v)),
+        Expr::UnaryOp { expr, .. } => is_simple_evaluable(expr),
+        Expr::BinaryOp { left, right, .. } => {
+            is_simple_evaluable(left) && is_simple_evaluable(right)
+        }
+        Expr::FunctionCall {
+            name,
+            args,
+            distinct: false,
+            window_spec: None,
+        } => {
+            uni_query_functions::expr_eval::is_scalar_function(name)
+                && args.iter().all(is_simple_evaluable)
+        }
+        _ => false,
+    }
+}
+
 /// Evaluate a simple expression to get a `uni_common::Value`.
 ///
 /// Supports:
@@ -2123,6 +2407,10 @@ fn numeric_promotion(left: &DataType, right: &DataType) -> DataType {
 /// - Variable references (node/edge variables from MATCH)
 /// - Literal lists
 /// - Literal maps ({key: value, ...})
+/// - Unary (`-x`, `NOT x`) and binary operators over any of these
+/// - Built-in scalar functions of any of these
+///
+/// [`is_simple_evaluable`] says which expressions need no `outer_values`.
 pub(crate) fn evaluate_simple_expr(
     expr: &Expr,
     params: &HashMap<String, Value>,
@@ -2168,10 +2456,55 @@ pub(crate) fn evaluate_simple_expr(
             Ok(Value::Map(map))
         }
 
+        Expr::UnaryOp { op, expr: inner } => {
+            let value = evaluate_simple_expr(inner, params, outer_values)?;
+            eval_simple_unary(op, value)
+        }
+
+        Expr::BinaryOp { left, op, right } => {
+            let l = evaluate_simple_expr(left, params, outer_values)?;
+            let r = evaluate_simple_expr(right, params, outer_values)?;
+            uni_query_functions::expr_eval::eval_binary_op(&l, op, &r)
+                .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))
+        }
+
+        Expr::FunctionCall {
+            name,
+            args,
+            distinct: false,
+            window_spec: None,
+        } if uni_query_functions::expr_eval::is_scalar_function(name) => {
+            let values = args
+                .iter()
+                .map(|arg| evaluate_simple_expr(arg, params, outer_values))
+                .collect::<DFResult<Vec<_>>>()?;
+            uni_query_functions::expr_eval::eval_scalar_function(name, &values, None)
+                .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))
+        }
+
         _ => Err(datafusion::error::DataFusionError::Execution(format!(
             "Unsupported expression type for procedure argument: {:?}",
             expr
         ))),
+    }
+}
+
+/// Applies `-` or `NOT` to an evaluated constant, with Cypher's NULL rules.
+///
+/// `-i64::MIN` is an overflow error rather than a wrapped value.
+fn eval_simple_unary(op: &uni_cypher::ast::UnaryOp, value: Value) -> DFResult<Value> {
+    use uni_cypher::ast::UnaryOp;
+    let err = |msg: String| datafusion::error::DataFusionError::Execution(msg);
+    match (op, value) {
+        (_, Value::Null) => Ok(Value::Null),
+        (UnaryOp::Neg, Value::Int(i)) => i
+            .checked_neg()
+            .map(Value::Int)
+            .ok_or_else(|| err(format!("integer overflow negating {i}"))),
+        (UnaryOp::Neg, Value::Float(f)) => Ok(Value::Float(-f)),
+        (UnaryOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
+        (UnaryOp::Neg, other) => Err(err(format!("cannot negate {other:?}"))),
+        (UnaryOp::Not, other) => Err(err(format!("NOT requires a boolean, got {other:?}"))),
     }
 }
 
@@ -2273,31 +2606,63 @@ pub fn merged_label_props(
     Some(merged)
 }
 
+/// The property columns a traversal over `edge_type_ids` reads, typed.
+///
+/// Every property any of the edge types declares is listed, so the read
+/// treats it as a column rather than an overflow-only name. Its type is the
+/// declared one only when every edge type in scope declares it at that type:
+/// an edge of a type that does not (a schemaless type, or one declaring it
+/// differently) stores whatever was written, and typing its column from a
+/// sibling type's declaration read an integer above 2^53 as a rounded float
+/// and a string as NULL. Those properties are typed `CypherValue`.
 pub fn merged_edge_schema_props(
     uni_schema: &UniSchema,
     edge_type_ids: &[u32],
 ) -> HashMap<String, uni_common::core::schema::PropertyMeta> {
-    let mut merged: HashMap<String, uni_common::core::schema::PropertyMeta> = HashMap::new();
+    use uni_common::core::schema::{DataType as UniDataType, EntityScope};
     let mut sorted_ids = edge_type_ids.to_vec();
     sorted_ids.sort_unstable();
+    sorted_ids.dedup();
+    // An id with no name stays in scope as an alternative declaring nothing.
+    let names: Vec<String> = sorted_ids
+        .iter()
+        .map(|id| {
+            uni_schema
+                .edge_type_name_by_id_unified(*id)
+                .unwrap_or_default()
+        })
+        .collect();
 
-    for edge_type_id in sorted_ids {
-        if let Some(edge_type_name) = uni_schema.edge_type_name_by_id_unified(edge_type_id)
-            && let Some(props) = uni_schema.properties.get(edge_type_name.as_str())
-        {
-            for (prop_name, meta) in props {
-                match merged.get_mut(prop_name) {
-                    Some(existing) => {
-                        if existing.r#type != meta.r#type {
-                            existing.r#type = uni_common::core::schema::DataType::CypherValue;
-                        }
-                        existing.nullable |= meta.nullable;
-                    }
-                    None => {
-                        merged.insert(prop_name.clone(), meta.clone());
-                    }
-                }
+    let mut merged: HashMap<String, uni_common::core::schema::PropertyMeta> = HashMap::new();
+    for name in &names {
+        let Some(props) = uni_schema.properties.get(name.as_str()) else {
+            continue;
+        };
+        for (prop_name, meta) in props {
+            if merged.contains_key(prop_name) {
+                continue;
             }
+            let entry = match uni_schema.scoped_property_meta(EntityScope::OneOf(&names), prop_name)
+            {
+                Some(agreed) => {
+                    let mut agreed = agreed.clone();
+                    agreed.nullable = names.iter().any(|n| {
+                        uni_schema
+                            .properties
+                            .get(n.as_str())
+                            .and_then(|p| p.get(prop_name))
+                            .is_some_and(|m| m.nullable)
+                    });
+                    agreed
+                }
+                None => {
+                    let mut dynamic = meta.clone();
+                    dynamic.r#type = UniDataType::CypherValue;
+                    dynamic.nullable = true;
+                    dynamic
+                }
+            };
+            merged.insert(prop_name.clone(), entry);
         }
     }
 
@@ -2505,6 +2870,20 @@ mod tests {
         }
     }
 
+    /// An outer column the decoder cannot read fails the subquery's
+    /// parameter extraction instead of binding the parameter to `NULL`.
+    #[test]
+    fn test_extract_row_params_undecodable_column_is_an_error() {
+        let arr = arrow_array::Decimal128Array::from(vec![Some(1_i128)]);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "d",
+            arr.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).expect("batch");
+        assert!(extract_row_params(&batch, 0).is_err());
+    }
+
     #[test]
     fn test_extract_row_params_loses_uint64_to_int() {
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -2515,7 +2894,7 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![Arc::new(UInt64Array::from(vec![Some(7)]))])
             .expect("batch should be valid");
 
-        let params = extract_row_params(&batch, 0);
+        let params = extract_row_params(&batch, 0).unwrap();
         assert_eq!(params.get("n._vid"), Some(&Value::Int(7)));
     }
 
@@ -2535,7 +2914,7 @@ mod tests {
         )
         .expect("batch should be valid");
 
-        let params = extract_row_params(&batch, 0);
+        let params = extract_row_params(&batch, 0).unwrap();
         assert_eq!(
             params.get("m._all_props"),
             Some(&Value::Map(HashMap::new()))

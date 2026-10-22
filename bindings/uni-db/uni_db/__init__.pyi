@@ -13,7 +13,7 @@ import builtins  # qualify annotations where methods shadow builtins (e.g. Value
 from collections.abc import Awaitable, Callable, Iterator
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
 from typing_extensions import deprecated
 
@@ -80,6 +80,30 @@ class UniConstraintError(UniError):
 
     ...
 
+class UniEdgeEndpointError(UniConstraintError):
+    """A relationship's endpoint lacks every label its declared edge type allows.
+
+    Raised when an edge is written (CREATE, MERGE, bulk insert, COPY FROM,
+    fork promote) and when a ``REMOVE`` of a label would leave an existing
+    edge outside its declaration.
+    """
+
+    edge_type: str
+    endpoint: str
+    labels: list[str]
+    allowed: list[str]
+
+class UniEdgeIdentityError(UniConstraintError):
+    """A ``SET`` / ``REMOVE`` on a relationship named other endpoints or another type.
+
+    A relationship's endpoints and type are fixed at creation; a property write
+    cannot move it. ``stored`` and ``requested`` read ``(src)-[:TYPE]->(dst)``.
+    """
+
+    eid: int
+    stored: str
+    requested: str
+
 class UniInvalidIdentifierError(UniError):
     """Invalid identifier name."""
 
@@ -96,6 +120,14 @@ class UniQueryError(UniError):
 
     ...
 
+class UniParameterMissingError(UniQueryError):
+    """A query refers to a ``$parameter`` the call did not supply.
+
+    Raised for reads and writes alike, before any row is written.
+    """
+
+    names: list[str]
+
 class UniTypeError(UniError):
     """Type mismatch error."""
 
@@ -106,6 +138,17 @@ class UniTransactionError(UniError):
     """Transaction error."""
 
     ...
+
+class UniUncommittedWritesError(UniTransactionError):
+    """The operation cannot run in a transaction holding uncommitted writes.
+
+    Raised by operations whose effect is not transactional, such as
+    ``uni.graph.project``, whose projection catalog is shared and is not
+    undone by a rollback. Commit or roll back first.
+    """
+
+    operation: str
+    reason: str
 
 class UniTransactionConflictError(UniError):
     """Transaction serialization conflict."""
@@ -199,6 +242,27 @@ class UniTimeoutError(UniError):
 
     ...
 
+class UniWriteStalledError(UniError):
+    """Writes are stopped at the write throttle's hard limit with compaction disabled.
+
+    Run ``CALL uni.admin.compact()`` to resume writes, or enable compaction.
+    """
+
+    l1_runs: int
+    hard_limit: int
+
+class UniRegexBacktrackLimitError(UniError):
+    r"""A `=~` match needed more backtracking steps than allowed.
+
+    Patterns with look-around, backreferences, atomic groups, possessive
+    quantifiers and a few other constructs (`\b`, `\X`, `\b{g}`, `(?c)`)
+    run on a backtracking matcher bounded by the
+    `regex_backtrack_limit` config key (default 10,000,000 steps).
+    """
+
+    pattern: str
+    limit: int
+
 # Access control
 class UniReadOnlyError(UniError):
     """Operation not supported on read-only database."""
@@ -228,9 +292,13 @@ class UniInternalError(UniError):
 
 # Snapshot
 class UniSnapshotNotFoundError(UniError):
-    """Snapshot not found."""
+    """Snapshot not found (restore_snapshot, delete_snapshot).
 
-    ...
+    Attributes:
+        snapshot_id: The id that names no snapshot.
+    """
+
+    snapshot_id: str
 
 # Arguments
 class UniInvalidArgumentError(UniError):
@@ -547,6 +615,25 @@ class QueryMetrics:
     vector_index_scans: int
     fts_index_scans: int
     searches_reported: int
+    lance_iops: int
+    """Lance I/O operations issued by the query's scans (physical reads;
+    moves across a compaction and is sensitive to caching)."""
+    subquery_executions: int
+    """Sub-plan executions performed by per-row expression fallbacks."""
+    physical_plans: int
+    """Physical plans built: one for the query plus one per execution-time
+    sub-plan (a correlated subquery body per outer row, a Locy clause body per
+    fixpoint iteration)."""
+    physical_plan_time_ms: float
+    """Wall time spent building those physical plans, in milliseconds. Part of
+    ``exec_time_ms``; distinct from ``plan_time_ms`` (logical planning)."""
+    shortest_path_searches: int
+    """Breadth-first searches started by ``shortestPath`` /
+    ``allShortestPaths``: one per distinct source searched from."""
+    shortest_path_adjacency_reads: int
+    """Per-vertex adjacency lookups made by ``shortestPath`` /
+    ``allShortestPaths``: bounded by the vertices searched, not by the paths
+    emitted."""
 
 class QueryWarning:
     """A query warning emitted during execution (e.g., missing index)."""
@@ -672,6 +759,15 @@ class ProfileOutput:
     peak_memory_bytes: int
     plan_text: str
     operators: Any
+    logical_planning_ms: float
+    """Logical planning time (Cypher AST to logical plan), in milliseconds.
+    Measured before execution, so not part of ``total_time_ms``."""
+    physical_planning_ms: float
+    """Physical planning time in milliseconds, summed over every plan built,
+    including execution-time sub-plans. Part of ``total_time_ms``."""
+    physical_plans: int
+    """Physical plans built: one for the query plus one per execution-time
+    sub-plan."""
 
 class LocyExplainOutput:
     """Typed output from ``session.locy_with(program).explain()``."""
@@ -700,7 +796,9 @@ class LocyProfileOutput:
     """Compile-time plan text (identical to ``locy_with(...).explain()``)."""
     strata: list[dict[str, Any]]
     """Per-stratum / per-rule / per-iteration profile as nested dicts and lists
-    (snake_case keys; operators carry ``operator``, ``actual_rows``, ``time_ms``)."""
+    (snake_case keys; operators carry ``operator``, ``actual_rows``, ``time_ms``).
+    Each iteration dict also carries ``planning_ms`` (physical planning time for
+    that rule in that iteration) and ``plans`` (physical plans built)."""
     def __str__(self) -> str: ...
     def __repr__(self) -> str: ...
 
@@ -869,6 +967,10 @@ class BulkStats:
     index_build_duration_secs: float
     index_task_ids: list[str]
     indexes_pending: bool
+    load_id: str
+    """The load's id; pass it to ``bulk_load_applied``."""
+    warnings: list[str]
+    """Steps after the commit point that failed without affecting the load."""
 
 class BulkProgress:
     """Progress callback data during bulk loading."""
@@ -894,6 +996,16 @@ class LocyStats:
     queries_executed: int
     mutations_executed: int
     peak_memory_bytes: int
+    hypothetical_strata_evaluated: int
+    """Strata derived by ``ASSUME`` / ``ABDUCE`` re-evaluations, summed."""
+    hypothetical_strata_reused: int
+    """Strata those re-evaluations reused because their mutation could not affect them."""
+    hypothetical_facts_derived: int
+    """Facts the derived (not reused) hypothetical strata produced."""
+    sequenced_strata_evaluated: int
+    """Strata derived again after a top-level command wrote and a later command read the facts."""
+    sequenced_strata_reused: int
+    """Strata those re-derivations reused because the write could not affect them."""
 
 class LocyResult:
     """Result of a Locy program evaluation."""
@@ -908,9 +1020,10 @@ class LocyResult:
     metrics: QueryMetrics
     """Timing and scan counters, the same type a Cypher ``QueryResult`` carries.
 
-    ``parse_time_ms`` and ``plan_time_ms`` are always ``0.0`` here and
-    ``plan_cache_hit`` is always ``False``: Locy does not go through the Cypher
-    parse/plan/cache path those measure. Every other field is real.
+    ``parse_time_ms`` is always ``0.0`` here and ``plan_cache_hit`` is always
+    ``False``: Locy does not go through the Cypher parse/cache path those
+    measure. ``plan_time_ms`` times the program's logical planning and
+    ``exec_time_ms`` is the remainder. Every other field is real.
     """
 
     def has_warning(self, code: str) -> bool: ...
@@ -982,11 +1095,16 @@ class DatabaseMetrics:
     active_sessions: int
     l1_run_count: int
     write_throttle_pressure: float
+    write_throttle_waits: int
+    write_throttle_wait_time_secs: float
+    writes_stalled: int
     compaction_in_progress: bool
     wal_size_bytes: int
     wal_lsn: int
     total_queries: int
     total_commits: int
+    storage_metadata_cache_bytes: int
+    storage_index_cache_bytes: int
 
 class SessionMetrics:
     """Metrics for a session's lifetime."""
@@ -1045,6 +1163,7 @@ class ExecuteResult:
     relationships_created: int
     relationships_deleted: int
     properties_set: int
+    properties_removed: int
     labels_added: int
     labels_removed: int
     metrics: dict[str, Any]
@@ -1410,6 +1529,10 @@ class ApplyBuilder:
 class BulkWriter:
     """High-performance bulk data loader."""
 
+    @property
+    def load_id(self) -> str:
+        """The load's id; still readable after ``commit`` or ``abort``."""
+        ...
     def insert_vertices(
         self, label: str, vertices: list[dict[str, Any]]
     ) -> list[int]: ...
@@ -1547,6 +1670,7 @@ class Session:
         self, cypher: str, params: dict[str, Any] | None = None
     ) -> QueryResult: ...
     def query_with(self, cypher: str) -> SessionQueryBuilder: ...
+    def run(self, cypher: str) -> QueryResult: ...
 
     # --- Locy ---
     def locy(
@@ -1562,6 +1686,10 @@ class Session:
 
     # --- Transaction Factory ---
     def tx(self) -> Transaction: ...
+    def scratch(self) -> Transaction:
+        """Begin a scratch transaction: like ``tx()``, but ``commit()`` is
+        refused, so its writes are always discarded."""
+        ...
     def tx_with(self) -> TransactionBuilder: ...
 
     # --- Forks ---
@@ -1571,6 +1699,12 @@ class Session:
 
     # --- Maintenance ---
     def flush(self) -> None: ...
+
+    # --- Bulk loads ---
+    def bulk_load_applied(self, load_id: str) -> bool:
+        """Whether the bulk load ``load_id``, run through this session, reached its
+        commit point. On a forked session it answers for loads on that fork."""
+        ...
 
     # --- Version Pinning ---
     def pin_to_version(self, snapshot_id: str) -> None: ...
@@ -1743,6 +1877,9 @@ class LocyConfig:
         max_bdd_variables: int | None = None,
         top_k_proofs: int | None = None,
         top_k_proofs_training: int | None = None,
+        # "off" | "on" | "shadow", matched case-insensitively; anything else
+        # raises ValueError.
+        goal_directed: str | None = None,
     ) -> None: ...
     @property
     def max_iterations(self) -> int: ...
@@ -1773,6 +1910,8 @@ class LocyConfig:
     def top_k_proofs(self) -> int: ...
     @property
     def top_k_proofs_training(self) -> int | None: ...
+    @property
+    def goal_directed(self) -> Literal["off", "on", "shadow"]: ...
     @property
     def classifier_aliases(self) -> list[str]: ...
     # Parameter is named `callable` at runtime (src/classifier.rs). It shadows
@@ -1811,9 +1950,30 @@ class QueryCommandResult:
     def __getitem__(self, key: str) -> Any: ...
 
 class AssumeCommandResult:
-    """Result from a Locy ASSUME command."""
+    """Result from a Locy ASSUME command.
+
+    ``results`` holds one result per body command, in order (a nested
+    ASSUME's own ``AssumeCommandResult`` among them, and an EXPLAIN RULE's
+    or ABDUCE's result computed in the hypothetical state). ``derived`` maps each
+    rule to its facts in the hypothetical state the body's first command
+    reads, after the ASSUME's mutations. ``rows`` is the first row-producing
+    body result's rows, searched depth first, or an empty list.
+    """
     @property
     def command_type(self) -> str: ...
+    @property
+    def results(
+        self,
+    ) -> list[
+        QueryCommandResult
+        | AssumeCommandResult
+        | ExplainCommandResult
+        | AbduceCommandResult
+        | DeriveCommandResult
+        | CypherCommandResult
+    ]: ...
+    @property
+    def derived(self) -> dict[str, list[dict[str, Any]]]: ...
     @property
     def rows(self) -> list[dict[str, Any]]: ...
     def __getitem__(self, key: str) -> Any: ...
@@ -1924,6 +2084,9 @@ class Uni:
     def get_edge_type_info(self, name: str) -> EdgeTypeInfo | None: ...
     def load_schema(self, path: str) -> None: ...
     def save_schema(self, path: str) -> None: ...
+    def bulk_load_applied(self, load_id: str) -> bool:
+        """Whether the bulk load ``load_id`` reached its commit point."""
+        ...
 
     # Facades
     def rules(self) -> RuleRegistry: ...
@@ -1940,6 +2103,7 @@ class Uni:
     def create_snapshot(self, name: str) -> str: ...
     def list_snapshots(self) -> list[SnapshotInfo]: ...
     def restore_snapshot(self, snapshot_id: str) -> None: ...
+    def delete_snapshot(self, snapshot_id: str) -> None: ...
 
     # Fork Management & Diff/Promote
     def list_forks(self) -> list[ForkInfo]: ...
@@ -2080,6 +2244,9 @@ class AsyncUni:
     async def get_edge_type_info(self, name: str) -> EdgeTypeInfo | None: ...
     async def load_schema(self, path: str) -> None: ...
     async def save_schema(self, path: str) -> None: ...
+    async def bulk_load_applied(self, load_id: str) -> bool:
+        """Whether the bulk load ``load_id`` reached its commit point."""
+        ...
 
     # Facades
     def rules(self) -> AsyncRuleRegistry: ...
@@ -2097,6 +2264,7 @@ class AsyncUni:
     async def create_snapshot(self, name: str) -> str: ...
     async def list_snapshots(self) -> list[SnapshotInfo]: ...
     async def restore_snapshot(self, snapshot_id: str) -> None: ...
+    async def delete_snapshot(self, snapshot_id: str) -> None: ...
 
     # Fork Management & Diff/Promote
     async def list_forks(self) -> list[ForkInfo]: ...
@@ -2152,6 +2320,7 @@ class AsyncSession:
         self, cypher: str, params: dict[str, Any] | None = None
     ) -> QueryResult: ...
     def query_with(self, cypher: str) -> AsyncSessionQueryBuilder: ...
+    async def run(self, cypher: str) -> QueryResult: ...
 
     # --- Locy ---
     async def locy(
@@ -2167,6 +2336,10 @@ class AsyncSession:
 
     # --- Transaction Factory ---
     async def tx(self, timeout: float | None = None) -> AsyncTransaction: ...
+    async def scratch(self) -> AsyncTransaction:
+        """Begin a scratch transaction: like ``tx()``, but ``commit()`` is
+        refused, so its writes are always discarded."""
+        ...
     def tx_with(self) -> AsyncTransactionBuilder: ...
 
     # --- Forks ---
@@ -2176,6 +2349,12 @@ class AsyncSession:
 
     # --- Maintenance ---
     async def flush(self) -> None: ...
+
+    # --- Bulk loads ---
+    async def bulk_load_applied(self, load_id: str) -> bool:
+        """Whether the bulk load ``load_id``, run through this session, reached its
+        commit point. On a forked session it answers for loads on that fork."""
+        ...
 
     # --- Version Pinning ---
     async def pin_to_version(self, snapshot_id: str) -> None: ...
@@ -2426,6 +2605,10 @@ class AsyncApplyBuilder:
 class AsyncBulkWriter:
     """Async bulk writer for high-throughput data ingestion."""
 
+    @property
+    def load_id(self) -> str:
+        """The load's id; still readable after ``commit`` or ``abort``."""
+        ...
     async def insert_vertices(
         self, label: str, vertices: list[dict[str, Any]]
     ) -> list[int]: ...
@@ -2835,6 +3018,16 @@ class UniForkHasChildrenError(UniError):
     name: str
     children: list[str]
 
+class UniRestoreBlockedByForksError(UniError):
+    """`restore_snapshot` refused because the database has forks.
+
+    A restore rewinds primary storage but not fork branches. Drop every
+    listed fork (``drop_fork``, or ``drop_fork_cascade`` for one with
+    children), then retry.
+    """
+
+    forks: list[str]
+
 class UniForkSubtreeInUseError(UniError):
     """`drop_fork_cascade` refused because the subtree has live sessions / open tx."""
 
@@ -2854,3 +3047,22 @@ class UniForkLifecycleError(UniError):
 
     name: str
     stage: str
+
+class UniBulkCommitIncompleteError(UniError):
+    """A bulk load is committed, but its publish could not be finished by the commit.
+
+    It stays hidden while a background task completes it, or the next open does,
+    exactly once. Do NOT retry the load.
+    """
+
+    load_id: str
+    reason: str
+
+class UniBulkCommitOutcomeUnknownError(UniError):
+    """Whether a bulk load committed is unknown.
+
+    Reopen the database, then call ``bulk_load_applied(load_id)`` before retrying.
+    """
+
+    load_id: str
+    reason: str

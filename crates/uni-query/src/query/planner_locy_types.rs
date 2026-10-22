@@ -89,6 +89,10 @@ pub struct LocyClausePlan {
     /// by the compiler. Carried through planning to the fixpoint
     /// executor where they're evaluated post-body-projection.
     pub model_invocations: Vec<uni_locy::ModelInvocation>,
+    /// Scan indices of the body's derived scans into its own stratum, in
+    /// first-use order, one per distinct handle (P5). A clause with two or
+    /// more holds only exclusive handles, which the fixpoint feeds per pass.
+    pub stratum_scans: Vec<usize>,
 }
 
 /// An IS-reference from a clause body to another derived relation.
@@ -106,22 +110,19 @@ pub struct LocyIsRef {
     pub target_has_prob: bool,
     /// Name of the PROB column in the target rule, if any.
     pub target_prob_col: Option<String>,
-    /// For negated IS-refs: subject/target variable → the hidden `_vid` column
-    /// the planner projected for it (`__isnot{n}_{var}`).
+    /// For a negated IS-ref: the anti-join key, one component per KEY
+    /// position some literal of the clause binds (`uni_locy::binding_plan`).
     ///
     /// The anti-join runs *after* `LocyProject`, so resolving a subject by its
-    /// bare variable name only works when YIELD happens to project that exact
-    /// name. A subject that YIELD renamed with `AS`, or did not project at all,
-    /// was previously unresolvable — and the anti-join silently emitted the
-    /// rows it was asked to exclude (issue #158).
-    ///
-    /// Carrying `{var}._vid` through the projection under a reserved name makes
-    /// resolution depend on node identity rather than on what YIELD chose to
-    /// call things. Empty for positive IS-refs, and for subjects that are not
-    /// MATCH-bound node variables (relationship variables expose `_eid`, not
-    /// `_vid`; scalar and ALONG-bound subjects have neither) — those keep the
-    /// by-name path and its error.
-    pub subject_vid_cols: std::collections::HashMap<String, String>,
+    /// bare variable name only worked when YIELD happened to project that
+    /// exact name. A subject that YIELD renamed with `AS`, or did not project
+    /// at all, was unresolvable — and the anti-join silently emitted the rows
+    /// it was asked to exclude (issue #158). So the planner carries each
+    /// binder's identity (a node's `_vid`, a relationship's `_eid`, a scalar's
+    /// column) through the projection under a reserved hidden name. A value
+    /// position bound nowhere is existentially quantified and absent. Empty
+    /// for positive IS-refs.
+    pub negation_keys: Vec<NegationKey>,
     /// The referenced rule's column bound by each subject, in order, then by
     /// the target if there is one (`uni_locy::is_binding::bound_columns`).
     ///
@@ -130,10 +131,178 @@ pub struct LocyIsRef {
     /// the planner's positive join instead of taking the derived scan's fields
     /// by position.
     pub binding_columns: Vec<String>,
+    /// For a positive reference to a PROB rule from a rule with a PROB
+    /// column: where the referenced probability travels and how the clause
+    /// already reads it. `None` otherwise, and the reference is a plain
+    /// semi-join.
+    pub prob_ref: Option<PositiveProbRef>,
+    /// For a negated reference to a PROB rule from a rule that keeps lineage
+    /// (an `MNOR`/`MPROD` rule, or a PROB rule without a fold when
+    /// provenance is recorded): the hidden column the complement fills with
+    /// the negated facts it read, for exact inference. `None` otherwise.
+    pub negated_lineage: Option<NegatedLineageRef>,
+    /// For a positive reference no lineage column identifies (one to a rule
+    /// without a PROB column, or from a rule that keeps no lineage), when
+    /// provenance is recorded: the transient columns naming the referenced
+    /// fact, so EXPLAIN shows it as the derivation's child. `None` otherwise.
+    pub support_ref: Option<SupportRef>,
 }
 
-/// Prefix for the hidden `_vid` columns described on
-/// [`LocyIsRef::subject_vid_cols`].
+/// The transient columns naming the fact a positive reference read, for
+/// provenance only (see [`LocyIsRef::support_ref`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupportRef {
+    /// The hidden body column (`__lin_sup_{clause}_{occurrence}`) holding the
+    /// hash of the referenced fact's KEY columns.
+    pub key_column: String,
+    /// The hidden body column holding the referenced fact's PROB value, when
+    /// the referenced rule has one. Without it, the referenced fact is
+    /// certain: its probability is 1.
+    pub prob_column: Option<String>,
+}
+
+/// Where a negated reference records the facts its complement read (see
+/// [`LocyIsRef::negated_lineage`]).
+///
+/// The complement multiplies `1 - p` into the row, `p` the noisy-OR of every
+/// fact of the negated rule the row's negation key matches. Exact inference
+/// instead conjoins the negation of those facts' formulas, which is not the
+/// same when the negated facts share lineage with the rest of the row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NegatedLineageRef {
+    /// The hidden body column (`__deriv_isnot_{clause}_{occurrence}`): per
+    /// row, each matched fact's KEY hash and probability (see
+    /// `locy_lineage::encode_negated_facts`). NULL when nothing matched.
+    pub column: String,
+    /// The negated rule's KEY columns in yield order, hashed as the rule's
+    /// own lineage hashes its facts.
+    pub target_key_columns: Vec<String>,
+}
+
+/// How a clause's PROB expression reads the probability of one positive
+/// reference to a PROB rule.
+///
+/// A positive reference to a PROB rule is a probabilistic condition: the row
+/// holds only when the referenced fact does, so the fact's probability is
+/// multiplied into the row's PROB value, as `IS NOT` multiplies `1 - p`. A
+/// clause that already reads that probability (`FOLD p = MNOR(p)`) must not
+/// count it a second time; this classification decides which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbRead {
+    /// The PROB expression does not read the referenced probability: it is
+    /// multiplied in.
+    Absent,
+    /// The PROB expression is a product with the referenced probability as
+    /// exactly one factor (`p`, `e.w * p`): it is already counted once.
+    Factor,
+    /// The PROB expression reads the referenced probability other than as one
+    /// product factor (`1 - p`, `p * p`, `max(p, e.w)`). Nothing is multiplied
+    /// in (never counting it twice), exact inference treats the row as an
+    /// independent event, and a `ProbabilityReadNotFactor` warning is raised.
+    Opaque,
+}
+
+/// The hidden columns and classification of one positive reference to a PROB
+/// rule (see [`LocyIsRef::prob_ref`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PositiveProbRef {
+    /// The hidden body column holding the referenced fact's PROB value.
+    pub prob_column: String,
+    /// The hidden body column holding a hash of the referenced fact's KEY
+    /// columns, for exact inference. Set only when the calling rule keeps
+    /// lineage: its PROB column is an `MNOR`/`MPROD` fold, whose rows are
+    /// kept as lineage, or it has no fold and provenance is recorded (a
+    /// transient column, see [`LIN_COL_PREFIX`]).
+    pub key_column: Option<String>,
+    /// The calling rule's PROB column as the clause body names it (the FOLD
+    /// variable for a folded PROB column).
+    pub into_column: String,
+    /// How the clause's PROB expression reads the referenced probability.
+    pub read: ProbRead,
+}
+
+/// Prefix of the transient hidden column carrying a referenced probability
+/// into a clause whose rule keeps no lineage. Stripped once multiplied in.
+pub const ISPROB_COL_PREFIX: &str = "__isprob_";
+
+/// Prefix of the persistent hidden column carrying a referenced probability in
+/// an `MNOR`/`MPROD` rule's pre-fold rows. It starts with
+/// [`FOLD_DISCRIMINATOR_COL_PREFIX`] so it is nullable and stripped like the
+/// discriminators, but it is a value, not an identity: it is excluded from the
+/// derivation key.
+pub const DERIV_ISPROB_COL_PREFIX: &str = "__deriv_isprob_";
+
+/// Prefix of the persistent hidden column carrying the hash of a referenced
+/// fact's KEY columns in an `MNOR`/`MPROD` rule's pre-fold rows.
+pub const DERIV_ISREF_COL_PREFIX: &str = "__deriv_isref_";
+
+/// Prefix of the persistent hidden column carrying the facts a negated
+/// reference's complement read, in an `MNOR`/`MPROD` rule's pre-fold rows (see
+/// [`NegatedLineageRef`]).
+pub const DERIV_ISNOT_COL_PREFIX: &str = "__deriv_isnot_";
+
+/// The row-event column of an `MNOR`/`MPROD` rule's pre-fold rows.
+///
+/// A row's own probability is its PROB expression with the referenced
+/// probabilities it reads factored out — `e.p` in `MNOR(e.p * w)`. Two rows
+/// whose local part is the same expression over the same nodes and
+/// relationships are one event: the direct `s→t` row of a reachability rule
+/// and its row through a self-loop at `t` both rest on the edge `s→t`. The
+/// column holds a hash of the expression's shape and those identities; NULL
+/// when the local part reads no node or relationship, which makes the row its
+/// own event.
+pub const DERIV_EVENT_COL: &str = "__deriv_event";
+
+/// Prefix of every transient lineage column.
+///
+/// A PROB rule without a fold has no pre-fold rows to keep its lineage in:
+/// its facts are its rows, deduplicated. When provenance is recorded, its
+/// clause bodies project the lineage columns under this prefix instead of
+/// [`FOLD_DISCRIMINATOR_COL_PREFIX`] ([`LIN_REF_COL_PREFIX`],
+/// [`LIN_PROB_COL_PREFIX`], [`LIN_NOT_COL_PREFIX`], [`LIN_EVENT_COL`]), as do
+/// the provenance-only columns of every other rule ([`LIN_SUP_COL_PREFIX`],
+/// [`LIN_SUPP_COL_PREFIX`]). They are read from a clause's rows before the
+/// facts are deduplicated, then dropped, so they are never part of a fact's
+/// identity.
+pub const LIN_COL_PREFIX: &str = "__lin_";
+
+/// [`DERIV_ISREF_COL_PREFIX`]'s transient counterpart (see [`LIN_COL_PREFIX`]).
+pub const LIN_REF_COL_PREFIX: &str = "__lin_ref_";
+
+/// [`DERIV_ISPROB_COL_PREFIX`]'s transient counterpart (see [`LIN_COL_PREFIX`]).
+pub const LIN_PROB_COL_PREFIX: &str = "__lin_prob_";
+
+/// [`DERIV_ISNOT_COL_PREFIX`]'s transient counterpart (see [`LIN_COL_PREFIX`]).
+pub const LIN_NOT_COL_PREFIX: &str = "__lin_not_";
+
+/// [`DERIV_EVENT_COL`]'s transient counterpart (see [`LIN_COL_PREFIX`]).
+pub const LIN_EVENT_COL: &str = "__lin_event";
+
+/// Prefix of the transient column holding the KEY hash of a fact a positive
+/// reference read, for provenance only (see [`SupportRef`]).
+pub const LIN_SUP_COL_PREFIX: &str = "__lin_sup_";
+
+/// Prefix of the transient column holding the probability of a fact a
+/// positive reference read, for provenance only (see [`SupportRef`]).
+pub const LIN_SUPP_COL_PREFIX: &str = "__lin_supp_";
+
+/// One component of a negated IS-reference's anti-join key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NegationKey {
+    /// The clause variable at the KEY position.
+    pub variable: String,
+    /// The hidden column of the projected clause body holding the binder's
+    /// identity (`__isnot_vid_{k}_{var}`).
+    pub body_column: String,
+    /// The negated rule's KEY column it is compared with.
+    pub fact_column: String,
+    /// What the column holds. A node component must be a `UInt64` vid on
+    /// both sides; any other component is compared by value.
+    pub kind: uni_locy::ColumnKind,
+}
+
+/// Prefix for the hidden identity columns described on
+/// [`LocyIsRef::negation_keys`].
 ///
 /// Two constraints, both load-bearing:
 /// * It must not begin with `__prob_complement_`, which the anti-join

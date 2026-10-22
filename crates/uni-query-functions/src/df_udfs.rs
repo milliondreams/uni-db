@@ -50,7 +50,17 @@ use super::expr_eval::{
     to_datafusion_err,
 };
 
+mod float_cmp;
+mod in_list;
+mod join_key;
 mod sort_key;
+pub use float_cmp::{
+    CYPHER_FIRST_SEEN_UDAF, CYPHER_FLOAT_KEY_UDF, CYPHER_VALUE_KEY_UDF, FloatCmp,
+    canonical_cypher_value, canonical_cypher_value_key, canonical_float,
+    create_cypher_first_seen_udaf, create_cypher_float_compare_udf, create_cypher_float_key_udf,
+    create_cypher_value_key_udf,
+};
+pub use join_key::encode_cypher_join_key;
 pub use sort_key::encode_cypher_sort_key;
 
 /// Generate a Cypher scalar UDF whose shell is entirely mechanical.
@@ -221,6 +231,7 @@ pub fn register_cypher_udfs(ctx: &SessionContext) -> DFResult<()> {
     ctx.register_udf(create_temporal_property_udf());
     ctx.register_udf(create_tostring_udf());
     ctx.register_udf(create_cypher_sort_key_udf());
+    ctx.register_udf(create_cypher_join_key_udf());
     ctx.register_udf(create_has_null_udf());
     ctx.register_udf(create_cypher_size_udf());
 
@@ -234,6 +245,10 @@ pub fn register_cypher_udfs(ctx: &SessionContext) -> DFResult<()> {
 
     // Boolean XOR UDF (3-valued logic with null propagation)
     ctx.register_udf(create_cypher_xor_udf());
+    ctx.register_udf(create_cypher_and_udf());
+    ctx.register_udf(create_cypher_or_udf());
+    ctx.register_udf(create_cypher_regex_udf());
+    ctx.register_udf(create_cypher_pow_udf());
 
     // CypherValue-aware comparison UDFs (decode LargeBinary values before comparing)
     ctx.register_udf(create_cypher_equal_udf());
@@ -242,6 +257,14 @@ pub fn register_cypher_udfs(ctx: &SessionContext) -> DFResult<()> {
     ctx.register_udf(create_cypher_gt_eq_udf());
     ctx.register_udf(create_cypher_lt_udf());
     ctx.register_udf(create_cypher_lt_eq_udf());
+
+    // Float comparisons and equivalence keys with openCypher semantics
+    // (`-0.0 = 0.0`, NaN compares false) instead of Arrow's total order.
+    for op in FloatCmp::ALL {
+        ctx.register_udf(create_cypher_float_compare_udf(op));
+    }
+    ctx.register_udf(create_cypher_float_key_udf());
+    ctx.register_udf(create_cypher_value_key_udf());
 
     // CypherValue to bool UDF (for boolean context: WHERE, CASE WHEN)
     ctx.register_udf(create_cv_to_bool_udf());
@@ -261,6 +284,9 @@ pub fn register_cypher_udfs(ctx: &SessionContext) -> DFResult<()> {
 
     // Cypher IN UDF (handles json-encoded and CypherValue list types)
     ctx.register_udf(create_cypher_in_udf());
+
+    // Label check on a whole-entity value (no flat `_labels` column)
+    ctx.register_udf(create_cypher_has_labels_udf());
 
     // List concatenation, append, slice, tail, reverse, and CV-wrapping UDFs
     ctx.register_udf(create_cypher_list_concat_udf());
@@ -791,13 +817,17 @@ impl ScalarUDFImpl for KeysUdf {
                     // a null-valued property does not exist on the entity, so we
                     // must filter it out.  For plain maps (literal or parameter),
                     // null-valued keys are valid and must be included.
-                    let (source, is_entity) = match map.get("_all_props") {
-                        Some(Value::Map(all)) => (all, true),
-                        _ => (map, false),
-                    };
+                    let (source, is_entity) =
+                        match uni_common::value::entity_property_container(map) {
+                            Some(props) => (props, true),
+                            None => (map, false),
+                        };
                     let mut key_strings: Vec<String> = source
                         .iter()
-                        .filter(|(k, v)| !k.starts_with('_') && (!is_entity || !v.is_null()))
+                        .filter(|(k, v)| {
+                            !uni_common::core::schema::is_reserved_property_name(k)
+                                && (!is_entity || !v.is_null())
+                        })
                         .map(|(k, _)| k.clone())
                         .collect();
                     key_strings.sort();
@@ -901,15 +931,12 @@ impl ScalarUDFImpl for PropertiesUdf {
                         return Ok(Value::Null);
                     }
 
-                    // For schemaless entities, properties are in _all_props.
-                    let source = match map.get("_all_props") {
-                        Some(Value::Map(all)) => all,
-                        _ => map,
-                    };
-                    // Filter out internal properties (those starting with '_')
+                    // A schemaless or serialised entity nests its properties.
+                    let source = uni_common::value::entity_property_container(map).unwrap_or(map);
+                    // Filter out the engine's reserved fields
                     let filtered: std::collections::HashMap<String, Value> = source
                         .iter()
-                        .filter(|(k, _)| !k.starts_with('_'))
+                        .filter(|(k, _)| !uni_common::core::schema::is_reserved_property_name(k))
                         .map(|(k, v)| (k.clone(), v.clone()))
                         .collect();
                     Ok(Value::Map(filtered))
@@ -1004,16 +1031,35 @@ impl ScalarUDFImpl for IndexUdf {
                         )));
                     }
                 }
+                // A declared `VECTOR` column reads back as `Value::Vector`;
+                // it indexes like the list it was written as.
+                Value::Vector(vec) => {
+                    if let Some(i) = index_as_int {
+                        let idx = if i < 0 { vec.len() as i64 + i } else { i };
+                        if idx >= 0 && (idx as usize) < vec.len() {
+                            Value::Float(f64::from(vec[idx as usize]))
+                        } else {
+                            Value::Null
+                        }
+                    } else if index.is_null() {
+                        Value::Null
+                    } else {
+                        return Err(datafusion::error::DataFusionError::Execution(format!(
+                            "TypeError: InvalidArgumentType - list index must be an integer, got: {:?}",
+                            index
+                        )));
+                    }
+                }
                 Value::Map(map) => {
                     if let Some(key) = index.as_str() {
                         // Check top-level first
                         if let Some(val) = map.get(key) {
                             val.clone()
-                        } else if let Some(Value::Map(all_props)) = map.get("_all_props") {
-                            // Schemaless entities store user properties under _all_props.
-                            all_props.get(key).cloned().unwrap_or(Value::Null)
-                        } else if let Some(Value::Map(props)) = map.get("properties") {
-                            // Serialized Node/Edge: properties are nested under "properties"
+                        } else if let Some(props) =
+                            uni_common::value::entity_property_container(map)
+                        {
+                            // A schemaless entity's `_all_props`, or a
+                            // serialised one's `properties`.
                             props.get(key).cloned().unwrap_or(Value::Null)
                         } else {
                             Value::Null
@@ -1379,111 +1425,48 @@ fn extract_vid(val: &Value) -> Option<u64> {
 // range(start, end, [step]) -> List<Int64>
 // ============================================================================
 
-/// Extract an i64 from a ColumnarValue, coercing from any integer type.
-/// Rejects floats, booleans, strings, lists, and maps with `InvalidArgumentType`.
-fn extract_i64_range_arg(arg: &ColumnarValue, row_idx: usize, name: &str) -> DFResult<i64> {
-    match arg {
-        ColumnarValue::Scalar(sv) => match sv {
-            ScalarValue::Int8(Some(v)) => Ok(*v as i64),
-            ScalarValue::Int16(Some(v)) => Ok(*v as i64),
-            ScalarValue::Int32(Some(v)) => Ok(*v as i64),
-            ScalarValue::Int64(Some(v)) => Ok(*v),
-            ScalarValue::UInt8(Some(v)) => Ok(*v as i64),
-            ScalarValue::UInt16(Some(v)) => Ok(*v as i64),
-            ScalarValue::UInt32(Some(v)) => Ok(*v as i64),
-            ScalarValue::UInt64(Some(v)) => Ok(*v as i64),
-            ScalarValue::LargeBinary(Some(bytes)) => {
-                scalar_binary_to_value(bytes)?.as_i64().ok_or_else(|| {
-                    datafusion::error::DataFusionError::Execution(format!(
-                        "ArgumentError: InvalidArgumentType - range() {} must be an integer",
-                        name
-                    ))
-                })
-            }
-            _ => Err(datafusion::error::DataFusionError::Execution(format!(
-                "ArgumentError: InvalidArgumentType - range() {} must be an integer",
-                name
-            ))),
-        },
+/// Extract one row of a `range()` argument as an `i64`, coercing from any
+/// integer type.
+///
+/// Returns `Ok(None)` for a null, whether a typed or untyped null scalar, a
+/// null array slot, or an encoded Cypher null: `range` is null-in/null-out.
+/// Rejects floats, booleans, strings, lists, and maps with
+/// `InvalidArgumentType`.
+fn extract_i64_range_arg(arg: &ColumnarValue, row_idx: usize, name: &str) -> DFResult<Option<i64>> {
+    let type_err = || {
+        datafusion::error::DataFusionError::Execution(format!(
+            "ArgumentError: InvalidArgumentType - range() {name} must be an integer"
+        ))
+    };
+    let owned;
+    let sv = match arg {
+        ColumnarValue::Scalar(sv) => sv,
         ColumnarValue::Array(arr) => {
-            if row_idx >= arr.len() || arr.is_null(row_idx) {
-                return Err(datafusion::error::DataFusionError::Execution(format!(
-                    "ArgumentError: InvalidArgumentType - range() {} must be an integer",
-                    name
-                )));
-            }
-            // Handle array inputs row-wise.
-            if !arr.is_empty() {
-                use datafusion::arrow::array::{
-                    Int8Array, Int16Array, Int32Array, Int64Array, UInt8Array, UInt16Array,
-                    UInt32Array, UInt64Array,
-                };
-                match arr.data_type() {
-                    DataType::Int8 => Ok(arr
-                        .as_any()
-                        .downcast_ref::<Int8Array>()
-                        .unwrap()
-                        .value(row_idx) as i64),
-                    DataType::Int16 => Ok(arr
-                        .as_any()
-                        .downcast_ref::<Int16Array>()
-                        .unwrap()
-                        .value(row_idx) as i64),
-                    DataType::Int32 => Ok(arr
-                        .as_any()
-                        .downcast_ref::<Int32Array>()
-                        .unwrap()
-                        .value(row_idx) as i64),
-                    DataType::Int64 => Ok(arr
-                        .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .unwrap()
-                        .value(row_idx)),
-                    DataType::UInt8 => Ok(arr
-                        .as_any()
-                        .downcast_ref::<UInt8Array>()
-                        .unwrap()
-                        .value(row_idx) as i64),
-                    DataType::UInt16 => Ok(arr
-                        .as_any()
-                        .downcast_ref::<UInt16Array>()
-                        .unwrap()
-                        .value(row_idx) as i64),
-                    DataType::UInt32 => Ok(arr
-                        .as_any()
-                        .downcast_ref::<UInt32Array>()
-                        .unwrap()
-                        .value(row_idx) as i64),
-                    DataType::UInt64 => Ok(arr
-                        .as_any()
-                        .downcast_ref::<UInt64Array>()
-                        .unwrap()
-                        .value(row_idx) as i64),
-                    DataType::LargeBinary => {
-                        let bytes = arr
-                            .as_any()
-                            .downcast_ref::<LargeBinaryArray>()
-                            .unwrap()
-                            .value(row_idx);
-                        scalar_binary_to_value(bytes)?.as_i64().ok_or_else(|| {
-                            datafusion::error::DataFusionError::Execution(format!(
-                                "ArgumentError: InvalidArgumentType - range() {} must be an integer",
-                                name
-                            ))
-                        })
-                    }
-                    _ => Err(datafusion::error::DataFusionError::Execution(format!(
-                        "ArgumentError: InvalidArgumentType - range() {} must be an integer",
-                        name
-                    ))),
-                }
-            } else {
-                Err(datafusion::error::DataFusionError::Execution(format!(
-                    "ArgumentError: InvalidArgumentType - range() {} must be an integer",
-                    name
-                )))
-            }
+            owned = ScalarValue::try_from_array(arr, row_idx)?;
+            &owned
         }
+    };
+    if sv.is_null() {
+        return Ok(None);
+    }
+    match sv {
+        ScalarValue::Int8(Some(v)) => Ok(Some(i64::from(*v))),
+        ScalarValue::Int16(Some(v)) => Ok(Some(i64::from(*v))),
+        ScalarValue::Int32(Some(v)) => Ok(Some(i64::from(*v))),
+        ScalarValue::Int64(Some(v)) => Ok(Some(*v)),
+        ScalarValue::UInt8(Some(v)) => Ok(Some(i64::from(*v))),
+        ScalarValue::UInt16(Some(v)) => Ok(Some(i64::from(*v))),
+        ScalarValue::UInt32(Some(v)) => Ok(Some(i64::from(*v))),
+        ScalarValue::UInt64(Some(v)) => i64::try_from(*v).map(Some).map_err(|_| {
+            datafusion::error::DataFusionError::Execution(format!(
+                "ArgumentError: NumberOutOfRange - range() {name} {v} exceeds the integer range"
+            ))
+        }),
+        ScalarValue::LargeBinary(Some(bytes)) => match scalar_binary_to_value(bytes)? {
+            Value::Null => Ok(None),
+            v => v.as_i64().map(Some).ok_or_else(type_err),
+        },
+        _ => Err(type_err()),
     }
 }
 
@@ -1545,17 +1528,29 @@ impl ScalarUDFImpl for RangeUdf {
             arrow_array::builder::ListBuilder::new(arrow_array::builder::Int64Builder::new());
 
         for row_idx in 0..len {
-            let start = extract_i64_range_arg(&args.args[0], row_idx, "start")?;
-            let end = extract_i64_range_arg(&args.args[1], row_idx, "end")?;
+            let start = extract_i64_range_arg(&args.args[0], row_idx, "start");
+            let end = extract_i64_range_arg(&args.args[1], row_idx, "end");
             let step = if args.args.len() == 3 {
-                extract_i64_range_arg(&args.args[2], row_idx, "step")?
+                extract_i64_range_arg(&args.args[2], row_idx, "step")
             } else {
-                1
+                Ok(Some(1))
+            };
+            // Null in, null out: a null bound or step makes this row null,
+            // ahead of every other check, so a non-integer or a zero step in
+            // another position does not raise.
+            let any_null = [&start, &end, &step].iter().any(|a| matches!(a, Ok(None)));
+            if any_null {
+                list_builder.append_null();
+                continue;
+            }
+            let (Some(start), Some(end), Some(step)) = (start?, end?, step?) else {
+                list_builder.append_null();
+                continue;
             };
 
             if step == 0 {
                 return Err(datafusion::error::DataFusionError::Execution(
-                    "range(): step cannot be zero".to_string(),
+                    "ArgumentError: NumberOutOfRange - range() step cannot be zero".to_string(),
                 ));
             }
 
@@ -2979,6 +2974,58 @@ cypher_scalar_udf! {
 }
 
 // ============================================================================
+// _cypher_join_key(x) -> LargeBinary
+// Hash-join bucket key: equal Cypher values always share a key. Coarse by
+// design, so the join must re-check the original equality (see `join_key`).
+// ============================================================================
+
+cypher_scalar_udf! {
+    /// Build the `_cypher_join_key` UDF, the bucket key of a mixed-type equi-join.
+    ///
+    /// Every pair of values that compare equal maps to the same key; `null`
+    /// maps to a null key, which joins nothing. Distinct values may collide,
+    /// so a planner that keys a hash join on it must keep the original
+    /// equality as a join filter.
+    create_cypher_join_key_udf => CypherJoinKeyUdf,
+    name: "_cypher_join_key",
+    signature: Signature::any(1, Volatility::Immutable),
+    return_type: DataType::LargeBinary,
+    invoke(args) {
+    if args.args.len() != 1 {
+        return Err(datafusion::error::DataFusionError::Execution(
+            "_cypher_join_key(): requires 1 argument".to_string(),
+        ));
+    }
+
+    match &args.args[0] {
+        ColumnarValue::Scalar(s) => {
+            let val = if s.is_null() {
+                Value::Null
+            } else {
+                scalar_to_value(s)?
+            };
+            Ok(ColumnarValue::Scalar(ScalarValue::LargeBinary(
+                encode_cypher_join_key(&val),
+            )))
+        }
+        ColumnarValue::Array(arr) => {
+            let field = args.arg_fields.first().map(|f| f.as_ref());
+            let mut keys: Vec<Option<Vec<u8>>> = Vec::with_capacity(arr.len());
+            for i in 0..arr.len() {
+                keys.push(if arr.is_null(i) {
+                    None
+                } else {
+                    encode_cypher_join_key(&get_value_from_array(arr, i, field)?)
+                });
+            }
+            let array: LargeBinaryArray = keys.iter().map(|k| k.as_deref()).collect();
+            Ok(ColumnarValue::Array(Arc::new(array)))
+        }
+    }
+    }
+}
+
+// ============================================================================
 // BTIC Scalar UDFs
 // ============================================================================
 
@@ -3713,16 +3760,6 @@ fn apply_comparison_op(ord: std::cmp::Ordering, op: &BinaryOp) -> bool {
     }
 }
 
-/// Compare two f64 values with NaN awareness and Cypher comparison semantics.
-/// Returns `None` when partial_cmp fails (should not happen for non-NaN floats).
-fn compare_f64(lhs: f64, rhs: f64, op: &BinaryOp) -> Option<bool> {
-    if lhs.is_nan() || rhs.is_nan() {
-        Some(matches!(op, BinaryOp::NotEq))
-    } else {
-        Some(apply_comparison_op(lhs.partial_cmp(&rhs)?, op))
-    }
-}
-
 /// Decode CypherValue bytes as f64 (works for both TAG_INT and TAG_FLOAT).
 fn cv_bytes_as_f64(bytes: &[u8]) -> Option<f64> {
     use uni_common::cypher_value_codec::{TAG_FLOAT, TAG_INT, decode_float, decode_int, peek_tag};
@@ -3738,43 +3775,42 @@ fn cv_bytes_as_f64(bytes: &[u8]) -> Option<f64> {
     }
 }
 
+/// Decode CypherValue bytes as a number, keeping an integer an integer.
+///
+/// `None` for anything that is not a well-formed `TAG_INT` or `TAG_FLOAT`;
+/// the caller falls back to the slow path, as for [`cv_bytes_as_f64`].
+fn cv_bytes_as_number(bytes: &[u8]) -> Option<Value> {
+    use uni_common::cypher_value_codec::{TAG_FLOAT, TAG_INT, decode_float, decode_int, peek_tag};
+    match peek_tag(bytes)? {
+        TAG_INT => decode_int(bytes).ok().flatten().map(Value::Int),
+        TAG_FLOAT => decode_float(bytes).ok().flatten().map(Value::Float),
+        _ => None,
+    }
+}
+
+/// `lhs op rhs` for two numbers, by exact value: an integer is never widened
+/// to `f64`, which rounds above 2^53. NaN is false under every operator but
+/// `<>`.
+fn compare_numbers(lhs: &Value, rhs: &Value, op: &BinaryOp) -> Option<bool> {
+    match crate::expr_eval::cypher_numeric_cmp(lhs, rhs)? {
+        Some(ord) => Some(apply_comparison_op(ord, op)),
+        None => Some(matches!(op, BinaryOp::NotEq)),
+    }
+}
+
 /// Compare CypherValue bytes against an f64, returning the boolean comparison result.
 /// Returns `None` for null/incomparable types (caller should emit null).
 fn compare_cv_numeric(bytes: &[u8], rhs: f64, op: &BinaryOp) -> Option<bool> {
-    use uni_common::cypher_value_codec::{TAG_INT, TAG_NULL, decode_int, peek_tag};
-    // Special case: int-vs-int comparison preserves exact integer semantics
-    if peek_tag(bytes) == Some(TAG_INT)
-        && let Ok(Some(lhs_int)) = decode_int(bytes)
-        // If rhs is exactly representable as i64, use integer comparison
-        && rhs.fract() == 0.0
-        && rhs >= i64::MIN as f64
-        && rhs <= i64::MAX as f64
-    {
-        return Some(apply_comparison_op(lhs_int.cmp(&(rhs as i64)), op));
-    }
-    if peek_tag(bytes) == Some(TAG_NULL) {
-        return None;
-    }
-    let lhs = cv_bytes_as_f64(bytes)?;
-    compare_f64(lhs, rhs, op)
+    compare_numbers(&cv_bytes_as_number(bytes)?, &Value::Float(rhs), op)
 }
 
 /// Compare a CypherValue-encoded LHS against an exact `i64` RHS.
 ///
-/// The `compare_cv_numeric` int fast-path is exact only if the caller preserves
-/// the RHS integer; passing `rhs as f64` first rounds values above 2^53 before
-/// the compare. When the LHS is itself an int, compare `i64` vs `i64` directly;
-/// only a float LHS falls back to `f64` (where exact-int semantics don't apply).
+/// The RHS stays an `i64`: passing `rhs as f64` would round values above 2^53
+/// before the compare. An int LHS compares as `i64`, a float LHS exactly
+/// against the integer.
 fn compare_cv_vs_i64(bytes: &[u8], rhs: i64, op: &BinaryOp) -> Option<bool> {
-    use uni_common::cypher_value_codec::{TAG_INT, TAG_NULL, decode_int, peek_tag};
-    match peek_tag(bytes) {
-        Some(TAG_NULL) => None,
-        Some(TAG_INT) => decode_int(bytes)
-            .ok()
-            .flatten()
-            .map(|lhs| apply_comparison_op(lhs.cmp(&rhs), op)),
-        _ => compare_f64(cv_bytes_as_f64(bytes)?, rhs as f64, op),
-    }
+    compare_numbers(&cv_bytes_as_number(bytes)?, &Value::Int(rhs), op)
 }
 
 /// Fast-path comparison for LargeBinary (CypherValue) vs native Arrow types.
@@ -3918,11 +3954,11 @@ fn try_fast_compare(
                         continue;
                     }
 
-                    // Numeric (mixed int/float): promote both to f64
+                    // Numeric (mixed int/float): compared by exact value.
                     if let (Some(l), Some(r)) =
-                        (cv_bytes_as_f64(lhs_bytes), cv_bytes_as_f64(rhs_bytes))
+                        (cv_bytes_as_number(lhs_bytes), cv_bytes_as_number(rhs_bytes))
                     {
-                        match compare_f64(l, r, op) {
+                        match compare_numbers(&l, &r, op) {
                             Some(result) => builder.append_value(result),
                             None => builder.append_null(),
                         }
@@ -4141,8 +4177,13 @@ fn cv_decode_error(e: &uni_common::UniError) -> datafusion::error::DataFusionErr
 enum CvArithOutcome {
     /// A successful result, as CypherValue-encoded bytes.
     Value(Vec<u8>),
-    /// A genuine null operand or non-numeric input: append a null (3VL).
+    /// A genuine null operand: append a null (3VL).
     Null,
+    /// A non-numeric operand (a string, list, temporal...), which the fast
+    /// path does not evaluate: the whole batch goes to the slow path, which
+    /// concatenates, appends or errors as `eval_binary_op` does. Answering
+    /// NULL here made `n.s + x` NULL where the slow path answers `'ab1'`.
+    Fallback,
     /// A hard error such as integer overflow or division by zero.
     Error(datafusion::error::DataFusionError),
 }
@@ -4194,8 +4235,8 @@ fn apply_float_arithmetic(lhs: f64, rhs: f64, op: &BinaryOp) -> CvArithOutcome {
 
 /// Perform arithmetic on a CypherValue-encoded LHS against an i64 RHS.
 ///
-/// Returns [`CvArithOutcome::Null`] for null/incompatible operands and an error
-/// for integer overflow or division by zero.
+/// Returns [`CvArithOutcome::Fallback`] for a non-numeric operand and an
+/// error for integer overflow or division by zero.
 // Rust guideline compliant
 fn cv_arithmetic_int(bytes: &[u8], rhs: i64, op: &BinaryOp) -> CvArithOutcome {
     use uni_common::cypher_value_codec::{TAG_FLOAT, TAG_INT, decode_float, decode_int, peek_tag};
@@ -4210,19 +4251,19 @@ fn cv_arithmetic_int(bytes: &[u8], rhs: i64, op: &BinaryOp) -> CvArithOutcome {
             Ok(None) => CvArithOutcome::Null,
             Err(e) => CvArithOutcome::Error(cv_decode_error(&e)),
         },
-        _ => CvArithOutcome::Null,
+        _ => CvArithOutcome::Fallback,
     }
 }
 
 /// Perform arithmetic on a CypherValue-encoded LHS against an f64 RHS.
 ///
-/// Returns [`CvArithOutcome::Null`] for null/incompatible operands. Float
+/// Returns [`CvArithOutcome::Fallback`] for a non-numeric operand. Float
 /// arithmetic itself never errors.
 // Rust guideline compliant
 fn cv_arithmetic_float(bytes: &[u8], rhs: f64, op: &BinaryOp) -> CvArithOutcome {
     match cv_bytes_as_f64(bytes) {
         Some(lhs) => apply_float_arithmetic(lhs, rhs, op),
-        None => CvArithOutcome::Null,
+        None => CvArithOutcome::Fallback,
     }
 }
 
@@ -4245,8 +4286,13 @@ pub(crate) fn cypher_arith_return_type(arg_types: &[DataType]) -> DataType {
     if any_large_binary {
         return DataType::LargeBinary;
     }
+    // A float beside anything but a number or NULL (`2.5 * duration('P1D')`
+    // is a duration) is not a float.
+    let all_numeric_or_null = arg_types
+        .iter()
+        .all(|t| matches!(t, DataType::Int64 | DataType::Float64 | DataType::Null));
     let any_float = arg_types.iter().any(|t| matches!(t, DataType::Float64));
-    if any_float {
+    if any_float && all_numeric_or_null {
         return DataType::Float64;
     }
     // No LargeBinary and no Float64: if every non-null arg is Int64, the result
@@ -4311,6 +4357,7 @@ fn try_fast_arithmetic(
                     match cv_arithmetic_int(lb_arr.value(i), int_arr.value(i), op) {
                         CvArithOutcome::Value(bytes) => builder.append_value(&bytes),
                         CvArithOutcome::Null => builder.append_null(),
+                        CvArithOutcome::Fallback => return None,
                         CvArithOutcome::Error(e) => return Some(Err(e)),
                     }
                 }
@@ -4330,6 +4377,7 @@ fn try_fast_arithmetic(
                     match cv_arithmetic_float(lb_arr.value(i), float_arr.value(i), op) {
                         CvArithOutcome::Value(bytes) => builder.append_value(&bytes),
                         CvArithOutcome::Null => builder.append_null(),
+                        CvArithOutcome::Fallback => return None,
                         CvArithOutcome::Error(e) => return Some(Err(e)),
                     }
                 }
@@ -4481,31 +4529,96 @@ impl ScalarUDFImpl for CypherArithmeticUdf {
 }
 
 // ============================================================================
-// _cypher_xor: 3-valued XOR with null propagation
+// _cypher_xor, _cypher_and, _cypher_or, _cypher_regex: boolean-valued
+// operators over operands of any type, with openCypher semantics
 // ============================================================================
 
+/// `XOR` under Kleene logic: NULL for a NULL operand, a type error for a
+/// non-boolean one.
 pub fn create_cypher_xor_udf() -> ScalarUDF {
-    ScalarUDF::new_from_impl(CypherXorUdf::new())
+    ScalarUDF::new_from_impl(CypherBooleanOpUdf::new("_cypher_xor", BinaryOp::Xor))
 }
 
+/// `AND` over operands of any type (a dynamically typed property, NULL): an
+/// operand `false` decides it whatever the other operand is, so the answer
+/// does not depend on which rows share a batch.
+pub fn create_cypher_and_udf() -> ScalarUDF {
+    ScalarUDF::new_from_impl(CypherBooleanOpUdf::new("_cypher_and", BinaryOp::And))
+}
+
+/// `OR` over operands of any type; an operand `true` decides it. See
+/// [`create_cypher_and_udf`].
+pub fn create_cypher_or_udf() -> ScalarUDF {
+    ScalarUDF::new_from_impl(CypherBooleanOpUdf::new("_cypher_or", BinaryOp::Or))
+}
+
+/// `=~` over operands of any type: NULL for a NULL operand. Evaluates under
+/// the runtime installed on the calling task, or the defaults.
+pub fn create_cypher_regex_udf() -> ScalarUDF {
+    ScalarUDF::new_from_impl(CypherBooleanOpUdf::new("_cypher_regex", BinaryOp::Regex))
+}
+
+/// `=~` evaluated under `runtime`: its backtrack limit, and its deadline and
+/// cancellation checked as rows are matched.
+///
+/// A query registers its own instance, because DataFusion evaluates
+/// partitions on spawned tasks that a task-local does not reach.
+pub fn create_cypher_regex_udf_with_runtime(
+    runtime: Arc<crate::expr_eval::RegexRuntime>,
+) -> ScalarUDF {
+    let mut udf = CypherBooleanOpUdf::new("_cypher_regex", BinaryOp::Regex);
+    udf.regex_runtime = Some(runtime);
+    ScalarUDF::new_from_impl(udf)
+}
+
+/// A boolean-valued binary operator evaluated per row by
+/// [`crate::expr_eval::eval_binary_op`], for operands DataFusion's own
+/// operators do not take (a CypherValue, a NULL literal) or evaluate
+/// differently (DataFusion's `AND`/`OR` skip the right operand when the left
+/// one decides the whole batch).
 #[derive(Debug)]
-struct CypherXorUdf {
+struct CypherBooleanOpUdf {
+    name: &'static str,
+    op: BinaryOp,
     signature: Signature,
+    /// For `=~`: the query's runtime, when the query registered one.
+    regex_runtime: Option<Arc<crate::expr_eval::RegexRuntime>>,
 }
 
-impl CypherXorUdf {
-    fn new() -> Self {
+impl CypherBooleanOpUdf {
+    fn new(name: &'static str, op: BinaryOp) -> Self {
         Self {
+            name,
+            op,
             signature: Signature::any(2, Volatility::Immutable),
+            regex_runtime: None,
         }
+    }
+
+    fn runtime(&self) -> Arc<crate::expr_eval::RegexRuntime> {
+        self.regex_runtime
+            .clone()
+            .unwrap_or_else(crate::expr_eval::current_regex_runtime)
     }
 }
 
-impl_udf_eq_hash!(CypherXorUdf);
+impl PartialEq for CypherBooleanOpUdf {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+    }
+}
 
-impl ScalarUDFImpl for CypherXorUdf {
+impl Eq for CypherBooleanOpUdf {}
+
+impl Hash for CypherBooleanOpUdf {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+    }
+}
+
+impl ScalarUDFImpl for CypherBooleanOpUdf {
     fn name(&self) -> &str {
-        "_cypher_xor"
+        self.name
     }
     fn signature(&self) -> &Signature {
         &self.signature
@@ -4515,24 +4628,226 @@ impl ScalarUDFImpl for CypherXorUdf {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        let output_type = DataType::Boolean;
-        invoke_cypher_udf(args, &output_type, |val_args| {
-            if val_args.len() != 2 {
-                return Err(datafusion::error::DataFusionError::Execution(
-                    "_cypher_xor(): requires 2 arguments".to_string(),
-                ));
-            }
-            // Coerce string-encoded booleans from UNWIND (Utf8 "true"/"false")
+        if args.args.len() != 2 {
+            return Err(datafusion::error::DataFusionError::Execution(format!(
+                "{}(): requires 2 arguments",
+                self.name
+            )));
+        }
+        // Two native boolean operands: Arrow's Kleene kernels answer exactly
+        // what `eval_binary_op` does, without a per-row decode.
+        if matches!(self.op, BinaryOp::And | BinaryOp::Or)
+            && args
+                .arg_fields
+                .iter()
+                .all(|f| matches!(f.data_type(), DataType::Boolean))
+        {
+            let len = args.number_rows;
+            let left = args.args[0].clone().into_array(len)?;
+            let right = args.args[1].clone().into_array(len)?;
+            let (Some(l), Some(r)) = (
+                left.as_any().downcast_ref::<BooleanArray>(),
+                right.as_any().downcast_ref::<BooleanArray>(),
+            ) else {
+                return Err(datafusion::error::DataFusionError::Internal(format!(
+                    "{}(): boolean operands did not downcast",
+                    self.name
+                )));
+            };
+            let result = if self.op == BinaryOp::And {
+                arrow::compute::kernels::boolean::and_kleene(l, r)?
+            } else {
+                arrow::compute::kernels::boolean::or_kleene(l, r)?
+            };
+            return Ok(ColumnarValue::Array(Arc::new(result)));
+        }
+        if self.op == BinaryOp::Regex
+            && args.arg_fields.iter().all(|f| {
+                matches!(
+                    f.data_type(),
+                    DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+                )
+            })
+        {
+            return regex_match_strings(
+                &args.args[0],
+                &args.args[1],
+                args.number_rows,
+                &self.runtime(),
+            );
+        }
+        let op = self.op;
+        let runtime = (op == BinaryOp::Regex).then(|| self.runtime());
+        invoke_cypher_udf(args, &DataType::Boolean, |val_args| {
+            // A logical operator reads a string-encoded boolean (UNWIND over
+            // a Utf8 column) as the boolean, as the logical path's cast does.
             let coerce_bool = |v: &Value| -> Value {
                 match v {
-                    Value::String(s) if s == "true" => Value::Bool(true),
-                    Value::String(s) if s == "false" => Value::Bool(false),
+                    Value::String(s) if op != BinaryOp::Regex && s == "true" => Value::Bool(true),
+                    Value::String(s) if op != BinaryOp::Regex && s == "false" => Value::Bool(false),
                     other => other.clone(),
                 }
             };
             let left = coerce_bool(&val_args[0]);
             let right = coerce_bool(&val_args[1]);
-            crate::expr_eval::eval_binary_op(&left, &BinaryOp::Xor, &right)
+            let eval = || crate::expr_eval::eval_binary_op(&left, &op, &right);
+            match &runtime {
+                Some(rt) => crate::expr_eval::REGEX_RUNTIME.sync_scope(rt.clone(), eval),
+                None => eval(),
+            }
+            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))
+        })
+    }
+}
+
+/// `subject =~ pattern` over two string operands, vectorized: the full-match
+/// semantics of [`crate::expr_eval::compile_cypher_regex`], NULL for a NULL
+/// operand, and one compile (or cache hit) per batch for a constant pattern.
+fn regex_match_strings(
+    subject: &ColumnarValue,
+    pattern: &ColumnarValue,
+    rows: usize,
+    runtime: &crate::expr_eval::RegexRuntime,
+) -> DFResult<ColumnarValue> {
+    let as_large_strings = |v: &ColumnarValue| -> DFResult<LargeStringArray> {
+        let array = arrow::compute::cast(&v.clone().into_array(rows)?, &DataType::LargeUtf8)?;
+        array
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .cloned()
+            .ok_or_else(|| {
+                datafusion::error::DataFusionError::Internal(
+                    "_cypher_regex(): string operand did not downcast".to_string(),
+                )
+            })
+    };
+    let subjects = as_large_strings(subject)?;
+    let result: BooleanArray = match pattern {
+        ColumnarValue::Scalar(scalar) => match scalar_to_string(scalar)? {
+            None => BooleanArray::new_null(subjects.len()),
+            Some(p) => crate::expr_eval::with_cached_regex(&p, runtime.backtrack_limit(), |re| {
+                // The deadline is checked before every row a backtracking
+                // match answers (each can take up to the backtrack limit),
+                // and every 64 rows of linear-time matching.
+                let every = if re.route() == crate::java_regex::Route::Backtracking {
+                    1
+                } else {
+                    64
+                };
+                subjects
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| {
+                        if i % every == 0 {
+                            runtime.check()?;
+                        }
+                        s.map(|s| re.is_match(s).map_err(|e| anyhow::anyhow!("{e}")))
+                            .transpose()
+                    })
+                    .collect::<anyhow::Result<BooleanArray>>()
+            })
+            .map_err(to_datafusion_err)?
+            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?,
+        },
+        ColumnarValue::Array(_) => {
+            let patterns = as_large_strings(pattern)?;
+            subjects
+                .iter()
+                .zip(patterns.iter())
+                .map(|(s, p)| match (s, p) {
+                    (Some(s), Some(p)) => {
+                        crate::expr_eval::cypher_regex_is_match_in(runtime, s, p).map(Some)
+                    }
+                    _ => Ok(None),
+                })
+                .collect::<anyhow::Result<BooleanArray>>()
+                .map_err(to_datafusion_err)?
+        }
+    };
+    Ok(ColumnarValue::Array(Arc::new(result)))
+}
+
+/// The string held by a string scalar, `None` for a NULL one.
+fn scalar_to_string(scalar: &ScalarValue) -> DFResult<Option<String>> {
+    match scalar {
+        ScalarValue::Utf8(s) | ScalarValue::LargeUtf8(s) | ScalarValue::Utf8View(s) => {
+            Ok(s.clone())
+        }
+        other => Err(datafusion::error::DataFusionError::Internal(format!(
+            "_cypher_regex(): expected a string pattern, got {other:?}"
+        ))),
+    }
+}
+
+// ============================================================================
+// _cypher_pow: `^`, always a float
+// ============================================================================
+
+/// `^` over operands of any type: a float for two numbers, NULL for a NULL
+/// operand (whatever the other one is), and a type error otherwise.
+pub fn create_cypher_pow_udf() -> ScalarUDF {
+    ScalarUDF::new_from_impl(CypherPowUdf::new())
+}
+
+#[derive(Debug)]
+struct CypherPowUdf {
+    signature: Signature,
+}
+
+impl CypherPowUdf {
+    fn new() -> Self {
+        Self {
+            signature: Signature::any(2, Volatility::Immutable),
+        }
+    }
+}
+
+impl_udf_eq_hash!(CypherPowUdf);
+
+impl ScalarUDFImpl for CypherPowUdf {
+    fn name(&self) -> &str {
+        "_cypher_pow"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Float64)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        if args.args.len() != 2 {
+            return Err(datafusion::error::DataFusionError::Execution(
+                "_cypher_pow(): requires 2 arguments".to_string(),
+            ));
+        }
+        // Two native numeric operands: vectorized, through Float64.
+        if args
+            .arg_fields
+            .iter()
+            .all(|f| matches!(f.data_type(), DataType::Int64 | DataType::Float64))
+        {
+            let len = args.number_rows;
+            let as_f64 = |c: &ColumnarValue| -> DFResult<ArrayRef> {
+                Ok(arrow::compute::cast(
+                    &c.clone().into_array(len)?,
+                    &DataType::Float64,
+                )?)
+            };
+            let (left, right) = (as_f64(&args.args[0])?, as_f64(&args.args[1])?);
+            let (Some(l), Some(r)) = (
+                left.as_any().downcast_ref::<Float64Array>(),
+                right.as_any().downcast_ref::<Float64Array>(),
+            ) else {
+                return Err(datafusion::error::DataFusionError::Internal(
+                    "_cypher_pow(): Float64 cast did not downcast".to_string(),
+                ));
+            };
+            let result: Float64Array = arrow::compute::binary(l, r, f64::powf)?;
+            return Ok(ColumnarValue::Array(Arc::new(result)));
+        }
+        invoke_cypher_udf(args, &DataType::Float64, |val_args| {
+            crate::expr_eval::eval_binary_op(&val_args[0], &BinaryOp::Pow, &val_args[1])
                 .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))
         })
     }
@@ -4880,7 +5195,7 @@ cypher_scalar_udf! {
             let value = &val_args[i + 1];
             if let Some(k) = key.as_str() {
                 if k == "__all__" {
-                    // AllProperties: expand entity map, skip _-prefixed keys
+                    // AllProperties: expand entity map, skip reserved keys
                     match value {
                         Value::Map(map) => {
                             // Prefer `_all_props` (the CypherValue-encoded
@@ -4894,7 +5209,7 @@ cypher_scalar_udf! {
                                 _ => map,
                             };
                             for (mk, mv) in source {
-                                if !mk.starts_with('_') {
+                                if !uni_common::core::schema::is_reserved_property_name(mk) {
                                     result_map.insert(mk.clone(), mv.clone());
                                 }
                             }
@@ -5005,6 +5320,16 @@ cypher_scalar_udf! {
     signature: Signature::any(2, Volatility::Immutable),
     return_type: DataType::Boolean,
     invoke(args) {
+    // A literal or parameter list is the same on every row: index it once and
+    // probe it per row, instead of scanning it per row (see `InListIndex`).
+    if let Some(out) = in_list::invoke_constant_list(&args)? {
+        return Ok(out);
+    }
+    // A list column is decoded and indexed once per run of identical rows
+    // (see `invoke_column_list`), the IC5 shape.
+    if let Some(out) = in_list::invoke_column_list(&args)? {
+        return Ok(out);
+    }
     invoke_cypher_udf(args, &DataType::Boolean, |vals| {
         if vals.len() != 2 {
             return Err(datafusion::error::DataFusionError::Execution(
@@ -5030,29 +5355,66 @@ cypher_scalar_udf! {
             }
         };
 
-        // If element is null
-        if element.is_null() {
-            return if items.is_empty() {
-                Ok(Value::Bool(false))
-            } else {
-                Ok(Value::Null) // null IN non-empty list → null
-            };
-        }
+        Ok(in_list::scan_membership(element, items))
+    })
+    }
+}
 
-        // 3-valued comparison: cypher_eq returns Some(true/false) or None (indeterminate)
-        let mut has_null = false;
-        for item in items {
-            match entity_aware_eq(element, item) {
-                Some(true) => return Ok(Value::Bool(true)),
-                None => has_null = true,
-                Some(false) => {}
+// ============================================================================
+// _cypher_has_labels(entity, label, ...) -> Boolean
+// ============================================================================
+
+cypher_scalar_udf! {
+    /// Create the `_cypher_has_labels` UDF: `entity:L1:L2` on a whole-entity
+    /// value.
+    ///
+    /// A scanned node carries its labels in a flat `{var}._labels` column, and
+    /// `LabelCheck` compiles against that. A node that arrives as one value — an
+    /// `UNWIND` element, a list item, a map — has no such column, so the check
+    /// reads the labels off the value instead. Either encoding of a node or an
+    /// edge is accepted: a node has all the labels, an edge has the one type.
+    /// `null` gives `null`; any other value is not an entity and gives `false`.
+    create_cypher_has_labels_udf => CypherHasLabelsUdf,
+    name: "_cypher_has_labels",
+    signature: Signature::variadic_any(Volatility::Immutable),
+    return_type: DataType::Boolean,
+    invoke(args) {
+    invoke_cypher_udf(args, &DataType::Boolean, |vals| {
+        let Some((entity, wanted)) = vals.split_first() else {
+            return Err(datafusion::error::DataFusionError::Execution(
+                "_cypher_has_labels(): requires an entity argument".to_string(),
+            ));
+        };
+        let wanted: Vec<&str> = wanted
+            .iter()
+            .map(|v| match v {
+                Value::String(s) => Ok(s.as_str()),
+                other => Err(datafusion::error::DataFusionError::Execution(format!(
+                    "_cypher_has_labels(): a label must be a string, got {other:?}"
+                ))),
+            })
+            .collect::<DFResult<_>>()?;
+        if entity.is_null() {
+            return Ok(Value::Null);
+        }
+        if let Some(labels) = entity.entity_labels() {
+            return Ok(Value::Bool(
+                wanted.iter().all(|w| labels.iter().any(|have| have == w)),
+            ));
+        }
+        match entity.edge_type_ref() {
+            Some(uni_common::value::EdgeTypeRef::Name(name)) => {
+                Ok(Value::Bool(wanted.len() == 1 && wanted[0] == name))
             }
-        }
-
-        if has_null {
-            Ok(Value::Null) // not found but comparison was indeterminate → null
-        } else {
-            Ok(Value::Bool(false))
+            // A type id cannot be named without the schema; answering `false`
+            // would silently drop the row.
+            Some(uni_common::value::EdgeTypeRef::Id(id)) => {
+                Err(datafusion::error::DataFusionError::Execution(format!(
+                    "_cypher_has_labels(): relationship carries only type id {id}, \
+                     which cannot be checked against a type name here"
+                )))
+            }
+            None => Ok(Value::Bool(false)),
         }
     })
     }
@@ -5201,8 +5563,15 @@ cypher_scalar_udf! {
         if vals[0].is_null() {
             return Ok(Value::Null);
         }
+        // A declared `VECTOR` reads back as `Value::Vector`; it slices like the
+        // list of floats it was written as, into a list.
+        let as_list;
         let list = match &vals[0] {
             Value::List(l) => l,
+            Value::Vector(v) => {
+                as_list = v.iter().map(|f| Value::Float(f64::from(*f))).collect::<Vec<_>>();
+                &as_list
+            }
             _ => {
                 return Err(datafusion::error::DataFusionError::Execution(format!(
                     "_cypher_list_slice(): first argument must be a list, got {:?}",
@@ -5514,10 +5883,10 @@ fn cypher_value_cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     match (a, b) {
         (Value::Null, Value::Null) => Some(std::cmp::Ordering::Equal),
         (Value::Null, _) | (_, Value::Null) => None,
-        (Value::Int(l), Value::Int(r)) => Some(l.cmp(r)),
-        (Value::Float(l), Value::Float(r)) => l.partial_cmp(r),
-        (Value::Int(l), Value::Float(r)) => (*l as f64).partial_cmp(r),
-        (Value::Float(l), Value::Int(r)) => l.partial_cmp(&(*r as f64)),
+        // Numbers by exact value; an integer is never widened to `f64`.
+        (Value::Int(_) | Value::Float(_), Value::Int(_) | Value::Float(_)) => {
+            crate::expr_eval::cypher_numeric_cmp(a, b).flatten()
+        }
         (Value::String(l), Value::String(r)) => Some(l.cmp(r)),
         (Value::Bool(l), Value::Bool(r)) => Some(l.cmp(r)),
         (Value::List(l), Value::List(r)) => cypher_list_cmp(l, r),
@@ -5528,6 +5897,94 @@ fn cypher_value_cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
         (Value::Temporal(l), Value::Temporal(r)) => crate::expr_eval::temporal_partial_cmp(l, r),
         _ => None, // Incomparable types
     }
+}
+
+// ============================================================================
+// CypherInteger Scalar UDF
+// ============================================================================
+
+/// Scalar UDF that reads a Cypher value as an Int64 integer.
+///
+/// The integer twin of `_cypher_number`, for a Cypher-value column brought to
+/// an Int64 column. Reading it as a Float64 and casting rounded every integer
+/// above 2^53: `9007199254740993` became `9007199254740992`. An integer is
+/// kept exactly; a float is truncated, as the cast it replaces did; NULL stays
+/// NULL; anything else is an error.
+struct CypherIntegerUdf {
+    signature: Signature,
+}
+
+impl_udf_eq_hash!(CypherIntegerUdf);
+
+impl std::fmt::Debug for CypherIntegerUdf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CypherIntegerUdf").finish()
+    }
+}
+
+impl ScalarUDFImpl for CypherIntegerUdf {
+    fn name(&self) -> &str {
+        "_cypher_integer"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _args: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Int64)
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let [arg] = args.args.as_slice() else {
+            return Err(datafusion::error::DataFusionError::Execution(
+                "_cypher_integer requires exactly 1 argument".into(),
+            ));
+        };
+        match arg {
+            ColumnarValue::Scalar(scalar) => {
+                let ints = integers_of(&scalar.to_array_of_size(1)?)?;
+                Ok(ColumnarValue::Scalar(ScalarValue::try_from_array(
+                    &ints, 0,
+                )?))
+            }
+            ColumnarValue::Array(arr) => Ok(ColumnarValue::Array(integers_of(arr)?)),
+        }
+    }
+}
+
+/// Reads every cell of `arr` as an Int64: see [`CypherIntegerUdf`].
+fn integers_of(arr: &ArrayRef) -> DFResult<ArrayRef> {
+    let fail = |what: String| {
+        datafusion::error::DataFusionError::Execution(format!("cannot read {what} as an integer"))
+    };
+    let Some(lb) = arr.as_any().downcast_ref::<LargeBinaryArray>() else {
+        return Ok(arrow::compute::cast(arr, &DataType::Int64)?);
+    };
+    let mut builder = arrow::array::Int64Builder::with_capacity(lb.len());
+    for i in 0..lb.len() {
+        if lb.is_null(i) {
+            builder.append_null();
+            continue;
+        }
+        match uni_common::cypher_value_codec::decode(lb.value(i))
+            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?
+        {
+            Value::Null => builder.append_null(),
+            Value::Int(n) => builder.append_value(n),
+            Value::Float(f) => match uni_common::f64_to_exact_i64(f.trunc()) {
+                Some(n) => builder.append_value(n),
+                None => return Err(fail(format!("the float {f}"))),
+            },
+            other => return Err(fail(crate::cypher_sum::describe(&other))),
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+/// Create the `_cypher_integer` ScalarUDF: a Cypher value read as an Int64
+/// integer, exactly for an integer, NULL kept, anything else an error.
+pub fn cypher_integer_udf() -> datafusion::logical_expr::ScalarUDF {
+    ScalarUDF::from(CypherIntegerUdf {
+        signature: Signature::new(TypeSignature::Any(1), Volatility::Immutable),
+    })
 }
 
 // ============================================================================
@@ -6206,9 +6663,23 @@ impl AggregateUDFImpl for DistinctUdaf {
             .iter()
             .map(|f| f.data_type().clone())
             .collect();
+        // A raw `Bytes` column shares `LargeBinary` with CypherValue but holds
+        // verbatim bytes, which have no numeric equivalence to apply.
+        let cypher_values = acc_args
+            .expr_fields
+            .iter()
+            .map(|f| {
+                f.data_type() == &DataType::LargeBinary
+                    && !f
+                        .metadata()
+                        .get("uni_raw_bytes")
+                        .is_some_and(|v| v == "true")
+            })
+            .collect();
         Ok(Box::new(DistinctAccumulator {
             inner: self.inner.accumulator(acc_args)?,
             arg_types,
+            cypher_values,
             order: Vec::new(),
             seen: std::collections::HashSet::new(),
             fed: false,
@@ -6242,8 +6713,13 @@ impl AggregateUDFImpl for DistinctUdaf {
 struct DistinctAccumulator {
     inner: Box<dyn DfAccumulator>,
     arg_types: Vec<DataType>,
+    /// Per argument, whether it is a CypherValue column.
+    cypher_values: Vec<bool>,
     /// Distinct tuples in first-seen order, so a float sum is deterministic.
+    /// Each is the first tuple of its equivalence class, as it arrived.
     order: Vec<Vec<ScalarValue>>,
+    /// The equivalence keys ([`DistinctAccumulator::equivalence_key`]) of
+    /// the tuples in `order`.
     seen: std::collections::HashSet<Vec<ScalarValue>>,
     /// Whether `inner` has been fed the set; it is fed once, on evaluate.
     fed: bool,
@@ -6256,10 +6732,36 @@ impl DistinctAccumulator {
                 "DISTINCT aggregate updated after it was evaluated".to_string(),
             ));
         }
-        if self.seen.insert(tuple.clone()) {
+        if self.seen.insert(self.equivalence_key(&tuple)) {
             self.order.push(tuple);
         }
         Ok(())
+    }
+
+    /// The tuple with each value replaced by its Cypher equivalence class.
+    ///
+    /// DISTINCT keeps one value per class of equal values, and `1 = 1.0`, as
+    /// `-0.0 = 0.0`; every NaN is one value. The tuple was compared as its
+    /// scalars, so `1` and `1.0` (two CypherValue encodings) were two values
+    /// and `sum(DISTINCT x)` over `[1.0, 1]` was `2.0`. The class decides
+    /// membership only: the tuple kept is the first one seen, as
+    /// `RETURN DISTINCT` keeps it.
+    fn equivalence_key(&self, tuple: &[ScalarValue]) -> Vec<ScalarValue> {
+        tuple
+            .iter()
+            .zip(&self.cypher_values)
+            .map(|(value, &cypher_value)| match value {
+                ScalarValue::LargeBinary(Some(bytes)) if cypher_value => {
+                    canonical_cypher_value_key(bytes)
+                        .map_or_else(|| value.clone(), |c| ScalarValue::LargeBinary(Some(c)))
+                }
+                ScalarValue::Float64(Some(f)) => ScalarValue::Float64(Some(canonical_float(*f))),
+                ScalarValue::Float32(Some(f)) => {
+                    ScalarValue::Float32(Some(canonical_float(f64::from(*f)) as f32))
+                }
+                other => other.clone(),
+            })
+            .collect()
     }
 
     /// Column `i` of the distinct tuples.
@@ -6511,6 +7013,16 @@ impl CypherCollectAccumulator {
                             write(&map[key], out);
                         }
                     }
+                    // Equal numbers share a key: `1` and `1.0`, `0` and `-0.0`,
+                    // every NaN.
+                    Value::Float(f) => {
+                        let bytes = uni_common::cypher_value_codec::encode(
+                            &float_cmp::canonical_number(*f),
+                        );
+                        out.push(b's');
+                        out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+                        out.extend_from_slice(&bytes);
+                    }
                     other => {
                         let bytes = uni_common::cypher_value_codec::encode(other);
                         out.push(b's');
@@ -6655,370 +7167,225 @@ pub fn create_cypher_collect_expr(
 // Cypher percentileDisc / percentileCont UDAFs
 // ============================================================================
 
-/// Custom UDAF for Cypher percentileDisc().
+/// Custom UDAF for Cypher `percentileDisc()` and `percentileCont()`.
+///
+/// The input reaches it as it is, not cast to `Float64`: the values are
+/// kept as exact numbers and folded by [`crate::percentile`], the definition
+/// the fallback executor uses too. `percentileDisc` answers one of its
+/// inputs, so over an integer column it answers an integer; read through
+/// `f64` it answered `3.0` for `3` and `2^53` for `2^53 + 1`.
 #[derive(Debug, Clone)]
-struct CypherPercentileDiscUdaf {
+struct CypherPercentileUdaf {
     signature: Signature,
+    /// `percentileCont` when set, `percentileDisc` otherwise.
+    cont: bool,
 }
 
-impl CypherPercentileDiscUdaf {
-    fn new() -> Self {
+impl CypherPercentileUdaf {
+    fn new(cont: bool) -> Self {
         Self {
             signature: Signature::new(TypeSignature::Any(2), Volatility::Immutable),
-        }
-    }
-}
-
-impl PartialEq for CypherPercentileDiscUdaf {
-    fn eq(&self, other: &Self) -> bool {
-        self.signature == other.signature
-    }
-}
-
-impl Eq for CypherPercentileDiscUdaf {}
-
-impl Hash for CypherPercentileDiscUdaf {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.name().hash(state);
-    }
-}
-
-impl AggregateUDFImpl for CypherPercentileDiscUdaf {
-    fn name(&self) -> &str {
-        "percentiledisc"
-    }
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-    fn return_type(&self, _args: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Float64)
-    }
-    fn accumulator(
-        &self,
-        _acc_args: datafusion::logical_expr::function::AccumulatorArgs,
-    ) -> DFResult<Box<dyn DfAccumulator>> {
-        Ok(Box::new(CypherPercentileDiscAccumulator {
-            values: Vec::new(),
-            percentile: None,
-        }))
-    }
-    fn state_fields(
-        &self,
-        args: datafusion::logical_expr::function::StateFieldsArgs,
-    ) -> DFResult<Vec<Arc<arrow::datatypes::Field>>> {
-        Ok(vec![
-            Arc::new(arrow::datatypes::Field::new(
-                format!("{}_values", args.name),
-                DataType::List(Arc::new(arrow::datatypes::Field::new(
-                    "item",
-                    DataType::Float64,
-                    true,
-                ))),
-                true,
-            )),
-            Arc::new(arrow::datatypes::Field::new(
-                format!("{}_percentile", args.name),
-                DataType::Float64,
-                true,
-            )),
-        ])
-    }
-}
-
-#[derive(Debug)]
-struct CypherPercentileDiscAccumulator {
-    values: Vec<f64>,
-    percentile: Option<f64>,
-}
-
-impl CypherPercentileDiscAccumulator {
-    fn extract_f64(arr: &ArrayRef, i: usize) -> Option<f64> {
-        if arr.is_null(i) {
-            return None;
-        }
-        match arr.data_type() {
-            DataType::LargeBinary => {
-                let lb = arr.as_any().downcast_ref::<LargeBinaryArray>()?;
-                cv_bytes_as_f64(lb.value(i))
-            }
-            DataType::Int64 => {
-                let a = arr.as_any().downcast_ref::<Int64Array>()?;
-                Some(a.value(i) as f64)
-            }
-            DataType::Float64 => {
-                let a = arr.as_any().downcast_ref::<Float64Array>()?;
-                Some(a.value(i))
-            }
-            DataType::Int32 => {
-                let a = arr.as_any().downcast_ref::<Int32Array>()?;
-                Some(a.value(i) as f64)
-            }
-            DataType::Float32 => {
-                let a = arr.as_any().downcast_ref::<Float32Array>()?;
-                Some(a.value(i) as f64)
-            }
-            _ => None,
+            cont,
         }
     }
 
-    fn extract_percentile(arr: &ArrayRef, i: usize) -> Option<f64> {
-        if arr.is_null(i) {
-            return None;
-        }
-        match arr.data_type() {
-            DataType::Float64 => {
-                let a = arr.as_any().downcast_ref::<Float64Array>()?;
-                Some(a.value(i))
-            }
-            DataType::Int64 => {
-                let a = arr.as_any().downcast_ref::<Int64Array>()?;
-                Some(a.value(i) as f64)
-            }
-            DataType::LargeBinary => {
-                let lb = arr.as_any().downcast_ref::<LargeBinaryArray>()?;
-                cv_bytes_as_f64(lb.value(i))
-            }
-            _ => None,
-        }
-    }
-}
-
-impl DfAccumulator for CypherPercentileDiscAccumulator {
-    fn update_batch(&mut self, values: &[ArrayRef]) -> DFResult<()> {
-        let expr_arr = &values[0];
-        let pct_arr = &values[1];
-        for i in 0..expr_arr.len() {
-            // Extract percentile from second arg (constant for all rows)
-            if self.percentile.is_none()
-                && let Some(p) = Self::extract_percentile(pct_arr, i)
-            {
-                if !(0.0..=1.0).contains(&p) {
-                    return Err(datafusion::error::DataFusionError::Execution(
-                        "ArgumentError: NumberOutOfRange - percentileDisc(): percentile value must be between 0.0 and 1.0".to_string(),
-                    ));
-                }
-                self.percentile = Some(p);
-            }
-            if let Some(f) = Self::extract_f64(expr_arr, i) {
-                self.values.push(f);
-            }
-        }
-        Ok(())
-    }
-    fn evaluate(&mut self) -> DFResult<ScalarValue> {
-        let pct = match self.percentile {
-            Some(p) if !(0.0..=1.0).contains(&p) => {
-                return Err(datafusion::error::DataFusionError::Execution(
-                    "ArgumentError: NumberOutOfRange - percentileDisc(): percentile value must be between 0.0 and 1.0".to_string(),
-                ));
-            }
-            Some(p) => p,
-            None => 0.0,
-        };
-        if self.values.is_empty() {
-            return Ok(ScalarValue::Float64(None));
-        }
-        self.values
-            .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let n = self.values.len();
-        let idx = (pct * (n as f64 - 1.0)).round() as usize;
-        let idx = idx.min(n - 1);
-        let result = self.values[idx];
-        Ok(ScalarValue::Float64(Some(result)))
-    }
-    fn size(&self) -> usize {
-        std::mem::size_of_val(self) + self.values.capacity() * 8
-    }
-    fn state(&mut self) -> DFResult<Vec<ScalarValue>> {
-        // State: list of f64 values + percentile
-        let list_values: Vec<ScalarValue> = self
-            .values
-            .iter()
-            .map(|f| ScalarValue::Float64(Some(*f)))
-            .collect();
-        let list_scalar = ScalarValue::List(ScalarValue::new_list(
-            &list_values,
-            &DataType::Float64,
-            true,
-        ));
-        Ok(vec![list_scalar, ScalarValue::Float64(self.percentile)])
-    }
-    fn merge_batch(&mut self, states: &[ArrayRef]) -> DFResult<()> {
-        // Merge list arrays from state
-        let list_arr = &states[0];
-        let pct_arr = &states[1];
-        // Extract percentile
-        if self.percentile.is_none()
-            && let Some(f64_arr) = pct_arr.as_any().downcast_ref::<Float64Array>()
-        {
-            for i in 0..f64_arr.len() {
-                if !f64_arr.is_null(i) {
-                    self.percentile = Some(f64_arr.value(i));
-                    break;
-                }
-            }
-        }
-        // Extract values from list arrays
-        if let Some(list_array) = list_arr.as_any().downcast_ref::<arrow_array::ListArray>() {
-            for i in 0..list_array.len() {
-                if list_array.is_null(i) {
-                    continue;
-                }
-                let inner = list_array.value(i);
-                if let Some(f64_arr) = inner.as_any().downcast_ref::<Float64Array>() {
-                    for j in 0..f64_arr.len() {
-                        if !f64_arr.is_null(j) {
-                            self.values.push(f64_arr.value(j));
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Custom UDAF for Cypher percentileCont().
-#[derive(Debug, Clone)]
-struct CypherPercentileContUdaf {
-    signature: Signature,
-}
-
-impl CypherPercentileContUdaf {
-    fn new() -> Self {
-        Self {
-            signature: Signature::new(TypeSignature::Any(2), Volatility::Immutable),
-        }
-    }
-}
-
-impl PartialEq for CypherPercentileContUdaf {
-    fn eq(&self, other: &Self) -> bool {
-        self.signature == other.signature
-    }
-}
-
-impl Eq for CypherPercentileContUdaf {}
-
-impl Hash for CypherPercentileContUdaf {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.name().hash(state);
-    }
-}
-
-impl AggregateUDFImpl for CypherPercentileContUdaf {
-    fn name(&self) -> &str {
-        "percentilecont"
-    }
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-    fn return_type(&self, _args: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Float64)
-    }
-    fn accumulator(
-        &self,
-        _acc_args: datafusion::logical_expr::function::AccumulatorArgs,
-    ) -> DFResult<Box<dyn DfAccumulator>> {
-        Ok(Box::new(CypherPercentileContAccumulator {
-            values: Vec::new(),
-            percentile: None,
-        }))
-    }
-    fn state_fields(
-        &self,
-        args: datafusion::logical_expr::function::StateFieldsArgs,
-    ) -> DFResult<Vec<Arc<arrow::datatypes::Field>>> {
-        Ok(vec![
-            Arc::new(arrow::datatypes::Field::new(
-                format!("{}_values", args.name),
-                DataType::List(Arc::new(arrow::datatypes::Field::new(
-                    "item",
-                    DataType::Float64,
-                    true,
-                ))),
-                true,
-            )),
-            Arc::new(arrow::datatypes::Field::new(
-                format!("{}_percentile", args.name),
-                DataType::Float64,
-                true,
-            )),
-        ])
-    }
-}
-
-#[derive(Debug)]
-struct CypherPercentileContAccumulator {
-    values: Vec<f64>,
-    percentile: Option<f64>,
-}
-
-impl DfAccumulator for CypherPercentileContAccumulator {
-    fn update_batch(&mut self, values: &[ArrayRef]) -> DFResult<()> {
-        let expr_arr = &values[0];
-        let pct_arr = &values[1];
-        for i in 0..expr_arr.len() {
-            if self.percentile.is_none()
-                && let Some(p) = CypherPercentileDiscAccumulator::extract_percentile(pct_arr, i)
-            {
-                if !(0.0..=1.0).contains(&p) {
-                    return Err(datafusion::error::DataFusionError::Execution(
-                        "ArgumentError: NumberOutOfRange - percentileCont(): percentile value must be between 0.0 and 1.0".to_string(),
-                    ));
-                }
-                self.percentile = Some(p);
-            }
-            if let Some(f) = CypherPercentileDiscAccumulator::extract_f64(expr_arr, i) {
-                self.values.push(f);
-            }
-        }
-        Ok(())
-    }
-    fn evaluate(&mut self) -> DFResult<ScalarValue> {
-        let pct = match self.percentile {
-            Some(p) if !(0.0..=1.0).contains(&p) => {
-                return Err(datafusion::error::DataFusionError::Execution(
-                    "ArgumentError: NumberOutOfRange - percentileCont(): percentile value must be between 0.0 and 1.0".to_string(),
-                ));
-            }
-            Some(p) => p,
-            None => 0.0,
-        };
-        if self.values.is_empty() {
-            return Ok(ScalarValue::Float64(None));
-        }
-        self.values
-            .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let n = self.values.len();
-        if n == 1 {
-            return Ok(ScalarValue::Float64(Some(self.values[0])));
-        }
-        let pos = pct * (n as f64 - 1.0);
-        let lower = pos.floor() as usize;
-        let upper = pos.ceil() as usize;
-        let lower = lower.min(n - 1);
-        let upper = upper.min(n - 1);
-        if lower == upper {
-            Ok(ScalarValue::Float64(Some(self.values[lower])))
+    fn function(&self) -> &'static str {
+        if self.cont {
+            "percentileCont"
         } else {
-            let frac = pos - lower as f64;
-            let result = self.values[lower] + frac * (self.values[upper] - self.values[lower]);
-            Ok(ScalarValue::Float64(Some(result)))
+            "percentileDisc"
         }
     }
+}
+
+impl PartialEq for CypherPercentileUdaf {
+    fn eq(&self, other: &Self) -> bool {
+        self.cont == other.cont && self.signature == other.signature
+    }
+}
+
+impl Eq for CypherPercentileUdaf {}
+
+impl Hash for CypherPercentileUdaf {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.name().hash(state);
+    }
+}
+
+impl AggregateUDFImpl for CypherPercentileUdaf {
+    fn name(&self) -> &str {
+        if self.cont {
+            "percentilecont"
+        } else {
+            "percentiledisc"
+        }
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, args: &[DataType]) -> DFResult<DataType> {
+        if self.cont {
+            return Ok(DataType::Float64);
+        }
+        // An input's own type where the column has one, a Cypher value for
+        // a column of mixed (or unknown) type.
+        Ok(match args.first() {
+            Some(t) if t.is_integer() => DataType::Int64,
+            Some(t) if t.is_floating() || matches!(t, DataType::Null) => DataType::Float64,
+            _ => DataType::LargeBinary,
+        })
+    }
+    fn accumulator(
+        &self,
+        acc_args: datafusion::logical_expr::function::AccumulatorArgs,
+    ) -> DFResult<Box<dyn DfAccumulator>> {
+        // A raw `Bytes` column holds verbatim bytes, not Cypher values; it
+        // is not a number, and must not be decoded as one (#93/#100).
+        let raw_bytes = acc_args
+            .expr_fields
+            .first()
+            .and_then(|field| field.metadata().get("uni_raw_bytes"))
+            .is_some_and(|v| v == "true");
+        Ok(Box::new(CypherPercentileAccumulator {
+            values: Vec::new(),
+            percentile: None,
+            function: self.function(),
+            cont: self.cont,
+            return_type: acc_args.return_field.data_type().clone(),
+            raw_bytes,
+        }))
+    }
+    fn state_fields(
+        &self,
+        args: datafusion::logical_expr::function::StateFieldsArgs,
+    ) -> DFResult<Vec<Arc<arrow::datatypes::Field>>> {
+        // The values travel as Cypher values, so an integer stays an integer
+        // across a partial aggregate.
+        Ok(vec![
+            Arc::new(arrow::datatypes::Field::new(
+                format!("{}_values", args.name),
+                DataType::List(Arc::new(arrow::datatypes::Field::new(
+                    "item",
+                    DataType::LargeBinary,
+                    true,
+                ))),
+                true,
+            )),
+            Arc::new(arrow::datatypes::Field::new(
+                format!("{}_percentile", args.name),
+                DataType::Float64,
+                true,
+            )),
+        ])
+    }
+}
+
+#[derive(Debug)]
+struct CypherPercentileAccumulator {
+    /// Every non-NULL input, an `Int` or a `Float`.
+    values: Vec<Value>,
+    /// The first non-NULL percentile argument.
+    percentile: Option<f64>,
+    function: &'static str,
+    cont: bool,
+    return_type: DataType,
+    raw_bytes: bool,
+}
+
+/// One cell of an aggregate argument as a Cypher value.
+fn percentile_cell(arr: &ArrayRef, i: usize, raw_bytes: bool) -> DFResult<Value> {
+    if arr.is_null(i) {
+        return Ok(Value::Null);
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
+        return Ok(Value::Int(a.value(i)));
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
+        return Ok(Value::Float(a.value(i)));
+    }
+    if let Some(lb) = arr.as_any().downcast_ref::<LargeBinaryArray>() {
+        return if raw_bytes {
+            Ok(Value::Bytes(lb.value(i).to_vec()))
+        } else {
+            scalar_binary_to_value(lb.value(i))
+        };
+    }
+    match ScalarValue::try_from_array(arr, i)? {
+        ScalarValue::Utf8(Some(s))
+        | ScalarValue::LargeUtf8(Some(s))
+        | ScalarValue::Utf8View(Some(s)) => Ok(Value::String(s)),
+        scalar => scalar_to_value(&scalar),
+    }
+}
+
+impl CypherPercentileAccumulator {
+    fn push(&mut self, v: &Value) -> DFResult<()> {
+        let read = crate::percentile::read_input(v, self.function)
+            .map_err(datafusion::error::DataFusionError::Execution)?;
+        if let Some(n) = read {
+            self.values.push(n);
+        }
+        Ok(())
+    }
+
+    fn set_percentile(&mut self, p: &Value) -> DFResult<()> {
+        if self.percentile.is_none() {
+            self.percentile = crate::percentile::read_percentile(p, self.function)
+                .map_err(datafusion::error::DataFusionError::Execution)?;
+        }
+        Ok(())
+    }
+}
+
+impl DfAccumulator for CypherPercentileAccumulator {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> DFResult<()> {
+        let expr_arr = &values[0];
+        let pct_arr = &values[1];
+        for i in 0..expr_arr.len() {
+            // The percentile is read from the first row that has one.
+            if self.percentile.is_none() {
+                self.set_percentile(&percentile_cell(pct_arr, i, false)?)?;
+            }
+            self.push(&percentile_cell(expr_arr, i, self.raw_bytes)?)?;
+        }
+        Ok(())
+    }
+    fn evaluate(&mut self) -> DFResult<ScalarValue> {
+        let pct = self.percentile.unwrap_or(0.0);
+        let result = if self.cont {
+            crate::percentile::percentile_cont(&mut self.values, pct)
+        } else {
+            crate::percentile::percentile_disc(&mut self.values, pct)
+        };
+        Ok(match (&self.return_type, result) {
+            (DataType::Int64, Value::Int(i)) => ScalarValue::Int64(Some(i)),
+            (DataType::Int64, Value::Null) => ScalarValue::Int64(None),
+            (DataType::Float64, Value::Float(f)) => ScalarValue::Float64(Some(f)),
+            (DataType::Float64, Value::Null) => ScalarValue::Float64(None),
+            (DataType::LargeBinary, Value::Null) => ScalarValue::LargeBinary(None),
+            (DataType::LargeBinary, v) => {
+                ScalarValue::LargeBinary(Some(uni_common::cypher_value_codec::encode(&v)))
+            }
+            (t, v) => {
+                return Err(datafusion::error::DataFusionError::Internal(format!(
+                    "{}() produced {v:?} for a {t} result",
+                    self.function
+                )));
+            }
+        })
+    }
     fn size(&self) -> usize {
-        std::mem::size_of_val(self) + self.values.capacity() * 8
+        std::mem::size_of_val(self) + self.values.capacity() * std::mem::size_of::<Value>()
     }
     fn state(&mut self) -> DFResult<Vec<ScalarValue>> {
         let list_values: Vec<ScalarValue> = self
             .values
             .iter()
-            .map(|f| ScalarValue::Float64(Some(*f)))
+            .map(|v| ScalarValue::LargeBinary(Some(uni_common::cypher_value_codec::encode(v))))
             .collect();
         let list_scalar = ScalarValue::List(ScalarValue::new_list(
             &list_values,
-            &DataType::Float64,
+            &DataType::LargeBinary,
             true,
         ));
         Ok(vec![list_scalar, ScalarValue::Float64(self.percentile)])
@@ -7029,38 +7396,41 @@ impl DfAccumulator for CypherPercentileContAccumulator {
         if self.percentile.is_none()
             && let Some(f64_arr) = pct_arr.as_any().downcast_ref::<Float64Array>()
         {
-            for i in 0..f64_arr.len() {
-                if !f64_arr.is_null(i) {
-                    self.percentile = Some(f64_arr.value(i));
-                    break;
-                }
-            }
+            self.percentile = (0..f64_arr.len())
+                .find(|&i| !f64_arr.is_null(i))
+                .map(|i| f64_arr.value(i));
         }
-        if let Some(list_array) = list_arr.as_any().downcast_ref::<arrow_array::ListArray>() {
-            for i in 0..list_array.len() {
-                if list_array.is_null(i) {
-                    continue;
-                }
-                let inner = list_array.value(i);
-                if let Some(f64_arr) = inner.as_any().downcast_ref::<Float64Array>() {
-                    for j in 0..f64_arr.len() {
-                        if !f64_arr.is_null(j) {
-                            self.values.push(f64_arr.value(j));
-                        }
-                    }
-                }
+        let Some(list_array) = list_arr.as_any().downcast_ref::<arrow_array::ListArray>() else {
+            return Err(datafusion::error::DataFusionError::Internal(format!(
+                "{}() state is a {}, not a list",
+                self.function,
+                list_arr.data_type()
+            )));
+        };
+        for i in 0..list_array.len() {
+            if list_array.is_null(i) {
+                continue;
+            }
+            let inner = list_array.value(i);
+            for j in 0..inner.len() {
+                // Partial states are Cypher values, whatever the input was.
+                let v = percentile_cell(&inner, j, false)?;
+                self.push(&v)?;
             }
         }
         Ok(())
     }
 }
 
+/// The Cypher `percentileDisc()` aggregate: an input value, exactly.
 pub fn create_cypher_percentile_disc_udaf() -> AggregateUDF {
-    AggregateUDF::from(CypherPercentileDiscUdaf::new())
+    AggregateUDF::from(CypherPercentileUdaf::new(false))
 }
 
+/// The Cypher `percentileCont()` aggregate: a float, interpolated between
+/// exact inputs.
 pub fn create_cypher_percentile_cont_udaf() -> AggregateUDF {
-    AggregateUDF::from(CypherPercentileContUdaf::new())
+    AggregateUDF::from(CypherPercentileUdaf::new(true))
 }
 
 // ============================================================================
@@ -7443,6 +7813,117 @@ mod tests {
         } else {
             panic!("Unexpected result: {:?}", result);
         }
+    }
+
+    // ====================================================================
+    // range() null handling
+    // ====================================================================
+
+    fn range_lists(cv: &ColumnarValue) -> Vec<Option<Vec<i64>>> {
+        let arr = cv.clone().into_array(1).unwrap();
+        let list = arr
+            .as_any()
+            .downcast_ref::<arrow_array::ListArray>()
+            .expect("range returns a List<Int64>");
+        (0..list.len())
+            .map(|r| {
+                (!list.is_null(r)).then(|| {
+                    let v = list.value(r);
+                    let ints = v.as_any().downcast_ref::<Int64Array>().unwrap();
+                    ints.values().to_vec()
+                })
+            })
+            .collect()
+    }
+
+    /// Null scalars (untyped, typed, and an encoded Cypher null) make `range`
+    /// null, ahead of a zero step or a non-integer elsewhere.
+    #[test]
+    fn test_range_udf_null_scalar_returns_null() {
+        let udf = create_range_udf();
+        let cv_null =
+            ScalarValue::LargeBinary(Some(uni_common::cypher_value_codec::encode(&Value::Null)));
+        for args in [
+            vec![ScalarValue::Int64(Some(0)), ScalarValue::Null],
+            vec![ScalarValue::Int64(None), ScalarValue::Int64(Some(3))],
+            vec![
+                ScalarValue::Int64(Some(0)),
+                ScalarValue::Int64(Some(3)),
+                cv_null.clone(),
+            ],
+            vec![
+                ScalarValue::Null,
+                ScalarValue::Int64(Some(3)),
+                ScalarValue::Int64(Some(0)),
+            ],
+            vec![ScalarValue::Float64(Some(0.5)), ScalarValue::Null],
+        ] {
+            let out = udf
+                .invoke_with_args(make_multi_scalar_args_with_return(
+                    args.clone(),
+                    udf.return_type(&[]).unwrap(),
+                ))
+                .unwrap();
+            assert!(matches!(out, ColumnarValue::Scalar(_)), "{args:?}");
+            assert_eq!(range_lists(&out), vec![None], "range({args:?})");
+        }
+    }
+
+    /// A null slot in an argument column nulls that row only.
+    #[test]
+    fn test_range_udf_null_array_slot_nulls_that_row() {
+        use datafusion::arrow::datatypes::Field;
+        use datafusion::config::ConfigOptions;
+
+        let udf = create_range_udf();
+        let ends: ArrayRef = Arc::new(Int64Array::from(vec![Some(2), None, Some(0)]));
+        let args = ScalarFunctionArgs {
+            args: vec![
+                ColumnarValue::Scalar(ScalarValue::Int64(Some(0))),
+                ColumnarValue::Array(ends),
+            ],
+            arg_fields: vec![
+                Arc::new(Field::new("s", DataType::Int64, true)),
+                Arc::new(Field::new("e", DataType::Int64, true)),
+            ],
+            number_rows: 3,
+            return_field: Arc::new(Field::new("r", udf.return_type(&[]).unwrap(), true)),
+            config_options: Arc::new(ConfigOptions::default()),
+        };
+        let out = udf.invoke_with_args(args).unwrap();
+        assert_eq!(
+            range_lists(&out),
+            vec![Some(vec![0, 1, 2]), None, Some(vec![0])]
+        );
+    }
+
+    /// A non-null, non-integer argument and a zero step keep their errors.
+    #[test]
+    fn test_range_udf_type_and_step_errors() {
+        let udf = create_range_udf();
+        let err = udf
+            .invoke_with_args(make_multi_scalar_args_with_return(
+                vec![
+                    ScalarValue::Int64(Some(0)),
+                    ScalarValue::Utf8(Some("a".into())),
+                ],
+                udf.return_type(&[]).unwrap(),
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("InvalidArgumentType"), "{err}");
+        let err = udf
+            .invoke_with_args(make_multi_scalar_args_with_return(
+                vec![
+                    ScalarValue::Int64(Some(0)),
+                    ScalarValue::Int64(Some(3)),
+                    ScalarValue::Int64(Some(0)),
+                ],
+                udf.return_type(&[]).unwrap(),
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("NumberOutOfRange"), "{err}");
     }
 
     // ====================================================================

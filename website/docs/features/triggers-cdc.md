@@ -399,9 +399,31 @@ not evaluated, so a predicated trigger counts as matching) is refused with
 visible. `BulkWriterBuilder::skip_before_triggers(true)` (and the same option on
 the appender builder) loads anyway, without running those triggers.
 
+Once a load is visible, its events are delivered by a background task of
+their own, which `commit()` waits for. Dropping the `commit()` future does not
+stop the delivery: every event still reaches triggers and CDC. (The dropped
+commit skips the load's index and snapshot finalization; the next open
+completes it and delivers the load's events again, so consumers see them
+twice.) A shutdown during the delivery stops it; CDC then halts with its
+checkpoint before the load, and the next open delivers the whole load again.
+
 A load completed in the background after `BulkCommitIncomplete` emits its events
-when it becomes visible. A load completed by recovery while the database opens
-emits none. See [Data ingestion](../guides/data-ingestion.md#triggers-cdc-and-the-enclosing-transaction).
+when it becomes visible. A load the database completes while opening, after a
+crash that came before its events were delivered, emits them from the open:
+announced before `build()` returns, so ahead of any commit made through the
+handle, with its rows streamed in the background. Only consumers that exist
+during the open see them: built-in triggers and triggers declared with
+`uni.plugin.declareTrigger` (the open reactivates those), and CDC outputs
+already registered -- which the public API offers no way to do before
+`build()` returns. A trigger or CDC output registered after the open does not
+get the load. Delivery is at least once: a crash during it delivers the load
+again at the next open. A fork's recovered load fires triggers when the fork is
+next opened. See [Data ingestion](../guides/data-ingestion.md#triggers-cdc-and-the-enclosing-transaction).
+
+A transaction commit that is abandoned after its commit point (its `commit()`
+future dropped, or failing, before the notification goes out) is announced with
+`mutations_failed: true` instead of not at all, so CDC halts rather than skip
+it.
 
 ## Forks
 

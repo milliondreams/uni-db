@@ -1601,7 +1601,7 @@ impl Writer {
         // The ticket is dropped unpublished: this caller announces nothing,
         // and the drop releases its place in the announcement order.
         let committed = self
-            .commit_transaction_l0_sequenced(tx_l0_arc, lock_timeout)
+            .commit_transaction_l0_sequenced(tx_l0_arc, lock_timeout, None)
             .await?;
         Ok((committed.wal_lsn, committed.flush_pending))
     }
@@ -1617,12 +1617,21 @@ impl Writer {
     /// overtake an earlier commit's. Publish the announcement through
     /// [`CommittedTx::ticket`] to keep commit order.
     ///
+    /// `on_abandon`, given the commit's version, is set as the ticket's
+    /// [`PublishTicket::on_abandon`] the moment it is issued, so it covers the
+    /// rest of this call too: once the commit is visible, this call may still
+    /// await (the inline post-commit flush), and a caller dropped there would
+    /// otherwise drop the ticket before it ever saw it.
+    ///
+    /// [`PublishTicket::on_abandon`]: crate::runtime::publish_sequencer::PublishTicket::on_abandon
+    ///
     /// # Errors
     /// As [`Self::commit_transaction_l0_with_lock_timeout`].
     pub async fn commit_transaction_l0_sequenced(
         self: &Arc<Self>,
         tx_l0_arc: Arc<RwLock<L0Buffer>>,
         lock_timeout: Option<std::time::Duration>,
+        on_abandon: Option<crate::runtime::publish_sequencer::AbandonAnnouncement>,
     ) -> Result<CommittedTx> {
         // Hold `flush_lock` across WAL append + flush + main-L0 merge.
         // Two concurrent commits serialize here; in Phase 3 the outer
@@ -1993,7 +2002,10 @@ impl Writer {
         };
         // Commit order is fixed here, under `flush_lock`: the announcement
         // order follows it whatever the post-commit work does.
-        let ticket = self.publish_sequencer.issue();
+        let mut ticket = self.publish_sequencer.issue();
+        if let Some(announce) = on_abandon {
+            ticket.on_abandon(move || announce(version));
+        }
 
         // Crash-recovery seam: durable AND merged, but the in-memory commit
         // registry has not recorded this write-set yet. A crash here is

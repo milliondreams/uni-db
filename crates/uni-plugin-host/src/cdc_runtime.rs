@@ -40,14 +40,17 @@
 //!   write at a time. Per provider it keeps only the LATEST submitted LSN,
 //!   and submissions arrive in commit order from the single driver task,
 //!   so a stale checkpoint can never overwrite a newer one.
-//! - **At-least-once, not exactly-once.** The persisted LSN may lag the
-//!   acknowledged one: several commits that arrive while a write is in
-//!   flight coalesce into one write of the newest LSN, and a crash (or a
-//!   failed write) before it lands means those commits are redelivered
-//!   after a restart. This was already the contract for a failed write;
-//!   coalescing only widens the window, it never lets the checkpoint
-//!   skip ahead. A failed write keeps its LSNs queued (unless superseded)
-//!   so the next write retries them.
+//! - **May lag, never leads.** The persisted LSN may lag the acknowledged
+//!   one: several commits that arrive while a write is in flight coalesce
+//!   into one write of the newest LSN, and a crash (or a failed write)
+//!   before it lands leaves the older LSN on disk. The runtime never
+//!   re-sends history — it forwards only commits announced after it
+//!   starts — so after a restart the provider is started from an LSN
+//!   older than the last commit it received; a provider that replays from
+//!   `from_lsn` out of its own log sees those commits twice. Coalescing
+//!   only widens that window, it never lets the checkpoint skip ahead. A
+//!   failed write keeps its LSNs queued (unless superseded) so the next
+//!   write retries them.
 //!
 //! The write itself (two `fsync`s) runs on tokio's blocking pool, never on
 //! an executor thread. A slow disk therefore delays only the checkpoint,
@@ -306,17 +309,17 @@ impl CheckpointWriter {
             Ok((_, Ok(()))) => return,
             Ok((batch, Err(e))) => (Some(batch), e),
             // The blocking task panicked or was cancelled; its batch is gone,
-            // so those commits are redelivered after a restart.
+            // so a restart resumes the provider from an older LSN.
             Err(e) => (None, e.to_string()),
         };
         // #233 P3: was `debug!`, i.e. below the default level, so a lost
         // checkpoint was invisible in a normal deployment. Not a gap — the
-        // commits WERE delivered — but they will be redelivered after a
-        // restart, which is at-least-once and worth saying.
+        // commits WERE delivered — but a restart hands the provider an
+        // older `from_lsn` than it has seen, which is worth saying.
         tracing::warn!(
             error = %error,
-            "CdcRuntime: checkpoint write failed; the affected commits will be redelivered \
-             after a restart (at-least-once) unless a later write succeeds",
+            "CdcRuntime: checkpoint write failed; unless a later write succeeds, a restart \
+             resumes the provider from an LSN before the affected commits",
         );
         if let Some(batch) = batch {
             let mut state = self.state.lock();

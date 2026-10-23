@@ -35,6 +35,10 @@ pub use bulk::{
     EdgeData, IntoArrow, RebuildManagerSource, record_batch_to_property_maps,
 };
 pub use events::{
-    BULK_EVENT_CHUNK_ROWS, BulkEventSink, BulkWriteKind, LoadEventReader, VisibleLoad,
+    BULK_EVENT_CHUNK_ROWS, BulkEventSink, BulkWriteKind, EventDelivery, LoadEventReader,
+    VisibleLoad,
 };
-pub use flush_intent::{check_recovered_bulk_endpoints, recover_interrupted_bulk_load};
+pub use flush_intent::{
+    RecoveredLoad, check_recovered_bulk_endpoints, finish_recovered_load_events,
+    recover_interrupted_bulk_load,
+};

@@ -60,8 +60,31 @@ pub trait BulkEventSink: Send + Sync {
     /// Announce a load that just became visible, and deliver its events.
     ///
     /// Infallible: the load is committed and visible whatever happens here;
-    /// a failure to deliver is the sink's to report.
-    fn publish(&self, load: VisibleLoad) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+    /// a failure to deliver is the sink's to report. Returns
+    /// [`EventDelivery::Interrupted`] when the database shut down (or went
+    /// away) before every event was delivered, in which case the writer keeps
+    /// the load's commit marker so the next open delivers them again.
+    ///
+    /// The writer runs this on a task of its own, so dropping the future of
+    /// `BulkWriter::commit` does not stop it.
+    fn publish(
+        &self,
+        load: VisibleLoad,
+    ) -> Pin<Box<dyn Future<Output = EventDelivery> + Send + '_>>;
+}
+
+/// Whether [`BulkEventSink::publish`] delivered a load's events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventDelivery {
+    /// The load was announced and every event handed on (or the database had
+    /// no consumer for them). A failure the sink logged, such as reading the
+    /// load's rows back, still ends here: delivering again would fail the
+    /// same way.
+    Finished,
+    /// The database shut down, or was dropped, before every event was
+    /// delivered. The load's events are to be delivered again at the next
+    /// open; consumers may then see some of them twice.
+    Interrupted,
 }
 
 /// A bulk load that just became visible, handed to

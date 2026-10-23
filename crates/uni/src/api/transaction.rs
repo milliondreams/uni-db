@@ -1483,6 +1483,46 @@ impl Transaction {
         // the live buffer (so a commit landing in between lent this one its
         // version) and the notification was sent directly (so it could
         // overtake an earlier commit's, regressing CDC's LSN sequence).
+        //
+        // From the moment the commit is visible, a ticket dropped without its
+        // notification -- this future cancelled or panicking before the
+        // publish below -- announces this stand-in instead: a notification
+        // whose mutations are marked lost. CDC halts on it rather than
+        // checkpointing past a commit it never saw (#233), and a watcher
+        // still learns the commit happened. Dropping the slot silently would
+        // be a hole in both.
+        let on_abandon: uni_store::runtime::publish_sequencer::AbandonAnnouncement = {
+            let commit_tx = self.db.commit_tx.clone();
+            let tx_id = self.id.clone();
+            let session_id = self.session_id.clone();
+            let causal_version = self.started_at_version;
+            let labels_affected = labels_affected.clone();
+            let edge_types_affected = edge_types_affected.clone();
+            Box::new(move |version| {
+                tracing::error!(
+                    tx_id = %tx_id,
+                    version,
+                    "a committed transaction's notification was abandoned (its commit was \
+                     cancelled or failed after the commit point); announcing it with its \
+                     mutations marked lost, so CDC streams halt rather than skip it",
+                );
+                let _ = commit_tx.send(Arc::new(crate::api::notifications::CommitNotification {
+                    version,
+                    mutation_count: mutations,
+                    labels_affected,
+                    edge_types_affected,
+                    rules_promoted: 0,
+                    timestamp: chrono::Utc::now(),
+                    tx_id,
+                    session_id,
+                    causal_version,
+                    mutations: None,
+                    mutations_failed: true,
+                    mutation_stream: None,
+                    dropped_before: 0,
+                }));
+            })
+        };
         let uni_store::runtime::writer::CommittedTx {
             wal_lsn,
             flush_pending: _flush_pending,
@@ -1492,6 +1532,7 @@ impl Transaction {
             .commit_transaction_l0_sequenced(
                 self.tx_l0.clone(),
                 Some(self.db.config.commit_timeout),
+                Some(on_abandon),
             )
             .await
             // Preserve typed commit errors (e.g. SSI `SerializationConflict` /
@@ -1529,6 +1570,16 @@ impl Transaction {
         self.db.cached_wal_lsn.store(wal_lsn, Ordering::Relaxed);
 
         self.completed = true;
+
+        // Test seam: the commit is visible and the transaction completed, and
+        // the commit future ends here without announcing -- as a caller that
+        // drops `commit()` at the schema save below does. No-op unless built
+        // with `--features failpoints`.
+        fail::fail_point!("commit::abandon-after-commit-point", |_| Err(
+            UniError::Internal(anyhow::anyhow!(
+                "injected: commit abandoned after its commit point"
+            ))
+        ));
 
         // Persist a schemaless edge type minted while this transaction ran.
         // `get_or_assign_edge_type_id` interns the name → id mapping on a

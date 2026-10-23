@@ -439,11 +439,26 @@ before the rows exist. To load anyway, accepting that those triggers do not see
 the load, build the writer with `.skip_before_triggers(true)` (the appender has
 the same option); after-phase triggers and CDC still get the events.
 
+**Cancelling `commit()`.** Once the load is visible, its events are delivered
+by a background task that `commit()` waits for. Dropping the `commit()` future
+does not stop that delivery: the events still reach every trigger and CDC
+output. The dropped commit does skip the load's finalization (index builds,
+snapshot), which the next open completes -- and that open delivers the load's
+events a second time.
+
 **Loads completed later.** A load whose publish `commit()` could not finish
 (`BulkCommitIncomplete`) emits its announcement and events from the background
 task once that task makes it visible. A load completed by recovery when the
-database is next opened emits none: it becomes visible while the database is
-opening, before any trigger or CDC output can be registered.
+database is next opened -- the process died after the load became visible and
+before its events were delivered -- emits them during that open: the open
+announces it before `build()` returns and streams its rows in the background.
+They reach the triggers present during the open, which are the built-in ones and
+those declared with `uni.plugin.declareTrigger`; a trigger or CDC output
+registered after `build()` returns does not see them. The load's marker stays
+until the delivery finishes, so a crash during it repeats the delivery at the
+next open (consumers may see a load twice, never not at all). A fork's
+recovered load fires triggers when the fork is next opened. A read-only open
+delivers nothing and leaves the load to the next writable open.
 
 ### Performance Guidelines
 

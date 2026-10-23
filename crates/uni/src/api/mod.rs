@@ -704,7 +704,14 @@ impl UniInner {
     /// per-fork notifications, hooks, params, and metrics. The Locy
     /// rule registry is a deep clone of primary's so rule registration
     /// on a forked session does not leak to primary.
-    pub(crate) async fn at_fork(&self, scope: Arc<uni_store::fork::ForkScope>) -> Result<UniInner> {
+    ///
+    /// Also returns the bulk loads on this fork that recovery completed and
+    /// whose events are still to be delivered: hand them to
+    /// `bulk_events::deliver_recovered_loads` once the inner is shared.
+    pub(crate) async fn at_fork(
+        &self,
+        scope: Arc<uni_store::fork::ForkScope>,
+    ) -> Result<(UniInner, Vec<uni_bulk::RecoveredLoad>)> {
         // Phase 3 (nested forks): `self` may itself be a fork-scoped
         // UniInner, in which case `self.schema` already encodes
         // `primary ⊕ parent_overlay`. Layering the child's overlay on
@@ -739,8 +746,10 @@ impl UniInner {
         // Complete a bulk load on this fork that passed its commit point but
         // whose publish was interrupted, before anything reads the fork: its
         // marker lives in the fork's catalog namespace, which the primary's
-        // open never looks at. A no-op when no marker is present.
-        uni_bulk::recover_interrupted_bulk_load(&forked_storage)
+        // open never looks at. A no-op when no marker is present. Its events
+        // are delivered as an ordinary fork load's are (triggers; a fork has
+        // no CDC), by the caller.
+        let recovered_loads = uni_bulk::recover_interrupted_bulk_load(&forked_storage)
             .await
             .map_err(UniError::Internal)?;
 
@@ -834,14 +843,17 @@ impl UniInner {
             prop_manager.clone(),
             self.df_session_template.clone(),
         );
-        Ok(self.derived_clone(
-            forked_storage,
-            merged_schema,
-            prop_manager,
-            Some(Arc::clone(&forked_writer_arc)),
-            Some(Arc::clone(&forked_writer_arc.l0_manager)),
-            rule_registry,
-            executor_template,
+        Ok((
+            self.derived_clone(
+                forked_storage,
+                merged_schema,
+                prop_manager,
+                Some(Arc::clone(&forked_writer_arc)),
+                Some(Arc::clone(&forked_writer_arc.l0_manager)),
+                rule_registry,
+                executor_template,
+            ),
+            recovered_loads,
         ))
     }
 }
@@ -2133,8 +2145,10 @@ impl UniBuilder {
         // a crash between the per-label and main table commits would otherwise
         // leave them divergent. Recovery rolls an uncommitted load back, or rolls
         // a committed-but-unfinalized one forward (it may flip the latest pointer,
-        // so it must run first). A no-op when no marker is present (H9).
-        uni_bulk::recover_interrupted_bulk_load(&storage)
+        // so it must run first). A no-op when no marker is present (H9). The
+        // loads it completes whose events were not delivered are delivered
+        // once the database's event machinery exists, below.
+        let recovered_loads = uni_bulk::recover_interrupted_bulk_load(&storage)
             .await
             .map_err(UniError::Internal)?;
         // A snapshot restore cut short rewinds the rest of the store and
@@ -2873,6 +2887,12 @@ impl UniBuilder {
             track_task_with_scratch_claim(&db.inner.shutdown_handle, scratch_dir.as_ref(), handle);
         }
 
+        // Deliver the events of the bulk loads recovery completed above, now
+        // that the commit broadcaster, the CDC runtime and the reactivated
+        // declared triggers exist. Their announcements are ordered here, so
+        // they precede every commit made through the returned handle.
+        bulk_events::deliver_recovered_loads(&db.inner, recovered_loads).await;
+
         Ok(db)
     }
 
@@ -3011,7 +3031,7 @@ mod fork_inner_tests {
             registry,
         ));
 
-        let forked_inner = primary_inner.at_fork(scope.clone()).await.unwrap();
+        let (forked_inner, _) = primary_inner.at_fork(scope.clone()).await.unwrap();
         assert!(forked_inner.storage.fork_scope().is_some());
         // Phase 2 Day 4: a forked UniInner now carries its own Writer.
         // The Writer's storage is the fork-scoped clone; its allocator

@@ -22,7 +22,11 @@
 //!
 //! A ticket dropped without publishing (its commit's post-commit path errored,
 //! panicked or was cancelled) releases its slot, so it can never wedge the
-//! announcements behind it.
+//! announcements behind it. The slot is released with the ticket's
+//! *abandon announcement* ([`PublishTicket::on_abandon`]) when one was set,
+//! and with nothing otherwise. A commit that is already visible sets one, so
+//! that a consumer which must not skip a commit (CDC) is told the commit's
+//! announcement was lost instead of never hearing of it.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -82,6 +86,7 @@ impl PublishSequencer {
             sequencer: Arc::clone(self),
             seq,
             completed: false,
+            abandoned: None,
         }
     }
 
@@ -109,21 +114,28 @@ impl PublishSequencer {
     }
 }
 
+/// What to announce for a visible commit whose ticket is dropped unpublished,
+/// given the commit's version; see [`PublishTicket::on_abandon`].
+pub type AbandonAnnouncement = Box<dyn FnOnce(u64) + Send>;
+
 /// A commit's place in the announcement order; see [`PublishSequencer`].
 ///
 /// Publish it with [`Self::publish`]. Dropping it unpublished gives up the
-/// place without announcing anything.
+/// place, announcing what [`Self::on_abandon`] set, or nothing.
 #[must_use = "a ticket orders an announcement; drop it explicitly to give up the slot"]
 pub struct PublishTicket {
     sequencer: Arc<PublishSequencer>,
     seq: u64,
     completed: bool,
+    /// Announced in this ticket's place if it is dropped unpublished.
+    abandoned: Option<Announcement>,
 }
 
 impl std::fmt::Debug for PublishTicket {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PublishTicket")
             .field("seq", &self.seq)
+            .field("on_abandon", &self.abandoned.is_some())
             .finish()
     }
 }
@@ -143,14 +155,28 @@ impl PublishTicket {
     /// block or publish another ticket.
     pub fn publish(mut self, announce: impl FnOnce() + Send + 'static) {
         self.completed = true;
+        self.abandoned = None;
         self.sequencer.complete(self.seq, Some(Box::new(announce)));
+    }
+
+    /// Set what to announce, in this ticket's place, if it is dropped without
+    /// [`Self::publish`] -- its commit's post-commit path errored, panicked or
+    /// was cancelled. Replaces any earlier one; [`Self::publish`] discards it.
+    ///
+    /// Set it once the commit is visible: the announcement then reports a
+    /// commit that happened but could not be announced in full, which a
+    /// consumer that must not skip a commit (CDC) can act on, where a dropped
+    /// slot would be a silent hole. The same constraints as
+    /// [`Self::publish`]'s `announce` apply.
+    pub fn on_abandon(&mut self, announce: impl FnOnce() + Send + 'static) {
+        self.abandoned = Some(Box::new(announce));
     }
 }
 
 impl Drop for PublishTicket {
     fn drop(&mut self) {
         if !self.completed {
-            self.sequencer.complete(self.seq, None);
+            self.sequencer.complete(self.seq, self.abandoned.take());
         }
     }
 }
@@ -195,6 +221,29 @@ mod tests {
         b.publish(rec(1));
         drop(a);
         assert_eq!(*log.lock(), [1, 2]);
+    }
+
+    #[test]
+    fn an_abandoned_ticket_announces_its_fallback_in_its_place() {
+        let seq = PublishSequencer::new();
+        let (log, rec) = recorder();
+        let mut a = seq.issue();
+        a.on_abandon(rec(0));
+        let b = seq.issue();
+        b.publish(rec(1));
+        assert!(log.lock().is_empty(), "b released before a");
+        drop(a);
+        assert_eq!(*log.lock(), [0, 1]);
+    }
+
+    #[test]
+    fn a_published_ticket_never_runs_its_fallback() {
+        let seq = PublishSequencer::new();
+        let (log, rec) = recorder();
+        let mut a = seq.issue();
+        a.on_abandon(rec(99));
+        a.publish(rec(0));
+        assert_eq!(*log.lock(), [0]);
     }
 
     #[test]

@@ -661,6 +661,21 @@ impl TriggerRouter {
             .map(|entry| entry.name.as_str())
     }
 
+    /// True if some after-phase (`AfterMutation` / `AfterCommit`) trigger
+    /// would receive a `kind` event row under `label_or_type`.
+    ///
+    /// Selection only, as [`Self::synchronous_before_trigger_for`]: a
+    /// predicated trigger counts as matching. Lets a writer whose rows are
+    /// read back to build their events (a bulk load) skip the read when no
+    /// trigger would see them.
+    #[must_use]
+    pub fn wants_after_event(&self, kind: TriggerEventMask, label_or_type: &str) -> bool {
+        [TriggerPhase::AfterMutation, TriggerPhase::AfterCommit]
+            .iter()
+            .flat_map(|&phase| &self.by_phase[phase_index(phase)])
+            .any(|entry| entry.matches(kind, label_or_type))
+    }
+
     /// True if some trigger is registered in an after phase
     /// (`AfterMutation` / `AfterCommit`), whatever it selects.
     #[must_use]

@@ -1,4 +1,5 @@
 pub mod bulk_events;
+pub mod bulk_events_delivery_resilience;
 pub mod commit_order_resilience;
 pub mod event_support;
 pub mod trigger_declared;

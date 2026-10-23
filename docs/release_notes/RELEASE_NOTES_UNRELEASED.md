@@ -30,7 +30,37 @@ chunks of at most 4096 rows. A trigger therefore fires once per chunk, and CDC
 receives one or more `CdcBatch`es sharing the load's LSN range, checkpointed
 once after the last. `bulk.commit()` returns after the events are delivered.
 A load completed in the background after `BulkCommitIncomplete` emits them when
-it becomes visible; a load completed by recovery at open emits none.
+it becomes visible. A load completed by recovery at open emits them too, if the
+crash came before they were delivered: the open announces it before returning
+and streams its rows in the background, to the triggers that exist at open --
+built-in ones and triggers declared with `uni.plugin.declareTrigger`, which the
+open reactivates -- and to CDC outputs registered by then (none can be, through
+the public API). Plugins registered with `add_plugin` or a `PluginRegistrar`
+after the open returns do not see it. The load's marker is kept until the
+delivery finishes, so a crash during it delivers the load again at the next
+open: at least once, possibly twice, never not at all. A fork's recovered load
+fires triggers when the fork is next opened; a read-only open delivers nothing
+and leaves the load to the next writable open.
+
+**Cancelling a bulk commit no longer loses or halts its events.** Once a load
+is visible, its events are delivered by a task of their own: dropping the
+`bulk.commit()` future -- while it waited for its place in the commit order, or
+part way through streaming the rows -- used to announce nothing at all (no
+trigger fired; CDC never heard of the load) or to cut the load short (the
+remaining rows never reached triggers, and every CDC stream halted). The
+delivery now finishes whether or not the caller waits for it. A dropped
+`commit()` skips the load's index and snapshot finalization, which the next
+open completes; that open also delivers the load's events again, so consumers
+see them twice. A shutdown during the delivery stops it: CDC halts with its
+checkpoint before the load, and the next open delivers the whole load again.
+
+**A commit abandoned after its commit point halts CDC instead of leaving a
+hole.** A transaction commit cancelled or failing after it became visible --
+for example a `commit()` future dropped at the schema save that follows the
+commit -- gave up its place in the announcement order silently: watchers never
+heard of the commit, and CDC delivered the next one and checkpointed past it.
+It is now announced with `mutations_failed: true`, so CDC halts (as it does
+for a commit whose mutations could not be materialized) and watchers see it.
 
 **A bulk load that a synchronous before-trigger would see is refused.** Such a
 trigger cannot veto a load that is already visible, so a load writing vertices
@@ -1570,7 +1600,15 @@ with `runtime::publish_sequencer::{PublishSequencer, PublishTicket}`.
 `skip_before_triggers`. `MutationEvents::creates` with `CreatedVertex` /
 `CreatedEdge`, `TriggerRouter::synchronous_before_trigger_for` and
 `TriggerRouter::has_after_triggers` are new. `UniError::BulkLoadBlockedByTrigger
-{ trigger, target }` is new (Python: base `UniError`).
+{ trigger, target }` is new (Python: base `UniError`). `BulkEventSink::publish`
+returns `uni_bulk::events::EventDelivery { Finished, Interrupted }`.
+`Writer::commit_transaction_l0_sequenced` takes an `on_abandon` announcement,
+installed with the new `PublishTicket::on_abandon`. **Breaking:**
+`uni_bulk::recover_interrupted_bulk_load` returns `Vec<RecoveredLoad>` (the
+loads whose events are still to be delivered) instead of `()`;
+`uni_bulk::finish_recovered_load_events`, `TriggerRouter::wants_after_event`
+and `ShutdownHandle::is_signalled` are new. Python: `skip_before_triggers` on
+`TxBulkWriterBuilder`, `TxAppenderBuilder` and their async twins.
 
 **Snapshot restore** (`uni-store`). `StorageManager::restore_snapshot` is
 removed: it only moved the manifest pointer. `Writer::restore_snapshot` and

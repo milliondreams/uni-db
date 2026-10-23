@@ -49,6 +49,7 @@ use uni_store::storage::manager::StorageManager;
 use uni_store::storage::{IndexManager, IndexRebuildManager};
 use uuid::Uuid;
 
+use crate::events::EventDelivery;
 use crate::flush_intent;
 
 /// Test-only fault-injection: when set, the bulk writer returns an error
@@ -103,6 +104,17 @@ pub struct BulkBackend {
 /// Tracks a spawned task until the database shuts down; see
 /// [`BulkBackend::track_task`].
 pub type TaskTracker = Arc<dyn Fn(tokio::task::JoinHandle<()>) + Send + Sync>;
+
+impl BulkBackend {
+    /// Track `handle` as [`Self::track_task`] says: so the database's shutdown
+    /// waits for it.
+    fn track(&self, handle: tokio::task::JoinHandle<()>) {
+        match &self.track_task {
+            Some(track) => track(handle),
+            None => self.shutdown.track_task(handle),
+        }
+    }
+}
 
 /// Yields a database's shared [`IndexRebuildManager`], creating it (and
 /// starting its worker) on first use.
@@ -1659,6 +1671,7 @@ impl BulkWriter {
                         plan.records.clone(),
                         plan.labels.clone(),
                         self.write_version,
+                        self.loaded_rows(),
                     )
                     .await
                 }
@@ -1671,6 +1684,7 @@ impl BulkWriter {
                             plan.records.clone(),
                             plan.labels.clone(),
                             self.write_version,
+                            self.loaded_rows(),
                         )
                         .await?;
                     }
@@ -2239,8 +2253,13 @@ impl BulkWriter {
     /// - the receipt and the marker delete: the marker is kept whenever an
     ///   earlier step that recovery repeats did not succeed, and recovery then
     ///   writes the receipt and deletes the marker at the next open.
-    async fn finalize(&mut self, plan: &PublishPlan) {
-        let mut keep_marker = false;
+    ///
+    /// `events` is how the delivery of the load's events ended: interrupted by
+    /// a shutdown, the marker is promoted with its events still pending and
+    /// kept, so the next open delivers them again.
+    async fn finalize(&mut self, plan: &PublishPlan, events: EventDelivery) {
+        let events_interrupted = events == EventDelivery::Interrupted;
+        let mut keep_marker = events_interrupted;
 
         // Unchecked, the marker is kept: recovery checks them at the next open.
         let endpoints_checked = self.recheck_external_endpoints().await;
@@ -2296,6 +2315,7 @@ impl BulkWriter {
                 plan.labels.clone(),
                 self.write_version,
                 endpoints_checked,
+                events_interrupted.then(|| self.loaded_rows()),
             )
             .await
         {
@@ -2433,8 +2453,12 @@ impl BulkWriter {
     /// and CDC through [`BulkBackend::events`], reading its rows back in
     /// chunks of at most [`crate::BULK_EVENT_CHUNK_ROWS`]; see
     /// [`crate::events`]. It waits while CDC has
-    /// `MUTATION_STREAM_DEPTH` chunks undelivered. A trigger registered after
-    /// a label's rows were staged that would make the load refused (see
+    /// `MUTATION_STREAM_DEPTH` chunks undelivered. The delivery runs on a task
+    /// of its own, so dropping this future once the load is visible does not
+    /// cut it short; the dropped commit skips finalizing the load (index
+    /// builds, snapshot), which the next open completes -- delivering the
+    /// load's events a second time. A trigger registered after a label's rows
+    /// were staged that would make the load refused (see
     /// [`BulkWriterBuilder::skip_before_triggers`]) is caught here, before the
     /// commit point, and the load is discarded.
     ///
@@ -2512,11 +2536,13 @@ impl BulkWriter {
         // Announce the load and stream its events to after-phase triggers and
         // CDC. Before the index finalization below, which can take long and
         // does not change what is visible.
-        if visible {
-            self.publish_events().await;
-        }
+        let events = if visible {
+            self.publish_events().await
+        } else {
+            EventDelivery::Finished
+        };
 
-        self.finalize(&plan).await;
+        self.finalize(&plan, events).await;
 
         self.committed = true;
         self.stats.duration = self.start_time.elapsed();
@@ -2576,10 +2602,22 @@ impl BulkWriter {
         Ok(())
     }
 
+    /// Rows this load wrote: vertices plus edges.
+    fn loaded_rows(&self) -> usize {
+        self.stats.vertices_inserted + self.stats.edges_inserted
+    }
+
     /// Hand the now-visible load to the event sink; see [`crate::events`].
-    async fn publish_events(&self) {
+    ///
+    /// The sink runs on a task of its own, tracked like the re-drive, and
+    /// this waits for it. Once the load is visible its events must be
+    /// delivered whole: run inline, a caller dropping `commit()` part way
+    /// would cut the delivery short -- before the announcement, a load CDC
+    /// never hears of; mid-stream, the rest of the load lost to triggers and
+    /// every CDC stream halted. Dropping `commit()` now drops only this wait.
+    async fn publish_events(&self) -> EventDelivery {
         let (Some(sink), Some(write_version)) = (&self.backend.events, self.write_version) else {
-            return;
+            return EventDelivery::Finished;
         };
         let mut labels: Vec<String> = self.touched_labels.iter().cloned().collect();
         labels.sort();
@@ -2591,15 +2629,25 @@ impl BulkWriter {
             !labels.is_empty(),
             !edge_types.is_empty(),
         );
-        sink.publish(crate::events::VisibleLoad {
+        let load = crate::events::VisibleLoad {
             load_id: self.load_id.clone(),
             write_version,
             labels,
             edge_types,
-            rows: self.stats.vertices_inserted + self.stats.edges_inserted,
+            rows: self.loaded_rows(),
             reader,
-        })
-        .await;
+        };
+        let sink = Arc::clone(sink);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let delivery = sink.publish(load).await;
+            // The committer may have stopped waiting; the delivery stands.
+            let _ = done_tx.send(delivery);
+        });
+        self.backend.track(handle);
+        // A task that ended without answering panicked, or was aborted by the
+        // runtime shutting down: the delivery did not finish.
+        done_rx.await.unwrap_or(EventDelivery::Interrupted)
     }
 
     /// Hide this load's version from the storage manager's readers; `None`
@@ -2619,10 +2667,7 @@ impl BulkWriter {
         let redrive = self.redrive(plan, hold);
         let shutdown = self.backend.shutdown.subscribe();
         let handle = tokio::spawn(redrive.run(shutdown));
-        match &self.backend.track_task {
-            Some(track) => track(handle),
-            None => self.backend.shutdown.track_task(handle),
-        }
+        self.backend.track(handle);
     }
 
     /// The re-drive of this committed load, taking over what it still owns:
@@ -2895,6 +2940,7 @@ impl Redrive {
         self.version_reservation = None;
         // The load is visible from here: announce it and deliver its events,
         // as `BulkWriter::commit` does for a load it publishes itself.
+        let mut events = EventDelivery::Finished;
         if visible && let (Some(sink), Some(write_version)) = (self.events.clone(), self.version) {
             let mut labels = std::mem::take(&mut self.vertex_labels);
             labels.sort();
@@ -2906,15 +2952,17 @@ impl Redrive {
                 !labels.is_empty(),
                 !edge_types.is_empty(),
             );
-            sink.publish(crate::events::VisibleLoad {
-                load_id: self.load_id.clone(),
-                write_version,
-                labels,
-                edge_types,
-                rows: self.load_rows,
-                reader,
-            })
-            .await;
+            let delivery = sink
+                .publish(crate::events::VisibleLoad {
+                    load_id: self.load_id.clone(),
+                    write_version,
+                    labels,
+                    edge_types,
+                    rows: self.load_rows,
+                    reader,
+                })
+                .await;
+            events = delivery;
         }
         for (label, vids) in std::mem::take(&mut self.written_vids) {
             for vid in vids {
@@ -2924,6 +2972,17 @@ impl Redrive {
         }
         // Every staged file is referenced by a table version now.
         self.staged_holds.clear();
+        if events == EventDelivery::Interrupted {
+            // Shut down part way through the delivery: the marker stays
+            // `Active`, so the next open repeats the bookkeeping below and
+            // delivers the load's events again.
+            tracing::info!(
+                load_id = %self.load_id,
+                "bulk load re-drive: event delivery stopped by shutdown; the next open delivers \
+                 the load's events again"
+            );
+            return;
+        }
         // The steps below only finish the bookkeeping; the marker is kept on
         // any failure and the next open repeats them.
         let types =

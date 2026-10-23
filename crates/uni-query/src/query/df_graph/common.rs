@@ -2323,16 +2323,17 @@ fn infer_expr_type(
         Expr::Variable(_) => DataType::LargeBinary,
         Expr::FunctionCall { name, args, .. } => match name.to_lowercase().as_str() {
             "count" => DataType::Int64,
-            // `sum` keeps an integer input integral; `avg` of numbers is a
-            // float. Either over a value of unknown type (or durations) is
-            // whatever that value makes it.
+            // `sum` keeps an integer input integral until it overflows, when
+            // it continues as a float, so an integer sum is a Cypher value
+            // (as the planner's `_cypher_sum` returns it); `avg` of numbers
+            // is a float. Either over a value of unknown type (or durations)
+            // is whatever that value makes it.
             "sum" | "avg" => {
                 let arg_type = args.first().map_or(DataType::LargeBinary, |arg| {
                     infer_expr_type(arg, schema_info, scopes)
                 });
                 match arg_type {
                     DataType::Float32 | DataType::Float64 => DataType::Float64,
-                    t if t.is_integer() && name.eq_ignore_ascii_case("sum") => DataType::Int64,
                     t if t.is_integer() => DataType::Float64,
                     _ => DataType::LargeBinary,
                 }

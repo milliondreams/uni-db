@@ -5642,6 +5642,17 @@ fn apply_post_fold_projection(
                         "post-fold projection '{name}' conversion: {e}"
                     ))
                 })?;
+            // A Cypher-value FOLD output (`SUM` / `MSUM` over integers or a
+            // schemaless property, `MIN`, `COLLECT`) computes through the
+            // Cypher arithmetic UDFs, as in HAVING: DataFusion's own coercion
+            // has no `LargeBinary + Int64`, so `t + 0` failed to plan.
+            let df_expr = crate::query::df_expr::apply_type_coercion(&df_expr, &df_schema)
+                .map_err(|e| {
+                    datafusion::common::DataFusionError::Internal(format!(
+                        "post-fold projection '{name}' type coercion: {e}"
+                    ))
+                })?;
+            let df_expr = resolve_registered_udfs(df_expr, task_ctx.scalar_functions())?;
             let empty = datafusion::logical_expr::LogicalPlan::EmptyRelation(
                 datafusion::logical_expr::EmptyRelation {
                     produce_one_row: false,

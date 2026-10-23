@@ -708,7 +708,7 @@ These aggregates are **not monotonic** and cannot be used in recursive strata. T
 
 | Aggregate | Description | Output Type |
 |-----------|-------------|-------------|
-| `SUM(expr)` | Sum of values; 0.0 when there are none, as in Cypher | Float64 |
+| `SUM(expr)` | Sum of values; 0 when there are none, as in Cypher | As Cypher's `sum`: an exact integer over integers, continuing as a float only past the 64-bit range; Float64 over floats |
 | `COUNT(expr)` | Count of non-null values | Int64 |
 | `COUNT(*)` | Count of all rows | Int64 |
 | `AVG(expr)` | Arithmetic mean | Float64 |
@@ -739,7 +739,7 @@ These aggregates are **monotonic** — their value can only move in one directio
 
 | Aggregate | Formula | Direction | Identity | Domain |
 |-----------|---------|-----------|----------|--------|
-| `MSUM(expr)` | `acc + val` | Non-decreasing | 0.0 | Non-negative for convergence |
+| `MSUM(expr)` | `acc + val` (exact over integers, as `SUM`) | Non-decreasing | 0 | Non-negative for convergence |
 | `MMAX(expr)` | `max(acc, val)` | Non-decreasing | -infinity | None |
 | `MMIN(expr)` | `min(acc, val)` | Non-increasing | +infinity | None |
 | `MCOUNT(expr)` | `acc + 1` | Non-decreasing | 0 | None |

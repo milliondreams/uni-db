@@ -338,10 +338,21 @@ fn arrow_scalar_to_value(
             arr.as_primitive::<arrow_array::types::Int32Type>()
                 .value(row_idx) as i64,
         )),
-        Dt::UInt64 => Ok(Value::Int(
-            arr.as_primitive::<arrow_array::types::UInt64Type>()
-                .value(row_idx) as i64,
-        )),
+        // A plugin's `UInt64` yield is a value: past i64::MAX the float it
+        // is, not a wrapped negative integer. An entity's id column is an
+        // identity and keeps its bits (`Value::from_id_bits`).
+        Dt::UInt64 => {
+            let v = arr
+                .as_primitive::<arrow_array::types::UInt64Type>()
+                .value(row_idx);
+            Ok(
+                if crate::query::df_graph::procedure_call::is_identity_field(field) {
+                    Value::from_id_bits(v)
+                } else {
+                    Value::from(v)
+                },
+            )
+        }
         Dt::Float64 => Ok(Value::Float(
             arr.as_primitive::<arrow_array::types::Float64Type>()
                 .value(row_idx),

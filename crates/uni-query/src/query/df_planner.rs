@@ -6477,11 +6477,15 @@ impl HybridPhysicalPlanner {
                         count(get_arg()?)
                     }
                 }
-                // DataFusion's own `sum` / `avg` only for a numeric column;
-                // anything else (an encoded value, a string, a duration, any
-                // expression) folds by Cypher's rules, which take numbers or
-                // durations and reject the rest. A string column used to be
-                // cast to Int64, so `sum` over '12' answered 12.
+                // DataFusion's own `sum` only for a float column, its own
+                // `avg` for any numeric one; anything else (an integer, an
+                // encoded value, a string, a duration, any expression) folds
+                // by Cypher's rules, which take numbers or durations and
+                // reject the rest. A string column used to be cast to Int64,
+                // so `sum` over '12' answered 12. An integer column went to
+                // DataFusion's `sum`, which wraps: `i64::MAX + 1` summed to
+                // `i64::MIN`. Cypher's (Neo4j's) stays an exact integer and
+                // continues as a float past the 64-bit range.
                 "sum" => {
                     let arg = get_arg()?;
                     match Self::numeric_column_type(&arg, schema) {
@@ -6489,11 +6493,8 @@ impl HybridPhysicalPlanner {
                             Box::new(arg),
                             datafusion::arrow::datatypes::DataType::Float64,
                         ))),
-                        // Widen small integers to Int64 (DataFusion has no Int32 sum).
-                        Some(false) => sum(DfExpr::Cast(datafusion::logical_expr::Cast::new(
-                            Box::new(arg),
-                            datafusion::arrow::datatypes::DataType::Int64,
-                        ))),
+                        Some(false) => Arc::new(crate::query::df_udfs::create_cypher_sum_udaf())
+                            .call(vec![Self::widen_narrow_integer(arg, schema)]),
                         None => Arc::new(crate::query::df_udfs::create_cypher_sum_udaf())
                             .call(vec![arg]),
                     }
@@ -7419,26 +7420,35 @@ impl HybridPhysicalPlanner {
                 }
             };
 
-            // `sum` / `avg` over anything but a numeric column fold by Cypher's
-            // rules, as the grouped aggregates do: DataFusion's cast below
-            // summed the strings '12' and '3' to 15, and failed on durations
-            // and on every schemaless (encoded) property.
-            let cypher_sum = matches!(name_lower.as_str(), "sum" | "avg")
-                && matches!(args.as_slice(), [arg] if !matches!(arg, Expr::Wildcard))
-                && !matches!(
-                    cypher_expr_to_df(&args[0], tx_ctx.as_ref())?.get_type(&df_schema),
-                    Ok(datafusion::arrow::datatypes::DataType::Float16
-                        | datafusion::arrow::datatypes::DataType::Float32
-                        | datafusion::arrow::datatypes::DataType::Float64
-                        | datafusion::arrow::datatypes::DataType::Int8
-                        | datafusion::arrow::datatypes::DataType::Int16
-                        | datafusion::arrow::datatypes::DataType::Int32
-                        | datafusion::arrow::datatypes::DataType::Int64
-                        | datafusion::arrow::datatypes::DataType::UInt8
-                        | datafusion::arrow::datatypes::DataType::UInt16
-                        | datafusion::arrow::datatypes::DataType::UInt32
-                        | datafusion::arrow::datatypes::DataType::UInt64)
-                );
+            // `sum` over anything but a float column, and `avg` over anything
+            // but a numeric one, fold by Cypher's rules, as the grouped
+            // aggregates do: DataFusion's cast below summed the strings '12'
+            // and '3' to 15, failed on durations and on every schemaless
+            // (encoded) property, and wrapped an integer sum on overflow.
+            let cypher_sum = match (name_lower.as_str(), args.as_slice()) {
+                ("sum" | "avg", [arg]) if !matches!(arg, Expr::Wildcard) => {
+                    use datafusion::arrow::datatypes::DataType as D;
+                    let arg_type = cypher_expr_to_df(arg, tx_ctx.as_ref())?.get_type(&df_schema);
+                    let float = matches!(arg_type, Ok(D::Float16 | D::Float32 | D::Float64));
+                    let integer = matches!(
+                        arg_type,
+                        Ok(D::Int8
+                            | D::Int16
+                            | D::Int32
+                            | D::Int64
+                            | D::UInt8
+                            | D::UInt16
+                            | D::UInt32
+                            | D::UInt64)
+                    );
+                    if name_lower == "sum" {
+                        !float
+                    } else {
+                        !float && !integer
+                    }
+                }
+                _ => false,
+            };
             // A non-built-in aggregate ignores DataFusion's DISTINCT flag.
             let mut window_distinct = *distinct;
             if cypher_sum {
@@ -7476,22 +7486,16 @@ impl HybridPhysicalPlanner {
                             let mut df_expr = cypher_expr_to_df(arg, tx_ctx.as_ref())?;
 
                             // Cast numeric types only for SUM/AVG aggregate functions:
-                            // SUM widens integers to Int64 and floats to Float64, as
-                            // the grouped `sum` does — casting every argument to
-                            // Int64 truncated each float before it was added
-                            // (`sum(0.5, 1.25) OVER ()` returned 1). AVG needs Float64.
+                            // only a float SUM and a numeric AVG reach DataFusion's
+                            // own, and both take Float64. (An integer SUM is Cypher's,
+                            // above: DataFusion's wraps on overflow. Casting every
+                            // argument to Int64 also truncated each float before it
+                            // was added: `sum(0.5, 1.25) OVER ()` returned 1.)
                             if is_aggregate && !cypher_sum {
-                                let is_float = matches!(
-                                    df_expr.get_type(&df_schema),
-                                    Ok(datafusion::arrow::datatypes::DataType::Float32
-                                        | datafusion::arrow::datatypes::DataType::Float64)
-                                );
                                 let cast_type = match name_lower.as_str() {
-                                    "sum" if is_float => {
+                                    "sum" | "avg" => {
                                         Some(datafusion::arrow::datatypes::DataType::Float64)
                                     }
-                                    "sum" => Some(datafusion::arrow::datatypes::DataType::Int64),
-                                    "avg" => Some(datafusion::arrow::datatypes::DataType::Float64),
                                     _ => None,
                                 };
                                 if let Some(target_type) = cast_type {
@@ -8399,6 +8403,23 @@ impl HybridPhysicalPlanner {
         }
     }
 
+    /// An integer column narrower than 64 bits, cast to `Int64`, so the Cypher
+    /// sum reads it on its typed path. `Int64` and `UInt64` are left as they
+    /// are: no cast holds an unsigned value above `i64::MAX`, and the sum
+    /// reads one as a float rather than wrapping it.
+    fn widen_narrow_integer(expr: DfExpr, schema: &SchemaRef) -> DfExpr {
+        use datafusion::arrow::datatypes::DataType as D;
+        let DfExpr::Column(col) = &expr else {
+            return expr;
+        };
+        match schema.field_with_name(&col.name).map(|f| f.data_type()) {
+            Ok(D::Int8 | D::Int16 | D::Int32 | D::UInt8 | D::UInt16 | D::UInt32) => DfExpr::Cast(
+                datafusion::logical_expr::Cast::new(Box::new(expr), D::Int64),
+            ),
+            _ => expr,
+        }
+    }
+
     fn is_large_binary_col(&self, expr: &DfExpr, schema: &SchemaRef) -> bool {
         if let DfExpr::Column(col) = expr
             && let Ok(field) = schema.field_with_name(&col.name)
@@ -8635,7 +8656,11 @@ fn resolve_fold_bindings(
                         smol_str::SmolStr::new_static("COUNTALL")
                     } else {
                         match upper.as_str() {
-                            "SUM" | "MSUM" => smol_str::SmolStr::new_static("SUM"),
+                            "SUM" => smol_str::SmolStr::new_static("SUM"),
+                            // Its own aggregate: numbers only, where `SUM`
+                            // also adds durations. As `SUM` it read every
+                            // Cypher value as a float to refuse a duration.
+                            "MSUM" => smol_str::SmolStr::new_static("MSUM"),
                             "COUNT" | "MCOUNT" => smol_str::SmolStr::new_static("COUNT"),
                             "MAX" | "MMAX" => smol_str::SmolStr::new_static("MAX"),
                             "MIN" | "MMIN" => smol_str::SmolStr::new_static("MIN"),

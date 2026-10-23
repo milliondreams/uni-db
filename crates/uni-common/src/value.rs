@@ -2554,14 +2554,43 @@ macro_rules! unival {
 // ---------------------------------------------------------------------------
 
 impl From<usize> for Value {
+    /// As `From<u64>`: past `i64::MAX`, a float rather than a wrapped integer.
     fn from(v: usize) -> Self {
-        Value::Int(v as i64)
+        Value::from(v as u64)
     }
 }
 
+/// An unsigned value is an integer while it fits Cypher's signed 64-bit
+/// integer, and the float it is past `i64::MAX`, as an integer sum continues
+/// past the 64-bit range. `as i64` wrapped it: `u64::MAX` read as `-1`, and
+/// compared, ordered and summed as negative.
+///
+/// An *identity* (a vid or eid) is not a value: its bits are carried as the
+/// `Int64` with the same bits (`as_u64() as i64`), which is what reads it back.
 impl From<u64> for Value {
     fn from(v: u64) -> Self {
-        Value::Int(v as i64)
+        i64::try_from(v).map_or(Value::Float(v as f64), Value::Int)
+    }
+}
+
+impl Value {
+    /// The integer a `UInt64` column of the engine's own carries: an identity
+    /// (a vid or eid), as the `Int64` with the same bits.
+    ///
+    /// Inside the engine `UInt64` is the identity type: a schema cannot
+    /// declare an unsigned property, and the vids and eids the engine writes
+    /// are `UInt64` columns. A stored id is below 2^63 and reads as itself; an
+    /// ephemeral one (`Vid::EPHEMERAL_BIT`, minted by `uni.create.vNode`) has
+    /// the sign bit set and reads as a negative integer, which
+    /// `uni.create.vEdge` and `Vid::from(i as u64)` read back. That is a
+    /// bijection, so it is not the wrapping `From<u64>` refuses: widening an
+    /// id to a float would round two ephemeral ids into one, and an
+    /// ephemeral node came back as a map. A `UInt64` *value* a plugin
+    /// declares is converted at the plugin boundary with `From<u64>`.
+    #[must_use]
+    #[allow(clippy::cast_possible_wrap)]
+    pub fn from_id_bits(bits: u64) -> Value {
+        Value::Int(bits as i64)
     }
 }
 
@@ -2577,6 +2606,18 @@ impl From<f32> for Value {
 
 #[cfg(test)]
 mod tests {
+
+    /// An unsigned value past `i64::MAX` is the float it is, not `as i64`'s
+    /// wrapped negative integer; within range it stays an integer.
+    #[test]
+    fn an_unsigned_value_does_not_wrap() {
+        use super::Value;
+        assert_eq!(Value::from(5_u64), Value::Int(5));
+        assert_eq!(Value::from(i64::MAX as u64), Value::Int(i64::MAX));
+        assert_eq!(Value::from(1_u64 << 63), Value::Float(2f64.powi(63)));
+        assert_eq!(Value::from(u64::MAX), Value::Float(u64::MAX as f64));
+        assert_eq!(Value::from(7_usize), Value::Int(7));
+    }
 
     mod property_container {
         use std::collections::HashMap;

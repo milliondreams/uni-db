@@ -621,6 +621,16 @@ Uni supports standard aggregation functions.
 | `MAX(x)` | Maximum, in `ORDER BY` order | `RETURN MAX(p.year)` |
 | `COLLECT(x)` | Collect into list | `RETURN COLLECT(p.title)` |
 
+`SUM` over integers is an exact integer, whatever the column's type (a
+declared `Int`, a schemaless property, a list element): `9007199254740992 + 1`
+sums to `9007199254740993`, not to a rounded float. If the total leaves the
+64-bit integer range, the sum continues as a float rather than wrapping or
+failing — `sum` over `[9223372036854775807, 1]` is `9.223372036854776e18` —
+and stays a float from there. A float among the inputs makes the sum a float.
+This is Neo4j's behaviour; the `+` operator, unlike `sum`, raises an error on
+integer overflow. The same holds for a window `sum`, and for Locy's FOLD
+`SUM` / `MSUM` and `QUERY ... RETURN sum(...)`.
+
 ### Implicit Grouping
 
 Non-aggregated columns become GROUP BY keys:
@@ -668,7 +678,7 @@ function_name(args) OVER (
 | `row_number()` | Sequential row number | `row_number() OVER (ORDER BY p.year)` |
 | `rank()` | Rank with gaps for ties | `rank() OVER (ORDER BY p.citations DESC)` |
 | `dense_rank()` | Rank without gaps | `dense_rank() OVER (ORDER BY p.citations DESC)` |
-| `sum()` | Running sum of numbers or durations; `0` over a frame with no non-null value | `sum(p.citations) OVER (ORDER BY p.year)` |
+| `sum()` | Running sum of numbers or durations; `0` over a frame with no non-null value. Integers sum exactly, continuing as a float only on 64-bit overflow, as the aggregate does | `sum(p.citations) OVER (ORDER BY p.year)` |
 | `avg()` | Running average of numbers or durations | `avg(p.citations) OVER (PARTITION BY p.venue)` |
 | `count()` | Running count | `count(*) OVER (PARTITION BY p.venue)` |
 | `min()` / `max()` | Running min/max | `max(p.citations) OVER (PARTITION BY p.author)` |

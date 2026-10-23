@@ -422,8 +422,9 @@ fn infer_yield_type_rec(
     visited: &mut HashSet<String>,
 ) -> DataType {
     // FOLD outputs — type depends on the aggregate function.
-    // COUNT/MCOUNT produce Int64; SUM/MSUM/AVG produce Float64, but SUM/AVG
-    // over a Cypher value produce a Cypher value.
+    // COUNT/MCOUNT produce Int64; SUM/MSUM/AVG produce Float64, but SUM/MSUM
+    // over integers, and SUM/MSUM/AVG over a Cypher value, produce a Cypher
+    // value.
     if fold_output_names.contains(name) {
         if let Some(fold) = first_clause.fold.iter().find(|fb| fb.name == name)
             && let Expr::FunctionCall { name: fn_name, .. } = &fold.aggregate
@@ -439,11 +440,38 @@ fn infer_yield_type_rec(
                         return dt;
                     }
                 }
-                // Over a Cypher value (a schemaless or duration property), a
-                // Cypher value: a float, or a duration. The input stays the
-                // Cypher value too, since this is also its column type; cast to
-                // Float64, a duration was refused.
-                "SUM" | "AVG"
+                // Over integers or a Cypher value (a schemaless or duration
+                // property), a Cypher value: an exact integer that continues
+                // as a float only past the 64-bit range, a float, or (`SUM`
+                // only) a duration. As a Float64 the sum of the integers 2^53
+                // and 1 was 2^53 (issue #316). The input takes this type
+                // too, since it is also its column type: cast to Float64, an
+                // integer was rounded before it was added, and a duration
+                // refused.
+                "SUM" | "MSUM" => {
+                    let arg_type =
+                        fold_argument_type(&fold.aggregate, schema, var_labels, node_vars).or_else(
+                            || {
+                                let Expr::FunctionCall { args, .. } = &fold.aggregate else {
+                                    return None;
+                                };
+                                arithmetic_yield_type(
+                                    args.first()?,
+                                    first_clause,
+                                    node_vars,
+                                    along_types,
+                                    rule_catalog,
+                                    schema,
+                                    var_labels,
+                                    visited,
+                                )
+                            },
+                        );
+                    if arg_type.is_some_and(|t| t == DataType::LargeBinary || t.is_integer()) {
+                        return DataType::LargeBinary;
+                    }
+                }
+                "AVG"
                     if fold_argument_type(&fold.aggregate, schema, var_labels, node_vars)
                         == Some(DataType::LargeBinary) =>
                 {
@@ -829,9 +857,11 @@ fn infer_expr_type(expr: &Expr, node_vars: &HashSet<String>) -> DataType {
                 | "SUBSTRING" | "LEFT" | "RIGHT" | "REVERSE" | "TYPE" => DataType::LargeUtf8,
                 // Boolean-returning functions
                 "EXISTS" | "STARTSWITH" | "ENDSWITH" | "CONTAINS" => DataType::Boolean,
-                // Aggregates that return Float64
-                "SUM" | "AVG" | "MAX" | "MIN" => DataType::Float64,
-                "COUNT" => DataType::Int64,
+                // No aggregate arm: this types YIELD items, and an aggregate
+                // there is a compile error (`check_no_aggregate_outside_fold`
+                // in uni-locy's typecheck); a FOLD output is typed by
+                // `infer_yield_type_rec`. The arm typed `sum` Float64, which
+                // an integer sum is not.
                 // Unknown function: try to infer from first argument
                 _ => {
                     if let Some(first_arg) = args.first() {

@@ -183,6 +183,8 @@ pub mod sum_of_nothing_is_zero;
 pub mod typed_values_survive_rewrites;
 // sum/avg take numbers or durations; a string is a type error.
 pub mod sum_avg_take_numbers_or_durations;
+// An unsigned value above i64::MAX reads as a float, not a negative integer.
+pub mod uint64_values_do_not_wrap;
 // Numeric functions and statistics reject a non-number instead of answering NULL.
 pub mod numeric_functions_take_numbers;
 // Durations sort by length; min/max follow ORDER BY; `<` between durations is null.

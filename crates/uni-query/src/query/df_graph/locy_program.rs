@@ -1953,9 +1953,10 @@ fn convert_fold_bindings(
 
 /// Parse a fold aggregate expression into (canonical_name, input_column_name).
 ///
-/// Normalizes grammar aliases to canonical names: `MSUM`→`SUM`, `MMAX`→`MAX`,
+/// Normalizes grammar aliases to canonical names: `MMAX`→`MAX`,
 /// `MMIN`→`MIN`, `MCOUNT`→`COUNT`. The zero-arg `COUNT()`/`MCOUNT()` form
-/// returns the `COUNTALL` sentinel. `MNOR`/`MPROD` are already canonical.
+/// returns the `COUNTALL` sentinel. `MSUM`/`MNOR`/`MPROD` are already
+/// canonical (`MSUM` takes numbers only, so it is not `SUM`).
 fn parse_fold_aggregate(expr: &Expr) -> DFResult<(smol_str::SmolStr, String)> {
     match expr {
         Expr::FunctionCall { name, args, .. } => {
@@ -1968,7 +1969,10 @@ fn parse_fold_aggregate(expr: &Expr) -> DFResult<(smol_str::SmolStr, String)> {
             }
 
             let canonical = match upper.as_str() {
-                "SUM" | "MSUM" => smol_str::SmolStr::new_static("SUM"),
+                "SUM" => smol_str::SmolStr::new_static("SUM"),
+                // Its own aggregate: numbers only, where `SUM` also adds
+                // durations.
+                "MSUM" => smol_str::SmolStr::new_static("MSUM"),
                 "MAX" | "MMAX" => smol_str::SmolStr::new_static("MAX"),
                 "MIN" | "MMIN" => smol_str::SmolStr::new_static("MIN"),
                 "COUNT" | "MCOUNT" => smol_str::SmolStr::new_static("COUNT"),

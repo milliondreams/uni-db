@@ -9775,9 +9775,24 @@ evaluator: the `_cypher_sum` / `_cypher_avg` aggregates, the row executor's
 `Accumulator` and Locy's `QUERY` aggregates. Integers stay exact until one
 overflows, then continue as a float; durations add component by component and
 average with the same division as `duration / n`; a string, a boolean, or
-numbers mixed with durations are a type error. Only a numeric *column* goes to
-DataFusion's own `sum` / `avg`, grouped or in a window
-(`numeric_column_type`). Before, the Cypher-value sum skipped every
+numbers mixed with durations are a type error. Only a *float* column goes to
+DataFusion's own `sum`, and only a numeric column to its `avg`, grouped or in
+a window (`numeric_column_type`): DataFusion's integer `sum` wraps on
+overflow (`i64::MAX + 1` summed to `i64::MIN`), where Neo4j's `sum`
+(`overflowSafeAdd`) continues as a float — unlike `+`, which raises. So an
+integer column's `sum` is `_cypher_sum` too, and its result a Cypher value
+(`LargeBinary`), as a schemaless sum's always was; `infer_expr_type` in
+`df_graph/common.rs` types it so. `_cypher_sum` implements
+`GroupsAccumulator` (`CypherSumGroupsAccumulator`: one `CypherSum` per group,
+the typed `Int64` / `Float64` columns read outside the row loop), so a
+grouped sum does not fall back to a boxed accumulator per group. Measured
+over 1M Int64 rows in 10k groups, the aggregate alone costs ~5.5 ms against
+DataFusion's wrapping `sum` at ~3.7 ms (about 1.5x), and ~28 ms without the
+`GroupsAccumulator`; end to end the query is dominated by the scan and the
+difference is not measurable. The 1.5x is the accepted price of an answer
+that does not wrap. On
+overflow `CypherSum::add_int` rounds the exact sum once, through `i128`.
+Before, the Cypher-value sum skipped every
 non-number, so `sum` over durations or strings was 0 and `avg` NULL; a typed
 string column was cast to an integer (`sum` over `'12'` and `'3'` was 15); a
 window failed with "Unsupported CAST from LargeBinary" on durations and on
@@ -9787,14 +9802,44 @@ an integer overflow Cypher continues past
 `uni-common` so Locy's FOLD `SUM` / `AVG` (in `uni-plugin-builtin`) share it:
 over a Cypher-value column they add durations and refuse strings, and the
 planner types their result as a Cypher value (`infer_yield_type_rec`).
+FOLD `SUM` and `MSUM` over an *integer* column (or an integer arithmetic
+expression) fold through `CypherSum` too, and are typed a Cypher value
+(`sum_total_type`): they had summed in `f64`, so the ledger amounts 2^53 and
+1 folded to 2^53 (issue #316), and `QUERY ... RETURN sum(...)` over the same
+rows answered the exact integer. The Locy projection brings a FOLD input to
+the fold's planned type, so with Float64 planned the integers were rounded
+before the aggregate saw them; the planned type is the lever, not only the
+state. `MSUM` resolves to its own `MSumAgg` (numbers only) rather than to
+`SUM`, since its input is no longer read through `_cypher_number`. The
+fixpoint's `MonotonicAggState` still tracks an `f64` image of each sum; it
+only decides convergence, which also needs an empty delta, so its rounding
+never shortens a fixpoint, and the folded values come from `LocyAggState`.
+A post-FOLD YIELD expression over such an output (`s + 1 AS t`) goes through
+`apply_type_coercion`, as the post-FOLD WHERE does, so it computes with the
+Cypher arithmetic UDFs. An aggregate in a YIELD item or ALONG binding is a
+compile error (`AggregateOutsideFold`): a rule aggregates through FOLD only.
+
+**`UInt64` is the identity type, not a value type.** A schema cannot declare
+an unsigned property; the engine's `UInt64` columns are vids and eids. The
+generic Arrow-to-`Value` readers (`arrow_convert`, `scalar_to_value`,
+`get_value_from_array`, `similar_to_expr`) read one with
+`Value::from_id_bits`, the `Int64` with the same bits: an ephemeral id
+(`EPHEMERAL_BIT`, `uni.create.vNode`) is negative, and `uni.create.vEdge`
+reads it back. Widening there turned `id()` of a vNode into a float. A plugin
+procedure's plain `UInt64` *yield* is a value: it is planned as a Cypher value
+(`field_from_signature`) and converted at the boundary
+(`widen_unsigned_yields`) with `Value::from(u64)` — an integer while it fits,
+a float past `i64::MAX`. Read as `as i64`, `u64::MAX` was `-1`, compared below
+zero and summed negative (`bugs::uint64_values_do_not_wrap`).
 
 **A number is read strictly, or not at all.** `_cypher_number` reads a
 value as Float64: NULL stays NULL, every number is read, and anything else is
 an error. It is the argument conversion of Cypher's math functions (`ceil`,
 `sqrt`, `^`, `atan2`, ...), of `stDev` / `variance` / percentiles over a
 non-numeric column, and of a Locy projection bringing a column to Float64
-(`coerce_physical_expr`), which is where a FOLD `MSUM`, `MNOR` or `MPROD`
-reads its input. It replaced `_cypher_to_float64`, which turned a non-number
+(`coerce_physical_expr`), which is where a FOLD `MNOR` or `MPROD`, and an
+`MSUM` over a column that is neither an integer nor a Cypher value, reads its
+input. It replaced `_cypher_to_float64`, which turned a non-number
 into NULL: `ceil('x')` and `sqrt(duration)` answered NULL while `abs('x')` and
 the row evaluator failed, `stDev` over a string column `'12'` read 12, and a
 FOLD over strings or durations summed to 0.0 with `AVG` / `MNOR` NULL,

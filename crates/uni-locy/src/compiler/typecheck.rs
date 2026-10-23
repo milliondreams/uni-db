@@ -269,6 +269,7 @@ pub fn check(
                 });
             }
             check_fold_yield_is_grouped(rule_name, def)?;
+            check_no_aggregate_outside_fold(rule_name, def)?;
 
             // Phase B Slice 3 + A4 follow-up: extract model invocations
             // from YIELD items, ALONG bindings, and FOLD aggregate
@@ -1316,6 +1317,53 @@ fn check_fold_yield_is_grouped(
             rule: rule_name.to_string(),
             column,
         });
+    }
+    Ok(())
+}
+
+/// Rejects an aggregate function call in a YIELD item or an ALONG binding.
+///
+/// Rule-body WHERE already refuses one (the Cypher planner's
+/// `InvalidAggregation`); a YIELD or ALONG aggregate reached the physical
+/// planner and failed there with an unstructured error.
+fn check_no_aggregate_outside_fold(
+    rule_name: &str,
+    def: &RuleDefinition,
+) -> Result<(), LocyCompileError> {
+    // `Expr::is_aggregate` stops at a non-aggregate call, so `abs(count(e))`
+    // is looked into here.
+    fn contains_aggregate(expr: &Expr) -> bool {
+        let mut found = expr.is_aggregate();
+        expr.for_each_child(&mut |child| found = found || contains_aggregate(child));
+        found
+    }
+    fn locy_expr_is_aggregate(expr: &LocyExpr) -> bool {
+        match expr {
+            LocyExpr::PrevRef(_) => false,
+            LocyExpr::Cypher(e) => contains_aggregate(e),
+            LocyExpr::BinaryOp { left, right, .. } => {
+                locy_expr_is_aggregate(left) || locy_expr_is_aggregate(right)
+            }
+            LocyExpr::UnaryOp(_, inner) => locy_expr_is_aggregate(inner),
+        }
+    }
+    let refuse = |position: String| LocyCompileError::AggregateOutsideFold {
+        rule: rule_name.to_string(),
+        position,
+    };
+    if let RuleOutput::Yield(yc) = &def.output {
+        let names = resolve_yield_column_names(&yc.items);
+        if let Some((_, column)) = yc
+            .items
+            .iter()
+            .zip(names)
+            .find(|(item, _)| contains_aggregate(&item.expr))
+        {
+            return Err(refuse(format!("YIELD column '{column}'")));
+        }
+    }
+    if let Some(along) = def.along.iter().find(|a| locy_expr_is_aggregate(&a.expr)) {
+        return Err(refuse(format!("ALONG binding '{}'", along.name)));
     }
     Ok(())
 }

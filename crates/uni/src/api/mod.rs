@@ -445,7 +445,33 @@ fn build_executor_template(
     Arc::new(e)
 }
 
+/// A storage-layer error as a `UniError`: a typed error the storage layer
+/// raised (wrapped in `anyhow`) keeps its variant, anything else is internal.
+pub(crate) fn storage_error(e: anyhow::Error) -> UniError {
+    match e.downcast::<UniError>() {
+        Ok(typed) => typed,
+        Err(e) => UniError::Internal(e),
+    }
+}
+
 impl UniInner {
+    /// Copy a label's rows from the main vertex table into its label table
+    /// right after the label entered the live catalog (#304).
+    ///
+    /// Goes through the writer when there is one, so flushes that read the
+    /// schema before the declaration are waited out first; see
+    /// `Writer::backfill_declared_label`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the barrier's and the backfill's failures.
+    pub(crate) async fn backfill_declared_label(&self, label: &str) -> anyhow::Result<usize> {
+        match &self.writer {
+            Some(writer) => writer.backfill_declared_label(label).await,
+            None => self.storage.backfill_declared_label(label).await,
+        }
+    }
+
     /// This view's background index-rebuild manager, created with its worker
     /// on first use.
     ///
@@ -2128,6 +2154,11 @@ impl UniBuilder {
             .as_ref()
             .map(Self::cloud_config_to_lancedb_storage_options);
 
+        // Declarations (and the restore and recovery paths that redo their
+        // storage half on open) judge the values a property already holds by
+        // the write path's rule; see `uni_store::storage::declared_values`.
+        uni_store::storage::declared_values::install_coercion(uni_query::coerce_declared_value);
+
         let mut storage = if is_hybrid || is_remote_uri {
             // Preserve explicit cloud settings (endpoint, credentials, path style)
             // by reusing the constructed remote store.
@@ -2482,6 +2513,27 @@ impl UniBuilder {
         uni_bulk::check_recovered_bulk_endpoints(&storage, &writer, !self.read_only)
             .await
             .map_err(UniError::Internal)?;
+        // A label declaration whose backfill a crash cut short (#304): the
+        // catalog may already declare the label while its flushed rows are
+        // still only in the main table. Finished here, before any write can
+        // race it. The labels' indexes were built over the label table as it
+        // stood, so each recovered label with an index is rebuilt below, once
+        // the index machinery is up.
+        let recovered_backfills = if self.read_only {
+            Vec::new()
+        } else {
+            let recovered = storage
+                .recover_label_backfills()
+                .await
+                .map_err(UniError::Internal)?;
+            for (label, rows) in &recovered {
+                writer
+                    .record_backfilled_rows(label, *rows)
+                    .await
+                    .map_err(UniError::Internal)?;
+            }
+            recovered
+        };
 
         // Wire up IndexRebuildManager for post-flush automatic rebuild scheduling
         let mut auto_rebuild_manager = None;
@@ -2900,6 +2952,21 @@ impl UniBuilder {
                 index_rebuild: tokio::sync::OnceCell::new_with(auto_rebuild_manager),
             }),
         };
+
+        // The rows a recovered label backfill copied in postdate its indexes'
+        // last build; rebuild them in the background.
+        for (label, _) in recovered_backfills {
+            if db
+                .inner
+                .schema
+                .schema()
+                .indexes
+                .iter()
+                .any(|i| i.label() == label)
+            {
+                db.indexes().rebuild(&label, true).await?;
+            }
+        }
 
         // The single `HostCypherExecutor` impl the moved plugin-host engines
         // (scheduler job host + persistence sinks) call back through for

@@ -447,6 +447,11 @@ impl Clone for Executor {
 impl Executor {
     /// Create a read-only executor backed by the given storage manager.
     pub fn new(storage: Arc<StorageManager>) -> Self {
+        // A declaration judges the values a property already holds by the
+        // write path's rule; see `uni_store::storage::declared_values`.
+        uni_store::storage::declared_values::install_coercion(
+            crate::query::executor::write::coerce_declared_value,
+        );
         // M4: auto-wire the host plugin registry so low-level test
         // setups that bypass `Uni::build` still see `uni.schema.*` and
         // `uni.algo.*` procedures (which no longer have hardcoded

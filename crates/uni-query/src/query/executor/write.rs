@@ -23,6 +23,7 @@ use uni_store::runtime::l0::StatEntity;
 use uni_store::runtime::l0_visibility;
 use uni_store::runtime::property_manager::PropertyManager;
 use uni_store::runtime::writer::Writer;
+use uni_store::storage::declared_values::DeclaredEntity;
 
 /// Whether `key` is a user property for side-effect counting: the storage
 /// columns and `ext_id` are not observable as properties (they are excluded
@@ -861,15 +862,48 @@ impl Executor {
             return Ok(());
         }
         let types = Self::prevalidate_property_definitions(&clause.properties)?;
+        let is_new = !sm.schema().labels.contains_key(&clause.name);
+        // Existing schemaless values must fit the declared types, or the
+        // backfill would store them as NULL; refused before anything changes.
+        // See `StorageManager::check_declared_values`.
+        let declared: Vec<(String, DataType)> = clause
+            .properties
+            .iter()
+            .zip(&types)
+            .map(|(prop, dt)| (prop.name.clone(), dt.clone()))
+            .collect();
+        let declaration_lock = if is_new {
+            self.prepare_declaration(&clause.name, DeclaredEntity::Label, &declared)
+                .await?
+        } else {
+            None
+        };
+        // The label may already hold vertices created schemaless; see
+        // `backfill_declared_label`. The marker precedes the live catalog.
+        if is_new {
+            self.storage
+                .mark_label_backfill_pending(&clause.name)
+                .await?;
+        }
+        // Rows that already carry the label cannot satisfy a NOT NULL
+        // property, so it is recorded nullable (as `SchemaBuilder::apply`
+        // does). Decided before the label enters the catalog.
+        let l0 = self
+            .writer
+            .as_ref()
+            .map(|w| w.committed_l0_context())
+            .unwrap_or_default();
+        let mut nullability = Vec::with_capacity(clause.properties.len());
+        for prop in &clause.properties {
+            nullability.push(
+                self.storage
+                    .new_property_nullability(&clause.name, &prop.name, prop.nullable, &l0)
+                    .await?,
+            );
+        }
         sm.add_label_with_desc(&clause.name, clause.description)?;
-        for (prop, dt) in clause.properties.into_iter().zip(types) {
-            sm.add_property_with_desc(
-                &clause.name,
-                &prop.name,
-                dt,
-                prop.nullable,
-                prop.description,
-            )?;
+        for ((prop, dt), nullable) in clause.properties.into_iter().zip(types).zip(nullability) {
+            sm.add_property_with_desc(&clause.name, &prop.name, dt, nullable, prop.description)?;
             if prop.unique {
                 let constraint = Constraint {
                     name: format!("{}_{}_unique", clause.name, prop.name),
@@ -882,8 +916,59 @@ impl Executor {
                 sm.add_constraint(constraint)?;
             }
         }
+        // Commits from here re-validate against the declaration.
+        drop(declaration_lock);
+        if is_new {
+            self.backfill_declared_label(&clause.name).await?;
+        }
         sm.save().await?;
+        if is_new {
+            self.storage
+                .clear_label_backfill_marker(&clause.name)
+                .await?;
+        }
         Ok(())
+    }
+
+    /// The storage half of declaring `declared` on `entity`, before the
+    /// catalog change: take the writer's declaration lock (returned, to be
+    /// held until the catalog change is made), flush the entity's committed
+    /// L0, refuse values the declared types cannot hold, and widen / convert
+    /// storage. See `SchemaBuilder::apply`, which does the same.
+    pub(crate) async fn prepare_declaration(
+        &self,
+        entity: &str,
+        kind: DeclaredEntity,
+        declared: &[(String, DataType)],
+    ) -> Result<Option<uni_store::runtime::DeclarationLock>> {
+        if declared.is_empty() {
+            return Ok(None);
+        }
+        let held = match self.writer.as_ref() {
+            Some(writer) => {
+                let held = writer.declaration_lock().await?;
+                writer.flush_before_declaration(&held, &[entity]).await?;
+                Some(held)
+            }
+            None => None,
+        };
+        self.storage
+            .check_declared_values(entity, kind, declared)
+            .await?;
+        self.storage
+            .widen_for_checked_properties(entity, kind, declared)
+            .await?;
+        Ok(held)
+    }
+
+    /// Copy a just-declared label's flushed rows from the main vertex table
+    /// into its label table (#304), through the writer's flush barrier when
+    /// there is a writer. See `Writer::backfill_declared_label`.
+    pub(crate) async fn backfill_declared_label(&self, label: &str) -> Result<usize> {
+        match &self.writer {
+            Some(writer) => writer.backfill_declared_label(label).await,
+            None => self.storage.backfill_declared_label(label).await,
+        }
     }
 
     pub(crate) async fn enrich_properties_with_generated_columns(
@@ -950,6 +1035,20 @@ impl Executor {
             return Ok(());
         }
         let types = Self::prevalidate_property_definitions(&clause.properties)?;
+        // Relationships written under the type schemaless keep their values,
+        // which must fit the declared types; see `prepare_declaration`.
+        let declared: Vec<(String, DataType)> = clause
+            .properties
+            .iter()
+            .zip(&types)
+            .map(|(prop, dt)| (prop.name.clone(), dt.clone()))
+            .collect();
+        let declaration_lock = if sm.schema().edge_types.contains_key(&clause.name) {
+            None
+        } else {
+            self.prepare_declaration(&clause.name, DeclaredEntity::EdgeType, &declared)
+                .await?
+        };
         sm.add_edge_type_with_desc(
             &clause.name,
             clause.src_labels,
@@ -965,6 +1064,7 @@ impl Executor {
                 prop.description,
             )?;
         }
+        drop(declaration_lock);
         sm.save().await?;
         Ok(())
     }
@@ -1056,12 +1156,38 @@ impl Executor {
         Ok(())
     }
 
+    /// For `ADD PROPERTY`: take the writer's declaration lock and flush
+    /// `entity`'s committed L0, so the values the declaration checks and
+    /// promotes are all where it reads them and no commit slips in before the
+    /// catalog change. Held by the caller across the whole ALTER. See
+    /// `Writer::declaration_lock`.
+    async fn lock_for_add_property(
+        &self,
+        entity: &str,
+        action: &AlterAction,
+    ) -> Result<Option<uni_store::runtime::DeclarationLock>> {
+        if matches!(action, AlterAction::AddProperty(_))
+            && let Some(writer) = self.writer.as_ref()
+        {
+            let held = writer.declaration_lock().await?;
+            writer.flush_before_declaration(&held, &[entity]).await?;
+            return Ok(Some(held));
+        }
+        Ok(None)
+    }
+
     pub(crate) async fn execute_alter_label(&self, clause: AlterLabel) -> Result<()> {
+        let _held = self
+            .lock_for_add_property(&clause.name, &clause.action)
+            .await?;
         let l0 = self.visible_l0().await;
         Self::execute_alter_entity(&self.storage, &l0, &clause.name, clause.action).await
     }
 
     pub(crate) async fn execute_alter_edge_type(&self, clause: AlterEdgeType) -> Result<()> {
+        let _held = self
+            .lock_for_add_property(&clause.name, &clause.action)
+            .await?;
         let l0 = self.visible_l0().await;
         Self::execute_alter_entity(&self.storage, &l0, &clause.name, clause.action).await
     }
@@ -3121,6 +3247,29 @@ impl Executor {
             Self::validate_structural_property_value(prop_name, &val)?;
             return Ok(val);
         };
+        Self::coerce_to_declared_type(prop_name, dt, val)
+    }
+
+    /// The declared-column half of [`Self::coerce_and_validate_property_value`]:
+    /// `val` in the form a column declared `dt` stores, or the type error.
+    ///
+    /// Also the rule a declaration applies to the values a property already
+    /// holds (installed into `uni-store` as its declared-value coercion), so
+    /// declaring and then writing agrees with writing and then declaring.
+    ///
+    /// # Errors
+    /// Returns an error if `dt` cannot hold `val`.
+    pub(crate) fn coerce_to_declared_type(
+        prop_name: &str,
+        dt: &uni_common::core::schema::DataType,
+        val: Value,
+    ) -> Result<Value> {
+        use uni_common::core::schema::DataType;
+
+        // CypherValue columns accept any value (including maps).
+        if matches!(dt, DataType::CypherValue) {
+            return Ok(val);
+        }
 
         // Sparse vectors carry invariants the type system cannot express (strictly
         // ascending unique term ids, finite weights, equal-length arrays, term ids
@@ -5108,6 +5257,24 @@ pub(crate) async fn read_edge_props_with_prefetch(
             .await?
             .unwrap_or_default()),
     }
+}
+
+/// The write path's rule for a value of a declared property: `val` in the
+/// form a column declared `dt` stores, or the type error a `CREATE`/`SET`
+/// would raise.
+///
+/// Installed into `uni-store` (`uni_store::storage::declared_values`) as the
+/// rule a declaration applies to values a property already holds, so that
+/// declaring then writing and writing then declaring agree.
+///
+/// # Errors
+/// Returns an error if `dt` cannot hold `val`.
+pub fn coerce_declared_value(
+    prop_name: &str,
+    dt: &uni_common::core::schema::DataType,
+    val: Value,
+) -> Result<Value> {
+    Executor::coerce_to_declared_type(prop_name, dt, val)
 }
 
 #[cfg(test)]

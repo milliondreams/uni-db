@@ -403,6 +403,12 @@ pub struct ForkPoint {
     pub parent_branch_versions: BTreeMap<String, u64>,
 }
 
+/// `flush_lock`, held by a schema declaration; see [`Writer::declaration_lock`].
+#[must_use = "the declaration is only serialized against commits while this is held"]
+pub struct DeclarationLock {
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
 /// RAII latch on [`StorageManager::flush_in_progress`].
 ///
 /// Sets the flag to `true` on construction (via CAS) and back to `false` on
@@ -1556,7 +1562,10 @@ impl Writer {
     pub fn create_transaction_l0(&self) -> Arc<RwLock<L0Buffer>> {
         let current_version = self.l0_manager.get_current().read().current_version;
         // Transaction mutations are logged to WAL at COMMIT time, not during the transaction.
-        let buf = L0Buffer::new(current_version, None);
+        let mut buf = L0Buffer::new(current_version, None);
+        // The schema its statements validate against; see
+        // `revalidate_declared_properties`.
+        buf.validated_schema_version = Some(self.schema_manager.schema().schema_version);
         // SSI: stamp the OCC read sequence at begin so commit can detect any
         // transaction that committed since. Gated on the runtime `ssi_enabled`
         // toggle — when off, `occ_read_set` stays `None` and every downstream
@@ -2003,6 +2012,29 @@ impl Writer {
         {
             let tx_l0 = tx_l0_arc.read();
             self.validate_edge_endpoints_overlay(&tx_l0)?;
+        }
+
+        // A declaration that landed while the transaction was open: its
+        // statements validated property values against the schema before it,
+        // so a value of a now-declared property may not fit the declared type
+        // (and the flush would refuse it). Re-validated -- and converted, as
+        // the write path converts -- here, under `flush_lock` and before the
+        // WAL append, so the transaction fails cleanly instead. A declaration
+        // publishes its catalog change under `flush_lock` too
+        // (`Writer::declaration_lock`), so no commit slips between a
+        // declaration's value check and its catalog change. The version
+        // compare keeps the common path free.
+        {
+            let schema = self.schema_manager.schema();
+            let stale = tx_l0_arc
+                .read()
+                .validated_schema_version
+                .is_some_and(|v| v != schema.schema_version);
+            if stale {
+                let mut tx_l0 = tx_l0_arc.write();
+                self.revalidate_declared_properties(&mut tx_l0, &schema)?;
+                tx_l0.validated_schema_version = Some(schema.schema_version);
+            }
         }
 
         // Crash-recovery seam: SSI validation has passed; the transaction is
@@ -5600,6 +5632,274 @@ impl Writer {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Re-validate the declared-property values a transaction carries against
+    /// `schema`, converting them as the write path would.
+    ///
+    /// For a commit whose statements validated against an older schema; see
+    /// the call in [`Self::commit_transaction_l0_sequenced`]. Vertices are
+    /// judged by the declared type of the first of their labels that declares
+    /// the property (as the write path does), edges by their type's.
+    ///
+    /// # Errors
+    ///
+    /// `UniError::Type` for the first value the declared type cannot hold.
+    fn revalidate_declared_properties(
+        &self,
+        tx_l0: &mut L0Buffer,
+        schema: &uni_common::core::schema::Schema,
+    ) -> Result<()> {
+        use crate::storage::declared_values::coerce;
+        let refuse = |what: String, name: &str, declared: &uni_common::DataType, e| {
+            anyhow::Error::from(uni_common::UniError::Type {
+                expected: format!(
+                    "TypeError: property '{name}' of {what} is declared {declared:?} (declared \
+                     while this transaction was open) but its value does not fit: {e}"
+                ),
+                actual: String::new(),
+            })
+        };
+        let L0Buffer {
+            vertex_properties,
+            vertex_labels,
+            vertex_tombstones,
+            edge_properties,
+            edge_endpoints,
+            edge_types,
+            tombstones,
+            ..
+        } = tx_l0;
+        for (vid, props) in vertex_properties.iter_mut() {
+            if vertex_tombstones.contains(vid) {
+                continue;
+            }
+            let Some(labels) = vertex_labels.get(vid) else {
+                continue;
+            };
+            for (name, value) in props.iter_mut() {
+                let Some(declared) = labels.iter().find_map(|l| {
+                    schema
+                        .properties
+                        .get(l)
+                        .and_then(|p| p.get(name))
+                        .map(|m| &m.r#type)
+                }) else {
+                    continue;
+                };
+                if declared.accepts(value) && declared.check_vector_dims(value).is_ok() {
+                    continue;
+                }
+                *value = coerce(name, declared, value.clone())
+                    .map_err(|e| refuse(format!("vertex {}", vid.as_u64()), name, declared, e))?;
+            }
+        }
+        for (eid, props) in edge_properties.iter_mut() {
+            if tombstones.contains_key(eid) {
+                continue;
+            }
+            let type_name = edge_types.get(eid).cloned().or_else(|| {
+                edge_endpoints
+                    .get(eid)
+                    .and_then(|(_, _, t)| self.schema_manager.edge_type_name_by_id_unified(*t))
+            });
+            let Some(declared_props) = type_name.and_then(|t| schema.properties.get(&t)) else {
+                continue;
+            };
+            for (name, value) in props.iter_mut() {
+                let Some(declared) = declared_props.get(name).map(|m| &m.r#type) else {
+                    continue;
+                };
+                if declared.accepts(value) && declared.check_vector_dims(value).is_ok() {
+                    continue;
+                }
+                *value = coerce(name, declared, value.clone())
+                    .map_err(|e| refuse(format!("edge {}", eid.as_u64()), name, declared, e))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Backfill `label` from the main vertex table once it has entered the
+    /// live catalog (#304). See [`StorageManager::backfill_declared_label`].
+    ///
+    /// A flush reads the schema once, at the start of its stream phase, and
+    /// writes a vertex into a label table only for labels that snapshot
+    /// declares. A flush still holding a snapshot from before the declaration
+    /// adds rows to the main table alone, and if it does so after the backfill
+    /// scanned, they stay hidden. Every such flush is waited out first:
+    /// - an inline flush holds `flush_lock` from rotate to finalize, so taking
+    ///   the lock once waits for it;
+    /// - an async flush rotates under `flush_lock` and streams outside it, so
+    ///   the coordinator is drained.
+    ///
+    /// The lock is released before the drain, because finalizing an async
+    /// flush takes it. A flush that rotates after the lock was taken reads the
+    /// schema after the declaration and writes the label table itself; it may
+    /// run alongside the backfill, which is safe for the reason given on
+    /// `backfill_declared_label`. The backfill does not hold `flush_lock`, so
+    /// commits are not stalled behind a scan of the main table.
+    ///
+    /// # Errors
+    ///
+    /// Fails if pending flushes stall past `flush_drain_timeout`, or if the
+    /// backfill fails.
+    pub async fn backfill_declared_label(&self, label: &str) -> Result<usize> {
+        self.drain_pre_declaration_flushes(label).await?;
+        let copied = self.storage.backfill_declared_label(label).await?;
+        self.record_backfilled_rows(label, copied).await?;
+        Ok(copied)
+    }
+
+    /// Count `rows` appended to `label`'s table outside a flush in the
+    /// manifest the next flush publishes.
+    ///
+    /// `SnapshotManifest::vertices[label].count` accumulates the live rows
+    /// each flush appends, and the index growth trigger compares it with an
+    /// index's `row_count_at_build` (a Lance row count, which does include
+    /// backfilled rows). Left out, a label declared over a million vertices
+    /// would need a million and a half flushed rows, not half a million, to
+    /// trigger a rebuild. The flush publishes the manifest it seeds from
+    /// `cached_manifest`, so the rows are added there. Like a flush's own
+    /// increment, it can be lost to an async flush whose stream copied the
+    /// manifest before this and finalizes after it; the count only drives a
+    /// heuristic trigger and `SHOW STATISTICS`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a failure to load the latest manifest.
+    pub async fn record_backfilled_rows(&self, label: &str, rows: usize) -> Result<()> {
+        if rows == 0 {
+            return Ok(());
+        }
+        if self.cached_manifest.lock().is_none() {
+            // Seeded as a flush would seed it. No manifest at all means
+            // nothing was ever flushed, so there was nothing to backfill.
+            let Some(latest) = self
+                .storage
+                .snapshot_manager()
+                .load_latest_snapshot()
+                .await?
+            else {
+                return Ok(());
+            };
+            let mut cached = self.cached_manifest.lock();
+            if cached.is_none() {
+                *cached = Some(latest);
+            }
+        }
+        if let Some(manifest) = self.cached_manifest.lock().as_mut() {
+            manifest
+                .vertices
+                .entry(label.to_string())
+                .or_insert(LabelSnapshot {
+                    version: 0,
+                    count: 0,
+                    lance_version: 0,
+                })
+                .count += rows as u64;
+        }
+        Ok(())
+    }
+
+    /// Exclude commits and flushes while a declaration checks the values its
+    /// entities already hold and publishes its catalog change.
+    ///
+    /// A declaration validates and converts the values it adopts
+    /// (`StorageManager::check_declared_values`), then changes the catalog.
+    /// A commit landing between the two would carry values validated against
+    /// the schema without the declaration, and the commit's own re-validation
+    /// (`revalidate_declared_properties`) would not fire because the version
+    /// had not moved yet. Holding `flush_lock` across both closes that window:
+    /// a commit before it is flushed and checked, one after it sees the new
+    /// version. Async flushes still streaming are drained first (their
+    /// finalize needs the lock), so none is in flight while it is held.
+    ///
+    /// Commits wait for the declaration while this is held. Drop it before
+    /// anything that takes `flush_lock` itself, such as
+    /// [`Self::backfill_declared_label`] or [`Self::flush_to_l1`].
+    ///
+    /// # Errors
+    ///
+    /// Fails if pending flushes stall past `flush_drain_timeout`.
+    pub async fn declaration_lock(&self) -> Result<DeclarationLock> {
+        loop {
+            if let Some(coord) = self.flush_coordinator.as_ref() {
+                coord
+                    .drain(self.config.flush_drain_timeout)
+                    .await
+                    .map_err(|e| {
+                        anyhow!(
+                            "cannot start a schema declaration: pending flushes did not \
+                             drain: {e} (waited {:?})",
+                            self.config.flush_drain_timeout
+                        )
+                    })?;
+            }
+            let guard = self.flush_lock.clone().lock_owned().await;
+            // A commit may have rotated an async flush between the drain and
+            // the lock; none can while the lock is held.
+            if self
+                .flush_coordinator
+                .as_ref()
+                .is_none_or(|c| c.pending_flush_count() == 0)
+            {
+                return Ok(DeclarationLock { _guard: guard });
+            }
+        }
+    }
+
+    /// Flush committed L0 data of `entities` ahead of a declaration that
+    /// changes their property set, under its [`Self::declaration_lock`].
+    ///
+    /// A declaration validates and converts the values it moves into typed
+    /// columns (`StorageManager::check_declared_values`), and it reads them
+    /// where flushed data lives. Flushing first puts every committed value
+    /// there. A no-op when none of `entities` has L0 data.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a flush failure.
+    pub async fn flush_before_declaration(
+        &self,
+        _held: &DeclarationLock,
+        entities: &[&str],
+    ) -> Result<()> {
+        let l0 = self.committed_l0_context();
+        if entities.iter().any(|e| l0.entity_count(e) > 0) {
+            self.flush_inline_under_lock(None).await?;
+            self.ensure_no_failed_flush()?;
+        }
+        Ok(())
+    }
+
+    /// The committed, unflushed L0 buffers: current plus pending flush, with
+    /// no transaction buffer.
+    #[must_use]
+    pub fn committed_l0_context(&self) -> crate::runtime::l0_visibility::L0Context {
+        crate::runtime::l0_visibility::L0Context {
+            current_l0: Some(self.l0_manager.get_current()),
+            transaction_l0: None,
+            pending_flush_l0s: self.l0_manager.get_pending_flush(),
+        }
+    }
+
+    /// The barrier half of [`Self::backfill_declared_label`].
+    async fn drain_pre_declaration_flushes(&self, label: &str) -> Result<()> {
+        drop(self.flush_lock.lock().await);
+        if let Some(coord) = self.flush_coordinator.as_ref() {
+            coord
+                .drain(self.config.flush_drain_timeout)
+                .await
+                .map_err(|e| {
+                    anyhow!(
+                        "cannot backfill label '{label}': pending flushes did not drain: {e} \
+                         (waited {:?})",
+                        self.config.flush_drain_timeout
+                    )
+                })?;
         }
         Ok(())
     }

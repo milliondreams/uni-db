@@ -822,8 +822,13 @@ impl Executor {
                     .evaluate_expr(&args[1], &empty_row, prop_manager, params, ctx)
                     .await?;
 
-                let success =
-                    super::ddl_procedures::create_label(&self.storage, &name, &config).await?;
+                let success = super::ddl_procedures::create_label(
+                    &self.storage,
+                    self.writer.as_deref(),
+                    &name,
+                    &config,
+                )
+                .await?;
                 success_result(success)
             }
             "uni.schema.createEdgeType" => {
@@ -865,6 +870,7 @@ impl Executor {
 
                 let success = super::ddl_procedures::create_edge_type(
                     &self.storage,
+                    self.writer.as_deref(),
                     &name,
                     src_labels,
                     dst_labels,

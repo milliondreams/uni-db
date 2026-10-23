@@ -932,6 +932,122 @@ than acquiring a NULL column. It fires on the fork branch a write is actually
 landing on, which is what closes the branch-creation race the eager pass cannot
 see.
 
+### Declaring a label that already has data (#304)
+
+A flush writes a vertex into `vertices_{label}` only for labels declared in the
+schema snapshot it took; an undeclared label's vertices are flushed into the
+main `vertices` table alone. Once the label is declared, the planner reads
+`MATCH (n:L)` from `vertices_L` (`Scan`, not `ScanMainByLabels`), so every row
+flushed before the declaration would vanish from label-scoped reads. Every
+label declaration path — `SchemaBuilder::apply`, Cypher `CREATE LABEL`,
+`uni.schema.createLabel`, `Uni::load_schema`, and `ForkSchemaBuilder::apply` — therefore
+**backfills** the new label:
+
+1. **Marker** (primary only): `catalog/label_backfill/{hex(label)}` is written
+   before the label enters the live catalog.
+2. **Catalog**: the label and its batch's properties and indexes are declared
+   in memory. Rows are fine catalog-first because the backfill is re-runnable;
+   *columns* stay storage-first (above).
+3. **Barrier** (`Writer::backfill_declared_label`): a flush that snapshotted the
+   schema before step 2 would add main-only rows the backfill scan misses. An
+   inline flush holds `flush_lock` from rotate to finalize, so the lock is taken
+   once and released; async flushes stream outside the lock, so the coordinator
+   is drained (after releasing the lock — finalize takes it). Flushes rotating
+   later see the label and write `vertices_L` themselves.
+4. **Backfill** (`StorageManager::backfill_declared_label`): the main table's
+   latest row per vertex that ever carried the label decides what `vertices_L`
+   holds. A live row still carrying the label is appended at its own version,
+   labels, properties and timestamps (plus its `UidIndex` mapping) unless
+   `vertices_L` already has it at that version or later; a tombstone or a
+   relabel-away retires an older live `vertices_L` row with a tombstone at the
+   main row's version. Append-only and MVCC-keyed (reads keep the highest
+   `_version`), so it is idempotent, fork-safe, and safe to run alongside a
+   post-declaration flush without holding `flush_lock`.
+5. **Save, then clear the marker.** Index builds run after the backfill, so they
+   cover the copied rows.
+
+Any commit can save the dirty catalog between steps 2 and 5. A crash there
+leaves the label declared on disk with its rows main-only; the next writable
+open runs `recover_label_backfills`, which backfills every marked label the
+catalog declares (and rebuilds its indexes in the background) and drops the
+rest. A recovery backfill that fails is logged at `error` and its marker kept
+for the next open, rather than failing the open. A fork needs no marker: its schema is durable only through the overlay,
+which `ForkSchemaBuilder::apply` persists *after* the backfill.
+
+`existing_row_count` also counts main-table rows carrying a label, so a
+`NOT NULL` property declared together with a schemaless-populated label is
+recorded nullable, as above; Cypher `CREATE LABEL` and `uni.schema.createLabel`
+apply the same rule.
+
+The backfill adds the live rows it copied to the label's
+`SnapshotManifest::vertices[label].count` (via the writer's cached manifest,
+published by the next flush). That count feeds the index growth trigger
+(`IndexRebuildManager::labels_needing_rebuild` compares it with
+`row_count_at_build`, a Lance row count that does include backfilled rows) and
+`SHOW STATISTICS`; nothing reads it for correctness or planning.
+
+A bulk load cannot leave main-table-only rows for a label: `BulkWriter`
+refuses an undeclared label (`LabelNotFound`, checked against the live schema
+on every `insert_vertices`) and always writes the label table and the main
+table together, so a load spanning a declaration needs no backfill.
+
+### Existing values must fit a declared type
+
+Both #249's promotion (a property added to a populated label: values move out
+of `overflow_json`) and #304's backfill (a label declared over schemaless
+vertices: values move out of the main table's `props_json`) put existing values
+into a typed column, and the column builders store a value they cannot hold as
+NULL. So every declaration path first runs
+`StorageManager::check_declared_values` for each property the catalog does not
+already hold — before the backfill marker, the widening, or the catalog change
+— and refuses with `UniError::DeclaredTypeConflict` (entity, property, declared
+type, conflicting count, one example id and value; Python: `UniSchemaError`
+with those attributes). The rule is the write path's own (`uni-query`'s
+`coerce_declared_value`, installed into `uni_store::storage::declared_values`
+at open): what a `CREATE`/`SET` of the declared property accepts is accepted,
+and the promotion and backfill store it in the form that write would have
+(`Int` into a float column as a float, an ISO string into a `DATE` column as a
+date), so declaring then writing and writing then declaring agree. Committed
+unflushed values of the entity are flushed first
+(`Writer::flush_before_declaration`), so the check and the conversion see
+them. A property already declared is not re-checked, so re-applying an
+unchanged schema scans nothing.
+
+The same applies to an **edge type declared with properties over schemaless
+relationships**: their values sit in the type's delta tables (`overflow_json`,
+which keep serving the type once declared) and in `main_edges`. The check reads
+the forward delta table; the declaration widens both delta tables and promotes
+the values out of `overflow_json`, converted, before the catalog names the
+type (`DeclaredEntity::EdgeType`). Before this, a flushed ISO string declared
+`DATETIME` read back NULL.
+
+**Main tables.** The main `vertices` / `main_edges` `props_json` blobs serve
+reads that bypass typed columns (an unlabeled `MATCH (n)`, `properties(n)`, an
+untyped relationship pattern). A declaration rewrites the latest row of each
+affected vertex or relationship there into the declared form
+(`convert_main_table_values`, an in-place merge on `(id, _version)`, only for
+rows whose value changes), so typed and untyped reads agree. Older versions
+keep the form they were written in.
+
+**Commits racing a declaration.** A transaction's statements validate values
+against the schema of their time, so one opened before a declaration can carry
+a value of a now-declared property that the type cannot hold. Three layers:
+
+1. The declaration holds the writer's `flush_lock` (`Writer::declaration_lock`,
+   after draining async flushes) from the flush of the entity's committed L0,
+   through the value check and widening, to the catalog change. No commit can
+   land between the check and the change.
+2. A transaction L0 is stamped with the schema version at creation
+   (`validated_schema_version`). A commit that finds the version moved
+   re-validates (and converts, as the write path would) the declared properties
+   it carries, under `flush_lock` and before the WAL append
+   (`Writer::revalidate_declared_properties`), and fails with `UniError::Type`
+   for a value that does not fit. Nothing of that transaction lands. The common
+   path costs one integer compare.
+3. `PropertyColumnBuilder` (every vertex and delta flush, the backfill, bulk
+   loads) no longer stores a non-fitting live value as NULL: it converts what
+   the write path would convert and refuses the rest with an error.
+
 ## Defining a Schema
 
 ### Rust API (SchemaBuilder)

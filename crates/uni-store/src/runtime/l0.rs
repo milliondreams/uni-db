@@ -388,6 +388,11 @@ pub struct L0Buffer {
     /// and consulted at commit to detect intervening conflicting commits. `0`
     /// for the main L0 and when SSI is disabled.
     pub occ_read_seq: u64,
+    /// The schema version a transaction's writes were validated under.
+    /// Stamped on a transaction's private L0 at creation; `None` for the main
+    /// L0. A commit that finds the schema moved since re-validates the
+    /// declared properties it carries (`Writer::revalidate_declared_properties`).
+    pub validated_schema_version: Option<u32>,
     /// Optimistic-concurrency read-set (SSI). `Some` on a read-write
     /// transaction's private L0 when SSI tracking is active; the read path
     /// records observed ids here and commit checks them for antidependencies.
@@ -469,6 +474,7 @@ impl Clone for L0Buffer {
             edge_identity_memo: EdgeIdentityMemo::default(),
             pending_embeddings: self.pending_embeddings.clone(),
             occ_read_seq: self.occ_read_seq,
+            validated_schema_version: self.validated_schema_version,
             // Forked L0s (ASSUME/ABDUCE) do not participate in OCC tracking.
             occ_read_set: None,
             // Inherit the registry so forked buffers merge custom CRDTs the
@@ -811,6 +817,7 @@ impl L0Buffer {
             edge_identity_memo: EdgeIdentityMemo::default(),
             pending_embeddings: HashMap::new(),
             occ_read_seq: 0,
+            validated_schema_version: None,
             occ_read_set: None,
             plugin_registry: None,
         }

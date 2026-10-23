@@ -118,6 +118,8 @@ pub(crate) fn into_query_error(e: impl std::fmt::Display, cypher: &str) -> UniEr
         reserved
     } else if let Some(stalled) = UniError::write_stalled_from_message(&msg) {
         stalled
+    } else if let Some(conflict) = UniError::declared_type_conflict_from_message(&msg) {
+        conflict
     } else if let Some(endpoint) = UniError::edge_endpoint_from_message(&msg) {
         endpoint
     } else if let Some(identity) = UniError::edge_identity_from_message(&msg) {
@@ -170,6 +172,8 @@ fn into_execution_error(
         reserved
     } else if let Some(stalled) = UniError::write_stalled_from_message(&msg) {
         stalled
+    } else if let Some(conflict) = UniError::declared_type_conflict_from_message(&msg) {
+        conflict
     } else if let Some(endpoint) = UniError::edge_endpoint_from_message(&msg) {
         endpoint
     } else if let Some(identity) = UniError::edge_identity_from_message(&msg) {
@@ -230,6 +234,8 @@ fn into_stream_error(
         reserved
     } else if let Some(stalled) = UniError::write_stalled_from_message(&msg) {
         stalled
+    } else if let Some(conflict) = UniError::declared_type_conflict_from_message(&msg) {
+        conflict
     } else if let Some(endpoint) = UniError::edge_endpoint_from_message(&msg) {
         endpoint
     } else if let Some(identity) = UniError::edge_identity_from_message(&msg) {

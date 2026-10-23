@@ -1233,6 +1233,29 @@ impl Writer {
         // still-unfinished write and report an older segment as its commit
         // point.
         let _flush_lock_guard = self.flush_lock.lock().await;
+        self.seal_wal_locked().await
+    }
+
+    /// [`Self::seal_wal`] only if `flush_lock` is free right now; `Ok(false)`
+    /// without sealing when it is held.
+    ///
+    /// For a caller that must not wait, such as a synchronous `Drop` that
+    /// blocks its thread: the lock's holder may be a flush that can only make
+    /// progress on that very thread (a `current_thread` runtime), so waiting
+    /// for it would deadlock. Skipping costs at most re-announcing the commits
+    /// announced since the last segment at the next open.
+    ///
+    /// # Errors
+    /// As `WriteAheadLog::seal`.
+    pub async fn try_seal_wal(&self) -> Result<bool> {
+        let Ok(_flush_lock_guard) = self.flush_lock.try_lock() else {
+            return Ok(false);
+        };
+        self.seal_wal_locked().await?;
+        Ok(true)
+    }
+
+    async fn seal_wal_locked(&self) -> Result<()> {
         let wal = self.l0_manager.get_current().read().wal.clone();
         if let Some(wal) = wal {
             wal.seal().await?;

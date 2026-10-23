@@ -1707,7 +1707,8 @@ impl UniInner {
     /// is skipped.
     ///
     /// Runs the write on the process-wide IO runtime: `Drop` is synchronous
-    /// and may run on a runtime thread, or on none.
+    /// and may run on a runtime thread, or on none. Skipped, not waited for,
+    /// while a flush holds the WAL (see `Writer::try_seal_wal`).
     fn seal_wal_on_drop(&self) {
         let Some(writer) = self.writer.as_ref() else {
             return;
@@ -1715,13 +1716,16 @@ impl UniInner {
         if self._temp_dir.is_some() || !writer.wal_needs_seal() {
             return;
         }
+        // Never wait for `flush_lock` here: this blocks the dropping thread,
+        // and the lock's holder may be a flush that only that thread can drive
+        // (a `current_thread` runtime). Waiting deadlocked such a drop.
         let writer = Arc::clone(writer);
-        let sealed =
-            uni_store::runtime::io_runtime::block_on_io_runtime(
-                async move { writer.seal_wal().await },
-            );
+        let sealed = uni_store::runtime::io_runtime::block_on_io_runtime(async move {
+            writer.try_seal_wal().await
+        });
         let error = match sealed {
-            Ok(Ok(())) => return,
+            Ok(Ok(true)) => return,
+            Ok(Ok(false)) => "a flush holds the WAL".to_owned(),
             Ok(Err(e)) => e.to_string(),
             Err(e) => e.to_string(),
         };

@@ -14,7 +14,7 @@ Line numbers are as of `c56f98f73`.
 
 ### D1. A commit durable in the WAL whose process crashed before the announcement is never announced
 
-**Status: fixed (uncommitted).** Each WAL segment records the highest announced LSN and the spans of its commits' own mutations. `Drop` and `shutdown` seal the mark. A flush waits for every issued announcement before rotating L0, and the post-commit auto-flush now runs after the publish. At open, `wal_recovery::replay_wal` classifies each unannounced commit against the state before it, and `deliver_recovered_commits` announces it ahead of the recovered loads. Reproduced by `triggers::wal_recovery_announce_resilience` (5 tests). The 3 crash tests and the drop test fail with the mechanisms switched off, and the flush test fails with only the barrier switched off. One finding along the way: a declared trigger's action writes waited in the WAL buffer until the next segment, so dropping the database lost them. The seal now persists them.
+**Status: fixed (uncommitted).** Each WAL segment records the highest announced LSN and the spans of its commits' own mutations. `Drop` and `shutdown` seal the mark. A flush waits for every issued announcement before rotating L0, and the post-commit auto-flush now runs after the publish. At open, `wal_recovery::replay_wal` classifies each unannounced commit against the state before it, and `deliver_recovered_commits` announces it ahead of the recovered loads. Reproduced by `triggers::wal_recovery_announce_resilience` (5 tests). The 3 crash tests and the drop test fail with the mechanisms switched off, and the flush test fails with only the barrier switched off. One finding along the way: a declared trigger's action writes waited in the WAL buffer until the next segment, so dropping the database lost them. The seal now persists them. Correction found later in G1: the drop-time seal as committed (`3192cc62f`) waited for `flush_lock`, which deadlocked a drop on a `current_thread` runtime while a flush held the lock. The seal is now skipped in that case, which at most re-announces the latest commits at the next open.
 
 - **How known:** code-read.
 - **Impact:** it can silently lose events in normal operation.
@@ -98,6 +98,24 @@ may hit this panic.
 If it does, guard the read-back so it never outlives a dropped runtime. A Lance
 fix, if one is needed, requires a minimal repro that pins the panic there first.
 
+### D4. Two processes loading the same model on a cold cache: one fails instead of waiting
+
+**How known:** reproduced on 2026-10-22, during G1.
+- Running the model-backed integration tests in parallel against an empty
+  `UNI_CACHE_DIR` and `HF_HOME` failed 16 of the 23 ungated tests. Each failure
+  was `Could not download ONNX model 'model.onnx': Lock acquisition failed:
+  <cache>/…/blobs/<sha>.lock`, or the same message from Candle. The same tests
+  run one at a time all passed.
+- hf-hub takes a non-blocking file lock per blob, and fails at once when
+  another process holds it. uni-xervo passes that failure through as a load
+  error, so an application whose instances start together on a cold cache gets
+  a failed model load (and, for an auto-embedding write, a failed `CREATE`).
+
+**Fix direction (uni-xervo):** on hf-hub's lock-acquisition error, wait for the
+other process's download, bounded by the load timeout, and then use the cached
+file rather than failing. The nightly sweep serializes model-backed tests until
+that change lands (`model-downloads` test group in `.config/nextest.toml`).
+
 ## Limits (documented, by design for now)
 
 ### L1. Events delivered at open reach only consumers present during `build`
@@ -145,6 +163,46 @@ fix, if one is needed, requires a minimal repro that pins the panic there first.
 
 ### G1. Ignored soaks and probes that do not run to completion anywhere
 
+**Status: closed for the whole class (uncommitted); the premise above was partly wrong.**
+- **The DQP soaks did run:** the nightly `dqp` job runs all of them, 13 in all,
+  under `test(/metamorphic::dqp::/) and test(soak)`. The stress tests run in the
+  `soak` job. Running the `dqp` job's exact command locally passed all 13 in
+  35.2 min wall-clock, with the slowest, `topo_small_batches_soak`, at 34.5 min
+  against the 54-minute per-test ceiling. Five of the 13 (`flush_pushdown`,
+  `flush_wide`, `cert`, `topo`, `topo_small_batches`) had never been timed.
+  The comments in `nightly.yml` and `.config/nextest.toml` now carry these
+  measurements.
+- **The real gap was larger than G1's list.** `cargo nextest list` against
+  every lane's filter showed that 85 of 165 ignored tests ran nowhere. Run
+  once, 75 passed and four did not:
+  - `second_handle_observes_fork_created_elsewhere` fails by design: it
+    specifies unsupported behaviour, and the black book wrongly said it "pins"
+    something.
+  - `test_auto_embedding_and_vector_search` had rotted against a removed index
+    DDL (`embedding.alias is required`). It is rewritten against the public API.
+  - `teeth_refind_issue_300` fails by design: it passes only against an engine
+    from before the #300 fix.
+  - `test_count_scaling` hung, which exposed a **deadlock in D1's drop-time
+    WAL seal**. On a `current_thread` runtime the seal waited for `flush_lock`
+    while a flush that only that thread could drive held it. This is fixed:
+    `Drop` now seals only if the lock is free. The regression test
+    `dropping_a_database_mid_flush_on_a_current_thread_runtime_returns_resilience`
+    times out without the fix.
+- **The fix:** a nightly `ignored-sweep` job runs every ignored test that no
+  dedicated lane selects, except those listed in `ON_DEMAND` in
+  `scripts/ci/ignored_tests.py`. That list has 5 entries, each with its reason.
+  A new ignored test therefore runs nightly by default. The
+  `ignored-test registry` static guard checks that each dedicated lane's filter
+  still matches its workflow and that each on-demand entry names a real test.
+- **Spikes turned into tests:** the Lance per-branch index spikes
+  (`phase5a_spike_per_branch_index`, `phase5b_spike_per_branch_vector`),
+  which AGENTS.md cites as evidence, only printed what they observed. They now
+  assert it and run on every PR.
+- **Model-backed tests** run in the sweep one at a time, through a nextest test
+  group. From an empty cache, 16 of the 23 ungated model tests failed when run
+  in parallel; see D4. The bge-m3 tests now warm the model eagerly, because a
+  lazy load had to fit the cold 2.1 GB download into a 30 s query timeout.
+
 **Unfinished in a local `--run-ignored only` failpoint run:** these hit the
 180 s debug ceiling.
 - **DQP soaks:** `plan_cache_agg_soak`, `pinned_agg_soak`, `pinned_soak`,
@@ -173,6 +231,12 @@ whose filter is `(test(/soak/) | test(/stress/)) and not test(/dqp::/)`:
 
 ### G2. The Rust↔Python parity check does not cover the bulk builders
 
+**Status: fixed (uncommitted).** `BulkWriterBuilder` and `AppenderBuilder`
+are in `BUILDER_PARITY`. Their constructors (`new_unguarded`, `new_from_tx`)
+are allowlisted with reasons, and the check now covers 67/85 methods on 8
+types. Hiding the Python `skip_before_triggers` binding makes the check fail
+with `BulkWriterBuilder.skip_before_triggers`.
+
 - `scripts/ci/check_rust_python_parity.py` compares builder methods only for
   `QueryBuilder`, `TxQueryBuilder`, `LocyBuilder` and `TxLocyBuilder`.
   `RUST_BUILDER_SRC` lists only `session.rs`, `transaction.rs` and
@@ -183,6 +247,18 @@ whose filter is `(test(/soak/) | test(/stress/)) and not test(/dqp::/)`:
 - **Action:** add both builders to `BUILDER_PARITY`, with their Rust sources.
 
 ### G3. Local verification missed two checks CI runs
+
+**Status: fixed (uncommitted).**
+- `scripts/ci/static_guards.py` is now the only list of static guards.
+  `pr.yml`'s `static-guards` job runs it, so the runbook cannot drift from CI.
+- `--with-fuzz-lock` adds the `fuzz/Cargo.lock` check, which works on stable
+  cargo.
+- The runbook's quick path for Rust-only changes now starts with
+  `static_guards.py --with-fuzz-lock`.
+- The fuzz section documents the lock refresh,
+  `cargo update --workspace --manifest-path fuzz/Cargo.toml`.
+- Checked by simulating PR #318's case: giving `uni-common` a new dependency
+  failed the check, and the documented refresh fixed it.
 
 PR #318's first CI run failed on two checks that the local lanes had not run
 after the binding change:

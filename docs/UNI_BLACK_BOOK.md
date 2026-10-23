@@ -1659,8 +1659,11 @@ source table per query — measured at ~0.33 ms on a small traversal, about 5–
 > Second, the failure is **silent**: `Uni::list_forks` returns a shorter list,
 > never an error, so a stale read is indistinguishable from a store with no
 > forks. Callers that would act on the list (create-if-absent, TTL sweeps)
-> should re-open the handle instead. Pinned by the `#[ignore]`d
-> `second_handle_observes_fork_created_elsewhere` in the same test file.
+> should re-open the handle instead. The `#[ignore]`d
+> `second_handle_observes_fork_created_elsewhere` in the same test file
+> asserts the *desired* behaviour, so it fails today and pins nothing; it is
+> kept as the specification and registered as on-demand-only in
+> `scripts/ci/ignored_tests.py`.
 
 ### AdjacencyDataset (Persistent CSR)
 

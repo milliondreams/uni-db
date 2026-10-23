@@ -257,3 +257,59 @@ mod crash {
         );
     }
 }
+
+/// Dropping a database on a `current_thread` runtime returns while a flush
+/// holds the writer's lock. The drop seals the WAL (records which commits were
+/// announced), and the seal used to wait for that lock while blocking the only
+/// thread the flush could run on: the drop hung for good. Found as
+/// `perf::test_count_performance::test_count_scaling` hanging at its end, the
+/// first time the nightly ignored-test sweep ran it; this is its shape. Fails
+/// (times out) with the drop-time seal waiting for the lock.
+#[test]
+fn dropping_a_database_mid_flush_on_a_current_thread_runtime_returns_resilience() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("store");
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    // On its own thread, so a hang fails this test instead of the suite.
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let db = open(&root).await;
+            db.schema()
+                .label("A")
+                .property("x", DataType::Int64)
+                .apply()
+                .await
+                .expect("schema");
+            // The shape of `test_count_scaling`, where the hang was found:
+            // load, read, then delete everything, at growing sizes.
+            for size in [100_i64, 500, 1_000, 2_000, 5_000] {
+                let rows: Vec<_> = (0..size)
+                    .map(|i| {
+                        std::collections::HashMap::from([("x".to_string(), uni_db::Value::Int(i))])
+                    })
+                    .collect();
+                let tx = db.session().tx().await.expect("tx");
+                tx.bulk_insert_vertices("A", rows).await.expect("insert");
+                tx.commit().await.expect("commit");
+                db.session()
+                    .query("MATCH (n:A) RETURN count(n) AS n")
+                    .await
+                    .expect("count");
+                let tx = db.session().tx().await.expect("tx");
+                tx.execute("MATCH (n:A) DETACH DELETE n")
+                    .await
+                    .expect("delete");
+                tx.commit().await.expect("commit");
+            }
+            drop(db);
+        });
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("dropping the database hung");
+}

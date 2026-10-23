@@ -47,6 +47,11 @@
   mechanism, and migration recipe: `docs/test_layout.md`.
 - Benchmarks go in `crates/uni/benches/` using Criterion.
 - If a test is flaky or sensitive to parallelism, document the constraint in a comment at the test site.
+- **An `#[ignore]`d test still has to run somewhere.** The nightly `ignored-sweep` job
+  runs every ignored test except those a dedicated lane already selects and those
+  listed in `ON_DEMAND` in `scripts/ci/ignored_tests.py` (each with the reason it
+  cannot run unattended). Slow, model-backed and assertion-free probes belong in the
+  sweep, not in `ON_DEMAND`: running them is what catches a hang or a rotted API.
 - For TCK compliance runs, use `scripts/run_tck_with_report.sh`.
 - For filtered TCK subsets, use `scripts/run_tck_with_report.sh "~Match1"` (replace filter as needed).
 - TCK run artifacts are written under `target/cucumber/` (results/report) and synced into `compliance_reports/` by mode.

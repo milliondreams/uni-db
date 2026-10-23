@@ -931,6 +931,19 @@ impl Transaction {
         labels: &[&str],
         properties_list: Vec<uni_common::Properties>,
     ) -> Result<Vec<uni_common::core::id::Vid>> {
+        self.insert_vertices_batch_impl(labels, properties_list, false)
+            .await
+    }
+
+    /// Shared body of the bulk vertex inserts. `allow_schemaless` admits
+    /// undeclared labels, as a Cypher `CREATE` does; the public bulk API
+    /// stays strict and only fork promote passes `true`.
+    async fn insert_vertices_batch_impl(
+        &self,
+        labels: &[&str],
+        properties_list: Vec<uni_common::Properties>,
+        allow_schemaless: bool,
+    ) -> Result<Vec<uni_common::core::id::Vid>> {
         self.check_completed()?;
         if labels.is_empty() {
             return Err(UniError::Schema {
@@ -938,14 +951,16 @@ impl Transaction {
                     .to_string(),
             });
         }
-        let schema = self.db.schema.schema();
-        for label in labels {
-            schema
-                .labels
-                .get(*label)
-                .ok_or_else(|| UniError::LabelNotFound {
-                    label: (*label).to_string(),
-                })?;
+        if !allow_schemaless {
+            let schema = self.db.schema.schema();
+            for label in labels {
+                schema
+                    .labels
+                    .get(*label)
+                    .ok_or_else(|| UniError::LabelNotFound {
+                        label: (*label).to_string(),
+                    })?;
+            }
         }
         let writer_lock = self.db.writer.as_ref().ok_or_else(|| UniError::ReadOnly {
             operation: "bulk_insert_vertices".to_string(),
@@ -1050,16 +1065,40 @@ impl Transaction {
             uni_common::Properties,
         )>,
     ) -> Result<()> {
+        self.insert_edges_batch_impl(edge_type, edges, false).await
+    }
+
+    /// Shared body of the bulk edge insert. `allow_schemaless` resolves an
+    /// undeclared edge type through the schemaless registry (interning it,
+    /// as a Cypher `CREATE` does; the commit persists it); the public bulk
+    /// API stays strict and only fork promote passes `true`.
+    async fn insert_edges_batch_impl(
+        &self,
+        edge_type: &str,
+        edges: Vec<(
+            uni_common::core::id::Vid,
+            uni_common::core::id::Vid,
+            uni_common::Properties,
+        )>,
+        allow_schemaless: bool,
+    ) -> Result<()> {
         self.check_completed()?;
-        let schema = self.db.schema.schema();
-        let edge_meta =
-            schema
-                .edge_types
-                .get(edge_type)
-                .ok_or_else(|| UniError::EdgeTypeNotFound {
+        let declared = self
+            .db
+            .schema
+            .schema()
+            .edge_types
+            .get(edge_type)
+            .map(|meta| meta.id);
+        let type_id = match declared {
+            Some(id) => id,
+            None if allow_schemaless => self.db.schema.get_or_assign_edge_type_id(edge_type),
+            None => {
+                return Err(UniError::EdgeTypeNotFound {
                     edge_type: edge_type.to_string(),
-                })?;
-        let type_id = edge_meta.id;
+                });
+            }
+        };
         let writer_lock = self.db.writer.as_ref().ok_or_else(|| UniError::ReadOnly {
             operation: "bulk_insert_edges".to_string(),
         })?;
@@ -1491,9 +1530,24 @@ impl Transaction {
         // durable, and returning an error would invite a retry that
         // double-applies it. The manager stays dirty, so the next commit
         // retries the write rather than dropping it silently.
-        if self.db.storage.fork_scope().is_none()
-            && let Err(e) = self.db.storage.schema_manager().save_if_dirty().await
-        {
+        if let Some(scope) = self.db.storage.fork_scope() {
+            // The fork's counterpart: record the names in the fork's overlay.
+            // Same failure policy — the overlay is unchanged on error, so the
+            // next commit (or the next open of this fork) retries.
+            if let Err(e) = crate::api::fork::record_fork_schemaless_edge_types(
+                scope,
+                self.db.storage.schema_manager(),
+            )
+            .await
+            {
+                tracing::error!(
+                    error = %e,
+                    "failed to persist the fork's schemaless edge types after commit; \
+                     a newly interned edge type will be lost if the process exits \
+                     before a later commit retries the write"
+                );
+            }
+        } else if let Err(e) = self.db.storage.schema_manager().save_if_dirty().await {
             tracing::error!(
                 error = %e,
                 "failed to persist the schema after commit; \
@@ -2295,7 +2349,9 @@ impl uni_fork::ForkPromoteSink for Transaction {
         label: &str,
         rows: Vec<uni_common::Properties>,
     ) -> Result<Vec<uni_common::core::id::Vid>> {
-        Transaction::bulk_insert_vertices(self, label, rows).await
+        // Promote's gate already refused a label the fork declared but
+        // primary lacks; any other undeclared label is schemaless (#306).
+        self.insert_vertices_batch_impl(&[label], rows, true).await
     }
 
     async fn bulk_insert_edges(
@@ -2307,7 +2363,8 @@ impl uni_fork::ForkPromoteSink for Transaction {
             uni_common::Properties,
         )>,
     ) -> Result<()> {
-        Transaction::bulk_insert_edges(self, edge_type, edges).await
+        // As for vertices: an undeclared edge type here is schemaless.
+        self.insert_edges_batch_impl(edge_type, edges, true).await
     }
 
     async fn update_vertex_properties(

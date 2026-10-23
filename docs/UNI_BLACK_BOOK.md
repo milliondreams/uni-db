@@ -8832,7 +8832,7 @@ A fork's on-disk presence spans several artifacts:
 - **Lance branch tree.** Each fork has one Lance branch per Lance dataset it owns. The branches sit under `<dataset>.lance/_refs/branches/{branch_name}.json` and chain to their parent via Lance's `base_paths`. A primary-rooted fork's branches chain to `main`; a nested fork's branches chain to *the parent fork's branch* (see "Fork Trees and Read Resolution" below).
 - **Per-fork allocator** at `catalog/forks/{fork_id}/id_allocator.json`. Bootstrapped from primary's VID/EID high-water-mark at fork creation so the fork's ID streams don't collide with primary's pre-existing rows that the fork reads through `base_paths`.
 - **Per-fork WAL stream** at `wal_forks/{fork_id}/`. Each commit on the fork appends WAL entries here; replay runs at `at_fork` time on session open. The flat `wal_forks/` prefix (not `wal/forks/`) avoids collision with primary's WAL listing under recursive `ObjectStore::list`.
-- **Per-fork schema overlay** at `catalog/fork_schemas/{fork_id}.json`. A `SchemaDelta` storing added labels, added edge types, and added properties; merged onto primary's schema at session open time to produce the fork's merged `SchemaManager`. Empty by default; populated through `Session::fork_schema()` under strict-schema mode (or implicitly through `BranchedBackend` dynamic-branch materialization under schemaless mode).
+- **Per-fork schema overlay** at `catalog/fork_schemas/{fork_id}.json`. A `SchemaDelta` storing added labels, added edge types, added properties, and the names of schemaless edge types the fork interned; merged onto primary's schema at session open time to produce the fork's merged `SchemaManager`. Empty by default; populated through `Session::fork_schema()` under strict-schema mode (or implicitly through `BranchedBackend` dynamic-branch materialization under schemaless mode).
 - **Registry entry** in `catalog/fork_registry.json`. A `BTreeMap<String, ForkInfo>` keyed by name, holding `(id, name, parent_fork_id, parent_snapshot_id, schema_version_at_creation, datasets: BTreeMap<dataset → branch>, status, ttl_expires_at)`.
 - **Tombstone files** at `catalog/fork_tombstones/{fork_id}.json` during drop. Written before branches are deleted; the recovery driver finishes any tombstoned fork on next open.
 
@@ -8997,6 +8997,11 @@ Identity is `compute_vertex_uid(label, None, properties)` for
 vertices and `(src_uid, dst_uid)` (scoped to the edge type) for
 edges, so two unrelated forks with overlapping VID allocation still
 pair correctly. `DiffVertex.vid` survives as informational metadata.
+The labels and edge types scanned are, per side, the declared ones
+plus those discovered in data (`MATCH (n) RETURN DISTINCT labels(n)`,
+`MATCH ()-[r]->() RETURN DISTINCT type(r)`), so schemaless labels and
+edge types diff like declared ones (#306); a schema-only enumeration
+returned an empty diff for them.
 
 `ForkDiff::invert()` is provided so the algebraic relation
 `diff(a, b).invert() == diff(b, a)` is enforced by construction; it
@@ -9026,19 +9031,45 @@ worth knowing. The shared
 entries from both primary and fork branches. `UidIndex::get_vid`
 returns *any* registered VID for a UID, even one that belongs to
 a fork-only vertex. The promote engine corrects for this with
-`resolve_primary_vid`, which takes the candidate VID and verifies
-via `MATCH (n:Label) WHERE id(n) = $vid` on a primary session;
-primary's branched backend naturally excludes fork-only rows.
-Don't roll your own UID→primary-VID lookup without this round-trip.
+`batch_resolve_primary_vids` (`crates/uni-fork/src/diff.rs`), which
+takes the candidate VIDs and verifies via `MATCH (n:Label) WHERE id(n)
+IN [...]` on a primary session; primary's branched backend naturally
+excludes fork-only rows. Don't roll your own UID→primary-VID lookup
+without this round-trip. A label undeclared on primary has no
+`UidIndex` (the flush registers UIDs only for declared labels), so for
+it the helper hashes a content scan of the label on primary instead.
 
-**Schema growth interaction.** A fork-only label promoted to primary
-must already have its dataset registered on primary's schema —
-promote does *not* auto-create labels. The intended path is:
-`db.schema().label("NewLabel").apply().await` on primary, then
-`promote_from_fork(fork_name, &[PromotePattern::label("NewLabel")])`.
-Same for fork-only edge types: register on primary first or the
-call errors with `UniError::EdgeTypeNotFound` *before* opening
-the primary transaction.
+**Schema growth interaction.** Promote does *not* auto-declare
+labels or edge types. A target declared on primary is inserted as
+declared; a target declared on *neither* side (schemaless) is inserted
+schemalessly, as a Cypher `CREATE` on primary would write it (the
+`ForkPromoteSink` impl uses crate-private schemaless-aware inserts; the
+public `Transaction::bulk_insert_*` stay strict). A label or edge type
+the fork *declared* (`Session::fork_schema()`) but primary lacks is
+refused with `UniError::LabelNotFound` / `EdgeTypeNotFound` *before*
+opening the primary transaction — a schemaless insert would silently
+drop the declaration. The intended path for those is
+`db.schema().label("NewLabel").apply().await` on primary first.
+
+**Schemaless edge types across fork sessions.** A schemaless edge type
+id (bit 31 set) is assigned by the in-memory
+`SchemalessEdgeTypeRegistry`. A fork's registry lives in its merged
+schema, which is never saved and is rebuilt on each open from primary's
+*current* registry, where the fork's old id may since name another
+type. The name is therefore the only durable identity:
+`SchemaDelta.added_schemaless_edge_types` records the names a fork
+interned (after each fork commit and after its WAL replay, through
+`ForkScope::record_schemaless_edge_types`), `with_overlay` re-interns
+them with fresh ids, and WAL replay (`Writer::remap_replayed_edge_types`)
+re-derives each replayed `InsertEdge` / `DeleteEdge` type id from the
+record's `edge_type_name` (primary included; its open saves the catalog
+when replay interned a name). Schemaless edge types are also fork
+candidate datasets (`fork_candidate_dataset_names`), so their
+`deltas_*` / `adjacency_*` tables are branched at the fork point like a
+declared type's. A reopened fork's writer resumes its version floor from
+the fork's own latest snapshot
+(`max(fork_point_version_hwm, version_high_water_mark + 1)`), so a write
+to a row the fork already flushed is stamped above that row.
 
 **Fork flush.** `promote_from_fork` opens a fresh fork session and
 calls `fork.flush().await?` before scanning. Without this, edges

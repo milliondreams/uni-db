@@ -1395,6 +1395,7 @@ impl L0Buffer {
                 dst_vid,
                 edge_type,
                 version: self.current_version,
+                edge_type_name: self.edge_types.get(&eid).cloned(),
             })?;
         }
 
@@ -2019,6 +2020,7 @@ impl L0Buffer {
                     dst_vid,
                     edge_type,
                     version: _,
+                    edge_type_name: _,
                 } => {
                     self.current_version += 1;
                     self.apply_edge_deletion(eid, src_vid, dst_vid, edge_type);

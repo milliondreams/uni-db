@@ -1073,6 +1073,68 @@ impl Writer {
         }
     }
 
+    /// Re-resolve every replayed edge mutation's type id from its type name.
+    ///
+    /// A schemaless edge type id is assigned by the in-memory registry of the
+    /// process that wrote the WAL record, and that registry need not survive:
+    /// a fork's merged schema is never saved, and is rebuilt on reopen from
+    /// primary's *current* registry, where the fork's old id may since have
+    /// been given to a different name. Replaying the raw id then either
+    /// relabels the edge (the id now names another type) or makes the next
+    /// flush fail (`Edge type ID … not found`). The name in the record is the
+    /// authority; the id is re-derived from it here, interning the name when
+    /// the registry no longer knows it.
+    ///
+    /// An edge delete written before deletes carried a name falls back to the
+    /// name an insert in this same replay gave its id; failing that, its id is
+    /// left as written.
+    fn remap_replayed_edge_types<'a>(
+        &self,
+        mutations: impl IntoIterator<Item = &'a mut crate::runtime::wal::Mutation>,
+    ) {
+        use crate::runtime::wal::Mutation;
+        let mut name_by_logged_id: HashMap<u32, String> = HashMap::new();
+        let mut remapped = 0usize;
+        for mutation in mutations {
+            let (edge_type, name) = match mutation {
+                Mutation::InsertEdge {
+                    edge_type,
+                    edge_type_name: Some(name),
+                    ..
+                } => {
+                    name_by_logged_id
+                        .entry(*edge_type)
+                        .or_insert_with(|| name.clone());
+                    (edge_type, name.clone())
+                }
+                Mutation::DeleteEdge {
+                    edge_type,
+                    edge_type_name,
+                    ..
+                } => {
+                    let Some(name) = edge_type_name
+                        .clone()
+                        .or_else(|| name_by_logged_id.get(edge_type).cloned())
+                    else {
+                        continue;
+                    };
+                    (edge_type, name)
+                }
+                _ => continue,
+            };
+            let id = self.schema_manager.get_or_assign_edge_type_id(&name);
+            if *edge_type != id {
+                *edge_type = id;
+                remapped += 1;
+            }
+        }
+        if remapped > 0 {
+            log::info!(
+                "WAL replay: re-resolved the edge type id of {remapped} edge mutations by name"
+            );
+        }
+    }
+
     /// Replay the WAL above `wal_high_water_mark` into L0 in one step.
     ///
     /// Announces nothing: a caller that announces recovered commits drives
@@ -1127,7 +1189,15 @@ impl Writer {
         // flush that published it; new ones must number above it, or the
         // next recovery skips them.
         wal.ensure_lsn_above(wal_high_water_mark)?;
-        let replay = wal.replay_segments_since(wal_high_water_mark).await?;
+        let mut replay = wal.replay_segments_since(wal_high_water_mark).await?;
+        // Remapped across every segment at once, so a legacy unnamed delete
+        // can borrow the name an insert in an earlier segment gave its id.
+        self.remap_replayed_edge_types(
+            replay
+                .segments
+                .iter_mut()
+                .flat_map(|segment| segment.mutations.iter_mut()),
+        );
         self.unmarked_wal_segments
             .store(replay.unmarked_segments, Ordering::Release);
         let announced_through = replay
@@ -2055,6 +2125,16 @@ impl Writer {
                 // which of its mutations are this commit's (`CommitSpan`):
                 // recovery announces exactly those.
                 let mut pending = Vec::new();
+                // An edge delete records its type NAME as well as its id, so
+                // replay can resolve the type by name: a schemaless id is
+                // only meaningful in this process's registry.
+                let wal_edge_type_name = |eid: Eid, edge_type: u32| {
+                    tx_l0
+                        .edge_types
+                        .get(&eid)
+                        .cloned()
+                        .or_else(|| self.schema_manager.edge_type_name_by_id_unified(edge_type))
+                };
                 // Order: vertices first, then edges (to ensure src/dst exist on replay)
 
                 // Vertex insertions
@@ -2107,6 +2187,7 @@ impl Writer {
                             dst_vid: *dst_vid,
                             edge_type: *edge_type,
                             version,
+                            edge_type_name: wal_edge_type_name(*eid, *edge_type),
                         });
                     } else {
                         let properties =
@@ -2139,6 +2220,7 @@ impl Writer {
                             dst_vid: tombstone.dst_vid,
                             edge_type: tombstone.edge_type,
                             version,
+                            edge_type_name: wal_edge_type_name(*eid, tombstone.edge_type),
                         });
                     }
                 }

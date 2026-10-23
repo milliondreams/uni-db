@@ -809,14 +809,30 @@ impl UniInner {
         // a per-fork WAL stream (Day 5), and the fork-scoped storage's
         // BranchedBackend (Day 2). User writes are still gated at
         // `Session::tx()` until Day 7.
+        // The fork's own latest snapshot, recorded at each fork flush under
+        // `catalog/forks/{fork_id}/latest`. `None` for a fork that never
+        // flushed.
+        let fork_latest_snapshot = forked_storage
+            .snapshot_manager()
+            .load_latest_snapshot()
+            .await
+            .map_err(UniError::Internal)?;
+        // The fork's MVCC version floor: above the parent's fork-point HWM, so
+        // in-tx fork reads see inherited rows, AND above every version the
+        // fork itself already flushed, exactly as primary's open resumes from
+        // its snapshot's HWM. WAL replay below only advances the counter past
+        // the *unflushed* writes; starting at the fork point instead let a
+        // reopened fork stamp a write at or below a version it had already
+        // flushed, so a delete of a flushed edge lost to the older insert.
+        let fork_start_version = fork_latest_snapshot
+            .as_ref()
+            .map_or(0, |s| s.version_high_water_mark + 1)
+            .max(scope.fork_info().fork_point_version_hwm);
         let forked_writer = uni_store::fork::writer_factory::new_for_fork(
             forked_storage.clone(),
             merged_schema.clone(),
             &scope.fork_id(),
-            // Bootstrap the fork's MVCC version floor to the parent's
-            // fork-point HWM so in-tx fork reads see inherited rows. WAL
-            // replay below advances the counter for the fork's own writes.
-            scope.fork_info().fork_point_version_hwm,
+            fork_start_version,
             self.config.clone(),
         )
         .await
@@ -835,13 +851,9 @@ impl UniInner {
         // double-apply them. A fork that has never flushed (or a pre-fix
         // on-disk fork) has no per-fork snapshot, so we fall back to 0 —
         // correct, since nothing has been moved out of the WAL yet.
-        let fork_wal_hwm = forked_storage
-            .snapshot_manager()
-            .load_latest_snapshot()
-            .await
-            .map_err(UniError::Internal)?
-            .map(|s| s.wal_high_water_mark)
-            .unwrap_or(0);
+        let fork_wal_hwm = fork_latest_snapshot
+            .as_ref()
+            .map_or(0, |s| s.wal_high_water_mark);
         let forked_writer_arc = Arc::new(forked_writer);
         // Commits the fork's WAL holds that the crashed process never
         // announced are announced by the caller, as recovered loads are.
@@ -854,6 +866,16 @@ impl UniInner {
             true,
         )
         .await?;
+        // Replay re-resolves edge types by name and may intern a schemaless
+        // one the overlay never recorded (a crash between the commit and its
+        // overlay write). Record it now, before a flush can move its edges
+        // into `deltas_{type}_*` where only the name finds them. Skipped on a
+        // read-only database (no primary writer), which persists nothing.
+        if self.writer.is_some() {
+            crate::api::fork::record_fork_schemaless_edge_types(&scope, &merged_schema)
+                .await
+                .map_err(UniError::Internal)?;
+        }
         // The fork's catalog view is never saved, so a downgrade stays in it.
         forked_writer_arc
             .distrust_conformance_after_unmarked_writes(false)
@@ -2497,6 +2519,16 @@ impl UniBuilder {
             .await?;
             if replayed > 0 {
                 info!("WAL recovery: replayed {} mutations", replayed);
+            }
+            // Replay re-resolves edge types by name and may intern a
+            // schemaless one the catalog never saved (a crash between a
+            // commit and its schema save). Save it before a flush moves the
+            // edges into `deltas_{type}_*`, where only the name finds them.
+            if !self.read_only {
+                schema_manager
+                    .save_if_dirty()
+                    .await
+                    .map_err(UniError::Internal)?;
             }
             recovered_commits
         };

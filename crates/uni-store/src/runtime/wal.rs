@@ -215,6 +215,12 @@ pub enum Mutation {
         dst_vid: Vid,
         edge_type: u32,
         version: u64,
+        /// Edge type name, so replay can resolve the type by name: a
+        /// schemaless `edge_type` id is only meaningful in the registry of
+        /// the process that wrote the record. `None` in segments written
+        /// before this field existed (externally-tagged serde, `default`).
+        #[serde(default)]
+        edge_type_name: Option<String>,
     },
     InsertVertex {
         vid: Vid,
@@ -1570,6 +1576,7 @@ mod tests {
                 dst_vid: Vid::new(3),
                 edge_type: 4,
                 version: 5,
+                edge_type_name: Some("T".to_string()),
             },
         ];
         let spans = vec![CommitSpan { start: 0, len: 1 }];

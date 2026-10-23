@@ -264,6 +264,18 @@ fn ext_id_equality(
     None
 }
 
+/// Whether `expr` is built only from literals, list literals and map literals —
+/// the shapes `GraphUnwindExec` evaluates itself, and the only ones whose
+/// element type it can infer natively.
+fn is_constant_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_) => true,
+        Expr::List(items) => items.iter().all(is_constant_literal),
+        Expr::Map(entries) => entries.iter().all(|(_, v)| is_constant_literal(v)),
+        _ => false,
+    }
+}
+
 /// Whether `expr` is a `sum(...)` aggregate.
 fn is_sum_aggregate(expr: &Expr) -> bool {
     matches!(expr, Expr::FunctionCall { name, window_spec: None, .. } if name.eq_ignore_ascii_case("sum"))
@@ -2392,18 +2404,38 @@ impl HybridPhysicalPlanner {
         all_properties: &HashMap<String, HashSet<String>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Recursively plan the input
-        let input_plan = self.plan_internal(&input, all_properties)?;
+        let mut input_plan = self.plan_internal(&input, all_properties)?;
 
         // Drop the source list when the planner proved nothing above reads it.
         // Without this the list rides through every operator above, and a
         // traversal replicates it once per fan-out row (#184).
-        let drop_source = match &expr {
+        let mut drop_source = match &expr {
             Expr::Variable(name) => all_properties
                 .get(crate::query::planner::DEAD_UNWIND_SOURCES_KEY)
                 .filter(|dead| dead.contains(name))
                 .map(|_| name.clone()),
             _ => None,
         };
+
+        // Anything but a column, a parameter or a constant is computed by the
+        // expression compiler into a hidden column first, and the operator
+        // unwinds that column. The operator's own row evaluator knew a handful
+        // of functions and answered `[]` for every other call and `NULL` for
+        // every other expression, so `UNWIND labels(n)` produced no rows and
+        // `UNWIND [id(n)]` produced `[]` — silently, while the same expression
+        // under `WITH` or `RETURN` was right.
+        let mut expr = expr;
+        let is_column = matches!(&expr, Expr::Variable(name) if input_plan.schema().column_with_name(name).is_some());
+        if !is_column && !matches!(expr, Expr::Parameter(_)) && !is_constant_literal(&expr) {
+            let hidden = format!("__unwind_list_{variable}");
+            input_plan = self.plan_project_from_input(
+                input_plan,
+                &[(Expr::Wildcard, None), (expr, Some(hidden.clone()))],
+                Some(&input),
+            )?;
+            expr = Expr::Variable(hidden.clone());
+            drop_source = Some(hidden);
+        }
 
         let unwind = GraphUnwindExec::new_dropping_source(
             input_plan,

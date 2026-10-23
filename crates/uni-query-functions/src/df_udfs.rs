@@ -807,43 +807,15 @@ impl ScalarUDFImpl for KeysUdf {
 
             let arg = &val_args[0];
             let keys = match arg {
-                Value::Map(map) => {
-                    // For schemaless entities, properties are stored in the
-                    // _all_props CypherValue blob.  If the map contains an _all_props
-                    // sub-map, extract property names from it instead of from
-                    // the top-level map (which only has system fields).
-                    // When _all_props is present, the input is a schemaless
-                    // entity (node/relationship).  Per the property graph model,
-                    // a null-valued property does not exist on the entity, so we
-                    // must filter it out.  For plain maps (literal or parameter),
-                    // null-valued keys are valid and must be included.
-                    let (source, is_entity) =
-                        match uni_common::value::entity_property_container(map) {
-                            Some(props) => (props, true),
-                            None => (map, false),
-                        };
-                    let mut key_strings: Vec<String> = source
-                        .iter()
-                        .filter(|(k, v)| {
-                            !uni_common::core::schema::is_reserved_property_name(k)
-                                && (!is_entity || !v.is_null())
-                        })
-                        .map(|(k, _)| k.clone())
-                        .collect();
-                    key_strings.sort();
-                    key_strings
-                        .into_iter()
-                        .map(Value::String)
-                        .collect::<Vec<_>>()
-                }
-                // Native encodings. Only the map form was handled, so
-                // `keys(n)` on a `Value::Node` fell to the catch-all and
-                // returned an empty list — a wrong answer with no error, and
-                // indistinguishable from an entity that genuinely has no
-                // properties (#234). A null-valued property does not exist on
-                // an entity, per the property graph model, so it is filtered
-                // out here exactly as the map arm above does.
-                Value::Node(_) | Value::Edge(_) => arg
+                // An OPTIONAL MATCH that found nothing reaches here as a struct
+                // of null columns rather than a null struct; its identity
+                // column is the tell (see `properties()` below).
+                Value::Map(map) if is_null_entity_struct(map) => return Ok(Value::Null),
+                // One definition for every encoding (#234). A null-valued
+                // property does not exist on an entity, so it is dropped; on a
+                // plain map (a literal or a parameter) a null value is a
+                // legitimate entry and its key is kept.
+                Value::Map(_) | Value::Node(_) | Value::Edge(_) => arg
                     .property_names()
                     .unwrap_or_default()
                     .into_iter()
@@ -867,6 +839,20 @@ impl ScalarUDFImpl for KeysUdf {
 // ============================================================================
 // properties(entity) -> Map (all user-visible properties as a map)
 // ============================================================================
+
+/// Whether `map` is the struct an OPTIONAL MATCH builds for an entity it did
+/// not find: the identity column (`_vid` for a node, `_eid` for an edge) is
+/// present and null.
+///
+/// `add_structural_projection` builds a `named_struct` from the entity's
+/// individual columns, which yields a valid struct of null fields rather than a
+/// null struct. A plain map (`properties({name: 'foo'})`) has no identity
+/// column, so it is never mistaken for one.
+fn is_null_entity_struct(map: &std::collections::HashMap<String, Value>) -> bool {
+    map.get("_vid")
+        .or_else(|| map.get("_eid"))
+        .is_some_and(Value::is_null)
+}
 
 pub fn create_properties_udf() -> ScalarUDF {
     ScalarUDF::new_from_impl(PropertiesUdf::new())
@@ -922,18 +908,20 @@ impl ScalarUDFImpl for PropertiesUdf {
                     // Note: only check when the field EXISTS — regular maps passed
                     // to properties() (e.g. properties({name: 'foo'})) won't have
                     // these fields and should proceed normally.
-                    let identity_null = map
-                        .get("_vid")
-                        .map(|v| v.is_null())
-                        .or_else(|| map.get("_eid").map(|v| v.is_null()))
-                        .unwrap_or(false);
-                    if identity_null {
+                    if is_null_entity_struct(map) {
                         return Ok(Value::Null);
                     }
 
-                    // A schemaless or serialised entity nests its properties.
+                    // An entity, in any of its map encodings: a null-valued
+                    // property does not exist on it. A declared label's
+                    // columns sit flattened beside `_all_props: null`, so an
+                    // unset declared property arrived here as a null entry and
+                    // `properties(n)` listed it.
+                    if let Some(props) = arg.entity_properties() {
+                        return Ok(Value::Map(props));
+                    }
+                    // A plain map keeps its null entries.
                     let source = uni_common::value::entity_property_container(map).unwrap_or(map);
-                    // Filter out the engine's reserved fields
                     let filtered: std::collections::HashMap<String, Value> = source
                         .iter()
                         .filter(|(k, _)| !uni_common::core::schema::is_reserved_property_name(k))
@@ -944,10 +932,10 @@ impl ScalarUDFImpl for PropertiesUdf {
                 // Native encodings. Falling through to `Value::Null` meant
                 // `properties(n)` silently returned null for an entity that was
                 // present — the same shape as the map arm above, one encoding
-                // short (#234). Their property maps hold user properties only,
-                // so no `_`-filtering is needed here.
-                Value::Node(node) => Ok(Value::Map(node.properties.clone())),
-                Value::Edge(edge) => Ok(Value::Map(edge.properties.clone())),
+                // short (#234).
+                Value::Node(_) | Value::Edge(_) => {
+                    Ok(Value::Map(arg.entity_properties().unwrap_or_default()))
+                }
                 _ => Ok(Value::Null),
             }
         })

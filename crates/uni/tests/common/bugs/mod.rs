@@ -238,3 +238,6 @@ pub mod wal_lsn_after_reopen;
 // Mutating built-in procedures are refused in read-only contexts and are
 // authorized as `dbms` / `schema`, never `read`.
 pub mod admin_procedure_read_only;
+// UNWIND evaluates its list expression with the expression compiler, and
+// types `nodes(p)` / `relationships(p)` elements as entities.
+pub mod unwind_entity_attribute_functions;

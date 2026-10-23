@@ -423,6 +423,13 @@ fn infer_unwind_output_type(expr: &Expr, vars_in_scope: &[VariableInfo]) -> Vari
         {
             infer_with_output_type(&args[0], vars_in_scope)
         }
+        // `nodes(p)` / `relationships(p)` yield nodes / relationships one at a
+        // time. Typing the element `Scalar` rejected `UNWIND nodes(p) AS m
+        // RETURN labels(m)` as "labels() requires a node argument".
+        Expr::FunctionCall { .. } => match infer_with_output_type(expr, vars_in_scope) {
+            t @ (VariableType::NodeList | VariableType::EdgeList) => unwrap_list_type(t),
+            _ => VariableType::Scalar,
+        },
         Expr::List(items) => {
             let mut inferred: Option<VariableType> = None;
             for item in items {

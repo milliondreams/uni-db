@@ -903,10 +903,14 @@ impl Value {
             Value::Node(node) => (&node.properties, true),
             Value::Edge(edge) => (&edge.properties, true),
             // A nested container holds an entity's properties; the top level
-            // holds system fields only.
+            // holds system fields only. A flattened entity — a declared
+            // label's or edge type's columns beside `_all_props: null` — has
+            // no container but is still an entity: its declared-but-unset
+            // properties are null columns, and reading it as a plain map
+            // listed every one of them.
             Value::Map(map) => match entity_property_container(map) {
                 Some(props) => (props, true),
-                None => (map, false),
+                None => (map, entity_ref_from_map(map).is_some()),
             },
             _ => return None,
         };

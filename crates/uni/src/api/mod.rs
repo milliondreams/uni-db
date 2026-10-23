@@ -18,6 +18,7 @@ pub mod appender {
 }
 pub mod builder;
 pub(crate) mod bulk_events;
+pub(crate) mod commit_events;
 /// Bulk writer engine, re-exported from `uni-bulk`.
 ///
 /// Shim kept so `crate::api::bulk::*` paths resolve unchanged after the
@@ -70,6 +71,7 @@ pub mod session;
 pub mod sync;
 pub mod template;
 pub mod transaction;
+pub(crate) mod wal_recovery;
 /// Trigger dispatch engine — moved to `uni-plugin-host`; re-exported to keep
 /// the `uni_db::api::triggers::*` path stable.
 pub mod triggers {
@@ -711,7 +713,11 @@ impl UniInner {
     pub(crate) async fn at_fork(
         &self,
         scope: Arc<uni_store::fork::ForkScope>,
-    ) -> Result<(UniInner, Vec<uni_bulk::RecoveredLoad>)> {
+    ) -> Result<(
+        UniInner,
+        Vec<uni_bulk::RecoveredLoad>,
+        Vec<wal_recovery::RecoveredCommit>,
+    )> {
         // Phase 3 (nested forks): `self` may itself be a fork-scoped
         // UniInner, in which case `self.schema` already encodes
         // `primary ⊕ parent_overlay`. Layering the child's overlay on
@@ -810,18 +816,26 @@ impl UniInner {
             .map_err(UniError::Internal)?
             .map(|s| s.wal_high_water_mark)
             .unwrap_or(0);
-        let replayed = forked_writer
-            .replay_wal(fork_wal_hwm)
-            .await
-            .map_err(UniError::Internal)?;
+        let forked_writer_arc = Arc::new(forked_writer);
+        // Commits the fork's WAL holds that the crashed process never
+        // announced are announced by the caller, as recovered loads are.
+        let (replayed, recovered_commits) = wal_recovery::replay_wal(
+            &forked_writer_arc,
+            &forked_storage,
+            &prop_manager,
+            &self.plugin_registry,
+            fork_wal_hwm,
+            true,
+        )
+        .await?;
         // The fork's catalog view is never saved, so a downgrade stays in it.
-        forked_writer
+        forked_writer_arc
             .distrust_conformance_after_unmarked_writes(false)
             .await
             .map_err(UniError::Internal)?;
         // As on the primary: a fork load completed by recovery above has its
         // edges' declared endpoints checked once the fork's WAL is replayed.
-        uni_bulk::check_recovered_bulk_endpoints(&forked_storage, &forked_writer, true)
+        uni_bulk::check_recovered_bulk_endpoints(&forked_storage, &forked_writer_arc, true)
             .await
             .map_err(UniError::Internal)?;
         if replayed > 0 {
@@ -832,7 +846,6 @@ impl UniInner {
             );
         }
 
-        let forked_writer_arc = Arc::new(forked_writer);
         let executor_template = build_executor_template(
             forked_storage.clone(),
             self.config.clone(),
@@ -854,6 +867,7 @@ impl UniInner {
                 executor_template,
             ),
             recovered_loads,
+            recovered_commits,
         ))
     }
 }
@@ -1428,6 +1442,16 @@ impl Uni {
             if let Err(e) = writer.flush_to_l1(None).await {
                 tracing::error!("Error flushing during shutdown: {}", e);
             }
+            // A flush that did not run (or found nothing to flush) leaves
+            // announced commits in the WAL; record that they were announced,
+            // so the next open does not announce them again.
+            if let Err(e) = writer.seal_wal().await {
+                tracing::warn!(
+                    error = %e,
+                    "could not record the WAL's announced mark at shutdown; the next open \
+                     announces the latest commits again",
+                );
+            }
             // Close the async-flush coordinator's submit channel so its
             // finalizer task exits now. The finalizer's JoinHandle is
             // tracked by `shutdown_handle`, but the loop blocks on
@@ -1676,6 +1700,39 @@ impl Drop for ScratchDir {
     }
 }
 
+impl UniInner {
+    /// Record the WAL's announced mark (`Writer::seal_wal`) as this view
+    /// closes, so a reopen does not announce the commits announced since the
+    /// last WAL segment again. A temporary database is never reopened, and
+    /// is skipped.
+    ///
+    /// Runs the write on the process-wide IO runtime: `Drop` is synchronous
+    /// and may run on a runtime thread, or on none.
+    fn seal_wal_on_drop(&self) {
+        let Some(writer) = self.writer.as_ref() else {
+            return;
+        };
+        if self._temp_dir.is_some() || !writer.wal_needs_seal() {
+            return;
+        }
+        let writer = Arc::clone(writer);
+        let sealed =
+            uni_store::runtime::io_runtime::block_on_io_runtime(
+                async move { writer.seal_wal().await },
+            );
+        let error = match sealed {
+            Ok(Ok(())) => return,
+            Ok(Err(e)) => e.to_string(),
+            Err(e) => e.to_string(),
+        };
+        tracing::warn!(
+            error,
+            "could not record the WAL's announced mark as the database closed; the next open \
+             announces the latest commits again",
+        );
+    }
+}
+
 impl Drop for UniInner {
     /// Signal this view's own background tasks, and reap the scratch directory
     /// on the implicit teardown path.
@@ -1692,6 +1749,7 @@ impl Drop for UniInner {
     /// when the *last* `Arc` dies, not when one handle goes out of scope while
     /// a `Session` still holds a reference to the data underneath it.
     fn drop(&mut self) {
+        self.seal_wal_on_drop();
         // Stop the tasks this view started; nothing can reach them any more. A
         // fork's last session going away is the common case. Tasks of views
         // derived from this one (a nested fork) are left alone, and the tasks
@@ -2386,15 +2444,27 @@ impl UniBuilder {
         // with LSN > wal_high_water_mark (the snapshot manifest's mark) are
         // replayed, so this is exactly the committed-but-unflushed suffix and
         // cannot double-apply.
-        {
-            let replayed = writer
-                .replay_wal(wal_high_water_mark)
-                .await
-                .map_err(UniError::Internal)?;
+        //
+        // Commits in it that the crashed process made durable but never
+        // announced are announced at the end of the open, once the broadcaster
+        // and the reactivated declared triggers exist; their places in the
+        // announcement order are taken now (see `wal_recovery`). A read-only
+        // open has nothing to announce with.
+        let recovered_commits = {
+            let (replayed, recovered_commits) = wal_recovery::replay_wal(
+                &writer,
+                &storage,
+                &prop_manager,
+                &plugin_registry,
+                wal_high_water_mark,
+                !self.read_only,
+            )
+            .await?;
             if replayed > 0 {
                 info!("WAL recovery: replayed {} mutations", replayed);
             }
-        }
+            recovered_commits
+        };
         // A WAL segment or latest manifest written by a binary that does not
         // enforce declared edge endpoints voids the catalog's conformance
         // records; a read-only open downgrades its in-memory view only.
@@ -2887,10 +2957,12 @@ impl UniBuilder {
             track_task_with_scratch_claim(&db.inner.shutdown_handle, scratch_dir.as_ref(), handle);
         }
 
-        // Deliver the events of the bulk loads recovery completed above, now
+        // Announce the commits the WAL replay above recovered unannounced,
+        // then deliver the events of the bulk loads recovery completed, now
         // that the commit broadcaster, the CDC runtime and the reactivated
         // declared triggers exist. Their announcements are ordered here, so
         // they precede every commit made through the returned handle.
+        wal_recovery::deliver_recovered_commits(&db.inner, recovered_commits);
         bulk_events::deliver_recovered_loads(&db.inner, recovered_loads).await;
 
         Ok(db)
@@ -3031,7 +3103,7 @@ mod fork_inner_tests {
             registry,
         ));
 
-        let (forked_inner, _) = primary_inner.at_fork(scope.clone()).await.unwrap();
+        let (forked_inner, _, _) = primary_inner.at_fork(scope.clone()).await.unwrap();
         assert!(forked_inner.storage.fork_scope().is_some());
         // Phase 2 Day 4: a forked UniInner now carries its own Writer.
         // The Writer's storage is the fork-scoped clone; its allocator

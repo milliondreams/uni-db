@@ -357,10 +357,17 @@ proptest! {
         lsn in 1u64..10000,
         mutations in prop::collection::vec(mutation_strategy(), 0..10)
     ) {
+        let mutations_len = mutations.len();
         let segment = WalSegment {
             lsn,
             mutations,
             writer_features: uni_common::core::schema::current_writer_features(),
+            announced_through: lsn / 2,
+            commits: if mutations_len > 0 {
+                vec![uni_store::runtime::wal::CommitSpan { start: 0, len: mutations_len }]
+            } else {
+                Vec::new()
+            },
         };
         let json = serde_json::to_string(&segment).expect("serialize");
         let restored: WalSegment = serde_json::from_str(&json).expect("deserialize");
@@ -368,5 +375,7 @@ proptest! {
         prop_assert_eq!(segment.lsn, restored.lsn);
         prop_assert_eq!(segment.mutations.len(), restored.mutations.len());
         prop_assert_eq!(segment.writer_features, restored.writer_features);
+        prop_assert_eq!(segment.announced_through, restored.announced_through);
+        prop_assert_eq!(segment.commits, restored.commits);
     }
 }

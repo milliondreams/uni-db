@@ -1309,144 +1309,37 @@ impl Transaction {
         let cdc_active = !self.db.plugin_registry.cdc_outputs_is_empty();
         let need_events = !trigger_router.is_empty() || cdc_active;
 
-        // For the trigger / CDC path, capture an `L0Manager` handle
-        // ahead of the L0 read scope so `PreExistingProbe` can scan
-        // committed L0 + pending-flush L0s for the VIDs/EIDs about to
-        // be committed. The handle is cheap (Arc clone).
+        // For the trigger / CDC path, capture an `L0Manager` handle so
+        // `PreExistingProbe` can scan committed L0 + pending-flush L0s for
+        // the VIDs/EIDs about to be committed. The handle is cheap (Arc
+        // clone).
         let l0_manager_for_probe = if need_events {
-            if let Some(wl) = self.db.writer.as_ref() {
-                Some(Arc::clone(&wl.l0_manager))
-            } else {
-                None
-            }
+            self.db.writer.as_ref().map(|wl| Arc::clone(&wl.l0_manager))
         } else {
             None
         };
 
-        // Snapshot labels and edge types from L0 (sync read, short
-        // lock scope). Also build the L0-chain portion of the probe
-        // here while we already hold the lock — `from_l0_chain` is
-        // sync.
-        let (labels_affected, edge_types_affected, mut probe_opt) = {
-            let l0 = self.tx_l0.read();
-            let labels: Vec<String> = l0
-                .vertex_labels
-                .values()
-                .flatten()
-                .cloned()
-                .collect::<std::collections::HashSet<_>>()
-                .into_iter()
-                .collect();
-            let edge_types: Vec<String> = l0
-                .edge_types
-                .values()
-                .cloned()
-                .collect::<std::collections::HashSet<_>>()
-                .into_iter()
-                .collect();
-            let probe = l0_manager_for_probe
-                .as_ref()
-                .map(|l0m| crate::api::triggers::PreExistingProbe::from_l0_chain(l0m, &l0));
-            (labels, edge_types, probe)
-        };
+        // Snapshot labels and edge types from L0 (sync read, short lock
+        // scope).
+        let (labels_affected, edge_types_affected) =
+            crate::api::commit_events::affected(&self.tx_l0.read());
 
-        // Extend the probe with an L1 storage existence scan for VIDs
-        // not found in the L0 chain. The candidate snapshot is taken
-        // under a short sync lock; the async probe runs outside the
-        // lock to keep the L0 buffer available to other readers and
-        // to satisfy the Send bound on the surrounding async fn.
-        //
-        // Edges take a different route: every edge the tx writes or deletes
-        // gets its committed state (L0 chain over L1) read in one batched
-        // lookup, which both detects pre-existence for edges already flushed
-        // and supplies their whole pre-image.
-        //
-        // The edge read runs only when an edge event can be delivered: a CDC
-        // output, or a trigger subscribed to edge events. Node-only triggers
-        // (the default `:_AuditMe` audit trigger among them) never read an
-        // edge's pre-image.
-        let wants_edge_pre_images = cdc_active || trigger_router.wants_edge_events();
-        if let Some(ref mut probe) = probe_opt {
-            let schema_manager = self.db.storage.schema_manager();
-            let (candidates, edge_candidates) = {
-                let l0 = self.tx_l0.read();
-                let resolve = |type_id: u32| schema_manager.edge_type_name_by_id_unified(type_id);
-                let mut candidates = probe.pending_l1_candidates(&l0);
-                // A vertex's pre-image feeds only its node event rows, which
-                // are emitted under its labels in this transaction; read it
-                // only when CDC or a trigger can receive one of them.
-                if !cdc_active {
-                    candidates.retain(|(vid, _)| {
-                        let labels = l0.vertex_labels.get(vid).map_or(&[][..], Vec::as_slice);
-                        trigger_router.wants_node_events_for(labels)
-                    });
-                }
-                (
-                    candidates,
-                    if wants_edge_pre_images {
-                        probe.pending_edge_candidates(&l0, &resolve)
-                    } else {
-                        Vec::new()
-                    },
-                )
-            };
-            if !candidates.is_empty() {
-                let started = std::time::Instant::now();
-                let vertices = candidates.len();
-                probe.extend_with_l1(candidates, &self.db.storage).await;
-                tracing::debug!(
-                    target: "uni::trigger_probe",
-                    vertices,
-                    elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
-                    "vertex pre-image probe"
-                );
-            }
-            if !edge_candidates.is_empty()
-                && let Some(l0m) = l0_manager_for_probe.as_ref()
-            {
-                let schema = schema_manager.schema();
-                let started = std::time::Instant::now();
-                let edges = edge_candidates.len();
-                probe
-                    .extend_edges_with_committed_state(
-                        edge_candidates,
-                        l0m,
-                        &self.db.properties,
-                        &schema,
-                    )
-                    .await;
-                tracing::debug!(
-                    target: "uni::trigger_probe",
-                    edges,
-                    elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
-                    "edge pre-image probe"
-                );
-            }
-        }
-
-        // Build trigger events under a second short read of tx_l0
-        // — the tx is single-threaded, so its contents are stable
-        // between the snapshot above and now. Includes the CDC path:
-        // when triggers aren't registered but CDC subscribers are, we
-        // still extract events (with no property bag — the trigger
-        // predicate gate is the only consumer of `properties_referenced`).
+        // Build trigger events — the tx is single-threaded, so its contents
+        // are stable from here to the commit. Includes the CDC path: when
+        // triggers aren't registered but CDC subscribers are, we still
+        // extract events.
         let trigger_events = if need_events {
-            let l0 = self.tx_l0.read();
-            let props_referenced = trigger_router.properties_referenced();
-            // #233: the edge type NAME may be missing from `edge_types`, but
-            // the type id is always carried in `edge_endpoints`. Give the
-            // event builder a schema-backed resolver so it never falls back to
-            // an empty type name, which the trigger router silently fails to
-            // match.
-            let schema_for_types = self.db.storage.schema_manager();
-            let resolve_edge_type =
-                move |type_id: u32| schema_for_types.edge_type_name_by_id_unified(type_id);
-            Some(MutationEvents::from_l0_with_probe(
-                &l0,
-                probe_opt.as_ref(),
-                &props_referenced,
-                &resolve_edge_type,
-            ))
+            Some(
+                crate::api::commit_events::extract(
+                    &self.db.storage,
+                    &self.db.properties,
+                    l0_manager_for_probe.as_ref(),
+                    &self.tx_l0,
+                    &trigger_router,
+                    cdc_active,
+                )
+                .await,
+            )
         } else {
             None
         };
@@ -1474,7 +1367,8 @@ impl Transaction {
         // whole future would cancel it past the durable point (WAL flush) — e.g.
         // during the inline post-commit L0→L1 flush — and return a retriable
         // `CommitTimeout` for a transaction that is already durable and visible,
-        // which a retry would double-apply. The writer surfaces `CommitTimeout`
+        // which a retry would double-apply. (The post-commit flush now runs
+        // after the announcement, below.) The writer surfaces `CommitTimeout`
         // with an empty `tx_id` on a lock-acquisition timeout; we fill it in.
         //
         // The commit's version and its place in the announcement order are
@@ -1518,6 +1412,7 @@ impl Transaction {
                     causal_version,
                     mutations: None,
                     mutations_failed: true,
+                    cdc_active,
                     mutation_stream: None,
                     dropped_before: 0,
                 }));
@@ -1525,7 +1420,7 @@ impl Transaction {
         };
         let uni_store::runtime::writer::CommittedTx {
             wal_lsn,
-            flush_pending: _flush_pending,
+            flush_pending: _,
             version,
             ticket: announce_ticket,
         } = writer_lock
@@ -1552,9 +1447,6 @@ impl Transaction {
         // the commit-notification ordering tests pause here to provoke. No-op
         // unless built with `--features failpoints`.
         fail::fail_point!("commit::before-notify");
-        // _flush_pending is true when async_flush_enabled and the coordinator
-        // accepted a flush submission. Nothing to do here — the spawned stream
-        // task drives the pipeline to completion independently.
         let writer: &uni_store::Writer = writer_lock.as_ref();
         // Update cached metrics atomics while we still hold the writer lock
         {
@@ -1752,6 +1644,7 @@ impl Transaction {
             causal_version: self.started_at_version,
             mutations: mutations_batch,
             mutations_failed,
+            cdc_active,
             // Only a bulk load streams its rows; a commit carries them above.
             mutation_stream: None,
             // Always 0 at the producer. Lag is a per-consumer property — one
@@ -1854,6 +1747,12 @@ impl Transaction {
             let runtime = tokio::runtime::Handle::current();
             trigger_router.dispatch_after(ctx, &events, &runtime);
         }
+
+        // The post-commit auto-flush, now that this commit's announcement is
+        // released: a flush waits for that (see `Writer::flush_after_commit`).
+        // In async-flush mode it only submits; the spawned stream task drives
+        // the pipeline to completion independently.
+        writer_lock.flush_after_commit().await;
 
         info!("Transaction committed");
 

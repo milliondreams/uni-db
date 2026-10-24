@@ -156,7 +156,8 @@ async fn run(
             .collect::<Vec<_>>()
     };
     let derived = result
-        .derived_facts(rule)
+        .derived_rule(rule)
+        .await?
         .map(|r| pick(r))
         .unwrap_or_default();
     let queried = result.rows().map(|r| pick(r)).unwrap_or_default();

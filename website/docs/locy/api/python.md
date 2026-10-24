@@ -57,20 +57,27 @@ out = (
         "exact_probability": True,
         "max_bdd_variables": 1000,
         "top_k_proofs": 100,
-        # Goal-directed QUERY evaluation: "off" (default), "on" or "shadow"
+        # Goal-directed QUERY evaluation: "auto" (default), "off", "on" or "shadow"
         "goal_directed": "on",
     })
     .run()
 )
 ```
 
-`goal_directed` takes `"off"`, `"on"` or `"shadow"` (case-insensitive; any
-other string raises `ValueError`). The same option is the `goal_directed=`
-keyword of `uni_db.LocyConfig(...)`, which reports it back as a lowercase
-string. With `"on"`, a `QUERY` whose `WHERE` pins a node KEY column derives
-only what that goal reaches; its answers are unchanged, but a rule only such
-goals needed is left out of `result.derived` rather than returned partial.
-`"shadow"` answers from the rewrite while keeping `derived` complete. See
+`goal_directed` takes `"auto"`, `"off"`, `"on"` or `"shadow"`
+(case-insensitive; any other string raises `ValueError`). The same option is
+the `goal_directed=` keyword of `uni_db.LocyConfig(...)`, which reports it
+back as a lowercase string. Under the default `"auto"`, a `QUERY` whose
+`WHERE` pins a node KEY column derives only what that goal reaches; its
+answers are unchanged, and so is `result.derived`: a rule only such goals
+needed is derived the first time `result.derived` is read, against the
+snapshot the evaluation read, and the warnings that derivation raised are
+appended to `result.warnings`. That first read blocks while it runs and raises
+what the derivation raised; in async code use `await result.derived_async()`,
+which derives on the runtime without blocking the event loop and returns the
+same dict. `"off"` evaluates every rule in full; with `"on"` such
+a rule is left out of `result.derived` rather than returned partial;
+`"shadow"` answers from the rewrite while evaluating every rule. See
 [Goal-directed QUERY](../advanced/modules-priority-query.md#goal-directed-query).
 
 Builder methods:

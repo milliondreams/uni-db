@@ -79,7 +79,10 @@ async fn locy_facts_and_filters_a_fact_is_a_row() -> Result<()> {
         ]
     );
     let result = db.session().locy(program).await?;
-    assert_eq!(result.derived_facts("r").map(Vec::len), Some(2));
+    assert_eq!(
+        result.derived_rule("r").await.unwrap().map(Vec::len),
+        Some(2)
+    );
     // A FOLD still counts every derivation.
     assert_eq!(
         rows(
@@ -329,7 +332,7 @@ async fn locy_facts_and_filters_along_facts_are_per_path() -> Result<()> {
         );
         let result = db.session().locy(&program).await?;
         assert_eq!(
-            result.derived_facts("x").map(Vec::len),
+            result.derived_rule("x").await.unwrap().map(Vec::len),
             Some(2),
             "{program}"
         );
@@ -533,7 +536,10 @@ async fn locy_facts_and_filters_along_paths_diverging_below_the_first_hop() -> R
         vec![vec![Value::Int(3), Value::Int(7)]]
     );
     let result = db.session().locy(program).await?;
-    assert_eq!(result.derived_facts("cost").map(Vec::len), Some(5));
+    assert_eq!(
+        result.derived_rule("cost").await.unwrap().map(Vec::len),
+        Some(5)
+    );
     Ok(())
 }
 

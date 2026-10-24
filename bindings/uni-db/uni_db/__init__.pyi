@@ -1010,7 +1010,24 @@ class LocyStats:
 class LocyResult:
     """Result of a Locy program evaluation."""
 
-    derived: Any
+    @property
+    def derived(self) -> dict[str, list[dict[str, Any]]]:
+        """Every rule's facts, as they stood before the program's first command.
+
+        Rules the evaluation left out because only goal-directed ``QUERY``
+        commands needed them (the default ``goal_directed="auto"``) are derived
+        on the first access, against the snapshot the evaluation read, and
+        added to this dict, and the warnings that derivation raised are
+        appended to ``warnings``. That access blocks while they are derived
+        (in async code, ``await derived_async()`` instead) and raises what
+        the derivation raised.
+        """
+    async def derived_async(self) -> dict[str, list[dict[str, Any]]]:
+        """``derived``, without blocking the event loop.
+
+        Derives the rules the evaluation left out on the runtime, then
+        returns the same dict ``derived`` does. Use this from async code.
+        """
     stats: Any
     command_results: Any
     warnings: Any
@@ -1891,8 +1908,8 @@ class LocyConfig:
         max_bdd_variables: int | None = None,
         top_k_proofs: int | None = None,
         top_k_proofs_training: int | None = None,
-        # "off" | "on" | "shadow", matched case-insensitively; anything else
-        # raises ValueError.
+        # "auto" (the default) | "off" | "on" | "shadow", matched
+        # case-insensitively; anything else raises ValueError.
         goal_directed: str | None = None,
     ) -> None: ...
     @property
@@ -1925,7 +1942,7 @@ class LocyConfig:
     @property
     def top_k_proofs_training(self) -> int | None: ...
     @property
-    def goal_directed(self) -> Literal["off", "on", "shadow"]: ...
+    def goal_directed(self) -> Literal["auto", "off", "on", "shadow"]: ...
     @property
     def classifier_aliases(self) -> list[str]: ...
     # Parameter is named `callable` at runtime (src/classifier.rs). It shadows

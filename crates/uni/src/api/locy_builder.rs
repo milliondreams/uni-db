@@ -113,6 +113,8 @@ impl<'a> InnerLocyBuilder<'a> {
             max_memory: None,
             // Nor a principal: it is authorized as the anonymous one.
             principal: None,
+            // No handle either: `Auto` evaluates in full here.
+            handle: None,
         };
         engine
             .evaluate_with_config(&self.program, &self.config)
@@ -400,6 +402,8 @@ impl<'a> TxLocyBuilder<'a> {
             cancel: self.tx.cancel_scope(self.cancellation_token.clone()),
             max_memory: self.max_memory,
             principal: self.tx.principal.clone(),
+            // A transaction's state cannot be held past the call.
+            handle: None,
         };
         self.tx
             .with_locy_scope(engine.evaluate_with_config(&self.program, &self.config))
@@ -420,6 +424,8 @@ impl<'a> TxLocyBuilder<'a> {
             cancel: self.tx.cancel_scope(self.cancellation_token.clone()),
             max_memory: self.max_memory,
             principal: self.tx.principal.clone(),
+            // A transaction's state cannot be held past the call.
+            handle: None,
         };
         let explain = crate::api::locy_result::LocyExplainOutput::from_compiled(
             &engine.compile_only(&self.program)?,

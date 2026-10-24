@@ -58,6 +58,9 @@ pub mod locy_issue_294_parallel_edge_fold;
 // Issue #301: recursive rule cost tracks the frontier, not the relation
 // (cost guard, correctness cases, and an #[ignore] measurement probe).
 pub mod locy_issue_301_fixpoint_delta;
+// Issue #307: a QUERY WHERE on one subject derives what its goal reaches
+// under the default configuration (and an #[ignore] measurement probe).
+pub mod locy_issue_307_query_goal_pruning;
 // P5 (2026-10-17 perf-class audit): semi-naive feeding of BEST BY (R2),
 // non-linear and mutual recursion (R3), and the IS NOT banned set (R5).
 pub mod locy_recursion_semi_naive;
@@ -145,3 +148,6 @@ pub mod locy_issue_314_classifier_relation_is;
 pub mod locy_yield_expression_types;
 // Issue #315: shared-dependency diagnostics say whether exact inference resolved it.
 pub mod locy_issue_315_dependency_diagnostics;
+// #307: a failed deferred derivation of left-out rules caches nothing and
+// is retried (failpoints).
+pub mod locy_lazy_derived_resilience;

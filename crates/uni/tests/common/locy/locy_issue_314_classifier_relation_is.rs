@@ -162,8 +162,8 @@ async fn issue_314_two_consumers_of_one_model_relation() -> Result<()> {
          WHERE n IS predicted YIELD KEY c, probability AS commitment\n"
     );
     let result = run_result(&program).await?;
-    let reviewed = result.derived_facts("reviewed").expect("reviewed");
-    let committed = result.derived_facts("committed").expect("committed");
+    let reviewed = result.derived_rule("reviewed").await?.expect("reviewed");
+    let committed = result.derived_rule("committed").await?.expect("committed");
     assert_eq!(float_of(reviewed, "r", "R", "probability"), Some(0.7));
     assert_eq!(float_of(committed, "c", "C", "commitment"), Some(0.7));
     Ok(())
@@ -180,8 +180,8 @@ async fn issue_314_model_output_in_arithmetic() -> Result<()> {
          WHERE n IS scaled YIELD KEY r, half * 4.0 AS twice\n"
     );
     let result = run_result(&program).await?;
-    let scaled = result.derived_facts("scaled").expect("scaled");
-    let doubled = result.derived_facts("doubled").expect("doubled");
+    let scaled = result.derived_rule("scaled").await?.expect("scaled");
+    let doubled = result.derived_rule("doubled").await?.expect("doubled");
     assert_eq!(float_of(scaled, "n", "S", "half"), Some(0.35));
     let twice = float_of(doubled, "r", "R", "twice").expect("twice");
     assert!((twice - 1.4).abs() < 1e-12, "{twice}");
@@ -202,7 +202,7 @@ async fn issue_314_recursive_model_backed_rule() -> Result<()> {
          WHERE n IS exposed, score >= 0.5 YIELD KEY r, score\n"
     );
     let result = run_result(&program).await?;
-    let exposed = result.derived_facts("exposed").expect("exposed");
+    let exposed = result.derived_rule("exposed").await?.expect("exposed");
     assert_eq!(float_of(exposed, "n", "S", "score"), Some(0.7));
     assert_eq!(float_of(exposed, "n", "T", "score"), Some(0.7));
     for row in exposed {
@@ -212,7 +212,7 @@ async fn issue_314_recursive_model_backed_rule() -> Result<()> {
             "a feature column reached a fact: {row:?}"
         );
     }
-    let flagged = result.derived_facts("flagged").expect("flagged");
+    let flagged = result.derived_rule("flagged").await?.expect("flagged");
     assert_eq!(float_of(flagged, "r", "R", "score"), Some(0.7));
     Ok(())
 }

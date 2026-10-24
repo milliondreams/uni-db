@@ -182,6 +182,14 @@ BUILDER_NOT_BOUND = {
     # --- LocyResult ----------------------------------------------------------
     "LocyResult.into_inner": "Rust unwrap; Python receives the converted fields",
     "LocyResult.into_parts": "Rust unwrap; Python receives the converted fields",
+    "LocyResult.with_derived": "Rust constructor used by the engine",
+    "LocyResult.with_lazy_derived": "Rust constructor used by the engine",
+    "LocyResult.derived_rules": "bound as the `derived` property and `derived_async()`",
+    "LocyResult.derived_rule": "bound as `derived_facts(rule)`",
+    "LocyResult.evaluated_rules": "not bound; Python exposes only the complete `derived` view",
+    "LocyResult.into_evaluated_rules": "by-value Rust accessor; not bound, as `evaluated_rules`",
+    "LocyResult.lazily_derived_rules": "not bound yet; Python derives them on first `derived` access",
+    "LocyResult.lazy_derived": "Rust handle the binding itself holds to derive on first access",
 }
 
 

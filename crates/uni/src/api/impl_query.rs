@@ -540,6 +540,16 @@ impl CancelScope {
         Self { scope, caller }
     }
 
+    /// This scope without the enclosing session or transaction scope: only
+    /// the caller's own token, for work done on the caller's behalf after
+    /// the statement returned.
+    pub(crate) fn caller_only(&self) -> Self {
+        Self {
+            scope: None,
+            caller: self.caller.clone(),
+        }
+    }
+
     /// Resolve as soon as any source is cancelled; pend forever if there are
     /// none, so callers can `select!` on it unconditionally.
     pub(crate) async fn cancelled(&self) {

@@ -522,6 +522,9 @@ impl PreparedLocy {
             // setting applies.
             max_memory: None,
             principal: self.principal.clone(),
+            // A session-prepared program can derive left-out rules later; a
+            // transaction's state cannot be held past the call.
+            handle: self.tx.is_none().then(|| Arc::downgrade(&self.db)),
         };
         // The task-local scope `LocyBuilder::run` / `Transaction::locy`
         // install: the principal for procedure capability gates, the instance

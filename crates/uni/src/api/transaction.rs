@@ -1200,6 +1200,8 @@ impl Transaction {
             // setting applies.
             max_memory: None,
             principal: self.principal.clone(),
+            // A transaction's state cannot be held past the call.
+            handle: None,
         };
         self.with_locy_scope(engine.evaluate(program)).await
     }

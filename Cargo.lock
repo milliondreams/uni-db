@@ -12538,6 +12538,7 @@ dependencies = [
 name = "uni-locy"
 version = "4.2.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "candle-core",
  "candle-nn",

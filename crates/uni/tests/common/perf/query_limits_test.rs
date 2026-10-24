@@ -3524,6 +3524,11 @@ const PROC_BODY: &str = "MATCH (x:X) RETURN x.pad AS p ORDER BY p DESC LIMIT 1";
 const JOIN_ALONE: &str = "MATCH (a:W), (b:W) WHERE a.k = b.k AND b.k = 0 RETURN count(*) AS c";
 const JOIN_CALLING_PROC: &str = "MATCH (a:W), (b:W) WHERE a.k = b.k AND b.k = 0 \
      CALL t.sorted() YIELD row_json RETURN count(*) AS c";
+/// The join yields 441 rows and calls the procedure once per row, ~37 ms a
+/// call in a debug build: 16 s idle. Under the default 30 s query timeout the
+/// statement timed out on a loaded machine (workspace suite, load average
+/// ~25), so it runs with room. The memory assertions do not depend on time.
+const JOIN_CALLING_PROC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 async fn db_with_per_row_procedure() -> Result<Uni> {
     let db = wide_db(0).await?;
@@ -3558,6 +3563,7 @@ async fn a_procedure_called_per_row_shares_the_statements_memory_budget() -> Res
 
     let err = session
         .query_with(JOIN_CALLING_PROC)
+        .timeout(JOIN_CALLING_PROC_TIMEOUT)
         .max_memory(PER_ROW_PROC_CEILING)
         .fetch_all()
         .await
@@ -3573,6 +3579,7 @@ async fn a_procedure_called_per_row_shares_the_statements_memory_budget() -> Res
     // And with room for both, the statement runs.
     let rows = session
         .query_with(JOIN_CALLING_PROC)
+        .timeout(JOIN_CALLING_PROC_TIMEOUT)
         .max_memory(64 * 1024 * 1024)
         .fetch_all()
         .await?;
@@ -3590,7 +3597,11 @@ async fn profile_peak_includes_a_procedures_inner_query() -> Result<()> {
 
     let (_, body) = session.query_with(PROC_BODY).profile().await?;
     let (_, join) = session.query_with(JOIN_ALONE).profile().await?;
-    let (_, both) = session.query_with(JOIN_CALLING_PROC).profile().await?;
+    let (_, both) = session
+        .query_with(JOIN_CALLING_PROC)
+        .timeout(JOIN_CALLING_PROC_TIMEOUT)
+        .profile()
+        .await?;
     assert!(body.peak_memory_bytes > 0 && join.peak_memory_bytes > 0);
     assert!(
         both.peak_memory_bytes >= body.peak_memory_bytes,

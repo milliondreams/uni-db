@@ -1014,6 +1014,14 @@ class LocyResult:
     stats: Any
     command_results: Any
     warnings: Any
+    """Runtime warnings, one dict each: ``code`` (snake_case), ``severity``
+    (``"info"`` for a status report such as ``shared_dependency_resolved``,
+    else ``"warning"``), ``message``, ``rule_name``, ``variable_count``,
+    ``key_group``, and ``probability`` — the structured shared-dependency
+    diagnostic (``inference_mode``, ``resolution``, ``reason``,
+    ``groups_detected``, ``groups_fallen_back``,
+    ``configured_bdd_variable_limit``, ``effective_bdd_variable_limit``) or
+    ``None``."""
     compile_warnings: list[dict[str, str]]
     approximate_groups: Any
     derived_fact_set: Any
@@ -1026,7 +1034,9 @@ class LocyResult:
     ``exec_time_ms`` is the remainder. Every other field is real.
     """
 
-    def has_warning(self, code: str) -> bool: ...
+    def has_warning(self, code: str) -> bool:
+        """Whether a runtime warning with this snake_case ``code`` was emitted."""
+        ...
     def warnings_list(self) -> Any: ...
     def derived_facts(self, rule: str) -> list[dict[str, Any]] | None: ...
     def rows(self) -> list[dict[str, Any]] | None: ...

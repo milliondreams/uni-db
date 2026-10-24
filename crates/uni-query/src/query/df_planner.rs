@@ -1806,10 +1806,12 @@ impl HybridPhysicalPlanner {
 
             LogicalPlan::LocyDerivedScan {
                 scan_index: _,
+                rule_name,
                 data,
                 schema,
             } => Ok(Arc::new(
                 super::df_graph::locy_fixpoint::DerivedScanExec::new(
+                    rule_name.clone(),
                     Arc::clone(data),
                     Arc::clone(schema),
                 ),
@@ -6177,6 +6179,25 @@ impl HybridPhysicalPlanner {
                 };
                 let cross_domain = (is_string(&actual_dt) && is_numeric(target_dt))
                     || (is_numeric(&actual_dt) && is_string(target_dt));
+                // A cast that would turn the computed value into something
+                // else, rather than widen it: any value to its text, a
+                // boolean to or from a number. The declared type is wrong,
+                // and casting stored `true` as the string "true", which a
+                // consumer's `flag = true` silently never matched (issue
+                // #314). Refused, naming the column.
+                let rewrites = actual_dt != DataType::Null
+                    && actual_dt != *target_dt
+                    && ((is_string(target_dt) && !is_string(&actual_dt))
+                        || ((*target_dt == DataType::Boolean) != (actual_dt == DataType::Boolean)
+                            && *target_dt != DataType::LargeBinary));
+                if rewrites {
+                    return Err(anyhow!(
+                        "Locy column '{}' is declared {target_dt} but its expression `{}` \
+                         computes {actual_dt}",
+                        alias.as_deref().unwrap_or("?"),
+                        expr.to_string_repr()
+                    ));
+                }
                 if actual_dt != *target_dt && *target_dt == DataType::LargeBinary {
                     // A dynamically typed column: encode the value, whatever
                     // its type, instead of an Arrow cast that cannot carry a

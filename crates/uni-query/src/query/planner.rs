@@ -2475,6 +2475,9 @@ pub enum LogicalPlan {
     /// Scan a derived relation's in-memory buffer during fixpoint iteration.
     LocyDerivedScan {
         scan_index: usize,
+        /// The rule whose relation is scanned, named when its facts do not
+        /// match `schema`.
+        rule_name: String,
         data: Arc<RwLock<Vec<RecordBatch>>>,
         schema: SchemaRef,
     },
@@ -4806,7 +4809,7 @@ impl QueryPlanner {
     ///
     /// `e VALID_AT timestamp` becomes `uni.temporal.validAt(e, 'valid_from', 'valid_to', timestamp)`
     /// `e VALID_AT(timestamp, 'start', 'end')` becomes `uni.temporal.validAt(e, 'start', 'end', timestamp)`
-    fn transform_valid_at_to_function(expr: Expr) -> Expr {
+    pub(crate) fn transform_valid_at_to_function(expr: Expr) -> Expr {
         match expr {
             Expr::ValidAt {
                 entity,
@@ -13424,20 +13427,19 @@ fn collect_properties_from_expr_into(
             start_prop,
             end_prop,
         } => {
-            // Extract property requirements from ValidAt expression
+            // Extract property requirements from ValidAt expression. Without
+            // explicit names the macro reads `valid_from` / `valid_to`
+            // (`transform_valid_at_to_function`), which must be loaded too:
+            // `n VALID_AT t` as a RETURN item failed with `No field named
+            // "n.valid_from"`.
             if let Expr::Variable(var) = entity.as_ref() {
-                if let Some(prop) = start_prop {
-                    properties
-                        .entry(var.clone())
-                        .or_default()
-                        .insert(prop.clone());
-                }
-                if let Some(prop) = end_prop {
-                    properties
-                        .entry(var.clone())
-                        .or_default()
-                        .insert(prop.clone());
-                }
+                let entry = properties.entry(var.clone()).or_default();
+                entry.insert(
+                    start_prop
+                        .clone()
+                        .unwrap_or_else(|| "valid_from".to_string()),
+                );
+                entry.insert(end_prop.clone().unwrap_or_else(|| "valid_to".to_string()));
             }
             collect_properties_from_expr_into(entity, properties, kinds);
             collect_properties_from_expr_into(timestamp, properties, kinds);

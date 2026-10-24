@@ -60,5 +60,6 @@ pub use semiring::{
 pub use top_k_proofs::{NeuralCallId, Proof, PruneNotice, TopKProofs, TopKTag};
 pub use types::{
     CompiledCalibrate, CompiledCommand, CompiledInputBinding, CompiledModel, CompiledProgram,
-    CompiledValidate, ModelInvocation, RuntimeWarning, RuntimeWarningCode, SemiringKind,
+    CompiledValidate, DependencyResolution, FEATURE_COL_PREFIX, InferenceMode, ModelInvocation,
+    ProbabilityDiagnostic, RuntimeWarning, RuntimeWarningCode, SemiringKind, feature_column_name,
 };

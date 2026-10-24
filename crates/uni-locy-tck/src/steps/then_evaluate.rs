@@ -1195,6 +1195,67 @@ async fn result_should_not_contain_shared_dep_warning(world: &mut LocyWorld) {
 }
 
 #[then(
+    regex = r#"^the result should report a SharedDependencyResolved status for rule ['"](.+)['"]$"#
+)]
+async fn result_should_report_shared_dep_resolved(world: &mut LocyWorld, rule_name: String) {
+    assert_warning_present(
+        world,
+        uni_locy::RuntimeWarningCode::SharedDependencyResolved,
+        &rule_name,
+        "SharedDependencyResolved",
+    );
+}
+
+#[then("the result should not report a SharedDependencyResolved status")]
+async fn result_should_not_report_shared_dep_resolved(world: &mut LocyWorld) {
+    assert_warning_absent(
+        world,
+        uni_locy::RuntimeWarningCode::SharedDependencyResolved,
+        "SharedDependencyResolved",
+    );
+}
+
+/// The structured shared-dependency diagnostic of `rule_name` (issue #315):
+/// its inference mode and resolution, by their stable identifiers.
+#[then(
+    regex = r#"^the shared dependency of rule ['"](.+)['"] should have inference mode ['"](.+)['"] and resolution ['"](.+)['"]$"#
+)]
+async fn shared_dependency_should_have_mode_and_resolution(
+    world: &mut LocyWorld,
+    rule_name: String,
+    mode: String,
+    resolution: String,
+) {
+    let result = world.expect_locy_ok();
+    let diagnostic = result
+        .warnings()
+        .iter()
+        .filter(|w| w.rule_name == rule_name)
+        .find(|w| {
+            matches!(
+                w.code,
+                uni_locy::RuntimeWarningCode::SharedProbabilisticDependency
+                    | uni_locy::RuntimeWarningCode::SharedDependencyResolved
+            )
+        })
+        .and_then(|w| w.probability.as_ref())
+        .unwrap_or_else(|| {
+            panic!(
+                "no shared-dependency diagnostic for rule '{rule_name}' (warnings: {:?})",
+                result.warnings()
+            )
+        });
+    assert_eq!(
+        (
+            diagnostic.inference_mode.as_str(),
+            diagnostic.resolution.as_str()
+        ),
+        (mode.as_str(), resolution.as_str()),
+        "{diagnostic:?}"
+    );
+}
+
+#[then(
     regex = r#"^the result should contain a FuzzyNotProbabilistic warning for rule ['"](.+)['"]$"#
 )]
 async fn result_should_contain_fuzzy_warning(world: &mut LocyWorld, rule_name: String) {

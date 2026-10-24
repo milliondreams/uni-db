@@ -1381,7 +1381,7 @@ Result of a Locy program evaluation.
 
 | Signature | Description |
 |---|---|
-| `has_warning(code: str) -> bool` | — |
+| `has_warning(code: str) -> bool` | Whether a runtime warning with this snake_case ``code`` was emitted. |
 | `warnings_list() -> Any` | — |
 | `derived_facts(rule: str) -> list[dict[str, Any]] | None` | — |
 | `rows() -> list[dict[str, Any]] | None` | — |

@@ -6510,7 +6510,7 @@ LocyConfig {
 
 `LocyResult` carries probability-specific runtime diagnostics:
 
-- `warnings: Vec<RuntimeWarning>` — includes `SharedProbabilisticDependency`, `BddLimitExceeded`, and `CrossGroupCorrelationNotExact`
+- `warnings: Vec<RuntimeWarning>` — includes `SharedProbabilisticDependency`, the informational `SharedDependencyResolved`, `BddLimitExceeded`, and `CrossGroupCorrelationNotExact`
 - `approximate_groups: HashMap<String, Vec<String>>` — human-readable rule/key groups that fell back to approximate mode
 - `warnings()` / `has_warning()` — convenience helpers for runtime inspection
 
@@ -10583,6 +10583,39 @@ Clauses of one rule infer their column types independently and are unioned, so
 `clause_column_types` unifies a column the clauses type differently (mixed
 integer and float to `Float64`, anything else to a Cypher value) and every
 clause projects that type; a column the clauses agree on keeps its own type.
+
+**A rule's facts carry exactly its declared columns (issue #314).** The
+declared type of an expression no arm recognises is a Cypher value
+(`LargeBinary`, lossless), never a string: the string catch-all cast a boolean
+to `"true"` (so `flag = true` through `IS` silently matched nothing), a list
+element to its bytes, a date to its text, and an unknown function took its
+first argument's type (`labels(n)` as a node id). Predicates (`IN`, `EXISTS
+{}`, quantifiers, label tests, `VALID_AT`, `IS NULL`) are `Boolean`, `COUNT
+{}` `Int64`, strings `Utf8` as the expression compiler emits them, CASE the
+type its branches share, a model invocation's output (`__model_*`) `Float64`;
+a PROB column whose type is only known at run time is `Float64`.
+`plan_locy_project` refuses a cast that would rewrite a value (anything to a
+string, a boolean to or from a number), naming the column. The model
+invocation's property features (`__feat_*`, `uni_locy::FEATURE_COL_PREFIX`)
+are transient like `__lin_*`: `strip_transient_columns` drops both before a
+row becomes a fact, and EXPLAIN reads a recursive rule's features from the
+iteration's candidates (`transient_features`). `write_facts_to_registry` and
+`DerivedScanExec` check the facts against the scan's declared columns
+(`check_fact_columns`) and fail naming the rule and both schemas; the
+registry write used to fall back to the batch's own schema silently.
+`VALID_AT` compiles anywhere (the planner expanded the macro in WHERE only).
+
+**Shared-dependency diagnostics report what inference did (issue #315).**
+`LineageStore::correct` / `correct_rows` report a rule's shared dependencies
+after recomputation (`report_shared_dependency`), with a structured
+`RuntimeWarning::probability` (`ProbabilityDiagnostic`: `inference_mode`,
+`resolution`, `reason`, groups detected / fallen back, configured and
+effective `max_bdd_variables`). Default mode: `SharedProbabilisticDependency`,
+`approximate` / `not_attempted`. Exact mode or `TopKProofs` with every shared
+group recomputed: the informational `SharedDependencyResolved` (`completed`),
+not the overestimation warning. A group over the variable budget
+(`fact_probability` records it in `Fallbacks`): the warning, `fallback` /
+`bdd_variable_limit_exceeded`, beside `BddLimitExceeded`.
 
 **The clauses of one Locy rule agree on what the rule is (C-CLAUSE).** The
 planner maps each clause's YIELD onto the rule's columns by name, falling back

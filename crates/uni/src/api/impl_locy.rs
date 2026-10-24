@@ -3400,6 +3400,7 @@ async fn enrich_vids_with_nodes(
                 rule_name: name.clone(),
                 variable_count: None,
                 key_group: None,
+                probability: None,
             });
         }
 

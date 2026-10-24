@@ -40,7 +40,8 @@ Locy has two warning channels. **Runtime warnings** (`RuntimeWarningCode`) surfa
 
 ### Runtime warnings (`result.warnings`)
 
-- `SharedProbabilisticDependency`: multiple proof paths inside one MNOR/MPROD group reuse shared evidence.
+- `SharedProbabilisticDependency`: multiple proof paths inside one MNOR/MPROD group reuse shared evidence, and the value was computed as if they did not — exact mode was off, or a group exceeded `max_bdd_variables` and fell back. The result may overestimate. `RuntimeWarning::probability` carries the structured diagnostic: `inference_mode` (`approximate`, `exact`, `top_k_proofs`), `resolution` (`not_attempted`, `fallback`), the `reason`, the groups detected and fallen back, and the configured and effective variable limits.
+- `SharedDependencyResolved` (informational, `RuntimeWarningCode::is_informational`): proof paths share evidence, and exact or top-k proof inference evaluated every shared group without the independence assumption (`resolution: completed`). Reported instead of `SharedProbabilisticDependency`, whose overestimation premise does not hold.
 - `BddLimitExceeded`: exact mode was enabled, but the group exceeded `max_bdd_variables` and fell back to independence mode.
 - `CrossGroupCorrelationNotExact`: shared evidence spans multiple aggregate groups; each group is exact internally, but correlation across groups is still approximate.
 - `FuzzyNotProbabilistic`: `LocyConfig.semiring = MaxMinProb` is active and a rule emits `PROB`. Fuzzy-truth math is being applied to a column declared as a probability; either pick the right semiring or drop the `PROB` annotation.

@@ -1054,6 +1054,54 @@ fn compile_warnings_to_py(
     Ok(list.into())
 }
 
+/// Convert one runtime warning to a Python dict.
+///
+/// `code`, `message`, `rule_name`, `variable_count` and `key_group` as
+/// before; `severity` is `"info"` for a status report (an exact-resolved
+/// shared dependency) and `"warning"` otherwise; `probability` is the
+/// structured shared-dependency diagnostic, or `None`. The two result
+/// conversions below each spelled the dict out, so a new field meant two
+/// identical edits.
+fn runtime_warning_to_py(py: Python, w: &uni_locy::RuntimeWarning) -> PyResult<Py<PyAny>> {
+    let wd = PyDict::new(py);
+    // See `RuntimeWarningCode::as_str`: the mapping lives on the enum in
+    // `uni-locy` so a new variant fails a build the workspace lanes run.
+    wd.set_item("code", w.code.as_str())?;
+    wd.set_item(
+        "severity",
+        if w.code.is_informational() {
+            "info"
+        } else {
+            "warning"
+        },
+    )?;
+    wd.set_item("message", &w.message)?;
+    wd.set_item("rule_name", &w.rule_name)?;
+    wd.set_item("variable_count", w.variable_count)?;
+    wd.set_item("key_group", w.key_group.as_deref())?;
+    match &w.probability {
+        Some(d) => {
+            let pd = PyDict::new(py);
+            pd.set_item("inference_mode", d.inference_mode.as_str())?;
+            pd.set_item("resolution", d.resolution.as_str())?;
+            pd.set_item("reason", d.reason.as_deref())?;
+            pd.set_item("groups_detected", d.groups_detected)?;
+            pd.set_item("groups_fallen_back", d.groups_fallen_back)?;
+            pd.set_item(
+                "configured_bdd_variable_limit",
+                d.configured_bdd_variable_limit,
+            )?;
+            pd.set_item(
+                "effective_bdd_variable_limit",
+                d.effective_bdd_variable_limit,
+            )?;
+            wd.set_item("probability", pd)?;
+        }
+        None => wd.set_item("probability", py.None())?,
+    }
+    Ok(wd.into())
+}
+
 /// Convert a LocyResult to a Python dict.
 pub fn locy_result_to_py(py: Python, result: uni_db::locy::LocyResult) -> PyResult<Py<PyAny>> {
     let result = result.into_inner();
@@ -1096,23 +1144,8 @@ pub fn locy_result_to_py(py: Python, result: uni_db::locy::LocyResult) -> PyResu
 
     // warnings: Vec<RuntimeWarning> -> list of dicts
     let warn_list = PyList::empty(py);
-    for w in result.warnings {
-        let wd = PyDict::new(py);
-        // See `RuntimeWarningCode::as_str`: the mapping lives on the enum in
-        // `uni-locy` so a new variant fails a build the workspace lanes run.
-        let code_str = w.code.as_str();
-        wd.set_item("code", code_str)?;
-        wd.set_item("message", &w.message)?;
-        wd.set_item("rule_name", &w.rule_name)?;
-        match w.variable_count {
-            Some(n) => wd.set_item("variable_count", n)?,
-            None => wd.set_item("variable_count", py.None())?,
-        }
-        match w.key_group {
-            Some(ref g) => wd.set_item("key_group", g)?,
-            None => wd.set_item("key_group", py.None())?,
-        }
-        warn_list.append(wd)?;
+    for w in &result.warnings {
+        warn_list.append(runtime_warning_to_py(py, w)?)?;
     }
     dict.set_item("warnings", warn_list)?;
 
@@ -1239,23 +1272,8 @@ pub fn locy_result_to_py_class(
     let compile_warn_list = compile_warnings_to_py(py, &result.compile_warnings)?;
 
     let warn_list = pyo3::types::PyList::empty(py);
-    for w in result.warnings {
-        let wd = pyo3::types::PyDict::new(py);
-        // See `RuntimeWarningCode::as_str`: the mapping lives on the enum in
-        // `uni-locy` so a new variant fails a build the workspace lanes run.
-        let code_str = w.code.as_str();
-        wd.set_item("code", code_str)?;
-        wd.set_item("message", &w.message)?;
-        wd.set_item("rule_name", &w.rule_name)?;
-        match w.variable_count {
-            Some(n) => wd.set_item("variable_count", n)?,
-            None => wd.set_item("variable_count", py.None())?,
-        }
-        match w.key_group {
-            Some(ref g) => wd.set_item("key_group", g)?,
-            None => wd.set_item("key_group", py.None())?,
-        }
-        warn_list.append(wd)?;
+    for w in &result.warnings {
+        warn_list.append(runtime_warning_to_py(py, w)?)?;
     }
 
     let approx_dict = pyo3::types::PyDict::new(py);

@@ -139,3 +139,9 @@ pub mod locy_issue_308_explain_recursive_children;
 pub mod locy_issue_309_third_key_binding;
 // #313: exact-mode MNOR keeps distinct event identities apart.
 pub mod locy_issue_313_exact_event_identity;
+// Issue #314: classifier-backed relation consumed through IS.
+pub mod locy_issue_314_classifier_relation_is;
+// Issue #314 (class): a YIELD column carries its expression's type on every surface.
+pub mod locy_yield_expression_types;
+// Issue #315: shared-dependency diagnostics say whether exact inference resolved it.
+pub mod locy_issue_315_dependency_diagnostics;

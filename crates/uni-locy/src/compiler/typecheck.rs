@@ -1815,7 +1815,7 @@ impl<'a> InvocationLifter<'a> {
     /// materialized into the per-row fact_row, deduping by column name.
     fn register_property_feature(&mut self, v: &str, prop: &str, refs: &mut Vec<(String, String)>) {
         refs.push((v.to_string(), prop.to_string()));
-        let col_name = format!("__feat_{}_{}", v, prop);
+        let col_name = crate::types::feature_column_name(v, prop);
         if self.seen_hidden.insert(col_name.clone()) {
             let hidden_expr =
                 Expr::Property(Box::new(Expr::Variable(v.to_string())), prop.to_string());

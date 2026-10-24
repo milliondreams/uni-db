@@ -5273,6 +5273,7 @@ mod plan_children_tests {
     fn plan_children_treats_a_locy_scan_as_a_leaf() {
         let plan = LogicalPlan::LocyDerivedScan {
             scan_index: 0,
+            rule_name: "r".to_string(),
             data: Arc::new(RwLock::new(Vec::new())),
             schema: Arc::new(arrow_schema::Schema::empty()),
         };

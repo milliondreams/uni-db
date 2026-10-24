@@ -1201,11 +1201,11 @@ impl PyLocyResult {
         let len = list.len()?;
         for i in 0..len {
             let item = list.get_item(i)?;
-            // Each warning is expected to have a `.code` attribute (string).
-            if let Ok(c) = item.getattr("code")
-                && let Ok(s) = c.extract::<String>()
-                && s == code
-            {
+            // Each warning is a dict (`runtime_warning_to_py`) keyed by
+            // `code`. This read a `.code` attribute, which a dict does not
+            // have, so it answered `False` for every code.
+            let c = item.get_item("code")?;
+            if c.extract::<String>()? == code {
                 return Ok(true);
             }
         }

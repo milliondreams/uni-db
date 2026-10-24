@@ -223,14 +223,17 @@ async fn a_merge_set_keeps_the_properties_it_reads() {
 }
 
 /// A named path is built from the row's element values, so every element of
-/// it stays whole. (MERGE only: the planner does not bring a CREATE path
-/// variable into scope, so `CREATE p = … RETURN p` does not plan.)
+/// it stays whole — for MERGE and CREATE alike. The CREATE queries also pin
+/// that the planner brings a CREATE path variable into scope: before it did,
+/// `CREATE p = … RETURN p` failed to plan with `UndefinedVariable`.
 #[tokio::test]
-async fn a_named_merge_path_keeps_its_elements_wide() {
+async fn a_named_write_path_keeps_its_elements_wide() {
     let p = planner().await;
     for q in [
         "MATCH (a:Person), (b:Company) MERGE p = (a)-[:WORKS_AT]->(b) RETURN length(p)",
         "MATCH (a:Person) MERGE p = (a)-[:WORKS_AT]->(:Company) RETURN length(p)",
+        "MATCH (a:Person), (b:Company) CREATE p = (a)-[:WORKS_AT]->(b) RETURN length(p)",
+        "MATCH (a:Person) CREATE p = (a)-[:WORKS_AT]->(:Company) RETURN p",
     ] {
         let props = collected(&p, q);
         let a = props.get("a").expect("`a` must be collected");

@@ -2309,6 +2309,18 @@ PropertyManager {
 4. Fetch from Lance storage runs, bounded by the reader's version high water mark when it has one → update cache → return
 5. L0 properties **always** take precedence over storage
 
+**A failed storage read is an error, not an absence.** Every storage scan a
+property read issues goes through `PropertyManager::scan_props`, and every
+existence check through `props_table_exists`; both propagate. Six reads used
+to drop a scan error (`Err(_) => continue`, `warn!` then `continue`, or
+`return Ok(partial)`) and `table_exists(..).unwrap_or(false)` did the same, so
+a property that exists on disk came back missing with nothing to say the
+answer was partial. A label or edge type with no dataset in this storage
+schema (`vertex_dataset` / `delta_dataset` returning `Err`) is still skipped:
+that is "no rows here", not a failed read. The `property_manager::scan`
+failpoint injects a scan failure
+(`uni-store` `property_scan_failure_resilience`, under `--features failpoints`).
+
 Step 4 spans two tiers, and both conjoin `_version <= hwm` when the `PropertyManager`'s own `StorageManager` carries one: the per-type delta scan (via `StorageManager::apply_version_filter`) and the `props_json` fallback in the main edges table (via `MainEdgeDataset::find_props_by_eid`). Schemaless and overflow edge properties live *only* in `props_json`, so every such read reaches the fallback — not only reads that come after a compaction.
 
 > **Which readers are bounded.** A read-write transaction shares the live database-level `PropertyManager` (so its own uncommitted properties, in tx_l0, stay readable at step 2), and the `PropertyManager`'s own `StorageManager` carries no hwm. The bound therefore travels with the read: `QueryContext::l1_visibility` holds the pinned view's `RowVisibility` (`StorageManager::pinned_row_visibility`, set by `Executor::get_context`, the DataFusion graph `query_context`, the procedure host and the Locy fixpoint), and every step-4 read takes its filter from the context when present, else from its own storage (`PropertyManager::l1_visibility`). A pinned read neither serves from nor fills step 3's LRU cache, which holds HEAD values (`PropertyManager::cache_usable`). The L0 gates are unchanged. The one step-4 read that stays live is `flushed_edge_key_conflict`, a writer-side check that must see the newest committed row. Before, only the `UniInner::at_snapshot` view, which constructs its own `PropertyManager` over pinned storage, was bounded: a transaction read L1 properties and the cache at HEAD, so an edge property updated and flushed by another transaction changed under it (`ssi_edge_pinning::property_reads_are_pinned_across_a_flush`).
@@ -2983,7 +2995,24 @@ CREATE (a)-[:KNOWS {since: 2023}]->(b)
 
 // Create with RETURN
 CREATE (n:Document {title: 'Hello'}) RETURN n
+
+// Bind the created path
+CREATE p = (:Person {name: 'Ann'})-[:KNOWS]->(:Person {name: 'Ben'})
+RETURN p, length(p)
 ```
+
+**Named paths in CREATE and MERGE.** The planner scopes a CREATE path variable
+as a `Path` (rejecting a rebinding with `VariableAlreadyBound`), and every
+CREATE executor — the mutation operator and the FOREACH body — goes through
+`Executor::execute_create_binding_paths`. The pattern is prepared once per
+pattern, not per row, by `prepare_pattern_for_path_binding`, which gives every
+anonymous node *and* relationship of a named path an internal name
+(`__path{pi}_n{idx}` / `__path{pi}_r{idx}`, per path so two paths cannot share
+one); `bind_path_variables` builds `Value::Path` from the row and strips those
+names. An element missing from the row is an error rather than a shorter path —
+naming only relationships used to drop an anonymous node from a MERGE'd `p`.
+Every element of a named write path is planned wide (`"*"`), not struct-only,
+because the path carries the element values.
 
 ### MERGE
 
@@ -4054,7 +4083,19 @@ row. Its imports start the plan as one `LogicalPlan::OuterRow` leaf.
   and `GraphApplyExec` bind. `GraphApplyExec` has no other path: its batched
   path (one sub-plan run with `$a._vid` as a list, joined back on that key)
   required an `Apply` with an `input_filter` whose subquery was not a
-  procedure call, which no planner path builds, and was removed. Over an
+  procedure call, which no planner path builds, and was removed.
+  A node-yielding procedure called after another clause is typed from its
+  real plan, not from `infer_logical_plan_schema`: its columns (`{n}._vid`,
+  `{n}._labels`, `{n}.{prop}`, the node struct) depend on what the clauses
+  after the `CALL` read from the node, which the logical walk cannot see — it
+  typed the node as one `Utf8`, so `id(b)` failed to plan with `No field named
+  "b._vid"`. `plan_apply` plans the call with those requirements
+  (`node_yield_subplan_properties`) and takes its schema, and
+  `GraphApplyExec::with_subplan_properties` plans each row's sub-plan with the
+  same set. The transient-id stream behind `uni.create.vNode` / `vEdge` is one
+  per query (`GraphExecutionContext::transient_ids`), inherited by every
+  sub-plan with the warnings sink: a stream per procedure host restarted at 0
+  per row, so every virtual node of a query had the same id. Over an
   input with no rows it returns no rows; it used to run the body once with no
   outer row, which emitted the body's rows as if the input had one (and a
   correlated body failed with `Unresolved parameter`). The fallback
@@ -4154,6 +4195,13 @@ own clause loaded (`WITH r AS rel, a AS q RETURN startNode(rel).x` read NULL).
 `plan_filter` now hydrates like a projection, hydrated `_endpoint.*` columns
 are offered to the UDF first, and an unresolved call marks its relationship
 struct-only so the outer row carries `_src` / `_dst`.
+
+The endpoints of a path's relationships are hydrated too: for
+`[r IN relationships(p) | startNode(r).x]`, `endpoint_list_column` names the
+path `p` as the column to hydrate, and `EndpointHydrateExec` reads a path value
+as the list of its relationships, in `relationships(p)` order. Only a bare list
+variable used to be recognised, so the call failed with "endpoint not available
+in this scope" on created and matched paths alike.
 
 Coverage: `bugs::outer_entity_in_subquery` crosses 34 entity operations with
 15 contexts, schemaless and declared, flushed and unflushed, against the same
@@ -7052,7 +7100,7 @@ buffer: 1.24 ms and 5.3 ms. The walk itself stays, for the reason given above.
 
 ## Write Throttling
 
-When flush generations accumulate faster than compaction folds them, write throttling slows and then stops writers. The count is `CompactionStatus::l1_runs`: every `flush_to_l1` adds one, and a completed full compaction pass (`StorageManager::run_full_pass`, run by the background task and by the manual `StorageManager::compact` / `CALL uni.admin.compact()`) subtracts the count it read when it started. It used to set the count to 0, which erased flushes that landed while the pass ran (wave P1, T2). The scoped `compact_label` / `compact_edge_type` fold no deltas and leave the count alone. `Writer::check_write_pressure` runs at the top of every vertex/edge insert and delete. It is charged once per statement or bulk batch (wave P1, T3): every Cypher statement on a transaction (`execute_internal_with_tx_l0`, the profile and AST variants) and every `Transaction::bulk_insert_*` call opens an `l0::StatementScope` on the transaction buffer; the first write in the scope waits and marks the buffer admitted (`L0Buffer::note_write_admitted`), and the scope's later writes skip the wait. The scope closes on drop, including when a timeout or cancellation drops the statement future. A write outside any scope (a direct `Writer` call, `tx_l0 = None`) is charged per call, as before. Before this a four-row `UNWIND … CREATE` waited four budgets, a two-node one-edge `CREATE` three, and `bulk_insert_edges` of three edges three (`storage::write_backpressure_test::soft_band_charges_once_per_statement_or_batch`).
+When flush generations accumulate faster than compaction folds them, write throttling slows and then stops writers. The count is `CompactionStatus::l1_runs`: every flush that writes something adds one — a flush of an empty L0 (`!L0Buffer::holds_flushable_data()`) appends no fragment and is not counted, because back-to-back idle flushes (a `flush()` loop, or the auto-flush timer while a transaction keeps its writes private) otherwise pushed the count past the hard limit and stalled the transaction's next write for seconds (#311 follow-up, `bugs::issue_311_tx_index_rekey::issue_311_idle_flushes_do_not_throttle_a_transaction`) — and a completed full compaction pass (`StorageManager::run_full_pass`, run by the background task and by the manual `StorageManager::compact` / `CALL uni.admin.compact()`) subtracts the count it read when it started. It used to set the count to 0, which erased flushes that landed while the pass ran (wave P1, T2). The scoped `compact_label` / `compact_edge_type` fold no deltas and leave the count alone. `Writer::check_write_pressure` runs at the top of every vertex/edge insert and delete. It is charged once per statement or bulk batch (wave P1, T3): every Cypher statement on a transaction (`execute_internal_with_tx_l0`, the profile and AST variants) and every `Transaction::bulk_insert_*` call opens an `l0::StatementScope` on the transaction buffer; the first write in the scope waits and marks the buffer admitted (`L0Buffer::note_write_admitted`), and the scope's later writes skip the wait. The scope closes on drop, including when a timeout or cancellation drops the statement future. A write outside any scope (a direct `Writer` call, `tx_l0 = None`) is charged per call, as before. Before this a four-row `UNWIND … CREATE` waited four budgets, a two-node one-edge `CREATE` three, and `bulk_insert_edges` of three edges three (`storage::write_backpressure_test::soft_band_charges_once_per_statement_or_batch`).
 
 ```mermaid
 graph LR
@@ -9856,7 +9904,14 @@ generic Arrow-to-`Value` readers (`arrow_convert`, `scalar_to_value`,
 `get_value_from_array`, `similar_to_expr`) read one with
 `Value::from_id_bits`, the `Int64` with the same bits: an ephemeral id
 (`EPHEMERAL_BIT`, `uni.create.vNode`) is negative, and `uni.create.vEdge`
-reads it back. Widening there turned `id()` of a vNode into a float. A plugin
+reads it back. Widening there turned `id()` of a vNode into a float. The
+inverse, `Value::as_id_bits`, is what every entity recogniser reads an
+integer id with (`entity_ref_from_map`, `TryFrom<&Value>` for `Vid`/`Eid`,
+`coerce_vid`): a negative integer is an ephemeral id, `-1` (`INVALID`) is
+none. Requiring a non-negative id read a vNode's `{_vid, _labels}` struct as
+a plain map, so `YIELD node RETURN node` returned a Map (APOC returns a node
+with a negative id). Recognition still needs the `_labels` / edge markers, and
+`hydrate_entity_if_needed` never reads storage for an ephemeral id. A plugin
 procedure's plain `UInt64` *yield* is a value: it is planned as a Cypher value
 (`field_from_signature`) and converted at the boundary
 (`widen_unsigned_yields`) with `Value::from(u64)` — an integer while it fits,

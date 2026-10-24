@@ -4350,6 +4350,16 @@ impl QueryPlanner {
                                 PatternElement::Parenthesized { .. } => {}
                             }
                         }
+                        // A path variable (`CREATE p = (a)-[:R]->(b)`) is a
+                        // new binding like a relationship's. Checked after the
+                        // path's own elements so `p = (p)-[:R]->()` is caught
+                        // as a rebinding rather than read as a reference.
+                        if let Some(v) = path.variable.as_deref()
+                            && !v.is_empty()
+                        {
+                            check_not_already_bound(v, &vars_in_scope, &create_vars)?;
+                            create_vars.push(v);
+                        }
                     }
 
                     // Batch consecutive CREATEs to avoid deep recursion
@@ -4374,8 +4384,15 @@ impl QueryPlanner {
                             };
                         }
                     }
-                    // Add variables from created nodes and relationships to scope
+                    // Add variables from created paths, nodes and relationships
+                    // to scope
                     for path in &create_clause.pattern.paths {
+                        if let Some(var) = &path.variable
+                            && !var.is_empty()
+                        {
+                            create_introduced_vars.insert(var.clone());
+                            add_var_to_scope(&mut vars_in_scope, var, VariableType::Path)?;
+                        }
                         for element in &path.elements {
                             match element {
                                 PatternElement::Node(n) => {

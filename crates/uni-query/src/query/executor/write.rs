@@ -5,6 +5,7 @@ use super::core::*;
 use crate::query::df_graph::mutation_common::Prefetch;
 use crate::query::planner::LogicalPlan;
 use anyhow::{Result, anyhow};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uni_common::DataType;
@@ -2259,7 +2260,7 @@ impl Executor {
                 )
                 .await?;
             }
-            Self::bind_path_variables(path_pattern, &mut row, temp_vars);
+            Self::bind_path_variables(path_pattern, &mut row, temp_vars)?;
             out.push(row);
         } else {
             // Apply ON MATCH SET to every matched node (multi-match semantics),
@@ -2326,7 +2327,7 @@ impl Executor {
                     .await?;
                     m.insert(var.clone(), Self::build_node_map(vid, label, props));
                 }
-                Self::bind_path_variables(path_pattern, &mut m, temp_vars);
+                Self::bind_path_variables(path_pattern, &mut m, temp_vars)?;
                 out.push(m);
             }
         }
@@ -2359,7 +2360,7 @@ impl Executor {
         // than a per-entity loop. Indexed keys get an index point-lookup;
         // un-indexed keys still skip planning (the lookup is a filtered scan).
         // The shape is the same for every row, so it is detected once.
-        let fastpath = self.merge_single_node_fastpath(pattern);
+        let fastpath = self.merge_single_node_fastpath(&path_pattern);
 
         // The same batched key resolution serves a relationship MERGE whose far
         // endpoint is found-or-created. Detected here rather than beside the
@@ -2641,7 +2642,7 @@ impl Executor {
                                 )
                                 .await?;
                             }
-                            Self::bind_path_variables(&path_pattern, &mut row, &temp_vars);
+                            Self::bind_path_variables(&path_pattern, &mut row, &temp_vars)?;
                             results.push(row);
                             continue;
                         }
@@ -2687,7 +2688,7 @@ impl Executor {
                                     .or_default()
                                     .push(new_vid);
                             }
-                            Self::bind_path_variables(&path_pattern, &mut row, &temp_vars);
+                            Self::bind_path_variables(&path_pattern, &mut row, &temp_vars)?;
                             results.push(row);
                             continue;
                         }
@@ -2777,7 +2778,7 @@ impl Executor {
                             )
                             .await?;
                         }
-                        Self::bind_path_variables(&path_pattern, &mut row, &temp_vars);
+                        Self::bind_path_variables(&path_pattern, &mut row, &temp_vars)?;
                         results.push(row);
                         continue;
                     }
@@ -2792,7 +2793,7 @@ impl Executor {
             let matches = self
                 // `path_pattern`, not `pattern`: when the MERGE carries a path
                 // variable, `prepare_pattern_for_path_binding` names the
-                // otherwise-anonymous relationships so they can be bound. The
+                // otherwise-anonymous nodes and relationships so they can be bound. The
                 // match ran on the original, which has nothing to bind, while
                 // `bind_path_variables` below reads the prepared one — so a
                 // matched `MERGE p = (a)-[:R]->(b)` produced a `p` holding its
@@ -2819,7 +2820,7 @@ impl Executor {
                             )
                             .await?;
                         }
-                        Self::bind_path_variables(&path_pattern, &mut m, &temp_vars);
+                        Self::bind_path_variables(&path_pattern, &mut m, &temp_vars)?;
                         batch.push(m);
                     }
                 } else {
@@ -2853,7 +2854,7 @@ impl Executor {
                         )
                         .await?;
                     }
-                    Self::bind_path_variables(&path_pattern, &mut row, &temp_vars);
+                    Self::bind_path_variables(&path_pattern, &mut row, &temp_vars)?;
                     batch.push(row);
                 }
                 Ok(batch)
@@ -5038,53 +5039,71 @@ impl Executor {
         Ok(final_matches)
     }
 
-    /// Prepare a MERGE pattern for path variable binding.
+    /// Prepare a CREATE or MERGE pattern for path variable binding.
     ///
-    /// If any path in the pattern has a path variable (e.g., `MERGE p = (a)-[:R]->(b)`),
-    /// unnamed relationships need internal variable names so that `execute_create_pattern`
-    /// stores the edge data in the row for later path construction.
+    /// A path variable (`CREATE p = (a)-[:R]->(:X)`) is built from the row's
+    /// element values, so every element of a named path must land in the row.
+    /// Anonymous nodes and relationships of such a path are given internal
+    /// names, `__path{pi}_n{idx}` / `__path{pi}_r{idx}`, which
+    /// `execute_create_pattern` and the MERGE match bind like any other
+    /// variable and [`Self::bind_path_variables`] strips afterwards. The path
+    /// index keeps two paths of one pattern from sharing a name.
     ///
-    /// Returns the (possibly modified) pattern and a list of temp variable names to clean up.
-    fn prepare_pattern_for_path_binding(pattern: &Pattern) -> (Pattern, Vec<String>) {
+    /// Returns the pattern — borrowed unchanged when it names no path — and
+    /// the internal names to remove.
+    pub(crate) fn prepare_pattern_for_path_binding(
+        pattern: &Pattern,
+    ) -> (Cow<'_, Pattern>, Vec<String>) {
         let has_path_vars = pattern
             .paths
             .iter()
             .any(|p| p.variable.as_ref().is_some_and(|v| !v.is_empty()));
 
         if !has_path_vars {
-            return (pattern.clone(), Vec::new());
+            return (Cow::Borrowed(pattern), Vec::new());
         }
 
         let mut modified = pattern.clone();
         let mut temp_vars = Vec::new();
 
-        for path in &mut modified.paths {
+        for (pi, path) in modified.paths.iter_mut().enumerate() {
             if path.variable.as_ref().is_none_or(|v| v.is_empty()) {
                 continue;
             }
             for (idx, element) in path.elements.iter_mut().enumerate() {
-                if let PatternElement::Relationship(r) = element
-                    && r.variable.as_ref().is_none_or(String::is_empty)
-                {
-                    let temp_var = format!("__path_r_{}", idx);
-                    r.variable = Some(temp_var.clone());
+                let (slot, kind) = match element {
+                    PatternElement::Node(n) => (&mut n.variable, 'n'),
+                    PatternElement::Relationship(r) => (&mut r.variable, 'r'),
+                    PatternElement::Parenthesized { .. } => continue,
+                };
+                if slot.as_ref().is_none_or(String::is_empty) {
+                    let temp_var = format!("__path{pi}_{kind}{idx}");
+                    *slot = Some(temp_var.clone());
                     temp_vars.push(temp_var);
                 }
             }
         }
 
-        (modified, temp_vars)
+        (Cow::Owned(modified), temp_vars)
     }
 
-    /// Bind path variables in the result row based on the MERGE pattern.
+    /// Bind path variables in the result row from a pattern prepared by
+    /// [`Self::prepare_pattern_for_path_binding`].
     ///
-    /// Walks each path in the pattern, collects node/edge values from the row
-    /// by variable name, and constructs a `Value::Path`.
+    /// Walks each named path, collects node/edge values from the row by
+    /// variable name, and constructs a `Value::Path`. Every element of a
+    /// prepared path has a name, so an element the row does not carry is an
+    /// error: skipping it would bind a shorter path than the one written.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an element of a named path is missing from the row
+    /// or is not a node / relationship.
     fn bind_path_variables(
         pattern: &Pattern,
         row: &mut HashMap<String, Value>,
         temp_vars: &[String],
-    ) {
+    ) -> Result<()> {
         for path in &pattern.paths {
             let Some(path_var) = path.variable.as_ref() else {
                 continue;
@@ -5099,35 +5118,85 @@ impl Executor {
             for element in &path.elements {
                 match element {
                     PatternElement::Node(n) => {
-                        if let Some(var) = &n.variable
-                            && let Some(val) = row.get(var)
-                            && let Some(node) = Self::value_to_node_for_path(val)
-                        {
-                            nodes.push(node);
-                        }
+                        let node = n
+                            .variable
+                            .as_ref()
+                            .and_then(|var| row.get(var))
+                            .and_then(Self::value_to_node_for_path)
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "cannot bind path '{path_var}': node {:?} is not bound \
+                                     to a node in the row",
+                                    n.variable
+                                )
+                            })?;
+                        nodes.push(node);
                     }
                     PatternElement::Relationship(r) => {
-                        if let Some(var) = &r.variable
-                            && let Some(val) = row.get(var)
-                            && let Some(edge) = Self::value_to_edge_for_path(val, &r.types)
-                        {
-                            edges.push(edge);
-                        }
+                        let edge = r
+                            .variable
+                            .as_ref()
+                            .and_then(|var| row.get(var))
+                            .and_then(|val| Self::value_to_edge_for_path(val, &r.types))
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "cannot bind path '{path_var}': relationship {:?} is not \
+                                     bound to a relationship in the row",
+                                    r.variable
+                                )
+                            })?;
+                        edges.push(edge);
                     }
-                    _ => {}
+                    PatternElement::Parenthesized { .. } => {
+                        return Err(anyhow!(
+                            "cannot bind path '{path_var}': a parenthesized pattern \
+                             cannot be part of a written path"
+                        ));
+                    }
                 }
             }
 
-            if !nodes.is_empty() {
-                use uni_common::value::Path;
-                row.insert(path_var.clone(), Value::Path(Path { nodes, edges }));
-            }
+            use uni_common::value::Path;
+            row.insert(path_var.clone(), Value::Path(Path { nodes, edges }));
         }
 
         // Clean up internal temp variables
         for var in temp_vars {
             row.remove(var);
         }
+        Ok(())
+    }
+
+    /// Run one CREATE pattern against `row` and bind its path variables.
+    ///
+    /// `prepared` / `temp_vars` come from
+    /// [`Self::prepare_pattern_for_path_binding`], called once per pattern
+    /// rather than once per row. Every CREATE executor goes through here so a
+    /// `CREATE p = …` binds `p` wherever it runs.
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) async fn execute_create_binding_paths(
+        &self,
+        prepared: &Pattern,
+        temp_vars: &[String],
+        row: &mut HashMap<String, Value>,
+        writer: &Writer,
+        prop_manager: &PropertyManager,
+        params: &HashMap<String, Value>,
+        ctx: Option<&QueryContext>,
+        tx_l0: Option<&Arc<parking_lot::RwLock<uni_store::runtime::l0::L0Buffer>>>,
+    ) -> Result<()> {
+        self.execute_create_pattern(
+            prepared,
+            row,
+            writer,
+            prop_manager,
+            params,
+            ctx,
+            tx_l0,
+            None,
+        )
+        .await?;
+        Self::bind_path_variables(prepared, row, temp_vars)
     }
 
     /// Convert a Value (Map or Node) to a Node for path construction.

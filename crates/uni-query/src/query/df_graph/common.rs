@@ -1927,6 +1927,82 @@ pub async fn execute_subplan_with_outer_vars(
     Vec<RecordBatch>,
     Arc<dyn datafusion::physical_plan::ExecutionPlan>,
 )> {
+    execute_subplan_planned_with(
+        plan,
+        params,
+        outer_values,
+        graph_ctx,
+        session_ctx,
+        storage,
+        schema_info,
+        outer_entity_vars,
+        outer_row,
+        mutation_ctx,
+        None,
+    )
+    .await
+}
+
+/// [`execute_subplan`] with property requirements the sub-plan cannot see.
+///
+/// An in-query node-yielding `CALL` runs as an `Apply` sub-plan per outer row,
+/// but the properties its node is read for (`node.k`, `RETURN node`) are named
+/// by the clauses *after* it, outside the sub-plan. Without them the procedure
+/// emits only the node's identity columns, and the `Apply` output — typed from
+/// the same requirements at plan time — would not match. See
+/// `HybridPhysicalPlanner::plan_apply`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Mirrors execute_subplan's context parameters plus the property set"
+)]
+pub async fn execute_subplan_with_properties(
+    plan: &LogicalPlan,
+    params: &HashMap<String, Value>,
+    outer_values: &HashMap<String, Value>,
+    graph_ctx: &Arc<GraphExecutionContext>,
+    session_ctx: &Arc<RwLock<SessionContext>>,
+    storage: &Arc<StorageManager>,
+    schema_info: &Arc<UniSchema>,
+    mutation_ctx: Option<&Arc<MutationContext>>,
+    extra_properties: &HashMap<String, std::collections::HashSet<String>>,
+) -> DFResult<Vec<RecordBatch>> {
+    let (batches, _plan) = execute_subplan_planned_with(
+        plan,
+        params,
+        outer_values,
+        graph_ctx,
+        session_ctx,
+        storage,
+        schema_info,
+        &std::collections::HashSet::new(),
+        None,
+        mutation_ctx,
+        Some(extra_properties),
+    )
+    .await?;
+    Ok(batches)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The shared body of the execute_subplan family"
+)]
+async fn execute_subplan_planned_with(
+    plan: &LogicalPlan,
+    params: &HashMap<String, Value>,
+    outer_values: &HashMap<String, Value>,
+    graph_ctx: &Arc<GraphExecutionContext>,
+    session_ctx: &Arc<RwLock<SessionContext>>,
+    storage: &Arc<StorageManager>,
+    schema_info: &Arc<UniSchema>,
+    outer_entity_vars: &std::collections::HashSet<String>,
+    outer_row: Option<RecordBatch>,
+    mutation_ctx: Option<&Arc<MutationContext>>,
+    extra_properties: Option<&HashMap<String, std::collections::HashSet<String>>>,
+) -> DFResult<(
+    Vec<RecordBatch>,
+    Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+)> {
     let mut planner = HybridPhysicalPlanner::with_l0_context(
         session_ctx.clone(),
         storage.clone(),
@@ -2000,9 +2076,11 @@ pub async fn execute_subplan_with_outer_vars(
         planner = planner.with_mutation_context(mc.clone());
     }
 
-    let execution_plan = planner.plan(plan).map_err(|e| {
-        datafusion::error::DataFusionError::Execution(format!("Sub-plan error: {e}"))
-    })?;
+    let execution_plan = match extra_properties {
+        Some(extra) => planner.plan_with_properties(plan, extra.clone()),
+        None => planner.plan(plan),
+    }
+    .map_err(|e| datafusion::error::DataFusionError::Execution(format!("Sub-plan error: {e}")))?;
 
     let task_ctx = session_ctx.read().task_ctx();
     // #261. `execute_subplan` is how `RecursiveCTEExec` runs each iteration and

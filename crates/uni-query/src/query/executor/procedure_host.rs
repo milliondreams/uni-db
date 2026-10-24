@@ -154,7 +154,10 @@ impl QueryProcedureHost {
             target_properties,
             yield_items,
             expected_schema,
-            transient_counter: Arc::new(AtomicU64::new(0)),
+            // The query's stream, not one per host: hosts are built per
+            // procedure invocation, and each restarting at 0 gave every
+            // virtual node of a query the same id.
+            transient_counter: graph_ctx.transient_ids(),
             writer: None,
             trigger_depth: 0,
         }

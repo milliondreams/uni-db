@@ -319,6 +319,12 @@ pub struct GraphExecutionContext {
     /// context, which is what releases the ids — see
     /// `uni_common::cypher_value_codec::handle`.
     handle_scope: Arc<HandleScope>,
+    /// The query's transient-id stream (`uni.create.vNode` / `vEdge`).
+    ///
+    /// One per query, shared with every sub-plan: an in-query `CALL` runs as a
+    /// sub-plan per row, and a stream per procedure host restarted at 0 for
+    /// each, so every virtual node in the query was the same node.
+    transient_ids: Arc<AtomicU64>,
 
     /// `K` for a `~=` vector search no `LIMIT` sized
     /// (`UniConfig::vector_knn_default_k`).
@@ -383,6 +389,7 @@ impl GraphExecutionContext {
             writer: None,
             handle_scope: Arc::new(HandleScope::new()),
             vector_knn_default_k: uni_common::config::DEFAULT_VECTOR_KNN_K,
+            transient_ids: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -481,6 +488,18 @@ impl GraphExecutionContext {
     /// The warning collector, for a sub-plan to share.
     pub(crate) fn warnings_sink(&self) -> Arc<Mutex<Vec<QueryWarning>>> {
         Arc::clone(&self.warnings)
+    }
+
+    /// The query's transient-id stream, for a procedure host or a sub-plan to
+    /// share. See the field.
+    pub(crate) fn transient_ids(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.transient_ids)
+    }
+
+    /// Draw transient ids from `ids` — the enclosing query's stream.
+    pub(crate) fn with_transient_ids(mut self, ids: Arc<AtomicU64>) -> Self {
+        self.transient_ids = ids;
+        self
     }
 
     /// Records `n` rows served from an L0 buffer, if counting is active.

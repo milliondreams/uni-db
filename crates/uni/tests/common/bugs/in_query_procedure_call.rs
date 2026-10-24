@@ -267,3 +267,50 @@ async fn in_query_procedure_call_unit_body_keeps_row_count() -> Result<()> {
     assert_eq!(got, ["[Int(6)]"]);
     Ok(())
 }
+
+/// A node-yielding procedure called after a MATCH yields a node on every row.
+///
+/// The per-row `Apply` typed the call's output with one `Utf8` column for the
+/// node, so anything that read the node as one failed to plan: `id(node)`
+/// with `No field named "node._vid"`. The node's property is the matched
+/// row's, so a mix-up between rows would show.
+#[tokio::test]
+async fn in_query_procedure_call_node_yield_after_match() -> Result<()> {
+    let db = Uni::in_memory().build().await?;
+    let tx = db.session().tx().await?;
+    tx.execute("CREATE (:P {uid: 'a'}), (:P {uid: 'b'})")
+        .await?;
+    tx.commit().await?;
+
+    let r = db
+        .session()
+        .query(
+            "MATCH (p:P) \
+             CALL uni.create.vNode(['Copy'], {of: p.uid}) YIELD node \
+             RETURN p.uid AS uid, node.of AS of, labels(node) AS l, id(node) AS nid, \
+                    node \
+             ORDER BY uid",
+        )
+        .await?;
+    assert_eq!(r.rows().len(), 2);
+    let mut ids = std::collections::HashSet::new();
+    for (row, want) in r.rows().iter().zip(["a", "b"]) {
+        ids.insert(row.get::<i64>("nid")?);
+        assert_eq!(row.get::<String>("uid")?, want);
+        assert_eq!(row.get::<String>("of")?, want);
+        assert_eq!(row.get::<Vec<String>>("l")?, vec!["Copy"]);
+        assert!(
+            row.get::<i64>("nid")? < 0,
+            "a virtual node's id is negative: {row:?}"
+        );
+        match row.value("node") {
+            Some(Value::Node(n)) => {
+                assert!(n.vid.is_ephemeral(), "{n:?}");
+                assert_eq!(n.properties.get("of"), Some(&Value::String(want.into())));
+            }
+            other => panic!("node should be a Node, got {other:?}"),
+        }
+    }
+    assert_eq!(ids.len(), 2, "each row's call mints its own node");
+    Ok(())
+}

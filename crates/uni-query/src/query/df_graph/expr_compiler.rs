@@ -1885,7 +1885,9 @@ impl<'a> CypherPhysicalExprCompiler<'a> {
         // column. `EndpointHydrateExec` materialised the endpoints of the *list*
         // before this expression runs; carry them into the inner schema under
         // the loop variable's name so the body can reach them.
-        let endpoint_lists = if let Expr::Variable(list_var) = list {
+        let endpoint_lists = if let Some(list_var) =
+            crate::query::df_graph::endpoint_hydrate::endpoint_list_column(list)
+        {
             let src = crate::query::df_graph::endpoint_hydrate::endpoint_column(list_var, true);
             let dst = crate::query::df_graph::endpoint_hydrate::endpoint_column(list_var, false);
             match (input_schema.index_of(&src), input_schema.index_of(&dst)) {

@@ -86,6 +86,14 @@ async fn hydrate_entity_if_needed(
     // NULL after a pushdown that emitted only the system fields (#234).
     let entity = uni_common::value::entity_ref_from_map(map);
 
+    // An ephemeral entity (`uni.create.vNode` / `vEdge`) has no stored row:
+    // whatever it carries is all there is, so there is nothing to hydrate.
+    match entity {
+        Some(uni_common::value::EntityRef::Vertex(vid)) if vid.is_ephemeral() => return,
+        Some(uni_common::value::EntityRef::Edge(eid)) if eid.is_ephemeral() => return,
+        _ => {}
+    }
+
     // Check for edge entity
     if let Some(uni_common::value::EntityRef::Edge(eid)) = entity {
         let eid_u64 = eid.as_u64();
@@ -3550,29 +3558,31 @@ impl Executor {
                 }
             }
             LogicalPlan::Create { pattern, .. } => {
-                self.execute_create_pattern(
-                    &pattern,
+                let (prepared, temp_vars) = Self::prepare_pattern_for_path_binding(&pattern);
+                self.execute_create_binding_paths(
+                    &prepared,
+                    &temp_vars,
                     scope,
                     writer,
                     prop_manager,
                     params,
                     ctx,
                     tx_l0,
-                    None,
                 )
                 .await?;
             }
             LogicalPlan::CreateBatch { patterns, .. } => {
                 for pattern in &patterns {
-                    self.execute_create_pattern(
-                        pattern,
+                    let (prepared, temp_vars) = Self::prepare_pattern_for_path_binding(pattern);
+                    self.execute_create_binding_paths(
+                        &prepared,
+                        &temp_vars,
                         scope,
                         writer,
                         prop_manager,
                         params,
                         ctx,
                         tx_l0,
-                        None,
                     )
                     .await?;
                 }

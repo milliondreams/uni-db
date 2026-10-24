@@ -666,9 +666,12 @@ impl HybridPhysicalPlanner {
     /// Share an enclosing query's warning collector with this sub-plan.
     #[must_use]
     pub(crate) fn with_inherited_warnings(mut self, parent: &GraphExecutionContext) -> Self {
+        // The transient-id stream crosses with the warnings: a sub-plan's
+        // `uni.create.vNode` must not mint ids the outer query already used.
         let ctx = self
             .take_graph_ctx()
-            .with_warnings_sink(parent.warnings_sink());
+            .with_warnings_sink(parent.warnings_sink())
+            .with_transient_ids(parent.transient_ids());
         self.graph_ctx = Arc::new(ctx);
         self
     }
@@ -2507,11 +2510,34 @@ impl HybridPhysicalPlanner {
         // 2. Infer subquery output schema from logical plan + UniSchema metadata.
         // Use the ORIGINAL (still-wrapped) subquery so a unit subquery resolves
         // to an empty schema, which `GraphApplyExec` reads as the unit signal.
-        let sub_schema = infer_logical_plan_schema(
-            subquery,
-            &self.schema,
-            self.graph_ctx.procedure_registry().map(Arc::as_ref),
-        );
+        //
+        // A node-yielding procedure is the exception: its columns depend on
+        // what the clauses after it read from the node (`node.k`, `RETURN
+        // node`), which the logical walk cannot type — it saw one `Utf8`
+        // column, so `id(node)` after a second `CALL` failed to plan with
+        // `No field named "node._vid"`. Plan it here with those requirements
+        // and take its schema; each row's sub-plan is planned with the same
+        // requirements (`with_subplan_properties`), so they agree.
+        let node_yield_properties =
+            node_yield_subplan_properties(subquery_effective, all_properties);
+        let sub_schema = match &node_yield_properties {
+            Some(extra) => {
+                let mut properties = collect_properties_from_plan(subquery_effective);
+                for (var, props) in extra {
+                    properties
+                        .entry(var.clone())
+                        .or_default()
+                        .extend(props.iter().cloned());
+                }
+                self.plan_internal(subquery_effective, &properties)?
+                    .schema()
+            }
+            None => infer_logical_plan_schema(
+                subquery,
+                &self.schema,
+                self.graph_ctx.procedure_registry().map(Arc::as_ref),
+            ),
+        };
 
         // 3. Merge schemas: subquery fields override input fields with the
         //    same name. The subquery's RETURN list is authoritative for the
@@ -2564,7 +2590,7 @@ impl HybridPhysicalPlanner {
         fields.extend(sub_schema.fields().iter().cloned());
         let output_schema: SchemaRef = Arc::new(Schema::new(fields));
 
-        Ok(Arc::new(GraphApplyExec::new(
+        let apply = GraphApplyExec::new(
             input_exec,
             subquery_effective.clone(),
             input_filter.cloned(),
@@ -2577,7 +2603,11 @@ impl HybridPhysicalPlanner {
             kept_input_indices,
             kept_input_overrides,
             self.mutation_ctx.clone(),
-        )))
+        );
+        Ok(Arc::new(match node_yield_properties {
+            Some(extra) => apply.with_subplan_properties(extra),
+            None => apply,
+        }))
     }
 
     /// Plan a vector KNN search.
@@ -8803,6 +8833,45 @@ fn apply_passthrough_reconciliation(
 /// Prefix of the columns `EndpointHydrateExec` appends.
 pub(crate) const ENDPOINT_COLUMN_PREFIX: &str = "_endpoint.";
 
+/// The outer requirements on the nodes a node-yielding procedure sub-plan
+/// binds, or `None` when `subquery` is not such a call.
+///
+/// Looks through the wrappers a `CALL … YIELD … WHERE` adds. Every node yield
+/// is listed, with no requirement when the query reads nothing from it, so the
+/// sub-plan is still planned (and typed) as a node.
+fn node_yield_subplan_properties(
+    subquery: &LogicalPlan,
+    all_properties: &HashMap<String, HashSet<String>>,
+) -> Option<HashMap<String, HashSet<String>>> {
+    use crate::query::df_graph::procedure_call::{
+        is_node_yield_procedure_static, map_yield_to_canonical,
+    };
+    match subquery {
+        LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Distinct { input } => node_yield_subplan_properties(input, all_properties),
+        LogicalPlan::ProcedureCall {
+            procedure_name,
+            yield_items,
+            ..
+        } if is_node_yield_procedure_static(procedure_name) => Some(
+            yield_items
+                .iter()
+                .filter(|(name, _)| map_yield_to_canonical(name) == "node")
+                .map(|(name, alias)| {
+                    let var = alias.as_ref().unwrap_or(name);
+                    (
+                        var.clone(),
+                        all_properties.get(var).cloned().unwrap_or_default(),
+                    )
+                })
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
 /// Collect the relationship variables named by `startNode(x)` / `endNode(x)`.
 ///
 /// Only a bare variable argument is collected. `startNode(<expr>)` has no column
@@ -8828,15 +8897,15 @@ fn collect_endpoint_relationships(expr: &Expr, out: &mut Vec<String>) {
         where_clause,
         map_expr,
     } = expr
-        && let Expr::Variable(list_var) = list.as_ref()
+        && let Some(list_var) = crate::query::df_graph::endpoint_hydrate::endpoint_list_column(list)
     {
         let mut inner = Vec::new();
         collect_endpoint_relationships(map_expr, &mut inner);
         if let Some(w) = where_clause {
             collect_endpoint_relationships(w, &mut inner);
         }
-        if inner.contains(variable) && !out.contains(list_var) {
-            out.push(list_var.clone());
+        if inner.contains(variable) && !out.iter().any(|o| o == list_var) {
+            out.push(list_var.to_string());
         }
     }
     expr.for_each_child(&mut |child| collect_endpoint_relationships(child, out));

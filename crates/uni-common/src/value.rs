@@ -828,7 +828,7 @@ impl Value {
                 };
                 let endpoint = |keys: &[&str]| {
                     get_with_fallback(map, keys)
-                        .and_then(Value::as_u64)
+                        .and_then(Value::as_id_bits)
                         .map(Vid::from)
                 };
                 match (
@@ -1177,14 +1177,15 @@ impl Value {
     /// a raw id is a legitimate input; where an entity is expected, the narrow
     /// form is what keeps a stray integer from matching one.
     ///
-    /// A negative integer is rejected rather than wrapped: `as_u64` requires a
-    /// non-negative value, so `-1` yields `None` instead of `u64::MAX`.
+    /// An integer is read as id bits ([`Value::as_id_bits`]): a negative one
+    /// is an ephemeral id (`uni.create.vNode`), and `-1` yields `None` rather
+    /// than wrapping to `u64::MAX`, which is `Vid::INVALID`.
     #[must_use]
     pub fn coerce_vid(&self) -> Option<Vid> {
         if let Some(vid) = self.entity_vid() {
             return Some(vid);
         }
-        if let Some(v) = self.as_u64() {
+        if let Some(v) = self.as_id_bits() {
             return Some(Vid::from(v));
         }
         self.as_str()
@@ -1953,10 +1954,13 @@ impl TryFrom<&Value> for Vid {
                     actual: s.clone(),
                 })
             }
-            // A negative integer must not wrap: `-1 as u64` is `u64::MAX`,
-            // which is exactly Vid::INVALID, and it was returned as `Ok`.
-            // `coerce_vid` documents rejecting negatives; match it.
-            Value::Int(i) if *i >= 0 => Ok(Vid::new(*i as u64)),
+            // An integer carries id bits (`Value::as_id_bits`): non-negative
+            // for a stored id, negative for an ephemeral one. `-1` must not
+            // wrap to `u64::MAX`, which is exactly Vid::INVALID.
+            Value::Int(_) => value
+                .as_id_bits()
+                .map(Vid::new)
+                .ok_or_else(|| type_error("Vid", value)),
             _ => Err(type_error("Vid", value)),
         }
     }
@@ -1977,10 +1981,13 @@ impl TryFrom<&Value> for Eid {
                     actual: s.clone(),
                 })
             }
-            // A negative integer must not wrap: `-1 as u64` is `u64::MAX`,
-            // which is exactly Eid::INVALID, and it was returned as `Ok`.
-            // `coerce_vid` documents rejecting negatives; match it.
-            Value::Int(i) if *i >= 0 => Ok(Eid::new(*i as u64)),
+            // An integer carries id bits (`Value::as_id_bits`): non-negative
+            // for a stored id, negative for an ephemeral one. `-1` must not
+            // wrap to `u64::MAX`, which is exactly Eid::INVALID.
+            Value::Int(_) => value
+                .as_id_bits()
+                .map(Eid::new)
+                .ok_or_else(|| type_error("Eid", value)),
             _ => Err(type_error("Eid", value)),
         }
     }
@@ -2147,7 +2154,10 @@ pub fn is_serialised_entity_map(map: &HashMap<String, Value>) -> bool {
 pub fn entity_ref_from_map(map: &HashMap<String, Value>) -> Option<EntityRef> {
     fn id_from(v: &Value) -> Option<u64> {
         match v {
-            Value::Int(i) if *i >= 0 => Some(*i as u64),
+            // Id bits: an ephemeral entity (`uni.create.vNode`) has the sign
+            // bit set, so its id is a negative integer. Requiring `>= 0` read
+            // a virtual node's `{_vid, _labels}` struct as a plain map.
+            Value::Int(_) => v.as_id_bits(),
             Value::String(s) => s
                 .strip_prefix("Vid(")
                 .or_else(|| s.strip_prefix("Eid("))
@@ -2595,6 +2605,22 @@ impl Value {
     #[allow(clippy::cast_possible_wrap)]
     pub fn from_id_bits(bits: u64) -> Value {
         Value::Int(bits as i64)
+    }
+
+    /// The id bits an `Int` carries — the inverse of [`Value::from_id_bits`].
+    ///
+    /// A stored id is non-negative; an ephemeral one has the sign bit set
+    /// and reads as a negative integer. Every negative integer but `-1` is
+    /// therefore an ephemeral id. `-1` is the bit pattern of
+    /// `Vid::INVALID` / `Eid::INVALID`, never a real identity, and is
+    /// refused rather than wrapped. `None` for every non-`Int`.
+    #[must_use]
+    #[allow(clippy::cast_sign_loss)]
+    pub fn as_id_bits(&self) -> Option<u64> {
+        match self {
+            Value::Int(i) if *i != -1 => Some(*i as u64),
+            _ => None,
+        }
     }
 }
 
@@ -3175,6 +3201,44 @@ mod tests {
             assert_eq!(Value::String("7".into()).entity_ref(), None);
             assert_eq!(Value::Null.entity_ref(), None);
             assert_eq!(node_map(Value::Int(-1)).entity_ref(), None);
+        }
+
+        /// An ephemeral id (sign bit set, `uni.create.vNode`) is a negative
+        /// integer, and still names an entity; `-1` (`INVALID`) never does.
+        #[test]
+        fn an_ephemeral_id_names_an_entity() {
+            let vid = Vid::ephemeral(5);
+            let bits = Value::from_id_bits(vid.as_u64());
+            assert!(matches!(bits, Value::Int(i) if i < 0));
+            assert_eq!(
+                node_map(bits.clone()).entity_ref(),
+                Some(EntityRef::Vertex(vid))
+            );
+            assert_eq!(Vid::try_from(&bits).ok(), Some(vid));
+            assert_eq!(bits.coerce_vid(), Some(vid));
+            let eid = Eid::ephemeral(9);
+            assert_eq!(
+                Eid::try_from(&Value::from_id_bits(eid.as_u64())).ok(),
+                Some(eid)
+            );
+            // A virtual edge between virtual nodes canonicalises to an edge.
+            let mut m = HashMap::new();
+            m.insert("_eid".to_string(), Value::from_id_bits(eid.as_u64()));
+            m.insert("_type_name".to_string(), Value::String("T".into()));
+            m.insert("_src".to_string(), bits.clone());
+            m.insert("_dst".to_string(), bits.clone());
+            m.insert("properties".to_string(), Value::Map(HashMap::new()));
+            let edge = Value::Map(m);
+            assert_eq!(edge.edge_endpoints(), Some((Some(vid), Some(vid))));
+            match edge.canonical_entity() {
+                Value::Edge(e) => assert_eq!((e.eid, e.src, e.dst), (eid, vid, vid)),
+                other => panic!("expected an edge, got {other:?}"),
+            }
+            let invalid = Value::Int(-1);
+            assert_eq!(invalid.as_id_bits(), None);
+            assert!(Vid::try_from(&invalid).is_err());
+            assert!(Eid::try_from(&invalid).is_err());
+            assert_eq!(invalid.coerce_vid(), None);
         }
 
         fn hash_of(v: &Value) -> u64 {

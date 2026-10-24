@@ -1054,6 +1054,23 @@ impl L0Buffer {
         }
     }
 
+    /// Whether a flush of this buffer writes anything to storage.
+    ///
+    /// Every flushed row comes from one of these maps: vertex rows and
+    /// tombstones, edge rows and tombstones, and relabeled vertices (which
+    /// carry labels but no properties). `mutation_count` is not the test —
+    /// a merged relabel, for one, does not bump it.
+    #[must_use]
+    pub fn holds_flushable_data(&self) -> bool {
+        self.mutation_count > 0
+            || !self.vertex_properties.is_empty()
+            || !self.vertex_tombstones.is_empty()
+            || !self.vertex_labels.is_empty()
+            || !self.vertex_label_overwrites.is_empty()
+            || !self.edge_endpoints.is_empty()
+            || !self.tombstones.is_empty()
+    }
+
     /// Add labels to an existing vertex.
     pub fn add_vertex_labels(&mut self, vid: Vid, labels: &[String]) {
         let existing = self.vertex_labels.entry(vid).or_default();

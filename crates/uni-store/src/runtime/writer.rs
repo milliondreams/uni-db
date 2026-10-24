@@ -7783,8 +7783,15 @@ impl Writer {
         metrics::counter!("uni_flush_bytes_total").increment(initial_size as u64);
         metrics::counter!("uni_flush_rows_total").increment(initial_count as u64);
 
-        // P. Increment flush generation counter for write throttling.
-        {
+        // P. Increment flush generation counter for write throttling — only
+        // for a flush that wrote something. An empty buffer's flush appends no
+        // fragment to any table, so it is no generation for compaction to fold;
+        // counting it let back-to-back flushes of an idle L0 (a `flush()` loop,
+        // the auto-flush timer while a transaction holds its writes privately)
+        // drive `l1_runs` past the hard limit, and the next write — a
+        // transaction's first `SET` — stalled until compaction caught up:
+        // ~10 s for a 250 ms statement (`bugs::issue_311_tx_index_rekey`).
+        if old_l0_arc.read().holds_flushable_data() {
             let mut status = uni_common::sync::acquire_mutex(
                 &shared.storage.compaction_status,
                 "compaction_status",

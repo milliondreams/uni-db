@@ -2733,7 +2733,7 @@ impl UniBuilder {
             // `DiskManagerMode::OsTmpDirectory`, so DataFusion's buffering
             // operators can spill, and #202 had already disproved the claim.
             // The full reasoning, and what would change it, is on
-            // `Executor::memory_bounded_runtime`, which makes the same choice.
+            // `Executor::query_runtime`, which makes the same choice.
             //
             // Two honest limits. The pool is on the shared template, so it is
             // a budget across concurrent queries rather than per query — which

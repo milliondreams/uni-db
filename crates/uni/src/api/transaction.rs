@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 use crate::api::UniInner;
 use crate::api::impl_locy::{self, LocyRuleRegistry};
+use crate::api::impl_query::QueryOverrides;
 use crate::api::session::Session;
 use crate::api::triggers::{MutationEvents, TriggerRouter, tx_id_to_u64};
 use crate::shutdown::ShutdownHandle;
@@ -513,7 +514,7 @@ impl Transaction {
             Some(self.id_reservoir.clone()),
             self.read_snapshot(),
             self.cancel_scope(None),
-            None,
+            QueryOverrides::default(),
         );
         self.with_principal_scope(fut).await
     }
@@ -761,6 +762,7 @@ impl Transaction {
             params: HashMap::new(),
             timeout: None,
             cancellation_token: None,
+            max_memory: None,
         }
     }
 
@@ -1187,6 +1189,7 @@ impl Transaction {
         // Transaction path: auto-apply DERIVE mutations to the private L0.
         let engine = impl_locy::LocyEngine {
             counters: std::sync::Arc::new(uni_store::QueryCounters::new()),
+            statement_memory: Default::default(),
             db: &self.db,
             tx_l0_override: Some(self.tx_l0.clone()),
             locy_l0: Some(self.tx_l0.clone()),
@@ -1893,12 +1896,17 @@ impl Transaction {
         cypher: &str,
         params: HashMap<String, Value>,
         cancellation_token: Option<CancellationToken>,
-        timeout: Option<Duration>,
+        overrides: QueryOverrides,
     ) -> Result<ExecuteResult> {
         self.check_completed()?;
         self.run_exec_guards(cypher, &params).await?;
         let before = self.snapshot_l0();
         let cancel = self.cancel_scope(cancellation_token);
+        // The timeout is enforced inside, at its effective value. It used to be
+        // a `tokio::time::timeout` wrapped around this call while execution
+        // stayed bounded by `UniConfig::query_timeout`, so a builder timeout
+        // could only tighten the database setting, and `max_memory` was
+        // dropped here altogether.
         let fut = self.db.execute_internal_with_tx_l0(
             cypher,
             params,
@@ -1906,11 +1914,9 @@ impl Transaction {
             Some(self.id_reservoir.clone()),
             self.read_snapshot(),
             cancel,
-            None,
+            overrides,
         );
-        let result = self
-            .with_principal_scope(with_optional_timeout(timeout, fut))
-            .await?;
+        let result = self.with_principal_scope(fut).await?;
         let after = self.snapshot_l0();
         Ok(Self::compute_execute_result(&before, &after, &result))
     }
@@ -2031,6 +2037,9 @@ pub struct ExecuteBuilder<'a> {
     /// a read on this transaction but not to a write, and the mutation
     /// terminal would silently ignore one.
     cancellation_token: Option<CancellationToken>,
+    /// Mirrors [`TxQueryBuilder::max_memory`]: a mutation's `MATCH` side
+    /// builds the same operators a read does.
+    max_memory: Option<usize>,
 }
 
 impl<'a> ExecuteBuilder<'a> {
@@ -2055,9 +2064,24 @@ impl<'a> ExecuteBuilder<'a> {
     }
 
     /// Set maximum execution time for this mutation.
+    ///
+    /// Replaces `UniConfig::query_timeout` for this statement, in either
+    /// direction: a value above the database setting allows a mutation the
+    /// setting alone would stop.
     pub fn timeout(mut self, duration: Duration) -> Self {
         self.timeout = Some(duration);
         self
+    }
+
+    /// Cap the memory this mutation may reserve, overriding
+    /// `UniConfig::max_query_memory` for this call alone.
+    pub fn max_memory(mut self, bytes: usize) -> Self {
+        self.max_memory = Some(bytes);
+        self
+    }
+
+    fn overrides(&self) -> QueryOverrides {
+        QueryOverrides::new(self.timeout, self.max_memory)
     }
 
     /// Execute the mutation and return affected row count with detailed stats.
@@ -2069,12 +2093,13 @@ impl<'a> ExecuteBuilder<'a> {
     /// Inner body of [`Self::run`]; the public method wraps the result in
     /// `mark_on_err` so any failure poisons the transaction (bug #15).
     async fn run_inner(self) -> Result<ExecuteResult> {
+        let overrides = self.overrides();
         self.tx
             .run_tx_mutation(
                 &self.cypher,
                 self.params,
                 self.cancellation_token,
-                self.timeout,
+                overrides,
             )
             .await
     }
@@ -2100,18 +2125,17 @@ impl<'a> ExecuteBuilder<'a> {
         self.tx.check_completed()?;
         self.tx.run_exec_guards(&self.cypher, &self.params).await?;
         let before = self.tx.snapshot_l0();
+        let overrides = self.overrides();
         let fut = self.tx.db.profile_internal_with_tx_l0(
             &self.cypher,
             self.params,
             self.tx.tx_l0.clone(),
             Some(self.tx.id_reservoir.clone()),
             self.tx.read_snapshot(),
-            None,
+            self.tx.cancel_scope(self.cancellation_token),
+            overrides,
         );
-        let (result, profile) = self
-            .tx
-            .with_principal_scope(with_optional_timeout(self.timeout, fut))
-            .await?;
+        let (result, profile) = self.tx.with_principal_scope(fut).await?;
         let after = self.tx.snapshot_l0();
         Ok((
             Transaction::compute_execute_result(&before, &after, &result),
@@ -2170,14 +2194,19 @@ impl<'a> TxQueryBuilder<'a> {
     /// Inner body of [`Self::execute`]; the public method wraps the result in
     /// `mark_on_err` so any failure poisons the transaction (bug #15).
     async fn execute_inner(self) -> Result<ExecuteResult> {
+        let overrides = self.overrides();
         self.tx
             .run_tx_mutation(
                 &self.cypher,
                 self.params,
                 self.cancellation_token,
-                self.timeout,
+                overrides,
             )
             .await
+    }
+
+    fn overrides(&self) -> QueryOverrides {
+        QueryOverrides::new(self.timeout, self.max_memory)
     }
 
     /// Execute as a query and return rows.
@@ -2194,7 +2223,8 @@ impl<'a> TxQueryBuilder<'a> {
     /// this existed the only transaction profiler was on `ExecuteBuilder`, so a
     /// *read* inside a transaction could not be profiled at all.
     ///
-    /// Honours `timeout` and `max_memory` set on this builder.
+    /// Honours `timeout`, `max_memory` and the cancellation token set on this
+    /// builder, and the transaction's own cancellation scope.
     pub async fn profile(self) -> Result<(QueryResult, ProfileOutput)> {
         let tx = self.tx;
         tx.mark_on_err(self.profile_inner().await)
@@ -2205,17 +2235,17 @@ impl<'a> TxQueryBuilder<'a> {
     async fn profile_inner(self) -> Result<(QueryResult, ProfileOutput)> {
         self.tx.check_completed()?;
         self.tx.run_exec_guards(&self.cypher, &self.params).await?;
+        let overrides = self.overrides();
         let fut = self.tx.db.profile_internal_with_tx_l0(
             &self.cypher,
             self.params,
             self.tx.tx_l0.clone(),
             Some(self.tx.id_reservoir.clone()),
             self.tx.read_snapshot(),
-            self.max_memory,
+            self.tx.cancel_scope(self.cancellation_token),
+            overrides,
         );
-        self.tx
-            .with_principal_scope(with_optional_timeout(self.timeout, fut))
-            .await
+        self.tx.with_principal_scope(fut).await
     }
 
     /// Inner body of [`Self::fetch_all`]; the public method wraps the result in
@@ -2224,6 +2254,7 @@ impl<'a> TxQueryBuilder<'a> {
         self.tx.check_completed()?;
         self.tx.run_exec_guards(&self.cypher, &self.params).await?;
         let cancel = self.tx.cancel_scope(self.cancellation_token);
+        let overrides = QueryOverrides::new(self.timeout, self.max_memory);
         let fut = self.tx.db.execute_internal_with_tx_l0(
             &self.cypher,
             self.params,
@@ -2231,11 +2262,9 @@ impl<'a> TxQueryBuilder<'a> {
             Some(self.tx.id_reservoir.clone()),
             self.tx.read_snapshot(),
             cancel,
-            self.max_memory,
+            overrides,
         );
-        self.tx
-            .with_principal_scope(with_optional_timeout(self.timeout, fut))
-            .await
+        self.tx.with_principal_scope(fut).await
     }
 
     /// Execute the query and return the first row, or `None` if empty.
@@ -2263,13 +2292,7 @@ impl<'a> TxQueryBuilder<'a> {
         // handed down rather than awaited here — until now `cursor_inner`
         // dropped both on the floor, so a transaction cursor ran unbounded and
         // uncancellable while the builder accepted the options.
-        let mut config = self.tx.db.config.clone();
-        if let Some(t) = self.timeout {
-            config.query_timeout = t;
-        }
-        if let Some(m) = self.max_memory {
-            config.max_query_memory = m;
-        }
+        let config = self.overrides().apply(&self.tx.db.config);
 
         // Built inside the principal scope: the cursor captures the scope it
         // was built in and re-installs it around every poll, since the stream
@@ -2278,6 +2301,8 @@ impl<'a> TxQueryBuilder<'a> {
             &self.cypher,
             self.params,
             self.tx.tx_l0.clone(),
+            Some(self.tx.id_reservoir.clone()),
+            self.tx.read_snapshot(),
             config,
             self.tx.cancel_scope(self.cancellation_token),
         );

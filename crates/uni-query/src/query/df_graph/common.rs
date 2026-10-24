@@ -2037,6 +2037,11 @@ async fn execute_subplan_planned_with(
     // same way.
     planner = planner.with_counters(graph_ctx.counters().cloned());
 
+    // The sub-plan already runs on the outer `SessionContext`, and so on its
+    // memory pool; the pool handle travels too so a procedure called inside
+    // the sub-plan hands it to its inner query.
+    planner = planner.with_memory_pool(graph_ctx.memory_pool().cloned());
+
     // Warnings and the `~=` default `K` cross the boundary for the same
     // reason: a fresh context would collect a sub-plan's warnings where
     // nobody harvests them, and size its vector searches by the built-in

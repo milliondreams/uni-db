@@ -395,31 +395,21 @@ impl Executor {
         // the shared template also makes a per-statement `.max_memory()`
         // override real, and makes the budget per query rather than shared
         // across concurrent ones, which is what the setting's name promises.
-        let df_runtime = Self::memory_bounded_runtime(self.config.max_query_memory)?;
+        let df_runtime = self.query_runtime()?;
 
         let session = if let (Some(tmpl), false) = (
             self.df_session_template.as_ref(),
             needs_dynamic_registration,
         ) {
             // Hot path: clone the template (Cypher UDFs already registered).
-            match df_runtime.clone() {
-                Some(rt) => {
-                    use datafusion::execution::session_state::SessionStateBuilder;
-                    let state = SessionStateBuilder::new_from_existing(tmpl.state())
-                        .with_runtime_env(rt)
-                        .build();
-                    SessionContext::new_with_state(state)
-                }
-                // A fresh state, not a clone of the template's handle: the
-                // query registers its own `_cypher_regex` below, which must
-                // not reach the shared template.
-                None => SessionContext::new_with_state(
-                    datafusion::execution::session_state::SessionStateBuilder::new_from_existing(
-                        tmpl.state(),
-                    )
-                    .build(),
-                ),
-            }
+            // A fresh state, not a clone of the template's handle: the query
+            // registers its own `_cypher_regex` below, which must not reach
+            // the shared template, and carries its own memory pool.
+            use datafusion::execution::session_state::SessionStateBuilder;
+            let state = SessionStateBuilder::new_from_existing(tmpl.state())
+                .with_runtime_env(Arc::clone(&df_runtime))
+                .build();
+            SessionContext::new_with_state(state)
         } else {
             // Cold path: build a fresh session, optionally with any
             // plugin-registered optimizer rules folded in.
@@ -429,24 +419,17 @@ impl Executor {
             // snapshotted at session-construction time; reload discipline
             // is M10's problem.
             let session = if optimizer_providers.is_empty() {
-                match df_runtime.clone() {
-                    Some(rt) => SessionContext::new_with_config_rt(
-                        datafusion_session_config(&self.config),
-                        rt,
-                    ),
-                    None => {
-                        SessionContext::new_with_config(datafusion_session_config(&self.config))
-                    }
-                }
+                SessionContext::new_with_config_rt(
+                    datafusion_session_config(&self.config),
+                    Arc::clone(&df_runtime),
+                )
             } else {
                 use datafusion::execution::session_state::SessionStateBuilder;
                 use uni_plugin::traits::operator::OptimizerPhase;
                 let mut builder = SessionStateBuilder::new()
                     .with_config(datafusion_session_config(&self.config))
-                    .with_default_features();
-                if let Some(rt) = df_runtime.clone() {
-                    builder = builder.with_runtime_env(rt);
-                }
+                    .with_default_features()
+                    .with_runtime_env(Arc::clone(&df_runtime));
                 for provider in optimizer_providers.iter() {
                     match provider.phase() {
                         OptimizerPhase::Logical => {
@@ -528,6 +511,10 @@ impl Executor {
         // the sense that `take_graph_ctx` preserves it either way — but it must
         // be here at all, or every operator-level count is dropped.
         planner = planner.with_counters(Some(self.counters.clone()));
+        // The statement's pool travels with the graph context, so a procedure's
+        // inner query (`QueryProcedureHost::execute_inner_query`) draws on it
+        // instead of building a full-size pool of its own per call.
+        planner = planner.with_memory_pool(Some(Arc::clone(&df_runtime.memory_pool)));
         planner = planner.with_vector_knn_default_k(self.config.vector_knn_default_k);
         // The deadline and token live on the `QueryContext` built above; without
         // this hop they never reach a physical operator and every
@@ -591,8 +578,8 @@ impl Executor {
         Ok((session_ctx, planner, prop_manager_arc))
     }
 
-    /// A DataFusion runtime environment whose memory pool caps execution at
-    /// `max_query_memory` bytes, or `None` when the limit is disabled (`0`).
+    /// The DataFusion runtime environment for one physical plan, whose memory
+    /// pool caps execution at `max_query_memory` bytes (unbounded when `0`).
     ///
     /// `GreedyMemoryPool` rather than `FairSpillPool`, but **not** because
     /// nothing can spill. This comment used to say a disk-spill path was not
@@ -624,18 +611,50 @@ impl Executor {
     /// buffer directly — `MutableArrayData`, the allocation behind #184 — never
     /// asks the pool and is still unbounded. This makes the limit real where
     /// DataFusion cooperates; it is not a fix for that crash.
-    fn memory_bounded_runtime(
-        max_query_memory: usize,
-    ) -> Result<Option<Arc<datafusion::execution::runtime_env::RuntimeEnv>>> {
-        if max_query_memory == 0 {
-            return Ok(None);
-        }
-        let rt = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
-            .with_memory_pool(Arc::new(
-                datafusion::execution::memory_pool::GreedyMemoryPool::new(max_query_memory),
+    ///
+    /// The pool is always wrapped in a [`PeakTrackingPool`], including when the
+    /// limit is disabled and the inner pool is unbounded: that is what lets
+    /// `PROFILE` report a peak for every query rather than only for bounded
+    /// ones. The wrapper adds one relaxed atomic add (plus a `fetch_max`) per
+    /// reservation change, which operators make per batch, not per row.
+    ///
+    /// Everything but the pool comes from one process-wide base environment:
+    /// the disk manager and DataFusion's file caches are shared, so a query
+    /// pays for two `Arc`s and a pool rather than for a fresh disk manager and
+    /// cache set.
+    ///
+    /// [`PeakTrackingPool`]: super::peak_pool::PeakTrackingPool
+    fn query_runtime(&self) -> Result<Arc<datafusion::execution::runtime_env::RuntimeEnv>> {
+        use datafusion::execution::memory_pool::{
+            GreedyMemoryPool, MemoryPool, UnboundedMemoryPool,
+        };
+        use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
+
+        static BASE: std::sync::OnceLock<Arc<RuntimeEnv>> = std::sync::OnceLock::new();
+        let base = match BASE.get() {
+            Some(base) => base,
+            None => {
+                let built = RuntimeEnvBuilder::new().build_arc()?;
+                BASE.get_or_init(|| built)
+            }
+        };
+
+        // One pool per statement, not per plan: see `StatementMemory`.
+        let pool = self.statement_memory.get_or_init(|| {
+            let limit = self.config.max_query_memory;
+            let inner: Arc<dyn MemoryPool> = if limit == 0 {
+                Arc::new(UnboundedMemoryPool::default())
+            } else {
+                Arc::new(GreedyMemoryPool::new(limit))
+            };
+            Arc::new(super::peak_pool::PeakTrackingPool::new(
+                inner,
+                Arc::clone(&self.counters),
             ))
-            .build_arc()?;
-        Ok(Some(rt))
+        });
+        Ok(RuntimeEnvBuilder::from_runtime_env(base)
+            .with_memory_pool(pool)
+            .build_arc()?)
     }
 
     /// Execute a DataFusion physical plan and collect all result batches.
@@ -915,9 +934,11 @@ impl Executor {
                 // 400 times reported the rows its *outer* MATCH examined and
                 // nothing else, so the counter read the same for a sixteen-
                 // second query as for a sub-second one.
+                // The memory pool is shared for the same reason: a per-row plan
+                // with a pool of its own would get a second full budget.
                 executor: {
                     let mut e = self.clone();
-                    e.set_counters(self.counters.clone());
+                    e.share_statement_with(self);
                     e
                 },
                 writer,

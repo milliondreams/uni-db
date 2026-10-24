@@ -1691,7 +1691,11 @@ The profile includes:
   `physical_plans` is one for the query plus one per sub-plan built while it runs, so a
   correlated `CALL { ... }` body planned once per outer row shows up as a count that grows
   with the rows
-- **peak_memory_bytes**: Maximum memory used during execution
+- **peak_memory_bytes**: The most memory the query held *reserved* from its query memory
+  pools at once, summed over every plan it built (sub-plans included). This is the quantity
+  `max_query_memory` bounds, not process RSS: an allocation that does not reserve through the
+  pool is not counted, and a query whose operators reserve nothing reads `0`. Per-operator
+  `memory_bytes` is not measured yet and reads `0`.
 
 The result's `metrics()` carries the query-level counters, including **rows_scanned**
 (rows examined by scans, before filtering). A variable-length pattern with an inline

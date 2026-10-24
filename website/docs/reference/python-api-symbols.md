@@ -432,6 +432,8 @@ Async fluent builder for mutations within a transaction.
 |---|---|
 | `param(name: str, value: Any) -> AsyncTxExecuteBuilder` | — |
 | `timeout(seconds: float) -> AsyncTxExecuteBuilder` | — |
+| `max_memory(bytes: int) -> AsyncTxExecuteBuilder` | — |
+| `cancellation_token(token: CancellationToken) -> AsyncTxExecuteBuilder` | — |
 | `async run() -> ExecuteResult` | — |
 | `async profile() -> tuple[ExecuteResult, ProfileOutput]` | — |
 
@@ -2146,6 +2148,8 @@ Fluent builder for mutations within a transaction.
 |---|---|
 | `param(name: str, value: Any) -> TxExecuteBuilder` | — |
 | `timeout(seconds: float) -> TxExecuteBuilder` | — |
+| `max_memory(bytes: int) -> TxExecuteBuilder` | — |
+| `cancellation_token(token: CancellationToken) -> TxExecuteBuilder` | — |
 | `run() -> ExecuteResult` | — |
 | `profile() -> tuple[ExecuteResult, ProfileOutput]` | — |
 

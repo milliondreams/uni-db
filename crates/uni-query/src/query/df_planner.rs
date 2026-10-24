@@ -685,6 +685,18 @@ impl HybridPhysicalPlanner {
         self
     }
 
+    /// Attach the statement's memory pool, so operators that build an inner
+    /// executor (a procedure's inner query) draw on the same budget.
+    #[must_use]
+    pub fn with_memory_pool(
+        mut self,
+        pool: Option<Arc<dyn datafusion::execution::memory_pool::MemoryPool>>,
+    ) -> Self {
+        let ctx = self.take_graph_ctx().with_memory_pool(pool);
+        self.graph_ctx = Arc::new(ctx);
+        self
+    }
+
     /// Attach the outer transaction's writer handle so declared
     /// `WRITE`-mode procedures invoked through this plan can run
     /// their Cypher bodies via the write-enabled inner-query host

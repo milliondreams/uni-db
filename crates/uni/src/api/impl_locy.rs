@@ -51,6 +51,9 @@ fn carry_budget(
     // counting — which made `tx.locy(...)` under-report against
     // `session.locy(...)`, since only the transaction path rebuilds one.
     ctx = ctx.with_counters(parent.counters().cloned());
+    // And the statement's memory pool, so a procedure called from a rebuilt
+    // context charges the same budget.
+    ctx = ctx.with_memory_pool(parent.memory_pool().cloned());
     ctx
 }
 
@@ -504,6 +507,7 @@ pub(crate) async fn evaluate_with_db_and_config_capturing(
     let engine = LocyEngine {
         db,
         counters: std::sync::Arc::new(uni_store::QueryCounters::new()),
+        statement_memory: Default::default(),
         tx_l0_override: locy_l0.clone(),
         locy_l0,
         collect_derive: true,
@@ -554,6 +558,10 @@ pub struct LocyEngine<'a> {
     /// vanish. A vanished count is indistinguishable from work that never
     /// happened, which is the whole failure being fixed.
     pub(crate) counters: Arc<uni_store::QueryCounters>,
+    /// The evaluation's memory pool, shared like `counters` by every executor
+    /// the evaluation builds (its re-entries included), so the evaluation
+    /// draws on one `max_memory` budget rather than one per executor.
+    pub(crate) statement_memory: uni_query::query::executor::core::StatementMemory,
     /// The transaction's pinned read snapshot (Components C1 + C2), when
     /// evaluating inside a read-write transaction under SSI. Installed on
     /// the executor so Locy clause bodies read the frozen L0 generations and
@@ -854,6 +862,7 @@ impl<'a> LocyEngine<'a> {
                 locy_l0: Some(overlay),
                 collect_derive: true,
                 counters: Arc::clone(&self.counters),
+                statement_memory: self.statement_memory.clone(),
                 read_snapshot: self.read_snapshot.clone(),
                 cancel: self.cancel.clone(),
                 max_memory: self.max_memory,
@@ -936,6 +945,7 @@ impl<'a> LocyEngine<'a> {
         let limits = LocyLimits::new(&executor_config, config);
         df_executor.set_config(executor_config);
         df_executor.set_counters(self.counters.clone());
+        df_executor.set_statement_memory(self.statement_memory.clone());
         if let Some(ref w) = self.db.writer {
             df_executor.set_writer(w.clone());
         }
@@ -1552,6 +1562,7 @@ impl<'a> LocyEngine<'a> {
         let limits = LocyLimits::new(&executor_config, config);
         df_executor.set_config(executor_config);
         df_executor.set_counters(self.counters.clone());
+        df_executor.set_statement_memory(self.statement_memory.clone());
         if let Some(ref w) = self.db.writer {
             df_executor.set_writer(w.clone());
         }
@@ -2521,6 +2532,14 @@ impl NativeExecutionAdapter<'_> {
                 .counters()
                 .cloned()
                 .unwrap_or_else(|| std::sync::Arc::new(uni_store::QueryCounters::new())),
+            // The evaluation's pool, from the same place and for the same
+            // reason as its counters.
+            statement_memory: self
+                .graph_ctx
+                .memory_pool()
+                .cloned()
+                .map(uni_query::query::executor::core::StatementMemory::with_pool)
+                .unwrap_or_default(),
             tx_l0_override: locy_l0.clone(),
             locy_l0,
             collect_derive: false,

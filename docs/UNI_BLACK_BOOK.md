@@ -8465,6 +8465,55 @@ ceiling, so no successful query can witness one. Each sets a ceiling below what
 the operator holds, requires a refusal naming it, and pairs that with a higher
 ceiling asserting the answer is unchanged.
 
+### Per-statement overrides, and what `PROFILE` measures
+
+Every Cypher terminal carries a crate-private `QueryOverrides { timeout,
+max_memory }` (`api/impl_query.rs`) plus a `CancelScope` down to execution, and
+every enforcement point reads the *effective* value from it: the executor's
+config (so `Executor::context_deadline` and the DataFusion pool both see it),
+the outer `tokio::time::timeout`, the elapsed-time check behind it, the post-run
+result-size check, and the budget an error reports. An explicit value replaces
+the database setting in both directions — the semantics the session `fetch_all`
+and the Locy builders already had. When nothing is overridden the transaction
+path keeps cloning the executor template unchanged.
+
+Before this, the transaction terminals applied `.timeout()` as an outer
+`tokio::time::timeout` around an execution still bounded by
+`UniConfig::query_timeout` (so it could only tighten), `execute`/`run` dropped
+`max_memory`, every `profile()` dropped cancellation and skipped the result-size
+check, and the transaction cursor did not install the transaction's pinned read
+snapshot — under SSI it read the live L0 while `fetch_all` on the same
+transaction read the snapshot. `query_limits_test.rs` now runs the full
+{11 terminals} × {max_memory, timeout below config, timeout above config,
+cancellation} matrix.
+
+`ProfileOutput::peak_memory_bytes` is measured by `PeakTrackingPool`
+(`executor/peak_pool.rs`), a delegating `MemoryPool` wrapper installed on every
+statement, bounded or not (`Executor::query_runtime`; an unbounded statement
+gets a wrapped `UnboundedMemoryPool`). It mirrors each successful grow and
+shrink into the statement's `QueryCounters`.
+
+**One pool per statement.** `StatementMemory` (`executor/core.rs`) is a lazily
+built slot holding the statement's pool. Every physical plan the statement
+builds reads it: the executor's own plans, the fallback interpreter's sub-plans,
+the per-row plans of the `MutationContext` executor (`share_statement_with`), a
+Locy evaluation's executors and re-entries (`LocyEngine::statement_memory`), and
+a procedure's inner query, which gets the pool through
+`GraphExecutionContext::memory_pool` → `QueryProcedureHost` →
+`StatementMemory::with_pool`. Correlated sub-plans (`df_graph::common::
+execute_subplan*`) always ran on the outer `SessionContext` and so on its pool.
+The procedure path did not. It built a pool from `UniConfig::default()`
+(1 GiB, whatever the statement's `max_memory`) once per call, while the outer
+plan's reservations were still held: a join calling a declared procedure per
+row reserved ~853 KB in total against parts of ~110 KB and ~562 KB, passed a
+700 KB ceiling, and `PROFILE` reported only the outer ~330 KB. With one pool the
+reserved total is exact, so the peak is too. It is not RSS: allocations that never reserve are
+invisible, exactly as they are to `max_query_memory`. Per-operator
+`OperatorStats::memory_bytes` stays `0`: reservations are made by named
+consumers that do not map one-to-one onto plan nodes. The runtime environment's
+disk manager and caches come from one process-wide base, so a query pays for a
+pool and two `Arc`s rather than a fresh disk manager.
+
 ### Traversal budgets: which limit actually stops a runaway path query
 
 A variable-length pattern is the one place where all three declared limits —

@@ -256,7 +256,7 @@ impl PreparedQuery {
                     Some(tx.id_reservoir.clone()),
                     snapshot,
                     self.cancel.clone(),
-                    None,
+                    crate::api::impl_query::QueryOverrides::default(),
                 )
                 .await;
         }
@@ -511,6 +511,7 @@ impl PreparedLocy {
         };
         let engine = crate::api::impl_locy::LocyEngine {
             counters: std::sync::Arc::new(uni_store::QueryCounters::new()),
+            statement_memory: Default::default(),
             db: &self.db,
             tx_l0_override: tx_l0.clone(),
             locy_l0: tx_l0,

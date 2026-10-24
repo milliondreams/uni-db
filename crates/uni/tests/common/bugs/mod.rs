@@ -241,3 +241,7 @@ pub mod admin_procedure_read_only;
 // UNWIND evaluates its list expression with the expression compiler, and
 // types `nodes(p)` / `relationships(p)` elements as entities.
 pub mod unwind_entity_attribute_functions;
+// #305: dropping an unfinished BulkWriter must not lose committed rows.
+pub mod issue_305_dropped_bulk_writer;
+// #310: FTS scores must not collapse to 0.5 before the index is built.
+pub mod issue_310_fts_score_constant_before_index;

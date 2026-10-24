@@ -133,3 +133,9 @@ pub mod locy_registered_rule_parameters;
 pub mod locy_explain_children;
 // Wave Q (Q1): a command finishing past the deadline is reported (failpoints).
 pub mod locy_budget_resilience;
+// #308: EXPLAIN RULE expands a recursive derivation into its supporting facts.
+pub mod locy_issue_308_explain_recursive_children;
+// #309: tuple IS / prefix-TO bind a third (scalar) KEY column positionally.
+pub mod locy_issue_309_third_key_binding;
+// #313: exact-mode MNOR keeps distinct event identities apart.
+pub mod locy_issue_313_exact_event_identity;

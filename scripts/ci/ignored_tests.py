@@ -99,6 +99,12 @@ ON_DEMAND: dict[str, str] = {
         "google/embeddinggemma-300m is a gated model: downloading it needs an "
         "HF_TOKEN whose account accepted the Gemma license (HTTP 401 without)"
     ),
+    "uni-db::integration bugs::issue_310_fts_score_constant_before_index::"
+    "issue_310_schemaless_fts_scores_are_constant": (
+        "specification for the open #310 residual (P3): a schemaless property "
+        "is still scored by word overlap, a constant 0.5, so it fails until "
+        "that is fixed"
+    ),
     "uni-db::reranker_integration test_real_onnx_cross_encoder_reranks_by_relevance": (
         "its model is served only through a xet-bridge redirect that hf-hub 0.5 "
         "refuses; ci.yml's reranker lane filters it out for the same reason"

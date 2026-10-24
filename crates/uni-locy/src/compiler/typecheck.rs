@@ -1746,30 +1746,25 @@ where
 
 // ─── Slice 3: model invocation extraction + YIELD rewriting ─────────────────
 
-/// Phase B Slice 3: lift neural-model calls out of YIELD items.
+/// The result of lifting neural-model calls out of a clause
+/// ([`extract_model_invocations`]).
 ///
-/// For each top-level `YIELD ... model_name(args) [AS alias]` where
-/// `model_name` is declared in `model_catalog`, this emits a
-/// [`ModelInvocation`] entry whose `output_column` matches the YIELD
-/// item's resolved column name, and rewrites the YIELD item's expression
-/// to a placeholder literal `0.0`. At runtime, the body projection still
-/// materializes a column with that name (initially zero); the
-/// invocation pass then **overwrites** that column with the classifier's
-/// per-row output before any downstream operator (FOLD, IS-ref) reads
-/// from it.
+/// Every call to a model declared in `model_catalog`, in a YIELD item, an
+/// ALONG binding or a FOLD aggregate — nested inside other calls, operators,
+/// lists and maps included — becomes a [`ModelInvocation`] whose
+/// `output_column` is a synthetic name `__model_<name>_<idx>`, and the call
+/// site is rewritten to `Variable("__model_<name>_<idx>")`, a reference to
+/// that column. No literal placeholder is emitted.
 ///
-/// Why a literal placeholder rather than a synthetic column? The body's
-/// projection is built by the planner from the (rewritten) YIELD items
-/// alone — there's no plan-node insertion point between projection and
-/// downstream operators where a brand-new column could be threaded in
-/// without restructuring the planner. Overwriting an existing column
-/// keeps the diff to the runtime alone.
+/// At runtime the planner inserts `LogicalPlan::LocyModelInvoke` between the
+/// clause body and its `LocyProject` (`locy_planner.rs`); its
+/// `LocyModelInvokeExec` adds the column, typed `Float64`, holding the
+/// classifier's per-row output (overwriting a same-named input column if one
+/// exists), so the rewritten YIELD / ALONG / FOLD expressions read it like
+/// any other body column. Calls in a rule's WHERE are not lifted.
 ///
-/// Slice 3 limits the extraction to direct top-level model calls in
-/// YIELD items (the common case from DEEP_LOCY.md §9.4). Nested calls
-/// (`f(model_x(s))`, `model_x(s) + 1`), invocations in WHERE, FOLD, or
-/// ALONG are not lifted in this slice — they parse and validate (arity)
-/// but won't execute at runtime. Follow-up slices extend the lift.
+/// `hidden_yield_cols` names the `__feat_<var>_<prop>` YIELD items appended
+/// so that property features are materialized into each fact row.
 pub(crate) struct ExtractedInvocations {
     pub output: RuleOutput,
     pub along: Vec<AlongBinding>,

@@ -1247,7 +1247,9 @@ Asks: "What graph modifications would make this rule hold (or stop holding)?"
 **Three-phase pipeline:**
 1. **Generate candidates**: Build derivation tree via EXPLAIN, extract candidate modifications (RemoveEdge, AddEdge, ChangeProperty)
 2. **Validate**: For each candidate, use ASSUME-style fork → mutate → re-evaluate (only the strata the candidate can affect, as for ASSUME) → check if goal holds → rollback
-3. **Return**: Validated modifications sorted by cost, up to `max_abduce_results`
+3. **Return**: Every candidate tried, validated ones first, then by ascending cost, up to `max_abduce_results`
+
+Each candidate is a **single** modification, validated on its own; the search never combines candidates, so a goal that only two or more edits together achieve yields no validated candidate. The cost is fixed per kind (`ChangeProperty` 0.5, `RemoveEdge` 1.0, `AddEdge` 1.5; `compute_cost` in `crates/uni-query/src/query/df_graph/locy_abduce.rs`) and ranks kinds of edit, not the size of a change: ABDUCE does not compute a minimal set of changes.
 
 ```
 -- "What edges would we need to remove to disconnect A from C?"

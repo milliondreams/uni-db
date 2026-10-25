@@ -3550,6 +3550,21 @@ async fn a_procedure_called_per_row_shares_the_statements_memory_budget() -> Res
     let db = db_with_per_row_procedure().await?;
     let session = db.session();
 
+    // Standalone CALL uses the simple executor's host, not a graph context.
+    // It must initialize its shared pool from the caller's limit too.
+    for part in [PROC_BODY, "CALL t.sorted() YIELD row_json RETURN row_json"] {
+        let err = session
+            .query_with(part)
+            .max_memory(1024)
+            .fetch_all()
+            .await
+            .expect_err("the sort cannot fit a 1 KiB statement pool");
+        assert!(
+            matches!(err, uni_db::UniError::MemoryLimitExceeded { .. }),
+            "{part}: {err:?}"
+        );
+    }
+
     // Each part fits the ceiling on its own. Without these, a ceiling that
     // refused the procedure body by itself would pass the assertion below.
     for part in [PROC_BODY, JOIN_ALONE] {

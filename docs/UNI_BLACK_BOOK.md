@@ -2619,6 +2619,25 @@ They stay in fragments the index does not cover until compaction's
 `optimize_indices`, a growth-triggered rebuild (off by default), or an explicit
 rebuild; Lance searches them with a flat pass meanwhile.
 
+For a schemaless text property, storage assembles one corpus from the visible
+main-table rows and the L0 chain. Newer text replaces older text by VID;
+tombstones, nulls and non-string replacements remove documents before
+statistics are calculated. `backend::lance_fts::score_documents` uses Lance's
+flat BM25 scorer and unindexed tokenizer without creating a table. Input
+batches and rescoring check the query's deadline/cancellation. All matches
+are sorted by score descending and VID ascending before top-k selection.
+
+Storage identity columns remain UInt64, but the `id` UDF returns their signed
+Int64 bit representation before expression evaluation, including encoded and
+struct entities. Predicate normalization retains raw-column pushdown only for
+identities backed by stored scans/traversals; virtual and unwound entities
+keep the signed ID expression. Ordinary UInt64 values are not identities.
+
+Procedure inner executors share their caller's `QueryCounters` atomics and
+memory pool. Simple-executor and guest-projection hosts attach those resources
+explicitly; graph-context hosts inherit them. Counters are never merged after
+execution, which avoids double counting nested calls.
+
 ## Predicate Pushdown Priority
 
 When executing a query, the planner pushes predicates down to the most efficient index:

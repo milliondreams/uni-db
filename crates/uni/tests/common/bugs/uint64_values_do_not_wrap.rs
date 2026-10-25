@@ -198,3 +198,61 @@ async fn uint64_values_do_not_wrap_an_ephemeral_id() -> Result<()> {
     assert_eq!((src, dst), (Value::Int(v), Value::Int(v)), "{row:?}");
     Ok(())
 }
+
+/// Returning an id and evaluating it must use the same signed identity bits.
+#[tokio::test]
+async fn ephemeral_id_expressions_are_signed() -> Result<()> {
+    let db = open().await?;
+    let call = "CALL uni.create.vNode(['L'], '{}') YIELD node";
+    for query in [
+        format!("{call} RETURN id(node) < 0"),
+        format!("{call} WITH id(node) AS v RETURN v < 0"),
+        format!("{call} WITH node WHERE id(node) < 0 RETURN true"),
+        format!("{call} RETURN elementId(node) = toString(id(node))"),
+        format!("{call} WITH collect(node) AS ns UNWIND ns AS n RETURN id(n) < 0"),
+        format!(
+            "{call} WITH collect(node) AS ns UNWIND ns AS n RETURN elementId(n) = toString(id(n))"
+        ),
+        format!("{call} RETURN id(node) IN [id(node)]"),
+        format!("{call} RETURN id(node) + 1 > id(node)"),
+        format!(
+            "{call} WITH id(node) AS v CALL uni.create.vEdge(v, 'T', '{{}}', v) \
+                 YIELD edge RETURN id(edge) < 0"
+        ),
+        format!(
+            "{call} WITH id(node) AS v CALL uni.create.vEdge(v, 'T', '{{}}', v) \
+                 YIELD edge RETURN elementId(edge) = toString(id(edge))"
+        ),
+    ] {
+        assert_eq!(
+            column(&db, &query).await?,
+            vec![Value::Bool(true)],
+            "{query}"
+        );
+    }
+    assert_eq!(
+        column(
+            &db,
+            &format!("{call} RETURN id(node) = -9223372036854775808")
+        )
+        .await?,
+        vec![Value::Bool(true)]
+    );
+    let query = format!("{call} WITH [id(node), 0] AS ids UNWIND ids AS v RETURN v ORDER BY v");
+    assert_eq!(
+        column(&db, &query).await?,
+        vec![Value::Int(i64::MIN), Value::Int(0)]
+    );
+    let result = db
+        .session()
+        .query_with(&format!(
+            "{call} WITH node WHERE id(node) = $id RETURN id(node) AS id"
+        ))
+        .param("id", i64::MIN)
+        .fetch_all()
+        .await?;
+    assert_eq!(result.rows().len(), 1);
+    assert_eq!(result.rows()[0].values(), &[Value::Int(i64::MIN)]);
+    assert_eq!(column(&db, "RETURN id(null)").await?, vec![Value::Null]);
+    Ok(())
+}

@@ -7,6 +7,27 @@ the version it ships in.
 
 ## ⚠️ Behaviour and API changes
 
+**Identity expressions use signed IDs consistently.** A virtual node's
+`id(node)` returned a negative integer, but `id(node) < 0` returned false
+because the comparison used its unsigned storage bits. Node and relationship
+IDs now use the same signed representation inside expressions, through WITH,
+and after collecting and unwinding entities. `elementId` uses that signed
+integer's string representation too. Ordinary unsigned property values keep
+their existing numeric conversion behavior.
+
+**Schemaless full-text searches use BM25.** `uni.fts.query` previously ranked
+an undeclared text property by word overlap, giving every single-word match
+the same `0.5` score. It now computes BM25 over the visible documents with the
+same tokenizer as a declared property without an index. Buffered updates,
+deletes and replacements are applied before computing statistics, so flushing
+does not change the scores. Existing schemaless filter restrictions remain.
+
+**Procedure metrics include inner queries.** A declared procedure could
+return rows while reporting zero scanned rows. Its inner queries, including
+nested and per-row calls, now share the statement's counters. Hosts created
+by the simple executor and graph projection resolver also inherit the
+statement's memory pool, so their inner queries use its configured limit.
+
 ### Results that change
 
 **A `QUERY` that pins a node KEY derives only what its goal reaches, by

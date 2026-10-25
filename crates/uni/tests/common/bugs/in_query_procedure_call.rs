@@ -35,6 +35,71 @@ use uni_plugin::traits::connector::Principal;
 use uni_plugin::{Capability, CapabilitySet};
 use uni_query::{ProcedureOutput, ProcedureParam, ProcedureValueType, RegisteredProcedure};
 
+/// Nested executors spend one statement's counters, not a private set per call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn procedure_inner_queries_share_scan_counters() -> Result<()> {
+    // The direct and wrapped reads must observe the same storage tier even
+    // when the suite is under load: an automatic flush would change l0_reads.
+    let db = Uni::in_memory()
+        .config(uni_db::UniConfig {
+            auto_flush_interval: None,
+            ..Default::default()
+        })
+        .build()
+        .await?;
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute("UNWIND range(1, 12) AS i CREATE (:CounterProbe {i: i})")
+        .await?;
+    tx.execute(
+        "CALL uni.plugin.declareProcedure('t.scan_counters', \
+        'MATCH (n:CounterProbe) RETURN n.i AS i', 'READ', '[]', '[]')",
+    )
+    .await?;
+    tx.execute(
+        "CALL uni.plugin.declareProcedure('t.nested_counters', \
+        'CALL t.scan_counters() YIELD row_json RETURN row_json', 'READ', '[]', '[]')",
+    )
+    .await?;
+    tx.commit().await?;
+    for flushed in [false, true] {
+        if flushed {
+            db.flush().await?;
+        }
+        let direct = session
+            .query("MATCH (n:CounterProbe) RETURN n.i AS i")
+            .await?;
+        assert_eq!(direct.rows().len(), 12);
+        assert_eq!(direct.metrics().rows_scanned, 12);
+        for (query, calls) in [
+            ("CALL t.scan_counters() YIELD i RETURN i", 1),
+            ("CALL t.nested_counters() YIELD row_json RETURN row_json", 1),
+            (
+                "UNWIND [1, 2, 3] AS k CALL t.scan_counters() YIELD row_json RETURN k, row_json",
+                3,
+            ),
+        ] {
+            let result = session.query(query).await?;
+            assert_eq!(
+                result.rows().len(),
+                12 * calls,
+                "{query}, flushed={flushed}"
+            );
+            assert_eq!(
+                result.metrics().rows_scanned,
+                direct.metrics().rows_scanned * calls,
+                "{query}, flushed={flushed}"
+            );
+            assert_eq!(
+                result.metrics().l0_reads,
+                direct.metrics().l0_reads * calls,
+                "{query}, flushed={flushed}"
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn bag(db: &Uni, query: &str) -> Result<Vec<String>> {
     let result = db.session().query(query).await?;
     let mut rows: Vec<String> = result

@@ -5126,37 +5126,56 @@ impl StorageManager {
             })
             .unwrap_or_default();
 
-        let mut scores: HashMap<Vid, f32> = HashMap::new();
-        let mut results = if schemaless {
-            // A schemaless property has no column to search, so flushed and
-            // unflushed rows both use the word-overlap score, which needs no
-            // statistics.
-            let mut deadline = ctx.map(DeadlineTicker::new);
-            let mut hits = Vec::new();
+        // Schemaless rows have no text column in Lance. Assemble their visible
+        // corpus before scoring so superseded/deleted rows do not affect BM25.
+        if schemaless {
+            let scoring_ctx = ctx.cloned();
+            let check = move || {
+                scoring_ctx
+                    .as_ref()
+                    .map_or(Ok(()), QueryContext::check_timeout)
+            };
+            check()?;
+            let mut corpus: HashMap<Vid, String> = HashMap::new();
             for (vid, props) in self.flushed_label_properties(label, ctx).await? {
-                if let Some(ticker) = deadline.as_mut() {
-                    ticker.tick()?;
-                }
-                let score = props
-                    .get(property)
-                    .and_then(|value| value.as_str())
-                    .map_or(0.0, |text| compute_text_relevance(query, text));
-                if score > 0.0 {
-                    hits.push((vid, score));
+                check()?;
+                if let Some(text) = props.get(property).and_then(|value| value.as_str()) {
+                    corpus.insert(vid, text.to_string());
                 }
             }
-            hits.sort_by(|a, b| {
-                b.1.partial_cmp(&a.1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then(a.0.cmp(&b.0))
-            });
-            scores = docs
+            if let Some((excluded, l0)) = &unflushed {
+                for vid in l0.tombstoned.iter().chain(excluded) {
+                    corpus.remove(vid);
+                }
+                for (vid, text) in &l0.texts {
+                    check()?;
+                    if l0.tombstoned.contains(vid) || excluded.contains(vid) {
+                        continue;
+                    }
+                    if let Some(text) = text {
+                        corpus.insert(*vid, text.clone());
+                    } else {
+                        corpus.remove(vid);
+                    }
+                }
+            }
+            let mut documents: Vec<_> = corpus
                 .into_iter()
-                .map(|(vid, text)| (Vid::new(vid), compute_text_relevance(query, &text)))
-                .filter(|(_, score)| *score > 0.0)
+                .map(|(vid, text)| (vid.as_u64(), text))
                 .collect();
-            hits
-        } else if docs.is_empty() && !backend.table_exists(&name).await? {
+            documents.sort_unstable_by_key(|(vid, _)| *vid);
+            let scored = crate::backend::score_documents(property, query, documents, check).await?;
+            let mut hits: Vec<_> = scored
+                .into_iter()
+                .map(|(vid, score)| (Vid::new(vid), score))
+                .collect();
+            hits.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+            hits.truncate(k);
+            return Ok(hits);
+        }
+
+        let mut scores: HashMap<Vid, f32> = HashMap::new();
+        let mut results = if docs.is_empty() && !backend.table_exists(&name).await? {
             Vec::new()
         } else {
             // Build combined filter: _deleted = false + optional user filter + HWM

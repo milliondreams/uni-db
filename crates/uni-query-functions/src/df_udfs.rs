@@ -417,7 +417,7 @@ impl ScalarUDFImpl for CustomScalarUdf {
 }
 
 // ============================================================================
-// id(node) -> UInt64
+// id(node) -> Int64
 // ============================================================================
 
 /// Create the `id` UDF for getting vertex/edge internal IDs.
@@ -456,7 +456,7 @@ impl ScalarUDFImpl for IdUdf {
     }
 
     fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::UInt64)
+        Ok(DataType::Int64)
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -465,17 +465,23 @@ impl ScalarUDFImpl for IdUdf {
                 "id(): requires 1 argument".to_string(),
             ));
         }
-        // Usually a pass-through: the planner rewrites `id(n)` to the `n._vid`
-        // column, which is already `UInt64`. But when `n` is an entity carried as
-        // a single CypherValue column — what `UNWIND` over a collected list binds
-        // — there is no `_vid` column to rewrite to, so the whole entity arrives
-        // here and its id has to be read out of the encoding.
-        // `return_type` promises `UInt64`, and DataFusion asserts that at
-        // runtime, so every branch here has to produce one — passing an argument
-        // straight through is only correct when it is already `UInt64`.
+        // Normalize storage identity bits before expressions evaluate them.
+        // Result decoding alone is too late: an unsigned comparison would
+        // already have judged an ephemeral id greater than zero.
         let arg = args.args[0].clone();
         match arg.data_type() {
-            DataType::UInt64 => Ok(arg),
+            DataType::Int64 => Ok(arg),
+            DataType::UInt64 => match arg {
+                ColumnarValue::Scalar(ScalarValue::UInt64(id)) => Ok(ColumnarValue::Scalar(
+                    ScalarValue::Int64(id.map(|id| id as i64)),
+                )),
+                ColumnarValue::Array(array) => {
+                    let ids = array.as_any().downcast_ref::<UInt64Array>().unwrap();
+                    let signed: Int64Array = ids.iter().map(|id| id.map(|id| id as i64)).collect();
+                    Ok(ColumnarValue::Array(Arc::new(signed)))
+                }
+                _ => unreachable!("UInt64 columnar value"),
+            },
             DataType::LargeBinary => {
                 let array = arg.to_array(args.number_rows)?;
                 let blobs = array
@@ -486,17 +492,17 @@ impl ScalarUDFImpl for IdUdf {
                             "id(): expected a LargeBinary entity column".to_string(),
                         )
                     })?;
-                let ids: UInt64Array = (0..blobs.len())
+                let ids: Int64Array = (0..blobs.len())
                     .map(|i| {
                         if blobs.is_null(i) {
                             return None;
                         }
                         // Documented exception (#233 class): this closure feeds
-                        // an infallible `collect()` into a `UInt64Array`. A blob
+                        // an infallible `collect()` into an `Int64Array`. A blob
                         // that will not decode yields no id, which reads as "not
                         // an entity" — logged so it is not silent.
                         match uni_common::cypher_value_codec::decode(blobs.value(i)) {
-                            Ok(value) => entity_identity(&value),
+                            Ok(value) => entity_identity(&value).map(|id| id as i64),
                             Err(e) => {
                                 tracing::error!(error = %e, "id(): value failed to decode");
                                 None
@@ -531,23 +537,22 @@ impl ScalarUDFImpl for IdUdf {
                             "id(): struct entity column carries no `_vid` or `_eid` field, got {fields:?}"
                         ))
                     })?;
-                let ids = arrow::compute::cast(entities.column(id_field), &DataType::UInt64)
-                    .map_err(|_| {
-                        datafusion::error::DataFusionError::Execution(
-                            "id(): struct entity column's identity field is not an id".to_string(),
-                        )
-                    })?;
-                let ids = ids.as_any().downcast_ref::<UInt64Array>().ok_or_else(|| {
-                    datafusion::error::DataFusionError::Execution(
-                        "id(): identity field did not cast to UInt64".to_string(),
-                    )
-                })?;
-                let out: UInt64Array = (0..entities.len())
+                let column = entities.column(id_field);
+                let unsigned = column.as_any().downcast_ref::<UInt64Array>();
+                let signed = column.as_any().downcast_ref::<Int64Array>();
+                if unsigned.is_none() && signed.is_none() {
+                    return Err(datafusion::error::DataFusionError::Execution(
+                        "id(): struct entity column's identity field is not an id".to_string(),
+                    ));
+                }
+                let out: Int64Array = (0..entities.len())
                     .map(|i| {
-                        if entities.is_null(i) || ids.is_null(i) {
+                        if entities.is_null(i) || column.is_null(i) {
                             None
+                        } else if let Some(ids) = unsigned {
+                            Some(ids.value(i) as i64)
                         } else {
-                            Some(ids.value(i))
+                            Some(signed.unwrap().value(i))
                         }
                     })
                     .collect();
@@ -555,7 +560,7 @@ impl ScalarUDFImpl for IdUdf {
             }
             other => {
                 let array = arg.to_array(args.number_rows)?;
-                arrow::compute::cast(&array, &DataType::UInt64)
+                arrow::compute::cast(&array, &DataType::Int64)
                     .map(ColumnarValue::Array)
                     .map_err(|_| {
                         datafusion::error::DataFusionError::Execution(format!(
@@ -8020,6 +8025,56 @@ mod tests {
     fn test_id_udf_signature() {
         let udf = create_id_udf();
         assert_eq!(udf.name(), "id");
+    }
+
+    #[test]
+    fn id_udf_preserves_ephemeral_bits_and_nulls() {
+        use datafusion::config::ConfigOptions;
+        let udf = create_id_udf();
+        for input in [
+            ColumnarValue::Array(Arc::new(UInt64Array::from(vec![
+                Some(1 << 63),
+                None,
+                Some(7),
+            ]))),
+            ColumnarValue::Array(Arc::new(Int64Array::from(vec![
+                Some(i64::MIN),
+                None,
+                Some(7),
+            ]))),
+            ColumnarValue::Array(Arc::new(arrow_array::StructArray::new(
+                vec![Arc::new(arrow_schema::Field::new(
+                    "_vid",
+                    DataType::UInt64,
+                    true,
+                ))]
+                .into(),
+                vec![Arc::new(UInt64Array::from(vec![1 << 63, 111, 7]))],
+                Some(arrow::buffer::NullBuffer::from(vec![true, false, true])),
+            ))),
+        ] {
+            let ty = input.data_type();
+            assert_eq!(
+                udf.return_type(std::slice::from_ref(&ty)).unwrap(),
+                DataType::Int64
+            );
+            let result = udf
+                .invoke_with_args(ScalarFunctionArgs {
+                    args: vec![input],
+                    arg_fields: vec![Arc::new(arrow_schema::Field::new("id", ty, true))],
+                    number_rows: 3,
+                    return_field: Arc::new(arrow_schema::Field::new("id", DataType::Int64, true)),
+                    config_options: Arc::new(ConfigOptions::default()),
+                })
+                .unwrap()
+                .to_array(3)
+                .unwrap();
+            let ids = result.as_any().downcast_ref::<Int64Array>().unwrap();
+            assert_eq!(
+                ids.iter().collect::<Vec<_>>(),
+                vec![Some(i64::MIN), None, Some(7)]
+            );
+        }
     }
 
     #[test]

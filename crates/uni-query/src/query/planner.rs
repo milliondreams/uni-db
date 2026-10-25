@@ -4887,7 +4887,11 @@ impl QueryPlanner {
     ///
     /// All three functions share the same shape: single-arg, argument
     /// must be a node/edge variable, returns the column value directly.
-    fn rewrite_id_to_vid(expr: Expr, vars_in_scope: &[VariableInfo]) -> Expr {
+    fn rewrite_id_to_vid(
+        expr: Expr,
+        vars_in_scope: &[VariableInfo],
+        stored_ids: &HashSet<String>,
+    ) -> Expr {
         match expr {
             Expr::FunctionCall {
                 name,
@@ -4896,6 +4900,17 @@ impl QueryPlanner {
                 window_spec,
             } if args.len() == 1 && Self::metadata_function_column(&name, None).is_some() => {
                 if let Expr::Variable(ref var) = args[0] {
+                    // Only stored identities have a nonnegative numeric value.
+                    // Procedure/UNWIND entities can carry ephemeral signed bits;
+                    // retain id() there so residual filters normalize them.
+                    if name.eq_ignore_ascii_case("id") && !stored_ids.contains(var) {
+                        return Expr::FunctionCall {
+                            name,
+                            args,
+                            distinct,
+                            window_spec,
+                        };
+                    }
                     // `id()` resolves to `_eid` for an edge binding and `_vid`
                     // for a node — edge rows expose `_eid`, not `_vid`. Mirror
                     // the projection path (`df_expr.rs` translate of `id`).
@@ -4914,13 +4929,13 @@ impl QueryPlanner {
                 }
             }
             Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
-                left: Box::new(Self::rewrite_id_to_vid(*left, vars_in_scope)),
+                left: Box::new(Self::rewrite_id_to_vid(*left, vars_in_scope, stored_ids)),
                 op,
-                right: Box::new(Self::rewrite_id_to_vid(*right, vars_in_scope)),
+                right: Box::new(Self::rewrite_id_to_vid(*right, vars_in_scope, stored_ids)),
             },
             Expr::UnaryOp { op, expr: inner } => Expr::UnaryOp {
                 op,
-                expr: Box::new(Self::rewrite_id_to_vid(*inner, vars_in_scope)),
+                expr: Box::new(Self::rewrite_id_to_vid(*inner, vars_in_scope, stored_ids)),
             },
             // `IN` recurses for the same reason `=` does, and its absence was
             // load-bearing: `extract_vid_from_cypher_filter`'s `Expr::In` arm
@@ -4929,15 +4944,15 @@ impl QueryPlanner {
             // not fire from any Cypher a user would write. `id(n) = 5` reached
             // it only because `=` is a `BinaryOp` and was already rewritten.
             Expr::In { expr: inner, list } => Expr::In {
-                expr: Box::new(Self::rewrite_id_to_vid(*inner, vars_in_scope)),
-                list: Box::new(Self::rewrite_id_to_vid(*list, vars_in_scope)),
+                expr: Box::new(Self::rewrite_id_to_vid(*inner, vars_in_scope, stored_ids)),
+                list: Box::new(Self::rewrite_id_to_vid(*list, vars_in_scope, stored_ids)),
             },
             // Reached through the arm above, so a list holding `id(m)` is
             // rewritten consistently with the value it is compared against.
             Expr::List(items) => Expr::List(
                 items
                     .into_iter()
-                    .map(|item| Self::rewrite_id_to_vid(item, vars_in_scope))
+                    .map(|item| Self::rewrite_id_to_vid(item, vars_in_scope, stored_ids))
                     .collect(),
             ),
             other => other,
@@ -8581,7 +8596,20 @@ impl QueryPlanner {
 
         // Rewrite id(var) to var._vid (or var._eid for an edge) so
         // PredicateAnalyzer can push it down.
-        let transformed_predicate = Self::rewrite_id_to_vid(transformed_predicate, vars_in_scope);
+        let stored_ids = vars_in_scope
+            .iter()
+            .filter(|var| {
+                Self::rewrite_target_reachable(&plan, &var.name, RewriteTarget::Scan)
+                    || Self::rewrite_target_reachable(
+                        &plan,
+                        &var.name,
+                        RewriteTarget::TraverseTarget,
+                    )
+            })
+            .map(|var| var.name.clone())
+            .collect();
+        let transformed_predicate =
+            Self::rewrite_id_to_vid(transformed_predicate, vars_in_scope, &stored_ids);
 
         let rewritten =
             self.rewrite_predicates_using_indexes(&transformed_predicate, &plan, vars_in_scope)?;

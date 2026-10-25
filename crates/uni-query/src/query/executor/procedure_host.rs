@@ -272,6 +272,18 @@ impl QueryProcedureHost {
         self
     }
 
+    /// Attach statement resources on paths without a GraphExecutionContext.
+    #[must_use]
+    pub(crate) fn with_statement_resources(
+        mut self,
+        counters: Arc<uni_store::QueryCounters>,
+        memory_pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
+    ) -> Self {
+        self.counters = Some(counters);
+        self.memory_pool = Some(memory_pool);
+        self
+    }
+
     /// Attach the outer query's L0 visibility snapshot to this host.
     ///
     /// [`Self::from_components`] starts from [`L0Context::empty`] because the
@@ -464,6 +476,17 @@ impl QueryProcedureHost {
             Executor::new(Arc::clone(&self.storage))
         };
 
+        // These are parts of one statement, including nested/per-row calls.
+        // Share the atomics rather than merging snapshots after execution.
+        if let Some(counters) = &self.counters {
+            executor.set_counters(Arc::clone(counters));
+        }
+        // A nested declared CALL must resolve against the caller's registry,
+        // not the new executor's built-in-only default.
+        if let Some(registry) = &self.procedure_registry {
+            executor.set_procedure_registry(Arc::clone(registry));
+        }
+
         // The inner query runs inside the outer one's poll -- and, for a
         // declared procedure, under `block_in_place` -- so the outer
         // `tokio::time::timeout` and cancellation race cannot interrupt it.
@@ -509,9 +532,17 @@ impl QueryProcedureHost {
 
         let schema_manager_arc = self.storage.schema_manager_arc();
         let schema = self.storage.schema_manager().schema();
-        let planner = QueryPlanner::new(schema);
+        let mut planner = QueryPlanner::new(schema);
+        if let Some(registry) = self
+            .procedure_registry
+            .as_ref()
+            .and_then(|r| r.plugin_registry())
+        {
+            planner = planner.with_plugin_registry(registry);
+        }
         let ast = uni_cypher::parse(cypher)?;
         let plan = planner.plan(ast)?;
+        let plan = crate::query::planner::rewrite_for_fork_fusion(plan, self.storage.as_ref());
 
         let prop_manager = if let Some(pm) = &self.property_manager {
             Arc::clone(pm)

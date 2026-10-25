@@ -624,7 +624,9 @@ impl Executor {
     /// cache set.
     ///
     /// [`PeakTrackingPool`]: super::peak_pool::PeakTrackingPool
-    fn query_runtime(&self) -> Result<Arc<datafusion::execution::runtime_env::RuntimeEnv>> {
+    pub(super) fn query_runtime(
+        &self,
+    ) -> Result<Arc<datafusion::execution::runtime_env::RuntimeEnv>> {
         use datafusion::execution::memory_pool::{
             GreedyMemoryPool, MemoryPool, UnboundedMemoryPool,
         };

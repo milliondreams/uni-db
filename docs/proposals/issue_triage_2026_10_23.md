@@ -1,12 +1,13 @@
 # Triage of issues #302–#317 (2026-10-23)
 
-All 15 issues were filed on 2026-10-21 or 2026-10-22 against **uni-db 4.1.1**,
-the latest release; `main` is at 4.2.0, unreleased. Each bug was reproduced
-through the public API, in an isolated worktree off `main` (`c56f98f73`). The
+All 15 issues were filed on 2026-10-21 or 2026-10-22 against **uni-db 4.1.1**.
+At triage time it was the latest release and `main` was at 4.2.0, unreleased.
+The reports were investigated through the public API, in isolated worktrees
+off `main` (`c56f98f73`). The
 4.1.1 behaviour was checked against the published wheel or crate wherever the
 issue was not reproducible on `main`.
 
-## Status (updated 2026-10-23, `main` at `279755263`)
+## Status (updated 2026-10-25)
 
 - **All P1s are fixed on `main`:** #304 (`d78cb3748`), #312 (`0f9043325`),
   #316 plus the typed-Int64 `sum` wrap (`d6e455e5e`), #306 plus the fork
@@ -16,14 +17,17 @@ issue was not reproducible on `main`.
   expressions into NULL.
 - **Regression tests landed** for the issues `main` had already fixed: #305,
   #308, #309, #310 (declared case), #313 (`crates/uni/tests/common/bugs/` and
-  `common/locy/`). The #310 schemaless residual is an ignored test, run on
-  demand.
-- **P2 work in progress:** #307, #314, #315, and the new defects: the
-  `TxQueryBuilder` limits (items 4-6), a CREATE-path defect, and the in-tx
-  `SET` slowdown (item 7).
-- **Still open, not started:** #302, #311 (needs reporter info), #317, the
-  #310 schemaless residual, the stale `locy.pest:438` SLG comment, and a 4.2.0
-  release, which is what ships every fix above to users.
+  `common/locy/`). The #310 schemaless specification is now a regular test
+  alongside the local BM25 fix (verification recorded in the follow-up triage).
+- **P2 implementation completed:** #307, #314, #315, the query options and
+  PROFILE gaps, CREATE path binding and the empty-flush write-throttle defect.
+  The October 24 handoff reports full merged-tree CI passing.
+- **Local follow-up fixes:** virtual-ID comparisons, schemaless FTS scoring,
+  and procedure inner-query counters. See `followup_triage_2026_10_25.md` for
+  verification and the remaining backlog.
+- **Still open:** #302, #311 (needs a reproduction), and #317. Release status
+  needs a live publication check; a local version number does not prove shipping.
+  The grammar's stale SLG comment has been corrected.
 
 ## Summary
 
@@ -32,17 +36,17 @@ issue was not reproducible on `main`.
 | 304 | Declaring a populated schemaless label hides its nodes | **Fixed** `d78cb3748` | **P1** silent wrong answer | Release |
 | 306 | Fork diff empty for schemaless labels | **Fixed** `279755263`, with 2 more fork defects | **P1** | Release |
 | 312 | Matched node's properties copied into every joined row | **Fixed** `0f9043325` | **P1** (writes fail at 1 GiB) | Release |
-| 314 | Classifier relation consumed through IS: Arrow error | **Reproduces** | P2 (loud; workaround exists) | In progress: hidden column leak, Utf8-vs-Float64 type |
+| 314 | Classifier relation consumed through IS: Arrow error | **Fixed** | P2 | Yield typing and transient-column handling landed |
 | 316 | Exact integer aggregation | **Fixed** `d6e455e5e` (bug part) | P1 for the bug part | Release |
 | 302 | uni-locy always depends on candle | Valid | P3 | Open: reimplement the classifier without candle (S) |
-| 307 | QUERY WHERE costs the full fixpoint | Valid; fix exists opt-in | P2 | In progress: the `goal_directed` default |
+| 307 | QUERY WHERE costs the full fixpoint | **Fixed** | P2 | Auto default and lazy derived facts landed |
 | 305 | Dropped BulkWriter loses committed rows | Fixed on `main` | was P0 in 4.1.1 | Regression test landed; release |
 | 308 | EXPLAIN RULE doesn't expand recursion | Fixed on `main` (#303) | was P2 | Regression test landed; release |
 | 309 | Tuple IS / prefix-TO, third KEY | Fixed on `main` (#303) | was P2 | Regression test landed; release |
-| 310 | FTS scores constant 0.5 before index build | Fixed on `main` for declared properties | was P2; P3 remains | Test landed; schemaless residual open (real BM25 or refuse) |
+| 310 | FTS scores constant 0.5 before index build | Declared fixed; schemaless fixed locally | P2 | Regular BM25 regression coverage; see follow-up verification |
 | 313 | Exact probability loses event identity | Fixed on `main` (lineage store) | was P1 | 8-case regression test landed; release |
 | 311 | In-tx BTree read after SET misses/repeats rows | **Not reproduced** on `main` or 4.1.1 | P3, needs info | Open: ask the reporter for the exact transaction |
-| 315 | Probability diagnostics, exact/fallback status | Feature, plus a misleading warning | P2 | In progress |
+| 315 | Probability diagnostics, exact/fallback status | **Fixed** | P2 | Exact/fallback diagnostics and warning timing landed |
 | 317 | Business-action schemas for ABDUCE | Feature | P3 (L) | Open; workaround: ASSUME per action |
 
 At triage time six of the fifteen were already fixed on `main` but
@@ -51,8 +55,9 @@ candidates.
 
 ## New defects found during triage (not in any issue)
 
-Status: 1-3 fixed (`279755263`, `d6e455e5e`); 4-7 in progress; of 8, the
-ABDUCE and `typecheck.rs` docs are corrected, the `locy.pest` comment is open.
+Status: 1-7 fixed in the completed P1/P2 batch; the stale documentation
+in item 8 has also been corrected. The details below retain the original
+measurements and proposed mechanisms as historical triage, not current blockers.
 
 1. **A fork becomes unflushable** (found during #306, P1, arguably P0).
    - A fork-only schemaless edge type keeps its id→name mapping only in that

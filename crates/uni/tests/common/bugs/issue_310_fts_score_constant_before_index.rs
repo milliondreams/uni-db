@@ -18,14 +18,18 @@
 
 use anyhow::Result;
 use uni_db::api::schema::IndexType;
-use uni_db::{DataType, Uni, Value};
+use uni_db::{DataType, Session, Uni, Value};
 
 const QUERY: &str = "CALL uni.fts.query('ElementVersion', 'terms', 'supplier', 50) \
                      YIELD node, score RETURN node.name AS name, score \
                      ORDER BY score DESC, name";
 
 async fn ranked(db: &Uni) -> Result<Vec<(String, f64)>> {
-    let result = db.session().query(QUERY).await?;
+    ranked_session(&db.session()).await
+}
+
+async fn ranked_session(session: &Session) -> Result<Vec<(String, f64)>> {
+    let result = session.query(QUERY).await?;
     Ok(result
         .rows()
         .iter()
@@ -161,18 +165,9 @@ async fn issue_310_fts_scores_stable_across_flush_and_reopen() -> Result<()> {
     Ok(())
 }
 
-/// Same rows, but `ElementVersion` is never declared, so `terms` is a
-/// schemaless property. `StorageManager::fts_search` scores such a property
-/// by word overlap on both sides of a flush (no BM25 statistics), so every
-/// single-word hit scores `normalize_bm25(1.0, 1.0) = 0.5`.
-///
-/// This is the open residual of #310 (P3): it fails on `main` and is the
-/// specification for the fix (real BM25 statistics for a schemaless property,
-/// or a result marked unranked). Registered in `ON_DEMAND` in
-/// `scripts/ci/ignored_tests.py` so the nightly sweep does not run a test
-/// known to fail.
+/// Schemaless text uses the same BM25 statistics as a declared, unindexed
+/// property, including documents that do not match the query.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "#310 residual: schemaless FTS scores are still a constant 0.5 (word overlap, no BM25 statistics)"]
 async fn issue_310_schemaless_fts_scores_are_constant() -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let path = tmp.path().to_str().unwrap().to_string();
@@ -197,5 +192,147 @@ async fn issue_310_schemaless_fts_scores_are_constant() -> Result<()> {
         distinct.len() > 1,
         "schemaless scores collapsed to a constant: {flushed:?}"
     );
+    assert_same(&unflushed, &flushed, "schemaless flush");
+
+    // Both an undeclared label and an undeclared property on a declared
+    // label must agree with the declared, unindexed scoring path.
+    for typed_text in [false, true] {
+        let declared = Uni::in_memory().build().await?;
+        let schema = declared
+            .schema()
+            .label("ElementVersion")
+            .property("uid", DataType::String)
+            .property("name", DataType::String);
+        if typed_text {
+            schema.property("terms", DataType::String).apply().await?;
+        } else {
+            schema.apply().await?;
+        }
+        let tx = declared.session().tx().await?;
+        for (i, (name, terms)) in rows().into_iter().enumerate() {
+            tx.execute_with("CREATE (:ElementVersion {uid: $uid, name: $name, terms: $terms})")
+                .param("uid", format!("u{i}"))
+                .param("name", name)
+                .param("terms", terms)
+                .run()
+                .await?;
+        }
+        tx.commit().await?;
+        assert_same(
+            &flushed,
+            &ranked(&declared).await?,
+            "declared vs schemaless",
+        );
+        declared.flush().await?;
+        assert_same(
+            &flushed,
+            &ranked(&declared).await?,
+            "declared flushed vs schemaless",
+        );
+    }
+    let top = db.session().query(&QUERY.replace(", 50)", ", 1)")).await?;
+    assert_eq!(top.rows().len(), 1);
+    assert_eq!(
+        top.rows()[0].values()[0],
+        Value::String(flushed[0].0.clone())
+    );
+
+    db.shutdown().await?;
+    let db = Uni::open(&path).build().await?;
+    assert_same(&flushed, &ranked(&db).await?, "schemaless reopen");
+    Ok(())
+}
+
+/// The corpus is the latest visible version of each document, not a bag of
+/// flushed versions plus L0 replacements. Fork and snapshot statistics are local.
+#[tokio::test(flavor = "multi_thread")]
+async fn issue_310_schemaless_fts_visible_corpus() -> Result<()> {
+    let db = Uni::in_memory()
+        .config(uni_db::UniConfig {
+            auto_flush_interval: None,
+            disable_fork_index_builder: true,
+            ..Default::default()
+        })
+        .build()
+        .await?;
+    let session = db.session();
+    let tx = session.tx().await?;
+    tx.execute(
+        "CREATE (:ElementVersion {name:'a', terms:'supplier'}), \
+        (:ElementVersion {name:'b', terms:'supplier supplier'}), \
+        (:ElementVersion {name:'c', terms:'supplier site code'}), \
+        (:ElementVersion {name:'d', terms:'customer order'})",
+    )
+    .await?;
+    tx.commit().await?;
+    db.flush().await?;
+    let original = ranked(&db).await?;
+    let snapshot = db.create_snapshot("fts-before").await?;
+    let mut pinned = db.session();
+    pinned.pin_to_version(&snapshot).await?;
+    let fork = session.fork("fts-corpus").await?;
+
+    let tx = session.tx().await?;
+    tx.execute("MATCH (n:ElementVersion {name:'a'}) SET n.terms = 'customer'")
+        .await?;
+    tx.execute("MATCH (n:ElementVersion {name:'b'}) SET n.terms = null")
+        .await?;
+    tx.execute("MATCH (n:ElementVersion {name:'c'}) DELETE n")
+        .await?;
+    tx.execute("CREATE (:ElementVersion {name:'new', terms:'supplier supplier supplier'})")
+        .await?;
+    tx.commit().await?;
+    let changed = ranked(&db).await?;
+    assert_eq!(
+        changed
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        ["new"]
+    );
+    assert_same(&original, &ranked_session(&pinned).await?, "pinned corpus");
+    assert_same(&original, &ranked_session(&fork).await?, "fork corpus");
+    db.flush().await?;
+    assert_same(&changed, &ranked(&db).await?, "updates flush");
+    assert_same(
+        &original,
+        &ranked_session(&pinned).await?,
+        "pinned after flush",
+    );
+    assert_same(
+        &original,
+        &ranked_session(&fork).await?,
+        "fork after primary flush",
+    );
+
+    let tx = fork.tx().await?;
+    tx.execute("MATCH (n:ElementVersion {name:'a'}) SET n.terms = 42")
+        .await?;
+    tx.commit().await?;
+    let fork_hits = ranked_session(&fork).await?;
+    assert_eq!(fork_hits.len(), 2);
+    assert!(fork_hits.iter().all(|(name, _)| name != "a"));
+    fork.flush().await?;
+    assert_same(
+        &fork_hits,
+        &ranked_session(&fork).await?,
+        "fork update flush",
+    );
+    assert_same(
+        &changed,
+        &ranked(&db).await?,
+        "fork does not affect primary",
+    );
+
+    let tx = session.tx().await?;
+    tx.execute("MATCH (n:ElementVersion {name:'new'}) SET n.terms = 'customer'")
+        .await?;
+    let inside = tx.query(QUERY).await?;
+    assert!(
+        inside.rows().is_empty(),
+        "transaction sees its own replacement"
+    );
+    tx.rollback();
+    assert_same(&changed, &ranked(&db).await?, "rollback");
     Ok(())
 }

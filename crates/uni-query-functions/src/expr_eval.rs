@@ -1355,8 +1355,8 @@ fn eval_entity_function(name: &str, args: &[Value]) -> Result<Value> {
             (None, None) => Value::Null,
         },
         "ELEMENTID" => match (arg.entity_vid(), arg.entity_eid()) {
-            (Some(vid), _) => Value::String(vid.as_u64().to_string()),
-            (None, Some(eid)) => Value::String(eid.as_u64().to_string()),
+            (Some(vid), _) => Value::String((vid.as_u64() as i64).to_string()),
+            (None, Some(eid)) => Value::String((eid.as_u64() as i64).to_string()),
             (None, None) => Value::Null,
         },
         "TYPE" => match arg.edge_type_ref() {

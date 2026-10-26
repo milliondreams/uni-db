@@ -51,6 +51,10 @@ returned to the caller; `elementId(entity)` is its string representation.
 
 ## Semantics Worth Knowing
 
+- **MERGE preserves other labels.** Matching `(n:A {key: ...})` against an
+  existing `A:B` node keeps both labels, including through `ON MATCH SET`
+  property updates and when returning `labels(n)`.
+
 - **Parameters must be supplied.** A query that references `$x` without a
   value for `x` fails with `UniError::ParameterMissing { names }` before it
   reads or writes anything -- including `CREATE`, `SET`, `MERGE` and Locy

@@ -7,6 +7,13 @@ the version it ships in.
 
 ## ⚠️ Behaviour and API changes
 
+**Keyed MERGE preserves every label of a matched node.** Matching an existing
+`A:B` node with `MERGE (n:A {key: ...})` previously bound only `A`, so
+`labels(n)` omitted `B` and an `ON MATCH SET` property update could remove
+`B` from subsequent reads. Keyed node and relationship-endpoint fast paths
+now retain the complete visible label set, including earlier changes in the
+transaction while excluding another session's later relabels.
+
 **Identity expressions use signed IDs consistently.** A virtual node's
 `id(node)` returned a negative integer, but `id(node) < 0` returned false
 because the comparison used its unsigned storage bits. Node and relationship

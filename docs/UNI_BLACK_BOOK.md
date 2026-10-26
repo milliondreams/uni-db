@@ -3076,6 +3076,13 @@ ORDER BY age DESC
 
 ### WITH RECURSIVE
 
+Recursive CTEs deduplicate visited values and have a 1,000-round iteration
+budget. Exhausting that budget before proving convergence returns an explicit
+iteration-limit error; successful results are never silently truncated. Node
+membership in the CTE frontier in leading MATCH clauses is planned as a
+parameterized VID restriction, allowing the existing scan to visit only frontier
+nodes rather than rescanning the label each round.
+
 Recursive common table expressions:
 
 <!-- doctest: skip -->
@@ -4516,6 +4523,13 @@ graph TB
 ```
 
 ## Vector Search
+
+Dense search widens disk candidates by the number of distinct buffered VIDs
+that can shadow them, then reconciles replacements, deletions, current label
+membership, and predicates across pending, committed, and transaction buffers.
+This bound preserves exact-path top-k after buffered mutations without relying
+on a fixed over-fetch factor. ANN recall remains approximate. Fork scanners
+receive the requested distance metric explicitly, including on flat scans.
 
 <!-- doctest: skip -->
 ```cypher
@@ -6647,6 +6661,15 @@ stateDiagram-v2
    fsync'd on local filesystems).
 3. **Merge** of the private L0 into the main L0, then the write-set is
    recorded for future validators.
+
+The bounded OCC history records logical key claims as well as item IDs:
+vertex and edge constraint keys, implicit MERGE keys, and external IDs. These
+claims remain available after the owning L0 buffer finishes flushing. A writer
+whose read point predates retained history aborts conservatively. Key conflicts
+between distinct item IDs return `ConstraintConflict` before durable WAL commit.
+Deletion retires owned keys through reverse maps; graph edge deletion updates
+adjacency positions with swap removal rather than repeatedly filtering a hub's
+whole vector. Neighbor iteration order is unspecified.
 
 The whole step (lock acquisition included) is bounded by
 `UniConfig.commit_timeout` (default 5 s); exceeding it returns
@@ -8925,6 +8948,13 @@ There is intentionally **no global `PluginConfig` for grants or resource limits*
 # Part XVI: Forks
 
 Forks are **named, durable, isolated branches** of the graph. Where a snapshot is a read-only point-in-time view (Part XII), a fork is a *named*, *durable*, *writable* parallel timeline. A session that holds a fork sees its own version of the database — committed mutations land on the fork's Lance branches without touching primary; new labels and edge types can live fork-locally; the fork survives process restarts.
+
+The persisted dataset-to-branch map also defines absence: an unmapped dataset is
+empty in that fork's snapshot, even if primary materializes it later. Its first
+fork write creates an empty private tip before publishing the mapping through
+`ForkRegistryHandle`. Nested fork capture resolves newly created parent branches
+after flushing the parent, and inherits only datasets present at that captured
+point. No branch creation runs while holding the global commit lock.
 
 ## Why Forks Exist
 

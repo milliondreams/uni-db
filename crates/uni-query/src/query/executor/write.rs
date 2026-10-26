@@ -2225,8 +2225,23 @@ impl Executor {
             let seed_props = self
                 .on_create_seed_props(on_create, &row, prop_manager, params, ctx)
                 .await?;
+            // Anonymous MERGE still needs a creation identity for dedup and
+            // commit guards. Keep its temporary binding out of the result row.
+            let mut create_pattern = Cow::Borrowed(path_pattern);
+            let mut created_var = node
+                .variable
+                .clone()
+                .unwrap_or_else(|| "__merge_created".into());
+            if node.variable.is_none() {
+                while row.contains_key(&created_var) {
+                    created_var.push('_');
+                }
+                if let PatternElement::Node(n) = &mut create_pattern.to_mut().paths[0].elements[0] {
+                    n.variable = Some(created_var.clone());
+                }
+            }
             self.execute_create_pattern(
-                path_pattern,
+                &create_pattern,
                 &mut row,
                 writer,
                 prop_manager,
@@ -2241,8 +2256,7 @@ impl Executor {
             // fresh vid has nothing in storage, so ON CREATE SET's lazy read
             // resolves from the L0 row the create just wrote instead of
             // issuing a per-row storage scan that finds nothing.
-            if let Some(var) = &node.variable
-                && let Some(val) = row.get(var)
+            if let Some(val) = row.get(&created_var)
                 && let Ok(vid) = Self::vid_from_value(val)
             {
                 existing.entry(key_tuple.clone()).or_default().push(vid);
@@ -2264,6 +2278,9 @@ impl Executor {
                         uni_store::runtime::l0::serialize_constraint_key(label, &key_values);
                     tx_l0.write().insert_merge_guard_key(guard_key, vid);
                 }
+            }
+            if node.variable.is_none() {
+                row.remove(&created_var);
             }
             if let Some(set) = on_create {
                 self.execute_set_items_locked(

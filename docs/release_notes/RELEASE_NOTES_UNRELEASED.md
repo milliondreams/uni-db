@@ -7,6 +7,22 @@ the version it ships in.
 
 ## ⚠️ Behaviour and API changes
 
+**Storage and query boundary corrections.** Concurrent UNIQUE, NodeKey,
+external-ID and MERGE key claims remain protected after a competing commit
+flushes. Forks retain the empty view of datasets absent at their creation,
+including across first writes, nested forks and reopen. Anonymous MERGE performs
+intra-statement deduplication and registers commit guards like named MERGE.
+Dense vector search replenishes candidates invalidated by buffered replacements,
+deletions or label changes, and fork scans receive the requested metric.
+`WITH RECURSIVE` reports an iteration-limit error when its 1,000-round budget
+ends without convergence; it previously returned successful partial results.
+
+**Buffered deletion and recursive traversal scaling.** Key retirement uses
+reverse ownership maps, and graph edge removal updates adjacency positions in
+constant time. These eliminate quadratic work in large buffered delete commits.
+Recursive frontier membership in leading MATCH clauses drives VID-restricted
+scans instead of a full label scan every round.
+
 **Keyed MERGE preserves every label of a matched node.** Matching an existing
 `A:B` node with `MERGE (n:A {key: ...})` previously bound only `A`, so
 `labels(n)` omitted `B` and an `ON MATCH SET` property update could remove

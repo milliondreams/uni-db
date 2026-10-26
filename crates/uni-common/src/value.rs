@@ -2644,7 +2644,8 @@ mod tests {
         use super::Value;
         assert_eq!(Value::from(5_u64), Value::Int(5));
         assert_eq!(Value::from(i64::MAX as u64), Value::Int(i64::MAX));
-        assert_eq!(Value::from(1_u64 << 63), Value::Float(2f64.powi(63)));
+        // A power of two is exactly representable; powi has unspecified precision.
+        assert_eq!(Value::from(1_u64 << 63), Value::Float((1_u64 << 63) as f64));
         assert_eq!(Value::from(u64::MAX), Value::Float(u64::MAX as f64));
         assert_eq!(Value::from(7_usize), Value::Int(7));
     }

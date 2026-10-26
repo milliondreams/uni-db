@@ -212,7 +212,7 @@ pub enum CommandResult {
         /// Every rule's facts in the hypothetical state the body's first
         /// command reads: after the block's mutations, before any body
         /// command, the parent program's rules and the body's own. The same
-        /// point the program's [`LocyResult::derived`] is taken at, before
+        /// point the program's [`LocyResult::derived_rules`] captures, before
         /// its first command.
         derived: RuleFacts,
     },

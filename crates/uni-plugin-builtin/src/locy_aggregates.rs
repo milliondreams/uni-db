@@ -395,7 +395,7 @@ impl LocyAggregate for SumAgg {
     fn output_type(&self) -> DataType {
         DataType::Float64
     }
-    /// See [`sum_total_type`].
+    /// Returns `LargeBinary` for integer or Cypher-value inputs, otherwise `Float64`.
     fn output_type_for_input(&self, input: &DataType) -> DataType {
         sum_total_type(input)
     }
@@ -439,7 +439,7 @@ impl LocyAggregate for MSumAgg {
     fn output_type(&self) -> DataType {
         DataType::Float64
     }
-    /// See [`sum_total_type`].
+    /// Returns `LargeBinary` for integer or Cypher-value inputs, otherwise `Float64`.
     fn output_type_for_input(&self, input: &DataType) -> DataType {
         sum_total_type(input)
     }

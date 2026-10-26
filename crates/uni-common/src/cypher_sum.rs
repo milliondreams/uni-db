@@ -248,6 +248,9 @@ pub fn describe(value: &Value) -> String {
 mod tests {
     use super::*;
 
+    // An exact reference value: `powi` has unspecified precision, including in Miri.
+    const TWO_POW_63: f64 = (1_u64 << 63) as f64;
+
     fn total(values: &[Value]) -> Result<CypherSum> {
         let mut t = CypherSum::default();
         for v in values {
@@ -293,14 +296,14 @@ mod tests {
             total(&[Value::Int(i64::MIN), Value::Int(-1)])
                 .unwrap()
                 .sum(),
-            Value::Float(-(2f64.powi(63)))
+            Value::Float(-TWO_POW_63)
         );
         // Once a float, a float, even back in range.
         assert_eq!(
             total(&[Value::Int(i64::MAX), Value::Int(1), Value::Int(-1)])
                 .unwrap()
                 .sum(),
-            Value::Float(2f64.powi(63))
+            Value::Float(TWO_POW_63)
         );
     }
 
@@ -312,7 +315,9 @@ mod tests {
     fn an_overflowing_sum_is_rounded_once() {
         let a = (1_i64 << 62) + 1;
         let b = (1_i64 << 62) + 1025;
-        let exact = 2f64.powi(63) + 2048.0;
+        let exact = TWO_POW_63 + 2048.0;
+        // Keep the witness sensitive to rounding the operands before adding.
+        assert_ne!(a as f64 + b as f64, exact);
         assert_eq!(
             total(&[Value::Int(a), Value::Int(b)]).unwrap().sum(),
             Value::Float(exact)

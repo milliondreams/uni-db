@@ -780,3 +780,69 @@ async fn review_persisted_unique_owner_is_enforced_after_reopen() -> Result<()> 
     db.shutdown().await?;
     Ok(())
 }
+
+// Exercise the real Arrow/Parquet callers of the patched zstd implementation,
+// including repeated contexts across batches and row groups.
+#[test]
+fn review_zstd_compressed_arrow_and_parquet_round_trips() -> Result<()> {
+    use arrow_array::{Int64Array, RecordBatch, StringArray};
+    use arrow_ipc::{
+        CompressionType,
+        reader::FileReader,
+        writer::{FileWriter, IpcWriteOptions},
+    };
+    use arrow_schema::{DataType as ArrowType, Field, Schema};
+    use parquet::{
+        arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder},
+        basic::{Compression, ZstdLevel},
+        file::properties::WriterProperties,
+    };
+    use std::{io::Cursor, sync::Arc};
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", ArrowType::Int64, false),
+        Field::new("text", ArrowType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from_iter_values(0..512)),
+            Arc::new(StringArray::from_iter(
+                (0..512).map(|i| (i % 3 != 0).then_some("repeated graph property")),
+            )),
+        ],
+    )?;
+    let options = IpcWriteOptions::default().try_with_compression(Some(CompressionType::ZSTD))?;
+    let mut ipc = Vec::new();
+    {
+        let mut writer = FileWriter::try_new_with_options(&mut ipc, &schema, options)?;
+        for _ in 0..3 {
+            writer.write(&batch)?;
+        }
+        writer.finish()?;
+    }
+    let decoded =
+        FileReader::try_new(Cursor::new(ipc), None)?.collect::<std::result::Result<Vec<_>, _>>()?;
+    assert_eq!(decoded, vec![batch.clone(); 3]);
+
+    let props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(ZstdLevel::default()))
+        .set_max_row_group_row_count(Some(512))
+        .build();
+    let mut file = tempfile::tempfile()?;
+    {
+        let mut writer = ArrowWriter::try_new(&mut file, schema, Some(props))?;
+        for _ in 0..3 {
+            writer.write(&batch)?;
+        }
+        writer.close()?;
+    }
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
+        .with_batch_size(512)
+        .build()?;
+    assert_eq!(
+        reader.collect::<std::result::Result<Vec<_>, _>>()?,
+        vec![batch; 3]
+    );
+    Ok(())
+}

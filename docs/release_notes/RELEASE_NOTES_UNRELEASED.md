@@ -1,5 +1,12 @@
 # uni-db — unreleased
 
+Repository and wheel builds now route older transitive zstd requirements through
+private compatibility facades to patched zstd 0.14.3, zstd-safe 8.2.0 and
+zstd-sys 2.1.2. This fixes reused-context data leakage, seekable output lengths
+past EOF, and malformed legacy-frame output handling without adding advisory
+exceptions. Cargo root patches do not propagate to applications using published
+Rust crates; see [compatibility scope](../../compat/README.md).
+
 Changes on `main` since 4.2.0 that are not yet in a release. Rename this file to
 the version it ships in.
 

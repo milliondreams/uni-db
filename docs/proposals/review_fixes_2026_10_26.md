@@ -180,3 +180,48 @@ Local versions are Rust 1.99.1 and Python 3.14.8; see the [environment record](r
 All 21 recorded source/configuration hashes matched the passing workspace run before the subsequent runbook edit. [Fuzz results](review_fixes_2026_10_26/local_ci/fuzz-result.json) and [final Clippy output](review_fixes_2026_10_26/local_ci/clippy-current.log) complete the selected verification. The source snapshot records the tested local tree, including pre-existing unrelated lockfile changes. The follow-up commit includes only the `zstd-sys` security update from that lockfile. The runbook was subsequently updated to require foreground execution at normal OS priority.
 
 The [final local CI summary](review_fixes_2026_10_26/local_ci/results.json) records the completed selected checks, the three remaining advisory failures, and the unrun job scope. No CI process group remains deliberately suspended.
+
+
+## zstd advisory remediation
+
+The three remaining advisories required implementations newer than the release
+lines accepted by Arrow/Lance, compression-codecs and Wasmtime. Two private
+workspace crates now forward the older package requirements and features to
+registry zstd 0.14.3 and zstd-safe 8.2.0. They contain no compression code;
+the fixed upstream implementations and zstd-sys 2.1.2 retain their registry
+checksums. Both the main and standalone fuzz workspaces apply the patches.
+`deny.toml` is unchanged.
+
+Five facade regressions cover abandoned encoder/decoder context isolation,
+bulk/dictionary round trips, corrupt legacy-frame output positions, and
+seekable offsets past EOF with Vec output. They run in the regular workspace
+nextest lane. An integration regression also exercises zstd-compressed Arrow
+IPC batches and Parquet row groups through the actual downstream callers.
+
+The earlier red supply-chain results above are historical evidence from before
+this remediation. Patch scope and removal criteria are recorded in
+[compat/README.md](../../compat/README.md), including the fact that root patches
+do not propagate to downstream published-crate consumers.
+
+Validation on the remediation: **cargo-deny passes all four checks**, with no
+new advisory ignores; **5/5 codec regressions** and **224/224 selected consumer
+tests** pass. The consumer run includes the compressed Arrow/Parquet regression
+and a WASM network round trip. Compatibility-crate Clippy with warnings denied,
+the no-default-features `no_std` build, formatting, all eight static guards
+(including fuzz-lock freshness), and the 25-crate release-list check pass.
+All 15 zstd and 16 zstd-safe feature names and their defaults are preserved.
+The optional separate full plugin-suite rerun was stopped during a redundant
+rebuild and is not counted as a passing suite. The full workspace and Python
+suites above were not rerun for this dependency change.
+
+Current [security validation results](review_fixes_2026_10_26/security_fix/results.json),
+[passing audit](review_fixes_2026_10_26/security_fix/deny.log),
+[codec regressions](review_fixes_2026_10_26/security_fix/compat-tests.log), and
+[consumer tests](review_fixes_2026_10_26/security_fix/consumer-tests.log)
+are separate from the earlier failing historical evidence.
+
+An isolated snapshot of the focused commit also passes locked offline dependency
+resolution for the root and fuzz workspaces and all four cargo-deny checks.
+Its [audit log](review_fixes_2026_10_26/security_fix/staged-deny.log) and lockfile
+hash in the validation results distinguish it from the original tested local
+lockfile, which contained unrelated changes excluded from this commit.

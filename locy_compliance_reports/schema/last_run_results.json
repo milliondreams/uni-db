@@ -6934,7 +6934,8 @@
             "keyword": "Scenario ",
             "name": "CREATE MODEL coexists with a non-invoking CREATE RULE",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/neural/CreateModel.feature:64:5\n      Matched: crates/uni-locy-tck/src/steps/then_evaluate.rs:469:1\n      Step panicked. Captured output: Expected derived relation 'link_prob' to contain a fact where p = 0.5, but no match found in 1 facts\n[Summary]\n1 feature\n1 scenario (1 failed)\n5 steps (4 passed, 1 failed)\n"
             }
           }
         ]
@@ -8100,7 +8101,8 @@
             "keyword": "Scenario ",
             "name": "MNOR under MaxMinProb returns max-of-inputs and warns",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/semiring/MaxMinProbViterbi.feature:42:5\n      Matched: crates/uni-locy-tck/src/steps/then_evaluate.rs:469:1\n      Step panicked. Captured output: Expected derived relation 'risk' to contain a fact where p = 0.7, but no match found in 1 facts\n[Summary]\n1 feature\n1 scenario (1 failed)\n8 steps (7 passed, 1 failed)\n"
             }
           }
         ]
@@ -8114,7 +8116,8 @@
             "keyword": "Scenario ",
             "name": "MPROD under MaxMinProb returns min-of-inputs and warns",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/semiring/MaxMinProbViterbi.feature:70:5\n      Matched: crates/uni-locy-tck/src/steps/then_evaluate.rs:469:1\n      Step panicked. Captured output: Expected derived relation 'joint' to contain a fact where p = 0.4, but no match found in 1 facts\n[Summary]\n1 feature\n1 scenario (1 failed)\n7 steps (6 passed, 1 failed)\n"
             }
           }
         ]
@@ -8156,7 +8159,8 @@
             "keyword": "Scenario ",
             "name": "Out-of-range input under MaxMinProb + strict fails fast",
             "result": {
-              "status": "passed"
+              "status": "failed",
+              "error_message": "Step failed:\n      Defined: tck/features/semiring/MaxMinProbViterbi.feature:155:5\n      Matched: crates/uni-locy-tck/src/steps/then_evaluate.rs:469:1\n      Step panicked. Captured output: Expected derived relation 'risk' to contain a fact where p = 1.0, but no match found in 1 facts\n[Summary]\n1 feature\n1 scenario (1 failed)\n5 steps (4 passed, 1 failed)\n"
             }
           }
         ]

@@ -387,5 +387,8 @@
       "log": "/tmp/uni-failure-triage/static-guards-fixed.log",
       "log_sha256": "ea3271fec7f11e729708d08141f72f2e50ef16397e7c58583ff637779eba30dc"
     }
-  ]
+  ],
+  "historical": true,
+  "superseded_by": "ci-completion-validation.json",
+  "interpretation_note": "The Locy TCK wrapper returned 0 despite four failed scenarios per mode. Use the final completion manifest for corrected grammar and suite outcomes."
 }

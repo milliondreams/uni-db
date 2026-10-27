@@ -314,5 +314,18 @@
       "metamorphic-soak"
     ],
     "pending": []
+  },
+  "follow_up_ci_completion": {
+    "status": "completed_with_strict_iai_alert",
+    "manifest": "../parser_backtracking_2026_10_27/ci-completion-validation.json",
+    "resolved": [
+      "parser timeouts",
+      "binding soak budget",
+      "Locy AS PROB regression",
+      "TCK report failure propagation"
+    ],
+    "remaining": [
+      "strict IAI baseline comparison requires CI qualification"
+    ]
   }
 }

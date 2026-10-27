@@ -1,6 +1,6 @@
 # Cypher parser backtracking issue and repair status
 
-Date: 2026-10-27. Priority: P1. Status: repaired and validated (`cypher_parse` and `locy_parse` fuzz targets, full 5-shard binding soak, and TCK suites passing).
+Date: 2026-10-27. Status: parser repair validated; remaining CI run completed with a strict IAI comparison alert.
 
 The Cypher parser could spend seconds parsing a query only a few hundred bytes
 long. Several grammar alternatives could read the same nested expression, fail
@@ -138,7 +138,7 @@ and [`locy.pest`](../../crates/uni-cypher/src/grammar/locy.pest):
   where `node_ahead` and `rel_detail_ahead` lexically validate the node and
   relationship headers up to their balanced property/WHERE groups, and
   `balanced_group_body` skips `string`, `escaped_name`, and `COMMENT`.
-- **`pattern_comprehension_ahead`** now anchors thecomprehension prefix to
+- **`pattern_comprehension_ahead`** now anchors the comprehension prefix to
   `(identifier =)? (shortestPath(...) | pattern_element_ahead+)` followed by an
   optional `WHERE` clause and `|`, and skips `:Label|Label` disjunction pipes in
   `comprehension_scan_token`.
@@ -154,23 +154,52 @@ and [`locy.pest`](../../crates/uni-cypher/src/grammar/locy.pest):
 
 ## Validation results
 
-All queued parser, fuzz, soak, conformance, and lint checks completed:
+The remaining CI run is complete. Correctness, conformance, fuzzing, and static
+checks pass. The strict IAI comparison remains non-green; its alert is retained below.
 
-- **Parser regression & unit/integration suites**: all 18 tests in
-  `parser_backtracking_regression` passed in 1.51 s (`cypher-all`: 147/147
-  passed in 2.79 s; `uni-locy`: 236/236 passed).
-- **Fuzz targets (5-minute budget each, unchanged `-timeout=10`)**:
-  - `cypher_parse`: 661,531 runs in 301 s, exit 0 (`fuzz-cypher_parse-fixed.log.gz`).
-  - `locy_parse`: 548,965 runs in 301 s, exit 0 (`fuzz-locy_parse-fixed.log.gz`).
-- **Metamorphic smoke & 5-shard binding soak (`METAMORPHIC_CASES=10000` per shard, 50,000 total)**:
-  - `metamorphic-smoke-fixed`: passed in 12.07 s.
-  - `binding-shard-1`..`5` (seeds 427–431): all 5 shards passed (1,442–1,808 s per shard, well within the 2,400 s per-job budget).
-- **Conformance & static checks**:
-  - `cypher-tck-fixed` (`--both`): passed in 175.09 s.
-  - `locy-tck-fixed` (`--both`): passed in 21.61 s.
-  - `clippy-fixes` (`-p uni-cypher -p uni-db --all-targets -- -D warnings`): passed in 252.90 s.
-  - `fmt-fixes` (`cargo fmt --all -- --check`): passed.
-  - `static-guards-fixed` (`scripts/ci/static_guards.py --with-fuzz-lock`): all 8 checks passed.
+- Parser and Locy compiler suites: **384 passed**.
+- Cypher fuzzing: **661,531 executions in 301 seconds**, with the unchanged
+  10-second per-input timeout.
+- Final Locy fuzzing after the probability fix: **487,816 executions in 301
+  seconds**, with the same timeout.
+- Binding soak: **50,000 cases and 1,315,911 query executions** across all five
+  distinct-seed shards; every shard passed within the 40-minute test limit.
+- Cypher TCK: **3,925 passed and one skipped in each mode**.
+- Locy TCK: **558 passed, zero failed in each mode**.
+- Clippy with warnings denied, formatting, and all **nine static checks**
+  including fuzz-lock consistency: passed.
+- TCK wrapper failure-propagation tests and IAI collector/gate self-tests: passed.
+- Current-source release IAI benchmark: all five measurement runs completed with
+  the expected lookup-row and name assertions passing. Lookup median:
+  **9,564,478 instructions**, CV **0.183%**, change against the committed CI
+  baseline **-53.84%**. Baseline and thresholds remain unchanged.
+
+The old Locy wrapper's exit code did not reflect its four scenario failures per
+mode. The final results above use the corrected wrapper and verify the actual
+scenario summaries. The final source and configuration snapshot was verified
+unchanged at completion. See the
+[completion manifest](parser_backtracking_2026_10_27/ci-completion-validation.json)
+for commands, exit codes, saved logs, and hashes.
+
+## Probability projection regression found by log audit
+
+The shared-prefix refactor used `AS ~ alias_identifier? ~ PROB`. In `p AS PROB`,
+the optional alias greedily consumed `PROB`; the remaining required `PROB`
+then failed. The ordinary projection alternative accepted it as an alias instead,
+losing the probability marker and the expected output name `p`.
+
+The corrected choice is `AS ~ (alias_identifier ~ PROB | PROB)`. It keeps the
+expression prefix factored while preserving shorthand and explicit aliases.
+A regression test checks both forms, property-derived aliases, and ordinary
+non-probability aliases. The parser and Locy compiler suites pass all 384 tests.
+
+Both TCK report scripts previously used `cargo nextest ... || true` and
+returned success after report generation, even when scenarios failed. They now
+retain the nextest failure status, finish reporting both modes, and exit with
+that status. Regression checks cover filtered failures, either failing mode,
+successful runs, and aggregation failures. These checks are part of the static
+CI guards. The corrected full Locy TCK run passes all 558 scenarios in each
+mode, with zero failures.
 
 ## Relation to the other CI failures
 
@@ -178,11 +207,13 @@ The binding-soak timeout was a separate workload-budget problem. Splitting the
 50,000 cases across five independent 10,000-case shards (`binding-shard-1`..`5`)
 has now been validated end-to-end above: all five shards passed.
 
-The instruction-count gate remains a separate runner/toolchain baseline
-calibration issue. Five fresh benchmark runs passed assertions requiring the
+The strict instruction-count comparison against the CI baseline remains
+unresolved. Five fresh benchmark runs passed assertions requiring the
 correct lookup row and name, while local Rust 1.99.1 / Valgrind 3.27.1 measures
-a 53.86% reduction against the CI baseline recorded on Rust 1.98.1 / Valgrind 3.22.
-Its baseline and thresholds remain unchanged pending a matching CI qualification run.
+a 53.84% reduction against the CI baseline recorded on Rust 1.98.1 / Valgrind 3.22.
+Its baseline and thresholds remain unchanged. A matching CI qualification run
+is required before claiming this comparison is green; these local checks do not
+establish the exact cause of the historical baseline difference.
 
 ## Evidence
 
@@ -190,6 +221,6 @@ Its baseline and thresholds remain unchanged pending a matching CI qualification
 - [Parser regression tests](../../crates/uni-cypher/tests/parser_backtracking_regression.rs).
 - [Evidence directory](parser_backtracking_2026_10_27/), including old/new
   diagnostic timings, parser test results, the failing inputs, and the
-  compressed fuzz logs (`fuzz-cypher_parse-fixed.log.gz`, `fuzz-locy_parse-fixed.log.gz`).
-- [Latest repair validation snapshot](parser_backtracking_2026_10_27/fix-validation-status.json).
+  compressed fuzz logs (`fuzz-cypher_parse-fixed.log.gz`, `locy-fuzz-final.log.gz`).
+- [Latest CI completion results](parser_backtracking_2026_10_27/ci-completion-validation.json).
 - [Upstream baseline qualification](https://github.com/rustic-ai/uni-db/actions/runs/35253386248).

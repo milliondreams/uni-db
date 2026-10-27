@@ -80,8 +80,11 @@ Exact lane commands, results and source hashes are retained in the
 
 ## Additional CI follow-up (2026-10-27, completed)
 
-**Local CI is not green.** All 66 additional command checks completed: 63 passed
-and three failed:
+At the original additional-CI snapshot, all 66 command checks completed:
+63 passed and three failed. The subsequent parser and soak repairs and final
+validation are tracked in
+[the parser repair report](parser_backtracking_2026_10_27.md). The failures below
+record the original snapshot, not the latest disposition:
 
 - Nightly `cypher_parse` fuzzing exceeded the unchanged 10-second per-input
   budget on a 1,633-byte malformed query. Replaying that exact input reproduced
@@ -131,6 +134,24 @@ Exact completed commands, environments,
 results and log hashes are in
 [`remaining-ci-validation.json`](lance_13_upgrade_2026_10_26/remaining-ci-validation.json).
 This follow-up retains normal process priority and serializes Cargo lanes.
+
+## CI completion after parser repairs
+
+The remaining validation run completed after the parser repairs. All five
+binding shards passed **50,000 total cases and 1,315,911 query executions**.
+Parser/compiler tests, both parser fuzz budgets, both schema modes of Cypher
+and Locy TCK, Clippy, formatting, and static checks passed. The Locy probability
+projection regression found during the log audit was repaired; report wrappers
+now preserve test failure exit codes instead of returning a false green.
+
+The current-source IAI benchmark completed five runs with explicit lookup result
+checks. Its strict comparison still flags an unusually large improvement
+against the CI baseline
+(lookup median 9,564,478 instructions, -53.84%, CV 0.183%).
+Baseline and thresholds were not changed. Local CI cannot be described as
+entirely green until that comparison is qualified on the appropriate CI runners.
+See the [repair report](parser_backtracking_2026_10_27.md) and
+[final validation manifest](parser_backtracking_2026_10_27/ci-completion-validation.json).
 
 ## Scope of compatibility evidence
 

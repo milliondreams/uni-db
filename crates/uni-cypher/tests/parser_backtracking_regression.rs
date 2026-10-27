@@ -400,3 +400,34 @@ fn nested_rel_predicate_properties_without_where_parse_fast() {
     assert_parses_within(&q, Duration::from_secs(5));
     assert!(uni_cypher::parse(&q).is_ok());
 }
+
+#[test]
+fn probability_projection_keeps_shorthand_and_explicit_aliases() {
+    use uni_cypher::locy_ast::{LocyStatement, RuleOutput};
+
+    for (projection, expected_alias, is_prob) in [
+        ("p AS PROB", Some("p"), true),
+        ("p PROB", Some("p"), true),
+        ("p AS score PROB", Some("score"), true),
+        ("n.p AS PROB", Some("p"), true),
+        ("p AS PROB PROB", Some("PROB"), true),
+        ("p AS score", Some("score"), false),
+        ("p AS PROBfoo", Some("PROBfoo"), false),
+    ] {
+        let source = format!("CREATE RULE r AS MATCH (n) YIELD {projection}");
+        let program = uni_cypher::parse_locy(&source).expect("parse rule");
+        let LocyStatement::Rule(rule) = &program.statements[0] else {
+            panic!("expected rule");
+        };
+        let RuleOutput::Yield(output) = &rule.output else {
+            panic!("expected YIELD");
+        };
+        assert_eq!(output.items.len(), 1);
+        assert_eq!(output.items[0].is_prob, is_prob, "{projection}");
+        assert_eq!(
+            output.items[0].alias.as_deref(),
+            expected_alias,
+            "{projection}"
+        );
+    }
+}

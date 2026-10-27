@@ -1,19 +1,19 @@
 # TCK Compliance Report
 
-**Generated:** 2026-10-27 11:03:17
-**Results:** `results_20261027_110317.json`
-**Compared to:** `results_20261026_213610.json`
+**Generated:** 2026-10-27 11:28:47
+**Results:** `results_20261027_112847.json`
+**Compared to:** `results_20261027_110317.json`
 
 ## Summary
 
 | Metric | Current | Previous | Delta |
 |--------|---------|----------|-------|
 | Scenarios | 558 | 558 |  |
-| Passed | 554 | 558 | -4 |
-| Failed | 4 | 0 | +4 |
-| Pass Rate | 99.3% | 100.0% | 📉 -0.7pp |
+| Passed | 558 | 554 | +4 |
+| Failed | 0 | 4 | -4 |
+| Pass Rate | 100.0% | 99.3% | 📈 +0.7pp |
 
-**🔴 Regressions:** 4 scenarios now failing
+**🟢 Fixed:** 4 scenarios now passing
 
 ## Feature Breakdown
 
@@ -34,7 +34,7 @@
 | ✅ CommandSequencing | 5 | 5 | 0 | 100% |  |
 | ✅ CompositePatterns | 27 | 27 | 0 | 100% |  |
 | ✅ ConformalCalibration | 2 | 2 | 0 | 100% |  |
-| ⚠️ CreateModel | 3 | 2 | 1 | 67% | -33pp |
+| ✅ CreateModel | 3 | 3 | 0 | 100% | +33pp |
 | ✅ CrossGroupCorrelation | 7 | 7 | 0 | 100% |  |
 | ✅ CypherFunctions | 9 | 9 | 0 | 100% |  |
 | ✅ DeriveEdges | 9 | 9 | 0 | 100% |  |
@@ -55,7 +55,7 @@
 | ✅ InvokeModel | 4 | 4 | 0 | 100% |  |
 | ✅ IsNotFoldQueryMatrix | 20 | 20 | 0 | 100% |  |
 | ✅ MathematicalReference | 12 | 12 | 0 | 100% |  |
-| ❌ MaxMinProbViterbi | 5 | 2 | 3 | 40% | -60pp |
+| ✅ MaxMinProbViterbi | 5 | 5 | 0 | 100% | +60pp |
 | ✅ ModelRelationComposition | 2 | 2 | 0 | 100% |  |
 | ✅ ModuleComposition | 8 | 8 | 0 | 100% |  |
 | ✅ MonotonicAggregation | 36 | 36 | 0 | 100% |  |
@@ -96,9 +96,9 @@
 | ✅ Validate | 4 | 4 | 0 | 100% |  |
 | ✅ YieldValueColumns | 7 | 7 | 0 | 100% |  |
 
-## 🔴 Regressions
+## 🟢 Newly Passing
 
-Scenarios that were passing but are now failing:
+Scenarios that were failing but are now passing:
 
 - **CreateModel** — CREATE MODEL coexists with a non-invoking CREATE RULE (line 45)
 - **MaxMinProbViterbi** — MNOR under MaxMinProb returns max-of-inputs and warns (line 14)
@@ -107,49 +107,4 @@ Scenarios that were passing but are now failing:
 
 ## Failed Scenarios
 
-### CreateModel
-
-- **CREATE MODEL coexists with a non-invoking CREATE RULE** (line 45)
-  ```
-  Step failed:
-      Defined: tck/features/neural/CreateModel.feature:64:5
-      Matched: crates/uni-locy-tck/src/steps/then_evaluate.rs:469:1
-      Step panicked. Captured output: Expected derived relation 'link_prob' to contain a fact where p = 0.5, but no match found in 1 facts
-[Summary]
-1 feature
-
-  ... (truncated)
-  ```
-
-### MaxMinProbViterbi
-
-- **MNOR under MaxMinProb returns max-of-inputs and warns** (line 14)
-  ```
-  Step failed:
-      Defined: tck/features/semiring/MaxMinProbViterbi.feature:42:5
-      Matched: crates/uni-locy-tck/src/steps/then_evaluate.rs:469:1
-      Step panicked. Captured output: Expected derived relation 'risk' to contain a fact where p = 0.7, but no match found in 1 facts
-[Summary]
-1 featu
-  ... (truncated)
-  ```
-- **MPROD under MaxMinProb returns min-of-inputs and warns** (line 47)
-  ```
-  Step failed:
-      Defined: tck/features/semiring/MaxMinProbViterbi.feature:70:5
-      Matched: crates/uni-locy-tck/src/steps/then_evaluate.rs:469:1
-      Step panicked. Captured output: Expected derived relation 'joint' to contain a fact where p = 0.4, but no match found in 1 facts
-[Summary]
-1 feat
-  ... (truncated)
-  ```
-- **Out-of-range input under MaxMinProb + strict fails fast** (line 138)
-  ```
-  Step failed:
-      Defined: tck/features/semiring/MaxMinProbViterbi.feature:155:5
-      Matched: crates/uni-locy-tck/src/steps/then_evaluate.rs:469:1
-      Step panicked. Captured output: Expected derived relation 'risk' to contain a fact where p = 1.0, but no match found in 1 facts
-[Summary]
-1 feat
-  ... (truncated)
-  ```
+🎉 No failed scenarios!

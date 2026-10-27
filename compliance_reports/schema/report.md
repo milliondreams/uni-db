@@ -1,8 +1,8 @@
 # TCK Compliance Report
 
-**Generated:** 2026-10-27 11:03:03
-**Results:** `results_20261027_110303.json`
-**Compared to:** `results_20261026_213556.json`
+**Generated:** 2026-10-27 11:32:11
+**Results:** `results_20261027_113210.json`
+**Compared to:** `results_20261027_110303.json`
 
 ## Summary
 

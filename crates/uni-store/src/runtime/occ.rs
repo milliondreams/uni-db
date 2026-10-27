@@ -84,11 +84,18 @@ impl WriteSet {
             && self.ext_ids.is_empty()
     }
 
-    fn keys_intersect(&self, other: &Self) -> bool {
-        !self.vertex_keys.is_disjoint(&other.vertex_keys)
-            || !self.edge_keys.is_disjoint(&other.edge_keys)
-            || !self.merge_keys.is_disjoint(&other.merge_keys)
-            || !self.ext_ids.is_disjoint(&other.ext_ids)
+    fn conflicting_key_kind(&self, other: &Self) -> Option<&'static str> {
+        if !self.vertex_keys.is_disjoint(&other.vertex_keys) {
+            Some("vertex constraint")
+        } else if !self.edge_keys.is_disjoint(&other.edge_keys) {
+            Some("edge constraint")
+        } else if !self.merge_keys.is_disjoint(&other.merge_keys) {
+            Some("MERGE")
+        } else if !self.ext_ids.is_disjoint(&other.ext_ids) {
+            Some("ext_id")
+        } else {
+            None
+        }
     }
 
     /// Returns `true` when this and `other` write any common vertex or edge.
@@ -204,7 +211,7 @@ fn read_set_intersects(read_set: &OccReadSet, w: &WriteSet) -> bool {
 #[derive(Debug)]
 pub enum Conflict {
     /// Concurrent transactions claimed the same logical unique/MERGE key.
-    Key { seq: u64 },
+    Key { seq: u64, kind: &'static str },
     /// A concurrent commit wrote an item this transaction also wrote.
     WriteWrite { seq: u64 },
     /// A concurrent commit wrote an item this transaction read (SSI).
@@ -217,7 +224,9 @@ pub enum Conflict {
 impl std::fmt::Display for Conflict {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Conflict::Key { seq } => write!(f, "key conflict with commit sequence {seq}"),
+            Conflict::Key { seq, kind } => {
+                write!(f, "{kind} key conflict with commit sequence {seq}")
+            }
             Conflict::WriteWrite { seq } => {
                 write!(f, "write-write conflict with commit sequence {seq}")
             }
@@ -322,8 +331,8 @@ impl CommitRegistry {
             if write_set.intersects(committed) {
                 return Some(Conflict::WriteWrite { seq: *seq });
             }
-            if write_set.keys_intersect(committed) {
-                return Some(Conflict::Key { seq: *seq });
+            if let Some(kind) = write_set.conflicting_key_kind(committed) {
+                return Some(Conflict::Key { seq: *seq, kind });
             }
             if let Some(rs) = read_set
                 && read_set_intersects(rs, committed)
@@ -648,7 +657,10 @@ mod key_history_regressions {
         history.record(1, a.clone());
         assert!(matches!(
             history.check(0, &a, None),
-            Some(Conflict::Key { seq: 1 })
+            Some(Conflict::Key {
+                seq: 1,
+                kind: "vertex constraint"
+            })
         ));
         assert!(history.check(1, &a, None).is_none());
         let mut edge = WriteSet::default();

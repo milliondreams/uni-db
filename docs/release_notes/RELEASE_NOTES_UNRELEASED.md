@@ -12,6 +12,8 @@ external-ID and MERGE key claims remain protected after a competing commit
 flushes. Forks retain the empty view of datasets absent at their creation,
 including across first writes, nested forks and reopen. Anonymous MERGE performs
 intra-statement deduplication and registers commit guards like named MERGE.
+Fork cardinality refreshes preserve primary's shared count cache, and concurrent
+key-conflict diagnostics identify the key kind, including `ext_id`.
 Dense vector search replenishes candidates invalidated by buffered replacements,
 deletions or label changes, and fork scans receive the requested metric.
 `WITH RECURSIVE` reports an iteration-limit error when its 1,000-round budget

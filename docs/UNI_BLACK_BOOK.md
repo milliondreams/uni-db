@@ -8955,6 +8955,9 @@ fork write creates an empty private tip before publishing the mapping through
 `ForkRegistryHandle`. Nested fork capture resolves newly created parent branches
 after flushing the parent, and inherits only datasets present at that captured
 point. No branch creation runs while holding the global commit lock.
+Cardinality reads use zero for an unmapped table's flushed rows and add fork L0
+rows when requested. Fork counts never enter the shared primary cardinality
+cache, including when refreshing the known empty view of an unmapped table.
 
 ## Why Forks Exist
 

@@ -138,3 +138,45 @@ The internals reference, user-facing Cypher and fork documentation, and
 unreleased notes describe the changed guarantees and recursive-limit error.
 All temporary probe registrations have been removed; the 19 permanent
 regressions remain registered in the consolidated integration binary.
+
+
+## Local CI follow-up (2026-10-26)
+
+The complete workspace run passes **8,638 tests**, with 137 skipped by the configured default tier. The initial broad run exposed two storage follow-ups, plus a timing assertion distorted by overlapping builds:
+
+- Preserve the logical key kind in OCC conflict diagnostics, including `ext_id`.
+- Keep an unmapped fork table's flushed cardinality at zero, include its buffered rows when requested, and prevent its refresh from overwriting primary's shared cardinality cache. The existing fork-count fixture now checks all three properties.
+- Serialize local Cargo lanes through test execution; nextest releases Cargo's build lock before its tests finish. The unchanged scaling assertion passes under that isolation. The runbook now records this requirement.
+
+A subsequent full run passed 8,637 tests and timed out in an existing probe of Lance's cancelled-runtime behavior. The probe now runs each cancellation mode in a bounded child process, verifies that the child actually selected one test, and keeps fixtures owned by the parent. A timeout witnesses the upstream defect only after the cancellation boundary; fixture or initial-read stalls still fail. A normal result or unexpected error still fails the probe. Both modes reproduced the expected cancelled-task panic in the focused verification.
+
+Evidence: [full passing workspace run](review_fixes_2026_10_26/local_ci/workspace-green.log), [26 focused regressions](review_fixes_2026_10_26/local_ci/focused-fixes.log), [bounded Lance probe](review_fixes_2026_10_26/local_ci/runtime-drop-probe-final.log), and [source snapshot](review_fixes_2026_10_26/local_ci/source_snapshot.json). The earlier performance measurements and their original source hash manifest remain historical evidence for the initial fix.
+
+Completed additional gates on the current source:
+
+| Gate | Result |
+| --- | --- |
+| Formatting, workspace Clippy, rustdoc, static guards | Pass; 8 static guards |
+| Miri | 329 passed |
+| Loom | 4 passed |
+| Metamorphic, `METAMORPHIC_CASES=64` | 105 passed |
+| GraphCompute tracing | 216 passed |
+| Failpoint crash/recovery | 246 passed |
+| Feature-disabled recovery | 26 passed |
+| LocalStack storage / hybrid end-to-end | 17 / 1 passed |
+| Slim ONNX wheel compile | Pass |
+| Cypher TCK, schemaless / sidecar | 3,925 passed and 1 skipped in each mode |
+| Locy TCK, schemaless / sidecar | 558 passed in each mode |
+| Python uni-db / uni-pydantic | 1,148 passed, 15 skipped / 317 passed |
+| Python stub / 3.14 typing checks | 6 modules / 12 source files pass |
+| Rust PyO3 loader with PyArrow | 35 passed |
+| Fuzz smoke: Cypher, Locy, WAL, BTIC | All 4 passed without crashes |
+| CUDA wheel dependency graph | Pass; metadata only |
+
+Local versions are Rust 1.99.1 and Python 3.14.8; see the [environment record](review_fixes_2026_10_26/local_ci/environment.json). Some orchestrator durations include queued or deliberately suspended time. The LocalStack container created for this run has been removed.
+
+**The complete CI result is not green.** Every selected local functional/lint gate above passed, but the supply-chain gate remains red. The calibrated instruction-count gate, flagship notebook execution, real ONNX reranker feature matrix, Python WASM/Extism feature wheel, and dedicated built-wheel ABI job were not run locally. The supply-chain gate rejects RUSTSEC-2026-0391, RUSTSEC-2026-0398 and RUSTSEC-2026-0403. The compatible `zstd-sys` 2.1.2 update clears RUSTSEC-2026-0410. No advisory exceptions were added. Registry checks confirm that Arrow IPC 58.4.1 still requires zstd 0.13, whose latest compatible release is 0.13.3; the advertised fixes require zstd >=0.14.3 and zstd-safe >=8.2.0. See the [remaining advisory output](review_fixes_2026_10_26/local_ci/deny-final.log).
+
+All 21 recorded source/configuration hashes matched the passing workspace run before the subsequent runbook edit. [Fuzz results](review_fixes_2026_10_26/local_ci/fuzz-result.json) and [final Clippy output](review_fixes_2026_10_26/local_ci/clippy-current.log) complete the selected verification. The source snapshot records the tested local tree, including pre-existing unrelated lockfile changes. The follow-up commit includes only the `zstd-sys` security update from that lockfile. The runbook was subsequently updated to require foreground execution at normal OS priority.
+
+The [final local CI summary](review_fixes_2026_10_26/local_ci/results.json) records the completed selected checks, the three remaining advisory failures, and the unrun job scope. No CI process group remains deliberately suspended.

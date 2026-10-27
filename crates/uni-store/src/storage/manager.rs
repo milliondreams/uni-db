@@ -3562,15 +3562,16 @@ impl StorageManager {
             CardinalityKey::Vertex(label) => table_names::vertex_table_name(label),
             CardinalityKey::EdgeType(_) => table_names::main_edge_table_name().to_string(),
         };
-        if self
-            .fork_scope()
-            .and_then(|scope| scope.branch_for(&table_name))
-            .is_some()
-        {
-            return None;
-        }
-
-        let flushed = self.cardinality.get(key)?;
+        let flushed = if let Some(scope) = self.fork_scope() {
+            if scope.branch_for(&table_name).is_some() {
+                return None;
+            }
+            // Unmapped tables are absent in this fork. Its buffered rows
+            // still contribute below, independently of primary's cache.
+            0
+        } else {
+            self.cardinality.get(key)?
+        };
         let Some(l0) = l0 else {
             return Some(flushed);
         };
@@ -3596,7 +3597,8 @@ impl StorageManager {
     /// `None` without caching anything when this view cannot answer for the
     /// primary — the same fork and pin conditions the sync reader declines on,
     /// so a fork's count can never be written into the shared cache and read
-    /// back later as primary's.
+    /// back later as primary's. An unmapped fork table returns its known zero
+    /// count without storing it in that shared cache.
     ///
     /// # Errors
     ///
@@ -3619,12 +3621,10 @@ impl StorageManager {
                 Some(FilterExpr::equals("type", Scalar::Str(etype.clone()))),
             ),
         };
-        if self
-            .fork_scope()
-            .and_then(|scope| scope.branch_for(&table_name))
-            .is_some()
-        {
-            return Ok(None);
+        if let Some(scope) = self.fork_scope() {
+            // Never publish a fork's count into the shared primary cache,
+            // including the empty view of an unmapped table.
+            return Ok(scope.branch_for(&table_name).is_none().then_some(0));
         }
         if !backend.table_exists(&table_name).await? {
             self.cardinality.put(key.clone(), 0);

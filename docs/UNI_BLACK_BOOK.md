@@ -2938,6 +2938,16 @@ graph TB
 
 Uni implements a substantial subset of the OpenCypher query language, extended with vector search, full-text search, DDL commands, time travel, and window functions. The parser is based on `pest` (PEG grammar) and produces an AST that the query planner converts to DataFusion physical plans.
 
+Shared Cypher/Locy expression rules use lexical lookahead before expensive
+ambiguous parses. A pattern expression requires a relationship after its first
+node; a pattern comprehension requires a pipe outside nested groups, strings,
+quoted identifiers and comments. This prevents list literals containing nested
+map projections from repeatedly parsing the same interiors. Node predicates
+parse properties once, followed by an optional `WHERE` expression. The existing
+nesting limit remains in force; it is not a substitute for these backtracking
+guards.
+
+
 ```mermaid
 graph LR
     subgraph "Query Execution Pipeline"

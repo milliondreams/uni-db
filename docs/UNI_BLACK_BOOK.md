@@ -4022,7 +4022,7 @@ return a path of any length. Both are now enforced:
 
 ### shortestPath: a pair with no path
 
-Matches openCypher / Neo4j (a breaking change from 4.2.0, where every no-path
+Matches openCypher / Neo4j (a breaking change from the 4.1 series, where every no-path
 pair was kept as a row with a NULL path, in mandatory and OPTIONAL MATCH alike):
 
 - **Mandatory `MATCH`** drops the pair. `GraphShortestPathExec` gets

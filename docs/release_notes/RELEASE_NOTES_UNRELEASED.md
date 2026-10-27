@@ -19,6 +19,12 @@ the version it ships in.
 
 ## ⚠️ Behaviour and API changes
 
+**Locy no longer requires Candle.** The built-in `CandleLinearClassifier`
+retains its public API, safetensors model format, and f32 inference while using
+CPU scalar arithmetic directly. Minimal Lance-backed Rust builds no longer
+pull in Candle through Locy; optional embedding providers retain their existing
+feature controls.
+
 **Storage and query boundary corrections.** Concurrent UNIQUE, NodeKey,
 external-ID and MERGE key claims remain protected after a competing commit
 flushes. Forks retain the empty view of datasets absent at their creation,

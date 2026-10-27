@@ -290,10 +290,19 @@ graph TB
 | `pest` / `pest_derive` | PEG parser generator powering `uni-cypher`'s Cypher and Locy grammars |
 | `object_store` | S3/GCS/Azure/local filesystem abstraction |
 | `pyo3` | Python bindings (FFI) |
-| `candle-core` / `candle-transformers` | Native Rust ML inference for auto-embedding |
+| `candle-core` / `candle-transformers` | Optional native Rust ML inference for auto-embedding |
+| `safetensors` | Locy CPU linear-classifier model loading without a tensor runtime |
 | `uni-xervo` | Embedding + generation runtime used by auto-embedding and host-side multimodal model calls |
 | `sha3` | SHA3-256 hashing for UniId content addressing |
 | `serde` / `rmp-serde` | MessagePack serialization for CRDTs and CypherValues |
+
+Locy's public `CandleLinearClassifier` keeps its historical name for API
+compatibility but does not depend on Candle. It loads F32 `weight` and `bias`
+tensors directly with `safetensors`, preserves flattened tensor acceptance and
+feature ordering/encoding, and computes dot product plus sigmoid in f32 before
+widening probabilities to f64. The default inverse-sigmoid `classify_logits`
+behavior is unchanged. Optional Xervo providers can still depend on Candle;
+disabling them removes that dependency from minimal Uni builds.
 
 ## Write Path (End-to-End)
 

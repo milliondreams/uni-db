@@ -107,6 +107,7 @@ rand = { workspace = true }
 # access flows through uni-xervo's provider facades.
 
 [dev-dependencies]
+bbtree = { version = "=0.1.5", features = ["file"] }
 criterion = "0.8"
 mimalloc = { version = "0.1", default-features = false }
 # Also a normal dependency (for production `fail_point!` markers); listed here
@@ -152,6 +153,10 @@ harness = false
 
 [[bench]]
 name = "micro_benchmarks"
+harness = false
+
+[[bench]]
+name = "collection_candidates"
 harness = false
 
 [[bench]]

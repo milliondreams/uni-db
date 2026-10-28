@@ -108,6 +108,11 @@ GUARDS: list[tuple[str, list[str], str]] = [
         "preserve receiver, factory, config and notebook drift detection",
     ),
     (
+        "ORT cache preparation checks",
+        [sys.executable, "scripts/ci/test_prepare_ort.py"],
+        "preserve pinned-version verification, resume, checksum and atomic cache publication",
+    ),
+    (
         "TCK report exit status",
         [sys.executable, "scripts/ci/test_tck_report_exit_status.py"],
         "preserve nextest failures while generating TCK reports for both modes",

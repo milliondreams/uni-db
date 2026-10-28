@@ -10877,3 +10877,22 @@ Quick reference of all anti-patterns from every chapter:
 
 *The Uni Black Book — Version 2.2.1*
 *Generated from Uni DB codebase analysis*
+
+
+### Python API parity contract
+
+The Python config converters expose all active `UniConfig` fields, including
+compaction, throttle, file-sandbox, object-store request policy, and index-rebuild
+nested structs. Config readback uses the same key set; durations are seconds and
+optional values retain `None`, so readback can be used to configure another
+builder. Config merges clone the prior settings and publish only after successful
+conversion. Cache and parallelism setters use the same config state, so the last
+setter wins. The deprecated `partial_lance_writes` no-op is not exposed.
+
+`scripts/ci/check_rust_python_parity.py` compares 19 facade, builder and result
+types, returned schema/session/metric fields, both Locy configuration entry
+points, and all five nested database config structs. It checks accepted config
+keys against both input conversion and readback; exclusions for native Rust
+handles, callbacks, and language-specific equivalents require explicit reasons.
+Negative-control tests verify new facade methods, fields and missing readback
+keys fail the guard. Runtime sync/async and stub parity tests remain independent.

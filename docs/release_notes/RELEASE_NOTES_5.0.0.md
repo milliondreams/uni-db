@@ -24,6 +24,31 @@ Rust crates; see [compatibility scope](../../compat/README.md).
 
 ## ⚠️ Behaviour and API changes
 
+**Python configuration and API parity.** Sync and async builders now accept all
+**44 active Rust `UniConfig` fields**, including file-sandbox, object-store
+request policy and index-rebuild options, alongside compaction and throttle.
+`db.config()` returns the same keys and can configure another builder. Nested
+config calls merge; rejected updates retain previous settings, and cache-size
+and parallelism setters now obey call order. Durations accept seconds or
+`timedelta`, with `None` for optional durations; invalid durations raise Python
+errors. The deprecated `partial_lance_writes` no-op remains rejected.
+
+**Configuration migration:** unknown Locy and provider-specific cloud config
+keys now raise `ValueError` instead of being ignored. Correct spelling mistakes
+or remove unused keys. Optional cloud credentials accept explicit `None`, as
+Rust does. These changes do not alter Rust configuration defaults.
+
+`LocyConfig(...)` and dictionary configuration both expose `semiring`,
+`neural_predicates_preview` and `classifier_cache_max`. Session APIs now include
+`execute_with_retry`, `compile_locy_with_config`, `build_fork_local_index`,
+`replacement_scans_enabled` and `set_replacement_scans`. Transaction execute
+and Locy builders accept `.params({...})`. Both database flavors also expose
+`background_task_count` and database-scoped `load_python_plugin`; the existing
+session plugin loader retains session scope. Async counterparts are awaitable
+where the operation requires it. See the
+[Python configuration reference](../../website/docs/reference/python-api.md#database-configuration)
+for keys, units and examples.
+
 **Locy no longer requires Candle.** The built-in `CandleLinearClassifier`
 retains its public API, safetensors model format, and f32 inference while using
 CPU scalar arithmetic directly. Minimal Lance-backed Rust builds no longer
@@ -2197,6 +2222,14 @@ inline `(n:M {p: $v})` read 1; the `WHERE` form now reads 1 too, as do `IN` and
 read 1.
 
 ## Testing and CI
+
+**Python API validation:** 1,189 tests passed with 15 existing skips on the
+rebuilt extension. Sync/async and runtime/stub parity checks, stubtest, strict
+binding Clippy, formatting, static guards and slim ONNX binding compilation
+passed. The Rust/Python source guard now covers 19 facade/builder/result types,
+12 returned data types, database and Locy configuration, and all cloud config
+variants. Native Rust handles and language-specific API differences remain
+explicit exclusions; see the [API parity review](../proposals/python_api_parity_2026_10_27.md).
 
 Regression coverage includes query equivalence and randomized oracle harnesses
 that run on PRs and nightly:

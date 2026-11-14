@@ -1,11 +1,14 @@
 # Proposal: scoring a similarity pairing without per-pair overhead (#330)
 
-Status: **step 1 implemented**, gate measured (§10). The pattern predicate
-that the measurement found is fixed (§10.6). Step 2 is not built; its decision
-is open. Step 3 remains deferred.
+Status: **closed**. Step 1 is implemented and the gate measured (§10); the
+pattern predicate the measurement found is fixed (§10.6); the costs around the
+pairing are removed (`locy_resolution_cost_2026_11_14.md`). Step 2 is not
+built: the gate did not justify it. Step 3, the top-k generator, is the
+subject of #335, since the number of pairs read is unchanged.
 Date: 2026-11-13 (rev. 2); step 1 and §10 added 2026-11-14.
 
-Issue: <https://github.com/rustic-ai/uni-db/issues/330>.
+Issue: <https://github.com/rustic-ai/uni-db/issues/330>. Follow-up:
+<https://github.com/rustic-ai/uni-db/issues/335>.
 Scope: `uni-query` and `uni-query-functions` (`similar_to` /
 `vector_similarity` evaluation) for step 1. Step 2, if built, adds one
 operator and a planner rule in `uni-query`. Step 3 is deferred and would reach

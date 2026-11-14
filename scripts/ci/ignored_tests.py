@@ -96,7 +96,7 @@ ON_DEMAND: dict[str, str] = {
     ),
     "uni-db::integration bugs::locy_similarity_cross_join_scale::"
     "similarity_rule_does_not_pair_every_mention_with_every_entity": (
-        "repro for #330 (a Locy similarity rule reads every pair), so it "
+        "repro for #335 (a Locy similarity rule reads every pair), so it "
         "fails until a rule can reach the vector index; kept as the specification"
     ),
     "uni-db::reranker_integration test_real_onnx_cross_encoder_reranks_by_relevance": (

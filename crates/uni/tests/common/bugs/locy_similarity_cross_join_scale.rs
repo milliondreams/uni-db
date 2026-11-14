@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Dragonscale Team
 
-//! #330: a Locy rule that pairs two unconnected labels by vector similarity reads
+//! #335: a Locy rule that pairs two unconnected labels by vector similarity reads
 //! every pair: `|A| × |B|` rows, whatever the vector index could have told it.
+//!
+//! First reported as #330, which was closed once each pair and everything
+//! around the pairing was made cheap (`docs/proposals/locy_similarity_join_330.md`,
+//! `docs/proposals/locy_resolution_cost_2026_11_14.md`). The number of pairs
+//! read is unchanged; #335 tracks reaching the vector index from a rule.
 //!
 //! ```locy
 //! CREATE RULE close AS
@@ -195,8 +200,8 @@ async fn pairing(db: &Uni, predicate: &str) -> Result<Pairing> {
 /// operator's row count rather than on time keeps it independent of the
 /// build profile and machine.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "repro: a similarity rule pairs every mention with every entity; fails until \
-            Locy can reach the vector index from a rule"]
+#[ignore = "repro for #335: a similarity rule pairs every mention with every entity; fails \
+            until Locy can reach the vector index from a rule"]
 async fn similarity_rule_does_not_pair_every_mention_with_every_entity() -> Result<()> {
     const N: usize = 300;
     let db = db_with(N, DIM).await?;

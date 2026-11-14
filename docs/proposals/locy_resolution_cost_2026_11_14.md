@@ -1,6 +1,6 @@
 # Proposal: what the resolution program still pays for
 
-Status: **implemented**, with four changes from the design below; see §10.
+Status: **implemented**, with five changes from the design below; see §10.
 Date: 2026-11-14
 
 Follows `docs/proposals/locy_similarity_join_330.md` (#330), §10.5 and §10.6.
@@ -429,7 +429,7 @@ Open questions:
 
 ## 9. What this does not do
 
-- `match_evidence` still holds mentions × entities facts per clause, and the
+- (Tracked as #335.) `match_evidence` still holds mentions × entities facts per clause, and the
   0.5 threshold keeps 209,257 of them at 1,000 × 1,000. Only the top-k
   generator of the #330 proposal (§7 there) changes that.
 - `DERIVE`'s re-run of its rule body still reads up to distinct-m ×
@@ -460,7 +460,22 @@ What is left of the 4.4 s: the first pass's strata, 2.0 s; the re-evaluation
 after the first `DERIVE`, 1.0 s; the two `DERIVE` commands' fact collection,
 about 0.35 s each. `match_evidence` is still mentions × entities (§9).
 
-Not measured as built: a release build, flushed data, more than one type.
+Release build, same probe, two runs:
+
+| | Before (#330 §10.6) | As built |
+|---|---|---|
+| Whole program, 1,000 × 1,000 | 5.86 s | 1.17 s, 1.21 s |
+| Whole program, 300 × 300 | 727 ms | 148 ms, 151 ms |
+| New-entity `MERGE`, run alone, 1,000 | 1.78 s | 45 ms, 50 ms |
+| First `DERIVE refers_to`, run alone, 1,000 | 2.96 s | 1.03 s, 1.06 s |
+| First pass's strata, 1,000 | 1.68 s | 0.59 s, 0.60 s |
+
+At 1,000 × 1,000 in release the default `returned_rules` (`All`) costs 0.26 s
+more (1.56 s), and with the join rewrite off (`UNI_EXISTS_JOIN=0`) the
+in-program `MERGE` is 0.70 s where it is 0.05 s (1.89 s in all). Of the 1.2 s,
+the two passes of the strata are 0.9 s.
+
+Not measured as built: flushed data, more than one type.
 
 ### 10.2 What changed from the design
 

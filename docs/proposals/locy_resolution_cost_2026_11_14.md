@@ -475,7 +475,17 @@ more (1.56 s), and with the join rewrite off (`UNI_EXISTS_JOIN=0`) the
 in-program `MERGE` is 0.70 s where it is 0.05 s (1.89 s in all). Of the 1.2 s,
 the two passes of the strata are 0.9 s.
 
-Not measured as built: flushed data, more than one type.
+Flushed data and several entity types, release build, whole program at
+1,000 × 1,000, two runs (`UNI_PROBE_FLUSH=1`, `UNI_PROBE_TYPES=5`):
+
+| | Unflushed | Flushed |
+|---|---|---|
+| One type | 1.20 s, 1.23 s | 1.25 s, 1.25 s |
+| Five types | 0.54 s, 0.55 s | 0.59 s, 0.59 s |
+
+Flushing changes little. With five types the type equality cuts the pairing
+to a fifth and the first pass's strata fall from 0.58 s to 0.16 s; the links
+are the same. There is no "before" for these two settings.
 
 ### 10.2 What changed from the design
 
@@ -516,10 +526,14 @@ cause, not confirmed, is a background flush that the longer strata gave time
 to finish; the mentions are committed but unflushed when the program starts. §7.2's projection and then
 §7.1 removed that cost on either path.
 
-### 10.4 Found on the way, not fixed
+### 10.4 Found on the way, fixed afterwards
 
-The per-row subquery path fails on `toLower` of a NULL outer value:
+The per-row subquery path failed on `toLower` of a NULL outer value:
 `MATCH (m:M) WHERE COUNT { MATCH (o:M) WHERE toLower(o.s) ENDS WITH
-toLower(m.s) } = 0` errors with "Unsupported data type NULL for function
-lower" when some `m.s` is NULL. The join path answers it. `bugs::exists_join`
-checks that shape against a hand-computed answer for that reason.
+toLower(m.s) } = 0` raised "Unsupported data type NULL for function lower"
+when some `m.s` was NULL. An untyped NULL literal reached DataFusion's
+`lower`, which has no signature for it; the same held for `toUpper` and the
+trims. `first_string_arg` (`uni-query-functions`, `df_expr.rs`) now hands
+them a NULL string. Guard: `bugs::exists_join::string_functions_of_null_are_null`,
+and the resolution shape is back in that file's comparison against the
+per-row path.

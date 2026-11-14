@@ -143,9 +143,9 @@ const SAME_TYPE_LOWER: &str = "MATCH (o:M) WHERE o.t = m.t AND o.k < m.k";
 
 /// The body of the entity-resolution program's new-entity `MERGE`: functions
 /// and a disjunction in the join condition, a pattern predicate on the body
-/// alone. Not in [`CASES`]: the per-row path fails on `toLower` of a NULL
-/// outer value ("Unsupported data type NULL for function lower"), so it is
-/// checked against the answer computed here.
+/// alone. Checked against the answer computed here as well as against its
+/// `COUNT` form: the per-row path used to fail on `toLower` of a NULL outer
+/// value ("Unsupported data type NULL for function lower").
 const RESOLUTION: &str = "MATCH (o:M) WHERE o.t = m.t AND NOT (o)-[:R]->() \
      AND ((toLower(o.s) ENDS WITH toLower(m.s) AND o.k <> m.k) OR o.k < m.k)";
 
@@ -169,6 +169,8 @@ const CASES: &[(&str, &str)] = &[
         "MATCH (o:M) WHERE o.t = m.t AND NOT (o)-[:R]->() \
          AND ((o.s ENDS WITH m.s AND o.k <> m.k) OR o.k < m.k)",
     ),
+    ("$NX", RESOLUTION),
+    ("$X", RESOLUTION),
     // A body conjunct of its own, and a body of two nodes.
     (
         "$X",
@@ -329,6 +331,36 @@ async fn exists_not_tied_by_its_where_alone_is_not_a_join() -> Result<()> {
             !has(&found, "HashJoinExec") && !has(&found, "NestedLoopJoinExec"),
             "{predicate}: {found:?}"
         );
+    }
+    Ok(())
+}
+
+/// A string function of NULL is NULL, wherever the NULL comes from: the
+/// query text, a parameter, or an outer row's value inside a subquery. The
+/// last used to fail the per-row subquery, which reads the outer value as a
+/// literal: "Unsupported data type NULL for function lower".
+#[tokio::test]
+async fn string_functions_of_null_are_null() -> Result<()> {
+    let db = open(false).await?;
+    let session = db.session();
+    for function in ["toLower", "toUpper", "trim", "lTrim", "rTrim"] {
+        let literal = session
+            .query(&format!("RETURN {function}(null) AS v"))
+            .await?;
+        assert_eq!(literal.rows()[0].values()[0], Value::Null, "{function}");
+        let parameter = session
+            .query_with(&format!("RETURN {function}($p) AS v"))
+            .param("p", Value::Null)
+            .fetch_all()
+            .await?;
+        assert_eq!(parameter.rows()[0].values()[0], Value::Null, "{function}");
+        // Node 6 has no `s`: no other node's lowered name can equal NULL.
+        let outer = cypher(
+            &session,
+            &format!("COUNT {{ MATCH (o:M) WHERE {function}(o.s) = {function}(m.s) }} = 0"),
+        )
+        .await?;
+        assert_eq!(outer, Keys::from([6]), "{function}");
     }
     Ok(())
 }

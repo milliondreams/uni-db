@@ -964,29 +964,48 @@ async fn hundreds_of_mentions_resolve_within_the_default_timeout() -> Result<()>
 /// `n` entities and `n` mentions of one type: every even mention is the
 /// surname of an existing entity, every odd one a new name.
 async fn scale_db(n: usize) -> Result<Uni> {
+    scale_db_of(n, 1, false).await
+}
+
+/// [`scale_db`] with the mentions and entities spread over `types` entity
+/// types (mention `i` and entity `i` share one, so the links are the same),
+/// and flushed to storage when `flush`.
+async fn scale_db_of(n: usize, types: usize, flush: bool) -> Result<Uni> {
     let db = db_with_models().await?;
-    let entities: Vec<String> = (0..n).map(|i| format!("'Known{i} Person{i}'")).collect();
+    let kind = |i: usize| {
+        if types == 1 {
+            "person".to_string()
+        } else {
+            format!("kind{}", i % types)
+        }
+    };
+    let entities: Vec<String> = (0..n)
+        .map(|i| format!("['Known{i} Person{i}', '{}']", kind(i)))
+        .collect();
     let mentions: Vec<String> = (0..n)
         .map(|i| {
             if i % 2 == 0 {
-                format!("'Person{i}'")
+                format!("['Person{i}', '{}']", kind(i))
             } else {
-                format!("'New{i} Name{i}'")
+                format!("['New{i} Name{i}', '{}']", kind(i))
             }
         })
         .collect();
     let tx = db.session().tx().await?;
     tx.execute(&format!(
-        "UNWIND [{}] AS name CREATE (:Entity {{name: name, type: 'person'}})",
+        "UNWIND [{}] AS row CREATE (:Entity {{name: row[0], type: row[1]}})",
         entities.join(", ")
     ))
     .await?;
     tx.execute(&format!(
-        "UNWIND [{}] AS text CREATE (:Mention {{text: text, type: 'person'}})",
+        "UNWIND [{}] AS row CREATE (:Mention {{text: row[0], type: row[1]}})",
         mentions.join(", ")
     ))
     .await?;
     tx.commit().await?;
+    if flush {
+        db.flush().await?;
+    }
     Ok(db)
 }
 
@@ -1052,14 +1071,21 @@ async fn resolution_program_stage_times() -> Result<()> {
     // `UNI_PROBE_PROGRAM_ONLY=1` skips the staged steps and the small size;
     // `UNI_PROBE_TOP_K=1` keeps one proof per fact, which makes the program
     // record provenance as every `MNOR` program once did.
+    // `UNI_PROBE_FLUSH=1` flushes the data before resolving it, and
+    // `UNI_PROBE_TYPES=k` spreads it over `k` entity types.
     let program_only = std::env::var_os("UNI_PROBE_PROGRAM_ONLY").is_some();
+    let flush = std::env::var_os("UNI_PROBE_FLUSH").is_some();
+    let types: usize = std::env::var("UNI_PROBE_TYPES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
     let top_k = std::env::var_os("UNI_PROBE_TOP_K").is_some();
     for n in [300, 1000] {
         if program_only && n != 1000 {
             continue;
         }
         println!("--- {n} mentions x {n} entities ---");
-        let db = scale_db(n).await?;
+        let db = scale_db_of(n, types, flush).await?;
         let tx = db.session().tx().await?;
         for (step, cypher) in [
             ("first DERIVE refers_to", None),
@@ -1107,7 +1133,7 @@ async fn resolution_program_stage_times() -> Result<()> {
             assert_scale_resolved(&db, n).await?;
         }
 
-        let db = scale_db(n).await?;
+        let db = scale_db_of(n, types, flush).await?;
         let tx = db.session().tx().await?;
         let started = Instant::now();
         // `UNI_PROBE_RETURN_ALL=1` returns every rule's facts, the default;

@@ -1049,7 +1049,15 @@ async fn resolution_program_stage_times() -> Result<()> {
     };
     let derive = format!("{}\nDERIVE refers_to", resolve_rules());
 
+    // `UNI_PROBE_PROGRAM_ONLY=1` skips the staged steps and the small size;
+    // `UNI_PROBE_TOP_K=1` keeps one proof per fact, which makes the program
+    // record provenance as every `MNOR` program once did.
+    let program_only = std::env::var_os("UNI_PROBE_PROGRAM_ONLY").is_some();
+    let top_k = std::env::var_os("UNI_PROBE_TOP_K").is_some();
     for n in [300, 1000] {
+        if program_only && n != 1000 {
+            continue;
+        }
         println!("--- {n} mentions x {n} entities ---");
         let db = scale_db(n).await?;
         let tx = db.session().tx().await?;
@@ -1059,6 +1067,9 @@ async fn resolution_program_stage_times() -> Result<()> {
             ("second DERIVE refers_to", None),
             ("MERGE leftovers", Some(leftovers)),
         ] {
+            if program_only {
+                continue;
+            }
             let started = Instant::now();
             let Some(cypher) = cypher else {
                 let (_, profile) = tx.locy_with(&derive).timeout(NO_LIMIT).profile().await?;
@@ -1092,13 +1103,44 @@ async fn resolution_program_stage_times() -> Result<()> {
             println!("{step}: {:.2?}", started.elapsed());
         }
         tx.commit().await?;
-        assert_scale_resolved(&db, n).await?;
+        if !program_only {
+            assert_scale_resolved(&db, n).await?;
+        }
 
         let db = scale_db(n).await?;
         let tx = db.session().tx().await?;
         let started = Instant::now();
-        tx.locy_with(RESOLVE).timeout(NO_LIMIT).run().await?;
-        println!("the whole program: {:.2?}", started.elapsed());
+        // `UNI_PROBE_RETURN_ALL=1` returns every rule's facts, the default;
+        // the program only writes, so the probe asks for none.
+        let returned_rules = if std::env::var_os("UNI_PROBE_RETURN_ALL").is_some() {
+            uni_db::locy::ReturnedRules::All
+        } else {
+            uni_db::locy::ReturnedRules::Nothing
+        };
+        let config = uni_db::locy::LocyConfig {
+            top_k_proofs: usize::from(top_k),
+            timeout: Some(NO_LIMIT),
+            returned_rules,
+            ..Default::default()
+        };
+        let (_, profile) = tx.locy_with(RESOLVE).with_config(config).profile().await?;
+        let strata: f64 = profile.profile.strata.iter().map(|s| s.elapsed_ms).sum();
+        println!(
+            "the whole program: {:.2?} (its first evaluation of the strata: {strata:.1} ms)",
+            started.elapsed()
+        );
+        for p in &profile.profile.phases {
+            println!(
+                "    {:<14} {:<8} {:>2} rules {:>8} facts {:>10.1} ms",
+                p.pass, p.kind, p.rules, p.facts, p.elapsed_ms
+            );
+        }
+        for c in &profile.profile.commands {
+            println!(
+                "    command {} {:<7} {:>10.1} ms  {} facts written, strata {} evaluated / {} reused",
+                c.index, c.kind, c.elapsed_ms, c.facts_written, c.strata_evaluated, c.strata_reused
+            );
+        }
         tx.commit().await?;
         assert_scale_resolved(&db, n).await?;
     }

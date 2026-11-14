@@ -613,6 +613,9 @@ What is left at 1,000 × 1,000 in a debug build, of 21.2 s: the first DERIVE
 step (12.6 s, of which `same_as` is 5.1 s and about 5 s is outside the strata)
 and the new-entity `MERGE` (11.5 s run on its own).
 
+Where that goes, and a design for it:
+`docs/proposals/locy_resolution_cost_2026_11_14.md`.
+
 Tests: `crates/uni/tests/common/bugs/pattern_predicate_join_side.rs` pins the
 answers of one-sided and two-sided pattern predicates in Cypher and Locy,
 flushed and unflushed, an uncommitted edge, and that the join emits only the

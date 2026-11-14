@@ -1,7 +1,8 @@
 # Proposal: scoring a similarity pairing without per-pair overhead (#330)
 
-Status: **step 1 implemented**, gate measured (§10). Step 2 is not built; its
-decision is open. Step 3 remains deferred.
+Status: **step 1 implemented**, gate measured (§10). The pattern predicate
+that the measurement found is fixed (§10.6). Step 2 is not built; its decision
+is open. Step 3 remains deferred.
 Date: 2026-11-13 (rev. 2); step 1 and §10 added 2026-11-14.
 
 Issue: <https://github.com/rustic-ai/uni-db/issues/330>.
@@ -384,9 +385,9 @@ New tests go in the existing `crates/uni/tests/integration.rs` binary.
   1,000 mentions.
 - At the 0.5 threshold the issue's similarity clause keeps 209,257 of
   1,000,000 pairs, and each is a fact that `MNOR` and `BEST BY` process.
-- The `NOT (m)-[:REFERS_TO]->()` pattern predicate is evaluated per joined
-  pair in the residual filter. With the edge type declared, as it is in the
-  real program, it is now the largest cost of the similarity clause (§10.3).
+- The `NOT (m)-[:REFERS_TO]->()` pattern predicate was evaluated per joined
+  pair in the residual filter, and with the edge type declared it was the
+  largest cost of the similarity clause (§10.3). Fixed in §10.6.
 - Locy's in-memory evaluator scores `similar_to` with cosine whatever the
   index metric (§3). With a non-cosine index, a rule's facts and its EXPLAIN
   RULE or DERIVE re-evaluation could then disagree. This was read from the
@@ -526,6 +527,94 @@ fails after step 1, as §8 said it would, and its `ON_DEMAND` entry is
 unchanged. If step 2 is not built, §8 says to retire that test and keep the
 probes.
 
-Not measured: the full resolution program, an ANN index, and widths above
-384.
+Not measured: an ANN index, and widths above 384.
+
+### 10.5 The full resolution program
+
+`nlp_resolve::resolution_program_stage_times`: the program of
+`website/docs/features/nlp-extraction.md` over `n` entities and `n` mentions of
+one type, half of them surnames of entities and half new names, 64-dimensional
+auto-embedded vectors, after step 1. One run each. The steps are the program's
+own, run one at a time in one transaction; "whole program" is one `locy` call
+on a fresh database.
+
+| | debug, 300 | debug, 1,000 | release, 300 | release, 1,000 |
+|---|---|---|---|---|
+| Whole program | 3.82 s | 29.33 s | 0.83 s | 7.17 s |
+| First `DERIVE refers_to` | 1.49 s | 12.19 s | 0.39 s | 3.10 s |
+| `MERGE` of new entities | 0.92 s | 10.40 s | 0.20 s | 1.73 s |
+| Second `DERIVE refers_to` | 1.46 s | 13.30 s | 0.28 s | 2.51 s |
+| `MERGE` of leftovers | 6 ms | 19 ms | 1 ms | 5 ms |
+
+The steps sum to more than the whole program because running them apart
+evaluates the rules twice from scratch.
+
+Inside the two DERIVE steps at 1,000 × 1,000:
+
+| | debug | release |
+|---|---|---|
+| First pass, `match_evidence` (three clauses, 1,000,000 pairs each) | 2.35 s | 0.65 s |
+| First pass, `same_as` | 4.89 s | 1.11 s |
+| First pass, outside the strata | 4.8 s | 1.3 s |
+| Second pass, `match_evidence` (1,500,000 pairs each) | 10.09 s | 1.39 s |
+| Second pass, its two slowest `FilterExec` | 4.87 s, 4.59 s | 0.55 s, 0.52 s |
+| Second pass, `same_as` | 1.02 s | 0.22 s |
+| Second pass, outside the strata | 2.1 s | 0.9 s |
+
+What it says:
+
+- In a debug build the program is at the 30 s timeout, not under it. In a
+  release build it has a factor of four to spare. There is no measurement of
+  the whole program before step 1.
+- Scoring is no longer where the time goes. The first pass scores 1,000,000
+  pairs in the filter and 209,257 again in the `YIELD`, and all three clauses
+  together take 0.65 s in release.
+- The second pass is slower per pair than the first, with fewer facts. The
+  difference is the `REFERS_TO` edges the first pass wrote: the
+  `NOT (m)-[:REFERS_TO]->()` predicate then costs about 3 µs per joined pair
+  in debug and 0.35 µs in release, in every clause (§10.3). It depends on `m`
+  alone, so it could be decided once per mention, before the join.
+- The new-entity `MERGE`, a mention × mention `NOT EXISTS`, is the next
+  largest step. Nothing in this proposal touches it.
+- Two costs were not expected and not looked into: `same_as`, whose profiled
+  operators account for under a quarter of the rule's time, and the time a
+  DERIVE step spends outside the strata.
+
+None of these is what step 2 or step 3 addresses.
+
+### 10.6 The pattern predicate, fixed
+
+`classify_join_predicate` sorts a join's conjuncts by the side whose variables
+they read, and pushes one-sided ones beneath the hash join. It did not look
+inside a pattern predicate, so `NOT (m)-[:REFERS_TO]->()` read no variable,
+was taken for a constant and stayed in the residual filter. It is now
+classified by the variables its pattern names (`conjunct_variables`,
+`df_planner.rs`) and applied to the mention's side as a `Filter` beneath the
+join (`filter_join_side`): once per mention. A pattern with a property map or
+an inline `WHERE`, and one that names both sides, stay above the join. This is
+a planner change for every Cypher query and rule of that shape, not only this
+program. It applies only where an equality makes the plan a hash join; a
+cross join without one still pushes nothing down (§6.1).
+
+Same probes, same machine, one run each:
+
+| 1,000 × 1,000 | debug, before | debug, after | release, before | release, after |
+|---|---|---|---|---|
+| Whole program | 29.33 s | 21.16 s | 7.17 s | 5.86 s |
+| Second `DERIVE refers_to` | 13.30 s | 4.44 s | 2.51 s | 1.45 s |
+| Second pass, `match_evidence` | 10.09 s | 1.03 s | 1.39 s | 0.30 s |
+
+At 300 × 300 the whole program went from 3.82 s to 3.09 s in debug and from
+0.83 s to 0.73 s in release. The clause of §10.3 with `REFERS_TO` declared:
+its filters went from 68.8 ms to 2.1 ms on the mention side plus 4.6 ms above
+the join in debug, and from 8.1 ms to 1.0 ms plus 0.5 ms in release.
+
+What is left at 1,000 × 1,000 in a debug build, of 21.2 s: the first DERIVE
+step (12.6 s, of which `same_as` is 5.1 s and about 5 s is outside the strata)
+and the new-entity `MERGE` (11.5 s run on its own).
+
+Tests: `crates/uni/tests/common/bugs/pattern_predicate_join_side.rs` pins the
+answers of one-sided and two-sided pattern predicates in Cypher and Locy,
+flushed and unflushed, an uncommitted edge, and that the join emits only the
+pairs of mentions the predicate keeps.
 

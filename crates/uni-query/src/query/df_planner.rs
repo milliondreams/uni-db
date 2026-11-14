@@ -5193,8 +5193,8 @@ impl HybridPhysicalPlanner {
 
         let left_filters: Vec<Expr> = cls.left_only.clone();
         let right_filters: Vec<Expr> = cls.right_only.clone();
-        let left_with_filter = wrap_with_filter(left.clone(), &left_filters);
-        let right_with_filter = wrap_with_filter(right.clone(), &right_filters);
+        let left_with_filter = filter_join_side(left.clone(), &left_filters);
+        let right_with_filter = filter_join_side(right.clone(), &right_filters);
         let left_plan = self.plan_internal(&left_with_filter, all_properties)?;
         let right_plan = self.plan_internal(&right_with_filter, all_properties)?;
 
@@ -9959,6 +9959,74 @@ fn collect_expr_variables_into(expr: &Expr, out: &mut HashSet<String>) {
     }
 }
 
+/// The variables a join conjunct reads, pattern predicates included.
+///
+/// [`collect_expr_variables_set`] does not look inside a pattern predicate, so
+/// `NOT (m)-[:R]->()` used to read no variable at all, was classified as a
+/// constant and stayed in the filter above the join, evaluated once per joined
+/// pair although it depends on `m` alone (#330). Here a pattern predicate
+/// reads the variables its pattern names.
+///
+/// `None` when a pattern predicate's variables cannot be listed with
+/// certainty; the conjunct must then stay above the join, where every
+/// variable is in scope.
+fn conjunct_variables(conjunct: &Expr) -> Option<HashSet<String>> {
+    fn walk(expr: &Expr, out: &mut HashSet<String>) -> Option<()> {
+        match expr {
+            Expr::Exists {
+                query,
+                from_pattern_predicate: true,
+            } => out.extend(pattern_predicate_variables(query)?),
+            Expr::UnaryOp { expr, .. } => walk(expr, out)?,
+            Expr::BinaryOp { left, right, .. } => {
+                walk(left, out)?;
+                walk(right, out)?;
+            }
+            other => collect_expr_variables_into(other, out),
+        }
+        Some(())
+    }
+    let mut out = HashSet::new();
+    walk(conjunct, &mut out)?;
+    Some(out)
+}
+
+/// The variables a pattern predicate's pattern names: its nodes, relationships
+/// and paths. A pattern predicate binds nothing new, so each is a variable of
+/// the enclosing scope.
+///
+/// `None` for anything but one plain `MATCH` of nodes and relationships with
+/// no property map and no inline `WHERE`: those hold expressions, which could
+/// read further variables.
+fn pattern_predicate_variables(query: &uni_cypher::ast::Query) -> Option<HashSet<String>> {
+    use uni_cypher::ast::{Clause, Query};
+    let Query::Single(statement) = query else {
+        return None;
+    };
+    let [Clause::Match(m)] = statement.clauses.as_slice() else {
+        return None;
+    };
+    if m.where_clause.is_some() {
+        return None;
+    }
+    let mut out = HashSet::new();
+    for path in &m.pattern.paths {
+        out.extend(path.variable.clone());
+        for element in &path.elements {
+            let (variable, properties, filter) = match element {
+                PatternElement::Node(n) => (&n.variable, &n.properties, &n.where_clause),
+                PatternElement::Relationship(r) => (&r.variable, &r.properties, &r.where_clause),
+                PatternElement::Parenthesized { .. } => return None,
+            };
+            if properties.is_some() || filter.is_some() {
+                return None;
+            }
+            out.extend(variable.clone());
+        }
+    }
+    Some(out)
+}
+
 /// Split a predicate at top-level AND-conjuncts.
 fn split_and_conjuncts(predicate: &Expr) -> Vec<Expr> {
     use uni_cypher::ast::BinaryOp;
@@ -10032,7 +10100,11 @@ fn classify_join_predicate(
         }
 
         // Not an equi-join — classify by which sides its variables belong to.
-        let vars = collect_expr_variables_set(&conjunct);
+        // A conjunct whose variables cannot all be named stays above the join.
+        let Some(vars) = conjunct_variables(&conjunct) else {
+            residual_parts.push(conjunct);
+            continue;
+        };
         let touches_left = vars.iter().any(|v| left_vars.contains(v));
         let touches_right = vars.iter().any(|v| right_vars.contains(v));
         match (touches_left, touches_right) {
@@ -10415,6 +10487,38 @@ fn expr_is_vid_property(expr: &Expr) -> bool {
         Expr::Property(inner, prop)
             if prop == "_vid" && matches!(inner.as_ref(), Expr::Variable(_))
     )
+}
+
+/// Applies a join side's own conjuncts beneath the join.
+///
+/// Those a scan can take are merged into it by [`wrap_with_filter`]. A
+/// conjunct holding a subquery (a pattern predicate, `EXISTS`, `COUNT {}`)
+/// cannot be: a scan's filter goes through the DataFusion expression
+/// translator, which has no subqueries. It becomes a `Filter` over the side,
+/// which `plan_filter` compiles with the physical expression compiler.
+fn filter_join_side(plan: LogicalPlan, filters: &[Expr]) -> LogicalPlan {
+    fn has_subquery(expr: &Expr) -> bool {
+        if matches!(
+            expr,
+            Expr::Exists { .. } | Expr::CountSubquery(_) | Expr::CollectSubquery(_)
+        ) {
+            return true;
+        }
+        let mut found = false;
+        expr.for_each_child(&mut |child| found = found || has_subquery(child));
+        found
+    }
+    let (subqueries, plain): (Vec<Expr>, Vec<Expr>) =
+        filters.iter().cloned().partition(has_subquery);
+    let plan = wrap_with_filter(plan, &plain);
+    match and_combine(subqueries) {
+        Some(predicate) => LogicalPlan::Filter {
+            input: Box::new(plan),
+            predicate,
+            optional_variables: HashSet::new(),
+        },
+        None => plan,
+    }
 }
 
 fn wrap_with_filter(plan: LogicalPlan, filters: &[Expr]) -> LogicalPlan {

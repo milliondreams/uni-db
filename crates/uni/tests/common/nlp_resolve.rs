@@ -956,9 +956,17 @@ async fn hundreds_of_mentions_resolve_within_the_default_timeout() -> Result<()>
     // MATCH and scanning the facts for each pair, and timed out at 30 s;
     // it now narrows the MATCH to the pairs `resolved` holds.
     const N: usize = 300;
+    let db = scale_db(N).await?;
+    resolve(&db).await?;
+    assert_scale_resolved(&db, N).await
+}
+
+/// `n` entities and `n` mentions of one type: every even mention is the
+/// surname of an existing entity, every odd one a new name.
+async fn scale_db(n: usize) -> Result<Uni> {
     let db = db_with_models().await?;
-    let entities: Vec<String> = (0..N).map(|i| format!("'Known{i} Person{i}'")).collect();
-    let mentions: Vec<String> = (0..N)
+    let entities: Vec<String> = (0..n).map(|i| format!("'Known{i} Person{i}'")).collect();
+    let mentions: Vec<String> = (0..n)
         .map(|i| {
             if i % 2 == 0 {
                 format!("'Person{i}'")
@@ -979,31 +987,120 @@ async fn hundreds_of_mentions_resolve_within_the_default_timeout() -> Result<()>
     ))
     .await?;
     tx.commit().await?;
+    Ok(db)
+}
 
-    resolve(&db).await?;
+/// What resolving [`scale_db`] must leave.
+async fn assert_scale_resolved(db: &Uni, n: usize) -> Result<()> {
     assert_eq!(
         count(
-            &db,
+            db,
             "MATCH (m:Mention)-[:REFERS_TO]->(e:Entity) \
              WHERE e.name ENDS WITH ' ' + m.text RETURN count(m) AS n"
         )
         .await?,
-        (N / 2) as i64,
+        (n / 2) as i64,
         "every surname reaches its entity"
     );
     assert_eq!(
         count(
-            &db,
+            db,
             "MATCH (m:Mention)-[:REFERS_TO]->(e:Entity) \
              WHERE e.name = m.text RETURN count(m) AS n"
         )
         .await?,
-        (N / 2) as i64,
+        (n / 2) as i64,
         "every new name gets an entity of its own"
     );
     assert_eq!(
-        count(&db, "MATCH (e:Entity) RETURN count(e) AS n").await?,
-        (N + N / 2) as i64
+        count(db, "MATCH (e:Entity) RETURN count(e) AS n").await?,
+        (n + n / 2) as i64
     );
+    Ok(())
+}
+
+/// The rules of [`RESOLVE`], without its commands.
+fn resolve_rules() -> &'static str {
+    let end = RESOLVE
+        .find("\nDERIVE refers_to")
+        .expect("the first command");
+    &RESOLVE[..end]
+}
+
+/// Not a pass/fail check: where the resolution program's time goes at
+/// 300 × 300 and 1,000 × 1,000 (#330). Runs [`RESOLVE`]'s steps one at a
+/// time in one transaction, so each can be timed: the rules with each
+/// `DERIVE refers_to`, profiled per rule, and the two Cypher commands between
+/// them. Then the whole program at once on a fresh database, with the timeout
+/// lifted, for the figure to hold against the default 30 s.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "timing probe: prints where the resolution program's time goes at 1,000 x 1,000; \
+            asserts only the links"]
+async fn resolution_program_stage_times() -> Result<()> {
+    use std::time::{Duration, Instant};
+    const NO_LIMIT: Duration = Duration::from_secs(3600);
+    let commands: Vec<&str> = RESOLVE[resolve_rules().len()..]
+        .split("DERIVE refers_to")
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .collect();
+    let [new_entities, leftovers] = commands.as_slice() else {
+        anyhow::bail!("expected two Cypher commands, got {}", commands.len());
+    };
+    let derive = format!("{}\nDERIVE refers_to", resolve_rules());
+
+    for n in [300, 1000] {
+        println!("--- {n} mentions x {n} entities ---");
+        let db = scale_db(n).await?;
+        let tx = db.session().tx().await?;
+        for (step, cypher) in [
+            ("first DERIVE refers_to", None),
+            ("MERGE new entities", Some(new_entities)),
+            ("second DERIVE refers_to", None),
+            ("MERGE leftovers", Some(leftovers)),
+        ] {
+            let started = Instant::now();
+            let Some(cypher) = cypher else {
+                let (_, profile) = tx.locy_with(&derive).timeout(NO_LIMIT).profile().await?;
+                println!("{step}: {:.2?}", started.elapsed());
+                for stratum in &profile.profile.strata {
+                    for rule in &stratum.rules {
+                        let ms: f64 = rule.iterations.iter().map(|i| i.elapsed_ms).sum();
+                        println!(
+                            "    rule {:<15} {:>8} facts {ms:>10.1} ms",
+                            rule.name, rule.facts
+                        );
+                        let mut slow: Vec<_> =
+                            rule.iterations.iter().flat_map(|i| &i.operators).collect();
+                        slow.sort_by(|a, b| b.time_ms.total_cmp(&a.time_ms));
+                        for o in slow.iter().take(4) {
+                            println!(
+                                "        {:>9} rows {:>10.1} ms  {}",
+                                o.actual_rows, o.time_ms, o.operator
+                            );
+                        }
+                    }
+                }
+                let strata: f64 = profile.profile.strata.iter().map(|s| s.elapsed_ms).sum();
+                println!(
+                    "    strata {strata:.1} ms of {:.1} ms",
+                    profile.profile.total_elapsed_ms
+                );
+                continue;
+            };
+            tx.execute(cypher).await?;
+            println!("{step}: {:.2?}", started.elapsed());
+        }
+        tx.commit().await?;
+        assert_scale_resolved(&db, n).await?;
+
+        let db = scale_db(n).await?;
+        let tx = db.session().tx().await?;
+        let started = Instant::now();
+        tx.locy_with(RESOLVE).timeout(NO_LIMIT).run().await?;
+        println!("the whole program: {:.2?}", started.elapsed());
+        tx.commit().await?;
+        assert_scale_resolved(&db, n).await?;
+    }
     Ok(())
 }

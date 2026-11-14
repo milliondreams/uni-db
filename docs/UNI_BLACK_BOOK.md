@@ -167,6 +167,8 @@ The query layer translates OpenCypher text into a streaming execution plan:
 
 A correlated pattern (`UNWIND $rows AS r MATCH (a:E {uid: r.a})`, two MATCH patterns sharing a predicate, WITH-then-MATCH) reaches the physical planner as `Filter(CrossJoin(L, R), pred)`. `HybridPhysicalPlanner::try_plan_cross_join_as_hash_join` (`uni-query/src/query/df_planner.rs`) splits `pred` into equi-pairs (`l = r`, each side over one subtree's variables), single-side conjuncts (pushed below the join), and a residual. Each equi-pair becomes a pair of hash keys through `unify_join_key_types`; if any pair cannot be keyed, the whole rewrite falls back to `FilterExec` over `CrossJoinExec` (N × V rows).
 
+A pattern predicate is a single-side conjunct when its pattern names variables of one side only: `NOT (m)-[:REFERS_TO]->()` reads `m`. `conjunct_variables` lists a conjunct's variables with those of any pattern predicate in it (through `NOT`, `AND` and `OR`); before it, the classification did not look inside a pattern predicate, took the conjunct for a constant and left it in the residual, one adjacency lookup per joined pair. A pattern with a property map or an inline `WHERE` is not classified and stays in the residual, since those hold expressions that could read the other side. A single-side conjunct holding a subquery cannot be merged into the scan's own filter, which goes through the DataFusion expression translator; `filter_join_side` keeps it as a `Filter` over the side, compiled by the physical expression compiler. Without an equi-pair nothing is pushed: the plan stays `FilterExec` over `CrossJoinExec` with every conjunct above the join.
+
 Key lowering, by the dtypes of the two compiled sides:
 
 | Pairing | Keys | Re-check |

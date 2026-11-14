@@ -251,7 +251,8 @@ async fn similarity_pairing_time_grows_with_the_product_of_both_sides() -> Resul
 /// scoring in the `YIELD`. Prints each operator's rows and time, for the
 /// clause and for the clause less each residual predicate, with the
 /// `REFERS_TO` edge type undeclared and declared: the pattern predicate costs
-/// far more per pair once the type exists.
+/// far more per row once the type exists. It reads `m` alone, so it is a
+/// filter on the mention side, beneath the join.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "timing probe: prints the operators of the resolution program's similarity clause; \
             asserts only counts"]
